@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from time import monotonic
 from typing import Protocol, cast
@@ -45,11 +45,14 @@ from .controller import (
 )
 from .results import BoundedResultProjection
 from .row_counts import (
+    COUNT_BATCH_CAPABILITY_ID,
+    COUNT_FINALIZE_CAPABILITY_ID,
     COUNT_INSPECT_CAPABILITY_ID,
     COUNT_OPERATION_CAPABILITY_ID,
-    COUNT_PLAN_TOOL_NAME,
     COUNT_SELECTION_TOOL_NAME,
+    CountComparisonPlan,
     count_operation_calls,
+    reduce_count_comparison,
     reduce_count_operation,
 )
 from .sql import (
@@ -75,10 +78,10 @@ COUNT_EXECUTION_POLICY = ExecutionAdmissionPolicy(
 COUNT_OPERATION_POLICY = ExecutionAdmissionPolicy(
     shape="relational_count_selection",
     inline_eligible=True,
-    graph_v1_eligible=True,
+    graph_v1_eligible=False,
     target_count_argument="resource_ids",
     inline_max_targets=CATALOG_SCHEMA_MAX_RESOURCE_IDS,
-    graph_max_targets=CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+    graph_max_targets=0,
 )
 
 RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID = "data.preview_update_rows.executor"
@@ -635,6 +638,146 @@ class DataCountRowsExecutor:
         )
 
 
+class DataFinalizeCountComparisonExecutor:
+    executor_id = "data.finalize_count_comparison.executor"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        arguments = request.arguments
+        plan = CountComparisonPlan.from_material(
+            cast(Mapping[str, object], arguments["plan"])
+        )
+        data = reduce_count_comparison(
+            plan,
+            job_id=cast(str, arguments["job_id"]),
+            agent_id=cast(str, arguments["agent_id"]),
+            batch_tasks=cast(
+                tuple[Mapping[str, object], ...], arguments["batch_tasks"]
+            ),
+            results=cast(tuple[Mapping[str, object], ...], arguments["work_results"]),
+        )
+        return ToolOutput(
+            kind="data.count_comparison",
+            data=data,
+            sensitivity=request.request_sensitivity,
+            sensitivity_provenance={
+                "authority": "authenticated_count_comparison",
+                "plan_digest": plan.digest,
+            },
+        )
+
+
+def data_count_internal_declarations() -> CapabilityDeclarations:
+    rows = data_count_rows_capability_declarations().capabilities[0]
+    binding_properties = {
+        "source_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "source_revision": {"type": "string", "minLength": 1, "maxLength": 256},
+        "complete_source_enumeration": {"type": "boolean", "enum": [True]},
+        "resources": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "source_id": {"type": "string", "minLength": 1},
+                    "resource_id": {"type": "string", "minLength": 1},
+                    "revision": {"type": "string", "minLength": 1},
+                    "kind": {"type": "string", "enum": ["table"]},
+                },
+                "required": ["source_id", "resource_id", "revision", "kind"],
+                "additionalProperties": False,
+            },
+        },
+    }
+    batch = replace(
+        rows,
+        id=COUNT_BATCH_CAPABILITY_ID,
+        description="Execute one exact frozen count-comparison batch.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "source_id": binding_properties["source_id"],
+                "resource_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": COUNT_EXECUTION_POLICY.inline_max_targets,
+                    "items": {"type": "string", "minLength": 1},
+                    "uniqueItems": True,
+                },
+                "include_views": {"type": "boolean", "enum": [False]},
+                "selection_binding": {
+                    "type": "object",
+                    "properties": binding_properties,
+                    "required": list(binding_properties),
+                    "additionalProperties": False,
+                },
+            },
+            "required": [
+                "source_id",
+                "resource_ids",
+                "include_views",
+                "selection_binding",
+            ],
+            "additionalProperties": False,
+        },
+    )
+    finalizer = Capability(
+        id=COUNT_FINALIZE_CAPABILITY_ID,
+        description="Reduce exact accepted count batch results without I/O.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "plan": {"type": "object"},
+                "batch_tasks": {"type": "array", "maxItems": 16},
+                "work_results": {"type": "array", "maxItems": 16},
+                "job_id": {"type": "string"},
+                "agent_id": {"type": "string"},
+            },
+            "required": ["plan", "batch_tasks", "work_results", "job_id", "agent_id"],
+            "additionalProperties": False,
+        },
+        output_kind="data.count_comparison",
+        output_schema={
+            "type": "object",
+            "properties": {
+                "plan_digest": {"type": "string"},
+                "status": {"type": "string", "enum": ["completed"]},
+                "sources": {"type": "array", "minItems": 2, "maxItems": 16},
+                "winner_source_ids": {"type": "array", "minItems": 1, "maxItems": 16},
+                "coverage": {
+                    "type": "string",
+                    "enum": ["complete_admitted_base_tables"],
+                },
+                "snapshot_scope": {
+                    "type": "string",
+                    "enum": ["separate_batch_and_source_snapshots"],
+                },
+                "accepted_results": {"type": "array", "minItems": 2, "maxItems": 16},
+                "observations": {"type": "array", "minItems": 2, "maxItems": 16},
+            },
+            "required": [
+                "plan_digest",
+                "status",
+                "sources",
+                "winner_source_ids",
+                "coverage",
+                "snapshot_scope",
+                "accepted_results",
+                "observations",
+            ],
+            "additionalProperties": False,
+        },
+        executor_id=DataFinalizeCountComparisonExecutor.executor_id,
+        access_mode=AccessMode.NONE,
+    )
+    return CapabilityDeclarations(
+        domain_owner_id="data",
+        capabilities=(batch, finalizer),
+        executor_ids=(batch.executor_id, finalizer.executor_id),
+        tool_views=(),
+    )
+
+
 def data_count_rows_capability_declarations() -> CapabilityDeclarations:
     properties = dict(
         cast(
@@ -866,8 +1009,9 @@ class DataCountInspectExecutor:
 
 def data_count_operation_declarations() -> CapabilityDeclarations:
     description = (
-        f"Count an entire authenticated fixed catalog selection of at most {COUNT_OPERATION_POLICY.inline_max_targets} resources. "
-        f"Use selection_ref from catalog_schema detail=identity. The framework executes a finite plan of at most "
+        f"Count up to {COUNT_OPERATION_POLICY.inline_max_targets} admitted resources. "
+        "For a whole source use source_id and coverage=complete_admitted_base_tables; the data owner resolves and freezes all readable admitted base tables without catalog pagination. "
+        f"For a subset use selection_ref from catalog_schema detail=identity. The framework executes a finite plan of at most "
         f"{(COUNT_OPERATION_POLICY.inline_max_targets + COUNT_EXECUTION_POLICY.inline_max_targets - 1) // COUNT_EXECUTION_POLICY.inline_max_targets} child reads, "
         f"each at most {COUNT_EXECUTION_POLICY.inline_max_targets} resources, within {COUNT_OPERATION_POLICY.inline_max_wall_seconds} seconds and the shared run call budget. "
         "No model continuation or count cursors are needed. Returns code-computed exact total or observed subtotal, fixed coverage and evidence references. "
@@ -889,7 +1033,28 @@ def data_count_operation_declarations() -> CapabilityDeclarations:
         },
         "include_views": properties["include_views"],
     }
-    plan_properties = {"plan_ref": {"type": "string", "pattern": "^plan_[0-9a-f]{16}$"}}
+    whole_source_properties = {
+        "source_id": explicit_properties["source_id"],
+        "coverage": {"type": "string", "enum": ["complete_admitted_base_tables"]},
+    }
+    reference_schema = {
+        "type": "object",
+        "properties": properties,
+        "required": ["selection_ref"],
+        "additionalProperties": False,
+    }
+    whole_source_schema = {
+        "type": "object",
+        "properties": whole_source_properties,
+        "required": ["source_id", "coverage"],
+        "additionalProperties": False,
+    }
+    model_schema = {
+        "type": "object",
+        "properties": {**properties, **whole_source_properties},
+        "oneOf": [reference_schema, whole_source_schema],
+        "additionalProperties": False,
+    }
     output_properties: dict[str, object] = {
         name: {"type": kind}
         for name, kind in {
@@ -925,20 +1090,14 @@ def data_count_operation_declarations() -> CapabilityDeclarations:
         description=description,
         input_schema={
             "type": "object",
-            "properties": {**properties, **explicit_properties, **plan_properties},
+            "properties": {
+                **properties,
+                **explicit_properties,
+                **whole_source_properties,
+            },
             "oneOf": [
-                {
-                    "type": "object",
-                    "properties": plan_properties,
-                    "required": ["plan_ref"],
-                    "additionalProperties": False,
-                },
-                {
-                    "type": "object",
-                    "properties": properties,
-                    "required": ["selection_ref"],
-                    "additionalProperties": False,
-                },
+                reference_schema,
+                whole_source_schema,
                 {
                     "type": "object",
                     "properties": explicit_properties,
@@ -958,7 +1117,6 @@ def data_count_operation_declarations() -> CapabilityDeclarations:
         executor_id=DataCountSelectionExecutor.executor_id,
         access_mode=AccessMode.READ,
         execution_admission_policy=COUNT_OPERATION_POLICY,
-        read_dependency_ids=(DATA_COUNT_ROWS_CAPABILITY_ID,),
     )
     inspect_description = "Inspect exact retained per-table count evidence for an operation_ref returned in this run. Bounded pages perform no source I/O; observations remain historical if permissions or structure changed."
     inspect_properties = {
@@ -1004,58 +1162,17 @@ def data_count_operation_declarations() -> CapabilityDeclarations:
         domain_owner_id="data",
         capabilities=(operation, inspection),
         executor_ids=(operation.executor_id, inspection.executor_id),
-        tool_views=tuple(
+        tool_views=(
             ToolView(
-                name,
-                cap.id,
-                (
-                    "Use only selection_ref and optional include_views. The authenticated reference already binds its source, resources and revisions; do not pass source_id, resource_ids or plan_ref. "
-                    + cap.description
-                    if name == COUNT_SELECTION_TOOL_NAME
-                    else (
-                        "Execute only the exact code-owned plan_ref from this graph task; do not supply source or selection identifiers. "
-                        + cap.description
-                        if name == COUNT_PLAN_TOOL_NAME
-                        else cap.description
-                    )
-                ),
+                COUNT_SELECTION_TOOL_NAME,
+                operation.id,
+                description,
                 ToolPresentation(
                     ToolboxId.SOURCES,
                     ToolLoadMode.ON_DEMAND,
                     ToolTextTrust.CODE,
-                    summary,
-                    guidance,
-                    keywords,
-                ),
-                input_schema=(
-                    {
-                        "type": "object",
-                        "properties": {
-                            "selection_ref": properties["selection_ref"],
-                            "include_views": {"type": "boolean"},
-                        },
-                        "required": ["selection_ref"],
-                        "additionalProperties": False,
-                    }
-                    if name == COUNT_SELECTION_TOOL_NAME
-                    else (
-                        {
-                            "type": "object",
-                            "properties": plan_properties,
-                            "required": ["plan_ref"],
-                            "additionalProperties": False,
-                        }
-                        if name == COUNT_PLAN_TOOL_NAME
-                        else None
-                    )
-                ),
-            )
-            for name, cap, summary, guidance, keywords in (
-                (
-                    COUNT_SELECTION_TOOL_NAME,
-                    operation,
                     "Count a fixed table selection with framework-managed bounded reads and totals.",
-                    "Prefer for source comparisons. Use catalog identity selection references; no per-page model calls.",
+                    "Prefer source_id plus explicit whole-source coverage for foreground source totals; selection_ref for subsets.",
                     (
                         "count",
                         "rows",
@@ -1067,21 +1184,21 @@ def data_count_operation_declarations() -> CapabilityDeclarations:
                         "operation",
                     ),
                 ),
-                (
-                    COUNT_PLAN_TOOL_NAME,
-                    operation,
-                    "Execute the frozen count plan for this graph task.",
-                    "Use only the task's exact plan_ref; bounded reads and totals use the same count execution owner.",
-                    ("count", "plan", "graph", "rows"),
-                ),
-                (
-                    "data_count_inspect",
-                    inspection,
+                input_schema=model_schema,
+            ),
+            ToolView(
+                "data_count_inspect",
+                inspection.id,
+                inspect_description,
+                ToolPresentation(
+                    ToolboxId.SOURCES,
+                    ToolLoadMode.ON_DEMAND,
+                    ToolTextTrust.CODE,
                     "Inspect retained exact table counts for a count operation.",
                     "Use operation_ref for per-table evidence; unnecessary for answering completed source totals.",
                     ("count", "inspect", "evidence", "rows", "operation"),
                 ),
-            )
+            ),
         ),
     )
 
@@ -1203,12 +1320,14 @@ def data_query_declarations(
             *declarations.capabilities,
             *data_count_rows_capability_declarations().capabilities,
             *data_count_operation_declarations().capabilities,
+            *data_count_internal_declarations().capabilities,
         ),
         (
             executor,
             DataCountRowsExecutor(agent_id, sqlite_backend, postgresql_backend),
             DataCountSelectionExecutor(),
             DataCountInspectExecutor(),
+            DataFinalizeCountComparisonExecutor(),
         ),
         (
             *declarations.tool_views,

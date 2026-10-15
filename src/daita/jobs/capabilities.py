@@ -502,6 +502,11 @@ def _inspection_payload(value: GraphInspection) -> dict[str, object]:
     }
     return {
         **_job_payload(value.job),
+        **(
+            {"count_progress": value.count_progress}
+            if value.count_progress is not None
+            else {}
+        ),
         "specification_digest": value.job.specification_digest,
         "graph_revision": value.graph.revision,
         "task_count": value.graph.task_count,

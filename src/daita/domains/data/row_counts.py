@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from hashlib import sha256
-from typing import cast
+from typing import TypedDict, cast
 
 from ..._json import FrozenJsonObject, canonical_json
 from ...capabilities import (
@@ -18,6 +18,7 @@ from ...capabilities import (
     OperationalEffect,
     ToolOutput,
     ToolOutputValidationError,
+    validate_tool_schema_value,
 )
 from ...catalog.capabilities import CATALOG_SCHEMA_CAPABILITY_ID
 from ...catalog.models import CATALOG_SCHEMA_MAX_RESOURCE_IDS
@@ -29,7 +30,394 @@ COUNT_CAPABILITY_ID = "data.count_rows"
 COUNT_OPERATION_CAPABILITY_ID = "data.count_selection"
 COUNT_INSPECT_CAPABILITY_ID = "data.count_inspect"
 COUNT_SELECTION_TOOL_NAME = "data_count_selection"
-COUNT_PLAN_TOOL_NAME = "data_count_plan"
+COUNT_BATCH_CAPABILITY_ID = "data.count_batch"
+COUNT_FINALIZE_CAPABILITY_ID = "data.finalize_count_comparison"
+
+
+class CountPlanResource(TypedDict):
+    source_id: str
+    resource_id: str
+    revision: str
+    kind: str
+
+
+class CountPlanSelection(TypedDict):
+    source_id: str
+    source_revision: str
+    resources: tuple[CountPlanResource, ...]
+    complete_source_enumeration: bool
+
+
+class CountBatch(TypedDict):
+    batch_id: str
+    source_id: str
+    resource_ids: tuple[str, ...]
+
+
+def count_comparison_limits(
+    *, batch_width: int, read_seconds: int = 30, job_seconds: int = 300
+) -> Mapping[str, int]:
+    from ...jobs.graph.models import MAX_TASK_RESULT_BYTES, GraphLimits
+
+    graph = GraphLimits()
+    finalizer_attempts = min(3, graph.max_attempts_per_task)
+    return cast(
+        Mapping[str, int],
+        FrozenJsonObject.from_mapping(
+            {
+                "minimum_sources": 2,
+                "maximum_sources": 16,
+                "maximum_resources_per_source": CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+                "batch_width": batch_width,
+                "maximum_batches": min(graph.max_direct_parents, graph.max_tasks - 1),
+                "minimum_deadline_seconds": 60,
+                "maximum_deadline_seconds": job_seconds,
+                "read_deadline_seconds": read_seconds,
+                "maximum_result_bytes": MAX_TASK_RESULT_BYTES,
+                "finalizer_attempts": finalizer_attempts,
+                "automatic_source_retries": 0,
+            }
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CountComparisonPlan:
+    """Required coverage, independent of the job's authorization ceiling."""
+
+    material: FrozenJsonObject
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "material", FrozenJsonObject.from_mapping(self.material)
+        )
+
+    @property
+    def selections(self) -> tuple[CountPlanSelection, ...]:
+        return cast(tuple[CountPlanSelection, ...], self.material["selections"])
+
+    @property
+    def batches(self) -> tuple[CountBatch, ...]:
+        return cast(tuple[CountBatch, ...], self.material["batches"])
+
+    @property
+    def limits(self) -> Mapping[str, int]:
+        return cast(Mapping[str, int], self.material["limits"])
+
+    @property
+    def digest(self) -> str:
+        return cast(str, self.material["plan_digest"])
+
+    @classmethod
+    def create(
+        cls,
+        selections: tuple[Mapping[str, object], ...],
+        *,
+        batch_width: int,
+        read_seconds: int = 30,
+        job_seconds: int = 300,
+    ) -> CountComparisonPlan:
+        limits = count_comparison_limits(
+            batch_width=batch_width, read_seconds=read_seconds, job_seconds=job_seconds
+        )
+        if (
+            type(batch_width) is not int
+            or not 1 <= batch_width <= 4
+            or not 1 <= read_seconds <= 30
+            or not 60 <= job_seconds <= 300
+            or not 2 <= len(selections) <= limits["maximum_sources"]
+        ):
+            raise ValueError("Count comparison exceeds its source or execution bounds")
+        frozen = tuple(
+            FrozenJsonObject.from_mapping(s)
+            for s in sorted(selections, key=lambda s: str(s.get("source_id", "")))
+        )
+        sources: set[str] = set()
+        resources: set[str] = set()
+        batches: list[dict[str, object]] = []
+        canonical_selections = []
+        for selection in frozen:
+            if set(selection) != {
+                "source_id",
+                "source_revision",
+                "resources",
+                "complete_source_enumeration",
+            }:
+                raise ValueError("Count comparison selection fields changed")
+            source = selection["source_id"]
+            revision = selection["source_revision"]
+            rows = selection["resources"]
+            if (
+                not isinstance(source, str)
+                or not source
+                or source in sources
+                or not isinstance(revision, str)
+                or not revision
+                or selection["complete_source_enumeration"] is not True
+                or not isinstance(rows, tuple)
+                or not 1 <= len(rows) <= CATALOG_SCHEMA_MAX_RESOURCE_IDS
+            ):
+                raise ValueError(
+                    "Count comparison requires distinct complete nonempty sources"
+                )
+            sources.add(source)
+            for row in rows:
+                if (
+                    not isinstance(row, FrozenJsonObject)
+                    or set(row) != {"source_id", "resource_id", "revision", "kind"}
+                    or row["source_id"] != source
+                    or row["kind"] != "table"
+                    or not isinstance(row["resource_id"], str)
+                    or not row["resource_id"]
+                    or row["resource_id"] in resources
+                    or not isinstance(row["revision"], str)
+                    or not row["revision"]
+                ):
+                    raise ValueError("Count comparison resource identity changed")
+                resources.add(row["resource_id"])
+            rows = tuple(
+                sorted(
+                    cast(tuple[FrozenJsonObject, ...], rows),
+                    key=lambda r: cast(str, r["resource_id"]),
+                )
+            )
+            canonical_selections.append({**selection, "resources": rows})
+            for offset in range(0, len(rows), batch_width):
+                batches.append(
+                    {
+                        "batch_id": f"batch:{len(batches) + 1}",
+                        "source_id": source,
+                        "resource_ids": tuple(
+                            r["resource_id"]
+                            for r in rows[offset : offset + batch_width]
+                        ),
+                    }
+                )
+        if len(batches) > limits["maximum_batches"]:
+            raise ValueError(
+                "Count comparison exceeds the total batch/finalizer fan-in bound"
+            )
+        body = {
+            "kind": "count_comparison",
+            "required_coverage": "complete_admitted_base_tables",
+            "include_views": False,
+            "selections": canonical_selections,
+            "batches": batches,
+            "limits": {
+                **limits,
+                "work_units": len(batches) + limits["finalizer_attempts"],
+            },
+        }
+        return cls(
+            FrozenJsonObject.from_mapping({**body, "plan_digest": _count_digest(body)})
+        )
+
+    @classmethod
+    def from_material(cls, material: Mapping[str, object]) -> CountComparisonPlan:
+        value = FrozenJsonObject.from_mapping(material)
+        try:
+            limits = cast(FrozenJsonObject, value["limits"])
+            rebuilt = cls.create(
+                cast(tuple[FrozenJsonObject, ...], value["selections"]),
+                batch_width=cast(int, limits["batch_width"]),
+                read_seconds=cast(int, limits["read_deadline_seconds"]),
+                job_seconds=cast(int, limits["maximum_deadline_seconds"]),
+            )
+            if rebuilt.material != value:
+                raise ValueError("Count comparison plan changed")
+            return rebuilt
+        except (KeyError, TypeError, AttributeError) as error:
+            raise ValueError("Count comparison plan is malformed") from error
+
+
+def _count_digest(value: object) -> str:
+    return "sha256:" + sha256(canonical_json(value).encode()).hexdigest()
+
+
+def validate_count_batch(
+    data: Mapping[str, object],
+    *,
+    source_id: str,
+    source_revision: str,
+    resources: tuple[Mapping[str, object], ...],
+) -> dict[str, int]:
+    """Shared exact arithmetic and coverage validation for count observations."""
+    rows = data.get("counts")
+    if (
+        not isinstance(rows, tuple)
+        or len(rows) != len(resources)
+        or data.get("source_id") != source_id
+        or data.get("source_revision") != source_revision
+    ):
+        raise ToolOutputValidationError(
+            "Count result differs from its exact source/batch"
+        )
+    counted: dict[str, int] = {}
+    for row, expected in zip(rows, resources, strict=True):
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != {"resource_id", "revision", "rows"}
+            or row["resource_id"] != expected["resource_id"]
+            or row["revision"] != expected["revision"]
+            or type(row["rows"]) is not int
+            or row["rows"] < 0
+            or row["resource_id"] in counted
+        ):
+            raise ToolOutputValidationError(
+                "Count result has invalid or duplicate values"
+            )
+        counted[cast(str, row["resource_id"])] = cast(int, row["rows"])
+    if type(data.get("total_rows")) is not int or data["total_rows"] != sum(
+        counted.values()
+    ):
+        raise ToolOutputValidationError("Count batch subtotal changed")
+    return counted
+
+
+def reduce_count_comparison(
+    plan: CountComparisonPlan,
+    *,
+    job_id: str,
+    agent_id: str,
+    batch_tasks: tuple[Mapping[str, object], ...],
+    results: tuple[Mapping[str, object], ...],
+    complete: bool = True,
+) -> dict[str, object]:
+    """Reduce only immutable accepted output envelopes; never repair evidence."""
+    from ...jobs.graph.models import TaskResult
+    from .capabilities import data_count_rows_capability_declarations
+
+    plan = CountComparisonPlan.from_material(plan.material)
+    output_schema = (
+        data_count_rows_capability_declarations().capabilities[0].output_schema
+    )
+    if (
+        len(batch_tasks) != len(plan.batches)
+        or tuple(m.get("batch_id") for m in batch_tasks)
+        != tuple(b["batch_id"] for b in plan.batches)
+        or len({m.get("task_id") for m in batch_tasks}) != len(batch_tasks)
+    ):
+        raise ToolOutputValidationError("Count comparison task mapping changed")
+    by_task = {
+        m["task_id"]: (b, m) for b, m in zip(plan.batches, batch_tasks, strict=True)
+    }
+    selections = {s["source_id"]: s for s in plan.selections}
+    counted: dict[str, dict[str, int]] = {cast(str, s): {} for s in selections}
+    accepted = []
+    seen: set[str] = set()
+    observations = []
+    for envelope in results:
+        try:
+            result = TaskResult.from_candidate_material(envelope)
+            batch, mapping = by_task[result.task_id]
+            selection = selections[batch["source_id"]]
+            verification = result.verification
+            validate_tool_schema_value(output_schema, result.payload)
+            if (
+                result.task_id in seen
+                or result.job_id != job_id
+                or result.agent_id != agent_id
+                or result.result_id != f"result:{result.attempt_id}"
+                or result.result_kind != "data.row_counts"
+                or result.schema_digest != mapping["schema_digest"]
+                or result.artifact_ids
+                or result.effect_receipt_ids
+                or result.provenance
+                != FrozenJsonObject.from_mapping(
+                    {
+                        "authority": "authenticated_internal_capability_output",
+                        "task_spec_digest": mapping["task_spec_digest"],
+                        "plan_digest": plan.digest,
+                        "batch_id": batch["batch_id"],
+                    }
+                )
+                or verification.get("capability_id") != COUNT_BATCH_CAPABILITY_ID
+                or verification.get("executor_id") != "data.count_rows.executor"
+                or verification.get("contract_digest") != mapping["contract_digest"]
+                or verification.get("output_sha256") != _count_digest(result.payload)
+            ):
+                raise ValueError("Count result lineage changed")
+            resources = cast(tuple[FrozenJsonObject, ...], selection["resources"])
+            by_id = {r["resource_id"]: r for r in resources}
+            values = validate_count_batch(
+                result.payload,
+                source_id=cast(str, batch["source_id"]),
+                source_revision=cast(str, selection["source_revision"]),
+                resources=tuple(by_id[r] for r in batch["resource_ids"]),
+            )
+            if (
+                result.payload.get("coverage") != "complete_requested_batch"
+                or result.payload.get("counted_resources") != len(values)
+                or result.payload.get("requested_resources") != len(values)
+                or result.payload.get("snapshot_scope") != "one_source_one_statement"
+            ):
+                raise ValueError("Count result coverage changed")
+            counted[cast(str, batch["source_id"])].update(values)
+        except (KeyError, ValueError, TypeError) as error:
+            raise ToolOutputValidationError(
+                "Count comparison evidence is invalid"
+            ) from error
+        seen.add(result.task_id)
+        accepted.append(
+            {
+                "task_id": result.task_id,
+                "result_id": result.result_id,
+                "result_digest": result.result_digest,
+            }
+        )
+        observations.append(
+            {
+                "batch_id": batch["batch_id"],
+                "source_id": batch["source_id"],
+                "observed_at": result.payload["observed_at"],
+                "duration_ms": result.payload["duration_ms"],
+            }
+        )
+    if complete and seen != set(by_task):
+        raise ToolOutputValidationError(
+            "Count comparison requires every successful batch"
+        )
+    sources = []
+    for selection in plan.selections:
+        source = cast(str, selection["source_id"])
+        resources = cast(tuple[FrozenJsonObject, ...], selection["resources"])
+        values = counted[source]
+        observed = sum(values.values())
+        sources.append(
+            {
+                "source_id": source,
+                "source_revision": selection["source_revision"],
+                "selected_resources": len(resources),
+                "counted_resources": len(values),
+                "missing_resource_ids": tuple(
+                    r["resource_id"]
+                    for r in resources
+                    if r["resource_id"] not in values
+                ),
+                "observed_total_rows": observed,
+                "total_rows": observed if len(values) == len(resources) else None,
+            }
+        )
+    all_complete = all(s["total_rows"] is not None for s in sources)
+    maximum = max(cast(int, s["total_rows"]) for s in sources) if all_complete else None
+    return {
+        "plan_digest": plan.digest,
+        "status": "completed" if all_complete else "partial",
+        "sources": sources,
+        "winner_source_ids": tuple(
+            s["source_id"]
+            for s in sources
+            if all_complete and s["total_rows"] == maximum
+        ),
+        "coverage": (
+            "complete_admitted_base_tables"
+            if all_complete
+            else "partial_admitted_base_tables"
+        ),
+        "snapshot_scope": "separate_batch_and_source_snapshots",
+        "accepted_results": sorted(accepted, key=lambda r: r["task_id"]),
+        "observations": sorted(observations, key=lambda r: cast(str, r["batch_id"])),
+    }
 
 
 def count_operation_calls(
@@ -119,20 +507,17 @@ def reduce_count_operation(
             continue
         data = cast(FrozenJsonObject, cast(FrozenJsonObject, facts["result"])["data"])
         rows = cast(tuple[FrozenJsonObject, ...], data["counts"])
-        if (
-            data["source_id"] != arguments["source_id"]
-            or data["source_revision"] != selection["source_revision"]
-            or tuple(r["resource_id"] for r in rows) != batch
-            or any(r["revision"] != expected[r["resource_id"]] for r in rows)
-            or data["total_rows"] != sum(cast(int, r["rows"]) for r in rows)
-            or any(r["resource_id"] in counted for r in rows)
-        ):
-            raise ToolOutputValidationError(
-                "Count operation result differs from its plan"
-            )
-        counted.update(
-            (cast(str, r["resource_id"]), cast(int, r["rows"])) for r in rows
+        values = validate_count_batch(
+            data,
+            source_id=cast(str, arguments["source_id"]),
+            source_revision=cast(str, selection["source_revision"]),
+            resources=tuple(
+                {"resource_id": rid, "revision": expected[rid]} for rid in batch
+            ),
         )
+        if set(values) & set(counted):
+            raise ToolOutputValidationError("Count operation has duplicate coverage")
+        counted.update(values)
     complete = len(counted) == len(expected)
     observed = sum(counted.values())
     return {
@@ -188,86 +573,6 @@ def count_reference(prefix: str, run_id: str, call_id: str) -> str:
         prefix
         + sha256(canonical_json((run_id, call_id, prefix)).encode()).hexdigest()[:16]
     )
-
-
-def count_operation_failure_details(data: Mapping[str, object]) -> dict[str, object]:
-    """Project bounded authenticated child causes into an actionable graph block.
-
-    The reducer bounds failures by its finite policy-derived batch plan. Only
-    normalized codes and dispatch facts are carried forward, never source payloads.
-    """
-    failures = cast(tuple[Mapping[str, object], ...], data["failures"])
-    codes = tuple(dict.fromkeys(cast(str, f["code"])[:128] for f in failures))
-    cause_set = set(codes)
-    if cause_set and cause_set <= {
-        "catalog_source_stale",
-        "count_binding_stale",
-        "execution_contract_changed",
-        "execution_contract_unavailable",
-    }:
-        control_kind = "source_or_contract_drift"
-        constraint = "The frozen source schema or execution contract changed. Block this task; a fresh caller-admitted plan is required. Do not retry or substitute this stale selection."
-    elif cause_set and cause_set <= {
-        "source_scope_violation",
-        "resource_read_not_allowed",
-        "source_permission_state_invalid",
-    }:
-        control_kind = "needs_authorization"
-        constraint = "The fixed selection is no longer admitted by current scope or permission. Block this task; only caller admission can restore authority."
-    elif (
-        data["deadline_reached"]
-        or cause_set
-        and cause_set
-        <= {
-            "count_operation_deadline",
-            "tool_calls_per_run_exceeded",
-            "analysis_child_budget_exhausted",
-            "analysis_batch_result_budget_exhausted",
-        }
-    ):
-        control_kind = "budget_exhausted"
-        constraint = "The bounded count operation exhausted its execution allowance. Block this task without extending the allowance."
-    else:
-        control_kind = "needs_replan"
-        constraint = "The fixed count selection could not complete its bounded reads. Block this task and report the retained failure codes; no complete total is available."
-    constraint += " The framework did not automatically replay failed child reads. Preserve genuine observations; they do not establish a complete total."
-    counts = {
-        name: data[name]
-        for name in (
-            "selected_resources",
-            "counted_resources",
-            "failed_resources",
-            "interrupted_resources",
-            "unexecuted_resources",
-            "observed_total_rows",
-        )
-    }
-    child_dispatched = bool(data["counted_resources"]) or any(
-        f["dispatched"] for f in failures
-    )
-    return {
-        **counts,
-        "total_rows": None,
-        "coverage": data["coverage"],
-        "execution_disposition": (
-            "partially_executed" if child_dispatched else "not_dispatched"
-        ),
-        "child_execution_dispatched": child_dispatched,
-        "deadline_reached": data["deadline_reached"],
-        "failure_codes": codes,
-        "failures": tuple({**f, "code": cast(str, f["code"])[:128]} for f in failures),
-        "evidence_call_ids": data["evidence_call_ids"],
-        "recovery": {
-            "kind": "block_task",
-            "tool_name": "task_block",
-            "constraint": constraint,
-            "arguments": {
-                "kind": control_kind,
-                "message": constraint,
-                "details": {**counts, "failure_codes": codes, "total_rows": None},
-            },
-        },
-    }
 
 
 def selection_error(message: str) -> CapabilityInputError:

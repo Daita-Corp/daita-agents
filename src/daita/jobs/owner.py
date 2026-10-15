@@ -826,6 +826,16 @@ class JobOwner:
         if inspection is None:
             raise JobError("unknown_graph", "The graph job is unavailable.")
         self._require_graph_principal(inspection, principal_id)
+        if (
+            inspection.job.specification.outcome_contract.get("kind")
+            == "count_comparison"
+            and inspection.job.specification.finalizer_task_template.get("kind")
+            == "count_comparison_finalizer"
+        ):
+            raise JobError(
+                "count_read_replay_forbidden",
+                "Count comparison work requires fresh job admission; retry/replacement cannot reset its required coverage or read budget.",
+            )
         control = next(
             (
                 item
@@ -909,6 +919,16 @@ class JobOwner:
         if inspection is None:
             raise JobError("unknown_graph", "The graph job is unavailable.")
         self._require_graph_principal(inspection, principal_id)
+        if (
+            inspection.job.specification.outcome_contract.get("kind")
+            == "count_comparison"
+            and inspection.job.specification.finalizer_task_template.get("kind")
+            == "count_comparison_finalizer"
+        ):
+            raise JobError(
+                "count_read_replay_forbidden",
+                "Count comparison work requires fresh job admission; retry/replacement cannot reset its required coverage or read budget.",
+            )
         if (
             not isinstance(expected_revision, int)
             or isinstance(expected_revision, bool)

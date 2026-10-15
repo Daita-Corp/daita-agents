@@ -58,6 +58,87 @@ from tests.support.model_graph_integration import (
 pytestmark = pytest.mark.integration
 
 
+@pytest.mark.parametrize("active", [False, True])
+async def test_retired_count_model_contract_requires_fresh_admission_before_provider_or_source(
+    tmp_path, active
+):
+    from daita.jobs.graph.models import BudgetAmount, topology_digest
+
+    integration = await ModelGraphIntegration.open(tmp_path)
+    try:
+        admission = integration.build()
+        worker = next(t for t in admission.tasks if t.role is TaskRole.WORKER)
+        spec = replace(
+            worker.specification,
+            expected_result_contract={
+                **worker.specification.expected_result_contract,
+                "initial_call": {
+                    "capability_id": "data.count_selection",
+                    "arguments": {"plan_ref": "plan_" + "a" * 16},
+                    "read_dependency_ids": ("data.count_rows",),
+                },
+            },
+        )
+        worker = replace(worker, specification=spec, task_spec_digest=spec.digest)
+        tasks = tuple(
+            worker if t.task_id == worker.task_id else t for t in admission.tasks
+        )
+        admission = replace(
+            admission,
+            tasks=tasks,
+            graph=replace(
+                admission.graph,
+                topology_digest=topology_digest(tasks, admission.dependencies),
+            ),
+        )
+        await integration.owner.admit(admission)
+        if active:
+            now = integration.clock()
+            attempt = await integration.store.claim_graph_task(
+                AGENT_ID,
+                admission.job.job_id,
+                worker.task_id,
+                attempt_id="attempt:historical",
+                claim_token="claim:historical",
+                run_id="run:historical",
+                executor_id=MODEL_ROUTE_ID,
+                claimed_at=now,
+                lease_seconds=30,
+                absolute_deadline_at=now + timedelta(seconds=60),
+                budget_reservations=(BudgetAmount("work_units", 1),),
+            )
+            assert attempt is not None
+            await integration.store.start_graph_attempt(
+                AGENT_ID,
+                admission.job.job_id,
+                worker.task_id,
+                attempt.attempt_id,
+                claim_token=attempt.claim_token,
+                fencing_epoch=attempt.fencing_epoch,
+                started_at=now,
+            )
+        await integration.supervisor.start()
+        terminal = await integration.wait_terminal(admission.job.job_id)
+        assert terminal.job.state is GraphState.NEEDS_ATTENTION
+        assert integration.provider.requests == () and integration.reader.calls == []
+        assert terminal.results == ()
+        assert (
+            await integration.store.list_graph_deliveries(
+                AGENT_ID, job_id=admission.job.job_id
+            )
+            == ()
+        )
+        assert terminal.controls[-1].kind.value == "source_or_contract_drift"
+        if active:
+            assert any(a.state is AttemptState.FENCED for a in terminal.attempts)
+            assert (
+                next(l for l in terminal.budget_ledgers if l.task_id is None).settled
+                == 2
+            )
+    finally:
+        await integration.close()
+
+
 def test_graph_dispatch_never_exceeds_two_when_another_graph_is_ready() -> None:
     first = graph_admission(job_id="job-first").tasks[0]
     second = graph_admission(job_id="job-second").tasks[0]

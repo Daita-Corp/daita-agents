@@ -120,6 +120,11 @@ def _graph_inspection_mapping(inspection: GraphInspection) -> dict[str, object]:
         )
     results = {item.task_id: item for item in inspection.results}
     return {
+        **(
+            {"count_progress": inspection.count_progress}
+            if inspection.count_progress is not None
+            else {}
+        ),
         "job_id": inspection.job.job_id,
         "state": inspection.job.state.value,
         "desired_state": inspection.job.desired_state.value,

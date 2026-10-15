@@ -20,6 +20,74 @@ from .graph.models import (
 MAX_OPERATIONAL_ITEMS = 100
 
 
+def count_progress(inspection: GraphInspection) -> Mapping[str, object] | None:
+    """Accepted observations are the sole arithmetic evidence for progress."""
+    from typing import cast
+
+    from ..domains.data.row_counts import CountComparisonPlan, reduce_count_comparison
+
+    outcome = inspection.job.specification.outcome_contract
+    if (
+        outcome.get("kind") != "count_comparison"
+        or inspection.job.specification.finalizer_task_template.get("kind")
+        != "count_comparison_finalizer"
+    ):
+        return None
+    plan = CountComparisonPlan.from_material(
+        cast(Mapping[str, object], outcome["plan"])
+    )
+    mapping = cast(tuple[Mapping[str, object], ...], outcome["batch_tasks"])
+    task_ids = {m["task_id"] for m in mapping}
+    reduced = reduce_count_comparison(
+        plan,
+        job_id=inspection.job.job_id,
+        agent_id=inspection.job.agent_id,
+        batch_tasks=mapping,
+        results=tuple(
+            r.candidate_material() for r in inspection.results if r.task_id in task_ids
+        ),
+        complete=False,
+    )
+    if inspection.job.state is not GraphState.SUCCEEDED:
+        reduced["winner_source_ids"] = ()
+        if reduced["status"] == "completed":
+            reduced["status"] = "awaiting_finalization"
+    dispositions = {
+        c.requesting_attempt_id: "not_dispatched"
+        for c in inspection.controls
+        if c.task_id in task_ids
+        and isinstance(details := c.payload.get("details"), Mapping)
+        and details.get("execution_disposition") == "not_dispatched"
+    }
+    return {
+        **reduced,
+        "attempts": tuple(
+            {
+                "task_id": a.task_id,
+                "attempt_id": a.attempt_id,
+                "state": a.state.value,
+                "failure_code": a.error_code,
+                "execution_disposition": (
+                    dispositions.get(a.attempt_id, "unknown")
+                    if a.result_id is None
+                    else "accepted"
+                ),
+                "started_at": (
+                    None if a.started_at is None else a.started_at.isoformat()
+                ),
+                "ended_at": None if a.ended_at is None else a.ended_at.isoformat(),
+            }
+            for a in inspection.attempts
+            if a.task_id in task_ids
+        ),
+        "controls": tuple(
+            {"kind": c.kind.value, "task_id": c.task_id, "details": c.payload}
+            for c in inspection.controls
+            if c.task_id in task_ids
+        ),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class GraphDiagnostics:
     job_id: str

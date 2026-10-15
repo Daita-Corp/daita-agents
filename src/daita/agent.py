@@ -701,6 +701,49 @@ class Agent:
     async def job_board(self, job_id: str) -> GraphBoardProjection | None:
         return await self._embedded.job_board(job_id)
 
+    async def start_count_comparison(
+        self,
+        *,
+        source_ids: tuple[str, ...],
+        conversation_id: str | None = None,
+        deadline_seconds: int = 300,
+        caller_principal_id: str | None = None,
+    ) -> GraphJob:
+        """Admit an explicit bounded comparison; execution uses no model workers."""
+        from .domains.data.capabilities import (
+            COUNT_EXECUTION_POLICY,
+            COUNT_OPERATION_POLICY,
+        )
+        from .domains.data.row_counts import count_comparison_limits
+
+        limits = count_comparison_limits(
+            batch_width=COUNT_EXECUTION_POLICY.inline_max_targets,
+            read_seconds=COUNT_EXECUTION_POLICY.inline_max_wall_seconds,
+            job_seconds=COUNT_OPERATION_POLICY.graph_max_wall_seconds,
+        )
+        if (
+            not isinstance(source_ids, tuple)
+            or not limits["minimum_sources"]
+            <= len(source_ids)
+            <= limits["maximum_sources"]
+            or any(not isinstance(s, str) or not s.strip() for s in source_ids)
+            or len(set(source_ids)) != len(source_ids)
+        ):
+            raise ValueError("source_ids requires 2–16 distinct explicit source IDs")
+        if (
+            type(deadline_seconds) is not int
+            or not limits["minimum_deadline_seconds"]
+            <= deadline_seconds
+            <= limits["maximum_deadline_seconds"]
+        ):
+            raise ValueError("deadline_seconds must be 60 through 300")
+        return await self._embedded.start_count_comparison(
+            source_ids=source_ids,
+            conversation_id=conversation_id,
+            deadline_seconds=deadline_seconds,
+            caller_principal_id=caller_principal_id,
+        )
+
     async def read_job_result(self, job_id: str) -> TaskResult | None:
         return await self._embedded.read_job_result(job_id)
 

@@ -18,6 +18,7 @@ from daita.jobs.graph.models import (
     ControlKind,
     ControlState,
     GraphEvent,
+    GraphInspection,
     GraphState,
     TaskControl,
     TaskState,
@@ -33,6 +34,24 @@ from daita.tui.screens.jobs import (
 )
 from tests.support.graph import GRAPH_NOW, graph_admission
 from tests.support.static_graph_integration import DeterministicIds
+
+
+def test_generic_outcome_labels_cannot_select_count_execution_or_progress():
+    admission = graph_admission()
+    specification = replace(
+        admission.job.specification,
+        outcome_contract={"kind": "count_comparison", "plan": {"forged": True}},
+    )
+    job = replace(
+        admission.job,
+        specification=specification,
+        specification_digest=specification.digest,
+    )
+    inspection = GraphInspection(
+        job, admission.graph, admission.tasks, admission.dependencies, (), (), ()
+    )
+    assert inspection.count_progress is None
+    assert "count_progress" not in _graph_inspection_mapping(inspection)
 
 
 async def _store_with_open_control(tmp_path: Path):

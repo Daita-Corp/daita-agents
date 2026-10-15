@@ -133,6 +133,7 @@ class _ContractValidatingAttemptGuard:
 
     delegate: TaskAttemptGuard
     validate_contracts: Callable[[], Awaitable[None]]
+    canonical_arguments: Mapping[str, object] | None = None
 
     @property
     def binding(self) -> GraphTaskBinding:
@@ -146,8 +147,21 @@ class _ContractValidatingAttemptGuard:
     def run_id(self) -> str:
         return self.delegate.run_id
 
-    async def revalidate(self, *, capability_id: str, point: str) -> None:
-        await self.delegate.revalidate(capability_id=capability_id, point=point)
+    async def revalidate(
+        self,
+        *,
+        capability_id: str,
+        point: str,
+        arguments: Mapping[str, object] | None = None,
+    ) -> None:
+        if self.canonical_arguments is None:
+            await self.delegate.revalidate(capability_id=capability_id, point=point)
+        else:
+            await self.delegate.revalidate(
+                capability_id=capability_id,
+                point=point,
+                arguments=self.canonical_arguments,
+            )
         await self.validate_contracts()
 
 
@@ -919,8 +933,29 @@ class CapabilityRuntime:
             else _ContractValidatingAttemptGuard(
                 request.task_attempt_guard,
                 lambda: self._validate_execution_contracts(request.run),
+                (
+                    request.arguments
+                    if request.capability_id
+                    in {"data.count_batch", "data.finalize_count_comparison"}
+                    else None
+                ),
             )
         )
+        if request.capability_id in {
+            "data.count_batch",
+            "data.finalize_count_comparison",
+        }:
+            scope = request.run.execution_scope
+            if (
+                scope is None
+                or scope.per_run_max_tokens != 0
+                or attempt_guard is None
+                or not scope.allows(capability)
+            ):
+                raise CapabilityInputError(
+                    "task_context_invalid",
+                    "Count internal work requires its exact guarded zero-model graph scope.",
+                )
         call = ToolCall(
             id=request.call_id,
             name=f"internal:{capability.id}",
@@ -2485,9 +2520,6 @@ class CapabilityRuntime:
                         validated_arguments=bound_arguments,
                         session=session,
                         dispatch_hook=dispatched,
-                        programmatic_parent=(
-                            parent if count_binding is not None else None
-                        ),
                     )
                 if capture and (
                     result.is_error
@@ -2812,7 +2844,6 @@ class CapabilityRuntime:
         session: RunSession | None,
         dispatch_hook: Callable[[], Awaitable[None]] | None = None,
         projection: StepToolProjection | None = None,
-        programmatic_parent: ToolCall | None = None,
     ) -> ToolResultBlock:
         started = (
             asyncio.get_running_loop().time() if self._observer is not None else None
@@ -2876,17 +2907,7 @@ class CapabilityRuntime:
                     origin=run.origin,
                     context=(None if session is None else session.options.task_context),
                     capability_id=capability.id,
-                    arguments=(
-                        call.arguments if programmatic_parent is not None else arguments
-                    ),
-                    programmatic_parent=(
-                        None
-                        if programmatic_parent is None
-                        else (
-                            self._registry.tool_capability(programmatic_parent.name).id,
-                            programmatic_parent.arguments,
-                        )
-                    ),
+                    arguments=arguments,
                 )
             preference = (
                 ExecutionPreference.AUTO
@@ -4366,11 +4387,6 @@ def _automation_contract(entry: RunToolCatalogEntry) -> dict[str, object]:
     return {
         "tool_name": entry.view.name,
         "capability_id": entry.capability.id,
-        **(
-            {"read_dependency_ids": entry.capability.read_dependency_ids}
-            if entry.capability.read_dependency_ids
-            else {}
-        ),
         "automation_eligibility": entry.capability.automation_eligibility.value,
         "requires_automation_grant": policy is not None,
         "execution_limits": (

@@ -43,8 +43,8 @@ memory/skill owners' validation, bounds and canonical bytes.
 ## Architecture status: current revision 4
 
 The current agent-home format is **revision 4**, extending released revision 3
-with bounded foreground analytical evidence and retained artifact computation
-provenance. Released revisions 1 through 3 and their migrations remain immutable. Revision 4 is the
+with bounded foreground analytical evidence, retained artifact computation
+provenance and deterministic count-comparison graph contracts. Released revisions 1 through 3 and their migrations remain immutable. Revision 4 is the
 sole current runnable format; legacy decoders remain migration-only.
 
 The current revision-2 graph has these non-negotiable boundaries:
@@ -529,6 +529,40 @@ model route and finite cost ceiling are configured. Planner-created work is a
 validated immutable-authority subset. Unmappable migrated work is
 `needs_attention`; no legacy executor can run it.
 
+`start_count_comparison` is the narrow foreground view on the existing
+`jobs.graph.start` capability/executor. Typed `Agent.start_count_comparison`
+resolves exact source IDs through the same data owner. Both freeze complete
+admitted base-table coverage independently of scope; ordinary foreground requests
+do not automatically become jobs. The model view accepts exact `source_ids` with
+explicit `coverage="complete_admitted_base_tables"`, or complete current-run
+`selection_refs`. Foreground `data_count_selection` accepts the corresponding
+single `source_id`/coverage form or a subset reference. The data owner resolves
+and freezes whole-source coverage without model-visible catalog enumeration;
+model results remain compact totals/coverage/evidence references. A data-owned immutable plan admits 2–16 sources
+and at most sixteen four-resource batches, each source's complete catalog selection
+fitting fifty resources and containing at least one base table. Views are excluded.
+
+These tasks use internal-only `data.count_batch` over `DataCountRowsExecutor`
+and pure `data.finalize_count_comparison` through `CapabilityRuntime`. Their exact
+GRAPH_TASK scopes bind current internal role/capability/arguments, empty model
+routes, zero tokens/cost and no effects/grants. Model and scheduled scopes retain
+positive token requirements. Internal attempts create no model transcripts.
+Successful bounded outputs use existing `TaskResult`/budget transactions with
+empty artifacts; only a complete accepted worker set permits finalization and
+one numerical success delivery. Partial inspection reduces accepted evidence only,
+with null totals for unobserved/incomplete sources and no premature winner.
+
+Unaccepted count reads never replay after failure, close, restart, cancellation or
+lease expiry. Pure finalizers can recompute from accepted outputs within their
+original three work units/deadline. Required coverage and budgets cannot be reset
+through retry/replacement controls. The development count MODEL-worker protocol,
+`data_count_plan`/`plan_ref`, dependency metadata and completion repair branches
+are removed. Foreground selection counts/cursors remain supported. Old nonterminal
+count MODEL jobs require fresh admission before provider/source dispatch; terminal
+history remains evidence. This semantic cutover belongs to unreleased revision 4;
+older development checksums stay fail-closed and supplied-storage upgrades stay
+with callers.
+
 An effectful initial task additionally requires foreground approval and one
 code-normalized exact grant. Native grants bind the exact PostgreSQL source,
 resource revision, operation, columns, keys, identity generation and row ceiling;
@@ -852,7 +886,7 @@ Do not add provider branches to `AgentLoop`.
 
 ## Architectural constraints
 
-Current revision 3 has one `AgentLoop`, one `CapabilityRuntime`, one capability
+Current revision 4 has one `AgentLoop`, one `CapabilityRuntime`, one capability
 registry, one catalog, one artifact store, one graph-aware jobs supervisor, one
 routines supervisor, one SQLite state boundary, and one writer per agent home. The
 graph coordinator is inside `jobs`; it does not add a second execution runtime. Do

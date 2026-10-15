@@ -224,12 +224,14 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
         "agent-relational", cast(CatalogProjection, catalog)
     )
     from daita.domains.data.capabilities import (
+        data_count_internal_declarations,
         data_count_operation_declarations,
         data_count_rows_capability_declarations,
     )
 
     count_bundle = data_count_rows_capability_declarations()
     operation_bundle = data_count_operation_declarations()
+    internal_bundle = data_count_internal_declarations()
     query_bundle = data_query_capability_declarations()
     export_bundle = data_export_tabular_capability_declarations()
     preview_bundle = relational_update_preview_capability_declarations()
@@ -246,6 +248,7 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
         *query_bundle.capabilities,
         *count_bundle.capabilities,
         *operation_bundle.capabilities,
+        *internal_bundle.capabilities,
         *export_bundle.capabilities,
         *preview_bundle.capabilities,
         *update_bundle.capabilities,
@@ -257,7 +260,9 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
         CapabilityDeclarations(
             domain_owner_id="data",
             capabilities=capabilities,
-            executor_ids=tuple(item.executor_id for item in capabilities),
+            executor_ids=tuple(
+                dict.fromkeys(item.executor_id for item in capabilities)
+            ),
             tool_views=(
                 *catalog_bundle.tool_views,
                 *query_bundle.tool_views,
@@ -274,6 +279,95 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
         LearningCandidateGuard(),
         local_file_sensitivity=ModelSensitivity.RESTRICTED if local_files else None,
     )
+
+
+@pytest.mark.parametrize("source_id", ["source-sqlite", "source-postgresql"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "empty",
+        "oversized",
+        "revision",
+        "mixed_revision",
+        "source_scope",
+        "resource_scope",
+        "read_scope",
+    ],
+)
+async def test_whole_source_owner_freezes_coverage_before_any_reads(
+    monkeypatch, source_id, fault
+):
+    from daita.domains.data.capabilities import data_count_operation_declarations
+    from daita.scope import EffectiveSourceScope
+
+    catalog = _Catalog()
+    first = catalog.schemas[source_id]
+    schemas = tuple(
+        replace(first, resource_id=f"table-{i}")
+        for i in range(51 if fault == "oversized" else 3)
+    )
+    if fault == "empty":
+        schemas = (replace(first, resource_kind="view"),)
+    if fault == "revision":
+        schemas = tuple(replace(r, source_revision=None) for r in schemas)
+    if fault == "mixed_revision":
+        schemas = (
+            *schemas[:-1],
+            replace(schemas[-1], source_revision="sha256:" + "9" * 64),
+        )
+    readable = frozenset(r.resource_id for r in schemas)
+    if fault == "read_scope":
+        readable -= {schemas[-1].resource_id}
+
+    async def resources(*args):
+        return schemas
+
+    async def readable_ids(*args):
+        return readable
+
+    async def identity(agent_id, resource_id):
+        resource = next((r for r in schemas if r.resource_id == resource_id), None)
+        return (
+            None
+            if resource is None
+            else (source_id, resource.resource_kind, resource.revision)
+        )
+
+    monkeypatch.setattr(catalog, "resource_schemas", resources)
+    monkeypatch.setattr(catalog, "readable_resource_ids", readable_ids)
+    monkeypatch.setattr(catalog, "resource_identity", identity)
+    scope_ids = frozenset(r.resource_id for r in schemas)
+    run = replace(
+        _run(),
+        resolved_source_scope=EffectiveSourceScope(
+            frozenset() if fault == "source_scope" else frozenset({source_id}),
+            (
+                frozenset()
+                if fault == "source_scope"
+                else (
+                    scope_ids - {schemas[-1].resource_id}
+                    if fault == "resource_scope"
+                    else scope_ids
+                )
+            ),
+        ),
+    )
+    domain = _domain(catalog)
+    capability = data_count_operation_declarations().capabilities[0]
+    if fault in {None, "read_scope"}:
+        selection = await domain._resolve_whole_source_selection(
+            run, capability, source_id
+        )
+        assert selection["complete_source_enumeration"] is True
+        assert {
+            r["resource_id"]
+            for r in cast(tuple[FrozenJsonObject, ...], selection["resources"])
+        } == readable
+        assert selection["source_revision"] == first.source_revision
+    else:
+        with pytest.raises(CapabilityInputError):
+            await domain._resolve_whole_source_selection(run, capability, source_id)
 
 
 @pytest.mark.parametrize(

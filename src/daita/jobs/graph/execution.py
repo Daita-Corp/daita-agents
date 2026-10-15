@@ -42,6 +42,8 @@ from .models import (
 PROFILE_WORK_KIND = "data_profile_work"
 PROFILE_FINALIZER_KIND = "data_profile_finalizer"
 GRAPH_RESULT_FINALIZER_KIND = "graph_result_finalizer"
+COUNT_BATCH_KIND = "count_comparison_batch"
+COUNT_FINALIZER_KIND = "count_comparison_finalizer"
 
 PLANNER_CATALOG_CAPABILITY_IDS = frozenset(
     {"catalog.search", "catalog.schema", "catalog.inspect", "catalog.traverse"}
@@ -79,6 +81,8 @@ def internal_task_contract(task: GraphTask) -> Mapping[str, object]:
         PROFILE_WORK_KIND,
         PROFILE_FINALIZER_KIND,
         GRAPH_RESULT_FINALIZER_KIND,
+        COUNT_BATCH_KIND,
+        COUNT_FINALIZER_KIND,
     }:
         raise ValueError("the internal graph task kind is outside the admitted slice")
     if any(
@@ -89,12 +93,31 @@ def internal_task_contract(task: GraphTask) -> Mapping[str, object]:
     assert isinstance(capability_id, str)
     assert isinstance(contract_digest, str)
     if (
-        kind in {PROFILE_FINALIZER_KIND, GRAPH_RESULT_FINALIZER_KIND}
+        kind
+        in {PROFILE_FINALIZER_KIND, GRAPH_RESULT_FINALIZER_KIND, COUNT_FINALIZER_KIND}
         and task.role is not TaskRole.FINALIZER
     ):
         raise ValueError("the graph finalizer contract is not reserved")
     if kind == PROFILE_WORK_KIND and task.role is TaskRole.FINALIZER:
         raise ValueError("the reserved finalizer cannot execute work")
+    if kind in {COUNT_BATCH_KIND, COUNT_FINALIZER_KIND}:
+        expected = (
+            ("data.count_batch", TaskRole.INTERNAL, "data.row_counts")
+            if kind == COUNT_BATCH_KIND
+            else (
+                "data.finalize_count_comparison",
+                TaskRole.FINALIZER,
+                "data.count_comparison",
+            )
+        )
+        if (
+            (capability_id, task.role, output_kind) != expected
+            or task.specification.authority.model_route_ids
+            or set(task.specification.authority.operational_effects) != {"none"}
+            or not set(task.specification.authority.access_modes) <= {"none", "read"}
+            or task.specification.authority.capability_ids != (capability_id,)
+        ):
+            raise ValueError("count internal contract exceeds its admitted slice")
     if capability_id not in task.specification.authority.capability_ids:
         raise ValueError("the task capability exceeds its immutable authority")
     binding = execution_contract_bindings(
@@ -362,6 +385,45 @@ def model_task_execution_scope(
     )
 
 
+def count_task_execution_scope(
+    inspection: GraphInspection,
+    task: GraphTask,
+    attempt: TaskAttempt,
+    binding: GraphTaskBinding,
+) -> ExecutionScope:
+    contract = internal_task_contract(task)
+    if contract["kind"] not in {COUNT_BATCH_KIND, COUNT_FINALIZER_KIND}:
+        raise ValueError("zero-model scope requires an exact count internal contract")
+    authority = task.specification.authority
+    return ExecutionScope(
+        scope_id=f"graph-scope:{attempt.attempt_id}",
+        revision=1,
+        agent_id=attempt.agent_id,
+        principal_id=inspection.job.specification.principal_id,
+        grant_id=f"graph-attempt:{attempt.attempt_id}",
+        job_id=attempt.job_id,
+        job_revision=inspection.graph.revision + 1,
+        allowed_source_ids=authority.source_ids,
+        allowed_resource_ids=authority.resource_ids,
+        allowed_capability_ids=authority.capability_ids,
+        allowed_access_modes=frozenset(AccessMode(m) for m in authority.access_modes),
+        allowed_operational_effects=frozenset({OperationalEffect.NONE}),
+        sensitivity_ceiling=authority.sensitivity,
+        eligible_model_routes=(),
+        per_run_max_cost_usd=Decimal(0),
+        per_run_max_tokens=0,
+        distribution_plan_digest=inspection.job.specification.distribution_plan_digest,
+        contract_bindings=execution_contract_bindings(
+            authority.contract_bindings,
+            capability_ids=authority.capability_ids,
+            resource_ids=authority.resource_ids,
+            model_route_ids=(),
+        ),
+        scope_kind=ExecutionScopeKind.GRAPH_TASK,
+        graph_task_binding=binding,
+    )
+
+
 def task_context_bundle(
     inspection: GraphInspection,
     task: GraphTask,
@@ -554,7 +616,6 @@ def validate_graph_task_arguments(
     context: object,
     capability_id: str,
     arguments: Mapping[str, object],
-    programmatic_parent: tuple[str, Mapping[str, object]] | None = None,
 ) -> None:
     """Validate a graph call against its immutable task role and proposal."""
 
@@ -587,20 +648,6 @@ def validate_graph_task_arguments(
     if not isinstance(initial_call, Mapping):
         raise CapabilityInputError(
             "task_context_invalid", "The frozen initial call is malformed."
-        )
-    if programmatic_parent is not None:
-        parent_id, parent_arguments = programmatic_parent
-        dependencies = initial_call.get("read_dependency_ids", ())
-        if (
-            initial_call.get("capability_id") == parent_id
-            and initial_call.get("arguments") == parent_arguments
-            and isinstance(dependencies, tuple)
-            and capability_id in dependencies
-        ):
-            return
-        raise CapabilityInputError(
-            "task_call_differs_from_proposal",
-            "The child read is outside the exact frozen parent operation.",
         )
     if capability_id.startswith("jobs.graph."):
         return

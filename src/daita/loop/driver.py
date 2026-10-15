@@ -332,6 +332,8 @@ def _effective_run_limits(configured: LoopLimits, run: RunInput) -> LoopLimits:
     scope = run.execution_scope
     if scope is None:
         return configured
+    if scope.per_run_max_tokens == 0 or not scope.eligible_model_routes:
+        raise ValueError("zero-model internal scopes cannot enter model execution")
     configured_cost = configured.max_estimated_cost_usd
     scoped_cost = scope.per_run_max_cost_usd
     return replace(
@@ -359,6 +361,7 @@ def _normalize_run_invocation(
         session = invocation
         runtime_session: RunSession | None = session
         run = session.run
+        _effective_run_limits(configured_limits, run)
         if run.conversation_id is None:
             raise ValueError("run session requires a resolved conversation_id")
         if prepared is None and isinstance(session.prepared, PreparedLoopRun):

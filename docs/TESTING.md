@@ -166,6 +166,27 @@ that a real external integration passed.
 
 ### Count, recovery, progress and diagnostic qualification
 
+The focused whole-source correction has these acceptance criteria, defined before
+implementation:
+
+- An exact source ID plus explicit `complete_admitted_base_tables` coverage resolves
+  the complete bounded base-table set in the data owner, without model-visible
+  identity enumeration, table rows or column schemas. The independent 8/38-table
+  fixture must produce 261/1331 with compact totals and coverage evidence.
+- The same owner resolution supplies explicit durable source-ID admission and the
+  existing typed API. Foreground requests never implicitly create jobs; admitted
+  deterministic workers/finalization make no model requests.
+- Required identities/revisions are frozen separately from authority. Scope,
+  permissions, sensitivity, queued revalidation, no replay and hard budgets remain
+  enforced. Empty/oversized sources fail before reads; incomplete work has no
+  complete total. Existing reference/subset/cursor contracts remain covered.
+- Scorers distinguish affirmative, negated, contradictory and tied winner claims;
+  truthful partial answers retain their measured subtotal and missing coverage.
+  Unknown prose remains unqualified. Historical live evidence is never rewritten.
+- Model-visible results remain bounded summaries; per-table evidence stays behind
+  existing bounded inspection. Offline checks establish contracts, not natural
+  model adoption. This correction authorizes no paid/live qualification.
+
 The count/recovery implementation has six deterministic owner contracts: execution
 limits and current local applicability share the registered contract; rejected
 calls carry bounded recovery/disposition evidence; catalog identity discovery
@@ -180,6 +201,8 @@ Run the focused deterministic cases and the ordinary release checks:
 ```bash
 .venv/bin/python -m pytest tests/capabilities/test_execution_recovery.py \
   tests/catalog/test_schema_slices.py tests/data/test_row_counts.py \
+  tests/data/test_capabilities.py tests/capabilities/test_toolbox_contracts.py \
+  tests/jobs/graph/test_public_composition.py \
   tests/loop/test_sessions.py tests/agent/test_observation.py \
   tests/llm/test_routing.py tests/acceptance/test_count_recovery.py
 .venv/bin/python -m pytest
@@ -203,9 +226,12 @@ Separate batches and sources do not establish a common snapshot or complete
 physical-database coverage. `observed_at` marks execution start and `duration_ms`
 covers execution and validation.
 
-Whole-selection counts now use `data_count_selection`. Identity results for one
-source supply `selection.count_selection_ref`; pass it as `selection_ref` to
-execute the finite selection in one model tool call. The operation admits at most
+Whole-source counts use `data_count_selection` with exact `source_id` and
+`coverage="complete_admitted_base_tables"`. The data owner resolves and freezes
+all readable admitted base tables independently of catalog query/pagination.
+Identity results remain available for explicit subsets: pass their
+`selection.count_selection_ref` as `selection_ref`. Never mix these argument forms.
+Both execute the finite selection in one model tool call. The operation admits at most
 50 resources, derives four-resource child batches from the existing count policy,
 and reserves at most 13 child calls. Parent and child calls consume the same
 64-call run allowance. Child observations reserve the existing bounded analytical
@@ -215,9 +241,10 @@ no source permit, so children cannot deadlock behind their parent.
 
 This explicitly replaces the original guide's four-resource limit for a **logical
 operation**. `data_count_rows` still admits at most four resources per statement
-and invocation. Operation limits are separate registered policy: 30 seconds in
-the foreground, 300 seconds in an admitted graph task, intersected with existing
-run deadlines. No failed child is automatically replayed. Frozen scope,
+and invocation. The foreground operation has a 30-second registered policy,
+intersected with its run deadline. Durable comparisons admit separate internal
+batches with 30-second read ceilings under one 60–300-second job deadline.
+No failed child is automatically replayed. Frozen scope,
 permissions and the whole selection's catalog revisions are checked at binding
 and again after queued source permits; adapters retain native structural checks.
 
@@ -232,62 +259,104 @@ boundary and home revision 4. No transcript compaction or new execution runtime
 is introduced. Separate batch snapshots still do not establish one shared
 transactional instant or complete physical-database coverage.
 
-Longer work uses the existing `start_graph_job`, `JobOwner` and `JobSupervisor`.
-For capability `data.count_selection`, an initial task may pass a current-run
-catalog `selection_ref`; composition resolves source/resources and revisions in
-code. Exact typed source/resource arrays remain supported. Admission freezes the
-operation and its read dependency contracts. The graph worker receives a short
-code-owned `plan_ref`, so it does not copy the table list. Partial operations
-cannot become successful whole-selection graph evidence. Other capabilities
-retain their own graph ceilings; the starter's larger reference envelope does
-not enlarge their execution policies or grants.
+Explicit durable comparisons use the narrow `start_count_comparison` view on the
+existing `jobs.graph.start` capability/executor. Its closed selection-reference
+schema and the generic starter's closed proposal schema remain separate in
+provider definitions, search/load/inspection and digests. Typed
+`Agent.start_count_comparison(source_ids=(...))` resolves the same complete admitted
+sets without transcript references or model-worker configuration. Foreground
+selection counts remain lightweight; ordinary requests never create jobs by size.
 
-The foreground `data_count_selection` view accepts only `selection_ref` and
-optional `include_views`. Its reference already binds the source and exact
-resource revisions. Graph workers instead receive the graph-only
-`data_count_plan` view, accepting only their frozen `plan_ref`. Both views use
-the same canonical capability, data binder, executor, budgets and count reducer.
-Typed graph admission retains explicit source/resource arrays. Model calls
-validate the registered view before canonical validation and current binding
-checks; internal calls retain canonical validation. Search, loading, inspection
-and provider definitions publish the same view schema and digest. View-schema
-changes revise frozen capability contracts; previously admitted jobs cannot
-silently adopt replacement contracts. This adds no agent-home format revision.
+The data-owned plan freezes complete admitted base-table coverage separately from
+scope. Admission requires 2–16 sources, at least one base table each, complete
+catalog enumerations of at most 50 resources, and at most sixteen total batches of
+four resources. The success-only finalizer consumes exact accepted output envelopes;
+counts, subtotals, coverage and ties are computed in code. Internal workers and
+finalizers have no model routes, tokens or model cost, no synthetic transcripts,
+and no artifacts. Output acceptance, budget settlement and unique final delivery
+use existing fenced transactions. See [durable jobs](DURABLE_JOBS.md).
 
-Mixed-selector errors identify the unexpected fields and the view's accepted
-fields without dispatching reads or rewriting the transcript. The model must
-submit its own correction; inspection is a fallback. The public owner test
-verifies discovery/loading, malformed calls, correction and completion within
-four requests, preserving ordered errors and exact bounded child evidence.
+Focused count coverage is in `tests/data/test_row_counts.py`,
+`tests/jobs/graph/test_public_composition.py`, the existing model/profile/guard and
+operational-projection families, `tests/storage/contracts/test_graph_transactions.py`,
+and `tests/acceptance/test_count_recovery.py`. The independent 8/38-table fixture
+requires twelve reads and exact totals 261/1331. Tests cover forged/cross-run and
+partial references, duplicate sources, scope/files-only exclusion, exact internal
+arguments, post-permit permission/revision checks, zero-model admission, malformed
+or substituted results, ties/zero rows, lifecycle interruption, acknowledgment
+loss and budget conservation. Partial inspection distinguishes no observations
+from measured zero and exact per-source totals; incomplete comparisons have no
+established winner or successful result delivery. Existing attention notices are
+separate from successful graph-job deliveries.
 
-The published starter schema requires
-`initial_task.expected_result_contract.result_kind`: a bounded result identifier
-of 1–256 characters. `outcome_contract.required_result_kind` is the corresponding
-optional outcome metadata field. Additional caller contract metadata is preserved;
-it grants no authority or general predicate evaluation. Schema validation rejects
-missing/misnamed core fields before admission, and typed admission independently
-validates the same result identifier without creating a job on failure.
+The retired development count MODEL-worker parameter cases in
+`test_public_agent_executes_graph_model_task_in_current_home` are replaced by the
+internal count families above. Its ordinary MODEL case remains. Explicit arrays
+and reference count-worker cases are replaced by typed/model count admission;
+worker drift by queued-binding and interruption coverage; premature completion
+and child-ID repairs by missing/duplicate/tampered accepted-result rejection.
+The foreground failure family retains its actual coverage, causes, dispatch,
+deadline and budgets; only assertions about the removed model-directed
+`task_block` argument generator were removed. Foreground cursors, whole-selection
+batch observations, repeated legitimate reads, full schemas and exact ordered
+transcripts retain their existing tests. The obsolete `read_dependency_ids`,
+`data_count_plan`/`plan_ref`, automatic count completion binding and count-specific
+MODEL context/repair branches are removed.
 
-Incomplete graph counts retain bounded normalized child failure codes, dispatch
-facts, exact observed totals, missing coverage and evidence IDs. Their recovery
-guidance supplies complete `task_block` arguments. Catalog/binding drift maps to
-`source_or_contract_drift`, permission revocation to `needs_authorization`, and
-actual execution-budget/deadline failures to `budget_exhausted`; other/mixed read
-failures report `needs_replan`. A source drift block enters the existing
-`needs_attention` state and requires a fresh caller-admitted plan. No binding,
-scope, receipt or budget check is bypassed and no failed read is automatically
-replayed. Live drift scoring requires the actual drift control kind, not merely
-any successful block.
+The original replacement's node reconciliation against checkpoint `b44eeec` collected 3,722
+deterministic cases versus 3,659 original cases: 69 added IDs and six retired
+parameter IDs. Five retired IDs were count MODEL cases replaced as described
+above; the sixth is the ordinary MODEL case restored under its unparameterized
+name. No other deterministic case was removed. Live collection removes only
+`worker_only`; complete/drift cases retain their IDs with the new admission
+contract and separate qualification categories.
 
-For a frozen count plan, `task_complete`/`task_request_review` may omit
-`evidence_call_ids`. The existing completion owner binds the latest successful
-current-run count parent with exact frozen arguments, executor identity and
-output digest. It still authenticates explicit references and rejects internal
-child observation IDs, missing counts and partial results. Count-result
-`evidence_call_ids` describe retained child observations, not model transcript
-calls. This binding performs no reads, replay, scope expansion or receipt
-resolution, and uses the existing accepted-result format. Supporting explicit
-references remain available for other workflows.
+Before the focused source-authoring correction, offline validation passed 310 focused owner cases and all
+3,722 default deterministic cases (15m32s), plus Black, Ruff import checks,
+Mypy across 602 source/test files, golden-home preservation, and the home-release
+contract check/comparison against tagged v1.2.2. Native-worker and loopback SDK
+fixtures ran in the normal local host environment; no security guard was relaxed.
+These results establish implementation/offline coverage only. No live cohort,
+external service, credential loading or paid model call was used.
+
+The focused whole-source authoring correction is additive: both closed argument
+forms use the existing capability/executor and the same frozen selection/plan
+records. It changes no stored-record shape, home revision or migration history.
+Frozen contract digests still undergo ordinary current-binding validation. Tests
+that previously required reference-only schemas now assert mutually exclusive
+source/coverage and reference branches, including mixed-argument rejection; the
+reference, subset, cursor, restart and failure coverage remains in place. New
+source authoring reuses the queued revocation/drift and budget failure family.
+
+Focused follow-up acceptance passes: the 8/38-table fixture returns exact
+261/1331 totals through foreground source/coverage arguments without catalog
+pages, with each successful model-visible result below 4,000 canonical bytes.
+Typed and model-authored source-ID durable admission produce twelve count reads,
+thirteen accepted internal results, the correct winner and one delivery, without
+model worker requests. Existing reference/subset/cursor coverage remains; thirty-three
+additional cases bring the deterministic collection to 3,755. The public acceptance
+waiter now polls lightweight job status before reading the full graph once, instead
+of repeatedly decoding the growing graph under its unchanged completion deadline.
+
+The follow-up full offline run completed with **3,754 passed, one failed** (27m42s).
+All 187 cases in the focused owner families passed. The sole failure was unchanged
+`tests/llm/test_official_client_subscriptions.py::test_command_timeout_terminates_descendants_after_leader_exit`:
+the child PID file did not appear after a command with a 0.2-second deadline.
+That test passed in isolation (0.51s); a clean full-suite pass is not established.
+The final scorer regressions were rerun successfully. Black, Ruff import checks,
+Mypy (602 files), the home-release check and comparison against v1.2.2 passed.
+No unrelated subprocess implementation/test was changed. Prior failure logs and
+live reports are retained. No paid/live runs were performed for this correction;
+natural-model adoption, token efficiency and seeded pre-admission model recovery
+remain unqualified.
+
+This is a durable semantic change in the unreleased revision-4 candidate even
+though graph DDL is unchanged. The migration definition/checksum, revision-4 golden
+fixture and release snapshot change together; released revisions 1–3 remain
+untouched. Golden-home/release tests exercise supported upgrades and historical
+preservation. Retired nonterminal count MODEL contracts require fresh admission
+before any provider/source call, including after conservative active-attempt
+recovery. Arbitrary older development revision-4 checksums remain fail-closed.
 
 The sequential cursor interface remains available for explicit individual reads.
 Identity tool results for one explicit source also supply
@@ -375,34 +444,35 @@ DAITA_GRAPH_COUNT_REPORT_DIR=/private/tmp/daita-count-jobs-candidate \
   --junitxml=/private/tmp/daita-count-jobs-candidate.xml -o junit_family=xunit1
 ```
 
-The complete case asks a real model to admit one durable 38-table Meridian
-count from its current-run identity selection. The worker must use the frozen
-`plan_ref`; independent fixture counts authenticate ten child batches, each
-with at most four resources, the exact 1,331-row total, coverage and delivery.
-The drift case changes the disposable table structure after job admission,
-then lets the real worker observe the ordinary runtime failure and issue a
-typed block. It is explicitly fault-seeded real-model continuation, never
-unscripted success evidence. Missing coverage cannot become an accepted worker
-result. Host shutdown drains the blocked case without replaying the read.
-The separate `worker_only` case supplies a controlled foreground admission with
-the exact registered contract, then uses a real model for the entire worker.
-Its synthetic foreground turns are labelled and excluded from measured model
-usage; it isolates worker execution when natural admission fails. Passing it
-cannot replace a failed unscripted `complete` journey or establish natural
-graph-contract discovery. Select `-k worker_only` and a fresh report directory
-to execute only this diagnostic under a separately reserved allowance.
+The complete case asks a real model to admit one two-source count comparison from
+current-run identity references. The independent fixture authenticates all twelve
+native batches, 46 table observations, exact totals 261/1331, the winner and one
+successful delivery. The drift case changes the disposable Meridian schema after
+real-model admission. Subsequent execution is deterministic framework fault
+qualification, not real-model continuation/correction evidence. Reports separately
+retain foreground admission attempts, injected faults, actual reads, accepted
+results, timing, zero worker/finalizer provider requests and cleanup.
 
-Each case reserves one **shared foreground-and-job** cost ceiling before any
-paid call. The test-only provider serializes and narrows canonical requests
-against that allowance. Terminal run usage is reconciled independently with
-the existing recording provider; unknown or unreconciled consumption retains
-the reservation. Reports and diagnostics remain private, include every
-foreground/model-task call and result, and omit opaque provider content.
-Collection resolves no credentials. Skipped, mocked, failed or unmeasured
-cases do not qualify; these cases establish only targeted API/SQLite
-durable count behavior, not restart, cancellation/recovery, PostgreSQL or
-Codex graph qualification. Aggregate ceilings must fit the caller's remaining
-authorized budget; the example is not authorization to spend.
+The former `worker_only` diagnostic is retired because count MODEL workers no
+longer exist. Its replacement is offline exact internal execution/lifecycle
+coverage; no historical report or failed natural admission is relabeled as passed.
+Pre-admission malformed-call continuations remain in the ordinary live recovery
+campaign. Prior targeted evidence (six successful natural foreground runs and one
+successful correction among three fault-seeded continuations) remains historical;
+the two unsuccessful corrections stopped before corrected reads. Deterministic
+job execution does not fix or qualify those model decisions.
+
+Each live count case reserves the existing shared foreground-and-job cost ceiling
+before any paid call. Unknown or unreconciled consumption retains its reservation.
+Reports include admission and internal attempt identities, exact outputs and
+recorded provider usage. Collection resolves no credentials and contacts no
+services. This implementation's offline results do not qualify live behavior:
+a fresh full 27-case API/SQLite campaign, targeted real-model job admission/fault
+execution, PostgreSQL and Codex cohorts all require separate explicit authorization,
+credentials and adequate budgets. Median 50,000-token/eight-request and maximum
+100,000-token efficiency gates remain unchanged. A targeted subset, skipped case,
+unknown measurement or truthful incomplete answer never establishes full execution
+qualification. No live cohort was performed during implementation.
 
 For an authorized targeted operation campaign with private API credentials already
 supplied to the process, select one repetition and keep the functional envelope:

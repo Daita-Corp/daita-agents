@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from functools import partial
 from hashlib import sha256
-from typing import TypeVar
+from typing import TypeVar, cast
 
 from ..artifacts.models import (
     ArtifactAuthorship,
@@ -19,10 +19,11 @@ from ..artifacts.models import (
     artifact_ref_to_mapping,
 )
 from ..artifacts.store import AgentHomeArtifactStore
-from ..capabilities import CapabilityInputError
+from ..capabilities import CapabilityInputError, ToolOutput
 from ..capability_runtime import CapabilityRuntime, InternalCapabilityRequest
 from ..distribution.models import (
     ArtifactRequirement,
+    OutcomeArtifactReference,
     OutcomeContract,
     outcome_artifact_reference,
     validate_outcome_artifact_references,
@@ -48,8 +49,11 @@ from ..storage.errors import (
     StorageUnavailableError,
 )
 from .graph.execution import (
+    COUNT_BATCH_KIND,
+    COUNT_FINALIZER_KIND,
     GRAPH_RESULT_FINALIZER_KIND,
     PROFILE_WORK_KIND,
+    count_task_execution_scope,
     effective_task_ids,
     graph_task_binding,
     inspection_task,
@@ -64,10 +68,13 @@ from .graph.guard import TaskAttemptStateGuard
 from .graph.models import (
     AttemptState,
     BudgetAmount,
+    ControlKind,
+    ControlState,
     GraphInspection,
     GraphTask,
     TaskAttempt,
     TaskCheckpoint,
+    TaskControl,
     TaskExecutionKind,
     TaskResult,
     TaskRole,
@@ -269,6 +276,29 @@ class JobSupervisor:
             if inspection is None:
                 continue
             task = inspection_task(inspection, attempt.task_id)
+            if task.specification.expected_result_contract.get("kind") in {
+                COUNT_BATCH_KIND,
+                COUNT_FINALIZER_KIND,
+            }:
+                await self._graph_store_call(
+                    partial(
+                        self._store.fence_graph_attempt,
+                        attempt.agent_id,
+                        attempt.job_id,
+                        attempt.task_id,
+                        attempt.attempt_id,
+                        fencing_epoch=attempt.fencing_epoch,
+                        fenced_at=self._clock(),
+                        requeue=task.specification.expected_result_contract["kind"]
+                        == COUNT_FINALIZER_KIND,
+                        reason_code=(
+                            "count_read_interrupted"
+                            if task.role is TaskRole.INTERNAL
+                            else "host_restarted"
+                        ),
+                    )
+                )
+                continue
             if task.execution_kind is TaskExecutionKind.MODEL:
                 await self._graph_store_call(
                     partial(
@@ -424,6 +454,17 @@ class JobSupervisor:
             )
         )
         for attempt in stale:
+            current = await self._graph_store_call(
+                lambda: self._store.inspect_graph(attempt.agent_id, attempt.job_id)
+            )
+            task = (
+                None if current is None else inspection_task(current, attempt.task_id)
+            )
+            count_read = (
+                task is not None
+                and task.specification.expected_result_contract.get("kind")
+                == COUNT_BATCH_KIND
+            )
             key = (attempt.job_id, attempt.task_id)
             fenced = await self._graph_store_call(
                 partial(
@@ -434,8 +475,10 @@ class JobSupervisor:
                     attempt.attempt_id,
                     fencing_epoch=attempt.fencing_epoch,
                     fenced_at=self._clock(),
-                    requeue=True,
-                    reason_code="lease_expired",
+                    requeue=not count_read,
+                    reason_code=(
+                        "count_read_interrupted" if count_read else "lease_expired"
+                    ),
                 )
             )
             if fenced is None:
@@ -581,6 +624,26 @@ class JobSupervisor:
             try:
                 await self._execute_graph_attempt(inspection, current_task, started)
             except asyncio.CancelledError:
+                if current_task.specification.expected_result_contract.get("kind") in {
+                    COUNT_BATCH_KIND,
+                    COUNT_FINALIZER_KIND,
+                }:
+                    await self._graph_store_call(
+                        lambda: self._store.fence_graph_attempt(
+                            started.agent_id,
+                            started.job_id,
+                            started.task_id,
+                            started.attempt_id,
+                            fencing_epoch=started.fencing_epoch,
+                            fenced_at=self._clock(),
+                            requeue=current_task.role is TaskRole.FINALIZER,
+                            reason_code=(
+                                "count_read_interrupted"
+                                if current_task.role is TaskRole.INTERNAL
+                                else "host_closing"
+                            ),
+                        )
+                    )
                 raise
             except StorageError:
                 raise
@@ -597,6 +660,74 @@ class JobSupervisor:
                     is TaskState.SUCCEEDED
                 ):
                     return
+                code = _safe_graph_failure_code(failure)
+                initial = current_task.specification.expected_result_contract.get(
+                    "initial_call"
+                )
+                if current_task.specification.expected_result_contract.get(
+                    "kind"
+                ) == COUNT_BATCH_KIND or (
+                    code == "execution_contract_changed"
+                    and isinstance(initial, Mapping)
+                    and initial.get("capability_id") == "data.count_selection"
+                ):
+                    kind = (
+                        ControlKind.SOURCE_OR_CONTRACT_DRIFT
+                        if code
+                        in {
+                            "count_binding_stale",
+                            "catalog_source_stale",
+                            "execution_contract_changed",
+                            "execution_contract_unavailable",
+                            "sqlite_schema_changed",
+                            "postgresql_schema_changed",
+                        }
+                        else (
+                            ControlKind.NEEDS_AUTHORIZATION
+                            if code
+                            in {
+                                "source_scope_violation",
+                                "resource_read_not_allowed",
+                                "source_permission_state_invalid",
+                            }
+                            else None
+                        )
+                    )
+                    if kind is not None:
+                        payload = {
+                            "message": "Frozen count work cannot proceed; fresh admission is required.",
+                            "details": {
+                                "failure_code": code,
+                                "execution_disposition": (
+                                    "not_dispatched"
+                                    if isinstance(failure, CapabilityInputError)
+                                    and failure.details.get("execution_disposition")
+                                    == "not_dispatched"
+                                    else "unknown"
+                                ),
+                                "automatic_source_retries": 0,
+                            },
+                        }
+                        control = TaskControl(
+                            agent_id=started.agent_id,
+                            job_id=started.job_id,
+                            task_id=started.task_id,
+                            control_id=f"control:{started.attempt_id}",
+                            kind=kind,
+                            state=ControlState.OPEN,
+                            requesting_attempt_id=started.attempt_id,
+                            payload=payload,
+                            created_at=self._clock(),
+                            payload_digest=canonical_digest(payload),
+                        )
+                        await self._graph_store_call(
+                            lambda: self._owner.open_graph_task_control(
+                                control,
+                                claim_token=started.claim_token,
+                                fencing_epoch=started.fencing_epoch,
+                            )
+                        )
+                        return
                 await self._graph_store_call(
                     lambda: self._store.fail_graph_attempt(
                         started.agent_id,
@@ -607,8 +738,14 @@ class JobSupervisor:
                         fencing_epoch=started.fencing_epoch,
                         failed_at=self._clock(),
                         retryable=(
-                            getattr(failure, "code", None) == "protocol_violation"
-                            or _graph_failure_is_retryable(failure)
+                            current_task.specification.expected_result_contract.get(
+                                "kind"
+                            )
+                            != COUNT_BATCH_KIND
+                            and (
+                                getattr(failure, "code", None) == "protocol_violation"
+                                or _graph_failure_is_retryable(failure)
+                            )
                         ),
                         reason_code=_safe_graph_failure_code(failure),
                         attempt_state=(
@@ -753,6 +890,9 @@ class JobSupervisor:
             await self._execute_model_graph_attempt(inspection, task, attempt)
             return
         contract = internal_task_contract(task)
+        if contract["kind"] in {COUNT_BATCH_KIND, COUNT_FINALIZER_KIND}:
+            await self._execute_count_graph_attempt(inspection, task, attempt)
+            return
         reservation = reserved_artifact_id(attempt.attempt_id)
         recovered = await self._artifacts.read_reserved(attempt.run_id, reservation)
         if recovered is not None:
@@ -832,12 +972,172 @@ class JobSupervisor:
             payload.content,
         )
 
+    async def _execute_count_graph_attempt(
+        self, inspection: GraphInspection, task: GraphTask, attempt: TaskAttempt
+    ) -> None:
+        contract = internal_task_contract(task)
+        current = await self._graph_store_call(
+            lambda: self._store.inspect_graph(self._agent_id, task.job_id)
+        )
+        if current is None:
+            raise ValueError("count graph disappeared")
+        accepted = next((r for r in current.results if r.task_id == task.task_id), None)
+        if accepted is not None:
+            if accepted.attempt_id != attempt.attempt_id:
+                raise ValueError("count result belongs to another attempt")
+            return
+        task = inspection_task(current, task.task_id)
+        guard = _graph_attempt_guard(
+            self._store, current, task, attempt, clock=self._clock
+        )
+        scope = count_task_execution_scope(current, task, attempt, guard.binding)
+        instruction = (
+            "Execute the exact code-owned count task; no model work is authorized."
+        )
+        run = RunInput(
+            id=attempt.run_id,
+            agent_id=attempt.agent_id,
+            message=instruction,
+            caller_principal_id=current.job.specification.principal_id,
+            created_at=attempt.started_at or self._clock(),
+            conversation_id=current.job.conversation_id,
+            start=RunStartEnvelope(
+                origin=RunOrigin.JOB_TASK,
+                instruction_authority=InstructionAuthority.CODE_OWNED,
+                trusted_instruction_id=f"graph-task:{attempt.attempt_id}",
+                trusted_instruction=instruction,
+                instruction_digest="sha256:" + sha256(instruction.encode()).hexdigest(),
+                payload_digest=canonical_digest({}),
+                execution_scope=scope,
+            ),
+        )
+        if contract["kind"] == COUNT_BATCH_KIND:
+            arguments = cast(Mapping[str, object], contract["arguments"])
+        else:
+            frozen_outcome = current.job.specification.outcome_contract
+            mapping = cast(
+                tuple[Mapping[str, object], ...], frozen_outcome["batch_tasks"]
+            )
+            by_task = {r.task_id: r for r in current.results}
+            for entry in mapping:
+                worker = inspection_task(current, cast(str, entry["task_id"]))
+                result = by_task.get(worker.task_id)
+                if (
+                    worker.state is not TaskState.SUCCEEDED
+                    or worker.task_spec_digest != entry["task_spec_digest"]
+                    or result is None
+                    or worker.latest_result_id != result.result_id
+                    or not any(
+                        a.attempt_id == result.attempt_id
+                        and a.state is AttemptState.SUCCEEDED
+                        and a.result_id == result.result_id
+                        and a.run_id == result.run_id
+                        for a in current.attempts
+                    )
+                ):
+                    raise ValueError(
+                        "count finalizer has missing or substituted accepted evidence"
+                    )
+            arguments = {
+                "plan": frozen_outcome["plan"],
+                "batch_tasks": mapping,
+                "job_id": task.job_id,
+                "agent_id": task.agent_id,
+                "work_results": tuple(
+                    by_task[cast(str, e["task_id"])].candidate_material()
+                    for e in mapping
+                ),
+            }
+        request = InternalCapabilityRequest(
+            run=run,
+            call_id=f"graph-call-{attempt.attempt_id}",
+            capability_id=str(contract["capability_id"]),
+            contract_digest=str(contract["contract_digest"]),
+            arguments=arguments,
+            sensitivity=scope.sensitivity_ceiling,
+            task_attempt_guard=guard,
+        )
+        remaining = (attempt.absolute_deadline_at - self._clock()).total_seconds()
+        if remaining <= 0:
+            raise TimeoutError("count task deadline expired")
+        async with asyncio.timeout(remaining):
+            outcome = await self._runtime.execute_internal(request)
+        if (
+            outcome.output.kind != contract["output_kind"]
+            or outcome.artifact_ref is not None
+        ):
+            raise ValueError("count task returned an invalid output contract")
+        result = _graph_task_result(
+            task=task,
+            attempt=attempt,
+            result_id=f"result:{attempt.attempt_id}",
+            result_kind=outcome.output.kind,
+            payload=outcome.output.data,
+            artifact=None,
+            output=outcome.output,
+            completed_at=self._clock(),
+            summary=(
+                "Admitted base-table row totals: "
+                + "; ".join(
+                    f"{s['source_id']}: {s['total_rows']}"
+                    for s in cast(
+                        tuple[Mapping[str, object], ...], outcome.output.data["sources"]
+                    )
+                )
+                + ". Winner(s): "
+                + ", ".join(
+                    cast(tuple[str, ...], outcome.output.data["winner_source_ids"])
+                )
+                + ". Separate batch and source snapshots."
+                if task.role is TaskRole.FINALIZER
+                else "Counted one exact admitted batch."
+            ),
+        )
+        if task.role is TaskRole.FINALIZER:
+            await self._finalize_graph_result(current, attempt, result, None)
+        else:
+            try:
+                await self._graph_store_call(
+                    lambda: self._store.complete_graph_attempt(
+                        result,
+                        claim_token=attempt.claim_token,
+                        fencing_epoch=attempt.fencing_epoch,
+                        usage=(BudgetAmount("work_units", 1),),
+                    )
+                )
+            except StorageOwnershipLostError:
+                raise
+            except Exception:
+                stored = await self._graph_store_call(
+                    lambda: self._store.inspect_graph(result.agent_id, result.job_id)
+                )
+                exact = (
+                    next(
+                        (r for r in stored.results if r.result_id == result.result_id),
+                        None,
+                    )
+                    if stored
+                    else None
+                )
+                if exact != result:
+                    raise
+
     async def _execute_model_graph_attempt(
         self,
         inspection: GraphInspection,
         task: GraphTask,
         attempt: TaskAttempt,
     ) -> None:
+        contract = task.specification.expected_result_contract
+        initial = contract.get("initial_call")
+        if isinstance(initial, Mapping) and (
+            initial.get("capability_id") == "data.count_selection"
+            or "read_dependency_ids" in initial
+        ):
+            raise CapabilityInputError(
+                "execution_contract_changed",
+                "The development count MODEL contract is retired; fresh count-comparison admission is required.",
+            )
         if self._graph_model_loop is None:
             raise CapabilityInputError(
                 "graph_model_executor_unavailable",
@@ -1253,42 +1553,55 @@ class JobSupervisor:
         inspection: GraphInspection,
         attempt: TaskAttempt,
         result: TaskResult,
-        artifact: ArtifactRef,
+        artifact: ArtifactRef | None,
     ) -> None:
         contract = internal_task_contract(inspection_task(inspection, attempt.task_id))
-        generic_result = contract["kind"] == GRAPH_RESULT_FINALIZER_KIND
-        requirement = ArtifactRequirement(
-            required=True,
-            minimum_count=1,
-            maximum_count=1,
-            allowed_media_types=("application/json",),
-            allowed_authorships=(
-                (
-                    ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS
-                    if generic_result
-                    else ArtifactAuthorship.EXACT_SOURCE_DATA
+        artifact_references: tuple[OutcomeArtifactReference, ...]
+        if contract["kind"] == COUNT_FINALIZER_KIND:
+            if (
+                artifact is not None
+                or result.artifact_ids
+                or result.payload.get("status") != "completed"
+            ):
+                raise ValueError(
+                    "count comparison finalization requires complete output without artifacts"
+                )
+            artifact_references = ()
+        else:
+            assert artifact is not None
+            generic_result = contract["kind"] == GRAPH_RESULT_FINALIZER_KIND
+            requirement = ArtifactRequirement(
+                required=True,
+                minimum_count=1,
+                maximum_count=1,
+                allowed_media_types=("application/json",),
+                allowed_authorships=(
+                    (
+                        ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS
+                        if generic_result
+                        else ArtifactAuthorship.EXACT_SOURCE_DATA
+                    ),
                 ),
-            ),
-            allowed_producer_capability_ids=(str(contract["capability_id"]),),
-            maximum_artifact_bytes=1 * 1024 * 1024,
-            maximum_total_bytes=1 * 1024 * 1024,
-            maximum_sensitivity=inspection.job.specification.authority.sensitivity,
-        )
-        outcome_contract = OutcomeContract(
-            require_terminal_conclusion=True,
-            artifact_requirements=(requirement,),
-            maximum_total_artifact_bytes=1 * 1024 * 1024,
-            maximum_effective_sensitivity=(
-                inspection.job.specification.authority.sensitivity
-            ),
-            require_current_run_provenance=True,
-            require_exact_source_bindings=not generic_result,
-        )
-        artifact_references = validate_outcome_artifact_references(
-            (outcome_artifact_reference(artifact),),
-            contract=outcome_contract,
-            resulting_run_id=attempt.run_id,
-        )
+                allowed_producer_capability_ids=(str(contract["capability_id"]),),
+                maximum_artifact_bytes=1 * 1024 * 1024,
+                maximum_total_bytes=1 * 1024 * 1024,
+                maximum_sensitivity=inspection.job.specification.authority.sensitivity,
+            )
+            outcome_contract = OutcomeContract(
+                require_terminal_conclusion=True,
+                artifact_requirements=(requirement,),
+                maximum_total_artifact_bytes=1 * 1024 * 1024,
+                maximum_effective_sensitivity=(
+                    inspection.job.specification.authority.sensitivity
+                ),
+                require_current_run_provenance=True,
+                require_exact_source_bindings=not generic_result,
+            )
+            artifact_references = validate_outcome_artifact_references(
+                (outcome_artifact_reference(artifact),),
+                contract=outcome_contract,
+                resulting_run_id=attempt.run_id,
+            )
         distribution = self._required_graph_distribution()
         target = distribution.resolve_conversation_inbox(
             inspection.job.conversation_id,
@@ -1514,9 +1827,10 @@ def _graph_task_result(
     result_id: str,
     result_kind: str,
     payload: Mapping[str, object],
-    artifact: ArtifactRef,
+    artifact: ArtifactRef | None,
     completed_at: datetime,
     summary: str,
+    output: ToolOutput | None = None,
 ) -> TaskResult:
     schema_digest = canonical_digest(
         {
@@ -1524,17 +1838,45 @@ def _graph_task_result(
             "task_contract": task.specification.expected_result_contract,
         }
     )
-    sensitivity = ModelSensitivity(artifact.sensitivity.value)
-    provenance = {
-        "authority": "authenticated_internal_capability_artifact",
-        "task_spec_digest": task.task_spec_digest,
-        "artifact_refs": (artifact_ref_to_mapping(artifact),),
-    }
-    verification = {
-        "artifact_sha256": artifact.sha256,
-        "capability_id": artifact.capability_id,
-        "artifact_authenticated": True,
-    }
+    if artifact is None:
+        if output is None or output.sensitivity is None:
+            raise ValueError("count output requires validated classification")
+        contract = internal_task_contract(task)
+        if contract["kind"] not in {COUNT_BATCH_KIND, COUNT_FINALIZER_KIND}:
+            raise ValueError("only count internal tasks accept direct outputs")
+        sensitivity = max(
+            (output.sensitivity, task.specification.authority.sensitivity),
+            key=lambda s: s.routing_rank,
+        )
+        provenance = {
+            "authority": "authenticated_internal_capability_output",
+            "task_spec_digest": task.task_spec_digest,
+            "plan_digest": contract["plan_digest"],
+        }
+        if contract["kind"] == COUNT_BATCH_KIND:
+            provenance["batch_id"] = contract["batch_id"]
+        verification = {
+            "capability_id": contract["capability_id"],
+            "executor_id": (
+                "data.count_rows.executor"
+                if contract["kind"] == COUNT_BATCH_KIND
+                else "data.finalize_count_comparison.executor"
+            ),
+            "contract_digest": contract["contract_digest"],
+            "output_sha256": canonical_digest(payload),
+        }
+    else:
+        sensitivity = ModelSensitivity(artifact.sensitivity.value)
+        provenance = {
+            "authority": "authenticated_internal_capability_artifact",
+            "task_spec_digest": task.task_spec_digest,
+            "artifact_refs": (artifact_ref_to_mapping(artifact),),
+        }
+        verification = {
+            "artifact_sha256": artifact.sha256,
+            "capability_id": artifact.capability_id,
+            "artifact_authenticated": True,
+        }
     digest_material = {
         "agent_id": task.agent_id,
         "job_id": task.job_id,
@@ -1548,7 +1890,7 @@ def _graph_task_result(
         "summary": summary,
         "sensitivity": sensitivity.value,
         "provenance": provenance,
-        "artifact_ids": (artifact.artifact_id,),
+        "artifact_ids": () if artifact is None else (artifact.artifact_id,),
         "effect_receipt_ids": (),
         "verification": verification,
         "residual_risk": None,
@@ -1568,7 +1910,7 @@ def _graph_task_result(
         summary=str(digest_material["summary"]),
         sensitivity=sensitivity,
         provenance=provenance,
-        artifact_ids=(artifact.artifact_id,),
+        artifact_ids=() if artifact is None else (artifact.artifact_id,),
         effect_receipt_ids=(),
         verification=verification,
         residual_risk=None,

@@ -7,7 +7,10 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    from ...domains.data.controller import DataCapabilityDomain
 
 from ..._json import FrozenJsonObject
 from ...capabilities import (
@@ -35,6 +38,11 @@ from ...capabilities import (
 )
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...distribution.owner import DistributionOwner
+from ...domains.data.row_counts import (
+    COUNT_BATCH_CAPABILITY_ID,
+    COUNT_FINALIZE_CAPABILITY_ID,
+    CountComparisonPlan,
+)
 from ...llm.models import ModelSensitivity, ToolCall
 from ...loop.models import RunInput, RunOrigin
 from ...loop.session import RunSession
@@ -78,6 +86,7 @@ START_GRAPH_JOB_CAPABILITY_ID = "jobs.graph.start"
 START_GRAPH_JOB_EXECUTOR_ID = "jobs.graph.start.executor"
 START_GRAPH_JOB_OUTPUT_KIND = "graph.job_started"
 START_GRAPH_JOB_TOOL_NAME = "start_graph_job"
+START_COUNT_COMPARISON_TOOL_NAME = "start_count_comparison"
 
 _MIN_DEADLINE_SECONDS = 60
 _MAX_DEADLINE_SECONDS = 24 * 60 * 60
@@ -138,8 +147,6 @@ class InitialTaskProposal:
     per_run_max_cost_usd: Decimal
     preview_capability_id: str | None = None
     requested_grant_constraints: Mapping[str, object] | None = None
-    read_dependency_ids: tuple[str, ...] = ()
-    retained_read_selection: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -151,12 +158,6 @@ class InitialTaskProposal:
         object.__setattr__(
             self, "arguments", FrozenJsonObject.from_mapping(self.arguments)
         )
-        if self.retained_read_selection is not None:
-            object.__setattr__(
-                self,
-                "retained_read_selection",
-                FrozenJsonObject.from_mapping(self.retained_read_selection),
-            )
         object.__setattr__(
             self,
             "expected_result_contract",
@@ -177,7 +178,6 @@ class InitialTaskProposal:
             "source_ids",
             "resource_ids",
             "connector_binding_ids",
-            "read_dependency_ids",
         ):
             values = tuple(getattr(self, name))
             if values != tuple(sorted(set(values))) or any(
@@ -226,7 +226,6 @@ class InitialTaskProposal:
             sorted(
                 (
                     self.capability_id,
-                    *self.read_dependency_ids,
                     *(
                         ()
                         if self.preview_capability_id is None
@@ -246,11 +245,6 @@ class InitialTaskProposal:
         return canonical_digest(
             {
                 "capability_id": self.capability_id,
-                **(
-                    {"read_dependency_ids": self.read_dependency_ids}
-                    if self.read_dependency_ids
-                    else {}
-                ),
                 "arguments": self.arguments,
                 "expected_result_contract": self.expected_result_contract,
                 "source_ids": self.source_ids,
@@ -262,11 +256,6 @@ class InitialTaskProposal:
                 "contract_bindings": self.contract_bindings.material(),
                 "preview_capability_id": self.preview_capability_id,
                 "requested_grant_constraints": self.requested_grant_constraints,
-                **(
-                    {"retained_read_selection": self.retained_read_selection}
-                    if self.retained_read_selection is not None
-                    else {}
-                ),
                 "max_steps": self.max_steps,
                 "max_wall_time_seconds": self.max_wall_time_seconds,
                 "per_run_max_tokens": self.per_run_max_tokens,
@@ -348,6 +337,24 @@ class RegistryInitialTaskProposalResolver:
                 "execution_not_supported_for_requested_shape",
                 "The proposed capability is not registered for this host.",
             ) from error
+        if capability_id == "data.count_selection":
+            correction = (
+                START_COUNT_COMPARISON_TOOL_NAME
+                if source_scope is not None and len(source_scope.source_ids) >= 2
+                else "data_count_selection"
+            )
+            raise CapabilityInputError(
+                "execution_not_supported_for_requested_shape",
+                "The development count MODEL-job path is retired. Durable comparison requires at least two sources; foreground single-source counts remain available.",
+                {
+                    "execution_disposition": "not_dispatched",
+                    "recovery": {
+                        "kind": "correct_arguments",
+                        "tool_name": correction,
+                        "constraint": "Use source_ids with coverage=complete_admitted_base_tables, or complete current-run selection_refs, in start_count_comparison for explicit durable comparisons; use foreground data_count_selection for a single source. No job was created.",
+                    },
+                },
+            )
         policy = capability.execution_admission_policy
         effectful = capability.operational_effect is not OperationalEffect.NONE
         preview_capability_id: str | None = None
@@ -430,33 +437,11 @@ class RegistryInitialTaskProposalResolver:
             sorted(
                 (
                     capability_id,
-                    *capability.read_dependency_ids,
                     *((preview_capability_id,) if preview_capability_id else ()),
                     *_GRAPH_SUPPORT_CAPABILITY_IDS,
                 )
             )
         )
-        for dependency_id in capability.read_dependency_ids:
-            dependency = self._registry.capability(dependency_id)
-            if (
-                dependency.access_mode is not AccessMode.READ
-                or dependency.operational_effect is not OperationalEffect.NONE
-                or dependency.artifact_policy is not None
-                or dependency.read_dependency_ids
-            ):
-                raise CapabilityInputError(
-                    "graph_read_dependency_invalid",
-                    "A read operation requires exact nonrecursive effect-free child contracts.",
-                )
-        if capability.read_dependency_ids and (
-            source_ids != (validated.get("source_id"),)
-            or resource_ids
-            != tuple(sorted(cast(tuple[str, ...], validated.get("resource_ids", ()))))
-        ):
-            raise CapabilityInputError(
-                "graph_read_selection_invalid",
-                "Retained references must cover the operation's exact fixed selection.",
-            )
         bindings = await self._contract_reader(
             agent_id=self._agent_id,
             source_ids=source_ids,
@@ -516,12 +501,11 @@ class RegistryInitialTaskProposalResolver:
             per_run_max_cost_usd=self._per_run_max_cost_usd,
             preview_capability_id=preview_capability_id,
             requested_grant_constraints=requested_constraints,
-            read_dependency_ids=tuple(sorted(capability.read_dependency_ids)),
         )
 
 
 class GraphAdmissionBuilder:
-    """Create only the Phase 4 minimal work-plus-finalizer topology."""
+    """Build code-owned static counts or bounded generic model-work topology."""
 
     def __init__(
         self,
@@ -569,6 +553,262 @@ class GraphAdmissionBuilder:
             raise TypeError("graph grant preparer must be callable")
         self._grant_preparer = preparer
 
+    def build_count_comparison(
+        self,
+        *,
+        run: RunInput,
+        call_id: str,
+        plan: CountComparisonPlan,
+        sensitivity: ModelSensitivity,
+        deadline_seconds: int = 300,
+    ) -> GraphAdmission:
+        plan = CountComparisonPlan.from_material(plan.material)
+        if (
+            type(deadline_seconds) is not int
+            or not plan.limits["minimum_deadline_seconds"]
+            <= deadline_seconds
+            <= plan.limits["maximum_deadline_seconds"]
+            or run.conversation_id is None
+            or run.origin is not RunOrigin.USER
+        ):
+            raise CapabilityInputError(
+                "count_comparison_invalid",
+                "Count comparison deadline or foreground destination is invalid.",
+            )
+        now = self._clock()
+        deadline = now + timedelta(seconds=deadline_seconds)
+        job_id = self._id_factory("job")
+        finalizer_id = self._id_factory("task")
+        batch_digest = self._registry.contract_digest(COUNT_BATCH_CAPABILITY_ID)
+        final_digest = self._registry.contract_digest(COUNT_FINALIZE_CAPABILITY_ID)
+        selections = {s["source_id"]: s for s in plan.selections}
+        revisions = {
+            r["resource_id"]: r["revision"]
+            for s in plan.selections
+            for r in s["resources"]
+        }
+        bindings = ExecutionContractBindings(
+            capability_contracts={
+                COUNT_BATCH_CAPABILITY_ID: batch_digest,
+                COUNT_FINALIZE_CAPABILITY_ID: final_digest,
+            },
+            resource_revisions=revisions,
+        )
+        root_authority = GraphAuthority(
+            source_ids=tuple(sorted(selections)),
+            resource_ids=tuple(sorted(revisions)),
+            capability_ids=(COUNT_BATCH_CAPABILITY_ID, COUNT_FINALIZE_CAPABILITY_ID),
+            access_modes=("none", "read"),
+            operational_effects=("none",),
+            sensitivity=sensitivity,
+            contract_bindings=bindings.material(),
+        )
+        work = []
+        for batch in plan.batches:
+            selection = selections[batch["source_id"]]
+            source_resources = {
+                r["resource_id"]: r["revision"] for r in selection["resources"]
+            }
+            authority = GraphAuthority(
+                source_ids=(batch["source_id"],),
+                resource_ids=tuple(sorted(source_resources)),
+                capability_ids=(COUNT_BATCH_CAPABILITY_ID,),
+                access_modes=("read",),
+                operational_effects=("none",),
+                sensitivity=sensitivity,
+                contract_bindings=ExecutionContractBindings(
+                    capability_contracts={COUNT_BATCH_CAPABILITY_ID: batch_digest},
+                    resource_revisions=source_resources,
+                ).material(),
+            )
+            spec = GraphTaskSpecification(
+                title="Count admitted table batch",
+                description="Execute one exact frozen read once.",
+                expected_result_contract={
+                    "kind": "count_comparison_batch",
+                    "capability_id": COUNT_BATCH_CAPABILITY_ID,
+                    "contract_digest": batch_digest,
+                    "output_kind": "data.row_counts",
+                    "plan_digest": plan.digest,
+                    "batch_id": batch["batch_id"],
+                    "arguments": {
+                        "source_id": batch["source_id"],
+                        "resource_ids": batch["resource_ids"],
+                        "include_views": False,
+                        "selection_binding": selection,
+                    },
+                    "attempt_budgets": {"work_units": 1},
+                },
+                authority=authority,
+                budgets=(BudgetAmount("work_units", 1),),
+                max_steps=1,
+                max_wall_time_seconds=min(
+                    deadline_seconds, plan.limits["read_deadline_seconds"]
+                ),
+                created_by="job_owner",
+            )
+            work.append(
+                GraphTask(
+                    agent_id=self._agent_id,
+                    job_id=job_id,
+                    task_id=self._id_factory("task"),
+                    state=TaskState.READY,
+                    role=TaskRole.INTERNAL,
+                    execution_kind=TaskExecutionKind.INTERNAL_CAPABILITY,
+                    priority=100,
+                    not_before=None,
+                    current_attempt_id=None,
+                    task_revision=1,
+                    specification=spec,
+                    task_spec_digest=spec.digest,
+                    task_scope_digest=authority.digest,
+                    attempt_count=0,
+                    failure_streak=0,
+                    fencing_epoch=0,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        batch_tasks = tuple(
+            {
+                "batch_id": batch["batch_id"],
+                "task_id": task.task_id,
+                "task_spec_digest": task.task_spec_digest,
+                "contract_digest": batch_digest,
+                "schema_digest": canonical_digest(
+                    {
+                        "result_kind": "data.row_counts",
+                        "task_contract": task.specification.expected_result_contract,
+                    }
+                ),
+            }
+            for batch, task in zip(plan.batches, work, strict=True)
+        )
+        final_authority = GraphAuthority(
+            capability_ids=(COUNT_FINALIZE_CAPABILITY_ID,),
+            access_modes=("none",),
+            operational_effects=("none",),
+            sensitivity=sensitivity,
+            contract_bindings=ExecutionContractBindings(
+                capability_contracts={COUNT_FINALIZE_CAPABILITY_ID: final_digest}
+            ).material(),
+        )
+        final_spec = GraphTaskSpecification(
+            title="Finalize count comparison",
+            description="Reduce all accepted count batches and deliver once.",
+            expected_result_contract={
+                "kind": "count_comparison_finalizer",
+                "capability_id": COUNT_FINALIZE_CAPABILITY_ID,
+                "contract_digest": final_digest,
+                "output_kind": "data.count_comparison",
+                "plan_digest": plan.digest,
+                "attempt_budgets": {"work_units": 1},
+            },
+            authority=final_authority,
+            budgets=(BudgetAmount("work_units", plan.limits["finalizer_attempts"]),),
+            max_steps=1,
+            max_wall_time_seconds=deadline_seconds,
+            created_by="job_owner",
+        )
+        finalizer = GraphTask(
+            agent_id=self._agent_id,
+            job_id=job_id,
+            task_id=finalizer_id,
+            state=TaskState.PENDING,
+            role=TaskRole.FINALIZER,
+            execution_kind=TaskExecutionKind.INTERNAL_CAPABILITY,
+            priority=1000,
+            not_before=None,
+            current_attempt_id=None,
+            task_revision=1,
+            specification=final_spec,
+            task_spec_digest=final_spec.digest,
+            task_scope_digest=final_authority.digest,
+            attempt_count=0,
+            failure_streak=0,
+            fencing_epoch=0,
+            created_at=now,
+            updated_at=now,
+        )
+        target = self._distribution.resolve_conversation_inbox(
+            run.conversation_id, sensitivity_ceiling=sensitivity
+        )
+        distribution = self._distribution.resolve_plan(
+            run.conversation_id,
+            destination_id=target.destination_id,
+            sensitivity_ceiling=sensitivity,
+        )
+        root = GraphJobSpecification(
+            principal_id=run.caller_principal_id or self._agent_id,
+            objective="Compare exact counts of all admitted base tables in the required sources.",
+            outcome_contract={
+                "kind": "count_comparison",
+                "plan": plan.material,
+                "batch_tasks": batch_tasks,
+                "required_result_kind": "data.count_comparison",
+            },
+            authority=root_authority,
+            distribution_plan_digest=distribution.plan_digest,
+            budgets=(
+                BudgetLimit(
+                    "work_units",
+                    plan.limits["work_units"],
+                    control_reserved=plan.limits["finalizer_attempts"],
+                ),
+            ),
+            deadline_at=deadline,
+            retry_policy={
+                "max_attempts": plan.limits["finalizer_attempts"],
+                "automatic_source_retries": 0,
+            },
+            cancellation_policy={"preserve_evidence": True},
+            finalizer_task_template=final_spec.expected_result_contract,
+        )
+        tasks = (*work, finalizer)
+        dependencies = tuple(
+            TaskDependency(
+                agent_id=self._agent_id,
+                job_id=job_id,
+                upstream_task_id=t.task_id,
+                downstream_task_id=finalizer_id,
+                edge_kind=EdgeKind.REQUIRES_ACCEPTED_SUCCESS,
+                created_at=now,
+                creator_key="job_owner",
+            )
+            for t in work
+        )
+        job = GraphJob(
+            agent_id=self._agent_id,
+            job_id=job_id,
+            conversation_id=run.conversation_id,
+            origin_run_id=run.id,
+            origin_call_id=call_id,
+            state=GraphState.QUEUED,
+            desired_state=GraphDesiredState.RUN,
+            created_at=now,
+            updated_at=now,
+            deadline_at=deadline,
+            specification=root,
+            specification_digest=root.digest,
+            finalizer_task_id=finalizer_id,
+        )
+        graph = JobGraph(
+            agent_id=self._agent_id,
+            job_id=job_id,
+            revision=0,
+            task_count=len(tasks),
+            edge_count=len(dependencies),
+            mutation_count=0,
+            active_attempt_count=0,
+            next_ready_at=now,
+            finalization_attempt_id=None,
+            finalization_started_revision=None,
+            created_at=now,
+            updated_at=now,
+            topology_digest=topology_digest(tasks, dependencies),
+        )
+        return GraphAdmission(job, graph, tasks, dependencies)
+
     async def build_admission(
         self,
         *,
@@ -580,15 +820,6 @@ class GraphAdmissionBuilder:
         deadline_seconds: int,
         proposal: InitialTaskProposal,
     ) -> GraphAdmission:
-        if proposal.read_dependency_ids != tuple(
-            sorted(
-                self._registry.capability(proposal.capability_id).read_dependency_ids
-            )
-        ):
-            raise CapabilityInputError(
-                "graph_read_dependency_invalid",
-                "The operation's frozen dependencies differ from its registered contract.",
-            )
         grant: CapabilityGrant | None = None
         if proposal.effectful:
             if self._grant_preparer is None:
@@ -933,39 +1164,7 @@ class GraphAdmissionBuilder:
                 "capability_id": proposal.capability_id,
                 "callable_tool_names": callable_tool_names,
                 "arguments": proposal.arguments,
-                **(
-                    {"read_dependency_ids": proposal.read_dependency_ids}
-                    if proposal.read_dependency_ids
-                    else {}
-                ),
             }
-            if proposal.read_dependency_ids:
-                plan_arguments = {
-                    "plan_ref": "plan_" + proposal.digest.removeprefix("sha256:")[:16]
-                }
-                compatible_names = []
-                for name in callable_tool_names:
-                    try:
-                        self._registry.validate_view_arguments(name, plan_arguments)
-                    except CapabilityInputError:
-                        continue
-                    compatible_names.append(name)
-                if not compatible_names:
-                    raise CapabilityInputError(
-                        "execution_not_supported_for_requested_shape",
-                        "The frozen read plan has no compatible model tool view.",
-                    )
-                initial_call = {
-                    **initial_call,
-                    "callable_tool_names": tuple(compatible_names),
-                    "arguments": plan_arguments,
-                    "read_arguments": proposal.arguments,
-                    **(
-                        {"count_selection_binding": proposal.retained_read_selection}
-                        if proposal.retained_read_selection is not None
-                        else {}
-                    ),
-                }
         else:
             preview_names = tuple(
                 sorted(
@@ -1122,39 +1321,41 @@ class StartGraphJobExecutor:
         self,
         *,
         owner: JobOwner,
-        resolver: InitialTaskProposalResolver,
+        resolver: InitialTaskProposalResolver | None,
         builder: GraphAdmissionBuilder,
-        read_selection_resolver: (
-            Callable[
-                [ToolExecution, Mapping[str, object]],
-                Awaitable[tuple[FrozenJsonObject, FrozenJsonObject | None]],
-            ]
-            | None
+        count_resolver: (
+            Callable[[ToolExecution], Awaitable[CountComparisonPlan]] | None
         ) = None,
     ) -> None:
+        self._count_resolver = count_resolver
         self._owner = owner
         self._resolver = resolver
         self._builder = builder
-        self._read_selection_resolver = read_selection_resolver
 
     async def _proposal(self, request: ToolExecution) -> InitialTaskProposal:
+        if self._resolver is None:
+            raise CapabilityInputError(
+                "graph_model_executor_unavailable",
+                "Generic model jobs require a model route and finite cost ceiling.",
+            )
         initial = request.arguments["initial_task"]
         assert isinstance(initial, Mapping)
-        selection = None
-        if self._read_selection_resolver is not None:
-            initial, selection = await self._read_selection_resolver(request, initial)
         proposal = await self._resolver(
             proposal=initial,
             source_scope=request.source_scope,
             sensitivity=request.request_sensitivity,
         )
-        return (
-            proposal
-            if selection is None
-            else replace(proposal, retained_read_selection=selection)
-        )
+        return proposal
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
+        if "selection_refs" in request.arguments or "source_ids" in request.arguments:
+            if self._count_resolver is None:
+                raise CapabilityInputError(
+                    "count_comparison_unavailable",
+                    "Count comparison admission is unavailable.",
+                )
+            plan = await self._count_resolver(request)
+            return FrozenJsonObject.from_mapping({"plan_digest": plan.digest})
         proposal = await self._proposal(request)
         return FrozenJsonObject.from_mapping(
             {
@@ -1169,6 +1370,50 @@ class StartGraphJobExecutor:
             raise CapabilityInputError(
                 "graph_conversation_required",
                 "A durable graph requires one exact originating conversation.",
+            )
+        if "selection_refs" in request.arguments or "source_ids" in request.arguments:
+            if self._count_resolver is None:
+                raise CapabilityInputError(
+                    "count_comparison_unavailable",
+                    "Count comparison admission is unavailable.",
+                )
+            plan = await self._count_resolver(request)
+            run = RunInput(
+                id=request.run_id,
+                agent_id=self._owner.agent_id,
+                caller_principal_id=request.caller_principal_id,
+                message="Start admitted count comparison.",
+                created_at=self._builder._clock(),
+                conversation_id=request.conversation_id,
+                resolved_source_scope=request.source_scope,
+            )
+            admission = self._builder.build_count_comparison(
+                run=run,
+                call_id=request.call_id,
+                plan=plan,
+                sensitivity=request.request_sensitivity,
+                deadline_seconds=cast(
+                    int, request.arguments.get("deadline_seconds", 300)
+                ),
+            )
+            job = await self._owner.admit(admission)
+            return ToolOutput(
+                kind=START_GRAPH_JOB_OUTPUT_KIND,
+                data={
+                    "job_id": job.job_id,
+                    "state": job.state.value,
+                    "specification_digest": job.specification_digest,
+                    "plan_digest": plan.digest,
+                    "required_source_count": len(plan.selections),
+                    "planned_batch_count": len(plan.batches),
+                    "task_count": len(admission.tasks),
+                    "limits": plan.limits,
+                },
+                sensitivity=request.request_sensitivity,
+                sensitivity_provenance={
+                    "authority": "frozen_count_comparison_plan",
+                    "plan_digest": plan.digest,
+                },
             )
         proposal = await self._proposal(request)
         objective = request.arguments["objective"]
@@ -1208,10 +1453,15 @@ class StartGraphJobExecutor:
 class GraphAdmissionCapabilityDomain:
     domain_owner_id = GRAPH_ADMISSION_DOMAIN_OWNER_ID
 
-    def __init__(self, declarations: CapabilityDeclarations) -> None:
+    def __init__(
+        self,
+        declarations: CapabilityDeclarations,
+        data_domain: DataCapabilityDomain | None = None,
+    ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("graph admission declarations have the wrong owner")
         self._declarations = declarations
+        self._data_domain = data_domain
 
     @property
     def declarations(self) -> CapabilityDeclarations:
@@ -1220,8 +1470,20 @@ class GraphAdmissionCapabilityDomain:
     async def project(
         self, run: RunInput, session: RunSession | None = None
     ) -> tuple[str, ...]:
-        del session
-        return (START_GRAPH_JOB_TOOL_NAME,) if run.origin is RunOrigin.USER else ()
+        if run.origin is not RunOrigin.USER or (
+            session is not None and session.options.files_only
+        ):
+            return ()
+        count_available = (
+            await self._data_domain.count_comparison_applicable(run, session)
+            if self._data_domain is not None
+            else False
+        )
+        return tuple(
+            v.name
+            for v in self._declarations.tool_views
+            if v.name != START_COUNT_COMPARISON_TOOL_NAME or count_available
+        )
 
     project_session = project
 
@@ -1318,14 +1580,10 @@ class GraphAdmissionCapabilityDomain:
 def graph_admission_declarations(
     *,
     owner: JobOwner,
-    resolver: InitialTaskProposalResolver,
+    resolver: InitialTaskProposalResolver | None,
     builder: GraphAdmissionBuilder,
-    read_selection_resolver: (
-        Callable[
-            [ToolExecution, Mapping[str, object]],
-            Awaitable[tuple[FrozenJsonObject, FrozenJsonObject | None]],
-        ]
-        | None
+    count_resolver: (
+        Callable[[ToolExecution], Awaitable[CountComparisonPlan]] | None
     ) = None,
 ) -> tuple[CapabilityDeclarations, tuple[Executor, ...]]:
     capability = Capability(
@@ -1418,7 +1676,96 @@ def graph_admission_declarations(
         automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         durable_foreground_entrypoint=True,
     )
+    generic_schema = capability.input_schema
+    from ...domains.data.capabilities import (
+        COUNT_EXECUTION_POLICY,
+        COUNT_OPERATION_POLICY,
+    )
+    from ...domains.data.row_counts import count_comparison_limits
+
+    limits = count_comparison_limits(
+        batch_width=COUNT_EXECUTION_POLICY.inline_max_targets,
+        read_seconds=COUNT_EXECUTION_POLICY.inline_max_wall_seconds,
+        job_seconds=COUNT_OPERATION_POLICY.graph_max_wall_seconds,
+    )
+    count_reference_schema = {
+        "type": "object",
+        "properties": {
+            "selection_refs": {
+                "type": "array",
+                "items": {"type": "string", "pattern": "^sel_[0-9a-f]{16}$"},
+                "minItems": limits["minimum_sources"],
+                "maxItems": limits["maximum_sources"],
+                "uniqueItems": True,
+            },
+            "deadline_seconds": {
+                "type": "integer",
+                "minimum": limits["minimum_deadline_seconds"],
+                "maximum": limits["maximum_deadline_seconds"],
+            },
+        },
+        "required": ["selection_refs"],
+        "additionalProperties": False,
+    }
+    count_reference_properties = cast(
+        Mapping[str, object], count_reference_schema["properties"]
+    )
+    count_source_properties = {
+        "source_ids": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 256},
+            "minItems": limits["minimum_sources"],
+            "maxItems": limits["maximum_sources"],
+            "uniqueItems": True,
+        },
+        "coverage": {"type": "string", "enum": ["complete_admitted_base_tables"]},
+        "deadline_seconds": count_reference_properties["deadline_seconds"],
+    }
+    count_schema = {
+        "type": "object",
+        "properties": {
+            **count_reference_properties,
+            **count_source_properties,
+        },
+        "oneOf": [
+            count_reference_schema,
+            {
+                "type": "object",
+                "properties": count_source_properties,
+                "required": ["source_ids", "coverage"],
+                "additionalProperties": False,
+            },
+        ],
+        "additionalProperties": False,
+    }
+    capability = replace(
+        capability,
+        input_schema={
+            "type": "object",
+            "properties": {
+                **cast(Mapping[str, object], count_schema["properties"]),
+                **cast(Mapping[str, object], generic_schema["properties"]),
+            },
+            "oneOf": [generic_schema, count_schema],
+            "additionalProperties": False,
+        },
+    )
+    count_view = ToolView(
+        name=START_COUNT_COMPARISON_TOOL_NAME,
+        capability_id=capability.id,
+        description=f"Start an explicitly requested durable comparison of complete admitted base-table counts for {limits['minimum_sources']}–{limits['maximum_sources']} sources. Use exact source_ids and coverage=complete_admitted_base_tables; the data owner resolves and freezes coverage without catalog pagination. Alternatively use complete current-run catalog identity selection_refs. At most {limits['maximum_batches']} batches of {limits['batch_width']} resources, no automatic source retries; separate snapshots. Execution and totals require no model workers.",
+        input_schema=count_schema,
+        presentation=ToolPresentation(
+            ToolboxId.JOBS,
+            ToolLoadMode.ON_DEMAND,
+            ToolTextTrust.CODE,
+            "Start an exact durable count comparison with frozen complete coverage.",
+            "Use only for an explicit durable multi-source count request; ordinary questions remain foreground.",
+            ("count", "compare", "database", "durable", "job", "records"),
+        ),
+    )
     view = ToolView(
+        input_schema=generic_schema,
         name=START_GRAPH_JOB_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
@@ -1438,16 +1785,20 @@ def graph_admission_declarations(
         domain_owner_id=GRAPH_ADMISSION_DOMAIN_OWNER_ID,
         capabilities=(capability,),
         executor_ids=(START_GRAPH_JOB_EXECUTOR_ID,),
-        tool_views=(view,),
-    )
-    return declarations, (
-        StartGraphJobExecutor(
-            owner=owner,
-            resolver=resolver,
-            builder=builder,
-            read_selection_resolver=read_selection_resolver,
+        tool_views=(
+            (
+                *((view,) if resolver is not None else ()),
+                *((count_view,) if count_resolver is not None else ()),
+            )
         ),
     )
+    executor = StartGraphJobExecutor(
+        owner=owner,
+        resolver=resolver,
+        builder=builder,
+        count_resolver=count_resolver,
+    )
+    return declarations, (executor,)
 
 
 def _reference_ids(references: Mapping[str, object], key: str) -> tuple[str, ...]:

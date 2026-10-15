@@ -151,11 +151,11 @@ class RunSessionEvidence:
                 if len(self._progress_warnings) >= 8:
                     del self._progress_warnings[next(iter(self._progress_warnings))]
                 self._progress_warnings[fingerprint] = (
-                    f"Repeated permanent failure for {identity}. "
+                    f"Repeated invocation failure for {identity}. "
                     + (
                         "Two exact-name searches confirmed no admitted tool. "
                         if error.get("code") == "exact_tool_unavailable"
-                        else "Two identical calls were not dispatched. "
+                        else "Two identical calls were not dispatched. This does not establish that the operation is unavailable; issue a corrected call using the existing recovery guidance. "
                     )
                     + "Change the relevant arguments/scope, "
                     "use the admitted recovery path, or report the blocker. Recovery: "

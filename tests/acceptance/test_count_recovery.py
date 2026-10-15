@@ -3,7 +3,9 @@
 import json
 from dataclasses import replace
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
+
+import pytest
 
 from daita import Agent, SQLiteSource
 from daita._json import canonical_json
@@ -25,6 +27,138 @@ from tests.support.count_recovery_live import (
 )
 from tests.support.job_benchmarks import RecordingProvider
 from tests.support.workspace import workspace_for
+
+
+@pytest.mark.parametrize("authoring", ["typed", "model_sources"])
+async def test_public_count_comparison_executes_without_model_workers(
+    tmp_path, monkeypatch, authoring
+):
+    import asyncio
+
+    from daita.adapters.sqlite_query import SQLiteQueryBackend
+    from daita.jobs.graph.models import GraphState, TaskExecutionKind
+    from daita.jobs.supervisor import JobSupervisor
+
+    paths = seed_sqlite(tmp_path)
+    model = MockModelProvider(())
+    reads = []
+    failures = []
+    record_failure = JobSupervisor._record_failure
+
+    def capture_failure(self, error):
+        failures.append(error)
+        record_failure(self, error)
+
+    monkeypatch.setattr(JobSupervisor, "_record_failure", capture_failure)
+    original = SQLiteQueryBackend.execute_read
+
+    async def observed(self, **kwargs):
+        reads.append(kwargs)
+        return await original(self, **kwargs)
+
+    monkeypatch.setattr(SQLiteQueryBackend, "execute_read", observed)
+    agent = await Agent.create(
+        "durable-comparison",
+        root=tmp_path,
+        model=model,
+        model_profile=model.model_profile,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        sources = {
+            name: await agent.attach(SQLiteSource(path, name=name))
+            for name, path in paths.items()
+        }
+        first_source = next(iter(sources.values())).id
+        for invalid_sources in ((), (first_source,), (first_source, first_source)):
+            with pytest.raises(ValueError, match="distinct explicit source IDs"):
+                await agent.start_count_comparison(source_ids=invalid_sources)
+        assert await agent.list_jobs() == ()
+        assert reads == [] and model.requests == ()
+        if authoring == "typed":
+            job = await agent.start_count_comparison(
+                source_ids=tuple(s.id for s in sources.values())
+            )
+        else:
+            model._script = (
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=(
+                        ToolCall(
+                            "load",
+                            "toolbox_load",
+                            {"tool_names": ("start_count_comparison",)},
+                        ),
+                    ),
+                ),
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=(
+                        ToolCall(
+                            "start",
+                            "start_count_comparison",
+                            {
+                                "source_ids": tuple(s.id for s in sources.values()),
+                                "coverage": "complete_admitted_base_tables",
+                            },
+                        ),
+                    ),
+                ),
+                ModelResponse(
+                    finish_reason=FinishReason.STOP, text="Job receipt recorded."
+                ),
+            )
+            foreground = await agent.run(
+                "Start a durable comparison of whole-source row totals.",
+                source_scope_ids=tuple(s.id for s in sources.values()),
+            )
+            assert foreground.kind is LoopExitKind.COMPLETED
+            jobs = await agent.list_jobs()
+            assert len(jobs) == 1
+            job = jobs[0]
+        async with asyncio.timeout(45):
+            while True:
+                if failures:
+                    raise failures[0]
+                current_job = next(
+                    j for j in await agent.list_jobs() if j.job_id == job.job_id
+                )
+                if current_job.state not in {GraphState.QUEUED, GraphState.ACTIVE}:
+                    break
+                await asyncio.sleep(0.05)
+        inspection = await agent.inspect_job(job.job_id)
+        assert inspection is not None
+        assert inspection.job.state is GraphState.SUCCEEDED, [
+            (a.state, a.error_code) for a in inspection.attempts
+        ]
+        assert len(inspection.tasks) == 13
+        assert all(
+            t.execution_kind is TaskExecutionKind.INTERNAL_CAPABILITY
+            for t in inspection.tasks
+        )
+        assert len(reads) == 12
+        assert len(model.requests) == (0 if authoring == "typed" else 3)
+        if authoring == "model_sources":
+            transcript = await agent.transcript(foreground.run_id)
+            assert all(c.name != "catalog_schema" for c, _ in transcript.tool_pairs)
+            assert all(
+                len(canonical_json(r.output).encode()) < 4000
+                for _, r in transcript.tool_pairs
+                if r is not None
+            )
+        result = await agent.read_job_result(job.job_id)
+        assert result is not None and result.result_kind == "data.count_comparison"
+        assert result.artifact_ids == ()
+        assert {
+            r["source_id"]: r["total_rows"]
+            for r in cast(Any, result.payload["sources"])
+        } == {sources[name].id: total for name, total in TOTALS.items()}
+        assert result.payload["winner_source_ids"] == (sources[WINNER].id,)
+        assert result.payload["coverage"] == "complete_admitted_base_tables"
+        assert len(inspection.results) == 13
+        assert len(inspection.delivery_ids) == 1
+    finally:
+        await agent.close()
 
 
 async def test_public_comparison_preserves_all_ordered_count_evidence(tmp_path):
@@ -116,6 +250,110 @@ async def test_public_comparison_preserves_all_ordered_count_evidence(tmp_path):
         await agent.close()
 
 
+async def test_whole_source_foreground_counts_are_compact_without_catalog_pages(
+    tmp_path,
+):
+    from daita.loop.models import validate_completed_transcript
+
+    paths = seed_sqlite(tmp_path)
+    model = MockModelProvider(())
+    agent = await Agent.create(
+        "whole-source",
+        root=tmp_path,
+        model=model,
+        model_profile=model.model_profile,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        sources = {
+            name: await agent.attach(SQLiteSource(path, name=name))
+            for name, path in paths.items()
+        }
+        model._script = (
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        "load",
+                        "toolbox_load",
+                        {"tool_names": ("data_count_selection",)},
+                    ),
+                ),
+            ),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=tuple(
+                    ToolCall(
+                        name,
+                        "data_count_selection",
+                        {
+                            "source_id": source.id,
+                            "coverage": "complete_admitted_base_tables",
+                        },
+                    )
+                    for name, source in sources.items()
+                ),
+            ),
+            ModelResponse(
+                finish_reason=FinishReason.STOP,
+                text="Juniper: 261 rows. Meridian: 1,331 rows. Meridian has the most admitted base-table rows. Separate snapshots.",
+            ),
+        )
+        result = await agent.run(
+            "Compare whole-source row totals.",
+            source_scope_ids=tuple(s.id for s in sources.values()),
+        )
+        transcript = await agent.transcript(result.run_id)
+        validate_completed_transcript(transcript, result)
+        pairs = [
+            (c, r) for c, r in transcript.tool_pairs if c.name == "data_count_selection"
+        ]
+        assert [c.id for c, _ in pairs] == list(sources)
+        for call, output in pairs:
+            assert output is not None and not output.is_error, output
+            data = cast(Any, output.output["data"])
+            assert data["total_rows"] == TOTALS[call.id]
+            assert data["observed_total_rows"] == TOTALS[call.id]
+            assert (
+                data["counted_resources"]
+                == data["selected_resources"]
+                == len(MANIFEST[call.id])
+            )
+            assert data["catalog_enumeration_complete"] is True
+            assert data["coverage"] == "complete_admitted_base_tables"
+            assert (
+                "resources" not in data
+                and "counts" not in data
+                and "columns" not in data
+            )
+            assert len(canonical_json(output.output).encode()) < 4000
+        assert len(model.requests) == 3
+        assert all(c.name != "catalog_schema" for c, _ in transcript.tool_pairs)
+        children = [
+            r for r in await agent.analysis_evidence(result.run_id) if r.kind == "child"
+        ]
+        assert len(children) == 12
+        actual = {
+            row["resource_id"]: row["rows"]
+            for r in children
+            for row in cast(Any, r.facts["result"])["data"]["counts"]
+        }
+        for name, source in sources.items():
+            for resource in await agent.list_catalog_resources(source_id=source.id):
+                if resource.kind.value == "table":
+                    expected = next(
+                        t["rows"] for t in MANIFEST[name] if t["table"] == resource.name
+                    )
+                    assert actual[resource.id] == expected
+                else:
+                    assert resource.id not in actual
+        assert len(actual) == 46
+        assert await agent.list_jobs() == ()
+        assert await agent.list_effects() == ()
+    finally:
+        await agent.close()
+
+
 async def test_paid_graph_disabled_continuation_only_narrows_allowances():
     delegate = MockModelProvider(
         (
@@ -170,6 +408,17 @@ def test_campaign_oracles_do_not_qualify_incomplete_or_missing_measurements():
         "result": {"kind": "data.count_operation", "data": {"status": "completed"}},
     }
     assert score_operation_usage([operation])["adopted"]
+    whole_operation = {
+        **operation,
+        "call": {
+            "name": "data_count_selection",
+            "arguments": {
+                "source_id": "source",
+                "coverage": "complete_admitted_base_tables",
+            },
+        },
+    }
+    assert score_operation_usage([whole_operation])["adopted"]
     assert not score_operation_usage(
         [{**operation, "result": {"error": {"code": "count_selection_invalid"}}}]
     )["adopted"]
@@ -199,7 +448,33 @@ def test_campaign_oracles_do_not_qualify_incomplete_or_missing_measurements():
     assert not score_partial_totals(partial, {"Juniper": 261, "Meridian": 278}, set())[
         "honest_partial"
     ]
+    for ending in (
+        "Comparison cannot be concluded.",
+        "No winner can be determined.",
+        "Neither source is established as the winner.",
+        "Most tables have been counted; comparison remains incomplete.",
+    ):
+        assert score_partial_totals(
+            "Partial counts: Juniper: at least 10 rows.\nMeridian: at least 20 rows.\n"
+            + ending,
+            {"Juniper": 10, "Meridian": 20},
+            set(),
+            observed_resource_counts={"Juniper": 1, "Meridian": 1},
+        )["honest_partial"]
+    for total, correct in ((135, True), (999, False)):
+        assert (
+            score_partial_totals(
+                f"Juniper: at least {total} rows counted in 4 of 8 tables. The remaining counts are unavailable after schema drift.",
+                {"Juniper": 135},
+                set(),
+                observed_resource_counts={"Juniper": 4},
+            )["honest_partial"]
+            is correct
+        )
     blocker = "No table rows were read or counted. Source totals are unavailable; no defensible winner can be reported."
+    assert not score_partial_totals(
+        blocker, {"Juniper": 135}, set(), observed_resource_counts={"Juniper": 4}
+    )["honest_partial"]
     no_observations = score_partial_totals(
         blocker,
         {"Juniper": 0, "Meridian": 0},
@@ -290,6 +565,38 @@ def test_campaign_oracles_do_not_qualify_incomplete_or_missing_measurements():
     answer = f'| Juniper | {TOTALS["Juniper"]:,} |\n| Meridian | {TOTALS["Meridian"]:,} |\nMeridian has the most records.'
     assert score_totals(answer, TOTALS)["numerical_correct"]
     assert score_totals(answer, TOTALS)["winner_correct"]
+    for claim in (
+        "Meridian is not the winner; Juniper has the most records.",
+        "The winner is not Meridian.",
+        "Not Meridian is the winner.",
+        "Meridian has the most records. Juniper is the winner.",
+        "Meridian has the most records. Meridian is not the winner.",
+        "Meridian has the most records. No winner can be determined.",
+        "Meridian doesn't have the most records.",
+        "Is Meridian the winner?",
+        "No winner can be determined.",
+    ):
+        assert not score_totals(
+            "Juniper: 261 rows.\nMeridian: 1,331 rows.\n" + claim, TOTALS
+        )["winner_correct"]
+    for claim, correct in (
+        ("Juniper and Meridian are tied.", True),
+        ("Both sources tie for the most records.", True),
+        ("Meridian is the winner.", False),
+        ("Juniper and Meridian are tied. They are not tied.", False),
+        ("Juniper and Meridian are not tied.", False),
+    ):
+        assert (
+            score_totals(
+                "Juniper: 10 rows.\nMeridian: 10 rows.\n" + claim,
+                {"Juniper": 10, "Meridian": 10},
+            )["winner_correct"]
+            is correct
+        )
+    assert not score_totals(
+        "Juniper does not have 261 rows.\nMeridian: 1,331 rows. Meridian has the most records.",
+        TOTALS,
+    )["numerical_correct"]
     answer_with_table_counts = (
         "Meridian has the most records: 1,331 rows.\n"
         "| Available source | Base tables counted | Total rows |\n"
@@ -338,6 +645,13 @@ def test_campaign_oracles_do_not_qualify_incomplete_or_missing_measurements():
     assert not summarize_campaign([report], expected_cases=1)["live_qualified"]
     report["coverage_correct"] = True
     assert summarize_campaign([report], expected_cases=1)["live_qualified"]
+    assert not summarize_campaign(
+        [
+            report,
+            {**report, "case": "L6", "usage_complete": False},
+        ],
+        expected_cases=2,
+    )["usage_complete"]
     report["tokens"] = 100001
     assert not summarize_campaign([report], expected_cases=1)["efficiency_qualified"]
 

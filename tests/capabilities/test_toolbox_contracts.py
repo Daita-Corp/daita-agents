@@ -48,6 +48,77 @@ from tests.capabilities._toolbox_support import (
 )
 
 
+async def test_graph_starter_views_keep_disjoint_closed_schemas_and_deadlines(tmp_path):
+    from daita.capabilities import CapabilityInputError
+    from daita.jobs.graph.admission import graph_admission_declarations
+    from tests.support.model_graph_integration import ModelGraphIntegration
+
+    integration = await ModelGraphIntegration.open(tmp_path)
+
+    async def generic(**kwargs):
+        return integration.proposal()
+
+    async def counts(request):
+        raise AssertionError("schema inspection must not resolve or execute a plan")
+
+    try:
+        bundle, executors = graph_admission_declarations(
+            owner=integration.owner,
+            resolver=generic,
+            builder=integration.builder,
+            count_resolver=counts,
+        )
+        registry = CapabilityRegistry(declarations=(bundle,), executors=executors)
+        generic_arguments = {
+            "objective": "Read exact resources",
+            "outcome_contract": {},
+            "deadline_seconds": 600,
+            "initial_task": {
+                "capability_id": "test.read",
+                "arguments": {},
+                "expected_result_contract": {"result_kind": "test.result"},
+                "retained_references": {},
+            },
+        }
+        count_arguments = {"selection_refs": ("sel_" + "a" * 16, "sel_" + "b" * 16)}
+        for name, arguments, other in (
+            ("start_graph_job", generic_arguments, count_arguments),
+            ("start_count_comparison", count_arguments, generic_arguments),
+        ):
+            view = registry.tool_definition(name)
+            assert view.input_schema["additionalProperties"] is False
+            assert ("oneOf" in view.input_schema) == (name == "start_count_comparison")
+            validated = registry.validate_view_arguments(name, arguments)
+            registry.validate_arguments("jobs.graph.start", validated)
+            with pytest.raises(CapabilityInputError):
+                registry.validate_view_arguments(name, other)
+        with pytest.raises(CapabilityInputError):
+            registry.validate_view_arguments(
+                "start_count_comparison", {**count_arguments, "deadline_seconds": 600}
+            )
+        with pytest.raises(CapabilityInputError):
+            registry.validate_arguments(
+                "jobs.graph.start", {**generic_arguments, **count_arguments}
+            )
+        whole = {
+            "source_ids": ("one", "two"),
+            "coverage": "complete_admitted_base_tables",
+        }
+        validated = registry.validate_view_arguments("start_count_comparison", whole)
+        registry.validate_arguments("jobs.graph.start", validated)
+        for invalid in (
+            {"source_ids": ("one", "two")},
+            {**whole, "coverage": "all"},
+            {**whole, **count_arguments},
+            {**whole, "resource_ids": ("table",)},
+            {**whole, "deadline_seconds": 600},
+        ):
+            with pytest.raises(CapabilityInputError):
+                registry.validate_view_arguments("start_count_comparison", invalid)
+    finally:
+        await integration.close()
+
+
 def test_canonical_toolbox_records_are_closed_bounded_and_exact() -> None:
     assert tuple(item.id for item in TOOLBOX_DEFINITIONS) == tuple(ToolboxId)
     assert tuple(item.label for item in TOOLBOX_DEFINITIONS) == (

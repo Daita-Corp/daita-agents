@@ -2922,6 +2922,11 @@ def fence_attempt(
         measured_usage=measured_usage,
     )
     _replace_attempt(connection, attempt_data, fenced)
+    if (
+        task.specification.expected_result_contract.get("kind")
+        == "count_comparison_batch"
+    ):
+        requeue = False
     reduction = reduce_attempt_failure(
         task,
         failed_at=fenced_at,
@@ -2962,6 +2967,21 @@ def fence_attempt(
                 updated_at=fenced_at,
             )
             _replace_job(connection, loaded_job[1], updated_job)
+    elif (
+        task.specification.expected_result_contract.get("kind")
+        == "count_comparison_batch"
+        and not reduction.retry
+        and job.state in {GraphState.QUEUED, GraphState.ACTIVE}
+    ):
+        require_graph_transition(job.state, GraphState.FAILED)
+        updated_job = replace(
+            job,
+            state=GraphState.FAILED,
+            updated_at=fenced_at,
+            terminal_at=fenced_at,
+            failure_code=reason_code,
+        )
+        _replace_job(connection, loaded_job[1], updated_job)
     tasks = tuple(
         updated_task if item.task_id == task_id else item
         for item in _load_tasks(connection, agent_id, job_id)
@@ -3058,6 +3078,11 @@ def fail_attempt(
         measured_usage=measured_usage,
     )
     _replace_attempt(connection, attempt_data, failed_attempt)
+    if (
+        task.specification.expected_result_contract.get("kind")
+        == "count_comparison_batch"
+    ):
+        retryable = False
     reduction = reduce_attempt_failure(
         task,
         failed_at=failed_at,
@@ -3097,7 +3122,11 @@ def fail_attempt(
                 updated_at=failed_at,
             )
             _replace_job(connection, job_data, updated_job)
-    elif not reduction.retry:
+    elif not reduction.retry and (
+        task.specification.expected_result_contract.get("kind")
+        not in {"count_comparison_batch", "count_comparison_finalizer"}
+        or job.state in {GraphState.QUEUED, GraphState.ACTIVE}
+    ):
         require_graph_transition(job.state, GraphState.FAILED)
         updated_job = replace(
             job,

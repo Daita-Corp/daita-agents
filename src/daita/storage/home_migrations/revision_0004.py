@@ -1,4 +1,4 @@
-"""Add foreground analytical evidence without changing released run formats."""
+"""Add analytical evidence and code-owned count graph semantics to revision 3."""
 
 import json
 import sqlite3
@@ -38,7 +38,13 @@ REVISION_4 = HomeMigration(
         "Native allocation retains an inherited exclusive closure guard and authenticated launch phases. "
         "Durable allocations retain named proof; standalone guards are anonymous. "
         "Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. "
-        "Recovery appends exact-identity CAS facts without replacing original observations or terminal runs."
+        "Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. "
+        "Count comparisons freeze complete admitted base-table coverage independently of scope, "
+        "execute exact internal batches and pure finalization under guarded zero-model graph scopes, "
+        "and accept bounded artifact-free outputs through existing fenced budget/result/delivery transactions. "
+        "Unaccepted count reads are never requeued, including after restart, lease expiry or cancellation. "
+        "Development count MODEL contracts require fresh admission before provider or source dispatch; "
+        "historical terminal evidence and conservative reservation settlement are preserved."
     ),
     affected_paths=("state.db",),
     target_schema=SCHEMA_REVISION_4,

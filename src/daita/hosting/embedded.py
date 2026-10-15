@@ -85,6 +85,7 @@ from ..capabilities import (
     ExecutionContractBindings,
     ExecutionContractReader,
     OperationalEffect,
+    ToolExecution,
 )
 from ..capability_runtime import CapabilityRuntime
 from ..catalog.capabilities import (
@@ -790,6 +791,8 @@ class EmbeddedAgent:
         routine_supervisor: RoutineSupervisor,
         job_supervisor: JobSupervisor,
         data_profile_admission: DataProfileAdmission,
+        data_domain: DataCapabilityDomain,
+        graph_admission_builder: GraphAdmissionBuilder,
         execution_contract_reader: ExecutionContractReader,
         data_profile_job_domain: DataProfileCapabilityDomain,
         learning_candidate_guard: LearningCandidateGuard,
@@ -863,6 +866,8 @@ class EmbeddedAgent:
         self._routine_supervisor = routine_supervisor
         self._job_supervisor = job_supervisor
         self._data_profile_admission = data_profile_admission
+        self._data_domain = data_domain
+        self._graph_admission_builder = graph_admission_builder
         self._execution_contract_reader = execution_contract_reader
         self._data_profile_job_domain = data_profile_job_domain
         self._learning_candidate_guard = learning_candidate_guard
@@ -1865,20 +1870,22 @@ class EmbeddedAgent:
                 *(local_files.capabilities if local_files is not None else ()),
             ),
             executor_ids=tuple(
-                item.executor_id
-                for item in (
-                    *catalog.capabilities,
-                    *relational_query.capabilities,
-                    *(
-                        relational_export.capabilities
-                        if relational_export is not None
-                        else ()
-                    ),
-                    *postgresql_preview.capabilities,
-                    *relational_update.capabilities,
-                    *relational_upsert.capabilities,
-                    *routine_precheck.capabilities,
-                    *(local_files.capabilities if local_files is not None else ()),
+                dict.fromkeys(
+                    item.executor_id
+                    for item in (
+                        *catalog.capabilities,
+                        *relational_query.capabilities,
+                        *(
+                            relational_export.capabilities
+                            if relational_export is not None
+                            else ()
+                        ),
+                        *postgresql_preview.capabilities,
+                        *relational_update.capabilities,
+                        *relational_upsert.capabilities,
+                        *routine_precheck.capabilities,
+                        *(local_files.capabilities if local_files is not None else ()),
+                    )
                 )
             ),
             tool_views=(
@@ -2151,13 +2158,12 @@ class EmbeddedAgent:
             *routine_lifecycle.executors,
         )
         graph_routes = _stage_c_model_routes(model, model_route)
-        graph_builder: GraphAdmissionBuilder | None = None
+        graph_prerequisite_registry = CapabilityRegistry(
+            declarations=tuple(domain.declarations for domain in domains),
+            executors=registered_executors,
+        )
         graph_resolver: RegistryInitialTaskProposalResolver | None = None
         if graph_routes and limits.max_estimated_cost_usd is not None:
-            graph_prerequisite_registry = CapabilityRegistry(
-                declarations=tuple(domain.declarations for domain in domains),
-                executors=registered_executors,
-            )
             graph_resolver = RegistryInitialTaskProposalResolver(
                 agent_id=identity.id,
                 registry=graph_prerequisite_registry,
@@ -2167,29 +2173,30 @@ class EmbeddedAgent:
                 per_run_max_tokens=limits.max_total_tokens,
                 per_run_max_cost_usd=limits.max_estimated_cost_usd,
             )
-            graph_builder = GraphAdmissionBuilder(
-                agent_id=identity.id,
-                registry=graph_prerequisite_registry,
-                distribution=distribution_owner,
-                clock=clock,
-                id_factory=id_factory,
+        graph_builder = GraphAdmissionBuilder(
+            agent_id=identity.id,
+            registry=graph_prerequisite_registry,
+            distribution=distribution_owner,
+            clock=clock,
+            id_factory=id_factory,
+        )
+
+        async def resolve_count_plan(execution: ToolExecution):
+            return await data_domain.resolve_count_comparison(execution=execution)
+
+        graph_admission_bundle, graph_admission_executors = (
+            graph_admission_declarations(
+                owner=job_owner,
+                resolver=graph_resolver,
+                builder=graph_builder,
+                count_resolver=resolve_count_plan,
             )
-            graph_admission_bundle, graph_admission_executors = (
-                graph_admission_declarations(
-                    owner=job_owner,
-                    resolver=graph_resolver,
-                    builder=graph_builder,
-                    read_selection_resolver=data_domain.resolve_graph_count_selection,
-                )
-            )
-            domains = (
-                *domains,
-                GraphAdmissionCapabilityDomain(graph_admission_bundle),
-            )
-            registered_executors = (
-                *registered_executors,
-                *graph_admission_executors,
-            )
+        )
+        domains = (
+            *domains,
+            GraphAdmissionCapabilityDomain(graph_admission_bundle, data_domain),
+        )
+        registered_executors = (*registered_executors, *graph_admission_executors)
         if hosted:
             declared_capability_ids = {
                 capability.id
@@ -2246,6 +2253,7 @@ class EmbeddedAgent:
             limits=limits,
         )
         routine_owner.bind_grant_preparer(capability_runtime.prepare_automation_grant)
+        graph_builder.bind_capability_registry(capabilities)
         if graph_builder is not None:
             graph_builder.bind_grant_preparer(
                 capability_runtime.prepare_automation_grant
@@ -2494,6 +2502,8 @@ class EmbeddedAgent:
             routine_supervisor=routine_supervisor,
             job_supervisor=job_supervisor,
             data_profile_admission=data_profile_admission,
+            data_domain=data_domain,
+            graph_admission_builder=graph_builder,
             execution_contract_reader=read_execution_contracts,
             data_profile_job_domain=data_profile_job_domain,
             learning_candidate_guard=learning_candidate_guard,
@@ -3407,6 +3417,64 @@ class EmbeddedAgent:
     async def job_board(self, job_id: str) -> GraphBoardProjection | None:
         self._require_open()
         return await self._job_owner.graph_board(job_id)
+
+    async def start_count_comparison(
+        self,
+        *,
+        source_ids: tuple[str, ...],
+        conversation_id: str | None = None,
+        deadline_seconds: int = 300,
+        caller_principal_id: str | None = None,
+    ) -> GraphJob:
+        self._require_open()
+        principal = self._resolve_caller_principal(caller_principal_id)
+        resolved_conversation = (
+            self._id_factory("conversation")
+            if conversation_id is None
+            else conversation_id
+        )
+        _validate_conversation_id(resolved_conversation)
+        async with self._admit_system_work("count-comparison-admission"):
+            if (
+                conversation_id is not None
+                and not await self._require_conversation_caller(
+                    conversation_id, principal
+                )
+            ):
+                raise ValueError("unknown conversation for this agent")
+            run = RunInput(
+                id=self._id_factory("run"),
+                agent_id=self.identity.id,
+                caller_principal_id=principal,
+                caller_principal_verified=not self._hosted
+                or caller_principal_id is not None,
+                message="Start explicit count comparison.",
+                created_at=self._clock(),
+                conversation_id=resolved_conversation,
+                source_scope_ids=source_ids,
+            )
+            run = replace(
+                run,
+                resolved_source_scope=await resolve_effective_source_scope(
+                    run, self._data_view
+                ),
+            )
+            plan = await self._data_domain.resolve_count_comparison(
+                run, source_ids=source_ids
+            )
+            sensitivity = await self._data_view.admitted_model_sensitivity(
+                self.identity.id, source_ids
+            )
+            if sensitivity is None:
+                raise ValueError("count comparison sensitivity is unavailable")
+            admission = self._graph_admission_builder.build_count_comparison(
+                run=run,
+                call_id=self._id_factory("call"),
+                plan=plan,
+                sensitivity=sensitivity,
+                deadline_seconds=deadline_seconds,
+            )
+            return await self._job_owner.admit(admission)
 
     async def read_job_result(self, job_id: str) -> TaskResult | None:
         self._require_open()

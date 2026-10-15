@@ -2964,31 +2964,24 @@ def _tool_guidance(
     instructions: list[str] = []
     if "catalog.schema" in candidates:
         instructions.append(
-            "Enumerate admitted tables with catalog_schema detail=identity and exact source_id "
-            "(no query needed), or catalog_search; "
-            "filters/joins need detail=schema. Never guess fields. Counts sum table rows once; "
-            "claim only admitted coverage, with separate batch/source snapshots."
+            "Use catalog_schema detail=identity with exact source_id (or catalog_search) "
+            "for table identities; detail=schema for filters/joins. Never guess fields. "
+            "Counts sum table rows once; report admitted coverage and separate batch/source snapshots."
         )
     if "data.count_selection" in candidates:
         instructions.append(
             reference(
                 "data.count_selection",
-                (
-                    "data_count_selection"
-                    if "catalog.schema" in candidates
-                    else "data_count_plan"
-                ),
+                "data_count_selection",
                 "a bounded whole-selection count operation",
             )
         )
         instructions.append(
-            "For source totals, request catalog_schema detail=identity and toolbox_load "
-            "data_count_selection together. Pass each count_selection_ref as selection_ref, with optional include_views only. The reference binds its source and resources; do not also provide source_id or resource_ids. "
+            "For whole-source totals, load data_count_selection and pass source_id with coverage=complete_admitted_base_tables. Code freezes admitted base tables without catalog pagination. "
+            "For subsets pass count_selection_ref as selection_ref with optional include_views; never mix reference and source arguments. "
             "Code executes bounded reads and computes totals/coverage; partial observed totals "
             "are lower bounds. Use data_count_rows "
             "for individual batches."
-            if "catalog.schema" in candidates
-            else "Execute the exact frozen count plan arguments from the code-owned task context. The framework schedules bounded reads and computes totals and coverage. Partial results do not complete the fixed selection. For task_complete, omit evidence_call_ids: the framework authenticates and binds the successful parent call. Internal count child observation IDs are not completion references."
         )
         if "data.count_inspect" in candidates:
             instructions.append(

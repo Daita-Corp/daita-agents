@@ -37,7 +37,7 @@ from ...catalog.capabilities import (
     CATALOG_SEARCH_CAPABILITY_ID,
     CATALOG_TRAVERSE_CAPABILITY_ID,
 )
-from ...catalog.models import Sensitivity
+from ...catalog.models import CATALOG_SCHEMA_MAX_RESOURCE_IDS, Sensitivity
 from ...llm.models import ModelSensitivity, ToolCall, ToolResultBlock
 from ...loop.analysis import AnalysisEvidence
 from ...loop.models import RunInput, RunOrigin, Transcript
@@ -52,13 +52,14 @@ from .file_capabilities import (
 )
 from .routine_precheck import RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID
 from .row_counts import (
+    COUNT_BATCH_CAPABILITY_ID,
+    COUNT_FINALIZE_CAPABILITY_ID,
     COUNT_INSPECT_CAPABILITY_ID,
     COUNT_OPERATION_CAPABILITY_ID,
-    COUNT_PLAN_TOOL_NAME,
+    CountComparisonPlan,
     CountSelection,
     attach_count_selection,
     authenticate_count_selection,
-    count_operation_failure_details,
     count_reference,
     finalize_count_page,
     selection_error,
@@ -103,6 +104,7 @@ _RELATIONAL_READ_CAPABILITIES = frozenset(
         DATA_QUERY_CAPABILITY_ID,
         DATA_EXPORT_TABULAR_CAPABILITY_ID,
         DATA_COUNT_ROWS_CAPABILITY_ID,
+        COUNT_BATCH_CAPABILITY_ID,
         COUNT_OPERATION_CAPABILITY_ID,
         COUNT_INSPECT_CAPABILITY_ID,
     }
@@ -151,6 +153,7 @@ _ADAPTER_CAPABILITIES = {
 }
 _SOURCE_CAPABILITIES = frozenset().union(
     _CATALOG_CAPABILITIES,
+    {COUNT_FINALIZE_CAPABILITY_ID},
     _RELATIONAL_READ_CAPABILITIES,
     *_ADAPTER_CAPABILITIES.values(),
 )
@@ -364,10 +367,6 @@ class DataCapabilityDomain:
         for name in sorted(views):
             view = views[name]
             capability = self._capabilities[view.capability_id]
-            if capability.id == COUNT_OPERATION_CAPABILITY_ID and (
-                (run.origin is RunOrigin.JOB_TASK) != (name == COUNT_PLAN_TOOL_NAME)
-            ):
-                continue
             if capability.id in {
                 COUNT_OPERATION_CAPABILITY_ID,
                 COUNT_INSPECT_CAPABILITY_ID,
@@ -444,75 +443,194 @@ class DataCapabilityDomain:
     ) -> None:
         """Recheck after a queued source permit and immediately before dispatch."""
         binding = arguments.get("_count_operation_binding")
-        if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID and isinstance(
-            binding, FrozenJsonObject
-        ):
+        if capability.id in {
+            DATA_COUNT_ROWS_CAPABILITY_ID,
+            COUNT_BATCH_CAPABILITY_ID,
+        } and isinstance(binding, FrozenJsonObject):
             await self._validate_count_binding(
                 run, capability, binding, cast(str, arguments["source_id"])
             )
 
-    async def resolve_graph_count_selection(
-        self, execution: ToolExecution, initial: Mapping[str, object]
-    ) -> tuple[FrozenJsonObject, FrozenJsonObject | None]:
-        arguments = initial.get("arguments")
+    async def resolve_count_comparison(
+        self,
+        run: RunInput | None = None,
+        *,
+        source_ids: tuple[str, ...] | None = None,
+        execution: ToolExecution | None = None,
+    ) -> CountComparisonPlan:
+        """Authoring adapters converge on one complete current admitted plan."""
+        from .capabilities import COUNT_EXECUTION_POLICY, COUNT_OPERATION_POLICY
+
         if (
-            initial.get("capability_id") != COUNT_OPERATION_CAPABILITY_ID
-            or not isinstance(arguments, Mapping)
-            or "selection_ref" not in arguments
+            run is None
+            and execution is not None
+            and self._transcript_loader is not None
         ):
-            return FrozenJsonObject.from_mapping(initial), None
-        if self._transcript_loader is None or self._registry is None:
-            raise selection_error("Count selection evidence is unavailable.")
-        transcript = await self._transcript_loader(execution.run_id)
-        calls = [
-            c
-            for m in transcript.messages
-            for c in m.tool_calls
-            if c.id == execution.call_id
-        ]
-        if len(calls) != 1 or calls[0].arguments != execution.arguments:
-            raise selection_error(
-                "Durable count admission must be its exact persisted current-run call."
+            run = replace(
+                (await self._transcript_loader(execution.run_id)).run,
+                resolved_source_scope=execution.source_scope,
             )
-        capability = self._registry.capability(COUNT_OPERATION_CAPABILITY_ID)
-        policy = capability.execution_admission_policy
-        assert policy is not None
-        run = replace(transcript.run, resolved_source_scope=execution.source_scope)
-        validated = await self._registry.validate_arguments_async(
-            capability.id, arguments
-        )
-        selection = await authenticate_count_selection(
-            transcript,
-            run,
-            calls[0],
-            self._registry,
-            policy.graph_max_targets,
-            selection_arguments=validated,
-        )
-        bound = selection.arguments(policy.graph_max_targets)
-        binding = cast(FrozenJsonObject, bound["_count_selection"])
-        await self._validate_count_binding(
-            run, capability, binding, selection.source_id
-        )
-        resolved = {
-            "source_id": selection.source_id,
-            "resource_ids": tuple(r["resource_id"] for r in selection.resources),
-            "include_views": selection.include_views,
-        }
-        return (
-            FrozenJsonObject.from_mapping(
-                {
-                    **initial,
-                    "arguments": resolved,
-                    "retained_references": {
-                        "source_ids": (selection.source_id,),
-                        "resource_ids": resolved["resource_ids"],
-                        "connector_binding_ids": (),
+        if run is None or run.origin is not RunOrigin.USER or self._registry is None:
+            raise selection_error("Count comparison admission is foreground only.")
+        capability = self._registry.capability(COUNT_BATCH_CAPABILITY_ID)
+        selections: list[Mapping[str, object]] = []
+        if execution is not None:
+            if self._transcript_loader is None or source_ids is not None:
+                raise selection_error("Count comparison evidence is unavailable.")
+            transcript = await self._transcript_loader(execution.run_id)
+            calls = [
+                c
+                for m in transcript.messages
+                for c in m.tool_calls
+                if c.id == execution.call_id
+            ]
+            if len(calls) != 1 or calls[0].arguments != execution.arguments:
+                raise selection_error(
+                    "Admission is not its exact persisted current-run call."
+                )
+            run = replace(transcript.run, resolved_source_scope=execution.source_scope)
+            if execution.arguments.get("coverage") == "complete_admitted_base_tables":
+                source_ids = cast(tuple[str, ...], execution.arguments["source_ids"])
+            for reference in cast(
+                tuple[str, ...], execution.arguments.get("selection_refs", ())
+            ):
+                selection = await authenticate_count_selection(
+                    transcript,
+                    run,
+                    calls[0],
+                    self._registry,
+                    CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+                    selection_arguments={
+                        "selection_ref": reference,
+                        "include_views": False,
                     },
-                }
-            ),
-            binding,
+                )
+                selections.append(
+                    {
+                        "source_id": selection.source_id,
+                        "source_revision": selection.source_revision,
+                        "resources": tuple(
+                            FrozenJsonObject.from_mapping(
+                                {
+                                    key: r[key]
+                                    for key in (
+                                        "source_id",
+                                        "resource_id",
+                                        "revision",
+                                        "kind",
+                                    )
+                                }
+                            )
+                            for r in selection.resources
+                        ),
+                        "complete_source_enumeration": selection.complete_source_enumeration,
+                    }
+                )
+        if execution is None or source_ids is not None:
+            if (
+                source_ids is None
+                or not 2 <= len(source_ids) <= 16
+                or len(set(source_ids)) != len(source_ids)
+            ):
+                raise selection_error(
+                    "Count comparison requires 2–16 distinct explicit sources."
+                )
+            for source_id in source_ids:
+                selections.append(
+                    await self._resolve_whole_source_selection(
+                        run, capability, source_id
+                    )
+                )
+        try:
+            plan = CountComparisonPlan.create(
+                tuple(selections),
+                batch_width=COUNT_EXECUTION_POLICY.inline_max_targets,
+                read_seconds=COUNT_EXECUTION_POLICY.inline_max_wall_seconds,
+                job_seconds=COUNT_OPERATION_POLICY.graph_max_wall_seconds,
+            )
+        except ValueError as error:
+            raise selection_error(str(error)) from error
+        for plan_selection in plan.selections:
+            source_id = plan_selection["source_id"]
+            if (
+                await self._catalog.source_adapter_id(run.agent_id, source_id)
+                not in _RELATIONAL_ADAPTER_IDS
+            ):
+                raise selection_error(
+                    "Count comparison requires an admitted relational adapter."
+                )
+            await self._validate_count_binding(
+                run, capability, cast(FrozenJsonObject, plan_selection), source_id
+            )
+        return plan
+
+    async def _resolve_whole_source_selection(
+        self, run: RunInput, capability: Capability, source_id: str
+    ) -> FrozenJsonObject:
+        """Freeze admitted base tables independently of catalog presentation pages."""
+        if run.origin is not RunOrigin.USER or (
+            await self._catalog.source_adapter_id(run.agent_id, source_id)
+            not in _RELATIONAL_ADAPTER_IDS
+        ):
+            raise selection_error(
+                "Whole-source counts require an admitted relational source."
+            )
+        schemas = await self._catalog.resource_schemas(run.agent_id, source_id)
+        readable = await self._catalog.readable_resource_ids(run.agent_id, (source_id,))
+        schemas = tuple(
+            r
+            for r in schemas
+            if r.resource_id in readable and r.resource_kind in {"table", "view"}
         )
+        tables = tuple(
+            sorted(
+                (r for r in schemas if r.resource_kind == "table"),
+                key=lambda r: r.resource_id,
+            )
+        )
+        if (
+            not tables
+            or len(schemas) > CATALOG_SCHEMA_MAX_RESOURCE_IDS
+            or len({r.source_revision for r in schemas}) != 1
+            or not isinstance(schemas[0].source_revision, str)
+        ):
+            raise selection_error(
+                "Complete source enumeration requires base tables and one current revision within the catalog selection bound."
+            )
+        selection = FrozenJsonObject.from_mapping(
+            {
+                "source_id": source_id,
+                "source_revision": schemas[0].source_revision,
+                "complete_source_enumeration": True,
+                "resources": tuple(
+                    {
+                        "source_id": source_id,
+                        "resource_id": r.resource_id,
+                        "revision": r.revision,
+                        "kind": r.resource_kind,
+                    }
+                    for r in tables
+                ),
+            }
+        )
+        # Required coverage is never intersected down to a narrower frozen ceiling.
+        await self._validate_count_binding(run, capability, selection, source_id)
+        return selection
+
+    async def count_comparison_applicable(
+        self, run: RunInput, session: RunSession | None = None
+    ) -> bool:
+        if run.origin is not RunOrigin.USER or (
+            session is not None and session.options.files_only
+        ):
+            return False
+        scope = await resolve_effective_source_scope(run, self._catalog)
+        if len(scope.source_ids) < 2:
+            return False
+        facts = await self._catalog.source_routing_facts(
+            run.agent_id, tuple(sorted(scope.source_ids))
+        )
+        return sum(f.get("adapter_id") in _RELATIONAL_ADAPTER_IDS for f in facts) >= 2
 
     async def _validate_count_binding(
         self,
@@ -680,6 +798,42 @@ class DataCapabilityDomain:
         request_sensitivity: ModelSensitivity,
         session: RunSession | None = None,
     ) -> FrozenJsonObject:
+        if capability.id == COUNT_FINALIZE_CAPABILITY_ID:
+            if (
+                run.origin is not RunOrigin.JOB_TASK
+                or run.execution_scope is None
+                or self._registry is None
+            ):
+                raise selection_error(
+                    "Count finalization requires its authenticated graph scope."
+                )
+            CountComparisonPlan.from_material(
+                cast(Mapping[str, object], arguments["plan"])
+            )
+            for envelope in cast(
+                tuple[FrozenJsonObject, ...], arguments["work_results"]
+            ):
+                self._registry.validate_output(
+                    COUNT_BATCH_CAPABILITY_ID,
+                    ToolOutput(
+                        kind="data.row_counts",
+                        data=cast(FrozenJsonObject, envelope["payload"]),
+                    ),
+                )
+            return arguments
+        if capability.id == COUNT_BATCH_CAPABILITY_ID:
+            if run.origin is not RunOrigin.JOB_TASK or run.execution_scope is None:
+                raise selection_error(
+                    "Count batches require their authenticated graph scope."
+                )
+            internal_binding = cast(FrozenJsonObject, arguments["selection_binding"])
+            if internal_binding["source_id"] != arguments["source_id"]:
+                raise selection_error(
+                    "Count batch source differs from its selection binding."
+                )
+            arguments = FrozenJsonObject.from_mapping(
+                {**arguments, "_count_operation_binding": internal_binding}
+            )
         if capability.id in LOCAL_FILE_CAPABILITY_IDS:
             if (
                 self._local_file_sensitivity is None
@@ -740,32 +894,6 @@ class DataCapabilityDomain:
                 raise selection_error("Bounded operation evidence is unavailable.")
             policy = capability.execution_admission_policy
             assert policy is not None
-            retained_binding = None
-            if "plan_ref" in arguments:
-                context = session.options.task_context
-                specification = getattr(context, "task_specification", None)
-                if run.origin is not RunOrigin.JOB_TASK or not isinstance(
-                    specification, Mapping
-                ):
-                    raise selection_error(
-                        "Plan references belong to their exact admitted graph task."
-                    )
-                initial = cast(
-                    Mapping[str, object],
-                    cast(
-                        Mapping[str, object], specification["expected_result_contract"]
-                    )["initial_call"],
-                )
-                if (
-                    initial.get("capability_id") != capability.id
-                    or initial.get("arguments") != arguments
-                    or not isinstance(initial.get("read_arguments"), Mapping)
-                ):
-                    raise selection_error("Unknown or changed graph count plan.")
-                arguments = await self._registry.validate_arguments_async(
-                    capability.id, cast(Mapping[str, object], initial["read_arguments"])
-                )
-                retained_binding = initial.get("count_selection_binding")
             if "selection_ref" in arguments:
                 selection = await authenticate_count_selection(
                     await self._transcript_loader(run.id),
@@ -773,6 +901,22 @@ class DataCapabilityDomain:
                     call,
                     self._registry,
                     policy.inline_max_targets,
+                )
+            elif arguments.get("coverage") == "complete_admitted_base_tables":
+                source_id = cast(str, arguments["source_id"])
+                whole_source = await self._resolve_whole_source_selection(
+                    run, capability, source_id
+                )
+                selection = CountSelection(
+                    count_reference("sel_", run.id, call.id),
+                    source_id,
+                    cast(str, whole_source["source_revision"]),
+                    cast(tuple[FrozenJsonObject, ...], whole_source["resources"]),
+                    True,
+                    False,
+                    (),
+                    (),
+                    request_sensitivity,
                 )
             else:
                 await self._validate_source_scope(run, capability, arguments)
@@ -826,23 +970,6 @@ class DataCapabilityDomain:
                     request_sensitivity,
                 )
             arguments = selection.arguments(policy.inline_max_targets)
-            if retained_binding is not None:
-                if (
-                    not isinstance(retained_binding, FrozenJsonObject)
-                    or tuple(
-                        r["resource_id"]
-                        for r in cast(
-                            tuple[FrozenJsonObject, ...], retained_binding["resources"]
-                        )
-                    )
-                    != arguments["resource_ids"]
-                ):
-                    raise selection_error(
-                        "The retained count selection differs from its exact plan."
-                    )
-                arguments = FrozenJsonObject.from_mapping(
-                    {**arguments, "_count_selection": retained_binding}
-                )
             operation_binding = cast(FrozenJsonObject, arguments["_count_selection"])
             await self._validate_count_binding(
                 run, capability, operation_binding, selection.source_id
@@ -872,9 +999,10 @@ class DataCapabilityDomain:
                 }
             )
         binding = arguments.get("_count_operation_binding")
-        if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID and isinstance(
-            binding, FrozenJsonObject
-        ):
+        if capability.id in {
+            DATA_COUNT_ROWS_CAPABILITY_ID,
+            COUNT_BATCH_CAPABILITY_ID,
+        } and isinstance(binding, FrozenJsonObject):
             await self._validate_count_binding(
                 run, capability, binding, cast(str, arguments["source_id"])
             )
@@ -977,7 +1105,7 @@ class DataCapabilityDomain:
                     "Catalog schema requires a non-empty query or explicit resource "
                     "IDs; identity enumeration may instead use an exact source_id.",
                 )
-        if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID:
+        if capability.id in {DATA_COUNT_ROWS_CAPABILITY_ID, COUNT_BATCH_CAPABILITY_ID}:
             from .sql.read_validation import render_row_counts
 
             source_id = cast(str, arguments["source_id"])
@@ -1404,17 +1532,7 @@ class DataCapabilityDomain:
         del request_sensitivity
         if capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
             output = attach_count_selection(run, call, output)
-        if (
-            capability.id == COUNT_OPERATION_CAPABILITY_ID
-            and run.origin is RunOrigin.JOB_TASK
-            and output.data["status"] != "completed"
-        ):
-            raise CapabilityInputError(
-                "count_operation_incomplete",
-                "The frozen count operation is incomplete. Retained child observations are historical evidence; block this graph task rather than claiming its whole-selection total.",
-                count_operation_failure_details(output.data),
-            )
-        if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID:
+        if capability.id in {DATA_COUNT_ROWS_CAPABILITY_ID, COUNT_BATCH_CAPABILITY_ID}:
             output = finalize_count_page(run, call, arguments, output)
         if capability.id == DATA_EXPORT_TABULAR_CAPABILITY_ID:
             self._validate_export_summary(output)
@@ -1431,9 +1549,10 @@ class DataCapabilityDomain:
             self._learning.mark_effect_succeeded(session, call.id)
         output = await self._classify(run, call, capability, output)
         selection = arguments.get("_count_selection")
-        if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID and isinstance(
-            selection, FrozenJsonObject
-        ):
+        if capability.id in {
+            DATA_COUNT_ROWS_CAPABILITY_ID,
+            COUNT_BATCH_CAPABILITY_ID,
+        } and isinstance(selection, FrozenJsonObject):
             floor = ModelSensitivity(cast(str, selection["sensitivity"]))
             ranks = tuple(ModelSensitivity)
             assert output.sensitivity is not None
@@ -2233,7 +2352,8 @@ class DataCapabilityDomain:
         run = replace(run, resolved_source_scope=scope)
         source_id = (
             output.data.get("source_id")
-            if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID
+            if capability.id
+            in {DATA_COUNT_ROWS_CAPABILITY_ID, COUNT_BATCH_CAPABILITY_ID}
             else call.arguments.get("source_id")
         )
         source_ids = (
@@ -2259,7 +2379,7 @@ class DataCapabilityDomain:
             readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
-        if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID:
+        if capability.id in {DATA_COUNT_ROWS_CAPABILITY_ID, COUNT_BATCH_CAPABILITY_ID}:
             # This page's source evidence is its exact batch. Cumulative evidence
             # is linked separately by authenticated prior call IDs in progress.
             readable = readable & frozenset(

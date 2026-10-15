@@ -1583,6 +1583,12 @@ class GraphInspection:
     events: tuple[GraphEvent, ...] = ()
     delivery_ids: tuple[str, ...] = ()
 
+    @property
+    def count_progress(self) -> Mapping[str, object] | None:
+        from ..projections import count_progress
+
+        return count_progress(self)
+
 
 @dataclass(frozen=True, slots=True)
 class GraphEventPage:

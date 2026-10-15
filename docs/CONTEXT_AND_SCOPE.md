@@ -141,6 +141,22 @@ The explicit `files_only=True` option excludes both catalog and MCP operations.
 Machine runs use their frozen authorization ceilings; an empty machine source
 ceiling means no sources.
 
+For an explicitly requested durable count comparison, `start_count_comparison`
+accepts exact source IDs with explicit `complete_admitted_base_tables` coverage,
+or authenticates complete current-run identity selections for every required source.
+The data owner resolves complete coverage internally, independently of catalog
+presentation queries/pages. The same resolution supports foreground
+`data_count_selection` with `source_id` and this coverage value. Its compact result
+contains totals, coverage counts and an `operation_ref`; bounded
+`data_count_inspect` supplies per-table evidence when needed. Neither whole-source
+form returns table rows or column schemas to the model.
+The frozen required set is an obligation distinct from the run/job authorization
+ceiling. Current revocation and revisions still narrow execution; they never
+silently replace the required set. Internal count batches/finalization execute
+without model turns, local-file authority or transcript fabrication. Ordinary
+foreground comparisons keep their existing selection/count tools. See
+[durable jobs](DURABLE_JOBS.md) for bounds, snapshots and partial progress.
+
 Conversation continuity is shared across sources and stays bounded. Private
 answers retain their classification when summarized, when a later question
 narrows its source filter, and after a source is detached or the agent reopens.

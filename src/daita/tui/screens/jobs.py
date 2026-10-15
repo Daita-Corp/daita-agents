@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, cast
 from uuid import uuid4
 
 from rich.text import Text
@@ -713,6 +714,21 @@ def render_graph_inspection(inspection: GraphInspection) -> str:
         "",
         "Tasks",
     ]
+    progress = inspection.count_progress
+    if progress is not None:
+        lines[-1:] = ["Count progress"]
+        for source in cast(tuple[Mapping[str, object], ...], progress["sources"]):
+            total = (
+                "unavailable"
+                if source["total_rows"] is None
+                else str(source["total_rows"])
+            )
+            lines.append(
+                safe_display(str(source["source_id"]), fallback="source", maximum=256)
+                + f": {source['counted_resources']}/{source['selected_resources']} tables; "
+                + f"observed subtotal {source['observed_total_rows']}; total {total}"
+            )
+        lines.extend(("Separate batch and source snapshots.", "", "Tasks"))
     attempts_by_task = {
         task.task_id: tuple(
             item for item in inspection.attempts if item.task_id == task.task_id

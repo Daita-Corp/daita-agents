@@ -315,7 +315,13 @@ class TaskAttemptGuard(Protocol):
     @property
     def run_id(self) -> str: ...
 
-    async def revalidate(self, *, capability_id: str, point: str) -> None: ...
+    async def revalidate(
+        self,
+        *,
+        capability_id: str,
+        point: str,
+        arguments: Mapping[str, object] | None = None,
+    ) -> None: ...
 
 
 class EffectOutcome(str, Enum):
@@ -608,7 +614,7 @@ class AutomationScopeProposal:
 
 @dataclass(frozen=True, slots=True)
 class ExecutionScope:
-    """One immutable, digestible ceiling carried by a bounded reasoning run."""
+    """One immutable, digestible ceiling carried by machine execution."""
 
     scope_id: str
     revision: int
@@ -713,7 +719,29 @@ class ExecutionScope:
         )
         access_modes = frozenset(self.allowed_access_modes)
         effects = frozenset(self.allowed_operational_effects)
-        if not capabilities or not routes:
+        zero_model = (
+            self.per_run_max_tokens == 0
+            and not isinstance(self.per_run_max_tokens, bool)
+            and self.per_run_max_cost_usd == Decimal(0)
+            and not routes
+            and self.scope_kind is ExecutionScopeKind.GRAPH_TASK
+            and self.graph_task_binding is not None
+            and (
+                (
+                    self.graph_task_binding.task_role == "internal"
+                    and capabilities == ("data.count_batch",)
+                )
+                or (
+                    self.graph_task_binding.task_role == "finalizer"
+                    and capabilities == ("data.finalize_count_comparison",)
+                )
+            )
+            and access_modes <= {AccessMode.READ, AccessMode.NONE}
+            and effects == {OperationalEffect.NONE}
+            and not self.capability_grants
+            and not connector_bindings
+        )
+        if not capabilities or (not routes and not zero_model):
             raise ValueError(
                 "execution scope capability and route ceilings cannot be empty"
             )
@@ -781,7 +809,7 @@ class ExecutionScope:
         if (
             not isinstance(self.per_run_max_tokens, int)
             or isinstance(self.per_run_max_tokens, bool)
-            or self.per_run_max_tokens < 1
+            or (self.per_run_max_tokens < 1 and not zero_model)
         ):
             raise ValueError("execution scope per-run tokens must be positive")
         object.__setattr__(self, "allowed_source_ids", sources)
@@ -1229,24 +1257,8 @@ class Capability:
     execution_admission_policy: ExecutionAdmissionPolicy | None = None
     durable_foreground_entrypoint: bool = False
     external_input_schema: Mapping[str, object] | None = None
-    read_dependency_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        dependencies = tuple(self.read_dependency_ids)
-        if dependencies:
-            if (
-                self.access_mode is not AccessMode.READ
-                or self.operational_effect is not OperationalEffect.NONE
-                or len(dependencies) > 4
-                or len(set(dependencies)) != len(dependencies)
-                or self.id in dependencies
-            ):
-                raise ValueError(
-                    "Read operation dependencies require a bounded effect-free declaration"
-                )
-            for dependency in dependencies:
-                _text(dependency, "read dependency capability id")
-        object.__setattr__(self, "read_dependency_ids", dependencies)
         for value, name in (
             (self.id, "capability id"),
             (self.description, "capability description"),
@@ -1362,12 +1374,6 @@ def capability_contract_digest(
     material = {
         "domain_owner_id": domain_owner_id,
         "capability_id": capability.id,
-        **(
-            {"read_dependency_ids": capability.read_dependency_ids}
-            if capability.read_dependency_ids
-            else {}
-        ),
-        "description": capability.description,
         "input_schema": capability.input_schema,
         **(
             {

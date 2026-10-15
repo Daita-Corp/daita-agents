@@ -2,13 +2,30 @@
 
 Daita versions its entire agent home as one unit. The home revision is separate
 from the package version, Git tag, and SQLite schema version. Current revision
-`3` is unreleased; supported homes from revision `1` onward upgrade automatically.
+`4` is the current unreleased candidate; supported homes from revision `1` onward
+upgrade automatically. Released revisions `1` through `3` remain immutable.
 
 Revision `3` adds caller provenance, MCP service contracts, and an independent
 artifact registry. Upgrades preserve existing artifact bytes. Homes from the
 original revision-3 MCP development format also convert automatically, preserving
 caller and MCP records. Unrecognized development formats are rejected; contributor
 guidance in [`AGENTS.md`](../AGENTS.md) defines the exact supported source.
+
+Revision `4` adds bounded analytical evidence and artifact computation provenance.
+It also declares the semantic count-comparison contract: exact internal count
+batches, narrowly valid zero-model graph scopes, artifact-free accepted results,
+success-only reduction/delivery, and no replay of unaccepted reads. These semantics
+use the existing graph tables; unchanged DDL does not imply unchanged compatibility.
+The revision-4 definition, checksum, golden fixture and release snapshot evolve
+together until release. Older development revision-4 checksums fail closed; their
+homes must be preserved rather than rewritten by a same-revision bridge.
+
+Upgrades retain terminal jobs, transcripts, artifacts, receipts and accounting.
+Old count MODEL contracts are not translated into new authority. Current execution
+preparation requires fresh admission before provider/source dispatch; active
+attempts are fenced and their reservations settled conservatively by recovery.
+Callers of `Agent.from_storage` own provisioning and upgrading their supplied
+storage, including this semantic change.
 
 One home revision covers every durable component whose shapes must remain
 compatible together, including:
@@ -146,7 +163,7 @@ refusals do not rewrite or reset the home.
 
 ## Production revision policy
 
-Revisions `1` and `2` are frozen. Released migration files, IDs, checksums,
+Revisions `1` through `3` are frozen. Released migration files, IDs, checksums,
 historical decoders, and golden fixtures are immutable. A durable format change
 requires a new revision even when it changes only a non-SQLite file. Fresh
 homes are built directly at the latest complete revision; they do not replay

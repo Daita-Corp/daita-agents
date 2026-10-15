@@ -16,6 +16,215 @@ from tests.support.count_recovery import MANIFEST, TOTALS, seed_sqlite
 from tests.support.workspace import workspace_for
 
 
+def _comparison_selections(sizes=(8, 38)):
+    return tuple(
+        {
+            "source_id": f"source:{i}",
+            "source_revision": f"revision:{i}",
+            "complete_source_enumeration": True,
+            "resources": tuple(
+                {
+                    "source_id": f"source:{i}",
+                    "resource_id": f"resource:{i}:{j}",
+                    "revision": f"revision:{i}:{j}",
+                    "kind": "table",
+                }
+                for j in range(size)
+            ),
+        }
+        for i, size in enumerate(sizes)
+    )
+
+
+def test_count_comparison_freezes_complete_coverage_and_total_batch_bounds():
+    from daita.domains.data.row_counts import CountComparisonPlan
+
+    plan = CountComparisonPlan.create(_comparison_selections(), batch_width=4)
+    assert len(plan.batches) == 12
+    assert plan.limits["maximum_batches"] == 16
+    assert plan.limits["automatic_source_retries"] == 0
+    assert plan.limits["work_units"] == 15
+    assert CountComparisonPlan.from_material(plan.material) == plan
+    assert (
+        CountComparisonPlan.create(
+            tuple(reversed(_comparison_selections())), batch_width=4
+        ).digest
+        == plan.digest
+    )
+    assert (
+        len(
+            CountComparisonPlan.create(
+                _comparison_selections((1,) * 16), batch_width=4
+            ).batches
+        )
+        == 16
+    )
+    with pytest.raises(ValueError):
+        CountComparisonPlan.from_material({**plan.material, "include_views": True})
+    for selections in (
+        (),
+        _comparison_selections((1,)),
+        _comparison_selections((0, 1)),
+        _comparison_selections((50, 50)),
+        _comparison_selections((1,) * 17),
+        (_comparison_selections()[0],) * 2,
+        (
+            {**_comparison_selections()[0], "complete_source_enumeration": False},
+            _comparison_selections()[1],
+        ),
+    ):
+        with pytest.raises(ValueError):
+            CountComparisonPlan.create(selections, batch_width=4)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "missing",
+        "duplicate",
+        "foreign",
+        "revision",
+        "negative",
+        "boolean",
+        "subtotal",
+        "digest",
+        "executor",
+        "substituted",
+    ],
+)
+@pytest.mark.parametrize("totals", [(0, 5), (0, 0)])
+def test_comparison_reducer_authenticates_values_coverage_and_ties(fault, totals):
+    from copy import deepcopy
+
+    from daita.capabilities import ToolOutputValidationError
+    from daita.domains.data.row_counts import (
+        CountComparisonPlan,
+        reduce_count_comparison,
+    )
+    from daita.jobs.graph.models import canonical_digest
+
+    plan = CountComparisonPlan.create(_comparison_selections((1, 1)), batch_width=4)
+    mapping = tuple(
+        {
+            "batch_id": f"batch:{i + 1}",
+            "task_id": f"task:{i}",
+            "task_spec_digest": "sha256:" + str(i) * 64,
+            "schema_digest": "sha256:" + "c" * 64,
+            "contract_digest": "sha256:" + "d" * 64,
+        }
+        for i in range(2)
+    )
+    results: list[dict[str, Any]] = []
+    for i, total in enumerate(totals):
+        payload = {
+            "source_id": f"source:{i}",
+            "source_revision": f"revision:{i}",
+            "counts": (
+                {
+                    "resource_id": f"resource:{i}:0",
+                    "revision": f"revision:{i}:0",
+                    "rows": total,
+                },
+            ),
+            "total_rows": total,
+            "counted_resources": 1,
+            "requested_resources": 1,
+            "coverage": "complete_requested_batch",
+            "snapshot_scope": "one_source_one_statement",
+            "observed_at": "2026-10-14T00:00:00+00:00",
+            "duration_ms": 0,
+            "source_name": f"Source {i}",
+            "adapter_id": "sqlite",
+            "scope_limitation": "Admitted tables only",
+            "sql_fingerprint": "sha256:" + "0" * 64,
+            "trust_classification": "untrusted_external_data",
+        }
+        material = {
+            "agent_id": "agent:test",
+            "job_id": "job:test",
+            "task_id": f"task:{i}",
+            "attempt_id": f"attempt:{i}",
+            "run_id": f"run:{i}",
+            "result_id": f"result:attempt:{i}",
+            "result_kind": "data.row_counts",
+            "schema_digest": mapping[i]["schema_digest"],
+            "payload": payload,
+            "summary": "Count observation.",
+            "sensitivity": "restricted",
+            "provenance": {
+                "authority": "authenticated_internal_capability_output",
+                "plan_digest": plan.digest,
+                "batch_id": mapping[i]["batch_id"],
+                "task_spec_digest": mapping[i]["task_spec_digest"],
+            },
+            "verification": {
+                "capability_id": "data.count_batch",
+                "executor_id": "data.count_rows.executor",
+                "contract_digest": mapping[i]["contract_digest"],
+                "output_sha256": canonical_digest(payload),
+            },
+            "artifact_ids": (),
+            "effect_receipt_ids": (),
+            "residual_risk": None,
+            "downstream_constraints": {},
+            "completed_at": "2026-10-14T00:00:00+00:00",
+        }
+        results.append({**material, "result_digest": canonical_digest(material)})
+    if fault == "missing":
+        results.pop()
+    elif fault == "duplicate":
+        results.append(deepcopy(results[0]))
+    elif fault:
+        item = results[0]
+        if fault == "foreign":
+            item["job_id"] = "job:other"
+        elif fault == "substituted":
+            item["task_id"] = "task:other"
+        elif fault == "executor":
+            item["verification"]["executor_id"] = "data.query.executor"
+        elif fault == "revision":
+            item["payload"]["counts"][0]["revision"] = "revision:other"
+        elif fault == "boolean":
+            item["payload"]["counts"][0]["rows"] = True
+        elif fault == "negative":
+            item["payload"]["counts"][0]["rows"] = -1
+        elif fault == "subtotal":
+            item["payload"]["total_rows"] = 10
+        item["verification"]["output_sha256"] = canonical_digest(item["payload"])
+        item["result_digest"] = canonical_digest(
+            {k: v for k, v in item.items() if k != "result_digest"}
+        )
+        if fault == "digest":
+            item["result_digest"] = "sha256:" + "0" * 64
+    frozen_results = tuple(FrozenJsonObject.from_mapping(r) for r in reversed(results))
+    kwargs: dict[str, Any] = {
+        "job_id": "job:test",
+        "agent_id": "agent:test",
+        "batch_tasks": mapping,
+        "results": frozen_results,
+    }
+    if fault:
+        with pytest.raises((ToolOutputValidationError, ValueError)):
+            reduce_count_comparison(plan, **kwargs)
+    else:
+        result = reduce_count_comparison(plan, **kwargs)
+        assert [s["total_rows"] for s in cast(Any, result["sources"])] == list(totals)
+        assert result["winner_source_ids"] == (
+            ("source:1",) if totals[1] else ("source:0", "source:1")
+        )
+        empty = reduce_count_comparison(
+            plan, **{**kwargs, "results": ()}, complete=False
+        )
+        assert empty["winner_source_ids"] == ()
+        assert all(
+            s["total_rows"] is None
+            and s["observed_total_rows"] == 0
+            and s["counted_resources"] == 0
+            for s in cast(Any, empty["sources"])
+        )
+
+
 def _results(request):
     from daita.llm.models import ToolResultBlock
 
@@ -86,6 +295,8 @@ async def test_count_operation_executes_fixed_selection_without_model_page_turns
             assert set(definition.input_schema["properties"]) == {
                 "selection_ref",
                 "include_views",
+                "source_id",
+                "coverage",
             }
             assert "data_count_plan" not in {t.name for t in request.tools}
             assert results["inspect-plan"].is_error
@@ -132,13 +343,15 @@ async def test_count_operation_executes_fixed_selection_without_model_page_turns
                 for name in sources:
                     error = results[name + "-mixed"].output["error"]
                     assert results[name + "-mixed"].is_error
-                    assert error["code"] == "unexpected_arguments"
-                    assert tuple(error["details"]["names"]) == ("source_id",)
+                    assert error["code"] == "invalid_argument_value"
+                    assert error["details"]["constraint"] == "oneOf"
                     recovery = error["details"]["recovery"]
                     assert recovery["kind"] == "correct_arguments"
                     assert set(recovery["allowed_fields"]) == {
                         "selection_ref",
                         "include_views",
+                        "source_id",
+                        "coverage",
                     }
                     assert error["details"]["execution_disposition"] == "not_dispatched"
             return ModelResponse(
@@ -262,22 +475,27 @@ async def test_count_operation_executes_fixed_selection_without_model_page_turns
 
 
 @pytest.mark.parametrize(
-    "fault",
+    "fault,authoring",
     [
-        "unknown",
-        "truncated",
-        "revocation",
-        "catalog_drift",
-        "queued_revocation",
-        "queued_catalog_drift",
-        "native_drift",
-        "timeout",
-        "deadline",
-        "run_budget",
+        (fault, authoring)
+        for fault in [
+            "unknown",
+            "truncated",
+            "revocation",
+            "catalog_drift",
+            "queued_revocation",
+            "queued_catalog_drift",
+            "native_drift",
+            "timeout",
+            "deadline",
+            "run_budget",
+        ]
+        for authoring in ["reference", "whole_source"]
+        if authoring == "reference" or fault not in {"unknown", "truncated"}
     ],
 )
 async def test_count_operation_retains_fixed_coverage_and_honest_failures(
-    tmp_path, monkeypatch, fault
+    tmp_path, monkeypatch, fault, authoring
 ):
     import asyncio
     import sqlite3
@@ -286,7 +504,6 @@ async def test_count_operation_retains_fixed_coverage_and_honest_failures(
     from daita.adapters.sqlite_query import SQLiteQueryBackend, SQLiteQueryError
     from daita.domains.data import capabilities as data_capabilities
     from daita.domains.data.controller import DataCapabilityDomain
-    from daita.domains.data.row_counts import count_operation_failure_details
     from daita.llm.models import FinishReason, ModelResponse
     from daita.loop.models import LoopLimits, validate_completed_transcript
     from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
@@ -417,7 +634,16 @@ async def test_count_operation_retains_fixed_coverage_and_honest_failures(
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
                     ToolCall(
-                        "operation", "data_count_selection", {"selection_ref": ref}
+                        "operation",
+                        "data_count_selection",
+                        (
+                            {"selection_ref": ref}
+                            if authoring == "reference"
+                            else {
+                                "source_id": source.id,
+                                "coverage": "complete_admitted_base_tables",
+                            }
+                        ),
                     ),
                 ),
             )
@@ -496,28 +722,6 @@ async def test_count_operation_retains_fixed_coverage_and_honest_failures(
                 == 8 - data["counted_resources"]
             )
             assert data["failures"]
-            details = count_operation_failure_details(data)
-            assert details["failure_codes"] == tuple(
-                dict.fromkeys(f["code"] for f in data["failures"])
-            )
-            assert details["total_rows"] is None
-            assert details["observed_total_rows"] == data["observed_total_rows"]
-            assert details["child_execution_dispatched"] is bool(dispatches)
-            action = cast(Any, details["recovery"])["arguments"]
-            assert (
-                action["kind"]
-                == {
-                    "revocation": "needs_authorization",
-                    "queued_revocation": "needs_authorization",
-                    "catalog_drift": "source_or_contract_drift",
-                    "queued_catalog_drift": "source_or_contract_drift",
-                    "native_drift": "source_or_contract_drift",
-                    "timeout": "needs_replan",
-                    "deadline": "budget_exhausted",
-                    "run_budget": "budget_exhausted",
-                }[fault]
-            )
-            assert action["details"]["counted_resources"] == data["counted_resources"]
         assert len(dispatches) == (
             0
             if fault == "run_budget"
@@ -1187,9 +1391,9 @@ async def test_public_run_warns_on_repeated_failure_and_preserves_correction(tmp
             for b in m.content
             if isinstance(b, TextBlock)
         ]
-        assert any("Repeated permanent failure" in text for text in systems)
+        assert any("Repeated invocation failure" in text for text in systems)
         assert not any(
-            "Repeated permanent failure" in b.text
+            "Repeated invocation failure" in b.text
             for m in provider.requests[2].messages
             if m.role is MessageRole.SYSTEM
             for b in m.content

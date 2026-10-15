@@ -77,17 +77,25 @@ def score_operation_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
         and r["result"].get("kind") == "data.count_operation"
     ]
     referenced = [r for r in successful if "selection_ref" in r["call"]["arguments"]]
+    whole_sources = [
+        r
+        for r in successful
+        if set(r["call"]["arguments"]) == {"source_id", "coverage"}
+        and r["call"]["arguments"]["coverage"] == "complete_admitted_base_tables"
+    ]
     return {
         "requested": len(requested),
         "successful": len(successful),
         "successful_selection_references": len(referenced),
+        "successful_whole_sources": len(whole_sources),
         "completed": sum(
             r["result"]["data"]["status"] == "completed" for r in successful
         ),
         "legacy_count_calls": sum(
             r["call"]["name"] == "data_count_rows" for r in records
         ),
-        "adopted": bool(referenced) and len(referenced) == len(successful),
+        "adopted": bool(successful)
+        and len(referenced) + len(whole_sources) == len(successful),
     }
 
 
@@ -285,6 +293,71 @@ def seeded(*calls: ToolCall) -> ModelResponse:
     )
 
 
+def _winner_claims(
+    text: str, names: tuple[str, ...]
+) -> tuple[set[str], set[str], set[str], bool]:
+    """Recognize bounded explicit assertions; unrecognized claims stay unqualified."""
+    source = re.compile(r"\b(?:" + "|".join(re.escape(n) for n in names) + r")\b", re.I)
+    canonical = {n.casefold(): n for n in names}
+    indicator = re.compile(
+        r"\bwinners?\b|\bmost (?:admitted )?(?:base[- ]table )?(?:records|rows)\b|\blarger\b|\bhighest (?:row |record )?(?:count|total)\b|\bmore (?:records|rows)\b",
+        re.I,
+    )
+    negative = re.compile(
+        r"\b(?:no|not|never|neither|cannot|can't|unable|unknown|undetermined|unavailable|unclear)\b|\b(?:isn|aren|wasn|weren|doesn|don|didn|couldn|wouldn|shouldn)'t\b",
+        re.I,
+    )
+    affirmed: set[str] = set()
+    denied: set[str] = set()
+    tied: set[str] = set()
+    unresolved = False
+    for clause in re.findall(r"[^.;!?\n]+(?:[.;!?\n]|$)", text):
+        tie = re.search(
+            r"\b(?:tie|ties|tied|equal totals|same (?:number of )?(?:rows|records))\b",
+            clause,
+            re.I,
+        )
+        if clause.rstrip().endswith("?"):
+            unresolved = unresolved or bool(tie or indicator.search(clause))
+            continue
+        positive_tie = tie is not None and not negative.search(clause[: tie.end()])
+        if tie is not None and not positive_tie:
+            denied.update(canonical[m[0].casefold()] for m in source.finditer(clause))
+            if not source.search(clause):
+                denied.update(names)
+        if positive_tie:
+            mentioned = {canonical[m[0].casefold()] for m in source.finditer(clause)}
+            if not mentioned and re.search(
+                r"\b(?:both|all|sources|they)\b", clause, re.I
+            ):
+                mentioned = set(names)
+            if len(mentioned) >= 2:
+                tied.update(mentioned)
+            else:
+                unresolved = True
+        for match in indicator.finditer(clause):
+            if positive_tie:
+                continue
+            before, after = clause[: match.start()], clause[match.end() :]
+            preceding = list(source.finditer(before))
+            following = list(source.finditer(after))
+            if preceding:
+                target = preceding[-1]
+                start = preceding[-2].end() if len(preceding) > 1 else 0
+                negated = bool(negative.search(before[start:]))
+            elif following:
+                target = following[0]
+                negated = bool(negative.search(before[-60:] + after[: target.start()]))
+            else:
+                if not negative.search(before[-60:] + after[:60]):
+                    unresolved = True
+                else:
+                    denied.update(names)
+                continue
+            (denied if negated else affirmed).add(canonical[target[0].casefold()])
+    return affirmed, denied, tied, unresolved
+
+
 def score_totals(answer: str | None, expected: dict[str, int]) -> dict[str, object]:
     """Conservative numerical pairing oracle; ambiguous parsing is unqualified."""
     text = (answer or "").replace("**", "").replace("`", "")
@@ -322,6 +395,7 @@ def score_totals(answer: str | None, expected: dict[str, int]) -> dict[str, obje
                     table_totals[name].append(int(value[1].replace(",", "")))
     prose_text = "\n".join(prose)
     pairs: dict[str, list[int]] = {}
+    denied_totals = False
     for name in expected:
         matches = []
         source_pattern = r"\b(?:" + "|".join(re.escape(n) for n in expected) + r")\b"
@@ -350,6 +424,19 @@ def score_totals(answer: str | None, expected: dict[str, int]) -> dict[str, obje
                         re.I,
                     )
                 ]
+                if any(
+                    re.search(
+                        r"\b(?:not|cannot|can't|isn't)\s+(?:(?:have|be|equal|exactly)\s+)*$",
+                        segment[: match.start()],
+                        re.I,
+                    )
+                    for match in re.finditer(
+                        r"(?<![\w])\d[\d,]*\s+(?:total\s+)?(?:rows|records)\b",
+                        segment,
+                        re.I,
+                    )
+                ):
+                    denied_totals = True
                 direct = re.match(
                     r"\s*[:=\-]\s*(\d[\d,]*)(?=\s*(?:$|[.;]|(?:total\s+)?(?:rows|records)\b))",
                     segment,
@@ -364,19 +451,26 @@ def score_totals(answer: str | None, expected: dict[str, int]) -> dict[str, obje
                 ]
             )
         )
-    numerical = all(pairs[name] == [total] for name, total in expected.items())
-    winner = max(expected, key=lambda name: expected[name])
-    winner_claim = any(
-        re.search(pattern, text, re.I)
-        for pattern in (
-            rf"{winner}[^.\n]{{0,80}}(?:most|larger|highest|winner|more records|more rows)",
-            rf"(?:most|larger|highest|winner)[^.\n]{{0,80}}{winner}",
+    numerical = not denied_totals and all(
+        pairs[name] == [total] for name, total in expected.items()
+    )
+    winners = {
+        name for name, total in expected.items() if total == max(expected.values())
+    }
+    affirmed, denied, tied, unresolved = _winner_claims(text, tuple(expected))
+    winner_correct = (
+        not unresolved
+        and not denied.intersection(winners)
+        and (
+            (len(winners) == 1 and affirmed == winners and not tied)
+            or (len(winners) > 1 and tied == winners and not affirmed)
         )
     )
     return {
         "parsed_totals": pairs,
         "numerical_correct": numerical,
-        "winner_correct": bool(winner_claim),
+        "winner_correct": winner_correct,
+        "affirmative_winner_claim": bool(affirmed or tied or unresolved),
         "ambiguous": any(len(v) != 1 for v in pairs.values()),
     }
 
@@ -413,14 +507,13 @@ def score_partial_totals(
             re.I,
         )
     )
-    winner = max(observed_totals, key=lambda name: observed_totals[name])
-    conclusive = all(
-        name == winner or (name in complete_sources and observed_totals[winner] > total)
+    maximum = max(observed_totals.values())
+    winners = {name for name, total in observed_totals.items() if total == maximum}
+    conclusive = (len(winners) == 1 or winners <= complete_sources) and all(
+        name in winners or (name in complete_sources and maximum > total)
         for name, total in observed_totals.items()
     )
-    claims_winner = bool(
-        re.search(r"winner|most records|most rows|larger|highest", text, re.I)
-    )
+    claims_winner = score["affirmative_winner_claim"]
     score["honest_partial"] = (
         acknowledges
         and score["numerical_correct"]
@@ -434,9 +527,7 @@ def score_partial_totals(
         and all(value == 0 for value in observed_resource_counts.values())
         and not complete_sources
     )
-    claims_any_winner = any(
-        score_totals(text, {name: 0})["winner_correct"] for name in observed_totals
-    )
+    claims_any_winner = score["affirmative_winner_claim"]
     score["honest_no_observations"] = bool(
         no_observations
         and re.search(
@@ -498,7 +589,8 @@ def summarize_campaign(
         "recorded_cases": len(reports),
         "functional_qualified": complete,
         "efficiency_qualified": complete and efficiency,
-        "usage_complete": measured,
+        "usage_complete": bool(reports)
+        and all(r.get("usage_complete") for r in reports),
         "median_tokens": median(tokens) if tokens else None,
         "max_tokens": max(tokens) if tokens else None,
         "median_logical_requests": median(logical) if logical else None,
@@ -1030,6 +1122,8 @@ async def run_case(
                     ) == {
                         "selection_ref",
                         "include_views",
+                        "source_id",
+                        "coverage",
                     }
                 assert definition.name != "data_count_plan"
         children = [
@@ -1244,7 +1338,18 @@ async def run_case(
                 result.final_text or "",
                 re.I,
             )
-            assert str(TOTALS["Juniper"]) not in (result.final_text or "")
+            report["partial_score"] = score_partial_totals(
+                result.final_text,
+                {"Juniper": sum(observed.values())},
+                set(),
+                observed_resource_counts={"Juniper": len(observed)},
+            )
+            assert report["partial_score"]["honest_partial"], report["partial_score"]
+            assert re.search(
+                rf"\b{len(observed)}\s+(?:(?:of|out of)\s+{len(resources['Juniper'])}\s+)?(?:admitted\s+)?(?:base[- ]table|table)s?\b",
+                result.final_text or "",
+                re.I,
+            ), "Schema-drift reporting must retain the measured table coverage as well as the subtotal."
         else:
             expected = {name: TOTALS[name] for name in scoped}
             score = score_totals(result.final_text, expected)
@@ -1319,7 +1424,7 @@ async def run_case(
                     for response in recorder.responses[:2]
                 ), "Correction or honest blocker is required within two real model responses"
                 assert any(
-                    "Repeated permanent failure" in str(request.messages)
+                    "Repeated invocation failure" in str(request.messages)
                     for request in recorder.requests[:2]
                 )
                 assert all(

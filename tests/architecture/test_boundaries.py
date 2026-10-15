@@ -554,6 +554,7 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
             "distribution",
             "jobs",
             "jobs.graph_task",
+            "jobs.graph_admission",
             "memory",
             "routines",
             "semantics",
@@ -1224,6 +1225,7 @@ async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_bran
             "skill_save",
             "skill_delete",
             "start_data_profile",
+            "start_count_comparison",
         }
     finally:
         await agent.close()

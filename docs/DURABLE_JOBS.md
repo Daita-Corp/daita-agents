@@ -11,6 +11,65 @@ read-only profile. `start_graph_job` starts one eligible task and a finalizer;
 the job can add bounded tasks when planning is authorized. A model route and
 finite cost ceiling are required for model-driven jobs.
 
+For an explicit durable comparison of whole-source row totals, use
+`start_count_comparison`. Its model view accepts two through sixteen distinct
+`source_ids` with `coverage="complete_admitted_base_tables"`. The data owner resolves
+and freezes the required set without catalog pagination or model-visible table
+enumeration. Alternatively, supply complete current-run catalog identity
+`selection_refs`. These forms are mutually exclusive. Both accept optional
+`deadline_seconds` (60–300, default 300). Each source's admitted tables/views must
+fit the 50-resource catalog bound. Execution excludes
+views and requires at least one base table per source. Ordinary questions remain
+foreground requests; Daita does not automatically create jobs.
+
+Typed callers name the required sources directly, without transcript references:
+
+```python
+job = await agent.start_count_comparison(
+    source_ids=(billing_source.id, application_source.id),
+    deadline_seconds=300,
+)
+inspection = await agent.inspect_job(job.job_id)
+result = await agent.read_job_result(job.job_id)  # None until successful finalization
+```
+
+An empty source tuple is invalid. Supplied conversations must exist and pass the
+ordinary caller checks; omission creates an inbox identity for this job. Current
+read permissions, source/resource revisions and sensitivity still apply. This
+static path works without a model route or model cost configuration.
+
+Admission freezes required coverage separately from the authorization ceiling.
+The complete plan must fit sixteen total batches of at most four resources;
+sixteen sources with fifty resources each do not fit. Each internal batch uses
+the existing validated count executor, adapters and source permits once. A pure
+internal finalizer authenticates every accepted batch, calculates totals and all
+tied winners, and publishes one structured `data.count_comparison` result and
+one success delivery. These tasks make no model requests or synthetic transcript
+exchanges, and create no artifacts. The originating foreground turn still uses
+the ordinary model/tool loop for admission and its answer.
+
+Counts are exact sums of the admitted observations, with separate batch and
+source snapshots. They do not establish a common instant or physical-database
+completeness. There is no automatic source retry: an interrupted read without an
+accepted result is fenced and cannot resume after restart, lease expiry or close.
+Accepted evidence survives. Pure finalization may recompute within its original
+three-attempt work/time allowance. New reading requires fresh job admission;
+retry/replacement controls cannot reset the frozen count denominator or budget.
+
+`inspection.count_progress` and `job_inspect.count_progress` expose accepted
+counts, missing coverage, attempts and controls. A source with no accepted
+observations has an observed subtotal of zero and a null total. Complete per-source
+totals may coexist with an incomplete comparison; no winner is established until
+successful finalization. Attention notices retain their existing separate delivery
+kind. Result readers never present partial progress as a successful comparison.
+
+The development single-source count MODEL-job protocol (`data_count_plan`,
+`plan_ref`, and generic `data.count_selection` graph admission) is retired.
+Foreground single-source selection counts and explicit/cursor count reads remain
+available. Old nonterminal count MODEL jobs need fresh admission before any
+provider/source call; terminal history remains readable. There is no single-source
+durable compatibility executor.
+
 The job's original objective, allowed sources and actions, outcome, deadline,
 distribution, and total budgets stay fixed. Added tasks can use only a
 validated subset of that authority. Source changes, expired contracts, budget

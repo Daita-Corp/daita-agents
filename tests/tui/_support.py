@@ -295,6 +295,7 @@ def _tui_job_summary(
 def _tui_job_inspection(summary: SimpleNamespace) -> SimpleNamespace:
     observed = datetime(2026, 8, 23, 14, 0, tzinfo=UTC)
     return SimpleNamespace(
+        count_progress=None,
         job=summary,
         graph=SimpleNamespace(
             revision=1,

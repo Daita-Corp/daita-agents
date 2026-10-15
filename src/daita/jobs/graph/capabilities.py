@@ -1964,63 +1964,6 @@ def _authenticate_evidence(
     return tuple(authenticated), sensitivity, artifact_ids, effect_receipt_ids
 
 
-def _frozen_count_call_id(task: GraphTask, transcript: Transcript) -> str | None:
-    """Bind the latest exact successful count parent, preserving repeated reads.
-
-    Internal child observation IDs are never promoted to transcript authority.
-    """
-    initial = task.specification.expected_result_contract.get("initial_call")
-    if (
-        not isinstance(initial, Mapping)
-        or initial.get("capability_id") != "data.count_selection"
-    ):
-        return None
-    arguments = initial.get("arguments")
-    names = initial.get("callable_tool_names", ())
-    if not isinstance(arguments, Mapping) or not isinstance(names, tuple):
-        raise CapabilityInputError(
-            "task_context_invalid", "The frozen count call is malformed."
-        )
-    matches = [
-        (call, result)
-        for call, result in transcript.tool_pairs
-        if call.name in names
-        and call.arguments == arguments
-        and result is not None
-        and result.capability_id == "data.count_selection"
-    ]
-    for call, result in reversed(matches):
-        assert result is not None
-        data = result.output.get("data")
-        if (
-            not result.is_error
-            and result.executor_id == "data.count_selection.executor"
-            and result.output_sha256 == canonical_digest(result.output)
-            and isinstance(data, Mapping)
-            and data.get("status") == "completed"
-        ):
-            return call.id
-    recovery: Mapping[str, object] = {
-        "kind": "load_tool_and_use_frozen_plan",
-        "tool_name": "toolbox_load",
-        "arguments": {"tool_names": names},
-        "constraint": "Execute the exact frozen count plan before completion. Omit evidence_call_ids to bind its successful parent automatically.",
-    }
-    if matches:
-        failed = matches[-1][1]
-        assert failed is not None
-        error = failed.output.get("error")
-        details = error.get("details") if isinstance(error, Mapping) else None
-        candidate = details.get("recovery") if isinstance(details, Mapping) else None
-        if isinstance(candidate, Mapping):
-            recovery = candidate
-    raise CapabilityInputError(
-        "task_result_evidence_missing",
-        "The exact frozen count has no authenticated complete result. Model payloads and child observation IDs cannot establish completion.",
-        {"execution_disposition": "not_dispatched", "recovery": recovery},
-    )
-
-
 def _task_result_from_arguments(
     request: ToolExecution,
     task: GraphTask,
@@ -2049,45 +1992,21 @@ def _task_result_from_arguments(
         "capability_grants"
     )
     effect_call_id = _grant_backed_effect_call_id(transcript, graph_grants)
-    count_call_id = _frozen_count_call_id(task, transcript)
     evidence_ids: tuple[object, ...] = tuple(
         dict.fromkeys(
             (
                 *raw_evidence_ids,
                 *((effect_call_id,) if effect_call_id is not None else ()),
-                *((count_call_id,) if count_call_id is not None else ()),
             )
         )
     )
     artifacts = tuple(sorted(str(item) for item in raw_artifact_ids))
-    try:
-        (
-            authenticated,
-            evidence_sensitivity,
-            authenticated_artifacts,
-            authenticated_effects,
-        ) = _authenticate_evidence(transcript, evidence_ids)
-    except CapabilityInputError as error:
-        if count_call_id is not None and error.code == "task_result_evidence_invalid":
-            raise CapabilityInputError(
-                error.code,
-                "For this frozen count plan, omit evidence_call_ids; the framework binds the authenticated parent. Internal child observation IDs are not transcript tool-call IDs.",
-                {
-                    "expected_reference_kind": "tool_call_id",
-                    "execution_disposition": "not_dispatched",
-                    "recovery": {
-                        "kind": "correct_arguments",
-                        "tool_name": (
-                            TASK_REQUEST_REVIEW_TOOL_NAME
-                            if request.capability_id
-                            == TASK_REQUEST_REVIEW_CAPABILITY_ID
-                            else TASK_COMPLETE_TOOL_NAME
-                        ),
-                        "constraint": "Omit evidence_call_ids and resubmit the result. No task result was committed and no count read will be replayed.",
-                    },
-                },
-            ) from error
-        raise
+    (
+        authenticated,
+        evidence_sensitivity,
+        authenticated_artifacts,
+        authenticated_effects,
+    ) = _authenticate_evidence(transcript, evidence_ids)
     if not set(artifacts) <= authenticated_artifacts:
         raise CapabilityInputError(
             "task_result_artifact_unverified",
