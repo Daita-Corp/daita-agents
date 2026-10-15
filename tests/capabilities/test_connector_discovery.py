@@ -173,7 +173,7 @@ async def test_catalog_continuation_is_complete_scoped_and_invalidated_by_hint_e
         agent_id=agent.id,
         source_ids=(source.id,),
         resource_ids=(resource.id,),
-        capability_ids=("catalog.inspect",),
+        capability_ids=("catalog.describe",),
         connector_binding_ids=(),
         model_route_ids=(),
     )

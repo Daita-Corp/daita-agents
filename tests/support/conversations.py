@@ -496,7 +496,7 @@ def _analytical_conversation_record(
     )
     catalog_call = ToolCall(
         id="catalog-native-call",
-        name="catalog_inspect",
+        name="catalog_describe",
         arguments={"resource_id": "orders"},
         provider_call_id="provider-catalog-call",
     )

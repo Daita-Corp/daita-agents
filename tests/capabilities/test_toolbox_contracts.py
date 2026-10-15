@@ -183,8 +183,7 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
         expected_pinned = {
             "artifact_list",
             "artifact_read",
-            "catalog_inspect",
-            "catalog_schema",
+            "catalog_describe",
             "catalog_search",
             "data_query",
             "delivery_list",
@@ -471,8 +470,7 @@ async def test_static_context_stays_frozen_while_provider_definitions_change(
 
         # This files-only prepared scope has no catalog tools. Document creation
         # is loaded, while publication remains discoverable for a later step.
-        assert "catalog_schema first" not in system_text(request_initial)
-        assert "catalog_inspect gives" not in system_text(request_initial)
+        assert "catalog_describe detail=schema" not in system_text(request_initial)
         assert "toolbox_load artifact_save_local" in system_text(request_a)
         assert "then invoke it from the next step" in system_text(request_a)
         assert "artifact_convert only converts" not in system_text(request_a)

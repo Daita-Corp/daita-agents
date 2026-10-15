@@ -10,10 +10,8 @@ import pytest
 from daita import Agent, SQLiteSource
 from daita._json import FrozenJsonObject
 from daita.catalog import (
-    CATALOG_INSPECT_CAPABILITY_ID,
-    CATALOG_SCHEMA_CAPABILITY_ID,
+    CATALOG_DESCRIBE_CAPABILITY_ID,
     CATALOG_SEARCH_CAPABILITY_ID,
-    CATALOG_TRAVERSE_CAPABILITY_ID,
     CatalogSchemaRequest,
     CatalogSearchRequest,
     CatalogTraversalRequest,
@@ -413,9 +411,7 @@ def test_model_catalog_registry_exposes_no_permission_mutation_capability() -> N
     )
     assert {capability.id for capability in declarations.capabilities} == {
         CATALOG_SEARCH_CAPABILITY_ID,
-        CATALOG_SCHEMA_CAPABILITY_ID,
-        CATALOG_INSPECT_CAPABILITY_ID,
-        CATALOG_TRAVERSE_CAPABILITY_ID,
+        CATALOG_DESCRIBE_CAPABILITY_ID,
     }
     assert not any(
         "permission" in capability.id for capability in declarations.capabilities

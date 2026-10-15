@@ -1948,21 +1948,24 @@ def test_catalog_summary_is_not_loop_or_storage_state():
     assert "readiness_state" not in storage.lower()
 
 
-def test_catalog_schema_slice_extends_existing_catalog_and_capability_owners():
+def test_catalog_describe_extends_existing_catalog_and_capability_owners():
     assert _class_owners("CatalogSchemaRequest") == {"catalog/models.py"}
+    assert _class_owners("CatalogDescribeRequest") == {"catalog/models.py"}
     service_methods = _class_methods(
         PACKAGE / "catalog" / "service.py",
         "CatalogService",
     )
-    assert "schema_slice" in service_methods
+    assert {"describe", "schema_slice"} <= service_methods
     capabilities = (PACKAGE / "catalog" / "capabilities.py").read_text(encoding="utf-8")
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     loop = _python_text(PACKAGE / "loop")
-    assert 'name="catalog_schema"' in capabilities
-    assert 'CATALOG_SCHEMA_EVIDENCE_KIND = "catalog.schema_slice"' in capabilities
+    assert 'name="catalog_describe"' in capabilities
+    assert 'CATALOG_DESCRIBE_EVIDENCE_KIND = "catalog.description"' in capabilities
+    for removed in ("catalog_schema", "catalog_inspect", "catalog_traverse"):
+        assert f'name="{removed}"' not in capabilities
     assert "catalog_declarations(identity.id, data_view)" in embedded
     assert "catalog_service = CatalogService(store, store)" in embedded
-    assert "catalog_schema" not in loop
+    assert "catalog_describe" not in loop
     for prohibited in (
         "CatalogSchemaCache",
         "CatalogSearchService",

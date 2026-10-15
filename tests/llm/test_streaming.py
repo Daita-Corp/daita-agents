@@ -160,7 +160,7 @@ def _request(*, tools: bool = False) -> ModelRequest:
     definitions = (
         (
             ToolDefinition(
-                name="catalog_schema",
+                name="catalog_describe",
                 description="Read catalog schema",
                 input_schema={"type": "object", "properties": {}},
             ),
@@ -521,7 +521,7 @@ async def test_openai_native_tool_stream_ignores_empty_argument_delta():
             {
                 "type": "function_call",
                 "call_id": "provider-call-1",
-                "name": "catalog_schema",
+                "name": "catalog_describe",
                 "arguments": "{}",
             }
         ],
@@ -915,7 +915,7 @@ async def test_anthropic_native_no_argument_tool_call_finishes_as_empty_object()
                 "content_block": {
                     "type": "tool_use",
                     "id": "provider-call-1",
-                    "name": "catalog_schema",
+                    "name": "catalog_describe",
                     "input": {},
                 },
             },
@@ -1069,7 +1069,7 @@ async def test_compatible_native_no_argument_tool_call_finishes_as_empty_object(
                                     "index": 0,
                                     "id": "provider-call-1",
                                     "function": {
-                                        "name": "catalog_schema",
+                                        "name": "catalog_describe",
                                         "arguments": "",
                                     },
                                 }

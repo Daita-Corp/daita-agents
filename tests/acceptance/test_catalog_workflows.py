@@ -1,4 +1,4 @@
-"""Component-owned tests split from ``test_schema_slices.py``."""
+"""Component-owned tests split from ``test_describe.py``."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ async def test_inventory_uses_one_catalog_tool_call_and_records_efficiency(
             for call in message.tool_calls
             if call.name.startswith("catalog_")
         )
-        assert tuple(call.name for call in calls) == ("catalog_schema",)
+        assert tuple(call.name for call in calls) == ("catalog_describe",)
     finally:
         await agent.close()
 
@@ -94,7 +94,7 @@ async def test_regional_margin_plan_uses_one_schema_slice_before_querying(
             for call in message.tool_calls
         }
         assert tuple(calls_by_id.values()) == (
-            "catalog_schema",
+            "catalog_describe",
             "data_query",
         )
     finally:
@@ -131,7 +131,7 @@ async def test_one_connected_schema_call_supplies_bridges_before_one_data_query(
             for message in request.messages
             for call in message.tool_calls
         }
-        assert tuple(calls.values()) == ("catalog_schema", "data_query")
+        assert tuple(calls.values()) == ("catalog_describe", "data_query")
     finally:
         await agent.close()
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from daita.capabilities import ToolExecution
 from tests.data.postgresql._large_fixture_support import (
     ATTACHED_SCHEMAS,
     Agent,
@@ -109,12 +110,11 @@ async def test_daita_catalogs_and_queries_large_multi_schema_postgresql(tmp_path
                 tool_calls=(
                     ToolCall(
                         id="multi-schema-catalog",
-                        name="catalog_schema",
+                        name="catalog_describe",
                         arguments={
                             "resource_ids": [
                                 by_native_identity[name].id for name in schema_resources
                             ],
-                            "include_relationships": True,
                         },
                     ),
                 ),
@@ -392,3 +392,72 @@ async def test_bulk_update_uses_exact_preview_approval_commit_and_readback(
     finally:
         await agent.close()
         await _restore_bulk_priority(port=port, password=password)
+
+
+@pytest.mark.acceptance
+@pytest.mark.integration
+@pytest.mark.requires_db
+@pytest.mark.skipif(
+    os.environ.get("DAITA_RUN_POSTGRES_LARGE_FIXTURE") != "1",
+    reason=(
+        "set DAITA_RUN_POSTGRES_LARGE_FIXTURE=1 after starting "
+        "tests/fixtures/postgres-large/compose.yaml"
+    ),
+)
+async def test_identity_describe_labels_postgresql_statistics_as_estimates(
+    tmp_path: Path,
+):
+    password = os.environ.get(
+        "DAITA_LARGE_POSTGRES_PASSWORD",
+        "daita_large_fixture_password",
+    )
+    port = int(os.environ.get("DAITA_LARGE_POSTGRES_PORT", "55433"))
+    agent = await Agent.create(
+        "postgres-large-estimates",
+        root=tmp_path,
+        secret_provider=_Secrets(password),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        source = await agent.attach_postgresql(
+            host="127.0.0.1",
+            port=port,
+            database="daita_large_fixture",
+            username="daita_large_reader",
+            credential=SecretReference.keychain("fixture:postgres-large:credential"),
+            schemas=ATTACHED_SCHEMAS,
+            ssl_mode="disable",
+        )
+        registry = agent._embedded._capabilities
+        _view, capability = registry.resolve_tool("catalog_describe")
+        _capability, executor = registry.resolve_execution(capability.id)
+        output = await executor.execute(
+            ToolExecution(
+                run_id="postgres-large-estimates",
+                call_id="postgres-large-estimates-call",
+                capability_id=capability.id,
+                arguments={"detail": "identity", "source_id": source.id},
+            )
+        )
+        assert registry.validate_output(capability.id, output) == output
+
+        summary = output.data["estimates"]
+        assert isinstance(summary, Mapping)
+        assert summary["approximate"] is True
+        assert "never exact counts" in str(summary["note"])
+        rows = output.data["resources"]
+        assert isinstance(rows, tuple) and rows
+        estimated = [row["estimates"] for row in rows if "estimates" in row]
+        assert summary["available"] == len(estimated)
+        assert summary["unavailable"] == len(rows) - len(estimated)
+        for estimate in estimated:
+            assert isinstance(estimate, Mapping)
+            assert set(estimate) == {
+                "approximate_row_count",
+                "approximate_size_bytes",
+                "statistics_as_of",
+                "discovered_at",
+            }
+        assert all("row_count" not in row and "columns" not in row for row in rows)
+    finally:
+        await agent.close()

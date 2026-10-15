@@ -89,7 +89,7 @@ async def main(root: Path) -> None:
         allowed_source_ids=(source.id,),
         allowed_connector_binding_ids=(),
         allowed_resource_ids=(resource.id,),
-        allowed_capability_ids=("catalog.inspect",),
+        allowed_capability_ids=("catalog.describe",),
         sensitivity_ceiling=ModelSensitivity.INTERNAL,
         outcome_contract=no_artifact_outcome_contract(),
         distribution_destination_id=conversation_inbox_destination_id(

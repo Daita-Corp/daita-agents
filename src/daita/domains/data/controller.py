@@ -32,12 +32,15 @@ from ...capabilities import (
 )
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.capabilities import (
-    CATALOG_INSPECT_CAPABILITY_ID,
-    CATALOG_SCHEMA_CAPABILITY_ID,
+    CATALOG_DESCRIBE_CAPABILITY_ID,
     CATALOG_SEARCH_CAPABILITY_ID,
-    CATALOG_TRAVERSE_CAPABILITY_ID,
 )
-from ...catalog.models import Sensitivity
+from ...catalog.models import (
+    CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT,
+    CATALOG_MAX_LIMIT,
+    CatalogDescribeDetail,
+    Sensitivity,
+)
 from ...llm.models import ModelSensitivity, ToolCall, ToolResultBlock
 from ...loop.models import RunInput, RunOrigin, Transcript
 from ...loop.session import RunSession
@@ -78,9 +81,7 @@ RELATIONAL_UPDATE_EVIDENCE_KIND = "data.update_rows_result"
 _CATALOG_CAPABILITIES = frozenset(
     {
         CATALOG_SEARCH_CAPABILITY_ID,
-        CATALOG_SCHEMA_CAPABILITY_ID,
-        CATALOG_INSPECT_CAPABILITY_ID,
-        CATALOG_TRAVERSE_CAPABILITY_ID,
+        CATALOG_DESCRIBE_CAPABILITY_ID,
         RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID,
     }
 )
@@ -108,7 +109,6 @@ def native_preview_capability(capability_id: str) -> str:
 _RESOURCE_ARGUMENT_CAPABILITIES = frozenset(
     {
         *_UPSERT_CAPABILITIES,
-        CATALOG_INSPECT_CAPABILITY_ID,
         RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID,
         RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
         RELATIONAL_UPDATE_CAPABILITY_ID,
@@ -134,6 +134,48 @@ _SOURCE_CAPABILITIES = frozenset().union(
     _RELATIONAL_READ_CAPABILITIES,
     *_ADAPTER_CAPABILITIES.values(),
 )
+
+
+def _validate_describe_arguments(arguments: Mapping[str, object]) -> None:
+    """Reject catalog_describe shapes that cannot select a bounded description."""
+
+    raw_detail = arguments.get("detail", CatalogDescribeDetail.SCHEMA.value)
+    detail = CatalogDescribeDetail(cast(str, raw_detail))
+    query = cast(str | None, arguments.get("query"))
+    resource_ids = cast(tuple[str, ...], arguments.get("resource_ids", ()))
+    source_id = cast(str | None, arguments.get("source_id"))
+    cursor = arguments.get("cursor")
+    limit = arguments.get("limit")
+    identity = detail is CatalogDescribeDetail.IDENTITY
+    if (
+        (query is not None and not query.strip())
+        or any(not item.strip() for item in resource_ids)
+        or (source_id is not None and not source_id.strip())
+    ):
+        raise CapabilityInputError(
+            "catalog_invalid_describe",
+            "catalog_describe arguments must be non-empty exact catalog values.",
+        )
+    if query is None and not resource_ids and not (identity and source_id):
+        raise CapabilityInputError(
+            "catalog_invalid_describe",
+            "catalog_describe needs resource_ids or a query; detail=identity can "
+            "instead take only an exact source_id to list every admitted table.",
+            {"detail": detail.value},
+        )
+    if cursor is not None and not identity:
+        raise CapabilityInputError(
+            "catalog_invalid_describe",
+            "cursor continues only a detail=identity listing.",
+            {"detail": detail.value},
+        )
+    maximum = CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT if identity else CATALOG_MAX_LIMIT
+    if isinstance(limit, int) and limit > maximum:
+        raise CapabilityInputError(
+            "catalog_invalid_describe",
+            f"detail={detail.value} accepts a limit of at most {maximum}.",
+            {"detail": detail.value, "maximum_limit": maximum},
+        )
 
 
 class CatalogSchemaReader(Protocol):
@@ -473,28 +515,8 @@ class DataCapabilityDomain:
                     "catalog_invalid_search",
                     "Catalog search requires a non-empty query.",
                 )
-        if capability.id == CATALOG_INSPECT_CAPABILITY_ID:
-            resource_id = cast(str, arguments["resource_id"])
-            if not resource_id.strip():
-                raise CapabilityInputError(
-                    "catalog_invalid_resource",
-                    "Catalog inspection requires a resource_id.",
-                )
-        if capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
-            schema_query = cast(str | None, arguments.get("query"))
-            resource_ids = cast(tuple[str, ...], arguments.get("resource_ids", ()))
-            schema_source_id = cast(str | None, arguments.get("source_id"))
-            if (
-                (schema_query is not None and not schema_query.strip())
-                or any(not item.strip() for item in resource_ids)
-                or (schema_query is None and not resource_ids)
-                or (schema_source_id is not None and not schema_source_id.strip())
-            ):
-                raise CapabilityInputError(
-                    "catalog_invalid_schema",
-                    "Catalog schema requires a non-empty query or explicit resource "
-                    "IDs and an optional non-empty current source scope.",
-                )
+        if capability.id == CATALOG_DESCRIBE_CAPABILITY_ID:
+            _validate_describe_arguments(arguments)
         if capability.id in _RELATIONAL_READ_CAPABILITIES:
             arguments = await self._validate_sql(run, arguments)
         if capability.id in _UPDATE_CAPABILITIES | _UPSERT_CAPABILITIES:
@@ -1043,16 +1065,9 @@ class DataCapabilityDomain:
         elif capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
-        elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
+        elif capability.id == CATALOG_DESCRIBE_CAPABILITY_ID:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
-        elif capability.id == CATALOG_TRAVERSE_CAPABILITY_ID:
-            raw_from = arguments.get("from_resource_ids", ())
-            raw_to = arguments.get("to_resource_ids", ())
-            resource_ids = (
-                *(raw_from if isinstance(raw_from, tuple) else ()),
-                *(raw_to if isinstance(raw_to, tuple) else ()),
-            )
         for resource_id in resource_ids:
             if not isinstance(resource_id, str):
                 continue
@@ -1078,16 +1093,9 @@ class DataCapabilityDomain:
         elif capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
-        elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
+        elif capability.id == CATALOG_DESCRIBE_CAPABILITY_ID:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
-        elif capability.id == CATALOG_TRAVERSE_CAPABILITY_ID:
-            raw_from = arguments.get("from_resource_ids", ())
-            raw_to = arguments.get("to_resource_ids", ())
-            resource_ids = (
-                *(raw_from if isinstance(raw_from, tuple) else ()),
-                *(raw_to if isinstance(raw_to, tuple) else ()),
-            )
         requested = tuple(item for item in resource_ids if isinstance(item, str))
         if not requested:
             return
@@ -1238,10 +1246,7 @@ class DataCapabilityDomain:
         scope = run.execution_scope
         if scope is None:
             return
-        if capability.id in {
-            CATALOG_SEARCH_CAPABILITY_ID,
-            CATALOG_TRAVERSE_CAPABILITY_ID,
-        }:
+        if capability.id == CATALOG_SEARCH_CAPABILITY_ID:
             raise CapabilityInputError(
                 "execution_scope_resource_violation",
                 "This autonomous run cannot perform open-ended catalog discovery.",
@@ -1252,7 +1257,7 @@ class DataCapabilityDomain:
         elif capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
-        elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
+        elif capability.id == CATALOG_DESCRIBE_CAPABILITY_ID:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
             if not resource_ids:

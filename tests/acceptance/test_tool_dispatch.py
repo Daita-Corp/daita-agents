@@ -78,7 +78,7 @@ PHASE5_ROUTES = {
     ),
     "customer_columns": (
         "What columns exist in the connected customer table?",
-        ("catalog_schema",),
+        ("catalog_describe",),
     ),
     "postgres_query": (
         "Run SELECT customer_id FROM customers against Postgres",
@@ -90,7 +90,7 @@ PHASE5_ROUTES = {
             "toolbox_search",
             "toolbox_load",
             "file_query",
-            "catalog_schema",
+            "catalog_describe",
             "data_query",
         ),
     ),
@@ -375,11 +375,10 @@ async def test_connected_schema_dispatch_uses_one_catalog_call(
         (
             _tool(
                 "customer-schema",
-                "catalog_schema",
+                "catalog_describe",
                 {
                     "query": "customer table columns",
                     "limit": 5,
-                    "include_relationships": False,
                 },
             ),
             _stop("The customer columns are customer_id, name, and segment."),
@@ -580,11 +579,10 @@ async def test_mixed_file_and_source_dispatch_keeps_results_separate(
                 ),
                 _tool(
                     "mixed-schema",
-                    "catalog_schema",
+                    "catalog_describe",
                     {
                         "query": "customer segment",
                         "limit": 5,
-                        "include_relationships": False,
                     },
                 ),
                 _tool(

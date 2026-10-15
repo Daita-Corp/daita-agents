@@ -43,9 +43,7 @@ PROFILE_WORK_KIND = "data_profile_work"
 PROFILE_FINALIZER_KIND = "data_profile_finalizer"
 GRAPH_RESULT_FINALIZER_KIND = "graph_result_finalizer"
 
-PLANNER_CATALOG_CAPABILITY_IDS = frozenset(
-    {"catalog.search", "catalog.schema", "catalog.inspect", "catalog.traverse"}
-)
+PLANNER_CATALOG_CAPABILITY_IDS = frozenset({"catalog.search", "catalog.describe"})
 PLANNER_CAPABILITY_PREFIX = "jobs.graph.planner_"
 TASK_LIFECYCLE_CAPABILITY_PREFIX = "jobs.graph.task_"
 

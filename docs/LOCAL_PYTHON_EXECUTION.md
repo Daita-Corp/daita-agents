@@ -187,9 +187,9 @@ truncation, per-root search coverage and other reported limitations in derived
 outputs and conclusions.
 
 For database work, reuse sufficient current catalog evidence. Obtain missing
-schemas and bounded relationship paths through `catalog_schema`, then use
-`catalog_traverse` only for paths still unresolved. Load these tools through the
-ordinary toolbox if needed. Matching field names alone do not establish a join;
+schemas and resolved relationship paths through one `catalog_describe` call;
+`detail=identity` lists tables without columns. Load it through the ordinary
+toolbox if needed. Matching field names alone do not establish a join;
 ambiguous mappings or relationships can require ordinary clarification.
 
 For query results, use the returned `columns` and `rows`, including aliases and

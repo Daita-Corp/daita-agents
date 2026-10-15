@@ -1,13 +1,15 @@
-"""Component-owned tests split from ``test_catalog_schema.py``."""
+"""Exercise the catalog_describe tool and the catalog schema projections."""
 
 from __future__ import annotations
 
+from daita.catalog import CatalogDescribeDetail, CatalogDescribeRequest
+from daita.catalog.models import CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT
 from tests.catalog._schema_support import (
     _OBSERVED_AT,
+    CATALOG_DESCRIBE_CAPABILITY_ID,
+    CATALOG_DESCRIBE_EVIDENCE_KIND,
     CATALOG_MAX_LIMIT,
     CATALOG_RESOURCE_ID_MAX_CHARACTERS,
-    CATALOG_SCHEMA_CAPABILITY_ID,
-    CATALOG_SCHEMA_EVIDENCE_KIND,
     CATALOG_SCHEMA_MAX_RESOURCE_IDS,
     CATALOG_SEARCH_CAPABILITY_ID,
     CATALOG_SEARCH_REQUEST_DEFAULT_LIMIT,
@@ -15,7 +17,6 @@ from tests.catalog._schema_support import (
     CATALOG_SOURCE_ID_MAX_CHARACTERS,
     CATALOG_TOOL_DEFAULT_LIMIT,
     CATALOG_TOOL_QUERY_MAX_CHARACTERS,
-    CATALOG_TRAVERSE_CAPABILITY_ID,
     Agent,
     CapabilityInputError,
     CapabilityRegistry,
@@ -47,6 +48,13 @@ from tests.catalog._schema_support import (
     pytest,
     sqlite3,
     workspace_for,
+)
+from tests.support.wide_catalog import (
+    CHAIN as WIDE_CHAIN,
+    COLUMN_COUNT as WIDE_COLUMN_COUNT,
+    MANIFEST as WIDE_MANIFEST,
+    TABLE_COUNT as WIDE_TABLE_COUNT,
+    seed_wide_sqlite,
 )
 
 
@@ -162,34 +170,34 @@ async def test_schema_slice_spans_eight_tables_with_exact_compact_structure(
         await agent.close()
 
 
-async def test_schema_capability_validates_output_and_is_smaller_than_inspections(
+async def test_describe_schema_validates_output_and_is_smaller_than_inspections(
     tmp_path: Path,
 ):
     database = tmp_path / "capability.sqlite"
     _fixture_database(database)
     agent = await Agent.create(
-        "catalog-schema-capability", root=tmp_path, workspace=workspace_for(tmp_path)
+        "catalog-describe-capability", root=tmp_path, workspace=workspace_for(tmp_path)
     )
     try:
         source = await agent.attach(SQLiteSource(database))
         resources = await agent.list_catalog_resources(source_id=source.id)
         registry: CapabilityRegistry = agent._embedded._capabilities
-        view, capability = registry.resolve_tool("catalog_schema")
-        assert view.capability_id == capability.id
+        view, capability = registry.resolve_tool("catalog_describe")
+        assert view.capability_id == capability.id == CATALOG_DESCRIBE_CAPABILITY_ID
         _, executor = registry.resolve_execution(capability.id)
         output = await executor.execute(
             ToolExecution(
-                run_id="schema-capability",
-                call_id="schema-capability-call",
+                run_id="describe-capability",
+                call_id="describe-capability-call",
                 capability_id=capability.id,
                 arguments={
                     "resource_ids": tuple(resource.id for resource in resources),
                     "limit": 50,
-                    "include_relationships": True,
                 },
             )
         )
-        assert output.kind == CATALOG_SCHEMA_EVIDENCE_KIND
+        assert output.kind == CATALOG_DESCRIBE_EVIDENCE_KIND
+        assert output.data["detail"] == "schema"
         assert registry.validate_output(capability.id, output) == output
         assert _mapping(output.data["bounds"])["relationships"] == 8
         assert len(_mapping_sequence(output.data["relationships"])) <= 8
@@ -197,7 +205,7 @@ async def test_schema_capability_validates_output_and_is_smaller_than_inspection
             registry.validate_output(
                 capability.id,
                 ToolOutput(
-                    kind=CATALOG_SCHEMA_EVIDENCE_KIND,
+                    kind=CATALOG_DESCRIBE_EVIDENCE_KIND,
                     data={"resources": (), "relationships": ()},
                 ),
             )
@@ -227,6 +235,9 @@ async def test_schema_capability_validates_output_and_is_smaller_than_inspection
                 for item in _mapping_sequence(output.data["relationships"])
             }
         ) == len(_mapping_sequence(output.data["relationships"]))
+        estimates = _mapping(output.data["estimates"])
+        assert estimates["approximate"] is True
+        assert estimates["available"] == 0
     finally:
         await agent.close()
 
@@ -319,15 +330,12 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
         registry: CapabilityRegistry = agent._embedded._capabilities
         search_definition = registry.tool_definition("catalog_search")
         _search_view, search_capability = registry.resolve_tool("catalog_search")
-        schema_definition = registry.tool_definition("catalog_schema")
-        inspect_definition = registry.tool_definition("catalog_inspect")
+        describe_definition = registry.tool_definition("catalog_describe")
 
         search_properties = search_definition.input_schema["properties"]
-        schema_properties = schema_definition.input_schema["properties"]
-        inspect_properties = inspect_definition.input_schema["properties"]
+        describe_properties = describe_definition.input_schema["properties"]
         assert isinstance(search_properties, Mapping)
-        assert isinstance(schema_properties, Mapping)
-        assert isinstance(inspect_properties, Mapping)
+        assert isinstance(describe_properties, Mapping)
         search_output_properties = search_capability.output_schema["properties"]
         search_output_required = search_capability.output_schema["required"]
         assert isinstance(search_output_properties, Mapping)
@@ -387,15 +395,32 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
             }
         )
 
-        assert "Provide a non-empty query or resource_ids" in (
-            schema_definition.description
+        assert set(describe_properties) == {
+            "cursor",
+            "detail",
+            "limit",
+            "query",
+            "resource_ids",
+            "source_id",
+        }
+        assert canonical_json(describe_properties["detail"]) == canonical_json(
+            {
+                "type": "string",
+                "enum": ["identity", "schema", "relationships"],
+                "default": "schema",
+            }
         )
-        assert canonical_json(schema_properties["query"]) == canonical_json(query_rule)
-        assert canonical_json(schema_properties["source_id"]) == canonical_json(
+        assert canonical_json(describe_properties["query"]) == canonical_json(
+            query_rule
+        )
+        assert canonical_json(describe_properties["source_id"]) == canonical_json(
             source_rule
         )
-        assert canonical_json(schema_properties["limit"]) == canonical_json(limit_rule)
-        assert canonical_json(schema_properties["resource_ids"]) == canonical_json(
+        describe_limit = _mapping(describe_properties["limit"])
+        assert describe_limit["minimum"] == 1
+        assert describe_limit["maximum"] == CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT
+        assert "default" not in describe_limit
+        assert canonical_json(describe_properties["resource_ids"]) == canonical_json(
             {
                 "type": "array",
                 "items": {
@@ -408,30 +433,15 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
                 "default": [],
             }
         )
-        assert canonical_json(
-            schema_properties["include_relationships"]
-        ) == canonical_json(
-            {
-                "type": "boolean",
-                "default": True,
-            }
-        )
-        assert canonical_json(inspect_properties["resource_id"]) == canonical_json(
-            {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": CATALOG_RESOURCE_ID_MAX_CHARACTERS,
-            }
-        )
 
-        for capability_id in (
-            CATALOG_SEARCH_CAPABILITY_ID,
-            CATALOG_SCHEMA_CAPABILITY_ID,
+        for capability_id, limit in (
+            (CATALOG_SEARCH_CAPABILITY_ID, CATALOG_MAX_LIMIT + 1),
+            (CATALOG_DESCRIBE_CAPABILITY_ID, CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT + 1),
         ):
             with pytest.raises(CapabilityInputError) as invalid_limit:
                 registry.validate_arguments(
                     capability_id,
-                    {"query": "orders", "limit": 100},
+                    {"query": "orders", "limit": limit},
                 )
             assert invalid_limit.value.code == "invalid_argument_value"
             assert invalid_limit.value.details.to_dict() == {
@@ -449,9 +459,19 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
             "name": "resource_kinds[0]",
         }
 
+        with pytest.raises(CapabilityInputError) as invalid_detail:
+            registry.validate_arguments(
+                CATALOG_DESCRIBE_CAPABILITY_ID,
+                {"query": "orders", "detail": "columns"},
+            )
+        assert invalid_detail.value.details.to_dict() == {
+            "constraint": "enum",
+            "name": "detail",
+        }
+
         with pytest.raises(CapabilityInputError) as duplicate_resources:
             registry.validate_arguments(
-                CATALOG_SCHEMA_CAPABILITY_ID,
+                CATALOG_DESCRIBE_CAPABILITY_ID,
                 {
                     "resource_ids": ("resource-a", "resource-a"),
                     "limit": CATALOG_TOOL_DEFAULT_LIMIT,
@@ -468,6 +488,18 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
         assert CatalogSchemaRequest(agent_id="agent", query="orders").limit == (
             CATALOG_TOOL_DEFAULT_LIMIT
         )
+        assert (
+            CatalogDescribeRequest(agent_id="agent", query="orders").effective_limit
+            == CATALOG_TOOL_DEFAULT_LIMIT
+        )
+        assert (
+            CatalogDescribeRequest(
+                agent_id="agent",
+                detail=CatalogDescribeDetail.IDENTITY,
+                source_id="source",
+            ).effective_limit
+            == CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT
+        )
         internal_context_query = "q" * (CATALOG_TOOL_QUERY_MAX_CHARACTERS + 1)
         assert (
             CatalogSearchRequest(agent_id="agent", query=internal_context_query).query
@@ -479,11 +511,23 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
         oversized_tool_query = "q" * (CATALOG_TOOL_QUERY_MAX_CHARACTERS + 1)
         with pytest.raises(ValueError, match="catalog schema query exceeds"):
             CatalogSchemaRequest(agent_id="agent", query=oversized_tool_query)
+        with pytest.raises(ValueError, match="catalog describe query exceeds"):
+            CatalogDescribeRequest(agent_id="agent", query=oversized_tool_query)
+        with pytest.raises(ValueError, match="exact source_id for identity"):
+            CatalogDescribeRequest(agent_id="agent", source_id="source")
+        with pytest.raises(ValueError, match="cursor applies only to identity"):
+            CatalogDescribeRequest(agent_id="agent", query="orders", cursor="1.ab")
+        with pytest.raises(ValueError, match="schema limit must be from 1"):
+            CatalogDescribeRequest(
+                agent_id="agent",
+                query="orders",
+                limit=CATALOG_MAX_LIMIT + 1,
+            )
     finally:
         await agent.close()
 
 
-async def test_catalog_schema_invalid_input_never_reaches_catalog_execution(
+async def test_catalog_describe_invalid_input_never_reaches_catalog_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -507,16 +551,16 @@ async def test_catalog_schema_invalid_input_never_reaches_catalog_execution(
         source = await agent.attach(SQLiteSource(database))
         catalog_execution_calls = 0
 
-        async def unexpected_schema_execution(*args: object, **kwargs: object):
+        async def unexpected_describe_execution(*args: object, **kwargs: object):
             nonlocal catalog_execution_calls
             del args, kwargs
             catalog_execution_calls += 1
-            raise AssertionError("invalid catalog schema input reached execution")
+            raise AssertionError("invalid catalog describe input reached execution")
 
         monkeypatch.setattr(
             catalog_service.CatalogService,
-            "schema_slice",
-            unexpected_schema_execution,
+            "describe",
+            unexpected_describe_execution,
         )
         loop = agent._embedded._loop
         assert loop is not None
@@ -535,16 +579,28 @@ async def test_catalog_schema_invalid_input_never_reaches_catalog_execution(
             (
                 ToolCall(
                     id="invalid-limit",
-                    name="catalog_schema",
-                    arguments={"source_id": source.id, "limit": 100},
+                    name="catalog_describe",
+                    arguments={"source_id": source.id, "limit": 101},
                 ),
                 ToolCall(
                     id="missing-selector",
-                    name="catalog_schema",
-                    arguments={
-                        "source_id": source.id,
-                        "limit": CATALOG_MAX_LIMIT,
-                    },
+                    name="catalog_describe",
+                    arguments={"source_id": source.id, "limit": CATALOG_MAX_LIMIT},
+                ),
+                ToolCall(
+                    id="schema-limit",
+                    name="catalog_describe",
+                    arguments={"query": "orders", "limit": CATALOG_MAX_LIMIT + 1},
+                ),
+                ToolCall(
+                    id="schema-cursor",
+                    name="catalog_describe",
+                    arguments={"query": "orders", "cursor": "1." + "0" * 64},
+                ),
+                ToolCall(
+                    id="blank-query",
+                    name="catalog_describe",
+                    arguments={"detail": "identity", "query": "  "},
                 ),
             ),
         )
@@ -552,193 +608,38 @@ async def test_catalog_schema_invalid_input_never_reaches_catalog_execution(
         error_codes = tuple(
             _mapping(_mapping(result.output)["error"])["code"] for result in results
         )
-        assert error_codes == ("invalid_argument_value", "catalog_invalid_schema")
+        assert error_codes == (
+            "invalid_argument_value",
+            "catalog_invalid_describe",
+            "catalog_invalid_describe",
+            "catalog_invalid_describe",
+            "catalog_invalid_describe",
+        )
         assert catalog_execution_calls == 0
     finally:
         await agent.close()
 
 
-async def test_catalog_tool_contract_exposes_and_enforces_progressive_bounds(
+async def test_catalog_describe_replaces_split_tools_without_ordering_rules(
     tmp_path: Path,
 ):
     agent = await Agent.create(
-        "catalog-progressive-contract", root=tmp_path, workspace=workspace_for(tmp_path)
+        "catalog-describe-contract", root=tmp_path, workspace=workspace_for(tmp_path)
     )
     try:
         registry: CapabilityRegistry = agent._embedded._capabilities
-        schema_definition = registry.tool_definition("catalog_schema")
-        traversal_definition = registry.tool_definition("catalog_traverse")
+        for removed in ("catalog_schema", "catalog_inspect", "catalog_traverse"):
+            with pytest.raises(KeyError, match="unknown tool"):
+                registry.tool_definition(removed)
+        for removed_id in ("catalog.schema", "catalog.inspect", "catalog.traverse"):
+            with pytest.raises(KeyError):
+                registry.resolve_execution(removed_id)
 
-        assert "SQL schema, bridges, paths" in schema_definition.description
-        assert "Do not use with catalog_traverse" in schema_definition.description
-        assert "later step" in traversal_definition.description
-        assert "Do not call alongside catalog_schema" in (
-            traversal_definition.description
-        )
-
-        schema_properties = schema_definition.input_schema["properties"]
-        assert isinstance(schema_properties, Mapping)
-        assert canonical_json(schema_properties["max_join_depth"]) == canonical_json(
-            {
-                "default": 3,
-                "maximum": 6,
-                "minimum": 1,
-                "type": "integer",
-            }
-        )
-        with pytest.raises(CapabilityInputError):
-            registry.validate_arguments(
-                CATALOG_SCHEMA_CAPABILITY_ID,
-                {"query": "orders", "max_join_depth": True},
-            )
-        with pytest.raises(CapabilityInputError):
-            registry.validate_arguments(
-                CATALOG_SCHEMA_CAPABILITY_ID,
-                {"query": "orders", "max_join_depth": 7},
-            )
-        with pytest.raises(ValueError, match="max_join_depth"):
-            CatalogSchemaRequest(
-                agent_id="agent",
-                query="orders",
-                max_join_depth=0,
-            )
-        with pytest.raises(ValueError, match="max_join_depth"):
-            CatalogSchemaRequest(
-                agent_id="agent",
-                query="orders",
-                max_join_depth=True,
-            )
-
-        traversal_properties = traversal_definition.input_schema["properties"]
-        assert isinstance(traversal_properties, Mapping)
-        endpoint_rule = {
-            "items": {
-                "maxLength": 256,
-                "minLength": 1,
-                "type": "string",
-            },
-            "maxItems": 16,
-            "minItems": 1,
-            "type": "array",
-            "uniqueItems": True,
-        }
-        assert canonical_json(
-            traversal_properties["from_resource_ids"]
-        ) == canonical_json(endpoint_rule)
-        assert canonical_json(
-            traversal_properties["to_resource_ids"]
-        ) == canonical_json(endpoint_rule)
-        assert canonical_json(
-            traversal_properties["relationship_kinds"]
-        ) == canonical_json(
-            {
-                "default": [],
-                "items": {
-                    "enum": [
-                        "contains",
-                        "references",
-                        "derived_from",
-                        "produces",
-                        "writes_to",
-                        "reads_from",
-                        "observes",
-                    ],
-                    "type": "string",
-                },
-                "maxItems": 7,
-                "type": "array",
-                "uniqueItems": True,
-            }
-        )
-        for name, default, maximum in (
-            ("max_depth", 4, 6),
-            ("max_paths", 5, 8),
-            ("max_nodes", 100, 1_000),
-            ("max_edges", 200, 2_000),
-        ):
-            assert canonical_json(traversal_properties[name]) == canonical_json(
-                {
-                    "default": default,
-                    "maximum": maximum,
-                    "minimum": 1,
-                    "type": "integer",
-                }
-            )
-
-        with pytest.raises(CapabilityInputError) as invalid_paths:
-            registry.validate_arguments(
-                CATALOG_TRAVERSE_CAPABILITY_ID,
-                {
-                    "from_resource_ids": ("resource-a",),
-                    "to_resource_ids": ("resource-b",),
-                    "max_paths": 20,
-                },
-            )
-        assert invalid_paths.value.code == "invalid_argument_value"
-        assert invalid_paths.value.details.to_dict() == {
-            "constraint": "maximum",
-            "name": "max_paths",
-        }
-
-        with pytest.raises(CapabilityInputError) as duplicate_endpoints:
-            registry.validate_arguments(
-                CATALOG_TRAVERSE_CAPABILITY_ID,
-                {
-                    "from_resource_ids": ("resource-a", "resource-a"),
-                    "to_resource_ids": ("resource-b",),
-                },
-            )
-        assert duplicate_endpoints.value.code == "invalid_argument_value"
-        assert duplicate_endpoints.value.details.to_dict() == {
-            "constraint": "uniqueItems",
-            "name": "from_resource_ids",
-        }
-
-        with pytest.raises(CapabilityInputError) as oversized_endpoints:
-            registry.validate_arguments(
-                CATALOG_TRAVERSE_CAPABILITY_ID,
-                {
-                    "from_resource_ids": tuple(
-                        f"resource-{index}" for index in range(17)
-                    ),
-                    "to_resource_ids": ("resource-b",),
-                },
-            )
-        assert oversized_endpoints.value.code == "invalid_argument_value"
-        assert oversized_endpoints.value.details.to_dict() == {
-            "constraint": "maxItems",
-            "name": "from_resource_ids",
-        }
-
-        with pytest.raises(CapabilityInputError) as oversized_endpoint:
-            registry.validate_arguments(
-                CATALOG_TRAVERSE_CAPABILITY_ID,
-                {
-                    "from_resource_ids": ("r" * 257,),
-                    "to_resource_ids": ("resource-b",),
-                },
-            )
-        assert oversized_endpoint.value.code == "invalid_argument_value"
-        assert oversized_endpoint.value.details.to_dict() == {
-            "constraint": "maxLength",
-            "name": "from_resource_ids[0]",
-        }
-
-        with pytest.raises(CapabilityInputError) as invalid_relationship_kind:
-            registry.validate_arguments(
-                CATALOG_TRAVERSE_CAPABILITY_ID,
-                {
-                    "from_resource_ids": ("resource-a",),
-                    "to_resource_ids": ("resource-b",),
-                    "relationship_kinds": ("invented",),
-                },
-            )
-        assert invalid_relationship_kind.value.code == "invalid_argument_value"
-        assert invalid_relationship_kind.value.details.to_dict() == {
-            "constraint": "enum",
-            "name": "relationship_kinds[0]",
-        }
-
+        description = registry.tool_definition("catalog_describe").description
+        for ordering_rule in ("Do not use with", "later step", "alongside"):
+            assert ordering_rule not in description
+        assert "one call is enough" in description
+        assert "estimates" in description
     finally:
         await agent.close()
 
@@ -945,3 +846,278 @@ async def test_schema_and_structural_search_order_ignore_catalog_insertion_order
     finally:
         await first_agent.close()
         await second_agent.close()
+
+
+async def _describe(
+    agent: Agent,
+    arguments: Mapping[str, object],
+) -> ToolOutput:
+    registry: CapabilityRegistry = agent._embedded._capabilities
+    _view, capability = registry.resolve_tool("catalog_describe")
+    _capability, executor = registry.resolve_execution(capability.id)
+    output = await executor.execute(
+        ToolExecution(
+            run_id="describe-run",
+            call_id="describe-call",
+            capability_id=capability.id,
+            arguments=arguments,
+        )
+    )
+    assert registry.validate_output(capability.id, output) == output
+    return output
+
+
+def _field_names(value: object) -> set[str]:
+    if isinstance(value, Mapping):
+        names = {str(key) for key in value}
+        for item in value.values():
+            names |= _field_names(item)
+        return names
+    if isinstance(value, (tuple, list)):
+        names = set()
+        for item in value:
+            names |= _field_names(item)
+        return names
+    return set()
+
+
+async def test_identity_lists_every_table_without_columns_or_source_io(
+    tmp_path: Path,
+):
+    database = seed_wide_sqlite(tmp_path / "wide.sqlite")
+    agent = await Agent.create(
+        "catalog-describe-identity", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        unavailable = tmp_path / "wide-source-is-unavailable.sqlite"
+        database.rename(unavailable)
+
+        output = await _describe(agent, {"detail": "identity", "source_id": source.id})
+
+        assert not database.exists()
+        data = output.data
+        assert data["detail"] == "identity"
+        rows = _mapping_sequence(data["resources"])
+        assert len(rows) == WIDE_TABLE_COUNT
+        assert {str(row["name"]) for row in rows} == {
+            f"main.{item['table']}" for item in WIDE_MANIFEST
+        }
+        assert all(
+            set(row) == {"kind", "name", "resource_id", "revision", "source_id"}
+            for row in rows
+        )
+        assert {"columns", "column", "data_type", "relationships"}.isdisjoint(
+            _field_names(data)
+        )
+        assert dict(_mapping(data["coverage"])) == {
+            "basis": "source",
+            "complete": True,
+            "offset": 0,
+            "returned": WIDE_TABLE_COUNT,
+            "scope_filtered": False,
+            "total": WIDE_TABLE_COUNT,
+        }
+        assert data["truncated"] is False
+        assert data["next_cursor"] is None
+        estimates = _mapping(data["estimates"])
+        assert estimates["approximate"] is True
+        assert estimates["available"] == 0
+        assert estimates["unavailable"] == WIDE_TABLE_COUNT
+        assert "never exact counts" in str(estimates["note"])
+        assert data["trust_classification"] == "untrusted_external_data"
+    finally:
+        await agent.close()
+
+
+async def test_identity_is_at_least_sixty_percent_smaller_than_full_schema(
+    tmp_path: Path,
+):
+    database = seed_wide_sqlite(tmp_path / "wide.sqlite")
+    agent = await Agent.create(
+        "catalog-describe-bytes", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        resources = await agent.list_catalog_resources(source_id=source.id)
+        assert len(resources) == WIDE_TABLE_COUNT
+        identity = await _describe(
+            agent, {"detail": "identity", "source_id": source.id}
+        )
+        schema_pages = (
+            await _describe(
+                agent,
+                {
+                    "detail": "schema",
+                    "resource_ids": tuple(item.id for item in resources[:23]),
+                    "limit": CATALOG_MAX_LIMIT,
+                },
+            ),
+            await _describe(
+                agent,
+                {
+                    "detail": "schema",
+                    "resource_ids": tuple(item.id for item in resources[23:]),
+                    "limit": CATALOG_MAX_LIMIT,
+                },
+            ),
+        )
+        assert (
+            sum(len(_mapping_sequence(page.data["resources"])) for page in schema_pages)
+            == WIDE_TABLE_COUNT
+        )
+        assert (
+            sum(
+                len(_mapping_sequence(resource["columns"]))
+                for page in schema_pages
+                for resource in _mapping_sequence(page.data["resources"])
+            )
+            == WIDE_COLUMN_COUNT
+        )
+
+        identity_bytes = len(canonical_json(identity.data).encode("utf-8"))
+        schema_bytes = sum(
+            len(canonical_json(page.data).encode("utf-8")) for page in schema_pages
+        )
+        assert identity_bytes <= schema_bytes * 0.4
+    finally:
+        await agent.close()
+
+
+async def test_identity_pages_by_cursor_and_reports_truthful_coverage(
+    tmp_path: Path,
+):
+    database = seed_wide_sqlite(tmp_path / "wide.sqlite")
+    agent = await Agent.create(
+        "catalog-describe-paging", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        names: list[str] = []
+        cursor: object = None
+        offsets: list[object] = []
+        while True:
+            arguments: dict[str, object] = {
+                "detail": "identity",
+                "source_id": source.id,
+                "limit": 20,
+            }
+            if cursor is not None:
+                arguments["cursor"] = cursor
+            data = (await _describe(agent, arguments)).data
+            coverage = _mapping(data["coverage"])
+            offsets.append(coverage["offset"])
+            assert coverage["total"] == WIDE_TABLE_COUNT
+            names.extend(
+                str(row["name"]) for row in _mapping_sequence(data["resources"])
+            )
+            cursor = data["next_cursor"]
+            assert data["truncated"] is (cursor is not None)
+            assert coverage["complete"] is False
+            if cursor is None:
+                break
+        assert offsets == [0, 20, 40]
+        assert len(names) == len(set(names)) == WIDE_TABLE_COUNT
+        assert names == sorted(names, key=str.casefold)
+
+        with pytest.raises(CatalogStoreError):
+            await _describe(
+                agent,
+                {
+                    "detail": "identity",
+                    "source_id": source.id,
+                    "cursor": "20." + "0" * 64,
+                },
+            )
+
+        queried = (
+            await _describe(
+                agent,
+                {"detail": "identity", "source_id": source.id, "query": "ledger"},
+            )
+        ).data
+        assert _mapping(queried["coverage"])["basis"] == "query"
+        assert [
+            str(row["name"]) for row in _mapping_sequence(queried["resources"])
+        ] == ["main.empty_ledger"]
+    finally:
+        await agent.close()
+
+
+async def test_identity_coverage_reports_permission_filtering(tmp_path: Path):
+    database = seed_wide_sqlite(tmp_path / "wide.sqlite")
+    agent = await Agent.create(
+        "catalog-describe-scope", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        resources = await agent.list_catalog_resources(source_id=source.id)
+        readable = frozenset(item.id for item in resources[:10])
+        service = agent._embedded._catalog_service
+        data = await service.describe(
+            CatalogDescribeRequest(
+                agent_id=agent.id,
+                detail=CatalogDescribeDetail.IDENTITY,
+                source_id=source.id,
+            ),
+            readable_resource_ids=readable,
+        )
+        coverage = _mapping(data["coverage"])
+        assert coverage["total"] == 10
+        assert coverage["scope_filtered"] is True
+        assert {
+            str(row["resource_id"]) for row in _mapping_sequence(data["resources"])
+        } == set(readable)
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize("detail", ["schema", "relationships"])
+async def test_describe_resolves_multi_hop_join_paths_in_one_call(
+    tmp_path: Path,
+    detail: str,
+):
+    database = seed_wide_sqlite(tmp_path / "wide.sqlite")
+    agent = await Agent.create(
+        "catalog-describe-paths", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        by_name = {
+            item.native_identity: item.id
+            for item in await agent.list_catalog_resources(source_id=source.id)
+        }
+        first, last = (
+            by_name[f"main.{WIDE_CHAIN[0]}"],
+            by_name[f"main.{WIDE_CHAIN[-1]}"],
+        )
+
+        data = (
+            await _describe(
+                agent,
+                {"detail": detail, "resource_ids": (first, last)},
+            )
+        ).data
+
+        assert data["detail"] == detail
+        paths = _mapping_sequence(data["paths"])
+        assert paths
+        path = paths[0]
+        assert len(cast(tuple[str, ...], path["relationship_ids"])) == 3
+        assert set(cast(tuple[str, ...], path["resource_ids"])) == {
+            by_name[f"main.{name}"] for name in WIDE_CHAIN
+        }
+        returned = {
+            str(row["resource_id"]): row for row in _mapping_sequence(data["resources"])
+        }
+        assert {by_name[f"main.{name}"] for name in WIDE_CHAIN} <= set(returned)
+        if detail == "relationships":
+            assert all("columns" not in row for row in returned.values())
+            assert all(
+                _mapping_sequence(item["field_pairs"])
+                for item in _mapping_sequence(data["relationships"])
+            )
+        else:
+            assert all("columns" in row for row in returned.values())
+    finally:
+        await agent.close()

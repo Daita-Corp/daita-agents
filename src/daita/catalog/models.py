@@ -40,6 +40,13 @@ CATALOG_TRAVERSAL_MAX_NODES = 1_000
 CATALOG_TRAVERSAL_MAX_PATHS = 8
 CATALOG_TRAVERSAL_MAX_RESOURCE_IDS = 16
 
+CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT = 100
+CATALOG_DESCRIBE_CURSOR_MAX_CHARACTERS = 80
+
+_TABULAR_REPORTED_ESTIMATE_FIELDS = frozenset(
+    {"size_bytes_estimate", "statistics_as_of"}
+)
+
 _RecordT = TypeVar("_RecordT")
 
 
@@ -465,17 +472,30 @@ class TabularIndex:
 
 @dataclass(frozen=True, slots=True)
 class TabularFacet:
-    """Typed structural table facts plus a separate nonstructural estimate."""
+    """Typed structural table facts plus separate nonstructural estimates.
+
+    Estimates are approximate discovery-time statistics reported by the
+    connector. They never change structural revisions and are never exact
+    counts.
+    """
 
     columns: tuple[TabularColumn, ...]
     indexes: tuple[TabularIndex, ...] = ()
     row_count_estimate: int | None = None
+    size_bytes_estimate: int | None = None
+    statistics_as_of: datetime | None = None
 
     def __post_init__(self) -> None:
         columns = _record_tuple(self.columns, TabularColumn, "tabular columns")
         indexes = _record_tuple(self.indexes, TabularIndex, "tabular indexes")
         if self.row_count_estimate is not None:
             _non_negative_int(self.row_count_estimate, "tabular row_count_estimate")
+        if self.size_bytes_estimate is not None:
+            _non_negative_int(self.size_bytes_estimate, "tabular size_bytes_estimate")
+        if self.statistics_as_of is not None:
+            if not isinstance(self.statistics_as_of, datetime):
+                raise TypeError("tabular statistics_as_of must be a datetime")
+            _aware(self.statistics_as_of, "tabular statistics_as_of")
 
         column_names = [column.name for column in columns]
         column_ordinals = [column.ordinal for column in columns]
@@ -527,22 +547,39 @@ class TabularFacet:
         }
 
     def to_payload(self) -> dict[str, object]:
-        """Return the typed facet projection, including nonstructural estimates."""
+        """Return the typed facet projection, including nonstructural estimates.
 
-        return {
+        Size and statistics-freshness estimates are present only when the
+        connector reported them, so payloads without them keep their shape.
+        """
+
+        payload: dict[str, object] = {
             **self.structural_payload(),
             "row_count_estimate": self.row_count_estimate,
         }
+        if self.size_bytes_estimate is not None:
+            payload["size_bytes_estimate"] = self.size_bytes_estimate
+        if self.statistics_as_of is not None:
+            payload["statistics_as_of"] = self.statistics_as_of.isoformat()
+        return payload
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> TabularFacet:
         """Strictly decode one current catalog tabular-facet payload."""
 
+        if not isinstance(payload, Mapping):
+            raise TypeError("tabular facet payload must be an object")
+        reported = frozenset(payload) & _TABULAR_REPORTED_ESTIMATE_FIELDS
         value = _exact_payload_fields(
             payload,
-            frozenset({"columns", "indexes", "row_count_estimate"}),
+            frozenset({"columns", "indexes", "row_count_estimate"}) | reported,
             "tabular facet payload",
         )
+        raw_as_of = value.get("statistics_as_of")
+        if raw_as_of is not None and not isinstance(raw_as_of, str):
+            raise TypeError("tabular facet payload statistics_as_of must be text")
+        if any(value[name] is None for name in reported):
+            raise ValueError("tabular facet payload omits unreported estimates")
         raw_columns = value["columns"]
         raw_indexes = value["indexes"]
         if not isinstance(raw_columns, tuple):
@@ -563,7 +600,27 @@ class TabularFacet:
                 for item in raw_indexes
             ),
             row_count_estimate=cast(int | None, value["row_count_estimate"]),
+            size_bytes_estimate=cast(int | None, value.get("size_bytes_estimate")),
+            statistics_as_of=(
+                None if raw_as_of is None else datetime.fromisoformat(raw_as_of)
+            ),
         )
+
+    def estimates_payload(self, observed_at: datetime) -> dict[str, object] | None:
+        """Project labeled approximate statistics, or None when none were reported."""
+
+        if self.row_count_estimate is None and self.size_bytes_estimate is None:
+            return None
+        return {
+            "approximate_row_count": self.row_count_estimate,
+            "approximate_size_bytes": self.size_bytes_estimate,
+            "statistics_as_of": (
+                None
+                if self.statistics_as_of is None
+                else self.statistics_as_of.isoformat()
+            ),
+            "discovered_at": observed_at.isoformat(),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1283,6 +1340,95 @@ class CatalogSchemaRequest:
                 f"{CATALOG_TRAVERSAL_MAX_DEPTH}"
             )
         object.__setattr__(self, "resource_ids", resource_ids)
+
+
+class CatalogDescribeDetail(str, Enum):
+    """How much current structural truth one catalog description projects."""
+
+    IDENTITY = "identity"
+    SCHEMA = "schema"
+    RELATIONSHIPS = "relationships"
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogDescribeRequest:
+    """Bounded selection for one current catalog description.
+
+    ``identity`` lists resource identities without fields; with only an exact
+    ``source_id`` it enumerates every admitted table in that source.
+    ``schema`` projects SQL-ready fields and the join paths among the
+    selection. ``relationships`` projects only join paths and relationships.
+    """
+
+    agent_id: str
+    detail: CatalogDescribeDetail = CatalogDescribeDetail.SCHEMA
+    query: str | None = None
+    resource_ids: tuple[str, ...] = ()
+    source_id: str | None = None
+    limit: int | None = None
+    cursor: str | None = None
+
+    def __post_init__(self) -> None:
+        _required_text(self.agent_id, "catalog describe agent_id")
+        if not isinstance(self.detail, CatalogDescribeDetail):
+            raise TypeError("catalog describe detail must be a CatalogDescribeDetail")
+        if self.query is not None:
+            if not isinstance(self.query, str):
+                raise TypeError("catalog describe query must be a string")
+            if not self.query.strip():
+                raise ValueError("catalog describe query must be non-empty")
+            if len(self.query) > CATALOG_TOOL_QUERY_MAX_CHARACTERS:
+                raise ValueError(
+                    "catalog describe query exceeds "
+                    f"{CATALOG_TOOL_QUERY_MAX_CHARACTERS} characters"
+                )
+        resource_ids = _text_tuple(
+            self.resource_ids,
+            "catalog describe resource_ids",
+            maximum_items=CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+            maximum_characters=CATALOG_RESOURCE_ID_MAX_CHARACTERS,
+        )
+        _optional_text(
+            self.source_id,
+            "catalog describe source_id",
+            maximum=CATALOG_SOURCE_ID_MAX_CHARACTERS,
+        )
+        _optional_text(
+            self.cursor,
+            "catalog describe cursor",
+            maximum=CATALOG_DESCRIBE_CURSOR_MAX_CHARACTERS,
+        )
+        identity = self.detail is CatalogDescribeDetail.IDENTITY
+        if (
+            self.query is None
+            and not resource_ids
+            and not (identity and self.source_id is not None)
+        ):
+            raise ValueError(
+                "catalog describe requires a query, resource IDs, or an exact "
+                "source_id for identity detail"
+            )
+        if self.cursor is not None and not identity:
+            raise ValueError("catalog describe cursor applies only to identity detail")
+        maximum = CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT if identity else CATALOG_MAX_LIMIT
+        if self.limit is not None and (
+            not isinstance(self.limit, int)
+            or isinstance(self.limit, bool)
+            or not 1 <= self.limit <= maximum
+        ):
+            raise ValueError(
+                f"catalog describe {self.detail.value} limit must be from 1 "
+                f"through {maximum}"
+            )
+        object.__setattr__(self, "resource_ids", resource_ids)
+
+    @property
+    def effective_limit(self) -> int:
+        if self.limit is not None:
+            return self.limit
+        if self.detail is CatalogDescribeDetail.IDENTITY:
+            return CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT
+        return CATALOG_TOOL_DEFAULT_LIMIT
 
 
 @dataclass(frozen=True, slots=True)

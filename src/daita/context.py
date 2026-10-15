@@ -27,10 +27,8 @@ from .capability_runtime import (
     StepToolProjection,
 )
 from .catalog.capabilities import (
-    CATALOG_INSPECT_EVIDENCE_KIND,
-    CATALOG_SCHEMA_EVIDENCE_KIND,
+    CATALOG_DESCRIBE_EVIDENCE_KIND,
     CATALOG_SEARCH_EVIDENCE_KIND,
-    CATALOG_TRAVERSE_EVIDENCE_KIND,
 )
 from .catalog.models import (
     CATALOG_CONTEXT_DEFAULT_LIMIT,
@@ -138,13 +136,7 @@ _HISTORICAL_ANSWER_EDGE_UTF8_BYTES = 256
 # priority even when the aggregate history window has unused space.
 _MAXIMUM_FULL_HISTORY_TURN_UTF8_BYTES = 4_096
 _MAXIMUM_MCP_HISTORY_PREVIEW_UTF8_BYTES = 2_048
-_CATALOG_EVIDENCE_KINDS = frozenset(
-    {
-        CATALOG_SEARCH_EVIDENCE_KIND,
-        CATALOG_INSPECT_EVIDENCE_KIND,
-        CATALOG_TRAVERSE_EVIDENCE_KIND,
-    }
-)
+_CATALOG_EVIDENCE_KINDS = frozenset({CATALOG_SEARCH_EVIDENCE_KIND})
 _QUERY_EVIDENCE_KINDS = frozenset(
     {
         DATA_QUERY_EVIDENCE_KIND,
@@ -1972,10 +1964,15 @@ def _project_historical_result(
     data = block.output.get("data")
     if not isinstance(data, Mapping):
         return None, True, False
-    if kind == CATALOG_SCHEMA_EVIDENCE_KIND:
+    if kind == CATALOG_DESCRIBE_EVIDENCE_KIND and data.get("detail") != "schema":
+        # Identity listings and relationship-only paths are cheap to re-read;
+        # only schema detail remains reusable continuity evidence.
+        return None, True, False
+    if kind == CATALOG_DESCRIBE_EVIDENCE_KIND:
         compact = _selected_result_fields(
             data,
             (
+                "detail",
                 "bounds",
                 "include_relationships",
                 "relationships",
@@ -2049,7 +2046,7 @@ def _project_historical_result(
         "state": "success",
         "data": compact,
     }
-    if kind == CATALOG_SCHEMA_EVIDENCE_KIND:
+    if kind == CATALOG_DESCRIBE_EVIDENCE_KIND:
         return compact_output, dict(block.output) != compact_output, False
     if continuity:
         return compact_output, dict(block.output) != compact_output, False
@@ -2216,7 +2213,7 @@ def _validate_schema_history_turn(
         for block in message.content:
             if not isinstance(block, ToolResultBlock):
                 continue
-            if block.output.get("kind") != CATALOG_SCHEMA_EVIDENCE_KIND:
+            if block.output.get("kind") != CATALOG_DESCRIBE_EVIDENCE_KIND:
                 continue
             data = block.output.get("data")
             if not isinstance(data, Mapping) or not _schema_history_matches_current(
@@ -3121,16 +3118,9 @@ def _tool_guidance(
             )
             instructions.append(
                 reference(
-                    "catalog.schema",
-                    "catalog_schema",
-                    "missing database schemas and bounded relationship paths",
-                )
-            )
-            instructions.append(
-                reference(
-                    "catalog.traverse",
-                    "catalog_traverse",
-                    "relationship paths still unresolved after schema evidence",
+                    "catalog.describe",
+                    "catalog_describe",
+                    "missing database schemas and resolved relationship paths",
                 )
             )
         if (
@@ -3195,22 +3185,12 @@ def _tool_guidance(
             "Automation grants apply to scheduled execution. Use the action's own exact argument schema "
             "for its destination. Framework inbox destinations govern report delivery, not external action targets."
         )
-    if "catalog.schema" in capability_ids:
+    if "catalog.describe" in capability_ids:
         instructions.append(
-            "Catalog: use context IDs; catalog_schema first for SQL (bounded bridges and paths) when current "
-            "authenticated evidence does not already resolve structure. "
-            "Do not repeat schema reads for sufficient current evidence."
-        )
-        instructions.append(
-            reference(
-                "catalog.traverse",
-                "catalog_traverse",
-                "reported unresolved paths after schema inspection; never call both together",
-            )
-        )
-    if "catalog.inspect" in capability_ids:
-        instructions.append(
-            "catalog_inspect gives full facets and freshness for an exact resource."
+            "Catalog: use context IDs; catalog_describe detail=schema before SQL when current "
+            "authenticated evidence does not already resolve structure; it resolves join paths "
+            "in one call. detail=identity with only source_id lists every admitted table without "
+            "columns. Do not repeat reads for sufficient current evidence."
         )
     if "catalog.search" in capability_ids:
         instructions.append(

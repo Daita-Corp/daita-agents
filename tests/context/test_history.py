@@ -1055,7 +1055,7 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
     source_revision = "catalog:sha256:" + ("d" * 64)
     schema_call = ToolCall(
         id="schema-history-call",
-        name="catalog_schema",
+        name="catalog_describe",
         arguments={"resource_ids": (resource_id,)},
     )
     record = _conversation_record(
@@ -1075,9 +1075,10 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
                     ToolResultBlock(
                         call_id=schema_call.id,
                         output={
-                            "kind": "catalog.schema_slice",
+                            "kind": "catalog.description",
                             "data": {
                                 "bounds": {"resources": 12},
+                                "detail": "schema",
                                 "include_relationships": True,
                                 "relationships": (),
                                 "resources": (
@@ -1122,7 +1123,7 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
         ),
     )
     prior = _project_completed_history((record,))
-    assert "catalog.schema_slice" in repr(prior)
+    assert "catalog.description" in repr(prior)
     assert "paid_revenue" in repr(prior)
 
     current_resource = {
@@ -1167,7 +1168,7 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
         step=1,
     )
     unchanged_text = repr(unchanged.messages)
-    assert "catalog.schema_slice" in unchanged_text
+    assert "catalog.description" in unchanged_text
     assert "paid_revenue" in unchanged_text
 
     changed_resource = {
@@ -1190,7 +1191,7 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
         step=1,
     )
     changed_text = repr(changed.messages)
-    assert "catalog.schema_slice" not in changed_text
+    assert "catalog.description" not in changed_text
     assert "'name', 'paid_revenue'" not in changed_text
     assert _HISTORY_OMISSION_MARKER in changed_text
 
@@ -1205,5 +1206,5 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
         step=1,
     )
     missing_source_text = repr(missing_source.messages)
-    assert "catalog.schema_slice" not in missing_source_text
+    assert "catalog.description" not in missing_source_text
     assert _HISTORY_OMISSION_MARKER in missing_source_text

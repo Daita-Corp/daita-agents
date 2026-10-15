@@ -9,9 +9,7 @@ import pytest
 
 import daita.catalog.service as catalog_service
 from daita import Agent, SQLiteSource
-from daita.capabilities import ToolExecution
 from daita.catalog import (
-    CATALOG_TRAVERSE_EVIDENCE_KIND,
     CatalogResource,
     CatalogResourceRevision,
     CatalogSync,
@@ -825,39 +823,6 @@ async def test_traversal_reuses_one_compiled_index_per_exact_generation(
 
     assert first == second
     assert compile_count == 1
-
-
-async def test_traversal_capability_validates_the_explicit_truncation_contract(
-    graph_agent,
-):
-    agent, source = graph_agent
-    graph = await _commit_graph(
-        agent,
-        source.id,
-        nodes=("a", "b"),
-        edges=(_EdgeSpec("a-b", "a", "b"),),
-        sync_id="capability-output-1",
-    )
-    registry = agent._embedded._capabilities
-    _, capability = registry.resolve_tool("catalog_traverse")
-    _, executor = registry.resolve_execution(capability.id)
-
-    output = await executor.execute(
-        ToolExecution(
-            run_id="catalog-traversal-capability",
-            call_id="catalog-traversal-call",
-            capability_id=capability.id,
-            arguments={
-                "from_resource_ids": (graph.resource_ids["a"],),
-                "to_resource_ids": (graph.resource_ids["b"],),
-            },
-        )
-    )
-
-    assert output.kind == CATALOG_TRAVERSE_EVIDENCE_KIND
-    assert output.data["truncated"] is False
-    assert output.data["truncation_reason"] is None
-    assert registry.validate_output(capability.id, output) == output
 
 
 async def test_traversal_retries_one_generation_conflict_then_returns_catalog_error(

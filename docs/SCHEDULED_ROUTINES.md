@@ -283,7 +283,7 @@ definition. For example:
   "allowed_source_ids": ["source:..."],
   "allowed_connector_binding_ids": [],
   "allowed_resource_ids": ["catalog-resource:..."],
-  "allowed_capability_ids": ["catalog.inspect", "data.query"],
+  "allowed_capability_ids": ["catalog.describe", "data.query"],
   "sensitivity_ceiling": "internal",
   "outcome_contract": {
     "require_terminal_conclusion": true,
@@ -415,5 +415,10 @@ the same proposal: `data.preview_update_rows` for `data.update_rows`, or
 `data.preview_upsert_rows` for `data.upsert_rows`. Admission does not perform or
 authorize a future preview; every occurrence must obtain its own authenticated
 preview. Structural discovery is separate. A natural assignment that needs table
-structure must explicitly request bounded `catalog.schema` access to its approved
+structure must explicitly request bounded `catalog.describe` access to its approved
 source/table. Daita never adds that permission automatically.
+
+Compatibility: `catalog.schema`, `catalog.inspect` and `catalog.traverse` were
+replaced by `catalog.describe` without aliases. A retained routine or job whose
+allowed capabilities or precheck name a removed capability fails ordinary
+revalidation; save it again with `catalog.describe`.

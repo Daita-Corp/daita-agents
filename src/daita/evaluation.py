@@ -22,9 +22,7 @@ EVALUATION_MAX_EVENTS_PER_OUTCOME = 8_192
 _LEARNING_REVIEW_MAX_DURATION_MS = int(LEARNING_REVIEW_MAX_WALL_TIME_SECONDS * 1_000)
 
 _CASE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
-_CATALOG_TOOLS = frozenset(
-    {"catalog_search", "catalog_schema", "catalog_inspect", "catalog_traverse"}
-)
+_CATALOG_TOOLS = frozenset({"catalog_search", "catalog_describe"})
 _SQL_TOOLS = frozenset({"data_query"})
 _LEARNING_WRITE_TOOLS = frozenset(
     {"memory_set", "semantic_save", "semantic_delete", "skill_save", "skill_delete"}

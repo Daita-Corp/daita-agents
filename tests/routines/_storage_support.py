@@ -48,7 +48,7 @@ def routine_record(
     instruction = "Read the exact admitted resource and report its current value."
     return ScheduledRoutine(
         contract_bindings=frozen_execution_bindings(
-            ("catalog.inspect", "data.query"), ("resource-1",), ("mock:routine",)
+            ("catalog.describe", "data.query"), ("resource-1",), ("mock:routine",)
         ),
         routine_id=routine_id,
         agent_id=agent_id,
@@ -66,7 +66,7 @@ def routine_record(
         allowed_source_ids=("source-1",),
         allowed_connector_binding_ids=(),
         allowed_resource_ids=("resource-1",),
-        allowed_capability_ids=("catalog.inspect", "data.query"),
+        allowed_capability_ids=("catalog.describe", "data.query"),
         allowed_access_modes=frozenset({AccessMode.READ}),
         allowed_operational_effects=frozenset({OperationalEffect.NONE}),
         sensitivity_ceiling=ModelSensitivity.INTERNAL,
@@ -104,7 +104,7 @@ def routine_record(
 def execution_scope(occurrence: RoutineOccurrence) -> ExecutionScope:
     return ExecutionScope(
         contract_bindings=frozen_execution_bindings(
-            ("catalog.inspect", "data.query"), ("resource-1",), ("mock:routine",)
+            ("catalog.describe", "data.query"), ("resource-1",), ("mock:routine",)
         ),
         scope_id=f"scope:{occurrence.occurrence_id}",
         revision=1,
@@ -115,7 +115,7 @@ def execution_scope(occurrence: RoutineOccurrence) -> ExecutionScope:
         job_revision=None,
         allowed_source_ids=("source-1",),
         allowed_resource_ids=("resource-1",),
-        allowed_capability_ids=("catalog.inspect", "data.query"),
+        allowed_capability_ids=("catalog.describe", "data.query"),
         allowed_access_modes=frozenset({AccessMode.READ}),
         allowed_operational_effects=frozenset({OperationalEffect.NONE}),
         sensitivity_ceiling=ModelSensitivity.INTERNAL,

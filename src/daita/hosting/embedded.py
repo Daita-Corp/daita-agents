@@ -88,8 +88,7 @@ from ..capabilities import (
 )
 from ..capability_runtime import CapabilityRuntime
 from ..catalog.capabilities import (
-    CATALOG_INSPECT_CAPABILITY_ID,
-    CATALOG_SCHEMA_CAPABILITY_ID,
+    CATALOG_DESCRIBE_CAPABILITY_ID,
     catalog_declarations,
 )
 from ..catalog.models import (
@@ -417,8 +416,7 @@ _CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS = LEARNING_REVIEW_MAX_TOTAL_TOKENS // 4
 _SOURCE_ALIAS_SEPARATOR = re.compile(r"[^a-z0-9]+")
 _T = TypeVar("_T")
 _STAGE_C_ALLOWED_CAPABILITY_IDS = (
-    CATALOG_INSPECT_CAPABILITY_ID,
-    CATALOG_SCHEMA_CAPABILITY_ID,
+    CATALOG_DESCRIBE_CAPABILITY_ID,
     DATA_QUERY_CAPABILITY_ID,
     JOB_INSPECT_CAPABILITY_ID,
     JOB_READ_RESULTS_CAPABILITY_ID,

@@ -246,14 +246,14 @@ async def test_native_routine_fixture_ceiling_must_fit_internal_target(
                 scenario, "Keep this company current now and each Monday."
             )
             assert set(natural.allowed_capability_ids) == {
-                "catalog.schema",
+                "catalog.describe",
                 "data.preview_upsert_rows",
                 "data.upsert_rows",
             }
             assert natural.allowed_source_ids == routine.allowed_source_ids
             assert natural.allowed_resource_ids == routine.allowed_resource_ids
             assert natural.capability_grants == routine.capability_grants
-            assert "catalog_schema" not in natural.authorized_instruction
+            assert "catalog_describe" not in natural.authorized_instruction
             assert "preview_fingerprint" not in natural.authorized_instruction
             assert len(provider.requests) == 1 and not await agent.list_effects()
     finally:
@@ -482,7 +482,7 @@ async def test_routine_approval_checks_grant_and_validated_proposal(tamper, prof
     }
     if profile == "user_flow":
         proposal["allowed_capability_ids"] = [
-            "catalog.schema",
+            "catalog.describe",
             "data.preview_upsert_rows",
             "data.upsert_rows",
         ]

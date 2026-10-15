@@ -82,14 +82,13 @@ class _GroundedFixtureProvider:
                 tool_calls=(
                     ToolCall(
                         id="regional-schema",
-                        name="catalog_schema",
+                        name="catalog_describe",
                         arguments={
                             "query": (
                                 "customers regions orders order_items products "
                                 "region_code total_amount unit_cost unit_price"
                             ),
                             "limit": 8,
-                            "include_relationships": True,
                         },
                     ),
                 ),
