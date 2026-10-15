@@ -20,6 +20,7 @@ from tests.support.job_benchmarks import (
     assert_on_demand_invocation,
     results_for,
 )
+from tests.support.live_billing import live_model_id
 from tests.support.mcp_routine_harness import (
     AUTHORIZATION,
     CONTENT,
@@ -203,7 +204,7 @@ async def test_live_model_authors_grant_and_runs_immediate_and_weekly_occurrence
         )
         assert routine.allowed_source_ids == routine.allowed_resource_ids == ()
         assert routine.skill_bindings == ()
-        assert routine.eligible_model_routes == (model_id,)
+        assert routine.eligible_model_routes == (live_model_id(model_id),)
         assert routine.outcome_contract.require_exact_source_bindings
         assert routine.outcome_contract.artifact_requirements == ()
         assert routine.maximum_consecutive_failures == 1

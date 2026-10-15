@@ -28,7 +28,6 @@ from daita import (
     ReportingMode,
     ScheduledRoutineDraft,
     SQLiteSource,
-    create_llm_provider,
 )
 from daita.artifacts.models import ArtifactAuthorship
 from daita.catalog.capabilities import CATALOG_DESCRIBE_CAPABILITY_ID
@@ -43,9 +42,9 @@ from daita.llm.models import (
     ModelUsage,
 )
 from daita.llm.pricing import CostEstimate
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import LoopExitKind, RunOrigin
+from tests.support.live_billing import cost_cap, live_provider, subscription_billing
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_STAGE_D2_OUTCOME"
@@ -143,24 +142,21 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
         await seed.close()
 
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
-    provider_name = model_id.partition(":")[0]
-    if provider_name not in _API_PROVIDERS:
-        pytest.fail(
-            f"{_MODEL_ID} must name an API-backed provider: "
-            + ", ".join(sorted(_API_PROVIDERS))
-        )
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name one reviewed tool-capable model")
-    api_key = os.environ.get(_MODEL_KEY)
-    if api_key is None or not api_key.strip():
-        pytest.fail(f"{_MODEL_KEY} must be set for the authorized live test")
-    live = create_llm_provider(
+    if not subscription_billing():
+        if model_id.partition(":")[0] not in _API_PROVIDERS:
+            pytest.fail(
+                f"{_MODEL_ID} must name an API-backed provider: "
+                + ", ".join(sorted(_API_PROVIDERS))
+            )
+        api_key = os.environ.get(_MODEL_KEY)
+        if api_key is None or not api_key.strip():
+            pytest.fail(f"{_MODEL_KEY} must be set for the authorized live test")
+    profile, live = live_provider(
         model_id,
-        api_key=api_key,
-        max_output_tokens=min(profile.max_output_tokens, 1_024),
+        api_key=lambda: os.environ[_MODEL_KEY],
+        max_output_tokens=1_024,
     )
-    cost_limit = _cost_limit()
+    cost_limit = cost_cap(_cost_limit())
     limits = LoopLimits(max_estimated_cost_usd=cost_limit)
     agent = await Agent.open(
         "stage-d2-live",
@@ -205,7 +201,9 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
                 per_run_max_tokens=limits.max_total_tokens,
                 per_run_max_cost_usd=cost_limit,
                 cumulative_max_tokens=limits.max_total_tokens * 2,
-                cumulative_max_cost_usd=cost_limit * 2,
+                cumulative_max_cost_usd=(
+                    None if cost_limit is None else cost_limit * 2
+                ),
                 cumulative_max_attempts=2,
                 cumulative_max_occurrences=2,
                 maximum_consecutive_failures=1,

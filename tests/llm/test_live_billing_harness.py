@@ -11,7 +11,11 @@ import pytest
 from daita.llm.models import ModelUsage
 from daita.llm.subscription_auth import CodexOAuthCredential
 from daita.security import KeychainSecretProvider, SecretReference
-from tests.support import live_billing, postgresql_live_harness as postgres_harness
+from tests.support import (
+    live_billing,
+    mcp_routine_harness as phase_f_harness,
+    postgresql_live_harness as postgres_harness,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -181,3 +185,23 @@ def test_postgresql_subscription_route_uses_only_the_test_keychain(
         isinstance(provider, KeychainSecretProvider)
         for provider in postgres_harness.live_secret_provider().providers
     )
+
+
+async def test_phase_f_subscription_route_drops_only_dollar_ceilings(
+    monkeypatch: pytest.MonkeyPatch, keyring_client: _Keyring
+) -> None:
+    monkeypatch.setenv(phase_f_harness.AUTHORIZATION, "1")
+    monkeypatch.delenv("DAITA_PHASE_F_LIVE_LLM_API_KEY", raising=False)
+    monkeypatch.delenv("DAITA_PHASE_F_LIVE_OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv(live_billing.BILLING_ENV, "subscription")
+    keyring_client.values[
+        (live_billing.KEYCHAIN_SERVICE, live_billing.CREDENTIAL.name)
+    ] = _credential()
+    limits = phase_f_harness.limits()
+    assert limits.max_estimated_cost_usd is None
+    assert limits.max_total_tokens == phase_f_harness.LoopLimits().max_total_tokens
+    profile, provider = phase_f_harness.live_provider("openai:gpt-5.6-terra")
+    try:
+        assert profile.id == provider.provider_id == "codex:gpt-5.6-terra"
+    finally:
+        await provider.close()

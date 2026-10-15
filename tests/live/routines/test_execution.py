@@ -39,7 +39,6 @@ from daita import (
     ScheduledRoutine,
     ScheduledRoutineDraft,
     SQLiteSource,
-    create_llm_provider,
 )
 from daita._json import canonical_json
 from daita.capabilities import (
@@ -66,7 +65,6 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.pricing import CostEstimate
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
     ManagedModelProvider,
     StreamingModelProvider,
@@ -82,6 +80,7 @@ from daita.loop.models import (
 )
 from daita.routines import RoutineOccurrenceDisposition, RoutineSlotKind
 from tests.support.distribution import no_artifact_outcome_contract
+from tests.support.live_billing import cost_cap, live_provider, subscription_billing
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_STAGE_D1_ROUTINES"
@@ -242,26 +241,23 @@ def _cost_limit() -> Decimal:
 
 
 def _limits() -> LoopLimits:
-    return LoopLimits(max_estimated_cost_usd=_cost_limit())
+    return LoopLimits(max_estimated_cost_usd=cost_cap(_cost_limit()))
 
 
 def _live_provider() -> tuple[ModelProfile, _RecordingProvider]:
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
-    provider_name = model_id.partition(":")[0]
-    if provider_name not in _API_PROVIDERS:
-        pytest.fail(
-            f"{_MODEL_ID} must name an API-backed provider: "
-            + ", ".join(sorted(_API_PROVIDERS))
-        )
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name one release-reviewed tool-capable model")
-    if not profile.supports_streaming:
-        pytest.fail(f"{_MODEL_ID} must name a model with reviewed streaming support")
-    delegate = create_llm_provider(
+    if not subscription_billing():
+        if model_id.partition(":")[0] not in _API_PROVIDERS:
+            pytest.fail(
+                f"{_MODEL_ID} must name an API-backed provider: "
+                + ", ".join(sorted(_API_PROVIDERS))
+            )
+        _required_environment(_MODEL_KEY)
+    profile, delegate = live_provider(
         model_id,
-        api_key=_required_environment(_MODEL_KEY),
-        max_output_tokens=min(profile.max_output_tokens, 1_024),
+        api_key=lambda: _required_environment(_MODEL_KEY),
+        max_output_tokens=1_024,
+        require_streaming=True,
     )
     return profile, _RecordingProvider(delegate)
 
@@ -426,7 +422,7 @@ async def _run_live_routine(
     assert origin.run.conversation_id is not None
     conversation_id = origin.run.conversation_id
     now = datetime.now(UTC)
-    cost_limit = _cost_limit()
+    cost_limit = scenario.limits.max_estimated_cost_usd
     proposal = await agent.propose_routine(
         ScheduledRoutineDraft(
             origin_run_id=scenario.origin_run_id,
@@ -452,7 +448,7 @@ async def _run_live_routine(
             per_run_max_tokens=scenario.limits.max_total_tokens,
             per_run_max_cost_usd=cost_limit,
             cumulative_max_tokens=scenario.limits.max_total_tokens * 2,
-            cumulative_max_cost_usd=cost_limit * 2,
+            cumulative_max_cost_usd=None if cost_limit is None else cost_limit * 2,
             cumulative_max_attempts=2,
             cumulative_max_occurrences=2,
             maximum_consecutive_failures=1,

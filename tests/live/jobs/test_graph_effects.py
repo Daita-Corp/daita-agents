@@ -15,7 +15,6 @@ from daita import (
     GraphState,
     LoopLimits,
     MCPToolSelection,
-    create_llm_provider,
 )
 from daita._json import canonical_json
 from daita.capabilities import (
@@ -27,10 +26,10 @@ from daita.capabilities import (
 )
 from daita.jobs.graph.models import TaskRole
 from daita.llm.models import ModelProfile, ModelSensitivity, ToolResultBlock
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import ManagedModelProvider
 from daita.loop.models import LoopExitKind
 from tests.support.graph_effects_live import create_native_graph_effect_fixture
+from tests.support.live_billing import cost_cap, live_provider, subscription_billing
 from tests.support.mcp_actions import ActionFixture
 from tests.support.workspace import workspace_for
 
@@ -77,21 +76,19 @@ def _cost_limit() -> Decimal:
 def _live_provider() -> tuple[ManagedModelProvider, ModelProfile, LoopLimits]:
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
     provider_name = model_id.partition(":")[0]
-    if provider_name not in _API_PROVIDERS:
-        pytest.fail(f"{_MODEL_ID} must name an API-backed provider")
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name a reviewed tool-capable model")
     provider_key_name = f"DAITA_GRAPH_EFFECTS_LIVE_{provider_name.upper()}_API_KEY"
-    api_key = os.environ.get(provider_key_name) or os.environ.get(_MODEL_KEY)
-    if api_key is None or not api_key.strip():
-        pytest.skip(
-            f"{provider_key_name} or {_MODEL_KEY} is unavailable for the authorized smoke"
-        )
-    provider = create_llm_provider(
+    if not subscription_billing():
+        if provider_name not in _API_PROVIDERS:
+            pytest.fail(f"{_MODEL_ID} must name an API-backed provider")
+        api_key = os.environ.get(provider_key_name) or os.environ.get(_MODEL_KEY)
+        if api_key is None or not api_key.strip():
+            pytest.skip(
+                f"{provider_key_name} or {_MODEL_KEY} is unavailable for the authorized smoke"
+            )
+    profile, provider = live_provider(
         model_id,
-        api_key=api_key,
-        max_output_tokens=min(profile.max_output_tokens, 2_048),
+        api_key=lambda: os.environ.get(provider_key_name) or os.environ[_MODEL_KEY],
+        max_output_tokens=2_048,
     )
     return (
         provider,
@@ -99,7 +96,7 @@ def _live_provider() -> tuple[ManagedModelProvider, ModelProfile, LoopLimits]:
         LoopLimits(
             max_steps=12,
             max_total_tokens=40_000,
-            max_estimated_cost_usd=_cost_limit(),
+            max_estimated_cost_usd=cost_cap(_cost_limit()),
         ),
     )
 

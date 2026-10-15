@@ -10,7 +10,6 @@ from pathlib import Path
 
 import pytest
 
-from daita import create_llm_provider
 from daita.context import AgentContextBuilder
 from daita.jobs.graph.models import (
     BudgetAmount,
@@ -22,8 +21,8 @@ from daita.jobs.graph.models import (
     TaskState,
     canonical_digest,
 )
-from daita.llm.profiles import reviewed_model_profile
 from tests.support.conversations import CatalogSpy
+from tests.support.live_billing import cost_cap, live_provider, subscription_billing
 from tests.support.model_graph_integration import ModelGraphIntegration
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_GRAPH_PLANNER"
@@ -63,19 +62,16 @@ async def test_live_planner_uses_typed_replacement_without_production_cutover(
     tmp_path: Path,
 ) -> None:
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
-    provider_name = model_id.partition(":")[0]
-    if provider_name not in _API_PROVIDERS:
-        pytest.fail(f"{_MODEL_ID} must name an API-backed provider")
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name a reviewed tool-capable model")
-    api_key = os.environ.get(_MODEL_KEY)
-    if api_key is None or not api_key.strip():
-        pytest.fail(f"{_MODEL_KEY} must be set for the authorized live test")
-    provider = create_llm_provider(
+    if not subscription_billing():
+        if model_id.partition(":")[0] not in _API_PROVIDERS:
+            pytest.fail(f"{_MODEL_ID} must name an API-backed provider")
+        api_key = os.environ.get(_MODEL_KEY)
+        if api_key is None or not api_key.strip():
+            pytest.fail(f"{_MODEL_KEY} must be set for the authorized live test")
+    profile, provider = live_provider(
         model_id,
-        api_key=api_key,
-        max_output_tokens=min(profile.max_output_tokens, 2_048),
+        api_key=lambda: os.environ[_MODEL_KEY],
+        max_output_tokens=2_048,
     )
     integration = await ModelGraphIntegration.open(
         tmp_path,
@@ -85,8 +81,8 @@ async def test_live_planner_uses_typed_replacement_without_production_cutover(
     assert loop is not None
     loop._model = provider
     loop._context_builder = AgentContextBuilder(CatalogSpy(), profile=profile)
-    # Graph jobs carry no dollar cap; this host-wide cap only guards live spend.
-    loop._limits = replace(loop._limits, max_estimated_cost_usd=_cost_limit())
+    # Graph jobs carry no dollar cap; this host-wide cap only guards API spend.
+    loop._limits = replace(loop._limits, max_estimated_cost_usd=cost_cap(_cost_limit()))
     try:
         admission = integration.build(
             model_route_id=provider.provider_id,
