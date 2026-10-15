@@ -33,10 +33,19 @@ from daita.routines.capabilities import ROUTINE_CREATE_CAPABILITY_ID
 from daita.security import (
     CompositeSecretProvider,
     EnvironmentSecretProvider,
+    SecretProvider,
     SecretReference,
 )
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
 from tests.support.job_benchmarks import RecordingProvider
+from tests.support.live_billing import (
+    CREDENTIAL as LIVE_CREDENTIAL,
+    SUBSCRIPTION_PROVIDER,
+    api_equivalent_cost,
+    keychain as live_keychain,
+    live_model_id,
+    subscription_billing,
+)
 from tests.support.paths import REPO_ROOT
 from tests.support.postgresql_live import _Secrets
 from tests.support.workspace import workspace_for
@@ -88,6 +97,15 @@ def evaluation_profile():
     return profile
 
 
+def live_secret_provider():
+    """Resolve fixture secrets, adding the test keychain only for subscriptions."""
+
+    providers: list[SecretProvider] = [EnvironmentSecretProvider(), _Secrets()]
+    if subscription_billing():
+        providers.insert(0, live_keychain())
+    return CompositeSecretProvider(providers)
+
+
 def live_config(model_id, *, limits=LIMITS):
     # Recheck at construction: a key or direct fixture invocation grants nothing.
     if os.environ.get(AUTHORIZATION) != "1":
@@ -96,23 +114,29 @@ def live_config(model_id, *, limits=LIMITS):
         raise ValueError(
             "Live diagnostics require an explicit positive finite cost cap"
         )
+    model_id = live_model_id(model_id)
     profile = reviewed_model_profile(model_id)
     provider = model_id.partition(":")[0]
-    if (
-        provider not in {"openai", "anthropic", "gemini"}
-        or profile is None
-        or not profile.supports_tools
-    ):
+    providers = {"openai", "anthropic", "gemini"}
+    if subscription_billing():
+        providers = {SUBSCRIPTION_PROVIDER}
+    if provider not in providers or profile is None or not profile.supports_tools:
         raise ValueError(
             "A reviewed API model with tools and input counting is required"
         )
-    key_name = f"DAITA_POSTGRES_LIVE_{provider.upper()}_API_KEY"
-    if not os.environ.get(key_name, "").strip():
-        key_name = KEY_ENV
-    if not os.environ.get(key_name, "").strip():
-        raise ValueError(
-            f"Set {key_name} in the environment; never put credentials in evidence"
-        )
+    if subscription_billing():
+        # Unpriced subscription usage keeps step and token limits only.
+        limits = replace(limits, max_estimated_cost_usd=None)
+        reference = LIVE_CREDENTIAL
+    else:
+        key_name = f"DAITA_POSTGRES_LIVE_{provider.upper()}_API_KEY"
+        if not os.environ.get(key_name, "").strip():
+            key_name = KEY_ENV
+        if not os.environ.get(key_name, "").strip():
+            raise ValueError(
+                f"Set {key_name} in the environment; never put credentials in evidence"
+            )
+        reference = SecretReference("env", key_name)
     return AgentConfig(
         model_route=ModelRoute(
             candidates=(
@@ -121,7 +145,7 @@ def live_config(model_id, *, limits=LIMITS):
                     replace(
                         profile, max_output_tokens=min(2048, profile.max_output_tokens)
                     ),
-                    secret_reference=SecretReference("env", key_name),
+                    secret_reference=reference,
                     allowed_sensitivities=frozenset(ModelSensitivity),
                 ),
             )
@@ -253,9 +277,7 @@ class Evaluation:
             root=self.db.root,
             config=self.config,
             workspace=workspace_for(self.db.root),
-            secret_provider=CompositeSecretProvider(
-                (EnvironmentSecretProvider(), _Secrets())
-            ),
+            secret_provider=live_secret_provider(),
             approval_handler=self.approve,
             clock=lambda: self.clock,
         )
@@ -555,6 +577,8 @@ class Evaluation:
             validate_completed_transcript(transcript, result)
             assert 0 < result.usage.total_tokens <= self.config.limits.max_total_tokens
             assert 0 < result.steps <= self.config.limits.max_steps
+            if subscription_billing():
+                continue
             assert result.usage.cost_estimate.status.value == "complete"
             assert (
                 result.usage.cost_estimate.amount_usd
@@ -614,19 +638,26 @@ class Evaluation:
             assert sum(
                 getattr(result.usage, field) for result, _, _ in self.captures
             ) == sum(getattr(usage, field) for usage in usages), field
-        assert all(usage.cost_estimate.status.value == "complete" for usage in usages)
-        assert sum(
-            result.usage.cost_estimate.amount_usd for result, _, _ in self.captures
-        ) == sum(usage.cost_estimate.amount_usd for usage in usages)
+        priced = not subscription_billing()
+        if priced:
+            assert all(
+                usage.cost_estimate.status.value == "complete" for usage in usages
+            )
+            assert sum(
+                result.usage.cost_estimate.amount_usd for result, _, _ in self.captures
+            ) == sum(usage.cost_estimate.amount_usd for usage in usages)
         groups: list[list[ModelRequest]] = [[]]
         for request in requests:
             assert request.deadline is not None
             assert 0 < request.max_total_tokens <= self.config.limits.max_total_tokens
-            assert (
-                0
-                < request.max_estimated_cost_usd
-                <= self.config.limits.max_estimated_cost_usd
-            )
+            if priced:
+                assert (
+                    0
+                    < request.max_estimated_cost_usd
+                    <= self.config.limits.max_estimated_cost_usd
+                )
+            else:
+                assert request.max_estimated_cost_usd is None
             assert request.attempt_deadline is not None
             assert request.attempt_deadline <= request.deadline
             assert request.call_policy == self.config.model_call_policy
@@ -644,10 +675,13 @@ class Evaluation:
             assert all(
                 later.max_total_tokens is not None
                 and earlier.max_total_tokens is not None
-                and later.max_estimated_cost_usd is not None
-                and earlier.max_estimated_cost_usd is not None
                 and later.max_total_tokens <= earlier.max_total_tokens
-                and later.max_estimated_cost_usd <= earlier.max_estimated_cost_usd
+                and (
+                    not priced
+                    or later.max_estimated_cost_usd is not None
+                    and earlier.max_estimated_cost_usd is not None
+                    and later.max_estimated_cost_usd <= earlier.max_estimated_cost_usd
+                )
                 for earlier, later in zip(group, group[1:])
             )
 
@@ -692,7 +726,11 @@ class Evaluation:
                     )
                 },
             },
-            "composition": "AgentConfig.model_route; real API counting/generation; real asyncpg/PostgreSQL",
+            "composition": (
+                "AgentConfig.model_route; real subscription generation; real asyncpg/PostgreSQL"
+                if subscription_billing()
+                else "AgentConfig.model_route; real API counting/generation; real asyncpg/PostgreSQL"
+            ),
             "model_id": self.config.model_route.candidates[0].provider_id,
             "setup": {
                 "mode": self.setup_mode,
@@ -717,7 +755,11 @@ class Evaluation:
                 "tokens": self.config.limits.max_total_tokens,
                 "seconds": self.config.limits.max_wall_time_seconds,
                 "estimated_cost_usd": str(self.config.limits.max_estimated_cost_usd),
-                "profile": "strict" if self.config.limits == LIMITS else "diagnostic",
+                "profile": (
+                    "subscription"
+                    if subscription_billing()
+                    else "strict" if self.config.limits == LIMITS else "diagnostic"
+                ),
                 "output_tokens": self.config.model_route.candidates[
                     0
                 ].profile.max_output_tokens,
@@ -731,6 +773,9 @@ class Evaluation:
                         for message in transcript.messages
                     ],
                     "elapsed_seconds": elapsed,
+                    "api_equivalent_cost": api_equivalent_cost(
+                        result.usage, result.provider_id
+                    ),
                 }
                 for result, transcript, elapsed in self.captures
             ],
@@ -799,6 +844,9 @@ class Evaluation:
                     },
                     "estimated_cost_status": response.usage.cost_estimate.status.value,
                     "estimated_cost_usd": str(response.usage.cost_estimate.amount_usd),
+                    "api_equivalent_cost": api_equivalent_cost(
+                        response.usage, response.provider_id
+                    ),
                     "provider_id": response.provider_id,
                     "provider_response_id": response.provider_response_id,
                     "calls": [

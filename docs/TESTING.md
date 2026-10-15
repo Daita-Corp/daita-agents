@@ -212,6 +212,43 @@ estimated cost cap per agent run in both evaluation profiles. Configure it with
 `DAITA_PHASE_F_LIVE_MAX_COST_USD`; it must remain finite and positive. These
 suites use real model providers with simulated MCP servers.
 
+### Subscription-billed live runs
+
+Live suites bill API keys by default. Adopted suites can instead run their
+reviewed `openai:<model>` choice through the matching `codex:<model>` ChatGPT
+subscription route by setting `DAITA_LIVE_BILLING=subscription` alongside their
+usual `DAITA_RUN_*` gate. Adopted suites are PostgreSQL write acceptance,
+write-unavailable, tool selection, result references, the Stage B benchmarks,
+data operations and the live MCP read workflows.
+
+Log in once through the existing device-code flow:
+
+```bash
+.venv/bin/python -m tests.support.live_billing login
+.venv/bin/python -m tests.support.live_billing status
+.venv/bin/python -m tests.support.live_billing logout
+```
+
+The login is stored only in the OS keychain under the test-only
+`daita-live-tests` service, separate from Daita's own logins. It is read when a
+test constructs its provider, never at collection, and is never accepted from
+the environment or printed. Refreshed tokens are written back to the same entry.
+A missing login fails the run; it never falls back to API billing.
+
+Subscription responses are unpriced, and Daita refuses unpriced requests under a
+dollar cap, so subscription runs drop only the dollar cap and keep their step,
+token and wall-time limits. Token limits are checked after each returned
+response, so a run can exceed its token limit by at most one response. Graph
+tasks, background jobs and routines require a priced budget and skip under
+subscription billing. Cost-accounting assertions run only under API billing;
+keep a small API-billed run for that evidence.
+
+Reports from subscription runs record `api_equivalent_cost`: reported tokens
+priced at the matching `openai:<model>` list rates with basis
+`codex_reported_tokens_at_api_rates`. It is notional comparison evidence, never
+billed cost, and never admits or stops a run. ChatGPT plans apply their own
+usage windows, so long sweeps can still be rate limited.
+
 ### Live analytical and operational acceptance
 
 `tests/live/data_operations` exercises Daita's data and analytics workflows using the
