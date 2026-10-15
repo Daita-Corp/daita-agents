@@ -33,7 +33,7 @@ from ..domains.data.export_capabilities import (
     resolved_exact_export_sensitivity,
 )
 from ..domains.data.results import project_result_rows
-from ..domains.data.sql import validate_postgresql_read
+from ..domains.data.sql import ResourceSchema, validate_postgresql_read
 from ..errors import DaitaError, ErrorRetryability
 from ..observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
 from ..security import SecretProvider, SecretReference, default_secret_provider
@@ -654,7 +654,14 @@ class PostgreSQLQueryBackend:
         parameters: tuple[object, ...],
         max_rows: int,
         max_bytes: int,
+        expected_resource_revisions: tuple[tuple[str, str], ...] | None = None,
+        timeout_seconds: float | None = None,
     ) -> PostgreSQLReadResult:
+        statement_timeout = self._statement_timeout_seconds
+        if timeout_seconds is not None:
+            if not 0 < float(timeout_seconds) <= 60:
+                raise ValueError("timeout_seconds must be from 0 through 60")
+            statement_timeout = min(statement_timeout, float(timeout_seconds))
         if (
             not isinstance(max_rows, int)
             or isinstance(max_rows, bool)
@@ -685,6 +692,16 @@ class PostgreSQLQueryBackend:
                 "The selected source is not a PostgreSQL source.",
             )
         resources = await self._catalog.resource_schemas(agent_id, source_id)
+        if expected_resource_revisions is not None:
+            current = {item.resource_id: item.revision for item in resources}
+            if any(
+                current.get(resource_id) != revision
+                for resource_id, revision in expected_resource_revisions
+            ):
+                raise PostgreSQLQueryError(
+                    "query_binding_stale",
+                    "A validated resource revision changed before source dispatch.",
+                )
         try:
             readable = await self._catalog.readable_resource_ids(
                 agent_id,
@@ -740,12 +757,11 @@ class PostgreSQLQueryBackend:
         transaction_finished = False
         connection_failure: tuple[str, str] | None = None
         query_failed = False
+        query_timed_out = False
         columns: tuple[str, ...] = ()
         rows: tuple[Mapping[str, object], ...] = ()
         try:
-            async with self._operation(
-                self._statement_timeout_seconds
-            ) as read_deadline:
+            async with self._operation(statement_timeout) as read_deadline:
                 connection, pool_entry = await self._connection(
                     registration, frozenset(readable)
                 )
@@ -754,10 +770,7 @@ class PostgreSQLQueryBackend:
                     readonly=True,
                 )
                 await transaction.start()
-                timeout_milliseconds = max(
-                    1,
-                    int(self._statement_timeout_seconds * 1_000),
-                )
+                timeout_milliseconds = max(1, int(statement_timeout * 1_000))
                 await connection.execute(
                     "SELECT set_config('statement_timeout', $1, true)",
                     f"{timeout_milliseconds}ms",
@@ -791,7 +804,7 @@ class PostgreSQLQueryBackend:
                     parameters,
                     max_rows=max_rows,
                     max_bytes=max_bytes,
-                    timeout_seconds=self._statement_timeout_seconds,
+                    timeout_seconds=statement_timeout,
                 )
                 if self._read_limits.pool_enabled:
                     self._metrics["query_seconds"] += (
@@ -813,11 +826,17 @@ class PostgreSQLQueryBackend:
             # Retain only its safe code and message, then raise a fresh query error
             # after the original exception context has ended.
             connection_failure = (error.code, str(error))
-        except Exception:
+        except Exception as error:
             # Driver and server errors can carry SQL, bound values, DSNs, or
             # credentials.  Cross the boundary only after the original
             # exception context has ended so diagnostics retain none of it.
+            # Only the timeout class (client deadline or server SQLSTATE 57014
+            # from statement_timeout) is retained.
             query_failed = True
+            query_timed_out = (
+                isinstance(error, TimeoutError)
+                or getattr(error, "sqlstate", None) == "57014"
+            )
         finally:
             if pool_entry is not None and connection is not None:
                 await self._release_pooled(
@@ -843,6 +862,12 @@ class PostgreSQLQueryBackend:
 
         if connection_failure is not None:
             raise PostgreSQLQueryError(*connection_failure)
+        if query_timed_out:
+            raise PostgreSQLQueryError(
+                "postgresql_query_timeout",
+                "The bounded PostgreSQL read exceeded its statement deadline of "
+                f"{statement_timeout:g} seconds.",
+            )
         if query_failed:
             raise PostgreSQLQueryError(
                 "postgresql_query_failed",
@@ -873,6 +898,7 @@ class PostgreSQLQueryBackend:
             source_revision=validation.source_revision,
             columns=columns,
             projection=projection,
+            resource_names=_resource_names(resources, validation.resource_ids),
         )
 
     async def execute_exact_tabular(
@@ -1131,6 +1157,14 @@ class PostgreSQLQueryBackend:
             sensitivity=sensitivity,
             column_types=arrow_schema(content)[1] if format_name == "arrow" else (),
         )
+
+
+def _resource_names(
+    resources: Iterable[ResourceSchema],
+    resource_ids: Iterable[str],
+) -> tuple[tuple[str, str], ...]:
+    names = {item.resource_id: item.name for item in resources}
+    return tuple((resource_id, names[resource_id]) for resource_id in resource_ids)
 
 
 async def _execute_user_query(

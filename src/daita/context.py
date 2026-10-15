@@ -2014,9 +2014,17 @@ def _project_historical_result(
                 "byte_limit",
                 "utf8_bytes",
                 "sql_fingerprint",
+                "tables_touched",
                 "trust_classification",
             ),
         )
+        statements = data.get("statements")
+        if isinstance(statements, tuple):
+            compact["statements"] = tuple(
+                {key: value for key, value in item.items() if key != "rows"}
+                for item in statements
+                if isinstance(item, Mapping)
+            )
     elif kind == LOCAL_FILE_READ_EVIDENCE_KIND:
         compact = _selected_result_fields(
             data,

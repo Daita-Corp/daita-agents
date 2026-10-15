@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import time
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Protocol, cast
 
@@ -27,6 +30,7 @@ from ...capabilities import (
     ToolTextTrust,
     ToolView,
 )
+from ...errors import DaitaError
 from .controller import (
     DATA_QUERY_CAPABILITY_ID,
     DATA_QUERY_EVIDENCE_KIND,
@@ -98,6 +102,7 @@ class SqlReadResult:
     source_revision: str
     columns: tuple[str, ...]
     projection: BoundedResultProjection
+    resource_names: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -121,6 +126,10 @@ class SqlReadResult:
             raise ValueError("columns must contain non-empty strings")
         if not isinstance(self.projection, BoundedResultProjection):
             raise TypeError("projection must be BoundedResultProjection")
+        names = tuple(sorted(tuple(item) for item in self.resource_names))
+        if names and {item[0] for item in names} != set(resource_ids):
+            raise ValueError("resource_names must cover every resource")
+        object.__setattr__(self, "resource_names", names)
         object.__setattr__(self, "resource_ids", resource_ids)
         object.__setattr__(self, "resource_revisions", revisions)
         object.__setattr__(self, "columns", columns)
@@ -140,8 +149,22 @@ class SqlReadResult:
                 "source_id": self.source_id,
                 "source_revision": self.source_revision,
                 "sql_fingerprint": self.sql_fingerprint,
+                "tables_touched": tables_touched(self.resource_names),
             }
         )
+
+
+def tables_touched(
+    resource_names: Iterable[tuple[str, str]],
+) -> tuple[dict[str, str], ...]:
+    """Name the catalog tables a read touched, ordered for stable evidence."""
+
+    return tuple(
+        {"name": name, "resource_id": resource_id}
+        for resource_id, name in sorted(
+            dict(resource_names).items(), key=lambda item: (item[1], item[0])
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +436,8 @@ class SqlReadBackend(Protocol):
         parameters: tuple[object, ...],
         max_rows: int,
         max_bytes: int,
+        expected_resource_revisions: tuple[tuple[str, str], ...] | None = None,
+        timeout_seconds: float | None = None,
     ) -> SqlReadResult: ...
 
 
@@ -464,8 +489,30 @@ class RelationalUpdateDeclarations:
     tool_views: tuple[ToolView, ...]
 
 
+DATA_QUERY_MAX_STATEMENTS = 8
+# Resource safety ceiling for one foreground read; graph tasks keep their own.
+DATA_QUERY_MAX_RESOURCES = 64
+DATA_QUERY_MAX_ROWS = 100
+DATA_QUERY_MAX_BYTES = 16_384
+DATA_QUERY_STATEMENT_TIMEOUT_SECONDS = 5.0
+DATA_QUERY_TOTAL_TIMEOUT_SECONDS = 15.0
+
+
+class DataQueryError(DaitaError):
+    """Stable model-visible failure of a bounded multi-statement read."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message, error_code=code)
+
+
 class DataQueryExecutor:
-    """Dispatch one trusted catalog-bound relational read to one backend."""
+    """Run catalog-bound read-only statements against one relational source.
+
+    Every statement shares one row budget, one UTF-8 byte budget and one total
+    deadline, and each statement also has its own statement deadline. All
+    statements must observe the catalog revisions validated before dispatch.
+    """
 
     executor_id = DATA_QUERY_EXECUTOR_ID
 
@@ -475,9 +522,14 @@ class DataQueryExecutor:
         sqlite_backend: SQLiteReadBackend,
         postgresql_backend: PostgreSQLReadBackend,
         *,
-        max_rows: int = 100,
-        max_bytes: int = 16_384,
+        max_rows: int = DATA_QUERY_MAX_ROWS,
+        max_bytes: int = DATA_QUERY_MAX_BYTES,
+        statement_timeout_seconds: float = DATA_QUERY_STATEMENT_TIMEOUT_SECONDS,
+        total_timeout_seconds: float = DATA_QUERY_TOTAL_TIMEOUT_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if not 0 < statement_timeout_seconds <= total_timeout_seconds:
+            raise ValueError("statement timeout must be positive and within total")
         self._agent_id = agent_id
         self._backends: dict[str, SqlReadBackend] = {
             "sqlite": sqlite_backend,
@@ -485,41 +537,208 @@ class DataQueryExecutor:
         }
         self._max_rows = max_rows
         self._max_bytes = max_bytes
+        self._statement_timeout_seconds = float(statement_timeout_seconds)
+        self._total_timeout_seconds = float(total_timeout_seconds)
+        self._clock = clock
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         source_id = request.arguments["source_id"]
-        sql = request.arguments["sql"]
-        parameters = request.arguments.get("parameters", ())
         resource_ids = request.arguments["resource_ids"]
         adapter_id = request.arguments["_adapter_id"]
         assert isinstance(source_id, str)
-        assert isinstance(sql, str)
-        assert isinstance(parameters, tuple)
         assert isinstance(resource_ids, tuple)
         assert isinstance(adapter_id, str)
+        statements = data_query_statements(request.arguments)
+        expected = _expected_resource_revisions(request.arguments)
         backend = self._backends.get(adapter_id)
         if backend is None:
             raise ValueError("relational query adapter binding is unsupported")
-        result = await backend.execute_read(
-            agent_id=self._agent_id,
-            source_id=source_id,
-            sql=sql,
-            parameters=parameters,
-            max_rows=self._max_rows,
-            max_bytes=self._max_bytes,
-        )
         expected_type = (
             PostgreSQLReadResult if adapter_id == "postgresql" else SQLiteReadResult
         )
-        if (
-            not isinstance(result, expected_type)
-            or result.source_id != source_id
-            or frozenset(result.resource_ids) != frozenset(resource_ids)
-        ):
+        started = self._clock()
+        deadline = started + self._total_timeout_seconds
+        remaining_rows = self._max_rows
+        remaining_bytes = self._max_bytes
+        results: list[tuple[SqlReadResult | None, int]] = []
+        for sql, parameters in statements:
+            if remaining_rows < 1 or remaining_bytes < 2:
+                # The shared budget is spent; later statements are reported as
+                # skipped rather than silently omitted.
+                results.append((None, 0))
+                continue
+            remaining_seconds = deadline - self._clock()
+            if remaining_seconds <= 0:
+                raise DataQueryError(
+                    "query_time_limit",
+                    "The statements exceeded the total read deadline of "
+                    f"{self._total_timeout_seconds:g} seconds.",
+                )
+            statement_started = self._clock()
+            result = await backend.execute_read(
+                agent_id=self._agent_id,
+                source_id=source_id,
+                sql=sql,
+                parameters=parameters,
+                max_rows=remaining_rows,
+                max_bytes=remaining_bytes,
+                expected_resource_revisions=expected,
+                timeout_seconds=min(self._statement_timeout_seconds, remaining_seconds),
+            )
+            elapsed_ms = _elapsed_ms(statement_started, self._clock())
+            if (
+                not isinstance(result, expected_type)
+                or result.source_id != source_id
+                or not frozenset(result.resource_ids) <= frozenset(resource_ids)
+            ):
+                raise ValueError("SQL backend returned different catalog binding facts")
+            if results and any(
+                earlier is not None
+                and earlier.source_revision != result.source_revision
+                for earlier, _ in results
+            ):
+                raise DataQueryError(
+                    "query_binding_stale",
+                    "The source changed between statements of one read.",
+                )
+            results.append((result, elapsed_ms))
+            remaining_rows -= result.projection.returned_rows
+            remaining_bytes -= result.projection.utf8_bytes
+        executed = tuple(result for result, _ in results if result is not None)
+        if frozenset(
+            resource_id for result in executed for resource_id in result.resource_ids
+        ) != frozenset(resource_ids):
             raise ValueError("SQL backend returned different catalog binding facts")
-        data = result.tool_data().to_dict()
-        data["adapter_id"] = adapter_id
-        return ToolOutput(kind=DATA_QUERY_EVIDENCE_KIND, data=data)
+        timing = {
+            "elapsed_ms": _elapsed_ms(started, self._clock()),
+            "statement_timeout_ms": int(self._statement_timeout_seconds * 1_000),
+            "total_timeout_ms": int(self._total_timeout_seconds * 1_000),
+        }
+        if len(statements) == 1:
+            data = executed[0].tool_data().to_dict()
+            data["adapter_id"] = adapter_id
+            data["timing"] = timing
+            return ToolOutput(kind=DATA_QUERY_EVIDENCE_KIND, data=data)
+        return ToolOutput(
+            kind=DATA_QUERY_EVIDENCE_KIND,
+            data=_multi_statement_data(
+                adapter_id,
+                source_id,
+                results,
+                timing=timing,
+                row_limit=self._max_rows,
+                byte_limit=self._max_bytes,
+            ),
+        )
+
+
+def data_query_statements(
+    arguments: Mapping[str, object],
+) -> tuple[tuple[str, tuple[object, ...]], ...]:
+    """Return the ordered statements of one data_query call."""
+
+    raw_statements = arguments.get("statements")
+    if raw_statements is None:
+        sql = arguments.get("sql")
+        parameters = arguments.get("parameters", ())
+        if not isinstance(sql, str) or not isinstance(parameters, tuple):
+            raise ValueError("data_query requires sql or statements")
+        return ((sql, parameters),)
+    if not isinstance(raw_statements, tuple) or not raw_statements:
+        raise ValueError("data_query statements must be a non-empty array")
+    statements: list[tuple[str, tuple[object, ...]]] = []
+    for item in raw_statements:
+        if not isinstance(item, Mapping):
+            raise ValueError("data_query statements must be objects")
+        sql = item.get("sql")
+        parameters = item.get("parameters", ())
+        if not isinstance(sql, str) or not isinstance(parameters, tuple):
+            raise ValueError("data_query statements need sql and parameters")
+        statements.append((sql, parameters))
+    return tuple(statements)
+
+
+def _expected_resource_revisions(
+    arguments: Mapping[str, object],
+) -> tuple[tuple[str, str], ...] | None:
+    raw = arguments.get("_resource_revisions")
+    if raw is None:
+        return None
+    if not isinstance(raw, tuple):
+        raise ValueError("validated resource revisions are malformed")
+    revisions: list[tuple[str, str]] = []
+    for item in raw:
+        if (
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not all(isinstance(value, str) for value in item)
+        ):
+            raise ValueError("validated resource revisions are malformed")
+        revisions.append((item[0], item[1]))
+    return tuple(revisions)
+
+
+def _elapsed_ms(started: float, finished: float) -> int:
+    return max(0, int(round((finished - started) * 1_000)))
+
+
+def _multi_statement_data(
+    adapter_id: str,
+    source_id: str,
+    results: list[tuple[SqlReadResult | None, int]],
+    *,
+    timing: Mapping[str, int],
+    row_limit: int,
+    byte_limit: int,
+) -> dict[str, object]:
+    statements: list[dict[str, object]] = []
+    revisions: dict[str, str] = {}
+    names: dict[str, str] = {}
+    reasons: list[str] = []
+    source_revision = ""
+    for index, (result, elapsed_ms) in enumerate(results):
+        if result is None:
+            statements.append({"index": index, "status": "skipped_budget_spent"})
+            reasons.append("budget_spent")
+            continue
+        source_revision = result.source_revision
+        revisions.update(result.resource_revisions)
+        names.update(result.resource_names)
+        payload = result.tool_data().to_dict()
+        for name in ("source_id", "source_revision", "resource_revisions"):
+            payload.pop(name)
+        for name in ("row_limit", "byte_limit"):
+            payload.pop(name)
+        payload["elapsed_ms"] = elapsed_ms
+        payload["index"] = index
+        payload["status"] = "completed"
+        statements.append(payload)
+        reasons.extend(result.projection.truncation_reasons)
+    executed = [result for result, _ in results if result is not None]
+    fingerprint = canonical_json([result.sql_fingerprint for result in executed])
+    return {
+        "adapter_id": adapter_id,
+        "byte_limit": byte_limit,
+        "resource_ids": tuple(sorted(revisions)),
+        "resource_revisions": tuple(
+            {"resource_id": resource_id, "revision": revision}
+            for resource_id, revision in sorted(revisions.items())
+        ),
+        "returned_rows": sum(result.projection.returned_rows for result in executed),
+        "row_limit": row_limit,
+        "source_id": source_id,
+        "source_revision": source_revision,
+        "sql_fingerprint": "sha256:"
+        + hashlib.sha256(fingerprint.encode("utf-8")).hexdigest(),
+        "statements": tuple(statements),
+        "tables_touched": tables_touched(names.items()),
+        "timing": dict(timing),
+        "total_rows": sum(result.projection.total_rows for result in executed),
+        "truncated": bool(reasons),
+        "truncation_reasons": tuple(dict.fromkeys(reasons)),
+        "trust_classification": "untrusted_external_data",
+        "utf8_bytes": sum(result.projection.utf8_bytes for result in executed),
+    }
 
 
 class RelationalUpdatePreviewExecutor:
@@ -907,11 +1126,18 @@ def relational_update_capability_declarations() -> CapabilityDeclarations:
 def _query_declarations(
     presentation: ToolPresentation,
 ) -> CapabilityDeclarations:
+    sql_rule = {"type": "string", "minLength": 1, "maxLength": MAX_SQL_CHARACTERS}
+    parameters_rule = {
+        "type": "array",
+        "maxItems": MAX_SQL_PARAMETERS,
+        "description": "SQLite ? values follow SQL occurrence order; PostgreSQL $1, $2, ... by index. Verify filter bindings.",
+    }
     capability = Capability(
         id=DATA_QUERY_CAPABILITY_ID,
         description=(
-            "Run one validated, read-only, bounded relational query against exact "
-            "current catalog resources."
+            "Run one or more validated, read-only relational statements against "
+            "exact current catalog resources of one source, bounded by statement "
+            "time, total time, rows and bytes."
         ),
         input_schema={
             "type": "object",
@@ -921,21 +1147,28 @@ def _query_declarations(
                     "type": "array",
                     "items": {"type": "string", "minLength": 1, "maxLength": 256},
                     "minItems": 1,
-                    "maxItems": 64,
+                    "maxItems": DATA_QUERY_MAX_RESOURCES,
                     "uniqueItems": True,
                 },
-                "sql": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": MAX_SQL_CHARACTERS,
-                },
-                "parameters": {
+                "sql": sql_rule,
+                "parameters": parameters_rule,
+                "statements": {
                     "type": "array",
-                    "maxItems": MAX_SQL_PARAMETERS,
-                    "description": "SQLite ? values follow SQL occurrence order; PostgreSQL $1, $2, ... by index. Verify filter bindings.",
+                    "minItems": 1,
+                    "maxItems": DATA_QUERY_MAX_STATEMENTS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "sql": sql_rule,
+                            "parameters": parameters_rule,
+                        },
+                        "required": ["sql"],
+                        "additionalProperties": False,
+                    },
+                    "description": "Use instead of sql to run several reads in one call.",
                 },
             },
-            "required": ["source_id", "resource_ids", "sql"],
+            "required": ["source_id", "resource_ids"],
             "additionalProperties": False,
         },
         output_kind=DATA_QUERY_EVIDENCE_KIND,
@@ -948,7 +1181,7 @@ def _query_declarations(
             inline_eligible=True,
             graph_v1_eligible=True,
             target_count_argument="resource_ids",
-            inline_max_targets=4,
+            inline_max_targets=DATA_QUERY_MAX_RESOURCES,
             graph_max_targets=16,
         ),
     )
@@ -967,25 +1200,6 @@ def _query_declarations(
 
 
 def _query_output_schema() -> dict[str, object]:
-    names = (
-        "byte_limit",
-        "adapter_id",
-        "canonical_sql",
-        "columns",
-        "resource_ids",
-        "resource_revisions",
-        "returned_rows",
-        "row_limit",
-        "rows",
-        "source_id",
-        "source_revision",
-        "sql_fingerprint",
-        "total_rows",
-        "truncated",
-        "truncation_reasons",
-        "trust_classification",
-        "utf8_bytes",
-    )
     types = {
         "byte_limit": "integer",
         "adapter_id": "string",
@@ -999,16 +1213,22 @@ def _query_output_schema() -> dict[str, object]:
         "source_id": "string",
         "source_revision": "string",
         "sql_fingerprint": "string",
+        "statements": "array",
+        "tables_touched": "array",
+        "timing": "object",
         "total_rows": "integer",
         "truncated": "boolean",
         "truncation_reasons": "array",
         "trust_classification": "string",
         "utf8_bytes": "integer",
     }
+    # One statement keeps its columns, rows and SQL at the top level; several
+    # statements report them per entry under statements.
+    per_statement = {"canonical_sql", "columns", "rows", "statements"}
     return {
         "type": "object",
-        "properties": {name: {"type": types[name]} for name in names},
-        "required": list(names),
+        "properties": {name: {"type": kind} for name, kind in sorted(types.items())},
+        "required": sorted(set(types) - per_statement),
         "additionalProperties": False,
     }
 

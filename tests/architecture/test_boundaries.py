@@ -591,7 +591,10 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         query_schema = registry.tool_definition("data_query").input_schema
         query_required = query_schema.get("required")
         assert isinstance(query_required, (tuple, list))
-        assert {"source_id", "resource_ids", "sql"} <= set(query_required)
+        assert {"source_id", "resource_ids"} <= set(query_required)
+        query_properties = query_schema.get("properties")
+        assert isinstance(query_properties, Mapping)
+        assert {"sql", "statements"} <= set(query_properties)
     finally:
         await agent.close()
 

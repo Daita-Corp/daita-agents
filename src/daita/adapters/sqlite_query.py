@@ -9,7 +9,7 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,10 +30,13 @@ from ..domains.data.export_capabilities import (
     resolved_exact_export_sensitivity,
 )
 from ..domains.data.results import project_result_rows
-from ..domains.data.sql import validate_sqlite_read
+from ..domains.data.sql import ResourceSchema, validate_sqlite_read
 from ..errors import DaitaError
 from ..storage.sqlite_records import SourcePermissionStateError
 from .protocols import SourceStore
+
+_DEFAULT_STATEMENT_TIMEOUT_SECONDS = 5.0
+_MAX_STATEMENT_TIMEOUT_SECONDS = 60.0
 
 
 class SQLiteQueryError(DaitaError):
@@ -79,7 +82,16 @@ class SQLiteQueryBackend:
         parameters: tuple[object, ...],
         max_rows: int,
         max_bytes: int,
+        expected_resource_revisions: tuple[tuple[str, str], ...] | None = None,
+        timeout_seconds: float | None = None,
     ) -> SQLiteReadResult:
+        statement_timeout = (
+            _DEFAULT_STATEMENT_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else float(timeout_seconds)
+        )
+        if not 0 < statement_timeout <= _MAX_STATEMENT_TIMEOUT_SECONDS:
+            raise ValueError("timeout_seconds must be from 0 through 60")
         registration = await self._sources.load_source(agent_id, source_id)
         if registration is None or not registration.active:
             raise SQLiteQueryError(
@@ -92,6 +104,16 @@ class SQLiteQueryBackend:
                 "The selected source is not a SQLite source.",
             )
         resources = await self._catalog.resource_schemas(agent_id, source_id)
+        if expected_resource_revisions is not None:
+            current = {item.resource_id: item.revision for item in resources}
+            if any(
+                current.get(resource_id) != revision
+                for resource_id, revision in expected_resource_revisions
+            ):
+                raise SQLiteQueryError(
+                    "query_binding_stale",
+                    "A validated resource revision changed before source dispatch.",
+                )
         try:
             readable = await self._catalog.readable_resource_ids(
                 agent_id,
@@ -147,6 +169,7 @@ class SQLiteQueryBackend:
             expected_schema_version=expected_schema_version,
             max_rows=max_rows,
             max_bytes=max_bytes,
+            timeout_seconds=statement_timeout,
         )
         projection = project_result_rows(
             rows,
@@ -162,6 +185,7 @@ class SQLiteQueryBackend:
             source_revision=live_source_revision,
             columns=columns,
             projection=projection,
+            resource_names=_resource_names(resources, validation.resource_ids),
         )
 
     async def execute_exact_tabular(
@@ -347,6 +371,7 @@ async def _run_query(
     expected_schema_version: int,
     max_rows: int,
     max_bytes: int,
+    timeout_seconds: float = 5.0,
 ) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...], str]:
     cancellation = threading.Event()
     worker = asyncio.create_task(
@@ -359,6 +384,7 @@ async def _run_query(
             max_rows,
             max_bytes,
             cancellation,
+            timeout_seconds,
         )
     )
     try:
@@ -571,7 +597,9 @@ def _run_query_sync(
     max_rows: int,
     max_bytes: int,
     cancellation: threading.Event,
+    timeout_seconds: float = 5.0,
 ) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...], str]:
+    deadline = time.monotonic() + timeout_seconds
     connection: sqlite3.Connection | None = None
     admitted_descriptor: int | None = None
     try:
@@ -580,7 +608,12 @@ def _run_query_sync(
         connection.execute("PRAGMA trusted_schema = OFF")
         connection.execute("PRAGMA foreign_keys = ON")
         connection.enable_load_extension(False)
-        connection.set_progress_handler(lambda: 1 if cancellation.is_set() else 0, 500)
+        # SQLite has no statement timeout; the progress handler interrupts the
+        # statement at its deadline as well as on cancellation.
+        connection.set_progress_handler(
+            lambda: int(cancellation.is_set() or time.monotonic() >= deadline),
+            500,
+        )
         if hasattr(connection, "setlimit"):
             connection.setlimit(
                 sqlite3.SQLITE_LIMIT_LENGTH,
@@ -612,6 +645,12 @@ def _run_query_sync(
     except SQLiteQueryError:
         raise
     except sqlite3.Error as error:
+        if not cancellation.is_set() and time.monotonic() >= deadline:
+            raise SQLiteQueryError(
+                "sqlite_query_timeout",
+                "The bounded SQLite read exceeded its statement deadline of "
+                f"{timeout_seconds:g} seconds.",
+            ) from None
         raise SQLiteQueryError(
             "sqlite_query_failed",
             "SQLite could not complete the bounded read.",
@@ -625,6 +664,14 @@ def _run_query_sync(
             connection.close()
         if admitted_descriptor is not None:
             os.close(admitted_descriptor)
+
+
+def _resource_names(
+    resources: Iterable[ResourceSchema],
+    resource_ids: Iterable[str],
+) -> tuple[tuple[str, str], ...]:
+    names = {item.resource_id: item.name for item in resources}
+    return tuple((resource_id, names[resource_id]) for resource_id in resource_ids)
 
 
 def _connect_admitted_read_only(

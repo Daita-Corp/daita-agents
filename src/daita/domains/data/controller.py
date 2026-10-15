@@ -178,6 +178,39 @@ def _validate_describe_arguments(arguments: Mapping[str, object]) -> None:
         )
 
 
+def _sql_statements(
+    arguments: Mapping[str, object],
+) -> tuple[tuple[str, tuple[object, ...]], ...] | None:
+    """Return validated (sql, parameters) pairs, or None for a malformed shape."""
+
+    raw_statements = arguments.get("statements")
+    if raw_statements is not None:
+        if "sql" in arguments or "parameters" in arguments:
+            return None
+        if not isinstance(raw_statements, tuple) or not raw_statements:
+            return None
+        items: tuple[object, ...] = raw_statements
+    else:
+        items = (
+            {
+                "sql": arguments.get("sql"),
+                "parameters": arguments.get("parameters", ()),
+            },
+        )
+    statements: list[tuple[str, tuple[object, ...]]] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            return None
+        sql = item.get("sql")
+        parameters = item.get("parameters", ())
+        if not isinstance(sql, str) or not sql.strip():
+            return None
+        if not isinstance(parameters, tuple):
+            return None
+        statements.append((sql, parameters))
+    return tuple(statements)
+
+
 class CatalogSchemaReader(Protocol):
     async def resource_schemas(
         self,
@@ -518,7 +551,11 @@ class DataCapabilityDomain:
         if capability.id == CATALOG_DESCRIBE_CAPABILITY_ID:
             _validate_describe_arguments(arguments)
         if capability.id in _RELATIONAL_READ_CAPABILITIES:
-            arguments = await self._validate_sql(run, arguments)
+            arguments = await self._validate_sql(
+                run,
+                arguments,
+                bind_revisions=capability.id == DATA_QUERY_CAPABILITY_ID,
+            )
         if capability.id in _UPDATE_CAPABILITIES | _UPSERT_CAPABILITIES:
             await self._validate_target_sensitivity(
                 run.agent_id, arguments, request_sensitivity
@@ -1125,24 +1162,24 @@ class DataCapabilityDomain:
         self,
         run: RunInput,
         arguments: Mapping[str, object],
+        *,
+        bind_revisions: bool = False,
     ) -> FrozenJsonObject:
         source_id = arguments.get("source_id")
         requested_resource_ids = arguments.get("resource_ids")
-        sql = arguments.get("sql")
-        parameters = arguments.get("parameters", ())
+        statements = _sql_statements(arguments)
         if (
             not isinstance(source_id, str)
             or not isinstance(requested_resource_ids, tuple)
             or not requested_resource_ids
             or any(not isinstance(item, str) for item in requested_resource_ids)
-            or not isinstance(sql, str)
-            or not sql.strip()
-            or not isinstance(parameters, tuple)
+            or statements is None
         ):
             raise CapabilityInputError(
                 "sql_invalid_input",
                 "SQL reads require an exact source_id, one or more resource_ids, "
-                "non-empty sql, and an array of parameters.",
+                "and either non-empty sql with an array of parameters or a "
+                "statements array of {sql, parameters}, not both.",
             )
         adapter_id = await self._catalog.source_adapter_id(
             run.agent_id,
@@ -1193,49 +1230,63 @@ class DataCapabilityDomain:
             if adapter_id == "postgresql"
             else validate_sqlite_read
         )
-        result = validator(
-            sql,
-            source_id=source_id,
-            resources=resources,
-            parameters=parameters,
-            allowed_resource_ids=readable,
-        )
-        if result.valid:
-            if frozenset(result.resource_ids) != frozenset(requested_resource_ids):
-                raise CapabilityInputError(
-                    "sql_resource_target_mismatch",
-                    "The SQL query must reference exactly the selected catalog resources.",
-                    {
-                        "source_id": source_id,
-                        "requested_resource_ids": requested_resource_ids,
-                    },
-                )
-            prepared = dict(arguments)
-            prepared["_adapter_id"] = adapter_id
-            return FrozenJsonObject.from_mapping(prepared)
-        if {item.code for item in result.issues} & {
-            "resource_out_of_scope",
-            "unknown_resource",
-        }:
-            raise CapabilityInputError(
-                "resource_read_not_allowed",
-                _RESOURCE_READ_DENIED_MESSAGE,
+        referenced: set[str] = set()
+        revisions: dict[str, str] = {}
+        for index, (sql, parameters) in enumerate(statements):
+            result = validator(
+                sql,
+                source_id=source_id,
+                resources=resources,
+                parameters=parameters,
+                allowed_resource_ids=readable,
             )
-        raise CapabilityInputError(
-            "sql_validation_failed",
-            "The SQL read is invalid. Correct all reported issues before retrying.",
-            {
-                "issues": [
-                    {
-                        "code": item.code,
-                        "message": item.message,
-                        "details": item.details,
-                    }
-                    for item in result.issues
-                ],
-                "source_id": source_id,
-            },
-        )
+            if not result.valid:
+                if {item.code for item in result.issues} & {
+                    "resource_out_of_scope",
+                    "unknown_resource",
+                }:
+                    raise CapabilityInputError(
+                        "resource_read_not_allowed",
+                        _RESOURCE_READ_DENIED_MESSAGE,
+                    )
+                details: dict[str, object] = {
+                    "issues": [
+                        {
+                            "code": item.code,
+                            "message": item.message,
+                            "details": item.details,
+                        }
+                        for item in result.issues
+                    ],
+                    "source_id": source_id,
+                }
+                if "statements" in arguments:
+                    details["statement_index"] = index
+                raise CapabilityInputError(
+                    "sql_validation_failed",
+                    "The SQL read is invalid. Correct all reported issues before "
+                    "retrying.",
+                    details,
+                )
+            referenced.update(result.resource_ids)
+            revisions.update(result.resource_revisions)
+        if referenced != frozenset(requested_resource_ids):
+            raise CapabilityInputError(
+                "sql_resource_target_mismatch",
+                "The SQL statements must reference exactly the selected catalog "
+                "resources.",
+                {
+                    "source_id": source_id,
+                    "requested_resource_ids": requested_resource_ids,
+                },
+            )
+        prepared = dict(arguments)
+        prepared["_adapter_id"] = adapter_id
+        if bind_revisions and len(revisions) == len(referenced):
+            # The executor rechecks these exact catalog revisions before every
+            # statement reaches the source.
+            prepared["_resource_revisions"] = tuple(sorted(revisions.items()))
+        return FrozenJsonObject.from_mapping(prepared)
 
     def _validate_execution_resource_scope(
         self,

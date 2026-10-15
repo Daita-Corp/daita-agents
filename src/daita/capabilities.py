@@ -91,7 +91,11 @@ class ExecutionPreference(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class ExecutionAdmissionPolicy:
-    """Immutable capability facts used for deterministic execution admission."""
+    """Immutable capability facts used for deterministic execution admission.
+
+    The inline target ceiling is a foreground resource safety ceiling. It is
+    independent of the graph ceiling, which bounds one durable task.
+    """
 
     shape: str
     inline_eligible: bool
@@ -127,8 +131,6 @@ class ExecutionAdmissionPolicy:
             raise ValueError("inline-eligible policy needs a positive target ceiling")
         if self.graph_v1_eligible and self.graph_max_targets < 1:
             raise ValueError("graph-eligible policy needs a positive target ceiling")
-        if self.inline_max_targets > self.graph_max_targets and self.graph_v1_eligible:
-            raise ValueError("graph target ceiling cannot be below inline")
         if not isinstance(self.synchronous_only, bool):
             raise TypeError("execution synchronous_only must be bool")
 

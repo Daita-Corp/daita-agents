@@ -287,7 +287,7 @@ async def test_public_agent_queries_sqlite_and_reopens_exact_transcript(tmp_path
     provider = MockModelProvider(())
     profile = ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=22_000,
+        context_window_tokens=24_000,
         max_output_tokens=1_000,
         supports_tools=True,
         supports_parallel_tools=True,
