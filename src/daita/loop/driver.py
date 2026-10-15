@@ -771,6 +771,13 @@ class AgentLoop:
                                         "error": {
                                             "code": budget_reason,
                                             "message": "The run budget prevented execution; this tool was not called.",
+                                            "details": {
+                                                "execution_disposition": "not_dispatched",
+                                                "recovery": {
+                                                    "kind": "terminal",
+                                                    "constraint": "The run reached a budget limit and stops here; nothing further runs.",
+                                                },
+                                            },
                                         }
                                     },
                                 ),

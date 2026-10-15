@@ -6,7 +6,7 @@ import json
 import math
 import re
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
@@ -133,6 +133,21 @@ class ExecutionAdmissionPolicy:
             raise ValueError("graph-eligible policy needs a positive target ceiling")
         if not isinstance(self.synchronous_only, bool):
             raise TypeError("execution synchronous_only must be bool")
+
+    def projection(self) -> dict[str, object]:
+        """Return the declared limits; current durable availability is separate."""
+
+        return asdict(self)
+
+    def limits_sentence(self) -> str | None:
+        """One model-facing sentence for the enforced foreground target bound."""
+
+        if not self.inline_eligible or self.target_count_argument is None:
+            return None
+        return (
+            f"Limits: at most {self.inline_max_targets} "
+            f"{self.target_count_argument} per call."
+        )
 
     def target_count(self, arguments: Mapping[str, object]) -> int:
         if self.target_count_argument is None:
@@ -1124,17 +1139,67 @@ def render_approval_arguments(arguments: Mapping[str, object]) -> str | None:
     return rendered
 
 
+class RecoveryKind(str, Enum):
+    """What a model can usefully do after one failed tool call."""
+
+    CORRECT_ARGUMENTS = "correct_arguments"
+    REDUCE_SCOPE = "reduce_scope"
+    REINSPECT_BINDING = "reinspect_binding"
+    REQUIRES_HUMAN_PERMISSION = "requires_human_permission"
+    TERMINAL = "terminal"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRecovery:
+    """Recovery advice attached by the code that raises one tool error.
+
+    ``tool_name`` names an exact tool only when the run can call it. Terminal
+    advice never suggests replaying an effect.
+    """
+
+    kind: RecoveryKind
+    constraint: str
+    tool_name: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, RecoveryKind):
+            raise TypeError("recovery kind must be RecoveryKind")
+        _text(self.constraint, "recovery constraint")
+        if self.tool_name is not None:
+            _text(self.tool_name, "recovery tool_name")
+
+    def to_details(self) -> dict[str, object]:
+        return {
+            "kind": self.kind.value,
+            "constraint": self.constraint,
+            **({} if self.tool_name is None else {"tool_name": self.tool_name}),
+        }
+
+
+def recovery_details(
+    recovery: ToolRecovery,
+    details: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Return error details carrying one recovery descriptor."""
+
+    return {**(details or {}), "recovery": recovery.to_details()}
+
+
 class CapabilityInputError(ValueError):
     def __init__(
         self,
         code: str,
         message: str,
         details: Mapping[str, object] | None = None,
+        *,
+        recovery: ToolRecovery | None = None,
     ) -> None:
         _text(code, "tool input error code")
         _text(message, "tool input error message")
         self.code = code
-        self.details = FrozenJsonObject.from_mapping(details or {})
+        self.details = FrozenJsonObject.from_mapping(
+            (details or {}) if recovery is None else recovery_details(recovery, details)
+        )
         super().__init__(message)
 
 
@@ -1977,9 +2042,14 @@ class CapabilityRegistry:
             input_schema: Mapping[str, object] = capability.input_schema
         else:
             input_schema = self._mode_input_schemas[name]
+        description = _provider_description(view)
+        policy = capability.execution_admission_policy
+        sentence = None if policy is None else policy.limits_sentence()
+        if sentence is not None:
+            description = f"{description} {sentence}"
         return ToolDefinition(
             name=view.name,
-            description=_provider_description(view),
+            description=description,
             input_schema=input_schema,
         )
 
@@ -2335,6 +2405,10 @@ def _validate_object(
                 "missing_arguments",
                 "Missing required tool arguments.",
                 {"names": missing, "path": path},
+                recovery=ToolRecovery(
+                    RecoveryKind.CORRECT_ARGUMENTS,
+                    "Supply the required arguments: " + ", ".join(missing) + ".",
+                ),
             )
         raise error_type(f"missing output fields: {', '.join(missing)}")
     if additional is False:
@@ -2345,6 +2419,12 @@ def _validate_object(
                     "unexpected_arguments",
                     "Unexpected tool arguments.",
                     {"names": unexpected, "path": path},
+                    recovery=ToolRecovery(
+                        RecoveryKind.CORRECT_ARGUMENTS,
+                        "Remove the undeclared arguments: "
+                        + ", ".join(unexpected)
+                        + ".",
+                    ),
                 )
             raise error_type(f"unexpected output fields: {', '.join(unexpected)}")
     for name, item in value.items():
@@ -2396,6 +2476,10 @@ def _validate_rule(
                 "invalid_argument_type",
                 f"Tool argument {name} must be {expected}.",
                 {"name": name, "expected": expected},
+                recovery=ToolRecovery(
+                    RecoveryKind.CORRECT_ARGUMENTS,
+                    f"Send {name} as {expected}.",
+                ),
             )
         raise error_type(f"output field {name} must be {expected}")
     enum = rule.get("enum")
@@ -2468,6 +2552,10 @@ def _constraint_error(
             "invalid_argument_value",
             f"Tool argument {name} must satisfy {expected}.",
             {"constraint": constraint, "name": name},
+            recovery=ToolRecovery(
+                RecoveryKind.CORRECT_ARGUMENTS,
+                f"{name} must satisfy {expected}.",
+            ),
         )
     raise error_type(f"output field {name} must satisfy {expected}")
 
@@ -2497,6 +2585,7 @@ __all__ = [
     "capability_contract_digest",
     "Executor",
     "OperationalEffect",
+    "RecoveryKind",
     "CapabilityDeclarations",
     "MAX_APPROVAL_DOCUMENT_CHARACTERS",
     "SideEffectExecutor",
@@ -2508,9 +2597,11 @@ __all__ = [
     "ToolOutput",
     "ToolOutputValidationError",
     "ToolPresentation",
+    "ToolRecovery",
     "ToolTextTrust",
     "ToolView",
     "RESERVED_TOOL_NAMES",
+    "recovery_details",
     "render_approval_arguments",
     "validate_tool_schema_value",
 ]

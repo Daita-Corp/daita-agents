@@ -26,9 +26,11 @@ from ...capabilities import (
     CapabilityInputError,
     CapabilityRegistry,
     OperationalEffect,
+    RecoveryKind,
     ToolExecution,
     ToolOutput,
     ToolOutputValidationError,
+    ToolRecovery,
 )
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.capabilities import (
@@ -209,6 +211,12 @@ def _sql_statements(
             return None
         statements.append((sql, parameters))
     return tuple(statements)
+
+
+_WRITE_PERMISSION_REQUIRED = ToolRecovery(
+    RecoveryKind.REQUIRES_HUMAN_PERMISSION,
+    "The person must grant write permission for this table before any write.",
+)
 
 
 class CatalogSchemaReader(Protocol):
@@ -585,6 +593,7 @@ class DataCapabilityDomain:
                 raise CapabilityInputError(
                     "resource_write_not_allowed",
                     "The exact write permission is unavailable or stale.",
+                    recovery=_WRITE_PERMISSION_REQUIRED,
                 )
             issue = await self._catalog.relational_write_scope_issue(
                 run.agent_id,
@@ -639,6 +648,7 @@ class DataCapabilityDomain:
                     raise CapabilityInputError(
                         "resource_write_not_allowed",
                         "The current write permission is unavailable.",
+                        recovery=_WRITE_PERMISSION_REQUIRED,
                     )
                 if cast(int, arguments["expected_affected_rows"]) > permission.max_rows:
                     raise CapabilityInputError(
@@ -1102,6 +1112,11 @@ class DataCapabilityDomain:
                     "allowed_source_ids": tuple(sorted(selected_source_ids)),
                     "requested_source_id": supplied_source_id,
                 },
+                recovery=ToolRecovery(
+                    RecoveryKind.REQUIRES_HUMAN_PERMISSION,
+                    "Use one of allowed_source_ids; another source needs the "
+                    "person to add it to this conversation's scope.",
+                ),
             )
         resource_ids: tuple[object, ...] = ()
         if capability.id in _RESOURCE_ARGUMENT_CAPABILITIES:
@@ -1694,6 +1709,11 @@ class DataCapabilityDomain:
         raise CapabilityInputError(
             "write_preview_not_authenticated",
             "The write requires its exact successful current-run preview and matching intent.",
+            recovery=ToolRecovery(
+                RecoveryKind.CORRECT_ARGUMENTS,
+                "Call mode=preview with the same arguments in this run, then "
+                "apply with its preview_fingerprint.",
+            ),
         )
 
     async def _classify(

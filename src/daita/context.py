@@ -1188,7 +1188,13 @@ class AgentContextBuilder:
         projected_system = CanonicalMessage(
             role=MessageRole.SYSTEM,
             content=(
-                TextBlock("\n\n".join(item for item in (core, guidance) if item)),
+                TextBlock(
+                    "\n\n".join(
+                        item
+                        for item in (core, tool_context.limits_guidance, guidance)
+                        if item
+                    )
+                ),
             ),
         )
         static_messages = (projected_system, *snapshot.static_messages[1:])

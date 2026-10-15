@@ -22,11 +22,13 @@ from ...capabilities import (
     ExecutionAdmissionPolicy,
     Executor,
     OperationalEffect,
+    RecoveryKind,
     ToolboxId,
     ToolExecution,
     ToolLoadMode,
     ToolOutput,
     ToolPresentation,
+    ToolRecovery,
     ToolTextTrust,
     ToolView,
 )
@@ -60,7 +62,7 @@ RELATIONAL_UPSERT_TOOL_NAME = "data_upsert_rows"
 DATA_QUERY_DESCRIPTION = (
     "Run read-only SQL on exact catalog resources of one source. Use sql, or "
     "statements for up to 8 reads in one call; resource_ids must list every "
-    "table read (up to 64). Returns columns, rows, tables_touched, truncation "
+    "table read. Returns columns, rows, tables_touched, truncation "
     "and timing. Limits: 5s per statement, 15s total, 100 rows and 16 KB "
     "shared by all statements. "
     'Example: {"source_id": "...", "resource_ids": ["..."], '
@@ -90,6 +92,11 @@ RELATIONAL_UPSERT_DESCRIPTION = (
     'Example: {"mode": "preview", "key_columns": ["sku"], "rows": '
     '[{"sku": "A1", "qty": 3}], ...}. Mistakes: omitting a column to clear '
     "it (send null); retrying after denial or failure."
+)
+_REPREVIEW = ToolRecovery(
+    RecoveryKind.REINSPECT_BINDING,
+    "The table changed since the preview; run mode=preview again and apply "
+    "only the new preview_fingerprint.",
 )
 _MAX_PREVIEW_OUTPUT_BYTES = 256 * 1_024
 
@@ -838,11 +845,13 @@ class RelationalUpdateExecutor:
             raise CapabilityInputError(
                 "write_state_changed",
                 "The exact target count differs from the approved update plan.",
+                recovery=_REPREVIEW,
             )
         if preview.fingerprint.preview_fingerprint != command.preview_fingerprint:
             raise CapabilityInputError(
                 "write_preview_stale",
                 "The supplied preview fingerprint is not the exact current preview.",
+                recovery=_REPREVIEW,
             )
         return FrozenJsonObject.from_mapping(
             {
@@ -1504,6 +1513,7 @@ class RelationalUpsertExecutor:
             raise CapabilityInputError(
                 "write_preview_stale",
                 "The exact upsert preview changed before dispatch.",
+                recovery=_REPREVIEW,
             )
         return FrozenJsonObject.from_mapping(
             {

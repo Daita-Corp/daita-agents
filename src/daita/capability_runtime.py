@@ -41,6 +41,7 @@ from .capabilities import (
     EffectEvidenceBasis,
     EffectObservation,
     EffectOutcome,
+    ExecutionAdmissionPolicy,
     ExecutionContractReader,
     ExecutionPreference,
     Executor,
@@ -48,6 +49,7 @@ from .capabilities import (
     MachineRunDirective,
     MachineRunDirectiveKind,
     OperationalEffect,
+    RecoveryKind,
     SideEffectExecutor,
     TaskAttemptGuard,
     ToolboxId,
@@ -55,7 +57,9 @@ from .capabilities import (
     ToolLoadMode,
     ToolOutput,
     ToolOutputValidationError,
+    ToolRecovery,
     ToolView,
+    recovery_details,
     validate_tool_schema_value,
 )
 from .errors import DaitaError
@@ -470,6 +474,49 @@ class StepToolProjection:
     source_scope: EffectiveSourceScope | None = None
     session: RunSession | None = field(default=None, repr=False, compare=False)
 
+    @property
+    def limits_guidance(self) -> str:
+        """One compact line of enforced per-call bounds for callable tools.
+
+        A durable bound is named only when a prepared durable entrypoint
+        extends the foreground bound; execution still rechecks applicability.
+        """
+
+        durable = next(
+            (
+                entry
+                for entry in self.catalog_entries
+                if entry.capability.durable_foreground_entrypoint
+            ),
+            None,
+        )
+        parts: list[str] = []
+        for entry in self.callable_entries:
+            policy = entry.capability.execution_admission_policy
+            if policy is None or policy.limits_sentence() is None:
+                continue
+            part = (
+                f"{entry.view.name} at most {policy.inline_max_targets} "
+                f"{policy.target_count_argument}"
+            )
+            if (
+                durable is not None
+                and policy.graph_v1_eligible
+                and policy.graph_max_targets > policy.inline_max_targets
+            ):
+                part += (
+                    f" (up to {policy.graph_max_targets} through "
+                    f"{durable.view.name}"
+                    + (
+                        ""
+                        if durable in self.callable_entries
+                        else " after toolbox_load"
+                    )
+                    + ")"
+                )
+            parts.append(part)
+        return "" if not parts else "Per-call limits: " + "; ".join(parts) + "."
+
     def require_current(
         self,
         *,
@@ -504,6 +551,13 @@ class _ResolvedCall:
     control_result: ToolResultBlock | None = None
 
 
+@dataclass(slots=True)
+class _DispatchState:
+    """Whether one call reached its executor or effect reservation."""
+
+    started: bool = False
+
+
 class _ToolExecutionInterrupted(Exception):
     def __init__(
         self,
@@ -521,6 +575,16 @@ class _ToolOutcomeUnknown(RuntimeError):
     pass
 
 
+_REINSPECT_AFTER_APPROVAL = ToolRecovery(
+    RecoveryKind.REINSPECT_BINDING,
+    "The approved state changed before dispatch; re-read the target and "
+    "preview again before asking for approval.",
+)
+_UNCERTAIN_OUTCOME = ToolRecovery(
+    RecoveryKind.TERMINAL,
+    "The outcome is unknown; report it and check the target before any "
+    "further action. Never repeat the call.",
+)
 _CONTROL_TOOL_NAMES = RESERVED_TOOL_NAMES
 _TOKEN = re.compile(r"[a-z0-9]+")
 
@@ -1658,11 +1722,20 @@ class CapabilityRuntime:
                         call,
                         "invalid_argument_value",
                         "Choose one of the modes this tool admits in this run.",
-                        {
-                            "name": TOOL_MODE_ARGUMENT,
-                            "constraint": "enum",
-                            "allowed": [name for name, _ in entry.routes],
-                        },
+                        recovery_details(
+                            ToolRecovery(
+                                RecoveryKind.CORRECT_ARGUMENTS,
+                                "Set mode to one of: "
+                                + ", ".join(name for name, _ in entry.routes)
+                                + ".",
+                            ),
+                            {
+                                "name": TOOL_MODE_ARGUMENT,
+                                "constraint": "enum",
+                                "allowed": [name for name, _ in entry.routes],
+                                "execution_disposition": "not_dispatched",
+                            },
+                        ),
                     ),
                 )
             target = replace(
@@ -1678,6 +1751,10 @@ class CapabilityRuntime:
             return _ResolvedCall(call, call, entry=entry)
         control_names = {item.name for item in projection.provider_definitions}
         if call.name not in _CONTROL_TOOL_NAMES or call.name not in control_names:
+            loadable = "toolbox_load" in control_names and any(
+                item.view.name == call.name and item.load_mode is ToolLoadMode.ON_DEMAND
+                for item in projection.catalog_entries
+            )
             return _ResolvedCall(
                 call,
                 call,
@@ -1685,7 +1762,25 @@ class CapabilityRuntime:
                     call,
                     "tool_not_available",
                     "The requested tool is not available for this step projection.",
-                    {"tool_name": call.name},
+                    recovery_details(
+                        (
+                            ToolRecovery(
+                                RecoveryKind.CORRECT_ARGUMENTS,
+                                f"Load {call.name} with toolbox_load, then call "
+                                "it in the next step.",
+                                tool_name="toolbox_load",
+                            )
+                            if loadable
+                            else ToolRecovery(
+                                RecoveryKind.CORRECT_ARGUMENTS,
+                                "Call only a tool from the current tool list.",
+                            )
+                        ),
+                        {
+                            "tool_name": call.name,
+                            "execution_disposition": "not_dispatched",
+                        },
+                    ),
                 ),
             )
         definition = next(
@@ -1791,6 +1886,7 @@ class CapabilityRuntime:
             sensitivity=sensitivity,
             validated_arguments=resolved.validated_arguments,
             session=session,
+            projection=projection,
         )
 
     async def _execute_control(
@@ -1807,10 +1903,16 @@ class CapabilityRuntime:
             asyncio.get_running_loop().time() if self._observer is not None else None
         )
         self._emit_tool_started(run, call, None, catalog_entry=None)
-        if prepared_result is not None:
+        if control_name == "toolbox_search" or (
+            control_name == "toolbox_load"
+            and prepared_result is not None
+            and not prepared_result.is_error
+        ):
+            result = await self._applicable_control_result(
+                run, call, control_name, projection, sensitivity, prepared_result
+            )
+        elif prepared_result is not None:
             result = prepared_result
-        elif control_name == "toolbox_search":
-            result = self._toolbox_search(call, projection, sensitivity=sensitivity)
         elif control_name == "toolbox_inspect":
             result = await self._toolbox_inspect(
                 run, call, projection, sensitivity=sensitivity
@@ -1831,6 +1933,78 @@ class CapabilityRuntime:
             catalog_entry=None,
         )
         return result
+
+    async def _current_tool_names(
+        self,
+        run: RunInput,
+        projection: StepToolProjection,
+    ) -> frozenset[str] | None:
+        """Intersect frozen candidates with current local domain applicability."""
+
+        names: set[str] = set()
+        try:
+            for owner_id in sorted(
+                {entry.domain_owner_id for entry in projection.catalog_entries}
+            ):
+                names.update(
+                    await _domain_project(
+                        self._domains[owner_id], run, projection.session
+                    )
+                )
+        except Exception:
+            return None
+        return frozenset(
+            entry.view.name
+            for entry in projection.catalog_entries
+            if entry.view.name in names
+        )
+
+    async def _applicable_control_result(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        control_name: str,
+        projection: StepToolProjection,
+        sensitivity: ModelSensitivity,
+        prepared_result: ToolResultBlock | None,
+    ) -> ToolResultBlock:
+        current = await self._current_tool_names(run, projection)
+        if current is None:
+            return _error(
+                call,
+                f"{control_name}_unavailable",
+                "Current local tool admission could not be checked; no tools "
+                "were loaded or reported.",
+                recovery_details(
+                    ToolRecovery(
+                        RecoveryKind.TERMINAL,
+                        "Report the blocker; tool availability is unknown.",
+                    )
+                ),
+            )
+        if control_name == "toolbox_search":
+            return self._toolbox_search(
+                call, projection, sensitivity=sensitivity, current_names=current
+            )
+        assert prepared_result is not None
+        requested = cast(tuple[str, ...], call.arguments["tool_names"])
+        unavailable = [name for name in requested if name not in current]
+        if unavailable:
+            return _error(
+                call,
+                "toolbox_tool_not_available",
+                "A requested tool is not currently applicable in this run, so "
+                "nothing was loaded: " + ", ".join(unavailable) + ".",
+                recovery_details(
+                    ToolRecovery(
+                        RecoveryKind.TERMINAL,
+                        "These tools cannot be called in this run; continue with "
+                        "the applicable tools or report the limitation.",
+                    ),
+                    {"tool_names": unavailable},
+                ),
+            )
+        return prepared_result
 
     async def _toolbox_inspect(
         self,
@@ -1928,6 +2102,7 @@ class CapabilityRuntime:
         projection: StepToolProjection,
         *,
         sensitivity: ModelSensitivity,
+        current_names: frozenset[str],
     ) -> ToolResultBlock:
         query = call.arguments.get("query")
         limit_value = call.arguments.get(
@@ -1943,9 +2118,16 @@ class CapabilityRuntime:
                 "toolbox_search_invalid",
                 "The toolbox search arguments are invalid.",
             )
+        # An exact registered tool name gets a definite availability answer,
+        # so a missing tool is not mistaken for a ranking miss.
+        exact_name = (
+            query.strip() if query.strip() in self._registry.tool_names else None
+        )
         loaded_names = {entry.view.name for entry in projection.loaded_entries}
         scored: list[tuple[int, str, str, RunToolCatalogEntry]] = []
         for entry in projection.catalog_entries:
+            if entry.view.name not in current_names:
+                continue
             score = _toolbox_search_score(query, entry)
             scored.append((score, entry.toolbox_id.value, entry.view.name, entry))
         scored.sort(key=lambda item: (-item[0], item[1], item[2]))
@@ -1977,6 +2159,14 @@ class CapabilityRuntime:
         while True:
             data = {
                 "catalog_digest": projection.catalog_digest,
+                **(
+                    {}
+                    if exact_name is None
+                    else {
+                        "exact_tool_name": exact_name,
+                        "exact_tool_available": exact_name in current_names,
+                    }
+                ),
                 "matches": matches,
                 "total_matches": sum(score > 0 for score, _, _, _ in scored),
                 "total_candidates": total,
@@ -2727,11 +2917,21 @@ class CapabilityRuntime:
         validated_arguments: FrozenJsonObject | None,
         session: RunSession | None,
         dispatch_hook: Callable[[], Awaitable[None]] | None = None,
+        projection: StepToolProjection | None = None,
     ) -> ToolResultBlock:
         started = (
             asyncio.get_running_loop().time() if self._observer is not None else None
         )
         capability = entry.capability
+        dispatch = _DispatchState()
+
+        async def mark_dispatch() -> None:
+            dispatch.started = True
+            if dispatch_hook is not None:
+                await dispatch_hook()
+            elif session is not None:
+                session.evidence.record_outer_dispatch(call.id)
+
         self._emit_tool_started(
             run,
             call,
@@ -2801,13 +3001,14 @@ class CapabilityRuntime:
                 if policy is not None:
                     admission_error = policy.admission_error(arguments, preference)
                     if admission_error is not None:
-                        message = (
-                            "The requested bounded shape requires durable graph execution; "
-                            "submit one typed initial-task proposal with start_graph_job."
-                            if admission_error == "durable_execution_required"
-                            else "The requested execution shape is outside both inline and graph V1 admission."
+                        raise await self._admission_failure(
+                            run,
+                            session,
+                            projection,
+                            policy,
+                            arguments,
+                            admission_error,
                         )
-                        raise CapabilityInputError(admission_error, message)
                 elif (
                     preference is ExecutionPreference.DURABLE
                     and not capability.durable_foreground_entrypoint
@@ -2815,6 +3016,11 @@ class CapabilityRuntime:
                     raise CapabilityInputError(
                         "execution_not_supported_for_requested_shape",
                         "This capability is direct-only and cannot be forced into graph V1.",
+                        recovery=ToolRecovery(
+                            RecoveryKind.TERMINAL,
+                            "This tool runs only in the foreground; durable "
+                            "execution is not available for it.",
+                        ),
                     )
             arguments = await _domain_prepare_call(
                 domain,
@@ -2869,6 +3075,7 @@ class CapabilityRuntime:
                     sensitivity=sensitivity,
                     catalog_entry=entry,
                     session=session,
+                    dispatch=dispatch,
                 )
             else:
                 output, artifact_refs = await self._execute_no_effect(
@@ -2882,7 +3089,7 @@ class CapabilityRuntime:
                     session=session,
                     task_attempt_guard=guard,
                     catalog_entry=entry,
-                    dispatch_hook=dispatch_hook,
+                    dispatch_hook=mark_dispatch,
                 )
                 result = _classified_success(call, output, artifact_refs=artifact_refs)
         except _ToolExecutionInterrupted:
@@ -2891,6 +3098,9 @@ class CapabilityRuntime:
             raise
         except BaseException as error:
             result = self._exception_result(call, error, domain)
+        if result.is_error and not dispatch.started:
+            # Proven by control flow: the executor or effect was never reached.
+            result = _with_execution_disposition(result, "not_dispatched")
         result = _with_execution_lineage(result, capability)
         result = _bounded_tool_result(call, result, self._limits)
         self._emit_tool_completed(
@@ -2908,6 +3118,96 @@ class CapabilityRuntime:
                 outcome_certainty,
             )
         return result
+
+    async def _durable_entrypoint(
+        self,
+        run: RunInput,
+        session: RunSession | None,
+        projection: StepToolProjection | None,
+    ) -> tuple[RunToolCatalogEntry, bool] | None:
+        """Return the durable entrypoint this run can call, and if it is loaded.
+
+        Availability is capability metadata intersected with the prepared
+        candidates and the owning domain's current local projection.
+        """
+
+        if projection is None:
+            return None
+        for entry in projection.catalog_entries:
+            if not entry.capability.durable_foreground_entrypoint:
+                continue
+            if not _entry_resolves_exactly(entry, self._registry):
+                continue
+            try:
+                names = await _domain_project(
+                    self._domains[entry.domain_owner_id], run, session
+                )
+            except Exception:
+                continue
+            if entry.view.name in names:
+                return entry, entry in projection.callable_entries
+        return None
+
+    async def _admission_failure(
+        self,
+        run: RunInput,
+        session: RunSession | None,
+        projection: StepToolProjection | None,
+        policy: ExecutionAdmissionPolicy,
+        arguments: Mapping[str, object],
+        admission_error: str,
+    ) -> CapabilityInputError:
+        requested = policy.target_count(arguments)
+        argument = policy.target_count_argument or "targets"
+        durable = (
+            await self._durable_entrypoint(run, session, projection)
+            if admission_error == "durable_execution_required"
+            else None
+        )
+        if requested < 1:
+            recovery = ToolRecovery(
+                RecoveryKind.CORRECT_ARGUMENTS,
+                f"Select at least one entry in {argument}.",
+            )
+        elif durable is not None:
+            entry, callable_now = durable
+            recovery = ToolRecovery(
+                RecoveryKind.REDUCE_SCOPE,
+                f"Select at most {policy.inline_max_targets} {argument} per call, "
+                f"or submit up to {policy.graph_max_targets} as one durable task "
+                f"with {entry.view.name}"
+                + ("" if callable_now else " after loading it with toolbox_load")
+                + ".",
+                tool_name=entry.view.name,
+            )
+        elif policy.inline_eligible and requested > policy.inline_max_targets:
+            recovery = ToolRecovery(
+                RecoveryKind.REDUCE_SCOPE,
+                f"Select at most {policy.inline_max_targets} {argument} per call.",
+            )
+        else:
+            recovery = ToolRecovery(
+                RecoveryKind.TERMINAL,
+                "No execution path in this run admits this shape; report the "
+                "limitation.",
+            )
+        if policy.inline_eligible and requested > policy.inline_max_targets:
+            message = (
+                f"No query ran: {requested} {argument} exceed the per-call bound "
+                f"of {policy.inline_max_targets}."
+            )
+        else:
+            message = "No query ran: this shape is not admitted in the foreground."
+        return CapabilityInputError(
+            admission_error,
+            message,
+            {
+                "requested_targets": requested,
+                "execution_limits": policy.projection(),
+                "durable_available": durable is not None,
+            },
+            recovery=recovery,
+        )
 
     async def _execute_no_effect(
         self,
@@ -3101,6 +3401,7 @@ class CapabilityRuntime:
         sensitivity: ModelSensitivity,
         catalog_entry: RunToolCatalogEntry,
         session: RunSession | None,
+        dispatch: _DispatchState | None = None,
     ) -> tuple[
         ToolResultBlock,
         ToolBatchInterruption | None,
@@ -3154,7 +3455,14 @@ class CapabilityRuntime:
                         call,
                         "approval_required",
                         "This side effect requires an approval handler.",
-                        {"capability_id": capability.id},
+                        recovery_details(
+                            ToolRecovery(
+                                RecoveryKind.REQUIRES_HUMAN_PERMISSION,
+                                "A person must approve this action; no approval "
+                                "path exists in this run.",
+                            ),
+                            {"capability_id": capability.id},
+                        ),
                     ),
                     None,
                     ToolBatchCertainty.DEFINITE,
@@ -3226,7 +3534,14 @@ class CapabilityRuntime:
                         call,
                         "approval_denied",
                         "The side effect was denied.",
-                        {"capability_id": capability.id},
+                        recovery_details(
+                            ToolRecovery(
+                                RecoveryKind.REQUIRES_HUMAN_PERMISSION,
+                                "The person declined this exact action; do not "
+                                "repeat it unless they ask again.",
+                            ),
+                            {"capability_id": capability.id},
+                        ),
                     ),
                     None,
                     ToolBatchCertainty.DEFINITE,
@@ -3251,6 +3566,7 @@ class CapabilityRuntime:
             sensitivity=sensitivity,
             catalog_entry=catalog_entry,
             session=session,
+            dispatch=dispatch,
         )
 
     async def _execute_preflighted_side_effect(
@@ -3268,6 +3584,7 @@ class CapabilityRuntime:
         sensitivity: ModelSensitivity,
         catalog_entry: RunToolCatalogEntry,
         session: RunSession | None,
+        dispatch: _DispatchState | None = None,
     ) -> tuple[
         ToolResultBlock,
         ToolBatchInterruption | None,
@@ -3300,6 +3617,7 @@ class CapabilityRuntime:
                     raise CapabilityInputError(
                         "state_changed",
                         "Current effect binding changed after approval.",
+                        recovery=_REINSPECT_AFTER_APPROVAL,
                     )
             if plan.recheck_after_approval:
                 try:
@@ -3324,6 +3642,7 @@ class CapabilityRuntime:
                         raise CapabilityInputError(
                             "state_changed",
                             "Current effect authorization changed after approval.",
+                            recovery=_REINSPECT_AFTER_APPROVAL,
                         )
                 except asyncio.CancelledError:
                     raise
@@ -3337,7 +3656,10 @@ class CapabilityRuntime:
                             call,
                             "state_changed",
                             "The validated state changed while approval was pending.",
-                            {"capability_id": capability.id},
+                            recovery_details(
+                                _REINSPECT_AFTER_APPROVAL,
+                                {"capability_id": capability.id},
+                            ),
                         ),
                         None,
                         ToolBatchCertainty.DEFINITE,
@@ -3348,7 +3670,10 @@ class CapabilityRuntime:
                             call,
                             "state_changed",
                             "The validated state changed while approval was pending.",
-                            {"capability_id": capability.id},
+                            recovery_details(
+                                _REINSPECT_AFTER_APPROVAL,
+                                {"capability_id": capability.id},
+                            ),
                         ),
                         None,
                         ToolBatchCertainty.DEFINITE,
@@ -3359,6 +3684,9 @@ class CapabilityRuntime:
                     capability.id,
                     "before_effect_reservation",
                 )
+                if dispatch is not None:
+                    # Reservation starts the receipt-owned effect boundary.
+                    dispatch.started = True
                 return await self._execute_reserved_effect(
                     run,
                     call,
@@ -3373,6 +3701,8 @@ class CapabilityRuntime:
                 )
             if session is not None:
                 session.evidence.record_outer_dispatch(call.id)
+            if dispatch is not None:
+                dispatch.started = True
             (
                 candidate,
                 execution_error,
@@ -3634,7 +3964,10 @@ class CapabilityRuntime:
             observation = EffectObservation(
                 EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
             )
-            result = self._exception_result(call, reservation_guard_error, domain)
+            result = _with_execution_disposition(
+                self._exception_result(call, reservation_guard_error, domain),
+                "not_dispatched",
+            )
         elif (
             active_task is not None
             and active_task.cancelling() > cancellations_before_reservation
@@ -3647,6 +3980,14 @@ class CapabilityRuntime:
                 call,
                 "effect_not_dispatched",
                 "The effect was cancelled after reservation and before dispatch.",
+                recovery_details(
+                    ToolRecovery(
+                        RecoveryKind.TERMINAL,
+                        "The run was cancelled; its reserved receipt records that "
+                        "nothing was applied.",
+                    ),
+                    {"execution_disposition": "not_dispatched"},
+                ),
             )
         else:
             try:
@@ -3726,6 +4067,9 @@ class CapabilityRuntime:
                 call,
                 "effect_outcome_uncertain",
                 "The external operation may have acted. It will not be dispatched again; explicit foreground recovery is required.",
+                recovery_details(
+                    _UNCERTAIN_OUTCOME, {"execution_disposition": "unknown"}
+                ),
             )
         elif observation.outcome is not EffectOutcome.SUCCEEDED and not result.is_error:
             result = _error(
@@ -3870,10 +4214,17 @@ class CapabilityRuntime:
                 call,
                 "effect_unresolved",
                 str(error),
-                {
-                    "receipt_ids": error.receipt_ids,
-                    "omitted_count": error.omitted_count,
-                },
+                recovery_details(
+                    ToolRecovery(
+                        RecoveryKind.TERMINAL,
+                        "An earlier effect has no confirmed outcome; a person "
+                        "must resolve its receipt before new effects run.",
+                    ),
+                    {
+                        "receipt_ids": error.receipt_ids,
+                        "omitted_count": error.omitted_count,
+                    },
+                ),
             )
         if isinstance(error, EffectReceiptConflictError):
             return _error(call, "effect_reservation_conflict", str(error))
@@ -3892,10 +4243,14 @@ class CapabilityRuntime:
                 "outcome_unknown",
                 "The tool action started, but its authoritative outcome was not "
                 "available within the bounded recovery wait.",
-                {
-                    "execution_state": "started",
-                    "outcome_certainty": ToolBatchCertainty.OUTCOME_UNKNOWN.value,
-                },
+                recovery_details(
+                    _UNCERTAIN_OUTCOME,
+                    {
+                        "execution_state": "started",
+                        "execution_disposition": "unknown",
+                        "outcome_certainty": ToolBatchCertainty.OUTCOME_UNKNOWN.value,
+                    },
+                ),
             )
         if isinstance(error, CapabilityInputError):
             return _error(call, error.code, str(error), error.details)
@@ -5139,6 +5494,14 @@ def _effect_duplicate_result(call: ToolCall, receipt: EffectReceipt) -> ToolResu
             call,
             "effect_already_reserved",
             "This operation was already reserved and was not dispatched again.",
+            recovery_details(
+                ToolRecovery(
+                    RecoveryKind.TERMINAL,
+                    "This call already has a receipt; report its recorded outcome.",
+                ),
+                # The earlier reservation owns the outcome; this attempt proves nothing.
+                {"execution_disposition": "unknown"},
+            ),
         ),
         receipt,
     )
@@ -5243,6 +5606,26 @@ def _error(
                 "details": {} if details is None else details,
             }
         },
+    )
+
+
+def _with_execution_disposition(
+    result: ToolResultBlock,
+    disposition: str,
+) -> ToolResultBlock:
+    """Record a proven dispatch fact without replacing one the owner set."""
+
+    error = result.output.get("error")
+    if not isinstance(error, Mapping):
+        return result
+    details = error.get("details")
+    current = dict(details) if isinstance(details, Mapping) else {}
+    if "execution_disposition" in current:
+        return result
+    current["execution_disposition"] = disposition
+    return replace(
+        result,
+        output={**result.output, "error": {**error, "details": current}},
     )
 
 
