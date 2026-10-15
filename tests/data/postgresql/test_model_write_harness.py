@@ -604,7 +604,7 @@ async def test_owned_route_evidence_cleanup_and_exact_accounting_offline(
 
     def provider(*args, **kwargs):
         model = OfflineModel()
-        model.configure("upsert", {**batch, "evidence_call_ids": []})
+        model.configure("upsert", dict(batch))
         providers.append(model)
         return model
 

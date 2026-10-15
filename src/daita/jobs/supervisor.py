@@ -908,8 +908,8 @@ class JobSupervisor:
                 + (
                     " The runtime automatically binds the sole successful grant-backed "
                     "effect call when the task completes. Never copy an effect-receipt "
-                    "ID into task_complete. Use evidence_call_ids only for additional "
-                    "current-run ToolCall.id values and artifact_ids only for actual "
+                    "ID into task_complete. Use evidence_refs only for the result_ref "
+                    "of additional earlier results and artifact_ids only for actual "
                     "artifacts; omit both when empty."
                 )
             )

@@ -1365,15 +1365,15 @@ def graph_task_capability_declarations(
         "result_kind": {"type": "string", "minLength": 1, "maxLength": 256},
         "summary": {"type": "string", "minLength": 1, "maxLength": 8192},
         "payload": {"type": "object"},
-        "evidence_call_ids": {
+        "evidence_refs": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
             "maxItems": 64,
             "uniqueItems": True,
             "description": (
-                "Successful current-run ToolCall.id values used as supporting "
-                "evidence. Never put receipt, result, or artifact IDs here. The "
-                "runtime automatically binds the sole grant-backed effect call."
+                "result_ref values (like r3) of earlier successful results used "
+                "as supporting evidence. Never put receipt or artifact IDs here. "
+                "The runtime automatically binds the sole grant-backed effect call."
             ),
         },
         "artifact_ids": {
@@ -1409,6 +1409,7 @@ def graph_task_capability_declarations(
         access_mode=AccessMode.NONE,
         automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         machine_run_directive_kind=MachineRunDirectiveKind.COMPLETE,
+        result_ref_arguments=("evidence_refs[]",),
     )
     block = Capability(
         id=TASK_BLOCK_CAPABILITY_ID,
@@ -1461,6 +1462,7 @@ def graph_task_capability_declarations(
         access_mode=AccessMode.NONE,
         automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         machine_run_directive_kind=MachineRunDirectiveKind.REQUEST_REVIEW,
+        result_ref_arguments=("evidence_refs[]",),
     )
     review_inspect = Capability(
         id=REVIEW_INSPECT_CANDIDATE_CAPABILITY_ID,
@@ -1879,7 +1881,7 @@ def _authenticate_evidence(
 ]:
     if any(not isinstance(item, str) for item in evidence_call_ids):
         raise CapabilityInputError(
-            "task_result_evidence_invalid", "Task evidence call IDs are invalid."
+            "task_result_evidence_invalid", "Task evidence_refs are invalid."
         )
     requested = tuple(str(item) for item in evidence_call_ids)
     pairs = {call.id: (call, result) for call, result in transcript.tool_pairs}
@@ -1892,8 +1894,8 @@ def _authenticate_evidence(
         if pair is None or pair[1] is None or pair[1].is_error:
             raise CapabilityInputError(
                 "task_result_evidence_invalid",
-                "evidence_call_ids must contain successful current-run ToolCall.id values; receipt, result, and artifact IDs are invalid.",
-                details={"expected_reference_kind": "tool_call_id"},
+                "evidence_refs must name earlier successful results in this run.",
+                details={"expected_reference_kind": "result_ref"},
             )
         call, result = pair
         assert result is not None
@@ -1975,7 +1977,8 @@ def _task_result_from_arguments(
             "task_attempt_binding_missing",
             "The result lacks its exact task-attempt binding.",
         )
-    raw_evidence_ids = request.arguments.get("evidence_call_ids")
+    # The runtime resolved each result_ref to its canonical call.
+    raw_evidence_ids = request.arguments.get("evidence_refs")
     raw_artifact_ids = request.arguments.get("artifact_ids", ())
     if raw_evidence_ids is None:
         raw_evidence_ids = ()

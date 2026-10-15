@@ -444,7 +444,7 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
                     {"query": "orders", "limit": limit},
                 )
             assert invalid_limit.value.code == "invalid_argument_value"
-            assert invalid_limit.value.details.to_dict() == {
+            assert _validation_details(invalid_limit.value) == {
                 "constraint": "maximum",
                 "name": "limit",
             }
@@ -454,7 +454,7 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
                 CATALOG_SEARCH_CAPABILITY_ID,
                 {"query": "orders", "resource_kinds": ("spreadsheet",)},
             )
-        assert invalid_kind.value.details.to_dict() == {
+        assert _validation_details(invalid_kind.value) == {
             "constraint": "enum",
             "name": "resource_kinds[0]",
         }
@@ -464,7 +464,7 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
                 CATALOG_DESCRIBE_CAPABILITY_ID,
                 {"query": "orders", "detail": "columns"},
             )
-        assert invalid_detail.value.details.to_dict() == {
+        assert _validation_details(invalid_detail.value) == {
             "constraint": "enum",
             "name": "detail",
         }
@@ -477,7 +477,7 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
                     "limit": CATALOG_TOOL_DEFAULT_LIMIT,
                 },
             )
-        assert duplicate_resources.value.details.to_dict() == {
+        assert _validation_details(duplicate_resources.value) == {
             "constraint": "uniqueItems",
             "name": "resource_ids",
         }
@@ -865,6 +865,14 @@ async def _describe(
     )
     assert registry.validate_output(capability.id, output) == output
     return output
+
+
+def _validation_details(error: CapabilityInputError) -> dict[str, object]:
+    details = dict(error.details.to_dict())
+    recovery = details.pop("recovery")
+    assert isinstance(recovery, dict)
+    assert recovery["kind"] == "correct_arguments"
+    return details
 
 
 def _field_names(value: object) -> set[str]:
