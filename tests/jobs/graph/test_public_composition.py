@@ -100,7 +100,9 @@ class _ProductionGraphProvider(MockModelProvider):
                             "result_kind": DATA_QUERY_EVIDENCE_KIND,
                             "summary": "The exact bounded query completed.",
                             "payload": {"queried_resource_count": 5},
-                            "evidence_call_ids": ("graph-data-query",),
+                            "evidence_refs": (
+                                request.tool_result_refs["graph-data-query"],
+                            ),
                             "artifact_ids": (),
                             "residual_risk": None,
                             "downstream_constraints": {},

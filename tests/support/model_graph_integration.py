@@ -61,6 +61,7 @@ from daita.storage.sqlite import SQLiteStateStore
 from tests.support.capability_runtime import StaticTestDomain
 from tests.support.loop import TranscriptContext
 from tests.support.static_graph_integration import DeterministicIds
+from tests.support.toolbox_model import RefCitingMockModelProvider, result_ref
 
 AGENT_ID = "agent-model-graph"
 CONVERSATION_ID = "conversation-model-graph"
@@ -270,7 +271,7 @@ class ModelGraphIntegration:
             execution_contract_reader=contracts,
         )
         responses = script or successful_script()
-        provider = MockModelProvider(
+        provider = RefCitingMockModelProvider(
             responses,
             provider_id=MODEL_ROUTE_ID,
             complete_pricing=True,
@@ -450,7 +451,7 @@ def successful_script(
                         "result_kind": "test.graph.read",
                         "summary": "The deterministic read completed.",
                         "payload": {"value": 42},
-                        "evidence_call_ids": ("read-call",),
+                        "evidence_refs": (result_ref("read-call"),),
                         "artifact_ids": (),
                         "residual_risk": None,
                         "downstream_constraints": {},

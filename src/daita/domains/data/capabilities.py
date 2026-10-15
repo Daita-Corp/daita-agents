@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject, canonical_json
@@ -22,11 +22,13 @@ from ...capabilities import (
     ExecutionAdmissionPolicy,
     Executor,
     OperationalEffect,
+    RecoveryKind,
     ToolboxId,
     ToolExecution,
     ToolLoadMode,
     ToolOutput,
     ToolPresentation,
+    ToolRecovery,
     ToolTextTrust,
     ToolView,
 )
@@ -60,7 +62,7 @@ RELATIONAL_UPSERT_TOOL_NAME = "data_upsert_rows"
 DATA_QUERY_DESCRIPTION = (
     "Run read-only SQL on exact catalog resources of one source. Use sql, or "
     "statements for up to 8 reads in one call; resource_ids must list every "
-    "table read (up to 64). Returns columns, rows, tables_touched, truncation "
+    "table read. Returns columns, rows, tables_touched, truncation "
     "and timing. Limits: 5s per statement, 15s total, 100 rows and 16 KB "
     "shared by all statements. "
     'Example: {"source_id": "...", "resource_ids": ["..."], '
@@ -90,6 +92,11 @@ RELATIONAL_UPSERT_DESCRIPTION = (
     'Example: {"mode": "preview", "key_columns": ["sku"], "rows": '
     '[{"sku": "A1", "qty": 3}], ...}. Mistakes: omitting a column to clear '
     "it (send null); retrying after denial or failure."
+)
+_REPREVIEW = ToolRecovery(
+    RecoveryKind.REINSPECT_BINDING,
+    "The table changed since the preview; run mode=preview again and apply "
+    "only the new preview_fingerprint.",
 )
 _MAX_PREVIEW_OUTPUT_BYTES = 256 * 1_024
 
@@ -838,11 +845,13 @@ class RelationalUpdateExecutor:
             raise CapabilityInputError(
                 "write_state_changed",
                 "The exact target count differs from the approved update plan.",
+                recovery=_REPREVIEW,
             )
         if preview.fingerprint.preview_fingerprint != command.preview_fingerprint:
             raise CapabilityInputError(
                 "write_preview_stale",
                 "The supplied preview fingerprint is not the exact current preview.",
+                recovery=_REPREVIEW,
             )
         return FrozenJsonObject.from_mapping(
             {
@@ -1473,6 +1482,15 @@ class RelationalUpsertBackend(Protocol):
     ) -> RelationalUpsertResult: ...
 
 
+def _upsert_intent(request: ToolExecution) -> RelationalUpsertIntent:
+    """Bind the model's batch to the evidence the runtime derived for it."""
+
+    return replace(
+        RelationalUpsertIntent.from_mapping(request.arguments),
+        evidence_call_ids=request.provenance.evidence_call_ids,
+    )
+
+
 class RelationalUpsertPreviewExecutor:
     executor_id = "data.preview_upsert_rows.executor"
 
@@ -1480,7 +1498,7 @@ class RelationalUpsertPreviewExecutor:
         self._agent_id, self._backend = agent_id, backend
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
-        intent = RelationalUpsertIntent.from_mapping(request.arguments)
+        intent = _upsert_intent(request)
         return ToolOutput(
             kind="data.preview_upsert_rows",
             data=await self._backend.preview_upsert(
@@ -1496,7 +1514,7 @@ class RelationalUpsertExecutor:
         self._agent_id, self._backend = agent_id, backend
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        intent = RelationalUpsertIntent.from_mapping(request.arguments)
+        intent = _upsert_intent(request)
         preview = await self._backend.preview_upsert(
             agent_id=self._agent_id, intent=intent
         )
@@ -1504,6 +1522,7 @@ class RelationalUpsertExecutor:
             raise CapabilityInputError(
                 "write_preview_stale",
                 "The exact upsert preview changed before dispatch.",
+                recovery=_REPREVIEW,
             )
         return FrozenJsonObject.from_mapping(
             {
@@ -1539,7 +1558,7 @@ class RelationalUpsertExecutor:
         result = await self._backend.execute_upsert(
             agent_id=self._agent_id,
             execution=request,
-            intent=RelationalUpsertIntent.from_mapping(request.arguments),
+            intent=_upsert_intent(request),
             preview_fingerprint=cast(str, request.arguments["preview_fingerprint"]),
         )
         return ToolOutput(
@@ -1602,14 +1621,6 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
                 },
             },
         },
-        "evidence_call_ids": {
-            "type": "array",
-            "maxItems": 32,
-            "uniqueItems": True,
-            "items": {"type": "string", "minLength": 1, "maxLength": 256},
-            "description": "Omit in normal use; it is for programs that hold "
-            "exact current-run call ids. Never tool names or empty strings.",
-        },
     }
     required = [
         "source_id",
@@ -1623,7 +1634,7 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
         id="data.preview_upsert_rows",
         description=(
             "Preview one exact uniform batch as inserts, updates or unchanged rows. Values are model-derived claims; "
-            "research call IDs retain current-run evidence, not proof of truth. Identity values are allocated only on insert. "
+            "earlier reads of the same table in this run are recorded as evidence, not proof of truth. Identity values are allocated only on insert. "
             "Execution briefly takes a table-wide EXCLUSIVE lock permitting ordinary reads, with bounded timeouts."
         ),
         input_schema={
@@ -1637,6 +1648,7 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
         executor_id=RelationalUpsertPreviewExecutor.executor_id,
         access_mode=AccessMode.READ,
         automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
+        derives_call_provenance=True,
     )
     write = Capability(
         id="data.upsert_rows",
@@ -1669,6 +1681,7 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
             payload_schema=_UPSERT_RECEIPT_SCHEMA,
             success_evidence_basis=EffectEvidenceBasis.ADAPTER_VERIFIED,
         ),
+        derives_call_provenance=True,
         execution_admission_policy=ExecutionAdmissionPolicy(
             shape="preview_bound_postgresql_upsert",
             inline_eligible=True,

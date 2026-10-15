@@ -474,8 +474,9 @@ conversation-scoped. There is no hidden current-file pointer, raw model
 path/byte interface, or alternate artifact execution path.
 
 `artifact_create_tabular` creates one bounded model-authored CSV, XLSX, or
-HTML table from exact earlier successful tool-call IDs in the current run. The
-artifact domain authenticates each result against the immutable registry and
+HTML table from earlier successful results in the current run, cited by their
+visible `result_ref` values in `evidence_refs`. The runtime resolves each ref to
+its call, and the artifact domain authenticates each result against the immutable registry and
 persisted transcript, rejects failed, stale, reordered, cross-run, or tampered
 lineage, inherits the highest result sensitivity, and preserves current
 relational resource revisions where present. The artifact remains explicitly

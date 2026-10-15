@@ -36,7 +36,6 @@ from daita.llm.models import (
     ToolCall,
 )
 from daita.llm.pricing import CostEstimate
-from daita.llm.providers.mock import MockModelProvider
 from daita.storage.sqlite import SQLiteStateStore
 from tests.support.graph import GRAPH_NOW, graph_admission, task_result
 from tests.support.model_graph_integration import (
@@ -45,6 +44,7 @@ from tests.support.model_graph_integration import (
     READ_CAPABILITY_ID,
     ModelGraphIntegration,
 )
+from tests.support.toolbox_model import RefCitingMockModelProvider, result_ref
 
 pytestmark = pytest.mark.integration
 
@@ -264,7 +264,7 @@ async def test_unexpected_discovery_replans_with_immutable_replacement(
                 "result_kind": "graph.plan",
                 "summary": "Created one immutable replacement.",
                 "payload": {"replacement": True},
-                "evidence_call_ids": ("replace-worker",),
+                "evidence_refs": (result_ref("replace-worker"),),
                 "artifact_ids": (),
                 "residual_risk": None,
                 "downstream_constraints": {},
@@ -282,14 +282,14 @@ async def test_unexpected_discovery_replans_with_immutable_replacement(
                 "result_kind": "test.graph.read",
                 "summary": "The replacement read completed.",
                 "payload": {"value": 42},
-                "evidence_call_ids": ("replacement-read",),
+                "evidence_refs": (result_ref("replacement-read"),),
                 "artifact_ids": (),
                 "residual_risk": None,
                 "downstream_constraints": {},
             },
         ),
     )
-    provider = MockModelProvider(
+    provider = RefCitingMockModelProvider(
         script,
         provider_id=MODEL_ROUTE_ID,
         complete_pricing=True,

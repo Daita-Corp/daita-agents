@@ -122,7 +122,8 @@ The existing artifact inventory and preview reads are included through their
 owner's exact contracts. Creation, conversion and delivery remain outer calls.
 
 `inputs` maps logical names to exact earlier successful same-run references:
-`{"sales":{"kind":"tool_result","call_id":"..."}}` or
+`{"sales":{"kind":"tool_result","result_ref":"r3"}}` (a child result uses its
+visible `evidence_id` instead) or
 `{"saved":{"kind":"artifact","artifact_id":"..."}}`. `inputs.get("sales")`
 reads the captured JSON result envelope; `inputs.path("saved")` supplies a private
 relative file for an installed reader. Inputs support structured JSON, UTF-8 text,

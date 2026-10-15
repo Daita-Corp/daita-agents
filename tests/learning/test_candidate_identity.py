@@ -224,7 +224,7 @@ def test_semantic_mutation_match_is_exact_except_for_runtime_owned_evidence():
         "evidence": [
             {
                 "kind": "tool_result",
-                "tool_call_id": "runtime-call",
+                "result_ref": "r2",
                 "note": "Fresh runtime evidence.",
             }
         ],

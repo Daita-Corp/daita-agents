@@ -30,6 +30,7 @@ from daita.storage.sqlite import SQLiteStateStore
 from tests.support.graph import GRAPH_NOW, graph_admission
 from tests.support.model_graph_integration import AGENT_ID, ModelGraphIntegration
 from tests.support.static_graph_integration import DeterministicIds
+from tests.support.toolbox_model import result_ref
 
 
 def _response(call_id: str, name: str, arguments: dict[str, object]) -> ModelResponse:
@@ -54,7 +55,7 @@ def _review_script(*, decision: str = "accept") -> tuple[ModelResponse, ...]:
                 "result_kind": "test.graph.read",
                 "summary": "Candidate awaiting an independent review.",
                 "payload": {"value": 42},
-                "evidence_call_ids": ("read-call",),
+                "evidence_refs": (result_ref("read-call"),),
                 "artifact_ids": (),
                 "residual_risk": None,
                 "downstream_constraints": {"review_required": True},
