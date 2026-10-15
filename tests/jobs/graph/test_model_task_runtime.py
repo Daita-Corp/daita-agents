@@ -49,6 +49,7 @@ from tests.support.model_graph_integration import (
     MODEL_ROUTE_ID,
     READ_CAPABILITY_ID,
     ModelGraphIntegration,
+    successful_script,
 )
 
 pytestmark = pytest.mark.integration
@@ -166,6 +167,84 @@ async def test_model_task_completes_only_through_exact_lifecycle_directive(
         integration.provider.assert_consumed()
     finally:
         release_finish.set()
+        await integration.close()
+
+
+@pytest.mark.parametrize("outcome", ["completed", "retried"])
+async def test_model_task_run_usage_and_ledger_debit_are_each_counted_once(
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    def priced(input_tokens: int, output_tokens: int, cost: str) -> ModelUsage:
+        return ModelUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_estimate=CostEstimate.complete(Decimal(cost)),
+        )
+
+    first, second = priced(120, 8, "0.003"), priced(150, 12, "0.004")
+    expected_runs: tuple[tuple[ModelUsage, ...], ...]
+    if outcome == "completed":
+        # One attempt makes two logical model steps.
+        script = successful_script(first, second)
+        expected_runs = ((first, second),)
+    else:
+        # Two attempts each make one step and violate the lifecycle protocol.
+        script = tuple(
+            ModelResponse(
+                finish_reason=FinishReason.STOP, text="No lifecycle result.", usage=item
+            )
+            for item in (first, second)
+        )
+        expected_runs = ((first,), (second,))
+    integration = await ModelGraphIntegration.open(tmp_path, script=script)
+    try:
+        admission = integration.build()
+        await integration.admit_and_start(admission)
+        terminal = await integration.wait_terminal(admission.job.job_id)
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(integration.supervisor._graph_workers.values())),
+            timeout=5,
+        )
+        integration.provider.assert_consumed()
+        work = next(item for item in terminal.tasks if item.role is TaskRole.WORKER)
+        attempts = sorted(
+            (item for item in terminal.attempts if item.task_id == work.task_id),
+            key=lambda item: item.ordinal,
+        )
+        assert len(attempts) == len(expected_runs)
+        for attempt, steps in zip(attempts, expected_runs, strict=True):
+            result = await integration.store.result(attempt.run_id)
+            assert result is not None
+            assert result.usage.input_tokens == sum(item.input_tokens for item in steps)
+            assert result.usage.output_tokens == sum(
+                item.output_tokens for item in steps
+            )
+            assert result.usage.cost_estimate.amount_usd == sum(
+                (item.cost_estimate.amount_usd or Decimal(0) for item in steps),
+                Decimal(0),
+            )
+            # Each attempt settles its own reservation exactly once.
+            assert attempt.measured_usage == attempt.reserved_budgets
+        ledgers = terminal.budget_ledgers
+        task_ledgers = [item for item in ledgers if item.task_id == work.task_id]
+        assert task_ledgers
+        for ledger in task_ledgers:
+            assert ledger.reserved == 0
+            assert ledger.settled == sum(
+                usage.amount
+                for attempt in attempts
+                for usage in attempt.measured_usage
+                if usage.dimension == ledger.dimension
+            )
+        for root in (item for item in ledgers if item.task_id is None):
+            assert root.reserved == 0
+            assert root.settled == sum(
+                item.settled
+                for item in ledgers
+                if item.task_id is not None and item.dimension == root.dimension
+            )
+    finally:
         await integration.close()
 
 
