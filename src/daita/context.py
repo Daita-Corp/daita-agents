@@ -1187,13 +1187,29 @@ class AgentContextBuilder:
                 for entry in tool_context.callable_entries
             ),
         )
+        progress_warnings = (
+            ""
+            if tool_context.session is None
+            else "\n".join(
+                tool_context.session.evidence.progress_warnings(
+                    frozenset(
+                        entry.view.name for entry in tool_context.callable_entries
+                    )
+                )
+            )
+        )
         projected_system = CanonicalMessage(
             role=MessageRole.SYSTEM,
             content=(
                 TextBlock(
                     "\n\n".join(
                         item
-                        for item in (core, tool_context.limits_guidance, guidance)
+                        for item in (
+                            core,
+                            tool_context.limits_guidance,
+                            guidance,
+                            progress_warnings,
+                        )
                         if item
                     )
                 ),

@@ -854,7 +854,8 @@ class AgentLoop:
                     raise ValueError(
                         "tool runtime must return one ordered result per tool call"
                     )
-                for result in results:
+                for call, result in zip(response.tool_calls, results, strict=True):
+                    session.evidence.observe_progress(call, result)
                     session.evidence.record_outer_result(
                         result.call_id, failed=result.is_error
                     )
@@ -1006,6 +1007,8 @@ class AgentLoop:
                 sensitivity=sensitivity,
             )
             raise
+        finally:
+            session.evidence.clear_progress()
 
     async def _finish(
         self,
