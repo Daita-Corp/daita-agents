@@ -692,9 +692,9 @@ class _ParsedSpec(TypedDict):
     distribution_destination_id: str
     eligible_model_routes: tuple[str, ...]
     per_run_max_tokens: int
-    per_run_max_cost_usd: Decimal
+    per_run_max_cost_usd: Decimal | None
     cumulative_max_tokens: int
-    cumulative_max_cost_usd: Decimal
+    cumulative_max_cost_usd: Decimal | None
     cumulative_max_attempts: int
     cumulative_max_occurrences: int
     maximum_consecutive_failures: int
@@ -747,9 +747,11 @@ def _parsed_spec(
         ),
         "eligible_model_routes": _strings(arguments, "eligible_model_routes"),
         "per_run_max_tokens": _integer(arguments, "per_run_max_tokens"),
-        "per_run_max_cost_usd": _decimal(arguments, "per_run_max_cost_usd"),
+        "per_run_max_cost_usd": _optional_decimal(arguments, "per_run_max_cost_usd"),
         "cumulative_max_tokens": _integer(arguments, "cumulative_max_tokens"),
-        "cumulative_max_cost_usd": _decimal(arguments, "cumulative_max_cost_usd"),
+        "cumulative_max_cost_usd": _optional_decimal(
+            arguments, "cumulative_max_cost_usd"
+        ),
         "cumulative_max_attempts": _integer(arguments, "cumulative_max_attempts"),
         "cumulative_max_occurrences": _integer(arguments, "cumulative_max_occurrences"),
         "maximum_consecutive_failures": _integer(
@@ -1316,9 +1318,7 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
         "distribution_destination_id",
         "eligible_model_routes",
         "per_run_max_tokens",
-        "per_run_max_cost_usd",
         "cumulative_max_tokens",
-        "cumulative_max_cost_usd",
         "cumulative_max_attempts",
         "cumulative_max_occurrences",
         "maximum_consecutive_failures",
@@ -1704,6 +1704,10 @@ def _decimal(values: Mapping[str, object], name: str) -> Decimal:
         raise CapabilityInputError(
             "routine_argument_invalid", f"{name} must be decimal text."
         ) from error
+
+
+def _optional_decimal(values: Mapping[str, object], name: str) -> Decimal | None:
+    return _decimal(values, name) if name in values else None
 
 
 def _datetime(value: str) -> datetime:

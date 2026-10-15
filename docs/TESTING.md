@@ -239,9 +239,10 @@ Subscription responses are unpriced, and Daita refuses unpriced requests under a
 dollar cap, so subscription runs drop only the dollar cap and keep their step,
 token and wall-time limits. Token limits are checked after each returned
 response, so a run can exceed its token limit by at most one response. Graph
-tasks, background jobs and routines require a priced budget and skip under
-subscription billing. Cost-accounting assertions run only under API billing;
-keep a small API-billed run for that evidence.
+tasks, background jobs and routines run too: graph tasks are bounded by turns,
+tokens, time and attempts, and subscription routines are admitted without dollar
+ceilings. Cost-accounting assertions run only under API billing; keep a small
+API-billed run for that evidence.
 
 Reports from subscription runs record `api_equivalent_cost`: reported tokens
 priced at the matching `openai:<model>` list rates with basis

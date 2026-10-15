@@ -1127,7 +1127,8 @@ class AgentContextBuilder:
                 + canonical_json(snapshot.routine_authoring_facts)
                 + "\nSelect exact eligible_model_routes from these data values. No current-model alias exists. "
                 "If multiple choices leave the intended route ambiguous, clarify. A null host cost ceiling means "
-                "no host cost ceiling; the routine still requires its own bounded budget."
+                "no host cost ceiling. Token, attempt and occurrence ceilings always bound a routine; omit both "
+                "dollar ceilings unless the user asks for one, and they are required together when set."
             )
         if remaining_tokens is not None:
             core += (

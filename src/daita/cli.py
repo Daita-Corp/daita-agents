@@ -1292,9 +1292,13 @@ def _routine_draft_from_file(path: Path) -> ScheduledRoutineDraft:
         ),
         eligible_model_routes=_string_tuple(document, "eligible_model_routes"),
         per_run_max_tokens=_required_integer(document, "per_run_max_tokens"),
-        per_run_max_cost_usd=_routine_decimal(document, "per_run_max_cost_usd"),
+        per_run_max_cost_usd=_optional_routine_decimal(
+            document, "per_run_max_cost_usd"
+        ),
         cumulative_max_tokens=_required_integer(document, "cumulative_max_tokens"),
-        cumulative_max_cost_usd=_routine_decimal(document, "cumulative_max_cost_usd"),
+        cumulative_max_cost_usd=_optional_routine_decimal(
+            document, "cumulative_max_cost_usd"
+        ),
         cumulative_max_attempts=_required_integer(document, "cumulative_max_attempts"),
         cumulative_max_occurrences=_required_integer(
             document, "cumulative_max_occurrences"
@@ -1437,6 +1441,10 @@ def _routine_decimal(value: Mapping[str, object], name: str) -> Decimal:
         return Decimal(str(item))
     except InvalidOperation as error:
         raise ValueError(f"{name} is not a decimal") from error
+
+
+def _optional_routine_decimal(value: Mapping[str, object], name: str) -> Decimal | None:
+    return None if value.get(name) is None else _routine_decimal(value, name)
 
 
 def _routine_datetime(value: str) -> datetime:

@@ -38,7 +38,6 @@ from tests.support.job_benchmarks import (
     wait_for_running,
     wait_for_terminal,
 )
-from tests.support.live_billing import require_api_billing
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_STAGE_B_MODEL_MATRIX"
 _MODEL_IDS = configured_model_ids()
@@ -84,7 +83,6 @@ async def test_model_certification_cross_conversation_result(
     model_id: str,
     record_property: Callable[[str, object], None],
 ) -> None:
-    require_api_billing("background job admission")
     fixture, job_id = await seed_completed_profile_agent(
         tmp_path,
         "matrix-result",
@@ -122,7 +120,6 @@ async def test_model_certification_start_and_cancel(
     model_id: str,
     record_property: Callable[[str, object], None],
 ) -> None:
-    require_api_billing("background job admission")
     fixture = await create_live_agent(tmp_path, "matrix-cancel", model_id)
     _, executor = fixture.agent._embedded._capabilities.resolve_execution(
         DATA_PROFILE_EXECUTION_CAPABILITY_ID

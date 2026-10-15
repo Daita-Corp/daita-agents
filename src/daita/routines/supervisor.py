@@ -6,7 +6,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha256
 
 from .._json import canonical_json
@@ -15,9 +15,11 @@ from ..artifacts.store import AgentHomeArtifactStore
 from ..capabilities import ExecutionScope, ExecutionScopeKind
 from ..capability_runtime import CapabilityRuntime, InternalCapabilityRequest
 from ..distribution import DistributionOwner, OutcomeArtifactReference
+from ..llm.errors import ProviderErrorCode
 from ..loop.models import (
     InstructionAuthority,
     LoopExit,
+    LoopExitKind,
     RunInput,
     RunOrigin,
     RunStartEnvelope,
@@ -40,6 +42,10 @@ from .owner import RoutineOwner, RoutineSupervisorStore
 _logger = logging.getLogger(__name__)
 
 _DEFAULT_POLL_SECONDS = 1.0
+# A provider quota rejection holds new claims on that route, doubling per repeat.
+# Loop exits do not carry the provider's retry-after, so the window is bounded here.
+_QUOTA_HOLD_INITIAL = timedelta(minutes=5)
+_QUOTA_HOLD_MAXIMUM = timedelta(hours=1)
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z")
 
 RoutineRunExecutor = Callable[
@@ -89,6 +95,7 @@ class RoutineSupervisor:
         self._failure_code: str | None = None
         self._consecutive_failures = 0
         self._retry_at = 0.0
+        self._quota_holds: dict[str, tuple[datetime, timedelta]] = {}
 
     @property
     def status(self) -> SupervisorStatus:
@@ -243,6 +250,8 @@ class RoutineSupervisor:
         )
         for routine in due:
             assert routine.next_due_at is not None
+            if self._quota_held(routine, now):
+                continue
             try:
                 occurrence = await self._store.claim_due_routine_occurrence(
                     self._agent_id,
@@ -319,6 +328,7 @@ class RoutineSupervisor:
             result = await self._execute_run(occurrence, run_input, observation)
             if result is None:
                 return
+            self._observe_quota(routine, result)
             terminal = await self._store.mark_routine_occurrence_run_terminal(
                 self._agent_id,
                 occurrence.occurrence_id,
@@ -355,6 +365,35 @@ class RoutineSupervisor:
             raise
         except Exception as error:
             await self._fail_unbound(occurrence, error)
+
+    def _quota_held(self, routine: ScheduledRoutine, now: datetime) -> bool:
+        """Leave due slots unclaimed while any eligible route is over quota."""
+        return any(
+            hold[0] > now
+            for route in routine.eligible_model_routes
+            if (hold := self._quota_holds.get(route)) is not None
+        )
+
+    def _observe_quota(self, routine: ScheduledRoutine, result: LoopExit) -> None:
+        if result.kind is LoopExitKind.COMPLETED:
+            # Completed exits carry no provider identity; any eligible route served.
+            for eligible in routine.eligible_model_routes:
+                self._quota_holds.pop(eligible, None)
+            return
+        route = result.provider_id
+        if (
+            route is not None
+            and result.kind is LoopExitKind.FAILED
+            and result.reason == ProviderErrorCode.RATE_LIMIT_ERROR.value
+        ):
+            previous = self._quota_holds.get(route)
+            window = (
+                _QUOTA_HOLD_INITIAL
+                if previous is None
+                else min(previous[1] * 2, _QUOTA_HOLD_MAXIMUM)
+            )
+            self._quota_holds[route] = (self._clock() + window, window)
+            _logger.warning("routine model route over quota; holding new claims")
 
     async def _observe_precheck(
         self,

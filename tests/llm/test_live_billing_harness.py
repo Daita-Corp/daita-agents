@@ -63,7 +63,6 @@ def test_api_billing_is_the_default_and_unknown_modes_fail(
     assert not live_billing.subscription_billing()
     assert live_billing.live_model_id("openai:gpt-5.6-terra") == "openai:gpt-5.6-terra"
     assert live_billing.cost_cap(Decimal("0.15")) == Decimal("0.15")
-    live_billing.require_api_billing("graph task admission")
 
     monkeypatch.setenv(live_billing.BILLING_ENV, "free")
     with pytest.raises(pytest.fail.Exception, match=live_billing.BILLING_ENV):
@@ -79,8 +78,6 @@ def test_subscription_maps_only_reviewed_openai_models_and_drops_dollar_caps(
     with pytest.raises(pytest.fail.Exception, match="no reviewed codex"):
         live_billing.live_model_id("anthropic:claude-opus-5-5")
     assert live_billing.cost_cap(Decimal("0.15")) is None
-    with pytest.raises(pytest.skip.Exception, match="requires API billing"):
-        live_billing.require_api_billing("graph task admission")
 
 
 def test_subscription_provider_reads_only_the_test_keychain(

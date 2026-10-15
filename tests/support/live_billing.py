@@ -11,10 +11,10 @@ collection, and is never printed, logged, or accepted from the environment.
 
 Subscription responses carry no per-request price, and Daita refuses unpriced
 requests under a dollar cap. Subscription runs therefore keep their step and
-token limits but drop the dollar cap, and work that requires a priced budget
-(background graph tasks, routines) is skipped rather than run unbounded. Token
-limits are checked against each returned response, so one run can exceed its
-token cap by at most one response.
+token limits but drop the dollar cap; graph tasks and routines stay bounded by
+their turn, token, time, attempt and occurrence ceilings. Token limits are
+checked against each returned response, so one run can exceed its token cap by
+at most one response.
 
 Reports record a notional API-equivalent cost: reported subscription tokens
 priced at the matching ``openai:<model>`` list rates. It is evidence for
@@ -88,13 +88,6 @@ def cost_cap(amount: Decimal) -> Decimal | None:
     """Return the dollar cap for API billing and none for subscription routes."""
 
     return None if subscription_billing() else amount
-
-
-def require_api_billing(reason: str) -> None:
-    """Skip work whose budget contract needs priced model usage."""
-
-    if subscription_billing():
-        pytest.skip(f"{reason} requires API billing; unset {BILLING_ENV}")
 
 
 def live_provider(
@@ -249,7 +242,6 @@ __all__ = [
     "keychain",
     "live_model_id",
     "live_provider",
-    "require_api_billing",
     "subscription_billing",
 ]
 

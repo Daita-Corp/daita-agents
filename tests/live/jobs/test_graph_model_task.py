@@ -1,4 +1,4 @@
-"""Cost-bounded live smoke through the revision-2 public composition."""
+"""Bounded live smoke through the revision-2 public composition."""
 
 from __future__ import annotations
 
@@ -9,14 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent, GraphState, LoopLimits, create_llm_provider
+from daita import Agent, GraphState, LoopLimits
 from daita.domains.data import DATA_QUERY_EVIDENCE_KIND
 from daita.jobs.graph.models import AttemptState, TaskExecutionKind, TaskRole
-from daita.llm.profiles import reviewed_model_profile
 from daita.loop.models import LoopExitKind
 from daita.storage.home_migrations import CURRENT_HOME_REVISION
 from tests.support.job_benchmarks import create_probe_home
-from tests.support.live_billing import require_api_billing
+from tests.support.live_billing import cost_cap, live_provider, subscription_billing
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_GRAPH_TASK"
@@ -71,21 +70,17 @@ async def _wait_terminal(agent: Agent, job_id: str) -> None:
 async def test_live_model_task_uses_public_revision_2_composition(
     tmp_path: Path,
 ) -> None:
-    require_api_billing("graph task admission")
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
-    provider_name = model_id.partition(":")[0]
-    if provider_name not in _API_PROVIDERS:
-        pytest.fail(f"{_MODEL_ID} must name an API-backed provider")
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name a reviewed tool-capable model")
-    api_key = os.environ.get(_MODEL_KEY)
-    if api_key is None or not api_key.strip():
-        pytest.skip(f"{_MODEL_KEY} is unavailable for the authorized live smoke")
-    provider = create_llm_provider(
+    if not subscription_billing():
+        if model_id.partition(":")[0] not in _API_PROVIDERS:
+            pytest.fail(f"{_MODEL_ID} must name an API-backed provider")
+        api_key = os.environ.get(_MODEL_KEY)
+        if api_key is None or not api_key.strip():
+            pytest.skip(f"{_MODEL_KEY} is unavailable for the authorized live smoke")
+    profile, provider = live_provider(
         model_id,
-        api_key=api_key,
-        max_output_tokens=min(profile.max_output_tokens, 2_048),
+        api_key=lambda: os.environ[_MODEL_KEY],
+        max_output_tokens=2_048,
     )
     home = await create_probe_home(
         tmp_path,
@@ -106,7 +101,7 @@ async def test_live_model_task_uses_public_revision_2_composition(
         limits=LoopLimits(
             max_steps=8,
             max_total_tokens=40_000,
-            max_estimated_cost_usd=_cost_limit(),
+            max_estimated_cost_usd=cost_cap(_cost_limit()),
         ),
         workspace=workspace_for(home.root),
     )
