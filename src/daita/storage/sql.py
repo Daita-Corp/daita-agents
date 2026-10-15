@@ -111,6 +111,7 @@ from ..learning_candidates import (
     LearningCandidateStatus,
     LearningReviewRunTail,
 )
+from ..llm.errors import ProviderErrorCode
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -1762,9 +1763,14 @@ class SQLStateStore:
                     or routine.distribution_plan != current.distribution_plan
                     or routine.expires_at > current.expires_at
                     or routine.per_run_max_tokens > current.per_run_max_tokens
-                    or routine.per_run_max_cost_usd > current.per_run_max_cost_usd
+                    or _cost_ceiling_widened(
+                        routine.per_run_max_cost_usd, current.per_run_max_cost_usd
+                    )
                     or routine.cumulative_max_tokens > current.cumulative_max_tokens
-                    or routine.cumulative_max_cost_usd > current.cumulative_max_cost_usd
+                    or _cost_ceiling_widened(
+                        routine.cumulative_max_cost_usd,
+                        current.cumulative_max_cost_usd,
+                    )
                     or routine.cumulative_max_attempts > current.cumulative_max_attempts
                     or routine.cumulative_max_occurrences
                     > current.cumulative_max_occurrences
@@ -2078,7 +2084,7 @@ class SQLStateStore:
             execution_scope_digest=None,
             reserved_run_id=None,
             reserved_tokens=current.per_run_max_tokens,
-            reserved_cost_usd=current.per_run_max_cost_usd,
+            reserved_cost_usd=current.per_run_max_cost_usd or Decimal("0"),
             charged_tokens=0,
             charged_cost_usd=Decimal("0"),
             run_bound_at=None,
@@ -2099,7 +2105,8 @@ class SQLStateStore:
             active_occurrence_id=identity,
             reserved_tokens=current.reserved_tokens + current.per_run_max_tokens,
             reserved_cost_usd=(
-                current.reserved_cost_usd + current.per_run_max_cost_usd
+                current.reserved_cost_usd
+                + (current.per_run_max_cost_usd or Decimal("0"))
             ),
             attempt_count=current.attempt_count + 1,
             occurrence_count=current.occurrence_count + 1,
@@ -2365,6 +2372,7 @@ class SQLStateStore:
             validated_artifact_references: tuple[OutcomeArtifactReference, ...] = ()
             effect_receipt_ids: tuple[str, ...] = ()
             uncertain_effect = False
+            rate_limited = False
             if pre_run_outcome:
                 occurrence_observation = skipped_no_change_observation
                 successful = occurrence_observation is not None
@@ -2556,9 +2564,23 @@ class SQLStateStore:
                 estimate = result.usage.cost_estimate
                 charged_tokens = result.usage.total_tokens
                 charged_cost = estimate.amount_usd or Decimal("0")
+                dollar_capped = routine.per_run_max_cost_usd is not None
+                # A provider quota rejection bills nothing for the rejected request.
+                rate_limited = (
+                    result.kind is LoopExitKind.FAILED
+                    and result.reason == ProviderErrorCode.RATE_LIMIT_ERROR.value
+                )
+                # Without a dollar ceiling, an unpriced route (a subscription or a
+                # model with no price schedule) is complete when it reported tokens.
+                unpriced_with_known_tokens = (
+                    not dollar_capped
+                    and estimate.code in _UNPRICED_COST_CODES
+                    and (result.usage.total_tokens > 0 or rate_limited)
+                )
                 if (
                     estimate.status is not CostEstimateStatus.COMPLETE
                     and estimate.code != "no_model_attempts"
+                    and not unpriced_with_known_tokens
                 ):
                     # Unknown consumption retains the reservation as a conservative
                     # charge, without discarding a larger known partial amount.
@@ -2569,9 +2591,8 @@ class SQLStateStore:
                             contract_failure_code or "routine_run_usage_incomplete"
                         )
                     successful = False
-                if (
-                    result.usage.total_tokens > current.reserved_tokens
-                    or charged_cost > current.reserved_cost_usd
+                if result.usage.total_tokens > current.reserved_tokens or (
+                    dollar_capped and charged_cost > current.reserved_cost_usd
                 ):
                     contract_failure_code = (
                         contract_failure_code or "routine_run_budget_exceeded"
@@ -2668,7 +2689,13 @@ class SQLStateStore:
                         after=following,
                         expires_at=routine.expires_at,
                     )
-            failures = 0 if successful else routine.consecutive_failures + 1
+            # A quota rejection is the provider's pause, not the routine failing;
+            # the supervisor holds new claims until the quota window passes.
+            failures = (
+                0
+                if successful
+                else routine.consecutive_failures + (0 if rate_limited else 1)
+            )
             if successful:
                 next_state = (
                     RoutineState.ACTIVE
@@ -7147,6 +7174,19 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
         if delivery_counts[agent_id] > MAX_DELIVERIES_PER_AGENT:
             raise ValueError("stored delivery count exceeds its fixed bound")
     return identity
+
+
+# Cost-estimate codes that mean "no price", never "unknown token usage".
+_UNPRICED_COST_CODES = frozenset(
+    {"subscription_billing", "pricing_schedule_unavailable", "pricing_rate_unavailable"}
+)
+
+
+def _cost_ceiling_widened(proposed: Decimal | None, current: Decimal | None) -> bool:
+    """A removed dollar ceiling widens authority just as a larger one does."""
+    if current is None:
+        return False
+    return proposed is None or proposed > current
 
 
 def _require_effects_unblocked(

@@ -220,7 +220,7 @@ async def _running_effect_attempt(tmp_path):
         ),
         sensitivity_ceiling=ModelSensitivity.RESTRICTED,
         eligible_model_routes=(_ROUTE_ID,),
-        per_run_max_cost_usd=Decimal("1"),
+        per_run_max_cost_usd=None,
         per_run_max_tokens=1_000,
         distribution_plan_digest=admission.job.specification.distribution_plan_digest,
         contract_bindings=contracts,

@@ -362,7 +362,9 @@ async def test_catalog_clarification_is_an_ordinary_completed_turn(tmp_path):
         "ordinary-clarification",
         root=tmp_path,
         model=provider,
-        model_profile=_profile(provider),
+        # History, not window pressure, is under test; the default 20k window
+        # leaves only a few hundred bytes for host-specific prompt facts.
+        model_profile=replace(_profile(provider), context_window_tokens=40_000),
         workspace=workspace_for(tmp_path),
     )
     try:

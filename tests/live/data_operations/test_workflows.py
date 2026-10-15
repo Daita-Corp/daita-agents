@@ -51,6 +51,7 @@ from tests.support.data_operations import (
 )
 from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.job_benchmarks import assert_completed, results_for
+from tests.support.live_billing import cost_cap
 from tests.support.mcp_read_harness import account_identity
 
 pytestmark = [pytest.mark.acceptance, pytest.mark.integration, pytest.mark.requires_llm]
@@ -181,7 +182,7 @@ async def test_live_approved_definition_repeats_survives_reopen_and_detects_drif
     name = agent.home.name
     profile = agent.model_profile
     workspace = agent.workspace
-    limits = LoopLimits(max_estimated_cost_usd=evaluation.budget.per_run)
+    limits = LoopLimits(max_estimated_cost_usd=cost_cap(evaluation.budget.per_run))
     await agent.close()
     evaluation.agent = await Agent.open(
         name,
@@ -469,9 +470,9 @@ async def routine_delivery(evaluation, origin, *, python: bool):
         )[0].destination_id,
         eligible_model_routes=(evaluation.provider.provider_id,),
         per_run_max_tokens=100000,
-        per_run_max_cost_usd=evaluation.budget.per_run,
+        per_run_max_cost_usd=cost_cap(evaluation.budget.per_run),
         cumulative_max_tokens=100000,
-        cumulative_max_cost_usd=evaluation.budget.per_run,
+        cumulative_max_cost_usd=cost_cap(evaluation.budget.per_run),
         cumulative_max_attempts=1,
         cumulative_max_occurrences=1,
         maximum_consecutive_failures=1,
@@ -616,7 +617,7 @@ async def test_live_existing_postgresql_fixture_independent_oracle(
         workspace=agent.workspace,
         model=evaluation.provider,
         model_profile=agent.model_profile,
-        limits=LoopLimits(max_estimated_cost_usd=evaluation.budget.per_run),
+        limits=LoopLimits(max_estimated_cost_usd=cost_cap(evaluation.budget.per_run)),
         secret_provider=EnvironmentSecretProvider(),
         config=AgentConfig(
             postgresql_reads=PostgreSQLReadLimits(

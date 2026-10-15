@@ -199,6 +199,8 @@ async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
     assert prepared.limits.max_estimated_cost_usd == Decimal("0.25")
     assert configured.max_total_tokens == 10_000
     assert configured.max_estimated_cost_usd == Decimal("2.00")
+    with pytest.raises(ValueError, match="job-event scope cannot omit"):
+        replace(scope, per_run_max_cost_usd=None)
     result = await loop.run(run, prepared=prepared)
     assert result.kind is LoopExitKind.COMPLETED
     assert events

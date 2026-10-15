@@ -24,16 +24,21 @@ from typing import Any, cast
 
 import httpx2 as httpx
 
-from daita import Agent, LoopLimits, create_llm_provider
+from daita import Agent, LoopLimits
 from daita.adapters.mcp import SDKMCPClientFactory
 from daita.llm.errors import ProviderErrorCode
 from daita.llm.models import ModelProfile, ToolResultBlock
-from daita.llm.profiles import reviewed_model_profile
 from daita.loop.models import LoopExit, LoopExitKind
 from daita.security import EmptySecretProvider, SecretProvider
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
 from daita.workspace import LocalWorkspace
 from tests.support.job_benchmarks import RecordingProvider, RunCapture
+from tests.support.live_billing import (
+    api_equivalent_cost,
+    cost_cap,
+    live_provider,
+    subscription_billing,
+)
 from tests.support.mcp import MCPConformanceTransport, MCPFixtureIdentity
 
 AUTHORIZATION = "DAITA_RUN_LIVE_MCP_READS"
@@ -229,6 +234,9 @@ class ReadBudget:
             raise RuntimeError(
                 "live MCP read evaluation budget exhausted before dispatch"
             )
+        if subscription_billing():
+            # Subscription usage is unpriced; per-run step/token limits bound it.
+            return
         self.charged += self.per_run
 
     def settle(self, result: LoopExit | None) -> None:
@@ -253,6 +261,8 @@ class ReadBudget:
         self.consecutive_provider_failures = (
             self.consecutive_provider_failures + 1 if provider_failure else 0
         )
+        if subscription_billing():
+            return
         estimate = result.usage.cost_estimate if result is not None else None
         if estimate is None or estimate.status.value != "complete":
             self.incomplete_runs += 1
@@ -268,23 +278,19 @@ def read_provider() -> tuple[ModelProfile, RecordingProvider]:
     if os.environ.get(AUTHORIZATION) != "1":
         raise ValueError(f"{AUTHORIZATION}=1 is required before resolving credentials")
     model_id = os.environ.get("DAITA_LIVE_MCP_MODEL_ID", "openai:gpt-5.6-terra")
-    profile = reviewed_model_profile(model_id)
-    if (
-        not model_id.startswith("openai:")
-        or profile is None
-        or not profile.supports_tools
-    ):
+    if not model_id.startswith("openai:"):
         raise ValueError("DAITA_LIVE_MCP_MODEL_ID must be a reviewed OpenAI tool model")
-    key = os.environ.get("OPENAI_API_KEY")
-    if not key:
-        raise ValueError("OPENAI_API_KEY is required for live read evaluations")
-    return profile, RecordingProvider(
-        create_llm_provider(
-            model_id,
-            api_key=key,
-            max_output_tokens=min(profile.max_output_tokens, 2_048),
-        )
+
+    def api_key() -> str:
+        key = os.environ.get("OPENAI_API_KEY")
+        if not key:
+            raise ValueError("OPENAI_API_KEY is required for live read evaluations")
+        return key
+
+    profile, delegate = live_provider(
+        model_id, api_key=api_key, max_output_tokens=2_048
     )
+    return profile, RecordingProvider(delegate)
 
 
 class _MeasuredStream(httpx.AsyncByteStream):
@@ -547,6 +553,11 @@ class ReadEvaluation:
                     ),
                     "cost_complete": result is not None
                     and result.usage.cost_estimate.status.value == "complete",
+                    "api_equivalent_cost": (
+                        api_equivalent_cost(result.usage, result.provider_id)
+                        if result is not None
+                        else None
+                    ),
                     "elapsed_seconds": elapsed,
                     "model_seconds": model_seconds,
                     "mcp_seconds": mcp_seconds,
@@ -656,7 +667,7 @@ async def evaluate_reads(
             workspace=workspace,
             model=provider,
             model_profile=profile,
-            limits=LoopLimits(max_estimated_cost_usd=budget.per_run),
+            limits=LoopLimits(max_estimated_cost_usd=cost_cap(budget.per_run)),
             secret_provider=secrets or EmptySecretProvider(),
             mcp_client_factory=SDKMCPClientFactory(
                 http_transport=transport, timeout_seconds=timeout_seconds

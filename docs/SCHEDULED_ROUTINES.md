@@ -65,8 +65,13 @@ grant preparation or execution-contract binding and return actionable errors.
 Admission rechecks the same rules; drafts and persisted records share their
 reporting/precheck invariant.
 
-Per-run token and estimated-cost ceilings must not exceed their corresponding
-cumulative ceilings. Drafts and stored routines share that invariant. The routine
+Token, attempt and occurrence ceilings always bound a routine. Dollar ceilings
+are optional: omit both `per_run_max_cost_usd` and `cumulative_max_cost_usd` for
+a turn- and token-bounded routine (the only way an unpriced subscription route,
+such as Codex, can run it), or set both together. Per-run ceilings must not
+exceed their corresponding cumulative ceilings. Drafts and stored routines share
+that invariant. Removing a dollar ceiling in a revision widens authority like
+raising one. The routine
 owner rejects inconsistent create/revision proposals with `routine_budget_invalid`
 before grant preparation, connector readiness, contract binding, approval or
 mutation. The error names both fields so the next ordinary model step can submit
@@ -143,7 +148,15 @@ creates separate report and escalation deliveries.
 Finalization records all known consumption, even when it exceeds a reservation.
 Incomplete usage conservatively consumes at least the full reservation, while the
 run retains its partial or unavailable estimate. Such a run cannot produce a
-successful outcome. A routine without enough cumulative allowance for another run
+successful outcome. A routine without dollar ceilings reserves no dollars, and an
+unpriced route that reported its tokens counts as complete usage.
+
+A provider quota rejection (`rate_limit_error`) fails that occurrence without
+counting toward `maximum_consecutive_failures`. The supervisor then leaves due
+slots on that model route unclaimed for a hold window that starts at five
+minutes, doubles on each repeat up to one hour, and clears after a completed
+run. The hold lives in the open host only; the misfire policy decides which
+missed slots run afterward. A routine without enough cumulative allowance for another run
 moves to `needs_attention`; resume and run-now cannot bypass that budget. There is
 no extra model call after the run reaches a step, token, or cost limit.
 
@@ -297,9 +310,7 @@ definition. For example:
   "distribution_destination_id": "conversation_inbox:conversation-...",
   "eligible_model_routes": ["openai"],
   "per_run_max_tokens": 4000,
-  "per_run_max_cost_usd": "0.10",
   "cumulative_max_tokens": 120000,
-  "cumulative_max_cost_usd": "3.00",
   "cumulative_max_attempts": 30,
   "cumulative_max_occurrences": 30,
   "maximum_consecutive_failures": 3,

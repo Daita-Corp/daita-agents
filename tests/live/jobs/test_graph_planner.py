@@ -85,11 +85,12 @@ async def test_live_planner_uses_typed_replacement_without_production_cutover(
     assert loop is not None
     loop._model = provider
     loop._context_builder = AgentContextBuilder(CatalogSpy(), profile=profile)
+    # Graph jobs carry no dollar cap; this host-wide cap only guards live spend.
+    loop._limits = replace(loop._limits, max_estimated_cost_usd=_cost_limit())
     try:
         admission = integration.build(
             model_route_id=provider.provider_id,
             per_run_max_tokens=_LIVE_TOKEN_LIMIT,
-            per_run_max_cost_usd=_cost_limit(),
         )
         raw_planner_template = admission.job.specification.planner_task_template
         assert raw_planner_template is not None

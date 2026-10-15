@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal
 from typing import Protocol
 
 from ..._json import FrozenJsonObject
@@ -128,7 +127,6 @@ class InitialTaskProposal:
     max_steps: int
     max_wall_time_seconds: int
     per_run_max_tokens: int
-    per_run_max_cost_usd: Decimal
     preview_capability_id: str | None = None
     requested_grant_constraints: Mapping[str, object] | None = None
 
@@ -193,12 +191,6 @@ class InitialTaskProposal:
                 raise ValueError(f"{name} must be positive")
         if self.max_wall_time_seconds > self.execution_policy.graph_max_wall_seconds:
             raise ValueError("initial task wall time exceeds its graph policy")
-        if (
-            not isinstance(self.per_run_max_cost_usd, Decimal)
-            or not self.per_run_max_cost_usd.is_finite()
-            or self.per_run_max_cost_usd < 0
-        ):
-            raise ValueError("initial task cost limit is invalid")
 
     @property
     def capability_ids(self) -> tuple[str, ...]:
@@ -239,7 +231,6 @@ class InitialTaskProposal:
                 "max_steps": self.max_steps,
                 "max_wall_time_seconds": self.max_wall_time_seconds,
                 "per_run_max_tokens": self.per_run_max_tokens,
-                "per_run_max_cost_usd": str(self.per_run_max_cost_usd),
             }
         )
 
@@ -266,7 +257,6 @@ class RegistryInitialTaskProposalResolver:
         model_route_id: str,
         max_steps: int,
         per_run_max_tokens: int,
-        per_run_max_cost_usd: Decimal,
     ) -> None:
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("proposal resolver agent_id must be non-empty")
@@ -280,7 +270,6 @@ class RegistryInitialTaskProposalResolver:
         self._model_route_id = model_route_id
         self._max_steps = max_steps
         self._per_run_max_tokens = per_run_max_tokens
-        self._per_run_max_cost_usd = per_run_max_cost_usd
 
     def bind_capability_registry(self, registry: CapabilityRegistry) -> None:
         """Replace current admission facts under the host's system lease."""
@@ -442,7 +431,6 @@ class RegistryInitialTaskProposalResolver:
             max_steps=self._max_steps,
             max_wall_time_seconds=policy.graph_max_wall_seconds,
             per_run_max_tokens=self._per_run_max_tokens,
-            per_run_max_cost_usd=self._per_run_max_cost_usd,
             preview_capability_id=preview_capability_id,
             requested_grant_constraints=requested_constraints,
         )
@@ -535,7 +523,7 @@ class GraphAdmissionBuilder:
                     ),
                     sensitivity_ceiling=proposal.sensitivity,
                     eligible_model_routes=(proposal.model_route_id,),
-                    per_run_max_cost_usd=proposal.per_run_max_cost_usd,
+                    per_run_max_cost_usd=None,
                     per_run_max_tokens=proposal.per_run_max_tokens,
                     expires_at=self._clock() + timedelta(seconds=deadline_seconds),
                     distribution_plan_digest=plan.plan_digest,
@@ -768,7 +756,6 @@ class GraphAdmissionBuilder:
                         "result_kind": "graph.plan",
                         "model_route_id": proposal.model_route_id,
                         "per_run_max_tokens": proposal.per_run_max_tokens,
-                        "per_run_max_cost_usd": str(proposal.per_run_max_cost_usd),
                         "attempt_budgets": {"work_units": 1},
                     },
                     "authority": GraphAuthority(
@@ -874,7 +861,6 @@ class GraphAdmissionBuilder:
                 "initial_call": initial_call,
                 "model_route_id": proposal.model_route_id,
                 "per_run_max_tokens": proposal.per_run_max_tokens,
-                "per_run_max_cost_usd": str(proposal.per_run_max_cost_usd),
                 "attempt_budgets": {"work_units": 1},
             },
             authority=worker_authority,

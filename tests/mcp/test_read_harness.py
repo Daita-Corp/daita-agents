@@ -31,6 +31,31 @@ from tests.support.paths import REPO_ROOT
 from tests.support.toolbox_model import ToolboxAwareMockModelProvider
 
 
+def test_subscription_read_budget_charges_nothing_but_still_stops_on_provider_failures(
+    monkeypatch,
+):
+    monkeypatch.setenv("DAITA_LIVE_BILLING", "subscription")
+    budget = harness.ReadBudget(
+        Decimal("1.00"), Decimal("0.50"), provider_failure_limit=2
+    )
+    failed = LoopExit(
+        "run",
+        "conversation",
+        LoopExitKind.FAILED,
+        "rate_limit_error",
+        datetime.now(UTC),
+        usage=ModelUsage(
+            cost_estimate=CostEstimate.unavailable("subscription_billing")
+        ),
+    )
+    for _ in range(2):
+        budget.reserve()
+        budget.settle(failed)
+    assert budget.charged == Decimal(0)
+    with pytest.raises(RuntimeError, match="repeated provider failures"):
+        budget.reserve()
+
+
 def test_read_budget_preserves_missing_usage_and_never_clips_known_consumption():
     budget = harness.ReadBudget(Decimal("1.00"), Decimal("0.50"))
     budget.reserve()

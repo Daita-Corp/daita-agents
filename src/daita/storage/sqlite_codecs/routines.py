@@ -36,6 +36,8 @@ from .common import (
     mapping,
     optional_datetime_decode,
     optional_datetime_encode,
+    optional_decimal_decode,
+    optional_decimal_encode,
     optional_text,
     plain_encode,
     record,
@@ -114,9 +116,11 @@ def encode_scheduled_routine(value: ScheduledRoutine) -> str:
                 "outcome_contract": encode_outcome_contract(value.outcome_contract),
                 "distribution_plan": encode_distribution_plan(value.distribution_plan),
                 "per_run_max_tokens": value.per_run_max_tokens,
-                "per_run_max_cost_usd": decimal_encode(value.per_run_max_cost_usd),
+                "per_run_max_cost_usd": optional_decimal_encode(
+                    value.per_run_max_cost_usd
+                ),
                 "cumulative_max_tokens": value.cumulative_max_tokens,
-                "cumulative_max_cost_usd": decimal_encode(
+                "cumulative_max_cost_usd": optional_decimal_encode(
                     value.cumulative_max_cost_usd
                 ),
                 "cumulative_max_attempts": value.cumulative_max_attempts,
@@ -299,12 +303,14 @@ def decode_scheduled_routine(
             fields["per_run_max_tokens"],
             "routine per-run tokens",
         ),
-        per_run_max_cost_usd=decimal_decode(fields["per_run_max_cost_usd"]),
+        per_run_max_cost_usd=optional_decimal_decode(fields["per_run_max_cost_usd"]),
         cumulative_max_tokens=integer(
             fields["cumulative_max_tokens"],
             "routine cumulative tokens",
         ),
-        cumulative_max_cost_usd=decimal_decode(fields["cumulative_max_cost_usd"]),
+        cumulative_max_cost_usd=optional_decimal_decode(
+            fields["cumulative_max_cost_usd"]
+        ),
         cumulative_max_attempts=integer(
             fields["cumulative_max_attempts"],
             "routine cumulative attempts",

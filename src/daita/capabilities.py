@@ -577,7 +577,7 @@ class AutomationScopeProposal:
     allowed_operational_effects: frozenset[OperationalEffect]
     sensitivity_ceiling: ModelSensitivity
     eligible_model_routes: tuple[str, ...]
-    per_run_max_cost_usd: Decimal
+    per_run_max_cost_usd: Decimal | None
     per_run_max_tokens: int
     expires_at: datetime
     distribution_plan_digest: str
@@ -605,7 +605,7 @@ class AutomationScopeProposal:
             object.__setattr__(self, name, items)
         if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
             raise TypeError("automation proposal sensitivity is invalid")
-        if (
+        if self.per_run_max_cost_usd is not None and (
             not isinstance(self.per_run_max_cost_usd, Decimal)
             or not self.per_run_max_cost_usd.is_finite()
             or self.per_run_max_cost_usd < 0
@@ -640,7 +640,8 @@ class ExecutionScope:
     allowed_operational_effects: frozenset[OperationalEffect]
     sensitivity_ceiling: ModelSensitivity
     eligible_model_routes: tuple[str, ...]
-    per_run_max_cost_usd: Decimal
+    # Graph tasks and routines may omit it; steps, tokens and attempts still bound them.
+    per_run_max_cost_usd: Decimal | None
     per_run_max_tokens: int
     distribution_plan_digest: str
     contract_bindings: ExecutionContractBindings
@@ -786,7 +787,10 @@ class ExecutionScope:
             raise ValueError("execution scope requires allowed operational effects")
         if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
             raise TypeError("execution scope sensitivity ceiling is invalid")
-        if (
+        if self.per_run_max_cost_usd is None:
+            if self.scope_kind is ExecutionScopeKind.JOB_EVENT:
+                raise ValueError("a job-event scope cannot omit its per-run cost")
+        elif (
             not isinstance(self.per_run_max_cost_usd, Decimal)
             or not self.per_run_max_cost_usd.is_finite()
             or self.per_run_max_cost_usd < 0
@@ -884,7 +888,11 @@ class ExecutionScope:
                         ),
                         "sensitivity_ceiling": self.sensitivity_ceiling.value,
                         "eligible_model_routes": self.eligible_model_routes,
-                        "per_run_max_cost_usd": str(self.per_run_max_cost_usd),
+                        "per_run_max_cost_usd": (
+                            None
+                            if self.per_run_max_cost_usd is None
+                            else str(self.per_run_max_cost_usd)
+                        ),
                         "per_run_max_tokens": self.per_run_max_tokens,
                         "distribution_plan_digest": self.distribution_plan_digest,
                         "contract_bindings": self.contract_bindings.material(),

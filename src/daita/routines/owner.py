@@ -314,8 +314,8 @@ class RoutineOwner:
     def _validate_budgets(
         per_run_max_tokens: int,
         cumulative_max_tokens: int,
-        per_run_max_cost_usd: Decimal,
-        cumulative_max_cost_usd: Decimal,
+        per_run_max_cost_usd: Decimal | None,
+        cumulative_max_cost_usd: Decimal | None,
     ) -> None:
         try:
             validate_budget_relationships(
@@ -404,9 +404,9 @@ class RoutineOwner:
         distribution_destination_id: str,
         eligible_model_routes: tuple[str, ...],
         per_run_max_tokens: int,
-        per_run_max_cost_usd: Decimal,
+        per_run_max_cost_usd: Decimal | None,
         cumulative_max_tokens: int,
-        cumulative_max_cost_usd: Decimal,
+        cumulative_max_cost_usd: Decimal | None,
         cumulative_max_attempts: int,
         cumulative_max_occurrences: int,
         maximum_consecutive_failures: int,
@@ -583,9 +583,9 @@ class RoutineOwner:
         distribution_destination_id: str,
         eligible_model_routes: tuple[str, ...],
         per_run_max_tokens: int,
-        per_run_max_cost_usd: Decimal,
+        per_run_max_cost_usd: Decimal | None,
         cumulative_max_tokens: int,
-        cumulative_max_cost_usd: Decimal,
+        cumulative_max_cost_usd: Decimal | None,
         cumulative_max_attempts: int,
         cumulative_max_occurrences: int,
         maximum_consecutive_failures: int,
@@ -937,6 +937,7 @@ class RoutineOwner:
             )
         if (
             self._maximum_per_run_cost_usd is not None
+            and routine.per_run_max_cost_usd is not None
             and routine.per_run_max_cost_usd > self._maximum_per_run_cost_usd
         ):
             raise RoutineError(
@@ -1617,6 +1618,10 @@ def routine_approval_arguments(authority: FrozenJsonObject) -> FrozenJsonObject:
     )
 
 
+def _optional_decimal_text(value: Decimal | None) -> str | None:
+    return None if value is None else str(value)
+
+
 def _routine_proposal_payload(routine: ScheduledRoutine) -> dict[str, object]:
     return {
         "routine_id": routine.routine_id,
@@ -1665,9 +1670,11 @@ def _routine_proposal_payload(routine: ScheduledRoutine) -> dict[str, object]:
         "outcome_contract": outcome_contract_projection(routine.outcome_contract),
         "distribution_plan": distribution_plan_projection(routine.distribution_plan),
         "per_run_max_tokens": routine.per_run_max_tokens,
-        "per_run_max_cost_usd": str(routine.per_run_max_cost_usd),
+        "per_run_max_cost_usd": _optional_decimal_text(routine.per_run_max_cost_usd),
         "cumulative_max_tokens": routine.cumulative_max_tokens,
-        "cumulative_max_cost_usd": str(routine.cumulative_max_cost_usd),
+        "cumulative_max_cost_usd": _optional_decimal_text(
+            routine.cumulative_max_cost_usd
+        ),
         "cumulative_max_attempts": routine.cumulative_max_attempts,
         "cumulative_max_occurrences": routine.cumulative_max_occurrences,
         "maximum_consecutive_failures": routine.maximum_consecutive_failures,

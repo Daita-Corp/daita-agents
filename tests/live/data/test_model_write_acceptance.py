@@ -435,6 +435,23 @@ async def test_live_uncertain_commit_restart_and_human_recovery(
         )
 
 
+def _routine_budget_text(budgets, lead, cumulative_label):
+    """Describe routine ceilings, naming dollars only when the run is priced."""
+
+    if budgets["per_run_max_cost_usd"] is None:
+        return (
+            f"{lead} {budgets['per_run_max_tokens']} tokens per run and "
+            f"{budgets['cumulative_max_tokens']} tokens {cumulative_label}, "
+            "with no dollar ceiling. "
+        )
+    return (
+        f"{lead} {budgets['per_run_max_tokens']} tokens and "
+        f"${budgets['per_run_max_cost_usd']} per run, "
+        f"{budgets['cumulative_max_tokens']} tokens and "
+        f"${budgets['cumulative_max_cost_usd']} {cumulative_label}. "
+    )
+
+
 @pytest.mark.parametrize("setup", ["model_authored", "owner_admitted_routine"])
 async def test_live_model_authors_and_executes_immediate_weekly_upsert(
     database, scenario_factory, model_id, setup
@@ -507,8 +524,10 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
             "Use latest_only misfires, skip nonexistent times, and the first ambiguous time. Stop after two occurrences/two attempts, or "
             + EXPIRES.isoformat()
             + ". Allow one consecutive failure. "
-            f"Authorize {scenario.routine_budgets['per_run_max_tokens']} tokens and ${scenario.routine_budgets['per_run_max_cost_usd']} per run, "
-            f"{scenario.routine_budgets['cumulative_max_tokens']} tokens and ${scenario.routine_budgets['cumulative_max_cost_usd']} cumulatively. Do not perform a separate foreground write. "
+            + _routine_budget_text(
+                scenario.routine_budgets, "Authorize", "cumulatively"
+            )
+            + "Do not perform a separate foreground write. "
             "Save this reporting instruction in the routine: "
             + REPORT_INSTRUCTION
             + " "
@@ -533,11 +552,12 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
             + ". "
             "If a run is missed, only catch up the most recent one. Skip nonexistent clock "
             "times and use the first occurrence of an ambiguous clock time. "
-            f"Use the current model with a budget of {scenario.routine_budgets['per_run_max_tokens']} tokens "
-            f"and ${scenario.routine_budgets['per_run_max_cost_usd']} per run, "
-            f"{scenario.routine_budgets['cumulative_max_tokens']} tokens and "
-            f"${scenario.routine_budgets['cumulative_max_cost_usd']} overall. "
-            "Keep the work at the table's current sensitivity. Report success only with "
+            + _routine_budget_text(
+                scenario.routine_budgets,
+                "Use the current model with a budget of",
+                "overall",
+            )
+            + "Keep the work at the table's current sensitivity. Report success only with "
             "database-confirmed evidence for the exact table. Include the immediate save "
             "in the scheduled work, rather than saving it separately first."
         )

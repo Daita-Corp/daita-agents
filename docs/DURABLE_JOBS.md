@@ -8,8 +8,12 @@ agent host is open.
 Ask Daita to profile admitted data without changing it, or to start a bounded
 graph job for a larger objective. `start_data_profile` creates a fixed,
 read-only profile. `start_graph_job` starts one eligible task and a finalizer;
-the job can add bounded tasks when planning is authorized. A model route and
-finite cost ceiling are required for model-driven jobs.
+the job can add bounded tasks when planning is authorized. A model route is
+required for model-driven jobs. Like turn limits in other agent harnesses, each
+model task is bounded by its step (model-turn) limit, the host per-run token
+ceiling, its wall time and three attempts. Graph jobs carry no dollar ceiling,
+so unpriced subscription routes and repeated work can run; a host-wide
+estimated-cost limit, when you configure one, still applies to each run.
 
 The job's original objective, allowed sources and actions, outcome, deadline,
 distribution, and total budgets stay fixed. Added tasks can use only a

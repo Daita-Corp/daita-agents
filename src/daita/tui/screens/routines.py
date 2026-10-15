@@ -308,6 +308,10 @@ class RoutinesScreen(ModalScreen[None]):
         error.set_class(bool(message), "-visible")
 
 
+def _dollar_ceiling(value: object) -> str:
+    return "no dollar cap" if value is None else f"${value} estimated model cost"
+
+
 def render_routine_list_label(summary: ScheduledRoutineSummary) -> str:
     state = summary.state.value.replace("_", " ").upper()
     title = safe_display(summary.title, fallback="Assignment", maximum=40)
@@ -384,8 +388,8 @@ def render_routine_details(inspection: ScheduledRoutineInspection) -> str:
         instruction,
         "",
         "Limits and access",
-        f"Per run: {routine['per_run_max_tokens']} tokens · ${routine['per_run_max_cost_usd']} estimated model cost",
-        f"Total: {routine['cumulative_max_tokens']} tokens · ${routine['cumulative_max_cost_usd']} · {routine['cumulative_max_attempts']} attempts · {routine['cumulative_max_occurrences']} occurrences",
+        f"Per run: {routine['per_run_max_tokens']} tokens · {_dollar_ceiling(routine['per_run_max_cost_usd'])}",
+        f"Total: {routine['cumulative_max_tokens']} tokens · {_dollar_ceiling(routine['cumulative_max_cost_usd'])} · {routine['cumulative_max_attempts']} attempts · {routine['cumulative_max_occurrences']} occurrences",
         f"Used: {routine['charged_tokens']} tokens · ${routine['charged_cost_usd']} · {routine['attempt_count']} attempts",
         f"Scope: {len(routine['allowed_source_ids'])} sources · {len(routine['allowed_resource_ids'])} resources · {len(routine['allowed_connector_binding_ids'])} connectors · {len(routine['allowed_capability_ids'])} capabilities",
         f"Sensitivity ceiling: {routine['sensitivity_ceiling']}",
