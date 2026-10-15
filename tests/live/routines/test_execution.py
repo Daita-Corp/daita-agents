@@ -246,13 +246,11 @@ def _limits() -> LoopLimits:
 
 def _live_provider() -> tuple[ModelProfile, _RecordingProvider]:
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
-    if not subscription_billing():
-        if model_id.partition(":")[0] not in _API_PROVIDERS:
-            pytest.fail(
-                f"{_MODEL_ID} must name an API-backed provider: "
-                + ", ".join(sorted(_API_PROVIDERS))
-            )
-        _required_environment(_MODEL_KEY)
+    if not subscription_billing() and model_id.partition(":")[0] not in _API_PROVIDERS:
+        pytest.fail(
+            f"{_MODEL_ID} must name an API-backed provider: "
+            + ", ".join(sorted(_API_PROVIDERS))
+        )
     profile, delegate = live_provider(
         model_id,
         api_key=lambda: _required_environment(_MODEL_KEY),
