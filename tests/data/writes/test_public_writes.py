@@ -72,10 +72,10 @@ async def test_initial_native_discovery_names_are_available_without_search_or_ac
         system = "\n".join(
             b.text for b in request.messages[0].content if isinstance(b, TextBlock)
         )
-        assert "data_preview_upsert_rows" in system
+        assert "data_preview_upsert_rows" not in system
         assert "data_upsert_rows" in system
         assert "data_update_rows" not in system
-        assert "load the needed preview and execution tools together" in system
+        assert "load the tool with toolbox_load" in system
         assert "data_upsert_rows" not in {tool.name for tool in request.tools}
         query = next(tool for tool in request.tools if tool.name == "data_query")
         properties = query.input_schema["properties"]
@@ -212,6 +212,7 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
                     name="data_update_rows",
                     arguments={
                         **arguments,
+                        "mode": "apply",
                         "preview_fingerprint": data["preview_fingerprint"],
                         "expected_affected_rows": data["matched_rows"],
                     },
@@ -224,19 +225,14 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
                     ToolCall(
                         id="load",
                         name="toolbox_load",
-                        arguments={
-                            "tool_names": (
-                                "data_preview_update_rows",
-                                "data_update_rows",
-                            )
-                        },
+                        arguments={"tool_names": ("data_update_rows",)},
                     )
                 ),
                 response(
                     ToolCall(
                         id="preview",
-                        name="data_preview_update_rows",
-                        arguments=arguments,
+                        name="data_update_rows",
+                        arguments={**arguments, "mode": "preview"},
                     )
                 ),
                 apply,
@@ -269,9 +265,11 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
             call
             for message in transcript.messages
             for call in message.tool_calls
-            if call.name == "data_update_rows"
+            if call.name == "data_update_rows" and call.arguments["mode"] == "apply"
         )
-        assert approval.arguments["arguments"] == call.arguments
+        assert dict(approval.arguments["arguments"]) == {
+            key: value for key, value in call.arguments.items() if key != "mode"
+        }
         document, reviewable = approval_review_document(
             tool_name=approval.tool_name,
             capability_id=approval.capability_id,
@@ -332,7 +330,11 @@ def script(
             ToolCall(
                 id="write",
                 name="data_upsert_rows",
-                arguments={**batch, "preview_fingerprint": data["preview_fingerprint"]},
+                arguments={
+                    **batch,
+                    "mode": "apply",
+                    "preview_fingerprint": data["preview_fingerprint"],
+                },
             )
         )
 
@@ -344,7 +346,6 @@ def script(
                 arguments={
                     "tool_names": (
                         research_name,
-                        "data_preview_upsert_rows",
                         "data_upsert_rows",
                     )
                 },
@@ -360,7 +361,11 @@ def script(
             )
         ),
         response(
-            ToolCall(id="preview", name="data_preview_upsert_rows", arguments=batch)
+            ToolCall(
+                id="preview",
+                name="data_upsert_rows",
+                arguments={**batch, "mode": "preview"},
+            )
         ),
     ]
     if schema:
@@ -380,7 +385,9 @@ def script(
         steps.append(
             response(
                 ToolCall(
-                    id="preview-again", name="data_preview_upsert_rows", arguments=batch
+                    id="preview-again",
+                    name="data_upsert_rows",
+                    arguments={**batch, "mode": "preview"},
                 )
             )
         )
@@ -517,7 +524,9 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
             for call in message.tool_calls
             if call.id == "write"
         )
-        assert approval.arguments["arguments"] == write_call.arguments
+        assert dict(approval.arguments["arguments"]) == {
+            key: value for key, value in write_call.arguments.items() if key != "mode"
+        }
         assert approval.arguments["target"]["name"] == "companies"
         assert approval.arguments["target"]["source_name"] == "Company research"
         assert approval.arguments["preview"]["inserted_count"] == 1
@@ -588,7 +597,11 @@ async def test_exact_native_upsert_runs_once_as_a_preview_bound_graph_task(
             ToolCall(
                 "graph-write",
                 "data_upsert_rows",
-                {**intent, "preview_fingerprint": data["preview_fingerprint"]},
+                {
+                    **intent,
+                    "mode": "apply",
+                    "preview_fingerprint": data["preview_fingerprint"],
+                },
             )
         )
 
@@ -630,15 +643,14 @@ async def test_exact_native_upsert_runs_once_as_a_preview_bound_graph_task(
                 ToolCall(
                     "load-write",
                     "toolbox_load",
-                    {
-                        "tool_names": (
-                            "data_preview_upsert_rows",
-                            "data_upsert_rows",
-                        )
-                    },
+                    {"tool_names": ("data_upsert_rows",)},
                 )
             ),
-            response(ToolCall("graph-preview", "data_preview_upsert_rows", intent)),
+            response(
+                ToolCall(
+                    "graph-preview", "data_upsert_rows", {**intent, "mode": "preview"}
+                )
+            ),
             apply_preview,
             response(
                 ToolCall(
@@ -1040,13 +1052,11 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                 )
                 assert "Routine authoring facts" not in system
                 if mode == "success":
-                    assert "catalog_describe detail=schema" not in system
                     assert "catalog_describe" not in {
                         tool.name for tool in request.tools
                     }
                     assert "Missing structure is unknown" in system
                 else:
-                    assert "catalog_describe detail=schema" in system
                     assert "catalog_describe" in {tool.name for tool in request.tools}
             inspection = await agent.inspect_routine(routine.routine_id)
             assert inspection is not None
@@ -1165,15 +1175,11 @@ async def test_public_upsert_admission_cannot_invent_preview_evidence_or_insert_
                 source_id=batch["source_id"],
                 confirmation_fingerprint=preview.confirmation_fingerprint,
             )
-        name = (
-            "data_upsert_rows"
-            if invalid == "missing_preview"
-            else "data_preview_upsert_rows"
-        )
+        name = "data_upsert_rows"
         arguments = (
-            {**batch, "preview_fingerprint": "sha256:" + "0" * 64}
+            {**batch, "mode": "apply", "preview_fingerprint": "sha256:" + "0" * 64}
             if invalid == "missing_preview"
-            else batch
+            else {**batch, "mode": "preview"}
         )
         provider.replace_script(
             (

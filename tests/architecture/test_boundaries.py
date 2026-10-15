@@ -1243,9 +1243,10 @@ async def test_database_writes_register_only_the_relational_write_slice(
     try:
         registry = agent._embedded._capabilities
         capability_ids = {
-            registry.resolve_tool(name)[1].id for name in registry.tool_names
+            capability_id
+            for name in registry.tool_names
+            for capability_id in registry.tool_capability_ids(name)
         }
-        preview_tool = "data_preview_update_rows"
         preview_capability = "data.preview_update_rows"
         update_tool = "data_update_rows"
         update_capability = "data.update_rows"
@@ -1258,14 +1259,15 @@ async def test_database_writes_register_only_the_relational_write_slice(
             "data.sqlite.update",
         }
 
-        assert preview_tool in registry.tool_names
-        preview = registry.resolve_tool(preview_tool)[1]
+        assert "data_preview_update_rows" not in registry.tool_names
+        preview = registry.resolve_tool_mode(update_tool, "preview")[1]
         assert preview.id == preview_capability
         assert preview.access_mode is AccessMode.READ
         assert preview.operational_effect is OperationalEffect.NONE
         assert update_tool in registry.tool_names
-        update = registry.resolve_tool(update_tool)[1]
+        update = registry.resolve_tool_mode(update_tool, "apply")[1]
         assert update.id == update_capability
+        assert registry.resolve_tool(update_tool)[1].id == update_capability
         assert update.access_mode is AccessMode.WRITE
         assert update.operational_effect is OperationalEffect.MUTATE_DATA
         _, update_executor = registry.resolve_execution(update.id)
@@ -2437,10 +2439,22 @@ def test_native_write_contracts_are_neutral_and_use_the_existing_domain():
         relational_upsert_capability_declarations(),
     )
     assert {view.name for bundle in declarations for view in bundle.tool_views} == {
-        "data_preview_update_rows",
         "data_update_rows",
-        "data_preview_upsert_rows",
         "data_upsert_rows",
+    }
+    assert {
+        view.name: view.mode_capability_ids
+        for bundle in declarations
+        for view in bundle.tool_views
+    } == {
+        "data_update_rows": (
+            ("preview", "data.preview_update_rows"),
+            ("apply", "data.update_rows"),
+        ),
+        "data_upsert_rows": (
+            ("preview", "data.preview_upsert_rows"),
+            ("apply", "data.upsert_rows"),
+        ),
     }
     for bundle in declarations:
         assert bundle.domain_owner_id == "data"

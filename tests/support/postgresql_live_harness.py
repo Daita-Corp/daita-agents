@@ -135,12 +135,13 @@ def report_path(case_id):
     return folder / (hashlib.sha256(case_id.encode()).hexdigest()[:20] + ".json")
 
 
-def calls_for(transcript, tool_name):
+def calls_for(transcript, tool_name, mode=None):
     return [
         call
         for message in transcript.messages
         for call in message.tool_calls
         if call.name == tool_name
+        and (mode is None or call.arguments.get("mode") == mode)
     ]
 
 
@@ -875,14 +876,14 @@ async def evaluate(
 
 
 def assert_preview_binding(transcript, operation="upsert"):
-    calls = calls_for(transcript, f"data_{operation}_rows")
+    calls = calls_for(transcript, f"data_{operation}_rows", "apply")
     assert len(calls) == 1, (
         f"Expected exactly one data_{operation}_rows call; observed {len(calls)}. "
         "A missing write or duplicate request fails effectiveness."
     )
     call = calls[0]
     preview_ids = {
-        item.id for item in calls_for(transcript, f"data_preview_{operation}_rows")
+        item.id for item in calls_for(transcript, f"data_{operation}_rows", "preview")
     }
     previews = [
         block
@@ -906,7 +907,7 @@ def assert_exact_preview(scenario, transcript, operation="upsert"):
     matching = [item for item in scenario.approvals if item["call_id"] == call.id]
     assert len(matching) == 1 and matching[0]["approved"]
     assert canonical_json(matching[0]["arguments"]["arguments"]) == canonical_json(
-        call.arguments
+        {key: value for key, value in call.arguments.items() if key != "mode"}
     )
     previews = [
         block.output["data"]

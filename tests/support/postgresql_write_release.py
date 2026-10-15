@@ -58,19 +58,22 @@ class WriteModel:
                 if isinstance(block, ToolResultBlock):
                     self.results[block.call_id] = block
         calls: tuple[ToolCall, ...] = ()
-        preview_name = f"data_preview_{self.operation}_rows"
         write_name = f"data_{self.operation}_rows"
         if self.phase == 0:
             calls = (
                 ToolCall(
                     id="load",
                     name="toolbox_load",
-                    arguments={"tool_names": (preview_name, write_name)},
+                    arguments={"tool_names": (write_name,)},
                 ),
             )
         elif self.phase == 1:
             calls = (
-                ToolCall(id="preview", name=preview_name, arguments=self.arguments),
+                ToolCall(
+                    id="preview",
+                    name=write_name,
+                    arguments={**self.arguments, "mode": "preview"},
+                ),
             )
         elif self.phase == 2:
             preview = self.results["preview"]
@@ -79,6 +82,7 @@ class WriteModel:
                 assert isinstance(data, Mapping)
                 arguments = {
                     **self.arguments,
+                    "mode": "apply",
                     "preview_fingerprint": data["preview_fingerprint"],
                 }
                 if self.operation == "update":

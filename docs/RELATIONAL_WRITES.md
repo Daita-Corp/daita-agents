@@ -279,10 +279,18 @@ credential, but it does not change database grants or restore data.
 
 ## Structured upsert
 
-The public tools are `data_preview_update_rows`, `data_update_rows`,
-`data_preview_upsert_rows`, and `data_upsert_rows`. The model supplies exact
-source/resource IDs and scalar values, never SQL. Both execution tools require
-a successful authenticated preview from the same run with matching intent.
+The public tools are `data_update_rows` and `data_upsert_rows`. Each takes
+`mode`: `preview` runs the read-only preview and `apply` runs the write. Mode
+selects the existing preview or write capability; it is not a separate
+execution path. The model supplies exact source/resource IDs and scalar values,
+never SQL. `mode=apply` requires a successful authenticated preview from the
+same run with matching intent.
+
+Compatibility: `data_preview_update_rows` and `data_preview_upsert_rows` were
+removed without aliases. Capability IDs (`data.preview_update_rows`,
+`data.update_rows`, `data.preview_upsert_rows`, `data.upsert_rows`), grants,
+receipts and approvals are unchanged, so saved routines and jobs keep
+revalidating normally.
 
 Upsert supplies exact `key_columns`, `insert_columns`, `update_columns`, and
 `rows`. Every row has exactly the insert-column shape. The key columns must be

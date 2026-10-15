@@ -157,12 +157,7 @@ class _BulkUpdateProvider:
                     ToolCall(
                         id="bulk-load-update-tools",
                         name="toolbox_load",
-                        arguments={
-                            "tool_names": [
-                                "data_preview_update_rows",
-                                "data_update_rows",
-                            ]
-                        },
+                        arguments={"tool_names": ["data_update_rows"]},
                     ),
                 ),
             )
@@ -175,8 +170,8 @@ class _BulkUpdateProvider:
                 tool_calls=(
                     ToolCall(
                         id="bulk-preview",
-                        name="data_preview_update_rows",
-                        arguments=self._plan(),
+                        name="data_update_rows",
+                        arguments={**self._plan(), "mode": "preview"},
                     ),
                 ),
             )
@@ -200,6 +195,7 @@ class _BulkUpdateProvider:
                         name="data_update_rows",
                         arguments={
                             **self._plan(),
+                            "mode": "apply",
                             "preview_fingerprint": preview_fingerprint,
                             "expected_affected_rows": matched_rows,
                         },

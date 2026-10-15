@@ -158,8 +158,8 @@ async def test_live_ambiguous_company_then_user_clarifies(database, scenario_fac
             "", user_prompt="Rename Shared Company to Updated in our companies table."
         )
         scenario.assert_completed_runs()
-        assert not calls_for(transcript, "data_update_rows")
-        assert not calls_for(transcript, "data_upsert_rows")
+        assert not calls_for(transcript, "data_update_rows", "apply")
+        assert not calls_for(transcript, "data_upsert_rows", "apply")
         assert not scenario.approvals and not await scenario.agent.list_effects()
         assert await database.rows() == original
         assert database.probe.mutations == database.probe.commit_attempts == 0
@@ -268,7 +268,7 @@ async def test_live_write_denial_preserves_database(database, scenario_factory, 
             assert (
                 len(scenario.approvals) == 1 and not scenario.approvals[0]["approved"]
             )
-            assert len(calls_for(transcript, "data_upsert_rows")) == 1
+            assert len(calls_for(transcript, "data_upsert_rows", "apply")) == 1
         scenario.stages.append(denial)
         scenario.assert_report(result, "not_applied")
 

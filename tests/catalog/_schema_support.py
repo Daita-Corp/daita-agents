@@ -458,9 +458,12 @@ class _InventoryProvider:
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         if len(self.requests) == 1:
-            guidance = repr(request.messages)
-            assert "catalog_describe detail=schema before SQL" in guidance
-            assert "it resolves join paths in one call" in guidance
+            describe = next(
+                tool for tool in request.tools if tool.name == "catalog_describe"
+            )
+            assert "before SQL" in describe.description
+            assert "multi-hop resolved in code" in describe.description
+            assert "catalog_describe detail=schema" not in repr(request.messages)
             self.catalog_tool_call_count += 1
             return ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,

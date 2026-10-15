@@ -188,8 +188,14 @@ def catalog_declarations(
     search = Capability(
         id=CATALOG_SEARCH_CAPABILITY_ID,
         description=(
-            "Find catalog IDs by name or field and report whether the strongest "
-            "target evidence is unique, ambiguous, or no_match; use catalog_describe next."
+            "Find catalog tables or fields by name or meaning when the target is "
+            "missing or ambiguous. Returns ranked IDs and match_outcome (unique, "
+            "ambiguous or no_match), computed over every candidate before paging; "
+            "a hit is a candidate, not authorization. Limits: metadata only, no "
+            "rows; up to 50 per page. "
+            'Example: {"query": "customer invoices"}. '
+            "Mistakes: searching again for exact IDs already supplied; querying a "
+            "hit before catalog_describe confirms its columns."
         ),
         input_schema={
             "type": "object",
@@ -234,12 +240,15 @@ def catalog_declarations(
     describe = Capability(
         id=CATALOG_DESCRIBE_CAPABILITY_ID,
         description=(
-            "Describe catalog structure without touching the source. detail=identity "
-            "lists table IDs, names, kinds, revisions and labeled row/size estimates "
-            "with no columns; give only an exact source_id to list every admitted "
-            "table. detail=schema (default) adds SQL columns, keys and resolved join "
-            "paths; detail=relationships returns only join paths and field pairs. "
-            "Join paths are resolved in code, so one call is enough."
+            "Describe catalog structure before SQL, without touching the source. "
+            "detail=identity with only an exact source_id lists every admitted "
+            "table (IDs, names, labeled row estimates, no columns). detail=schema "
+            "(default) adds columns, keys and join paths; detail=relationships "
+            "returns only join paths, multi-hop resolved in code. Reports coverage "
+            "and truncation; page with cursor. "
+            'Example: {"source_id": "...", "resource_ids": ["..."]}. '
+            "Mistakes: joining on matching names; repeating it when current "
+            "evidence suffices; reading estimates as exact counts."
         ),
         input_schema={
             "type": "object",

@@ -25,6 +25,7 @@ from .artifacts.models import (
 from .artifacts.store import AgentHomeArtifactStore
 from .capabilities import (
     RESERVED_TOOL_NAMES,
+    TOOL_MODE_ARGUMENT,
     TOOLBOX_DEFINITIONS,
     AccessMode,
     ApprovalDecision,
@@ -389,6 +390,21 @@ class RunToolCatalogEntry:
     origin_revision_digest: str
     toolbox_id: ToolboxId
     load_mode: ToolLoadMode
+    # For a mode-routed tool: the admitted (mode, entry) routes of this run.
+    # The outer entry is the route of the view's primary capability when it
+    # is admitted, otherwise the first admitted route.
+    routes: tuple[tuple[str, RunToolCatalogEntry], ...] = ()
+
+    def route(self, mode: object) -> RunToolCatalogEntry | None:
+        if not self.routes:
+            return self
+        return next((entry for name, entry in self.routes if name == mode), None)
+
+    @property
+    def capabilities(self) -> tuple[Capability, ...]:
+        if not self.routes:
+            return (self.capability,)
+        return tuple(entry.capability for _, entry in self.routes)
 
     @property
     def parameter_names(self) -> tuple[str, ...]:
@@ -417,7 +433,9 @@ class RunToolCatalog:
 
     @property
     def capability_ids(self) -> frozenset[str]:
-        return frozenset(entry.capability.id for entry in self.entries)
+        return frozenset(
+            capability.id for entry in self.entries for capability in entry.capabilities
+        )
 
     @property
     def initial_provider_definitions(self) -> tuple[ToolDefinition, ...]:
@@ -1020,54 +1038,32 @@ class CapabilityRuntime:
             for name in await _domain_project(domain, run, session):
                 if name in projected:
                     raise ValueError(f"tool projected by multiple domains: {name}")
-                view, capability, resolved_owner = self._registry.resolve_tool_owner(
-                    name
+                view = self._registry.resolve_tool(name)[0]
+                routed: list[tuple[str, RunToolCatalogEntry]] = []
+                modes = dict(
+                    (capability_id, mode)
+                    for mode, capability_id in view.mode_capability_ids
                 )
-                if resolved_owner != owner_id:
-                    raise ValueError(f"tool projected by the wrong domain: {name}")
-                if run.execution_scope is not None and not run.execution_scope.allows(
-                    capability
-                ):
+                for capability_id in self._registry.tool_capability_ids(name):
+                    admitted = self._admitted_catalog_entry(
+                        run,
+                        session,
+                        name,
+                        owner_id,
+                        capability_id,
+                    )
+                    if admitted is not None:
+                        routed.append((modes.get(capability_id, ""), admitted))
+                if not routed:
                     continue
-                if run.origin is RunOrigin.JOB_TASK:
-                    from .jobs.graph.execution import task_role_allows_capability
-
-                    context = None if session is None else session.options.task_context
-                    binding = getattr(context, "binding", None)
-                    if not isinstance(binding, GraphTaskBinding):
-                        raise CapabilityInputError(
-                            "task_context_invalid",
-                            "The code-owned graph task binding is unavailable.",
-                        )
-                    if not task_role_allows_capability(
-                        binding.task_role, capability.id
-                    ):
-                        continue
-                if (
-                    run.origin is RunOrigin.SCHEDULED_ROUTINE
-                    and capability.automation_eligibility
-                    is not AutomationEligibility.AUTOMATION_DIRECT
-                ):
+                if not view.mode_capability_ids:
+                    projected[name] = routed[0][1]
                     continue
-                schema_digest = _sha256_digest(capability.input_schema)
-                origin_digest = view.origin_revision_digest or _sha256_digest(
-                    {
-                        "domain_owner_id": owner_id,
-                        "capability_id": capability.id,
-                        "executor_id": capability.executor_id,
-                        "input_schema_digest": schema_digest,
-                    }
+                mode_order = [mode for mode, _ in view.mode_capability_ids]
+                routes = tuple(
+                    sorted(routed, key=lambda item: mode_order.index(item[0]))
                 )
-                projected[name] = RunToolCatalogEntry(
-                    view=view,
-                    capability=capability,
-                    domain_owner_id=owner_id,
-                    executor_id=capability.executor_id,
-                    input_schema_digest=schema_digest,
-                    origin_revision_digest=origin_digest,
-                    toolbox_id=view.presentation.toolbox_id,
-                    load_mode=view.presentation.load_mode,
-                )
+                projected[name] = replace(routed[0][1], routes=routes)
         entries = tuple(projected[name] for name in sorted(projected))
         manifest = _toolbox_manifest(entries)
         manifest_bytes = len(canonical_json(_manifest_material(manifest)).encode())
@@ -1146,6 +1142,61 @@ class CapabilityRuntime:
             manifest_token_limit=self._limits.max_toolbox_manifest_tokens,
             source_scope=run.resolved_source_scope,
             session=session,
+        )
+
+    def _admitted_catalog_entry(
+        self,
+        run: RunInput,
+        session: RunSession | None,
+        name: str,
+        owner_id: str,
+        capability_id: str,
+    ) -> RunToolCatalogEntry | None:
+        view, capability, resolved_owner = self._registry.resolve_tool_owner(
+            name, capability_id=capability_id
+        )
+        if resolved_owner != owner_id:
+            raise ValueError(f"tool projected by the wrong domain: {name}")
+        if run.execution_scope is not None and not run.execution_scope.allows(
+            capability
+        ):
+            return None
+        if run.origin is RunOrigin.JOB_TASK:
+            from .jobs.graph.execution import task_role_allows_capability
+
+            context = None if session is None else session.options.task_context
+            binding = getattr(context, "binding", None)
+            if not isinstance(binding, GraphTaskBinding):
+                raise CapabilityInputError(
+                    "task_context_invalid",
+                    "The code-owned graph task binding is unavailable.",
+                )
+            if not task_role_allows_capability(binding.task_role, capability.id):
+                return None
+        if (
+            run.origin is RunOrigin.SCHEDULED_ROUTINE
+            and capability.automation_eligibility
+            is not AutomationEligibility.AUTOMATION_DIRECT
+        ):
+            return None
+        schema_digest = _sha256_digest(capability.input_schema)
+        origin_digest = view.origin_revision_digest or _sha256_digest(
+            {
+                "domain_owner_id": owner_id,
+                "capability_id": capability.id,
+                "executor_id": capability.executor_id,
+                "input_schema_digest": schema_digest,
+            }
+        )
+        return RunToolCatalogEntry(
+            view=view,
+            capability=capability,
+            domain_owner_id=owner_id,
+            executor_id=capability.executor_id,
+            input_schema_digest=schema_digest,
+            origin_revision_digest=origin_digest,
+            toolbox_id=view.presentation.toolbox_id,
+            load_mode=view.presentation.load_mode,
         )
 
     def project(
@@ -1594,6 +1645,35 @@ class CapabilityRuntime:
             entry.view.name: entry for entry in projection.callable_entries
         }
         entry = callable_entries.get(call.name)
+        if entry is not None and entry.routes:
+            # A mode-routed tool selects one admitted capability; the selected
+            # capability then runs its own unchanged execution path.
+            mode = call.arguments.get(TOOL_MODE_ARGUMENT)
+            routed = entry.route(mode)
+            if routed is None:
+                return _ResolvedCall(
+                    call,
+                    call,
+                    failure=_error(
+                        call,
+                        "invalid_argument_value",
+                        "Choose one of the modes this tool admits in this run.",
+                        {
+                            "name": TOOL_MODE_ARGUMENT,
+                            "constraint": "enum",
+                            "allowed": [name for name, _ in entry.routes],
+                        },
+                    ),
+                )
+            target = replace(
+                call,
+                arguments={
+                    key: value
+                    for key, value in call.arguments.items()
+                    if key != TOOL_MODE_ARGUMENT
+                },
+            )
+            return _ResolvedCall(call, target, entry=routed)
         if entry is not None:
             return _ResolvedCall(call, call, entry=entry)
         control_names = {item.name for item in projection.provider_definitions}
@@ -2084,7 +2164,12 @@ class CapabilityRuntime:
 
     def _analysis_authority_reader(self, session: RunSession, run: RunInput):
         async def revalidate(call: ToolCall, sensitivity: ModelSensitivity) -> None:
-            view, capability, owner = self._registry.resolve_tool_owner(call.name)
+            view, capability, owner = self._registry.resolve_tool_owner(
+                call.name,
+                capability_id=self._registry.call_capability(
+                    call.name, call.arguments
+                ).id,
+            )
             if not (
                 self._analysis_read_eligible(owner, capability)
                 or self._analysis_capture_eligible(owner, capability)
@@ -2100,7 +2185,11 @@ class CapabilityRuntime:
                     "An admitted input is no longer readable.",
                 )
             arguments = await self._registry.validate_arguments_async(
-                capability.id, domain.normalize_arguments(capability, call.arguments)
+                capability.id,
+                domain.normalize_arguments(
+                    capability,
+                    self._registry.target_arguments(call.name, call.arguments),
+                ),
             )
             await _domain_prepare_call(
                 domain,
@@ -2653,7 +2742,9 @@ class CapabilityRuntime:
         outcome_certainty = ToolBatchCertainty.DEFINITE
         domain: CapabilityDomain | None = None
         try:
-            view, resolved, owner_id = self._registry.resolve_tool_owner(call.name)
+            view, resolved, owner_id = self._registry.resolve_tool_owner(
+                call.name, capability_id=entry.capability.id
+            )
             if (
                 view != entry.view
                 or resolved != entry.capability
@@ -2740,7 +2831,7 @@ class CapabilityRuntime:
             )
             if (
                 resolved_capability != capability
-                or view.capability_id != capability.id
+                or capability.id not in self._registry.tool_capability_ids(view.name)
                 or self._registry.resolve_domain_owner(capability.id) != owner_id
             ):
                 raise ValueError("tool execution identity changed")
@@ -4007,8 +4098,15 @@ def _entry_resolves_exactly(
     entry: RunToolCatalogEntry,
     registry: CapabilityRegistry,
 ) -> bool:
+    if entry.routes and not all(
+        route.view == entry.view and _entry_resolves_exactly(route, registry)
+        for _, route in entry.routes
+    ):
+        return False
     try:
-        view, capability, owner_id = registry.resolve_tool_owner(entry.view.name)
+        view, capability, owner_id = registry.resolve_tool_owner(
+            entry.view.name, capability_id=entry.capability.id
+        )
     except KeyError:
         return False
     return all(
@@ -4048,6 +4146,10 @@ def _catalog_entry_material(entry: RunToolCatalogEntry) -> dict[str, object]:
         },
         "origin_revision_digest": entry.origin_revision_digest,
         "automation_contract": _automation_contract(entry),
+        "mode_routes": [
+            {"mode": mode, "entry": _catalog_entry_material(route)}
+            for mode, route in entry.routes
+        ],
     }
 
 
