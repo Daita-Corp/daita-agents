@@ -478,6 +478,53 @@ async def test_observer_exceptions_do_not_change_result_or_transcript():
     assert await store.result(result.run_id) == result
 
 
+@pytest.mark.parametrize("stream", [False, True])
+async def test_raising_observer_changes_no_usage_budget_or_result(stream):
+    from tests.llm._routing_support import (
+        lookup_response,
+        measured_usage,
+        routed_loop,
+        scripted_attempts,
+    )
+
+    def raise_on_every_event(event: AgentEvent) -> None:
+        raise RuntimeError(f"observer failure on {event.kind.value}")
+
+    async def execute(observer):
+        provider = scripted_attempts(
+            stream,
+            (
+                ModelProviderError(
+                    ProviderErrorCode.TIMEOUT, usage=measured_usage(30, 0, "0.01")
+                ),
+                lookup_response(measured_usage(40, 5, "0.02")),
+                _stop("answer", usage=measured_usage(50, 6, "0.03")),
+            ),
+        )
+        router, store, loop = routed_loop(provider, stream, observer=observer)
+        try:
+            result = await loop.run(_run(run_id=f"observer-accounting-{stream}"))
+        finally:
+            await router.close()
+        transcript = await store.load(result.run_id)
+        # Monotonic deadlines differ between runs; every allowance must not.
+        requests = tuple(
+            replace(item, deadline=None, attempt_deadline=None)
+            for item in provider.requests
+        )
+        return result, transcript.messages, requests
+
+    observed = await execute(raise_on_every_event)
+    unobserved = await execute(None)
+
+    result = observed[0]
+    assert result.kind is LoopExitKind.COMPLETED
+    assert result.usage.total_tokens == 131
+    assert result.usage.cost_estimate.amount_usd == Decimal("0.06")
+    # Results, transcripts and every admitted request budget are identical.
+    assert observed == unobserved
+
+
 async def test_stream_fragments_are_bounded_and_observer_failure_is_non_directive():
     observed: list[AgentEvent] = []
 

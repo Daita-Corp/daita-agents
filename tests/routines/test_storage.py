@@ -570,6 +570,116 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
         await store.close()
 
 
+async def test_routine_charges_equal_the_sum_of_its_run_usage(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    runs = (
+        ModelUsage(
+            input_tokens=300,
+            output_tokens=20,
+            cost_estimate=CostEstimate.complete(Decimal("0.004")),
+        ),
+        ModelUsage(
+            input_tokens=450,
+            output_tokens=30,
+            cost_estimate=CostEstimate.complete(Decimal("0.006")),
+        ),
+    )
+    try:
+        routine = await store.admit_scheduled_routine(routine_record())
+        for index, usage in enumerate(runs):
+            due_at = routine.next_due_at
+            assert due_at is not None
+            claimed = await store.claim_due_routine_occurrence(
+                routine.agent_id,
+                routine.routine_id,
+                expected_revision=routine.revision,
+                expected_due_at=due_at,
+                claimed_at=due_at,
+                claim_token=f"claim-{index}",
+            )
+            assert claimed is not None
+            run_id = f"run-routine-sum-{index}"
+            bound = await store.bind_routine_occurrence_run(
+                routine.agent_id,
+                claimed.occurrence_id,
+                claim_token=f"claim-{index}",
+                run_id=run_id,
+                execution_scope=execution_scope(claimed),
+                bound_at=due_at + timedelta(seconds=1),
+            )
+            assert bound is not None
+            run = RunInput(
+                id=run_id,
+                agent_id=routine.agent_id,
+                message=routine.authorized_instruction,
+                created_at=due_at + timedelta(seconds=1),
+                conversation_id=routine.conversation_id,
+                source_scope_ids=("source-1",),
+                start=RunStartEnvelope(
+                    origin=RunOrigin.SCHEDULED_ROUTINE,
+                    instruction_authority=InstructionAuthority.FOREGROUND_AUTHORIZED,
+                    trusted_instruction_id="routine:routine-1:revision:1",
+                    trusted_instruction=routine.authorized_instruction,
+                    instruction_digest=routine.instruction_digest,
+                    untrusted_payload={},
+                    payload_digest="sha256:" + sha256(b"{}").hexdigest(),
+                    execution_scope=execution_scope(claimed),
+                ),
+            )
+            await store.start(run)
+            await store.append(run.id, run.start_message())
+            final_text = f"Run {index} completed."
+            await store.complete(
+                LoopExit(
+                    run_id=run.id,
+                    conversation_id=routine.conversation_id,
+                    kind=LoopExitKind.COMPLETED,
+                    reason="completed",
+                    created_at=due_at + timedelta(seconds=2),
+                    final_text=final_text,
+                    steps=1,
+                    usage=usage,
+                ),
+                CanonicalMessage(
+                    role=MessageRole.ASSISTANT,
+                    content=(TextBlock(final_text),),
+                ),
+            )
+            assert await store.mark_routine_occurrence_run_terminal(
+                routine.agent_id,
+                claimed.occurrence_id,
+                run_id=run.id,
+                terminal_at=due_at + timedelta(seconds=2),
+            )
+            for attempt in range(2):
+                # A repeated finalization returns the first outcome and charges nothing.
+                finalized = await store.finalize_routine_occurrence(
+                    routine.agent_id,
+                    claimed.occurrence_id,
+                    delivery_id=f"delivery-routine-sum-{index}-{attempt}",
+                    finalized_at=due_at + timedelta(seconds=3 + attempt),
+                )
+                assert finalized is not None
+                assert finalized[0].charged_tokens == usage.total_tokens
+                assert finalized[0].charged_cost_usd == usage.cost_estimate.amount_usd
+            current = await store.load_scheduled_routine(
+                routine.agent_id, routine.routine_id
+            )
+            assert current is not None
+            routine = current
+        assert routine.reserved_tokens == 0
+        assert routine.reserved_cost_usd == Decimal("0")
+        assert routine.charged_tokens == sum(item.total_tokens for item in runs)
+        assert routine.charged_cost_usd == sum(
+            (item.cost_estimate.amount_usd or Decimal(0) for item in runs),
+            Decimal(0),
+        )
+    finally:
+        await store.close()
+
+
 async def test_reopen_converges_completed_reserved_run_without_reexecution(
     tmp_path: Path,
 ) -> None:

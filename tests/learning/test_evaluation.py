@@ -695,6 +695,57 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
     assert "paid-contribution-margin-executable" in report.render_markdown()
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("outcome", ["recovered", "exhausted"])
+async def test_failed_model_attempts_do_not_count_as_model_calls(stream, outcome):
+    from daita.llm.errors import ModelProviderError, ProviderErrorCode
+    from daita.loop import RunInput
+    from tests.llm._routing_support import (
+        lookup_response,
+        measured_usage,
+        routed_loop,
+        scripted_attempts,
+    )
+    from tests.support.loop import NOW
+
+    def failed():
+        return ModelProviderError(
+            ProviderErrorCode.TIMEOUT, usage=measured_usage(30, 0, "0.01")
+        )
+
+    answer = ModelResponse(
+        finish_reason=FinishReason.STOP,
+        text="done",
+        usage=measured_usage(50, 6, "0.03"),
+    )
+    lookup = lookup_response(measured_usage(40, 5, "0.02"))
+    if outcome == "recovered":
+        attempts, completed_steps = (failed(), lookup, answer), 2
+    else:
+        attempts, completed_steps = (lookup, failed(), failed()), 1
+    events: list[AgentEvent] = []
+    provider = scripted_attempts(stream, attempts)
+    router, _store, loop = routed_loop(provider, stream, observer=events.append)
+    try:
+        result = await loop.run(
+            RunInput(
+                id=f"evaluation-{outcome}-{stream}",
+                agent_id="agent-1",
+                message="Question",
+                created_at=NOW,
+            )
+        )
+    finally:
+        await router.close()
+
+    measurement = measure_observer_events(events)
+    assert len(provider.requests) == 3
+    # Only completed logical steps are model calls; failed attempts are not.
+    assert measurement.model_calls == completed_steps
+    assert measurement.total_tokens == result.usage.total_tokens
+    assert measurement.estimated_cost_usd == result.usage.cost_estimate.amount_usd
+
+
 def test_observer_measurement_is_bounded_content_free_and_counts_corrections():
     events = (
         _event(AgentEventKind.RUN_STARTED, {"agent_id": "agent-1"}),

@@ -34,7 +34,14 @@ from daita.llm.routing import (
     RetryPolicy,
 )
 from daita.security import SecretReference, SecretResolutionError
-from tests.llm._routing_support import registration, request
+from tests.llm._routing_support import (
+    lookup_response,
+    measured_usage,
+    registration,
+    request,
+    routed_loop,
+    scripted_attempts,
+)
 from tests.llm._token_counting_support import (
     count_response,
     input_request,
@@ -631,6 +638,150 @@ async def test_loop_retains_completion_usage_through_stream_shutdown(mode):
     assert result is not None
     assert result.usage.total_tokens == 30
     assert result.usage.cost_estimate.amount_usd == Decimal(".01")
+    assert result.usage.cost_estimate.status.value == "complete"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("outcome", ["recovered", "exhausted"])
+async def test_loop_usage_is_the_sum_of_measured_retry_attempts(stream, outcome):
+    from daita.loop import LoopExitKind, RunInput
+    from tests.support.loop import NOW
+
+    first = measured_usage(30, 0, "0.010")
+    second = measured_usage(40, 5, "0.020")
+    third = measured_usage(50, 0, "0.030")
+    fourth = measured_usage(60, 7, "0.040")
+    attempts: tuple[ModelResponse | ModelProviderError, ...]
+    before_second_step: tuple[ModelUsage, ...]
+    if outcome == "recovered":
+        # Step 1 fails once and recovers; step 2 answers on its first attempt.
+        attempts = (
+            ModelProviderError(ProviderErrorCode.TIMEOUT, usage=first),
+            lookup_response(second),
+            ModelResponse(finish_reason=FinishReason.STOP, text="done", usage=third),
+        )
+        before_second_step = (first, second)
+    else:
+        # Step 1 answers; step 2 fails twice and the router gives up.
+        attempts = (
+            lookup_response(second),
+            ModelProviderError(ProviderErrorCode.TIMEOUT, usage=first),
+            ModelProviderError(ProviderErrorCode.TIMEOUT, usage=fourth),
+        )
+        before_second_step = (second,)
+    measured = tuple(item.usage for item in attempts)
+    provider = scripted_attempts(stream, attempts)
+    router, store, loop = routed_loop(provider, stream)
+    run = RunInput(
+        id=f"retry-accounting-{outcome}-{stream}",
+        agent_id="agent-1",
+        message="Question",
+        created_at=NOW,
+    )
+    try:
+        result = await loop.run(run)
+    finally:
+        await router.close()
+
+    assert len(provider.requests) == len(attempts)
+    assert result.kind is (
+        LoopExitKind.COMPLETED if outcome == "recovered" else LoopExitKind.FAILED
+    )
+    assert result.usage.input_tokens == sum(item.input_tokens for item in measured)
+    assert result.usage.output_tokens == sum(item.output_tokens for item in measured)
+    assert result.usage.cost_estimate.status.value == "complete"
+    assert result.usage.cost_estimate.amount_usd == sum(
+        (item.cost_estimate.amount_usd or Decimal(0) for item in measured),
+        Decimal(0),
+    )
+    assert await store.result(run.id) == result
+    # The second logical step is admitted against exactly the usage of the first.
+    initial_allowance = provider.requests[0].max_total_tokens
+    assert initial_allowance is not None
+    assert provider.requests[len(before_second_step)].max_total_tokens == (
+        initial_allowance - sum(item.total_tokens for item in before_second_step)
+    )
+
+
+class _InterruptedAfterMeasurement(MockStreamingModelProvider):
+    """Fail one attempt, then measure a second attempt before interruption."""
+
+    def __init__(self) -> None:
+        super().__init__((), complete_pricing=True)
+        self.entered = asyncio.Event()
+
+    async def _attempt(self, request):
+        from daita.llm.errors import with_cancelled_model_usage
+
+        self._requests.append(request)
+        if len(self._requests) == 1:
+            raise ModelProviderError(
+                ProviderErrorCode.TIMEOUT, usage=measured_usage(30, 0, "0.010")
+            )
+        try:
+            self.entered.set()
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as error:
+            raise with_cancelled_model_usage(error, measured_usage(7, 0, "0.002"))
+        raise AssertionError("the in-flight attempt must be interrupted")
+
+    async def generate(self, request):
+        await self._attempt(request)
+        raise AssertionError("unreachable")
+
+    async def stream(self, request):
+        await self._attempt(request)
+        yield  # pragma: no cover
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("interruption", ["cancel", "deadline"])
+async def test_interrupted_in_flight_attempt_is_counted_once(stream, interruption):
+    from daita.loop import AgentLoop, InMemoryTranscriptStore, LoopLimits, RunInput
+    from tests.support.loop import NOW, ScriptedTools, TranscriptContext
+
+    provider = _InterruptedAfterMeasurement()
+    router = ModelRouter(
+        (registration(provider, streaming=stream, tools=True),),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
+    )
+    store = InMemoryTranscriptStore()
+    loop = AgentLoop(
+        model=router,
+        context_builder=TranscriptContext(),
+        tools=ScriptedTools({}),
+        transcripts=store,
+        clock=lambda: NOW,
+        stream_model_calls=stream,
+        limits=LoopLimits(
+            max_wall_time_seconds=0.2 if interruption == "deadline" else 300.0
+        ),
+    )
+    run = RunInput(
+        id=f"interrupted-{interruption}-{stream}",
+        agent_id="agent-1",
+        message="Question",
+        created_at=NOW,
+    )
+    task = asyncio.create_task(loop.run(run))
+    try:
+        await asyncio.wait_for(provider.entered.wait(), 1)
+        if interruption == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            await asyncio.wait_for(task, 2)
+    finally:
+        await router.close()
+
+    result = await store.result(run.id)
+    assert result is not None
+    assert len(provider.requests) == 2
+    # 30 tokens from the failed attempt plus 7 measured before interruption,
+    # counted by the router once and adopted by the loop without re-adding.
+    assert result.usage.total_tokens == 37
+    assert result.usage.cost_estimate.amount_usd == Decimal("0.012")
     assert result.usage.cost_estimate.status.value == "complete"
 
 

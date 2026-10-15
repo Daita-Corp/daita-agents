@@ -269,7 +269,7 @@ class ModelGraphIntegration:
             effect_coordinator=coordinator.effect_coordinator,
             execution_contract_reader=contracts,
         )
-        responses = script or _successful_script()
+        responses = script or successful_script()
         provider = MockModelProvider(
             responses,
             provider_id=MODEL_ROUTE_ID,
@@ -420,7 +420,11 @@ class ModelGraphIntegration:
         await self.store.close()
 
 
-def _successful_script() -> tuple[ModelResponse, ...]:
+def successful_script(
+    read_usage: ModelUsage | None = None,
+    complete_usage: ModelUsage | None = None,
+) -> tuple[ModelResponse, ...]:
+    """Read the admitted resources, then complete the task with that evidence."""
     usage = ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
     return (
         ModelResponse(
@@ -434,7 +438,7 @@ def _successful_script() -> tuple[ModelResponse, ...]:
                     },
                 ),
             ),
-            usage=usage,
+            usage=read_usage or usage,
         ),
         ModelResponse(
             finish_reason=FinishReason.TOOL_CALLS,
@@ -453,7 +457,7 @@ def _successful_script() -> tuple[ModelResponse, ...]:
                     },
                 ),
             ),
-            usage=usage,
+            usage=complete_usage or usage,
         ),
     )
 
@@ -471,4 +475,5 @@ __all__ = [
     "GraphReadExecutor",
     "ModelGraphIntegration",
     "graph_read_declarations",
+    "successful_script",
 ]

@@ -279,28 +279,8 @@ async def test_native_streams_release_resources_on_every_exit(monkeypatch, kind,
     assert opened[0].closed
 
 
-@pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
-@pytest.mark.parametrize("fault", ["cleanup", "diagnostic", "both"])
-async def test_attempt_completion_survives_cleanup_and_diagnostic_faults(
-    monkeypatch, kind, fault
-):
-    from daita.llm._lifecycle import closing_stream
-    from tests.support.job_benchmarks import RecordingProvider
-
-    if fault in {"cleanup", "both"}:
-
-        async def fail_close(self):
-            self.closed = True
-            raise RuntimeError("private cleanup details must not escape")
-
-        monkeypatch.setattr(_NativeStream, "close", fail_close)
-        monkeypatch.setattr(_NativeStream, "aclose", fail_close)
-    if fault in {"diagnostic", "both"}:
-
-        def fail_snapshot(self):
-            raise ValueError("diagnostic extraction failed")
-
-        monkeypatch.setattr(ProviderAttempt, "snapshot", fail_snapshot)
+def _completed_native_provider(kind: str) -> Any:
+    """Return a native adapter whose one stream completes with 3 + 2 tokens."""
     provider: Any
     if kind == "openai":
         terminal = _openai_text_response("Done.")
@@ -365,7 +345,35 @@ async def test_attempt_completion_survives_cleanup_and_diagnostic_faults(
                 ),
             ),
         )
-    recorder = RecordingProvider(provider)
+    return provider
+
+
+def _fail_native_cleanup(monkeypatch) -> None:
+    async def fail_close(self):
+        self.closed = True
+        raise RuntimeError("private cleanup details must not escape")
+
+    monkeypatch.setattr(_NativeStream, "close", fail_close)
+    monkeypatch.setattr(_NativeStream, "aclose", fail_close)
+
+
+@pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
+@pytest.mark.parametrize("fault", ["cleanup", "diagnostic", "both"])
+async def test_attempt_completion_survives_cleanup_and_diagnostic_faults(
+    monkeypatch, kind, fault
+):
+    from daita.llm._lifecycle import closing_stream
+    from tests.support.job_benchmarks import RecordingProvider
+
+    if fault in {"cleanup", "both"}:
+        _fail_native_cleanup(monkeypatch)
+    if fault in {"diagnostic", "both"}:
+
+        def fail_snapshot(self):
+            raise ValueError("diagnostic extraction failed")
+
+        monkeypatch.setattr(ProviderAttempt, "snapshot", fail_snapshot)
+    recorder = RecordingProvider(_completed_native_provider(kind))
     events = []
     try:
         async with closing_stream(recorder.stream(_request())) as stream:
@@ -386,6 +394,92 @@ async def test_attempt_completion_survives_cleanup_and_diagnostic_faults(
         assert observation["cleanup_finished_seconds"] is not None
     else:
         assert observation == {"measurement_availability": "unavailable"}
+
+
+@pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
+async def test_completed_stream_cleanup_failure_counts_the_attempt_once(
+    monkeypatch, kind
+):
+    from daita.llm._lifecycle import closing_stream
+    from daita.llm.routing import ModelRouter, RetryPolicy
+    from tests.llm._routing_support import registration
+
+    _fail_native_cleanup(monkeypatch)
+    provider = _completed_native_provider(kind)
+    router = ModelRouter(
+        (registration(provider, streaming=True),),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
+    )
+    events = []
+    try:
+        with pytest.raises(ModelProviderError) as caught:
+            async with closing_stream(router.stream(_request())) as stream:
+                async for event in stream:
+                    events.append(event)
+    finally:
+        await router.close()
+
+    # One physical attempt completed with 3 input and 2 output tokens. Its
+    # cleanup failure is neither another attempt nor a second measurement.
+    usage = caught.value.usage
+    assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (3, 2, 5)
+    assert not any(isinstance(event, ModelStreamCompleted) for event in events)
+
+
+async def test_cleanup_failure_after_routed_completion_counts_the_attempt_once():
+    from decimal import Decimal
+
+    from daita.llm.models import FinishReason, ModelResponse, ModelUsage
+    from daita.llm.pricing import CostEstimate
+    from daita.llm.providers.mock import MockStreamingModelProvider
+    from daita.loop import LoopExitKind, RunInput
+    from tests.llm._routing_support import routed_loop
+    from tests.support.loop import NOW
+
+    measured = ModelUsage(
+        input_tokens=60,
+        output_tokens=50,
+        cost_estimate=CostEstimate.complete(Decimal("0.011")),
+    )
+
+    class CompletedThenCleanupFails(MockStreamingModelProvider):
+        async def stream(self, request):
+            self._requests.append(request)
+            try:
+                yield ModelStreamCompleted(
+                    ModelResponse(
+                        finish_reason=FinishReason.STOP, text="done", usage=measured
+                    )
+                )
+            finally:
+                # A cleanup failure reports the terminal usage it already measured.
+                raise ModelProviderError(
+                    ProviderErrorCode.CLEANUP_FAILED,
+                    usage=measured,
+                    terminal_observed=True,
+                )
+
+    provider = CompletedThenCleanupFails((), complete_pricing=True)
+    router, store, loop = routed_loop(provider, stream=True)
+    run = RunInput(
+        id="routed-completion-cleanup",
+        agent_id="agent-1",
+        message="Question",
+        created_at=NOW,
+    )
+    try:
+        result = await loop.run(run)
+    finally:
+        await router.close()
+
+    assert len(provider.requests) == 1
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == ProviderErrorCode.CLEANUP_FAILED.value
+    assert (result.usage.input_tokens, result.usage.output_tokens) == (60, 50)
+    assert result.usage.total_tokens == 110
+    assert result.usage.cost_estimate.status.value == "complete"
+    assert result.usage.cost_estimate.amount_usd == Decimal("0.011")
+    assert await store.result(run.id) == result
 
 
 async def test_openai_native_stream_ignores_empty_deltas_and_uses_terminal_response():
