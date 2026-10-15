@@ -204,6 +204,7 @@ are reported without retry or replacement; recovery performs no action.
 When routine creation or revision is callable, a mandatory code-owned context block
 exposes the complete frozen eligible model-route choices and host per-run token/cost
 ceilings. These are local configuration facts, not remaining credit or approval.
-There is no current-model alias or implied default; a null host cost ceiling does
-not remove the routine's own bounded-budget requirement. Machine runs receive no
+There is no current-model alias or implied default; a null host cost ceiling
+means none. Token, attempt and occurrence ceilings always bound a routine, and its
+two dollar ceilings are optional and set together. Machine runs receive no
 routine-management facts. Loading another working set removes authoring guidance.

@@ -353,9 +353,9 @@ class _RoutineDraftValues(TypedDict):
     distribution_destination_id: str
     eligible_model_routes: tuple[str, ...]
     per_run_max_tokens: int
-    per_run_max_cost_usd: Decimal
+    per_run_max_cost_usd: Decimal | None
     cumulative_max_tokens: int
-    cumulative_max_cost_usd: Decimal
+    cumulative_max_cost_usd: Decimal | None
     cumulative_max_attempts: int
     cumulative_max_occurrences: int
     maximum_consecutive_failures: int

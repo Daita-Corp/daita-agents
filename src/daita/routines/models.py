@@ -115,6 +115,11 @@ def _money(value: Decimal, name: str, *, maximum: Decimal | None) -> None:
         raise ValueError(f"{name} must be a bounded non-negative Decimal")
 
 
+def _optional_money(value: Decimal | None, name: str, *, maximum: Decimal) -> None:
+    if value is not None:
+        _money(value, name, maximum=maximum)
+
+
 def _identities(
     values: Iterable[str],
     name: str,
@@ -331,14 +336,25 @@ RoutineSchedule: TypeAlias = OnceSchedule | IntervalSchedule | CalendarSchedule
 def validate_budget_relationships(
     per_run_max_tokens: int,
     cumulative_max_tokens: int,
-    per_run_max_cost_usd: Decimal,
-    cumulative_max_cost_usd: Decimal,
+    per_run_max_cost_usd: Decimal | None,
+    cumulative_max_cost_usd: Decimal | None,
 ) -> None:
-    """Share the per-run/cumulative invariant across proposals and retained records."""
-    for per_run, cumulative, field in (
-        (per_run_max_tokens, cumulative_max_tokens, "tokens"),
-        (per_run_max_cost_usd, cumulative_max_cost_usd, "cost_usd"),
-    ):
+    """Share the per-run/cumulative invariant across proposals and retained records.
+
+    Dollar ceilings are optional and travel together; tokens, attempts and
+    occurrences always bound a routine.
+    """
+    if (per_run_max_cost_usd is None) != (cumulative_max_cost_usd is None):
+        raise ValueError(
+            "per_run_max_cost_usd and cumulative_max_cost_usd must be set together "
+            "or both omitted."
+        )
+    budgets: list[tuple[int | Decimal, int | Decimal, str]] = [
+        (per_run_max_tokens, cumulative_max_tokens, "tokens")
+    ]
+    if per_run_max_cost_usd is not None and cumulative_max_cost_usd is not None:
+        budgets.append((per_run_max_cost_usd, cumulative_max_cost_usd, "cost_usd"))
+    for per_run, cumulative, field in budgets:
         if per_run > cumulative:
             raise ValueError(
                 f"per_run_max_{field} must not exceed cumulative_max_{field}. "
@@ -418,9 +434,9 @@ class ScheduledRoutineDraft:
     distribution_destination_id: str
     eligible_model_routes: tuple[str, ...]
     per_run_max_tokens: int
-    per_run_max_cost_usd: Decimal
+    per_run_max_cost_usd: Decimal | None
     cumulative_max_tokens: int
-    cumulative_max_cost_usd: Decimal
+    cumulative_max_cost_usd: Decimal | None
     cumulative_max_attempts: int
     cumulative_max_occurrences: int
     maximum_consecutive_failures: int
@@ -542,12 +558,12 @@ class ScheduledRoutineDraft:
             _bounded_count(value, name, maximum=maximum)
             if value == 0:
                 raise ValueError(f"{name} must be positive")
-        _money(
+        _optional_money(
             self.per_run_max_cost_usd,
             "draft per-run cost",
             maximum=MAX_ROUTINE_PER_RUN_COST_USD,
         )
-        _money(
+        _optional_money(
             self.cumulative_max_cost_usd,
             "draft cumulative cost",
             maximum=MAX_ROUTINE_CUMULATIVE_COST_USD,
@@ -662,9 +678,9 @@ class ScheduledRoutine:
     outcome_contract: OutcomeContract
     distribution_plan: DistributionPlan
     per_run_max_tokens: int
-    per_run_max_cost_usd: Decimal
+    per_run_max_cost_usd: Decimal | None
     cumulative_max_tokens: int
-    cumulative_max_cost_usd: Decimal
+    cumulative_max_cost_usd: Decimal | None
     cumulative_max_attempts: int
     cumulative_max_occurrences: int
     reserved_tokens: int
@@ -907,12 +923,12 @@ class ScheduledRoutine:
             _bounded_count(count_value, count_name, maximum=maximum)
             if require_positive and count_value == 0:
                 raise ValueError(f"{count_name} must be positive")
-        _money(
+        _optional_money(
             self.per_run_max_cost_usd,
             "per-run cost ceiling",
             maximum=MAX_ROUTINE_PER_RUN_COST_USD,
         )
-        _money(
+        _optional_money(
             self.cumulative_max_cost_usd,
             "cumulative cost ceiling",
             maximum=MAX_ROUTINE_CUMULATIVE_COST_USD,
@@ -938,9 +954,9 @@ class ScheduledRoutine:
             and self.reserved_tokens + self.charged_tokens > self.cumulative_max_tokens
         ):
             raise ValueError("routine token budget is oversubscribed")
-        if (
-            self.reserved_cost_usd
-            and self.reserved_cost_usd + self.charged_cost_usd
+        if self.reserved_cost_usd and (
+            self.cumulative_max_cost_usd is None
+            or self.reserved_cost_usd + self.charged_cost_usd
             > self.cumulative_max_cost_usd
         ):
             raise ValueError("routine cost budget is oversubscribed")
@@ -1013,12 +1029,15 @@ class ScheduledRoutine:
     @property
     def model_budget_exhausted(self) -> bool:
         """Consumption is a fact; only a new reservation is capped by authority."""
-        return (
+        if (
             self.reserved_tokens + self.charged_tokens + self.per_run_max_tokens
             > self.cumulative_max_tokens
-            or self.reserved_cost_usd
-            + self.charged_cost_usd
-            + self.per_run_max_cost_usd
+        ):
+            return True
+        if self.per_run_max_cost_usd is None or self.cumulative_max_cost_usd is None:
+            return False
+        return (
+            self.reserved_cost_usd + self.charged_cost_usd + self.per_run_max_cost_usd
             > self.cumulative_max_cost_usd
         )
 

@@ -16,9 +16,9 @@ from ...llm.models import ModelSensitivity
 from .common import (
     datetime_decode,
     datetime_encode,
-    decimal_decode,
-    decimal_encode,
     integer,
+    optional_decimal_decode,
+    optional_decimal_encode,
     optional_text,
     plain_encode,
     record,
@@ -56,11 +56,7 @@ def encode_execution_scope(value: ExecutionScope):
             ),
             "sensitivity_ceiling": value.sensitivity_ceiling.value,
             "eligible_model_routes": list(value.eligible_model_routes),
-            "per_run_max_cost_usd": (
-                None
-                if value.per_run_max_cost_usd is None
-                else decimal_encode(value.per_run_max_cost_usd)
-            ),
+            "per_run_max_cost_usd": optional_decimal_encode(value.per_run_max_cost_usd),
             "per_run_max_tokens": value.per_run_max_tokens,
             "distribution_plan_digest": value.distribution_plan_digest,
             "contract_bindings": encode_execution_contract_bindings(
@@ -199,11 +195,7 @@ def decode_execution_scope(value) -> ExecutionScope:
                 "execution scope model routes",
             )
         ),
-        per_run_max_cost_usd=(
-            None
-            if fields["per_run_max_cost_usd"] is None
-            else decimal_decode(fields["per_run_max_cost_usd"])
-        ),
+        per_run_max_cost_usd=optional_decimal_decode(fields["per_run_max_cost_usd"]),
         per_run_max_tokens=integer(
             fields["per_run_max_tokens"],
             "execution scope per-run tokens",

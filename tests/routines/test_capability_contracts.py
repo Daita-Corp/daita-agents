@@ -364,3 +364,50 @@ async def test_draft_and_record_share_budget_relationship_and_equal_boundary(bud
                 cumulative_max_cost_usd=Decimal(0),
             )
             assert zero.per_run_max_cost_usd == zero.cumulative_max_cost_usd == 0
+
+
+async def test_dollar_ceilings_are_optional_and_travel_together():
+    from dataclasses import replace
+    from decimal import Decimal
+
+    from daita.routines.capabilities import _parsed_spec
+    from daita.routines.models import ScheduledRoutineDraft
+    from daita.routines.owner import _routine_proposal_payload
+    from tests.routines._owner_support import _owner, _proposal, _Store
+
+    schema = _spec_schema(update=False)
+    required = cast(list[str], schema["required"])
+    assert "per_run_max_cost_usd" not in required
+    assert "cumulative_max_cost_usd" not in required
+    assert {"per_run_max_tokens", "cumulative_max_tokens"} <= set(required)
+
+    proposal = await _proposal(_owner(_Store()))
+    properties = cast(Mapping[str, object], schema["properties"])
+    arguments = {
+        key: value
+        for key, value in _routine_proposal_payload(proposal).items()
+        if key in properties
+        and value is not None
+        and key not in {"per_run_max_cost_usd", "cumulative_max_cost_usd"}
+    }
+    arguments.update(skill_names=(), distribution_destination_id="destination")
+    parsed = dict(_parsed_spec(FrozenJsonObject.from_mapping(arguments)))
+    assert parsed["per_run_max_cost_usd"] is None
+    assert parsed["cumulative_max_cost_usd"] is None
+    parsed.pop("basis_run_id")
+    draft = ScheduledRoutineDraft(origin_run_id="run-origin", **cast(Any, parsed))
+
+    uncapped = replace(
+        proposal, per_run_max_cost_usd=None, cumulative_max_cost_usd=None
+    )
+    assert _routine_proposal_payload(uncapped)["per_run_max_cost_usd"] is None
+    assert not replace(
+        uncapped, charged_cost_usd=Decimal("1000000")
+    ).model_budget_exhausted
+    for item in (draft, proposal):
+        with pytest.raises(ValueError, match="must be set together"):
+            replace(
+                item,
+                per_run_max_cost_usd=Decimal("0.01"),
+                cumulative_max_cost_usd=None,
+            )

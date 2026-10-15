@@ -324,6 +324,97 @@ async def test_supervisor_runs_one_due_slot_and_delivers_once(
         await store.close()
 
 
+async def test_quota_rejection_holds_the_route_without_counting_a_failure(
+    tmp_path,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    await _seed_conversation(store)
+    # An uncapped subscription routine: tokens, attempts and occurrences bound it.
+    routine = await store.admit_scheduled_routine(
+        replace(_routine(), per_run_max_cost_usd=None, cumulative_max_cost_usd=None)
+    )
+    distribution = DistributionOwner(agent_id="agent-1", store=store)
+    artifacts = await AgentHomeArtifactStore.open(
+        agent_id="agent-1",
+        agent_home=tmp_path,
+        registry=store,
+    )
+    route = routine.eligible_model_routes[0]
+
+    async def execute(
+        occurrence: RoutineOccurrence,
+        run: RunInput,
+        observation: ResourceRevisionObservation | None,
+    ) -> LoopExit | None:
+        assert run.execution_scope is not None
+        assert run.execution_scope.per_run_max_cost_usd is None
+        bound = await store.bind_routine_occurrence_run(
+            "agent-1",
+            occurrence.occurrence_id,
+            claim_token=cast(str, occurrence.claim_token),
+            run_id=run.id,
+            execution_scope=run.execution_scope,
+            bound_at=NOW,
+        )
+        assert bound is not None
+        await store.start(run)
+        await store.append(run.id, run.start_message())
+        result = LoopExit(
+            run_id=run.id,
+            conversation_id="conversation-1",
+            kind=LoopExitKind.FAILED,
+            reason="rate_limit_error",
+            created_at=NOW,
+            provider_id=route,
+        )
+        await store.finish(result)
+        return result
+
+    supervisor = RoutineSupervisor(
+        agent_id="agent-1",
+        store=store,
+        owner=cast(RoutineOwner, _Owner()),
+        runtime=cast(CapabilityRuntime, _UnusedRuntime()),
+        distribution=distribution,
+        artifacts=artifacts,
+        execute_run=execute,
+        clock=lambda: NOW,
+        id_factory=_ids(),
+        poll_seconds=0.02,
+    )
+    try:
+        await supervisor.start()
+        occurrence_id = await _wait_for_occurrence_id(store, routine.routine_id)
+        terminal = await _wait_for_terminal(store, occurrence_id)
+        assert terminal.disposition is RoutineOccurrenceDisposition.TERMINAL_FAILED
+        persisted = await store.load_scheduled_routine("agent-1", routine.routine_id)
+        assert persisted is not None
+        assert persisted.state is RoutineState.ACTIVE
+        assert persisted.consecutive_failures == 0
+        assert persisted.charged_tokens == 0
+        assert supervisor._quota_held(persisted, NOW + timedelta(minutes=4))
+        assert not supervisor._quota_held(persisted, NOW + timedelta(minutes=6))
+        repeated = await store.result(cast(str, terminal.terminal_run_id))
+        assert repeated is not None
+        # A repeat rejection doubles the hold; a completed run clears it.
+        supervisor._observe_quota(persisted, repeated)
+        assert supervisor._quota_held(persisted, NOW + timedelta(minutes=9))
+        supervisor._observe_quota(
+            persisted,
+            replace(
+                repeated,
+                kind=LoopExitKind.COMPLETED,
+                reason="assistant_text",
+                final_text="done",
+                provider_id=None,
+            ),
+        )
+        assert not supervisor._quota_held(persisted, NOW)
+    finally:
+        await supervisor.close()
+        await store.close()
+
+
 async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
