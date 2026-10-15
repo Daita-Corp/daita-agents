@@ -1607,6 +1607,9 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
             "maxItems": 32,
             "uniqueItems": True,
             "items": {"type": "string", "maxLength": 256},
+            "description": "Optional; usually omit. Exact call ids of earlier "
+            "successful data_query results this write relies on, in call order. "
+            "Never tool names.",
         },
     }
     required = [

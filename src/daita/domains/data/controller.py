@@ -1641,9 +1641,16 @@ class DataCapabilityDomain:
             )
             != evidence_ids
         ):
+            known = {block.call_id for block in results}
+            unknown = [item for item in evidence_ids if item not in known]
             raise CapabilityInputError(
                 "write_evidence_invalid",
-                "Evidence must identify ordered successful authenticated current-run results.",
+                "Evidence must identify ordered successful authenticated current-run results"
+                + (
+                    f"; not a successful call id in this run: {', '.join(unknown[:4])}."
+                    if unknown
+                    else "; the call ids are out of order."
+                ),
             )
         if not execution:
             return
