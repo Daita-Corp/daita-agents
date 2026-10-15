@@ -139,13 +139,14 @@ constructors and models belong in support modules.
 
 ```bash
 # Default deterministic suite. Configuration excludes tests/live and tests/slow.
-.venv/bin/python -m pytest
+# -n auto runs one worker per CPU core; drop it to debug ordering or output.
+.venv/bin/python -m pytest -n auto
 
 # Focused owner suite.
 .venv/bin/python -m pytest tests/llm -v
 
 # Explicit deterministic CI selection.
-.venv/bin/python -m pytest tests/ \
+.venv/bin/python -m pytest -n auto tests/ \
   -m "not requires_llm and not requires_db and not requires_network and not slow"
 
 # Architecture boundaries.
