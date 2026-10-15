@@ -392,7 +392,13 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
                 composer = app.screen.query_one(Composer)
                 composer.load_text("/sources")
                 composer.action_submit()
-                await pilot.pause()
+                await settle_until(
+                    pilot,
+                    lambda: isinstance(app.screen, CatalogScreen)
+                    and any(
+                        tree.has_focus for tree in app.screen.query("#catalog-tree")
+                    ),
+                )
 
                 assert isinstance(app.screen, CatalogScreen)
                 assert str(app.screen.query_one("#catalog-title").render()) == "Sources"
