@@ -60,7 +60,14 @@ async def admit_owner_routine(scenario, owner_prompt):
         )
     )[0]
     arguments = {
-        **scenario.routine_contract,
+        # Subscription runs carry no dollar ceilings; omit them rather than
+        # sending null, which routine admission rejects.
+        **{
+            key: value
+            for key, value in scenario.routine_contract.items()
+            if value is not None
+            or key not in {"per_run_max_cost_usd", "cumulative_max_cost_usd"}
+        },
         "title": "Owner-authorized company finding",
         "authorized_instruction": (
             "Maintain the owner-supplied finding in the exact admitted companies table: "
