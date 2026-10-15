@@ -77,7 +77,7 @@ if loaded:
     assert completed.returncode == 0, completed.stderr
 
 
-@pytest.mark.parametrize("provider", BUILTIN_PROVIDER_IDS - {"ollama"})
+@pytest.mark.parametrize("provider", sorted(BUILTIN_PROVIDER_IDS - {"ollama"}))
 def test_fixed_builtin_endpoints_reject_overrides(provider):
     with pytest.raises(ValueError, match="fixed endpoint"):
         admit_model_selection(provider, "model", "https://override.invalid")
