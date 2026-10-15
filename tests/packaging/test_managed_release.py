@@ -368,7 +368,7 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
     assert "${{ needs.build.outputs.wheel }}[dev]" in release_gates
     assert "DAITA_TEST_CANDIDATE_WHEEL:" in release_gates
     assert "python -m build --wheel" not in release_gates
-    assert "python -m pytest tests/" in release_gates
+    assert "python -m pytest -n auto tests/" in release_gates
     assert "Validate GitHub Actions workflow syntax" in release_gates
     assert (
         "rhysd/actionlint@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9"

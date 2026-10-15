@@ -234,7 +234,7 @@ jobs:
         env:
           DAITA_TEST_CANDIDATE_WHEEL: ${{ github.workspace }}/release-artifacts/${{ needs.build.outputs.wheel }}
         run: |
-          python -m pytest tests/ -m "not requires_llm and not requires_db and not requires_network and not slow"
+          python -m pytest -n auto tests/ -m "not requires_llm and not requires_db and not requires_network and not slow"
           python -m black --check src tests scripts
           python -m ruff check --select I .
           python -m mypy src/daita tests

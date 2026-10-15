@@ -1,6 +1,7 @@
 import ast
 import inspect
 from collections.abc import Mapping
+from functools import cache
 from pathlib import Path
 
 import daita
@@ -19,14 +20,23 @@ def test_public_agent_facade_cannot_replace_composed_context_or_tool_runtime():
         assert "tools" not in parameters
 
 
+@cache
+def _source(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+@cache
+def _tree(path: Path) -> ast.Module:
+    # Shared read-only parse; callers only walk the tree.
+    return ast.parse(_source(path))
+
+
 def _python_text(root: Path) -> str:
-    return "\n".join(
-        path.read_text(encoding="utf-8") for path in sorted(root.rglob("*.py"))
-    )
+    return "\n".join(_source(path) for path in sorted(root.rglob("*.py")))
 
 
 def _class_methods(path: Path, class_name: str) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree = _tree(path)
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and node.name == class_name:
             return {
@@ -40,7 +50,7 @@ def _class_methods(path: Path, class_name: str) -> set[str]:
 def _class_owners(class_name: str) -> set[str]:
     owners = set()
     for path in PACKAGE.rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tree = _tree(path)
         if any(
             isinstance(node, ast.ClassDef) and node.name == class_name
             for node in ast.walk(tree)
@@ -50,7 +60,7 @@ def _class_owners(class_name: str) -> set[str]:
 
 
 def _imports(path: Path) -> set[str]:
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree = _tree(path)
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -63,7 +73,7 @@ def _imports(path: Path) -> set[str]:
 def _files_with_method_call(root: Path, method_name: str) -> set[str]:
     owners: set[str] = set()
     for path in root.rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tree = _tree(path)
         if any(
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -262,7 +272,7 @@ def test_current_graph_kernel_is_registered_and_legacy_runtime_is_unreachable():
 
 def test_common_runtime_has_one_owner_and_no_domain_dependencies():
     runtime_path = PACKAGE / "capability_runtime.py"
-    runtime_tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
+    runtime_tree = _tree(runtime_path)
 
     assert _class_owners("CapabilityRuntime") == {"capability_runtime.py"}
     assert not {
@@ -297,7 +307,7 @@ def test_toolbox_catalog_and_activation_owners_are_explicit():
     assert "StepToolProjection" not in _python_text(PACKAGE / "storage")
 
     mcp_path = PACKAGE / "domains" / "mcp.py"
-    mcp_tree = ast.parse(mcp_path.read_text(encoding="utf-8"))
+    mcp_tree = _tree(mcp_path)
     activation = next(
         node
         for node in mcp_tree.body
@@ -327,7 +337,7 @@ def test_loop_context_and_composition_owners_are_exact():
 def test_local_workspace_backend_is_explicit_and_conditionally_composed():
 
     embedded_path = PACKAGE / "hosting" / "embedded.py"
-    tree = ast.parse(embedded_path.read_text(encoding="utf-8"))
+    tree = _tree(embedded_path)
     embedded_class = next(
         node
         for node in tree.body
@@ -1560,7 +1570,7 @@ def test_terminal_application_remains_a_presentation_over_the_public_agent_api()
         "storage",
     }
     for path in tui_root.rglob("*.py"):
-        module_tree = ast.parse(path.read_text(encoding="utf-8"))
+        module_tree = _tree(path)
         for node in ast.walk(module_tree):
             if isinstance(node, ast.ImportFrom) and node.module:
                 root = node.module.split(".")[0]
@@ -1902,7 +1912,7 @@ def test_subscription_process_and_envelope_have_single_owners():
 
 def test_schema_multi_selector_has_no_data_runtime_or_persisted_state_owner():
     selector_path = PACKAGE / "tui" / "screens" / "selection.py"
-    selector_tree = ast.parse(selector_path.read_text(encoding="utf-8"))
+    selector_tree = _tree(selector_path)
     imported_modules = {
         node.module
         for node in ast.walk(selector_tree)
