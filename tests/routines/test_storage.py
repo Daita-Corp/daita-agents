@@ -29,9 +29,11 @@ from daita.loop.models import (
 )
 from daita.routines.models import (
     OnceSchedule,
+    RoutineOccurrence,
     RoutineOccurrenceDisposition,
     RoutineSlotKind,
     RoutineState,
+    ScheduledRoutine,
 )
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_codecs.routines import (
@@ -58,6 +60,25 @@ def test_routine_codec_v1_round_trip_is_exact() -> None:
         )
         == routine
     )
+
+
+def test_uncapped_routine_round_trips_and_keeps_its_cost_pair_invariant() -> None:
+    routine = replace(
+        routine_record(), per_run_max_cost_usd=None, cumulative_max_cost_usd=None
+    )
+    decoded = decode_scheduled_routine(
+        encode_scheduled_routine(routine),
+        agent_id=routine.agent_id,
+        routine_id=routine.routine_id,
+    )
+    assert decoded == routine
+    # Token, attempt and occurrence ceilings still exhaust an uncapped routine.
+    assert not routine.model_budget_exhausted
+    assert replace(routine, charged_tokens=46_000).model_budget_exhausted
+    with pytest.raises(ValueError, match="both be set or both omitted"):
+        replace(routine_record(), per_run_max_cost_usd=None)
+    with pytest.raises(ValueError, match="uncapped routine cannot reserve cost"):
+        replace(routine, reserved_tokens=5_000, reserved_cost_usd=Decimal("0.05"))
 
 
 def test_occurrence_codec_v1_round_trip_is_exact() -> None:
@@ -860,4 +881,152 @@ async def test_cancelled_immediate_admission_settles_one_atomic_assignment(
         assert await store.list_effect_receipts(proposal.agent_id) == ()
     finally:
         release.set()
+        await store.close()
+
+
+async def _settle_occurrence(
+    store: SQLiteStateStore,
+    routine: ScheduledRoutine,
+    index: int,
+    *,
+    kind: LoopExitKind,
+    reason: str,
+    usage: ModelUsage,
+) -> tuple[ScheduledRoutine, RoutineOccurrence]:
+    due_at = routine.next_due_at
+    assert due_at is not None
+    claimed = await store.claim_due_routine_occurrence(
+        routine.agent_id,
+        routine.routine_id,
+        expected_revision=routine.revision,
+        expected_due_at=due_at,
+        claimed_at=due_at,
+        claim_token=f"claim-{index}",
+    )
+    assert claimed is not None
+    assert claimed.reserved_cost_usd == Decimal("0")
+    scope = replace(execution_scope(claimed), per_run_max_cost_usd=None)
+    run_id = f"run-uncapped-{index}"
+    assert await store.bind_routine_occurrence_run(
+        routine.agent_id,
+        claimed.occurrence_id,
+        claim_token=f"claim-{index}",
+        run_id=run_id,
+        execution_scope=scope,
+        bound_at=due_at + timedelta(seconds=1),
+    )
+    run = RunInput(
+        id=run_id,
+        agent_id=routine.agent_id,
+        message=routine.authorized_instruction,
+        created_at=due_at + timedelta(seconds=1),
+        conversation_id=routine.conversation_id,
+        source_scope_ids=("source-1",),
+        start=RunStartEnvelope(
+            origin=RunOrigin.SCHEDULED_ROUTINE,
+            instruction_authority=InstructionAuthority.FOREGROUND_AUTHORIZED,
+            trusted_instruction_id="routine:routine-1:revision:1",
+            trusted_instruction=routine.authorized_instruction,
+            instruction_digest=routine.instruction_digest,
+            untrusted_payload={},
+            payload_digest="sha256:" + sha256(b"{}").hexdigest(),
+            execution_scope=scope,
+        ),
+    )
+    await store.start(run)
+    await store.append(run.id, run.start_message())
+    final_text = f"Run {index} completed." if kind is LoopExitKind.COMPLETED else None
+    result = LoopExit(
+        run_id=run.id,
+        conversation_id=routine.conversation_id,
+        kind=kind,
+        reason=reason,
+        created_at=due_at + timedelta(seconds=2),
+        final_text=final_text,
+        steps=1,
+        usage=usage,
+    )
+    if final_text is None:
+        await store.finish(result)
+    else:
+        await store.complete(
+            result,
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT, content=(TextBlock(final_text),)
+            ),
+        )
+    assert await store.mark_routine_occurrence_run_terminal(
+        routine.agent_id,
+        claimed.occurrence_id,
+        run_id=run.id,
+        terminal_at=due_at + timedelta(seconds=2),
+    )
+    finalized = await store.finalize_routine_occurrence(
+        routine.agent_id,
+        claimed.occurrence_id,
+        delivery_id=f"delivery-uncapped-{index}",
+        finalized_at=due_at + timedelta(seconds=3),
+    )
+    assert finalized is not None
+    current = await store.load_scheduled_routine(routine.agent_id, routine.routine_id)
+    assert current is not None
+    return current, finalized[0]
+
+
+async def test_uncapped_routine_runs_unpriced_and_quota_failures_do_not_count(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    unpriced = CostEstimate.unavailable("subscription_billing")
+    try:
+        routine = await store.admit_scheduled_routine(
+            replace(
+                routine_record(maximum_consecutive_failures=2),
+                per_run_max_cost_usd=None,
+                cumulative_max_cost_usd=None,
+            )
+        )
+        # A provider quota window fails the occurrence without counting toward
+        # needs_attention; the routine stays active for its next slot.
+        routine, occurrence = await _settle_occurrence(
+            store,
+            routine,
+            0,
+            kind=LoopExitKind.FAILED,
+            reason="rate_limit_error",
+            usage=ModelUsage(cost_estimate=unpriced),
+        )
+        assert occurrence.disposition is RoutineOccurrenceDisposition.TERMINAL_FAILED
+        assert routine.consecutive_failures == 0
+        assert routine.state is RoutineState.ACTIVE
+
+        # Unpriced subscription usage completes under token authority alone.
+        usage = ModelUsage(input_tokens=300, output_tokens=20, cost_estimate=unpriced)
+        routine, occurrence = await _settle_occurrence(
+            store,
+            routine,
+            1,
+            kind=LoopExitKind.COMPLETED,
+            reason="completed",
+            usage=usage,
+        )
+        assert occurrence.disposition is RoutineOccurrenceDisposition.COMPLETED
+        assert occurrence.charged_tokens == usage.total_tokens
+        assert occurrence.charged_cost_usd == Decimal("0")
+
+        # Other failures still count.
+        routine, occurrence = await _settle_occurrence(
+            store,
+            routine,
+            2,
+            kind=LoopExitKind.FAILED,
+            reason="model_response_error",
+            usage=ModelUsage(cost_estimate=unpriced),
+        )
+        assert routine.consecutive_failures == 1
+        assert routine.reserved_tokens == 0
+        assert routine.reserved_cost_usd == Decimal("0")
+        assert routine.charged_cost_usd == Decimal("0")
+        assert routine.state is RoutineState.ACTIVE
+    finally:
         await store.close()

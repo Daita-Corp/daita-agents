@@ -528,8 +528,10 @@ fairness and finalization; all capability work still executes through the one
 admits one code-resolved graph-eligible initial task and internal finalizer when a
 model route is configured. Graph work is bounded by per-task steps, the host
 per-run token ceiling, wall time and `work_units` attempts; graph contracts and
-graph-task scopes carry no dollar ceiling, and only graph-task scopes may omit
-one. Planner-created work is a validated immutable-authority subset. Unmappable
+graph-task scopes carry no dollar ceiling. Graph-task and scheduled-routine
+scopes are the only scopes that may omit one; routine dollar ceilings are an
+optional per-run/cumulative pair beside required token, attempt and occurrence
+ceilings. Planner-created work is a validated immutable-authority subset. Unmappable
 migrated work is `needs_attention`; no legacy executor can run it.
 
 An effectful initial task additionally requires foreground approval and one

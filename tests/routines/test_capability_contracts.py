@@ -364,3 +364,20 @@ async def test_draft_and_record_share_budget_relationship_and_equal_boundary(bud
                 cumulative_max_cost_usd=Decimal(0),
             )
             assert zero.per_run_max_cost_usd == zero.cumulative_max_cost_usd == 0
+            uncapped = replace(
+                item, per_run_max_cost_usd=None, cumulative_max_cost_usd=None
+            )
+            assert uncapped.per_run_max_cost_usd is None
+            with pytest.raises(ValueError, match="both be set or both omitted"):
+                replace(item, cumulative_max_cost_usd=None)
+    if budget == "cost_usd":
+        # Dollar ceilings are optional tool arguments; omitting both is uncapped.
+        omitted = {
+            key: value
+            for key, value in arguments.items()
+            if key not in {"per_run_max_cost_usd", "cumulative_max_cost_usd"}
+        }
+        validate_tool_schema_value(_spec_schema(update=False), omitted)
+        uncapped_spec = _parsed_spec(FrozenJsonObject.from_mapping(omitted))
+        assert uncapped_spec["per_run_max_cost_usd"] is None
+        assert uncapped_spec["cumulative_max_cost_usd"] is None

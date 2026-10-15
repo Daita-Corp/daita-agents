@@ -65,6 +65,16 @@ grant preparation or execution-contract binding and return actionable errors.
 Admission rechecks the same rules; drafts and persisted records share their
 reporting/precheck invariant.
 
+Every routine requires per-run and cumulative token ceilings plus attempt and
+occurrence ceilings. Dollar ceilings are optional and are set or omitted as one
+per-run/cumulative pair. An uncapped routine reserves no dollars; its runs are
+bounded by steps, tokens and wall time, so subscription routes such as Codex can
+run it. A host-wide cost limit, when configured, still applies to each run. When
+dollar ceilings are set, unpriced or incomplete usage is charged conservatively
+and fails the occurrence, as before. A provider rate-limit or quota failure
+fails the occurrence without counting toward the consecutive-failure limit, so
+the routine retries at its next slot rather than needing attention.
+
 Per-run token and estimated-cost ceilings must not exceed their corresponding
 cumulative ceilings. Drafts and stored routines share that invariant. The routine
 owner rejects inconsistent create/revision proposals with `routine_budget_invalid`

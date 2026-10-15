@@ -640,7 +640,8 @@ class ExecutionScope:
     allowed_operational_effects: frozenset[OperationalEffect]
     sensitivity_ceiling: ModelSensitivity
     eligible_model_routes: tuple[str, ...]
-    # Graph tasks are bounded by steps, tokens, attempts and wall time only.
+    # Graph tasks and routines may be bounded by steps, tokens, attempts and
+    # wall time alone; a dollar ceiling is an optional additional bound.
     per_run_max_cost_usd: Decimal | None
     per_run_max_tokens: int
     distribution_plan_digest: str
@@ -788,8 +789,13 @@ class ExecutionScope:
         if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
             raise TypeError("execution scope sensitivity ceiling is invalid")
         if self.per_run_max_cost_usd is None:
-            if self.scope_kind is not ExecutionScopeKind.GRAPH_TASK:
-                raise ValueError("only a graph-task scope may omit its per-run cost")
+            if self.scope_kind not in {
+                ExecutionScopeKind.GRAPH_TASK,
+                ExecutionScopeKind.SCHEDULED_ROUTINE,
+            }:
+                raise ValueError(
+                    "only graph-task and routine scopes may omit their per-run cost"
+                )
         elif (
             not isinstance(self.per_run_max_cost_usd, Decimal)
             or not self.per_run_max_cost_usd.is_finite()

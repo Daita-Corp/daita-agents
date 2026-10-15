@@ -111,6 +111,7 @@ from ..learning_candidates import (
     LearningCandidateStatus,
     LearningReviewRunTail,
 )
+from ..llm.errors import ProviderErrorCode
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -1762,9 +1763,14 @@ class SQLStateStore:
                     or routine.distribution_plan != current.distribution_plan
                     or routine.expires_at > current.expires_at
                     or routine.per_run_max_tokens > current.per_run_max_tokens
-                    or routine.per_run_max_cost_usd > current.per_run_max_cost_usd
+                    or _cost_ceiling_widened(
+                        routine.per_run_max_cost_usd, current.per_run_max_cost_usd
+                    )
                     or routine.cumulative_max_tokens > current.cumulative_max_tokens
-                    or routine.cumulative_max_cost_usd > current.cumulative_max_cost_usd
+                    or _cost_ceiling_widened(
+                        routine.cumulative_max_cost_usd,
+                        current.cumulative_max_cost_usd,
+                    )
                     or routine.cumulative_max_attempts > current.cumulative_max_attempts
                     or routine.cumulative_max_occurrences
                     > current.cumulative_max_occurrences
@@ -2078,7 +2084,7 @@ class SQLStateStore:
             execution_scope_digest=None,
             reserved_run_id=None,
             reserved_tokens=current.per_run_max_tokens,
-            reserved_cost_usd=current.per_run_max_cost_usd,
+            reserved_cost_usd=_cost_reservation(current),
             charged_tokens=0,
             charged_cost_usd=Decimal("0"),
             run_bound_at=None,
@@ -2098,9 +2104,7 @@ class SQLStateStore:
             current,
             active_occurrence_id=identity,
             reserved_tokens=current.reserved_tokens + current.per_run_max_tokens,
-            reserved_cost_usd=(
-                current.reserved_cost_usd + current.per_run_max_cost_usd
-            ),
+            reserved_cost_usd=(current.reserved_cost_usd + _cost_reservation(current)),
             attempt_count=current.attempt_count + 1,
             occurrence_count=current.occurrence_count + 1,
             updated_at=claimed_at,
@@ -2556,8 +2560,10 @@ class SQLStateStore:
                 estimate = result.usage.cost_estimate
                 charged_tokens = result.usage.total_tokens
                 charged_cost = estimate.amount_usd or Decimal("0")
+                cost_capped = routine.per_run_max_cost_usd is not None
                 if (
-                    estimate.status is not CostEstimateStatus.COMPLETE
+                    cost_capped
+                    and estimate.status is not CostEstimateStatus.COMPLETE
                     and estimate.code != "no_model_attempts"
                 ):
                     # Unknown consumption retains the reservation as a conservative
@@ -2569,9 +2575,8 @@ class SQLStateStore:
                             contract_failure_code or "routine_run_usage_incomplete"
                         )
                     successful = False
-                if (
-                    result.usage.total_tokens > current.reserved_tokens
-                    or charged_cost > current.reserved_cost_usd
+                if result.usage.total_tokens > current.reserved_tokens or (
+                    cost_capped and charged_cost > current.reserved_cost_usd
                 ):
                     contract_failure_code = (
                         contract_failure_code or "routine_run_budget_exceeded"
@@ -2668,7 +2673,14 @@ class SQLStateStore:
                         after=following,
                         expires_at=routine.expires_at,
                     )
-            failures = 0 if successful else routine.consecutive_failures + 1
+            # A provider quota or rate-limit window is not the routine's fault: it
+            # retries at its next slot without counting toward needs_attention.
+            quota_hold = not successful and reason == _ROUTINE_QUOTA_FAILURE
+            failures = (
+                0
+                if successful
+                else routine.consecutive_failures + (0 if quota_hold else 1)
+            )
             if successful:
                 next_state = (
                     RoutineState.ACTIVE
@@ -7349,3 +7361,18 @@ def _connect(database: SQLDatabase) -> SQLConnection:
 
 def _connect_read_only(database: SQLDatabase) -> SQLConnection:
     return database.connect(read_only=True)
+
+
+def _cost_reservation(routine: ScheduledRoutine) -> Decimal:
+    """Uncapped routines reserve no dollars; tokens remain the run authority."""
+    return routine.per_run_max_cost_usd or Decimal("0")
+
+
+def _cost_ceiling_widened(proposed: Decimal | None, current: Decimal | None) -> bool:
+    """Removing a dollar ceiling widens authority; adding one narrows it."""
+    if proposed is None:
+        return current is not None
+    return current is not None and proposed > current
+
+
+_ROUTINE_QUOTA_FAILURE = f"routine_run_{ProviderErrorCode.RATE_LIMIT_ERROR.value}"

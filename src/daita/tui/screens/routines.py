@@ -24,6 +24,7 @@ from daita.routines.capabilities import (
     routine_inspection_projection,
 )
 
+from ..projection import routine_cost_ceiling
 from ..sanitization import safe_display, sanitize_terminal_text
 from .confirm import ConfirmScreen
 
@@ -384,8 +385,8 @@ def render_routine_details(inspection: ScheduledRoutineInspection) -> str:
         instruction,
         "",
         "Limits and access",
-        f"Per run: {routine['per_run_max_tokens']} tokens · ${routine['per_run_max_cost_usd']} estimated model cost",
-        f"Total: {routine['cumulative_max_tokens']} tokens · ${routine['cumulative_max_cost_usd']} · {routine['cumulative_max_attempts']} attempts · {routine['cumulative_max_occurrences']} occurrences",
+        f"Per run: {routine['per_run_max_tokens']} tokens · {routine_cost_ceiling(routine['per_run_max_cost_usd'])}",
+        f"Total: {routine['cumulative_max_tokens']} tokens · {routine_cost_ceiling(routine['cumulative_max_cost_usd'])} · {routine['cumulative_max_attempts']} attempts · {routine['cumulative_max_occurrences']} occurrences",
         f"Used: {routine['charged_tokens']} tokens · ${routine['charged_cost_usd']} · {routine['attempt_count']} attempts",
         f"Scope: {len(routine['allowed_source_ids'])} sources · {len(routine['allowed_resource_ids'])} resources · {len(routine['allowed_connector_binding_ids'])} connectors · {len(routine['allowed_capability_ids'])} capabilities",
         f"Sensitivity ceiling: {routine['sensitivity_ceiling']}",

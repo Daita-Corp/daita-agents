@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from ...capabilities import AccessMode, OperationalEffect
 from ...llm.models import ModelSensitivity
 from ...routines.models import (
@@ -114,9 +116,11 @@ def encode_scheduled_routine(value: ScheduledRoutine) -> str:
                 "outcome_contract": encode_outcome_contract(value.outcome_contract),
                 "distribution_plan": encode_distribution_plan(value.distribution_plan),
                 "per_run_max_tokens": value.per_run_max_tokens,
-                "per_run_max_cost_usd": decimal_encode(value.per_run_max_cost_usd),
+                "per_run_max_cost_usd": _optional_decimal_encode(
+                    value.per_run_max_cost_usd
+                ),
                 "cumulative_max_tokens": value.cumulative_max_tokens,
-                "cumulative_max_cost_usd": decimal_encode(
+                "cumulative_max_cost_usd": _optional_decimal_encode(
                     value.cumulative_max_cost_usd
                 ),
                 "cumulative_max_attempts": value.cumulative_max_attempts,
@@ -299,12 +303,14 @@ def decode_scheduled_routine(
             fields["per_run_max_tokens"],
             "routine per-run tokens",
         ),
-        per_run_max_cost_usd=decimal_decode(fields["per_run_max_cost_usd"]),
+        per_run_max_cost_usd=_optional_decimal_decode(fields["per_run_max_cost_usd"]),
         cumulative_max_tokens=integer(
             fields["cumulative_max_tokens"],
             "routine cumulative tokens",
         ),
-        cumulative_max_cost_usd=decimal_decode(fields["cumulative_max_cost_usd"]),
+        cumulative_max_cost_usd=_optional_decimal_decode(
+            fields["cumulative_max_cost_usd"]
+        ),
         cumulative_max_attempts=integer(
             fields["cumulative_max_attempts"],
             "routine cumulative attempts",
@@ -349,6 +355,14 @@ def decode_scheduled_routine(
         created_at=datetime_decode(fields["created_at"]),
         updated_at=datetime_decode(fields["updated_at"]),
     )
+
+
+def _optional_decimal_encode(value: Decimal | None):
+    return None if value is None else decimal_encode(value)
+
+
+def _optional_decimal_decode(value) -> Decimal | None:
+    return None if value is None else decimal_decode(value)
 
 
 def encode_routine_occurrence(value: RoutineOccurrence) -> str:

@@ -59,6 +59,11 @@ _TOOL_ERROR_HEADINGS = {
 }
 
 
+def routine_cost_ceiling(value: object) -> str:
+    """Render an optional routine dollar ceiling for people."""
+    return "no dollar ceiling" if value is None else f"${value} estimated model cost"
+
+
 def redact_presentation_value(value: object, *, key: str = "") -> object:
     normalized_key = key.casefold().replace("-", "_")
     if key and any(part in normalized_key for part in SENSITIVE_KEY_PARTS):
@@ -814,8 +819,8 @@ def approval_summary(arguments_text: str, capability_id: str) -> str:
                 if routine.get("run_immediately")
                 else "none"
             ),
-            f"Per run: {routine.get('per_run_max_tokens')} tokens, ${routine.get('per_run_max_cost_usd')} estimated model cost.",
-            f"Total: {routine.get('cumulative_max_tokens')} tokens, ${routine.get('cumulative_max_cost_usd')}; "
+            f"Per run: {routine.get('per_run_max_tokens')} tokens, {routine_cost_ceiling(routine.get('per_run_max_cost_usd'))}.",
+            f"Total: {routine.get('cumulative_max_tokens')} tokens, {routine_cost_ceiling(routine.get('cumulative_max_cost_usd'))}; "
             f"{routine.get('cumulative_max_attempts')} attempts, {routine.get('cumulative_max_occurrences')} occurrences; "
             f"expires {routine.get('expires_at')}.",
             f"Sensitivity ceiling: {routine.get('sensitivity_ceiling')}; model routes: {routine.get('eligible_model_routes')}.",
