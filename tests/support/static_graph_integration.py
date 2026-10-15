@@ -147,8 +147,10 @@ class ObservedReadBackend:
         parameters: tuple[object, ...],
         max_rows: int,
         max_bytes: int,
+        expected_resource_revisions: tuple[tuple[str, str], ...] | None = None,
+        timeout_seconds: float | None = None,
     ) -> SqlReadResult:
-        del parameters
+        del parameters, expected_resource_revisions, timeout_seconds
         assert agent_id == AGENT_ID
         if self.assert_store_idle is not None:
             self.assert_store_idle()

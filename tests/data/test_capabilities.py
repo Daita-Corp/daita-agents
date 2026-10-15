@@ -58,11 +58,17 @@ def test_data_query_is_one_backend_neutral_model_tool() -> None:
     capability = declarations.capabilities[0]
     properties = capability.input_schema["properties"]
     assert isinstance(properties, Mapping)
-    assert set(properties) == {"source_id", "resource_ids", "sql", "parameters"}
-    assert set(cast(list[str], capability.input_schema["required"])) == {
+    assert set(properties) == {
         "source_id",
         "resource_ids",
         "sql",
+        "parameters",
+        "statements",
+    }
+    # Exactly one of sql or statements is enforced by the data domain.
+    assert set(cast(list[str], capability.input_schema["required"])) == {
+        "source_id",
+        "resource_ids",
     }
     assert set(properties).isdisjoint(
         {"adapter", "adapter_id", "backend", "connection", "executor_id"}
