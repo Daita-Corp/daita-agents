@@ -30,6 +30,7 @@ from ..distribution.models import (
 from ..distribution.owner import DistributionOwner, construct_graph_job_delivery
 from ..errors import DaitaError, ErrorRetryability
 from ..hosting.execution_governor import RunAdmissionCoordinator, WorkloadClass
+from ..llm.errors import ProviderErrorCode
 from ..llm.models import ModelSensitivity
 from ..loop.driver import AgentLoop
 from ..loop.models import (
@@ -999,6 +1000,11 @@ class JobSupervisor:
                 "A graph task returned normal text instead of a lifecycle terminator.",
             )
             raise error
+        if (
+            exit.kind is LoopExitKind.FAILED
+            and exit.reason in _TRANSIENT_PROVIDER_EXITS
+        ):
+            raise _TransientProviderExit(exit.reason)
         raise CapabilityInputError(
             exit.reason,
             "The graph model task did not reach an authenticated lifecycle transition.",
@@ -1580,6 +1586,28 @@ def _graph_task_result(
         completed_at=completed_at,
         result_digest=canonical_digest(digest_material),
     )
+
+
+# A stalled, rate-limited or unavailable model leaves no durable effect of its
+# own; the task's bounded attempts and retry backoff decide whether to try again.
+_TRANSIENT_PROVIDER_EXITS = frozenset(
+    code.value
+    for code in (
+        ProviderErrorCode.TIMEOUT,
+        ProviderErrorCode.RATE_LIMIT_ERROR,
+        ProviderErrorCode.PROVIDER_UNAVAILABLE,
+    )
+)
+
+
+class _TransientProviderExit(DaitaError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(
+            "The graph task's model provider failed transiently.",
+            error_code=code,
+            retryability=ErrorRetryability.TRANSIENT,
+        )
 
 
 def _safe_graph_failure_code(error: BaseException) -> str:

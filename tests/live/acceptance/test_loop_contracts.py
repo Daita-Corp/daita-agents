@@ -22,7 +22,9 @@ from daita._json import canonical_json
 from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
+    CanonicalMessage,
     FinishReason,
+    MessageRole,
     ModelProfile,
     ModelRequest,
     ModelResponse,
@@ -295,21 +297,20 @@ async def test_live_tool_round_trip_has_stable_context_and_durable_completion(
             request.sensitivity is ModelSensitivity.INTERNAL
             for request in provider.requests
         )
-        systems = [
-            "".join(
-                block.text
-                for block in request.messages[0].content
-                if isinstance(block, TextBlock)
+
+        def text(message: CanonicalMessage) -> str:
+            return "".join(
+                block.text for block in message.content if isinstance(block, TextBlock)
             )
-            for request in provider.requests
-        ]
-        frozen_core = systems[0].split(
-            "\n\nToken budget left for this run (not a routine ceiling):", 1
-        )[0]
-        for request, system in zip(provider.requests, systems, strict=True):
-            assert system.startswith(
-                frozen_core
-                + f"\n\nToken budget left for this run (not a routine ceiling): {request.max_total_tokens} tokens."
+
+        # The system prompt stays a stable prefix; per-step budget status
+        # follows the transcript.
+        assert len({text(request.messages[0]) for request in provider.requests}) == 1
+        for request in provider.requests:
+            assert request.messages[-1].role is MessageRole.SYSTEM
+            assert text(request.messages[-1]).startswith(
+                "Token budget left for this run (not a routine ceiling): "
+                f"{request.max_total_tokens} tokens."
             )
         assert all(
             tuple(tool.name for tool in request.tools)

@@ -234,14 +234,18 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
         assert model.provider_id not in transcript.run.message
         for request in requests:
             assert (
-                request.messages[1:] == transcript.messages[: len(request.messages) - 1]
+                request.messages[1:-1]
+                == transcript.messages[: len(request.messages) - 2]
             )
             assert request.sensitivity is scenario.binding.maximum_outbound_sensitivity
-        assert "Latest measured request input: 6915 tokens" in texts[3]
-        assert "recent input growth: 2382 tokens" in texts[3]
-        assert "24976 tokens" in texts[3]
-        assert "Budget pressure" not in texts[3]
-        assert "not reserved capacity or a guaranteed count" in texts[3]
+        status = "".join(
+            b.text for b in requests[3].messages[-1].content if isinstance(b, TextBlock)
+        )
+        assert "Latest measured request input: 6915 tokens" in status
+        assert "recent input growth: 2382 tokens" in status
+        assert "24976 tokens" in status
+        assert "Budget pressure" not in status
+        assert "not reserved capacity or a guaranteed count" in status
         assert len(await scenario.agent.list_routines()) == 0
         assert scenario.server.calls == []
     report = json.loads(path.read_text())

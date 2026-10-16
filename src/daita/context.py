@@ -124,6 +124,7 @@ _MAXIMUM_PRIOR_MESSAGES = 40
 _MAXIMUM_PRIOR_UTF8_BYTES = 24_000
 _CURRENT_RUN_GROWTH_RESERVE = 2_048
 _PROVIDER_FRAMING_TOKEN_ALLOWANCE = 512
+_FORECAST_OUTPUT_FLOOR = 2_048
 _HISTORY_OMISSION_MARKER = (
     "[Additional earlier conversation history exists outside the active window.]"
 )
@@ -1046,6 +1047,7 @@ class AgentContextBuilder:
         previous_request_input_tokens: int | None = None,
         remaining_tokens: int | None = None,
         request_input_growth_tokens: int | None = None,
+        previous_response_output_tokens: int | None = None,
         remaining_steps: int | None = None,
     ) -> ModelRequest:
         """Project one request from immutable static context plus exact transcript."""
@@ -1130,23 +1132,31 @@ class AgentContextBuilder:
                 "no host cost ceiling. Token, attempt and occurrence ceilings always bound a routine; omit both "
                 "dollar ceilings unless the user asks for one, and they are required together when set."
             )
+        # Per-request status changes on every step. It follows the transcript so
+        # the system prompt and the history before it stay a stable, cacheable
+        # prefix; adapters that hoist system text keep it after the fixed prompt.
+        status = ""
         if remaining_tokens is not None:
             core += (
-                f"\n\nToken budget left for this run (not a routine ceiling): {remaining_tokens} tokens. "
-                "Requests consume input plus output; tool results require another request. "
-                "Use bounded results and avoid redundant discovery/inspection. "
-                "Once the requested work is evidenced, answer from its receipts."
+                "\n\nThis run has a token budget. Requests consume input plus output; "
+                "tool results require another request. Use bounded results and avoid "
+                "redundant discovery/inspection. Once the requested work is evidenced, "
+                "answer from its receipts."
             )
+            status += f"Token budget left for this run (not a routine ceiling): {remaining_tokens} tokens."
         for value, name in (
             (request_input_growth_tokens, "request input growth"),
+            (previous_response_output_tokens, "previous response output"),
             (remaining_steps, "remaining steps"),
         ):
             if value is not None and (type(value) is not int or value < 0):
                 raise ValueError(f"{name} must be non-negative")
         if remaining_steps is not None:
-            core += f" Remaining model requests including this one: {remaining_steps}."
+            status += (
+                f" Remaining model requests including this one: {remaining_steps}."
+            )
             if remaining_steps == 1:
-                core += (
+                status += (
                     " A tool call now cannot be followed by a model answer in this run."
                 )
         if remaining_tokens is not None and previous_request_input_tokens is not None:
@@ -1155,22 +1165,27 @@ class AgentContextBuilder:
             # growth once for this request and twice for its continuation, with
             # an output allowance for both. No bytes become billing estimates;
             # unseen schemas/results can grow faster and native admission wins.
-            forecast = (
-                2 * previous_request_input_tokens
-                + 3 * growth
-                + 2 * snapshot.profile.max_output_tokens
+            # Allow each request twice the latest measured output, at least
+            # _FORECAST_OUTPUT_FLOOR and never above the profile maximum. The
+            # maximum alone (up to 128k) predicts pressure on every request.
+            output_allowance = min(
+                snapshot.profile.max_output_tokens,
+                max(_FORECAST_OUTPUT_FLOOR, 2 * (previous_response_output_tokens or 0)),
             )
-            core += (
+            forecast = (
+                2 * previous_request_input_tokens + 3 * growth + 2 * output_allowance
+            )
+            status += (
                 f" Latest measured request input: {previous_request_input_tokens} tokens; "
                 f"recent input growth: {growth if request_input_growth_tokens is not None else 'not yet measured'}"
                 f"{' tokens' if request_input_growth_tokens is not None else ''}. "
                 f"Advisory forecast for this request plus its continuation: "
-                f"{forecast} tokens, allowing {snapshot.profile.max_output_tokens} output "
+                f"{forecast} tokens, allowing {output_allowance} output "
                 "per request; not reserved capacity or a guaranteed count. "
                 "New tools/results can grow more."
             )
             if forecast > remaining_tokens:
-                core += (
+                status += (
                     " Budget pressure: another round trip may not fit. "
                     "Answer from available evidence and identify unfinished work."
                 )
@@ -1204,16 +1219,21 @@ class AgentContextBuilder:
                 TextBlock(
                     "\n\n".join(
                         item
-                        for item in (
-                            core,
-                            tool_context.limits_guidance,
-                            guidance,
-                            progress_warnings,
-                        )
+                        for item in (core, tool_context.limits_guidance, guidance)
                         if item
                     )
                 ),
             ),
+        )
+        status = "\n\n".join(
+            item for item in (status.strip(), progress_warnings) if item
+        )
+        step_status = (
+            ()
+            if not status
+            else (
+                CanonicalMessage(role=MessageRole.SYSTEM, content=(TextBlock(status),)),
+            )
         )
         static_messages = (projected_system, *snapshot.static_messages[1:])
         provenance = FrozenJsonObject.from_mapping(
@@ -1226,7 +1246,7 @@ class AgentContextBuilder:
             }
         )
         request = ModelRequest(
-            messages=(*static_messages, *messages),
+            messages=(*static_messages, *messages, *step_status),
             tools=tools,
             sensitivity=sensitivity,
             sensitivity_provenance=provenance,

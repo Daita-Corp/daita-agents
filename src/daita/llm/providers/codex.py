@@ -201,6 +201,11 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
                 arguments["input"] = retained
         if request.tools:
             arguments["tool_choice"] = "auto"
+        cache_key = arguments.get("prompt_cache_key")
+        if isinstance(cache_key, str):
+            # The ChatGPT Codex surface keys its prompt cache on the session
+            # header, not prompt_cache_key; without it nothing is cached.
+            arguments["extra_headers"] = {"session_id": cache_key}
         return arguments
 
     async def _admit_request(

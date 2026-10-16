@@ -36,10 +36,12 @@ from ...errors import (
 )
 from ...models import (
     FinishReason,
+    MessageRole,
     ModelRequest,
     ModelResponse,
     ModelStreamEvent,
     ModelUsage,
+    TextBlock,
     ToolCall,
 )
 from ...pricing import (
@@ -546,6 +548,9 @@ class OpenAIResponsesProvider:
             "service_tier": self._service_tier,
             "store": False,
         }
+        cache_key = _prompt_cache_key(request)
+        if cache_key is not None:
+            arguments["prompt_cache_key"] = cache_key
         if self._max_output_tokens is not None:
             arguments["max_output_tokens"] = self._max_output_tokens
         if request.allow_parallel_tool_calls is not None:
@@ -612,7 +617,14 @@ class OpenAIResponsesProvider:
         count_arguments = {
             key: value
             for key, value in arguments.items()
-            if key not in {"max_output_tokens", "service_tier", "store", "include"}
+            if key
+            not in {
+                "max_output_tokens",
+                "service_tier",
+                "store",
+                "include",
+                "prompt_cache_key",
+            }
         }
         attempt.start_count()
         try:
@@ -878,6 +890,25 @@ def _message_text(item: object) -> list[str]:
                 "OpenAI refused the response",
             )
     return text
+
+
+def _prompt_cache_key(request: ModelRequest) -> str | None:
+    """Route requests sharing a system prompt to the same prompt cache.
+
+    Without a key, OpenAI spreads requests across cache shards and a run's
+    identical prefix rarely hits. The leading system prompt is fixed for a
+    run's steps while its working set is unchanged, so its digest groups a
+    run's requests without sending any identifier or prompt text.
+    """
+
+    if not request.messages or request.messages[0].role is not MessageRole.SYSTEM:
+        return None
+    text = "".join(
+        block.text
+        for block in request.messages[0].content
+        if isinstance(block, TextBlock)
+    )
+    return "daita-" + sha256(text.encode("utf-8")).hexdigest()[:32]
 
 
 def _decode_usage(value: object) -> ModelUsage:

@@ -99,7 +99,7 @@ async def test_explicit_reusable_workflow_is_one_approved_foreground_skill(tmp_p
             in _system_text(second)
         )
         transcript = await agent.transcript(result.run_id)
-        assert second.messages[1:] == transcript.messages[:-1]
+        assert second.messages[1:-1] == transcript.messages[:-1]
         tool_result = _tool_results(provider)[0]
         assert tool_result.output["data"] == FrozenJsonObject.from_mapping(
             {"name": "monthly-revenue", "changed": True}
