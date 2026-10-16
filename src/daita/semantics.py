@@ -65,7 +65,6 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 SEMANTIC_LIST_CAPABILITY_ID = "semantic.list"
 SEMANTIC_LIST_EXECUTOR_ID = "semantic.list.executor"
 SEMANTIC_LIST_OUTPUT_KIND = "semantic.annotation_list"
-SEMANTIC_LIST_TOOL_NAME = "semantic_list"
 
 SEMANTIC_VIEW_CAPABILITY_ID = "semantic.view"
 SEMANTIC_VIEW_EXECUTOR_ID = "semantic.view.executor"
@@ -80,7 +79,26 @@ SEMANTIC_SAVE_TOOL_NAME = "semantic_save"
 SEMANTIC_DELETE_CAPABILITY_ID = "semantic.delete"
 SEMANTIC_DELETE_EXECUTOR_ID = "semantic.delete.executor"
 SEMANTIC_DELETE_OUTPUT_KIND = "semantic.deleted"
-SEMANTIC_DELETE_TOOL_NAME = "semantic_delete"
+
+# semantic_view lists when no id is given and views one annotation otherwise;
+# semantic_save routes action=save (default) to semantic.save and
+# action=delete to semantic.delete, each with its own approval.
+SEMANTIC_VIEW_DESCRIPTION = (
+    "Without id, list annotations (filter by source_id, resource_id, kind, "
+    "limit); list before creating a duplicate. With id, load one annotation and "
+    "current_sha256 before replacing, superseding, deleting or revalidating it. "
+    "maintenance.state says whether its statement is current meaning; stale, "
+    "conflicting, duplicate and superseded content is review-only."
+)
+SEMANTIC_SAVE_ACTION_ARGUMENT = "action"
+SEMANTIC_SAVE_DESCRIPTION = (
+    "Create, replace or supersede one resource-scoped business definition via "
+    "the sole approval card. Use only for explicit user assertions or validated "
+    "tool results: evidence kind tool_result names the result_ref of an earlier "
+    "step; the runtime binds run and position. Global definitions belong in "
+    "MEMORY.md. Needs current catalog IDs, fields and exact revisions. View "
+    "first: replace, supersede and action=delete need expected_sha256."
+)
 SEMANTIC_DOMAIN_OWNER_ID = "semantics"
 
 _CONFIRMED_BY = "local-user"
@@ -1512,65 +1530,63 @@ def semantic_declarations(
     return SemanticDeclarations(
         capabilities=capabilities,
         executors=(listing, view, save, delete),
-        tool_views=tuple(
+        tool_views=(
             ToolView(
-                name=name,
-                capability_id=capability.id,
-                description=capability.description,
-                presentation=presentation,
-            )
-            for name, capability, presentation in zip(
-                (
-                    SEMANTIC_LIST_TOOL_NAME,
-                    SEMANTIC_VIEW_TOOL_NAME,
-                    SEMANTIC_SAVE_TOOL_NAME,
-                    SEMANTIC_DELETE_TOOL_NAME,
+                name=SEMANTIC_VIEW_TOOL_NAME,
+                capability_id=SEMANTIC_VIEW_CAPABILITY_ID,
+                description=SEMANTIC_VIEW_DESCRIPTION,
+                presentation=ToolPresentation(
+                    toolbox_id=ToolboxId.KNOWLEDGE,
+                    load_mode=ToolLoadMode.ON_DEMAND,
+                    text_trust=ToolTextTrust.CODE,
+                    summary="List semantic annotations or view one with its evidence.",
+                    when_to_use=(
+                        "Use to inspect stored business meaning, or before "
+                        "correcting or deleting an exact annotation."
+                    ),
+                    keywords=("semantic", "meaning", "annotation", "view", "list"),
                 ),
-                capabilities,
-                (
-                    ToolPresentation(
-                        toolbox_id=ToolboxId.KNOWLEDGE,
-                        load_mode=ToolLoadMode.ON_DEMAND,
-                        text_trust=ToolTextTrust.CODE,
-                        summary="List bounded active semantic annotations.",
-                        when_to_use="Use to inspect current stored business meaning.",
-                        keywords=("semantic", "meaning", "annotation", "list"),
+                mode_capability_ids=(
+                    ("list", SEMANTIC_LIST_CAPABILITY_ID),
+                    ("view", SEMANTIC_VIEW_CAPABILITY_ID),
+                ),
+                mode_argument="id",
+                mode_by_presence=True,
+            ),
+            ToolView(
+                name=SEMANTIC_SAVE_TOOL_NAME,
+                capability_id=SEMANTIC_SAVE_CAPABILITY_ID,
+                description=SEMANTIC_SAVE_DESCRIPTION,
+                presentation=ToolPresentation(
+                    toolbox_id=ToolboxId.KNOWLEDGE,
+                    load_mode=ToolLoadMode.ON_DEMAND,
+                    text_trust=ToolTextTrust.CODE,
+                    summary=(
+                        "Save or delete one evidence-bound business metric or "
+                        "field definition."
                     ),
-                    ToolPresentation(
-                        toolbox_id=ToolboxId.KNOWLEDGE,
-                        load_mode=ToolLoadMode.ON_DEMAND,
-                        text_trust=ToolTextTrust.CODE,
-                        summary="View one exact semantic annotation and its evidence.",
-                        when_to_use="Use before correcting or deleting an exact annotation.",
-                        keywords=("semantic", "meaning", "annotation", "view"),
+                    when_to_use=(
+                        "Use to remember validated resource meaning, or delete "
+                        "an exact annotation, after exact approval."
                     ),
-                    ToolPresentation(
-                        toolbox_id=ToolboxId.KNOWLEDGE,
-                        load_mode=ToolLoadMode.ON_DEMAND,
-                        text_trust=ToolTextTrust.CODE,
-                        summary="Save one evidence-bound business metric or field definition.",
-                        when_to_use="Use to remember validated resource meaning after exact approval.",
-                        keywords=(
-                            "semantic",
-                            "meaning",
-                            "annotation",
-                            "save",
-                            "metric",
-                            "definition",
-                            "remember",
-                        ),
-                    ),
-                    ToolPresentation(
-                        toolbox_id=ToolboxId.KNOWLEDGE,
-                        load_mode=ToolLoadMode.ON_DEMAND,
-                        text_trust=ToolTextTrust.CODE,
-                        summary="Delete one exact semantic annotation after validation.",
-                        when_to_use="Use only for an explicit exact semantic deletion.",
-                        keywords=("semantic", "meaning", "annotation", "delete"),
+                    keywords=(
+                        "semantic",
+                        "meaning",
+                        "annotation",
+                        "save",
+                        "metric",
+                        "definition",
+                        "remember",
+                        "delete",
                     ),
                 ),
-                strict=True,
-            )
+                mode_capability_ids=(
+                    ("save", SEMANTIC_SAVE_CAPABILITY_ID),
+                    ("delete", SEMANTIC_DELETE_CAPABILITY_ID),
+                ),
+                mode_argument=SEMANTIC_SAVE_ACTION_ARGUMENT,
+                default_mode="save",
+            ),
         ),
     )
 
@@ -2407,11 +2423,13 @@ def _id_input_schema() -> dict[str, object]:
 
 
 def _save_input_schema() -> dict[str, object]:
-    identifier = _identifier_schema()
+    # Nested IDs keep a compact rule; annotation validation checks their exact
+    # identifier form before the approval card.
+    identifier = {"type": "string", "maxLength": _IDENTIFIER_MAX_CHARACTERS}
     return {
         "type": "object",
         "properties": {
-            "id": identifier,
+            "id": _identifier_schema(),
             "subject": {
                 "type": "object",
                 "properties": {
@@ -2471,7 +2489,7 @@ def _save_input_schema() -> dict[str, object]:
                         },
                         "result_ref": {
                             **identifier,
-                            "description": "For tool_result: its result_ref, like r3.",
+                            "description": "tool_result only, like r3.",
                         },
                         "note": {
                             "type": "string",
@@ -2492,11 +2510,7 @@ def _save_input_schema() -> dict[str, object]:
                     "type": "object",
                     "properties": {
                         "resource_id": identifier,
-                        "revision": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": _IDENTIFIER_MAX_CHARACTERS,
-                        },
+                        "revision": identifier,
                     },
                     "required": ["resource_id", "revision"],
                     "additionalProperties": False,
@@ -2521,11 +2535,9 @@ __all__ = [
     "SEMANTIC_DELETE_CAPABILITY_ID",
     "SEMANTIC_DELETE_EXECUTOR_ID",
     "SEMANTIC_DELETE_OUTPUT_KIND",
-    "SEMANTIC_DELETE_TOOL_NAME",
     "SEMANTIC_LIST_CAPABILITY_ID",
     "SEMANTIC_LIST_EXECUTOR_ID",
     "SEMANTIC_LIST_OUTPUT_KIND",
-    "SEMANTIC_LIST_TOOL_NAME",
     "SEMANTIC_MAX_ANNOTATIONS",
     "SEMANTIC_MAX_EVIDENCE",
     "SEMANTIC_MAX_FIELDS",
@@ -2534,13 +2546,16 @@ __all__ = [
     "SEMANTIC_MAINTENANCE_MAX_NOTICES",
     "SEMANTIC_RECALL_MAX_ANNOTATIONS",
     "SEMANTIC_RECALL_MAX_UTF8_BYTES",
+    "SEMANTIC_SAVE_ACTION_ARGUMENT",
     "SEMANTIC_SAVE_CAPABILITY_ID",
+    "SEMANTIC_SAVE_DESCRIPTION",
     "SEMANTIC_SAVE_EXECUTOR_ID",
     "SEMANTIC_SAVE_OUTPUT_KIND",
     "SEMANTIC_SAVE_TOOL_NAME",
     "SEMANTIC_STATEMENT_MAX_CHARACTERS",
     "SEMANTIC_STATEMENT_MAX_UTF8_BYTES",
     "SEMANTIC_VIEW_CAPABILITY_ID",
+    "SEMANTIC_VIEW_DESCRIPTION",
     "SEMANTIC_VIEW_EXECUTOR_ID",
     "SEMANTIC_VIEW_OUTPUT_KIND",
     "SEMANTIC_VIEW_TOOL_NAME",

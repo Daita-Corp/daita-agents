@@ -278,6 +278,18 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
                 ("create", "routines.create"),
                 ("update", "routines.update"),
             ),
+            "semantic_save": (
+                ("save", "semantic.save"),
+                ("delete", "semantic.delete"),
+            ),
+            "semantic_view": (
+                ("list", "semantic.list"),
+                ("view", "semantic.view"),
+            ),
+            "skill_save": (
+                ("save", "skill.save"),
+                ("delete", "skill.delete"),
+            ),
         }
         for name in (
             "catalog_search",
@@ -285,6 +297,9 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             "data_query",
             "data_update_rows",
             "data_upsert_rows",
+            "semantic_save",
+            "semantic_view",
+            "skill_save",
         ):
             assert len(registry.tool_definition(name).description.encode()) <= 600
     finally:

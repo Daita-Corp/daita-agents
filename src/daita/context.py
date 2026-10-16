@@ -100,7 +100,6 @@ from .routines.temporal import system_user_timezone, valid_iana_timezone
 from .scope import SourceScopeCatalog, resolve_effective_source_scope
 from .semantics import (
     SEMANTIC_DELETE_OUTPUT_KIND,
-    SEMANTIC_DELETE_TOOL_NAME,
     SEMANTIC_SAVE_CAPABILITY_ID,
     SEMANTIC_SAVE_OUTPUT_KIND,
     SEMANTIC_SAVE_TOOL_NAME,
@@ -112,7 +111,6 @@ from .semantics import (
 )
 from .skills.capabilities import (
     SKILL_DELETE_OUTPUT_KIND,
-    SKILL_DELETE_TOOL_NAME,
     SKILL_SAVE_OUTPUT_KIND,
     SKILL_SAVE_TOOL_NAME,
     SKILL_VIEW_OUTPUT_KIND,
@@ -159,9 +157,7 @@ _SIDE_EFFECT_TOOL_NAMES = frozenset(
     {
         MEMORY_SET_TOOL_NAME,
         SEMANTIC_SAVE_TOOL_NAME,
-        SEMANTIC_DELETE_TOOL_NAME,
         SKILL_SAVE_TOOL_NAME,
-        SKILL_DELETE_TOOL_NAME,
         ARTIFACT_SAVE_LOCAL_TOOL_NAME,
         ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
     }
@@ -2563,9 +2559,7 @@ def _redacted_arguments(call: ToolCall) -> Mapping[str, object]:
     if call.name in {
         "memory_set",
         "semantic_save",
-        "semantic_delete",
         "skill_save",
-        "skill_delete",
     }:
         return {"redacted": _KNOWLEDGE_WRITE_MARKER}
     return call.arguments

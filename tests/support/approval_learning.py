@@ -8,7 +8,6 @@ __all__ = (
     "SKILL_DELETE_CAPABILITY_ID",
     "SKILL_DELETE_EXECUTOR_ID",
     "SKILL_DELETE_OUTPUT_KIND",
-    "SKILL_DELETE_TOOL_NAME",
     "SKILL_SAVE_CAPABILITY_ID",
     "SKILL_SAVE_EXECUTOR_ID",
     "SKILL_SAVE_OUTPUT_KIND",
@@ -102,7 +101,6 @@ from daita.skills.capabilities import (
     SKILL_DELETE_CAPABILITY_ID,
     SKILL_DELETE_EXECUTOR_ID,
     SKILL_DELETE_OUTPUT_KIND,
-    SKILL_DELETE_TOOL_NAME,
     SKILL_SAVE_CAPABILITY_ID,
     SKILL_SAVE_EXECUTOR_ID,
     SKILL_SAVE_OUTPUT_KIND,
@@ -178,8 +176,8 @@ def _skill_delete_call(
 ) -> ToolCall:
     return ToolCall(
         id=call_id,
-        name=SKILL_DELETE_TOOL_NAME,
-        arguments={"name": name},
+        name=SKILL_SAVE_TOOL_NAME,
+        arguments={"action": "delete", "name": name},
     )
 
 

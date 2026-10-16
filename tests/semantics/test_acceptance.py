@@ -503,7 +503,7 @@ async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
                 (
                     ToolCall(
                         id="list-semantics",
-                        name="semantic_list",
+                        name="semantic_view",
                         arguments={"limit": 1},
                     ),
                 ),

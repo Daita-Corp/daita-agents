@@ -175,7 +175,7 @@ class ReplayTools:
                     description=name,
                     input_schema={"type": "object"},
                 )
-                for name in ("memory_set", "skill_save", "skill_delete", "skill_view")
+                for name in ("memory_set", "skill_save", "skill_view")
             )
         )
 
@@ -204,7 +204,6 @@ class ReplayTools:
                             "kind": {
                                 "memory_set": "memory.replacement",
                                 "skill_save": "skill.saved",
-                                "skill_delete": "skill.deleted",
                             }[call.name],
                             "data": {"ok": True},
                         }
@@ -431,7 +430,7 @@ def _tool_response(run_number: int) -> ModelResponse:
                 arguments={"content": f"SECRET {name} {run_number}"},
                 provider_call_id=f"native-{name}",
             )
-            for name in ("memory_set", "skill_save", "skill_delete", "skill_view")
+            for name in ("memory_set", "skill_save", "skill_view")
         ),
         provider_id="mock:scripted",
         provider_metadata={"continuation": {"run": run_number}},

@@ -45,8 +45,7 @@ CAPABILITY_LABELS = {
     "artifact_set_export_location": "Set export location",
     "memory_set": "Update memory",
     "skill_view": "Read skill",
-    "skill_save": "Save skill",
-    "skill_delete": "Delete skill",
+    "skill_save": "Save or delete skill",
     "routine_save": "Save routine",
     "routine_control": "Control routine",
 }

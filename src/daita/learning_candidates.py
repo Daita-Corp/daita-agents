@@ -2455,6 +2455,9 @@ def candidate_matches_mutation_call(
     if not isinstance(call, ToolCall):
         raise TypeError("candidate call matching requires ToolCall")
     arguments = call.arguments
+    # skill_save and semantic_save delete with action=delete and save when the
+    # action is omitted or "save".
+    action = arguments.get("action", "save")
     if candidate.target in {
         LearningCandidateTarget.MEMORY,
         LearningCandidateTarget.USER,
@@ -2469,9 +2472,14 @@ def candidate_matches_mutation_call(
         assert isinstance(candidate.content, SkillCandidateContent)
         content = candidate.content
         if content.action is LearningCandidateAction.DELETE:
-            return call.name == "skill_delete" and arguments.get("name") == content.name
+            return (
+                call.name == "skill_save"
+                and action == "delete"
+                and arguments.get("name") == content.name
+            )
         return (
             call.name == "skill_save"
+            and action == "save"
             and arguments.get("name") == content.name
             and arguments.get("description") == content.description
             and arguments.get("instructions") == content.instructions
@@ -2480,12 +2488,14 @@ def candidate_matches_mutation_call(
     semantic_content = candidate.content
     if semantic_content.action is LearningCandidateAction.DELETE:
         return (
-            call.name == "semantic_delete"
+            call.name == "semantic_save"
+            and action == "delete"
             and arguments.get("id") == semantic_content.annotation_id
         )
     subject = arguments.get("subject")
     return (
         call.name == "semantic_save"
+        and action == "save"
         and _optional_candidate_argument_matches(
             arguments,
             "id",

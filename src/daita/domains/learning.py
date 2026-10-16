@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from ..capabilities import CapabilityInputError
 from ..llm.models import ToolCall
@@ -13,9 +13,7 @@ if TYPE_CHECKING:
 
 _MEMORY_SET_TOOL_NAME = "memory_set"
 _SKILL_SAVE_TOOL_NAME = "skill_save"
-_SKILL_DELETE_TOOL_NAME = "skill_delete"
 _SEMANTIC_SAVE_TOOL_NAME = "semantic_save"
-_SEMANTIC_DELETE_TOOL_NAME = "semantic_delete"
 
 
 class LearningCandidateGuard:
@@ -72,31 +70,18 @@ class LearningCandidateGuard:
 
 
 def _candidate_mutation_tool(candidate: LearningCandidate) -> str:
-    from ..learning_candidates import (
-        LearningCandidateAction,
-        LearningCandidateTarget,
-        SemanticCandidateContent,
-        SkillCandidateContent,
-    )
+    from ..learning_candidates import LearningCandidateTarget
 
     if candidate.target in {
         LearningCandidateTarget.MEMORY,
         LearningCandidateTarget.USER,
     }:
         return _MEMORY_SET_TOOL_NAME
+    # Deletes use the same tool with action=delete; the call matcher checks
+    # the action against the candidate.
     if candidate.target is LearningCandidateTarget.SKILL:
-        skill_content = cast(SkillCandidateContent, candidate.content)
-        return (
-            _SKILL_DELETE_TOOL_NAME
-            if skill_content.action is LearningCandidateAction.DELETE
-            else _SKILL_SAVE_TOOL_NAME
-        )
-    semantic_content = cast(SemanticCandidateContent, candidate.content)
-    return (
-        _SEMANTIC_DELETE_TOOL_NAME
-        if semantic_content.action is LearningCandidateAction.DELETE
-        else _SEMANTIC_SAVE_TOOL_NAME
-    )
+        return _SKILL_SAVE_TOOL_NAME
+    return _SEMANTIC_SAVE_TOOL_NAME
 
 
 __all__ = ["LearningCandidateGuard"]

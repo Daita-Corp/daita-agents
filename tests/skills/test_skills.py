@@ -736,7 +736,7 @@ async def test_save_delete_never_mutate_fixed_declarations(tmp_path):
         )
         assert before == middle == after
         assert SKILL_VIEW_TOOL_NAME in registry.tool_names
-        assert {"skill_save", "skill_delete"} <= registry.tool_names
+        assert "skill_save" in registry.tool_names
     finally:
         await agent.close()
 

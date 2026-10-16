@@ -26,9 +26,7 @@ from daita.loop.models import LoopLimits, RunInput
 from daita.loop.session import RunSessionOptions
 from daita.semantics import (
     SEMANTIC_DELETE_CAPABILITY_ID,
-    SEMANTIC_DELETE_TOOL_NAME,
     SEMANTIC_LIST_CAPABILITY_ID,
-    SEMANTIC_LIST_TOOL_NAME,
     SEMANTIC_SAVE_CAPABILITY_ID,
     SEMANTIC_SAVE_TOOL_NAME,
     SEMANTIC_VIEW_CAPABILITY_ID,
@@ -263,26 +261,25 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             for entry in catalog.entries
         )
         names = {item.name for item in definitions}
-        assert {
-            SEMANTIC_LIST_TOOL_NAME,
-            SEMANTIC_VIEW_TOOL_NAME,
-            SEMANTIC_SAVE_TOOL_NAME,
-            SEMANTIC_DELETE_TOOL_NAME,
-        } <= names
+        assert {SEMANTIC_VIEW_TOOL_NAME, SEMANTIC_SAVE_TOOL_NAME} <= names
         registry = agent._embedded._capabilities
-        expected = {
-            SEMANTIC_LIST_TOOL_NAME: SEMANTIC_LIST_CAPABILITY_ID,
-            SEMANTIC_VIEW_TOOL_NAME: SEMANTIC_VIEW_CAPABILITY_ID,
-            SEMANTIC_SAVE_TOOL_NAME: SEMANTIC_SAVE_CAPABILITY_ID,
-            SEMANTIC_DELETE_TOOL_NAME: SEMANTIC_DELETE_CAPABILITY_ID,
-        }
-        for name, capability_id in expected.items():
-            view, capability = registry.resolve_tool(name)
-            assert view.capability_id == capability_id
+        # semantic_view lists without id; semantic_save deletes with action.
+        expected: tuple[tuple[str, dict[str, str], str], ...] = (
+            (SEMANTIC_VIEW_TOOL_NAME, {}, SEMANTIC_LIST_CAPABILITY_ID),
+            (SEMANTIC_VIEW_TOOL_NAME, {"id": "x"}, SEMANTIC_VIEW_CAPABILITY_ID),
+            (SEMANTIC_SAVE_TOOL_NAME, {}, SEMANTIC_SAVE_CAPABILITY_ID),
+            (
+                SEMANTIC_SAVE_TOOL_NAME,
+                {"action": "delete"},
+                SEMANTIC_DELETE_CAPABILITY_ID,
+            ),
+        )
+        for name, arguments, capability_id in expected:
+            capability = registry.call_capability(name, arguments)
             assert capability.id == capability_id
             assert capability.operational_effect is (
                 OperationalEffect.CHANGE_ADVISORY_CONTEXT
-                if name in {SEMANTIC_SAVE_TOOL_NAME, SEMANTIC_DELETE_TOOL_NAME}
+                if name == SEMANTIC_SAVE_TOOL_NAME
                 else OperationalEffect.NONE
             )
         save_definition = next(
@@ -309,10 +306,8 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             )
         )
         assert not {
-            SEMANTIC_LIST_TOOL_NAME,
             SEMANTIC_VIEW_TOOL_NAME,
             SEMANTIC_SAVE_TOOL_NAME,
-            SEMANTIC_DELETE_TOOL_NAME,
         }.intersection(item.view.name for item in ordinary.entries)
         incidental = await runtime.prepare_run(
             RunInput(
@@ -325,10 +320,8 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             )
         )
         assert not {
-            SEMANTIC_LIST_TOOL_NAME,
             SEMANTIC_VIEW_TOOL_NAME,
             SEMANTIC_SAVE_TOOL_NAME,
-            SEMANTIC_DELETE_TOOL_NAME,
         }.intersection(item.view.name for item in incidental.entries)
     finally:
         await agent.close()
@@ -517,13 +510,17 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
     )
     missing_delete_digest = ToolCall(
         id="delete-missing",
-        name=SEMANTIC_DELETE_TOOL_NAME,
-        arguments={"id": "booked-revenue"},
+        name=SEMANTIC_SAVE_TOOL_NAME,
+        arguments={"action": "delete", "id": "booked-revenue"},
     )
     stale_delete_digest = ToolCall(
         id="delete-stale",
-        name=SEMANTIC_DELETE_TOOL_NAME,
-        arguments={"id": "booked-revenue", "expected_sha256": "0" * 64},
+        name=SEMANTIC_SAVE_TOOL_NAME,
+        arguments={
+            "action": "delete",
+            "id": "booked-revenue",
+            "expected_sha256": "0" * 64,
+        },
     )
     provider = MockModelProvider(
         tuple(
@@ -588,8 +585,9 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
                 (
                     ToolCall(
                         id="delete-approved",
-                        name=SEMANTIC_DELETE_TOOL_NAME,
+                        name=SEMANTIC_SAVE_TOOL_NAME,
                         arguments={
+                            "action": "delete",
                             "id": current.annotation.id,
                             "expected_sha256": current.sha256,
                         },

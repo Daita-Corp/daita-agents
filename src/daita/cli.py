@@ -796,9 +796,9 @@ def build_parser() -> argparse.ArgumentParser:
     skill_save.add_argument("skill_name")
     skill_save.add_argument("--description", required=True)
     skill_save.add_argument("--instructions-file", required=True)
-    skill_delete = skill_commands.add_parser("delete")
-    skill_delete.add_argument("name")
-    skill_delete.add_argument("skill_name")
+    skill_delete_parser = skill_commands.add_parser("delete")
+    skill_delete_parser.add_argument("name")
+    skill_delete_parser.add_argument("skill_name")
 
     effects = commands.add_parser(
         "effects",
