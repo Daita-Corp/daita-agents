@@ -330,26 +330,8 @@ class RoutineCapabilityDomain:
         capability: Capability,
         arguments: Mapping[str, object],
     ) -> Mapping[str, object]:
-        """Drop blank keys from the flat schedule before any check sees them.
-
-        One flat schedule object lists every kind's keys, so a model may send
-        the keys it does not use as null, empty text or an empty list. Those
-        say nothing; removing them leaves only the schedule actually meant.
-        """
-        schedule = arguments.get("schedule")
-        if capability.id not in {
-            ROUTINE_CREATE_CAPABILITY_ID,
-            ROUTINE_UPDATE_CAPABILITY_ID,
-        } or not isinstance(schedule, Mapping):
-            return arguments
-        return {
-            **arguments,
-            "schedule": {
-                key: value
-                for key, value in schedule.items()
-                if value is not None and value != "" and value != () and value != []
-            },
-        }
+        del capability
+        return arguments
 
     async def prepare_call(
         self,
@@ -941,9 +923,10 @@ def _calendar_day_selector(value: Mapping[str, object]) -> CalendarDaySelector:
 
     if "day_selector" in value:
         return CalendarDaySelector(_string(value, "day_selector"))
-    if "weekdays" in value and "month_days" not in value:
+    weekdays, month_days = value.get("weekdays"), value.get("month_days")
+    if weekdays and not month_days:
         return CalendarDaySelector.WEEKDAYS
-    if "month_days" in value and "weekdays" not in value:
+    if month_days and not weekdays:
         return CalendarDaySelector.MONTH_DAYS
     return CalendarDaySelector.EVERY_DAY
 

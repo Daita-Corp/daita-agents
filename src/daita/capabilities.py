@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -2528,6 +2528,62 @@ def _declares(capability: Capability, name: str) -> bool:
     return isinstance(properties, Mapping) and name in properties
 
 
+def omit_unset_arguments(
+    arguments: Mapping[str, object],
+    schemas: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    """Treat a null the schema never accepts as an argument the model left out.
+
+    Models often send every optional key a schema lists, writing null for the
+    ones they mean to leave unset. Where no candidate schema accepts null for
+    that property, the null carries no intent, so it is removed here, at every
+    nested object level, before mode selection or validation sees the call. A
+    null a schema does accept is kept unchanged.
+    """
+
+    property_schemas: dict[str, list[Mapping[str, object]]] = {}
+    for schema in schemas:
+        properties = schema.get("properties")
+        if isinstance(properties, Mapping):
+            for name, rule in properties.items():
+                if isinstance(rule, Mapping):
+                    property_schemas.setdefault(name, []).append(rule)
+    result: dict[str, object] = {}
+    changed = False
+    for name, value in arguments.items():
+        rules = property_schemas.get(name, [])
+        if value is None:
+            if rules and not any(_accepts_null(rule) for rule in rules):
+                changed = True
+                continue
+        elif isinstance(value, Mapping):
+            nested = omit_unset_arguments(value, rules)
+            if nested is not value:
+                changed = True
+                value = nested
+        result[name] = value
+    return result if changed else arguments
+
+
+def _accepts_null(rule: Mapping[str, object]) -> bool:
+    for keyword in ("anyOf", "oneOf"):
+        branches = rule.get(keyword)
+        if isinstance(branches, (list, tuple)):
+            return any(
+                isinstance(branch, Mapping) and _accepts_null(branch)
+                for branch in branches
+            )
+    if "const" in rule:
+        return rule["const"] is None
+    enum = rule.get("enum")
+    if isinstance(enum, (list, tuple)):
+        return None in enum
+    kind = rule.get("type")
+    if kind is None:
+        return "properties" not in rule
+    return kind == "null" or (isinstance(kind, (list, tuple)) and "null" in kind)
+
+
 def tool_route_arguments(
     view: ToolView,
     capability: Capability,
@@ -2966,6 +3022,7 @@ def _matches_type(value: object, expected: object) -> bool:
 
 
 __all__ = [
+    "omit_unset_arguments",
     "AccessMode",
     "ApprovalDecision",
     "ApprovalHandler",

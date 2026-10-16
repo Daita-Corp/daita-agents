@@ -60,6 +60,7 @@ from .capabilities import (
     ToolOutputValidationError,
     ToolRecovery,
     ToolView,
+    omit_unset_arguments,
     recovery_details,
     resolve_result_refs,
     tool_call_mode,
@@ -1734,6 +1735,17 @@ class CapabilityRuntime:
             entry.view.name: entry for entry in projection.callable_entries
         }
         entry = callable_entries.get(call.name)
+        if entry is not None:
+            # Unset nulls are dropped once, for every tool, before the mode is
+            # chosen; the outer call keeps exactly what the model sent.
+            outer = call
+            call = replace(
+                call,
+                arguments=omit_unset_arguments(
+                    call.arguments,
+                    tuple(item.input_schema for item in entry.capabilities),
+                ),
+            )
         if entry is not None and entry.routes:
             # A mode-routed tool selects one admitted capability; the selected
             # capability then runs its own unchanged execution path.
@@ -1744,7 +1756,7 @@ class CapabilityRuntime:
                 if entry.view.mode_by_presence:
                     present = selector in call.arguments
                     return _ResolvedCall(
-                        call,
+                        outer,
                         call,
                         failure=_error(
                             call,
@@ -1768,7 +1780,7 @@ class CapabilityRuntime:
                         ),
                     )
                 return _ResolvedCall(
-                    call,
+                    outer,
                     call,
                     failure=_error(
                         call,
@@ -1803,7 +1815,7 @@ class CapabilityRuntime:
                 else:
                     condition = f"when {selector}={mode}"
                 return _ResolvedCall(
-                    call,
+                    outer,
                     call,
                     failure=_error(
                         call,
@@ -1829,9 +1841,9 @@ class CapabilityRuntime:
                     entry.view, routed.capability, call.arguments
                 ),
             )
-            return _ResolvedCall(call, target, entry=routed)
+            return _ResolvedCall(outer, target, entry=routed)
         if entry is not None:
-            return _ResolvedCall(call, call, entry=entry)
+            return _ResolvedCall(outer, call, entry=entry)
         control_names = {item.name for item in projection.provider_definitions}
         if call.name not in _CONTROL_TOOL_NAMES or call.name not in control_names:
             loadable = "toolbox_load" in control_names and any(

@@ -155,6 +155,7 @@ def test_invented_or_incomplete_schedule_shapes_fail_the_declared_schema(schedul
     "filters,selector",
     (
         ({}, "every_day"),
+        ({"weekdays": [], "month_days": []}, "every_day"),
         ({"weekdays": [1, 3]}, "weekdays"),
         ({"month_days": [1, 15], "months": [2]}, "month_days"),
     ),
@@ -194,58 +195,35 @@ def test_contradictory_calendar_says_how_to_correct_it():
         )
 
 
-@pytest.mark.parametrize("update", [False, True])
-def test_blank_keys_of_other_schedule_kinds_are_dropped_before_checks(update):
-    from daita.capabilities import CapabilityDeclarations
-    from daita.routines.capabilities import (
-        ROUTINE_CREATE_CAPABILITY_ID,
-        ROUTINE_DOMAIN_OWNER_ID,
-        ROUTINE_UPDATE_CAPABILITY_ID,
-        RoutineCapabilityDomain,
-        routine_capability_declarations,
-    )
-    from tests.routines._owner_support import _owner, _Store
+def test_null_keys_of_other_schedule_kinds_are_omitted_before_checks():
+    from daita.capabilities import omit_unset_arguments
 
-    owner = _owner(_Store())
-    lifecycle = routine_capability_declarations(owner)
-    domain = RoutineCapabilityDomain(
-        CapabilityDeclarations(
-            domain_owner_id=ROUTINE_DOMAIN_OWNER_ID,
-            capabilities=lifecycle.capabilities,
-            executor_ids=tuple(item.executor_id for item in lifecycle.capabilities),
-            tool_views=lifecycle.tool_views,
-        ),
-        owner,
-    )
-    capability_id = (
-        ROUTINE_UPDATE_CAPABILITY_ID if update else ROUTINE_CREATE_CAPABILITY_ID
-    )
-    capability = next(
-        item for item in lifecycle.capabilities if item.id == capability_id
-    )
-    # The flat schedule invites every kind's keys; blank ones carry no intent.
-    arguments = {
+    # routine_save offers both routes, so both schemas are candidates.
+    schemas = (_spec_schema(update=False), _spec_schema(update=True))
+    # The flat schedule lists every kind's keys; models send unused ones null.
+    arguments: dict[str, object] = {
         "title": "Daily",
+        "routine_id": None,
         "schedule": {
             "kind": "calendar",
             "timezone": "America/Chicago",
             "hour": 9,
             "minute": 0,
-            "day_selector": "every_day",
             "weekdays": [],
-            "month_days": [],
             "exact_at": None,
             "after_seconds": None,
-            "anchor_at": "",
             "interval_seconds": None,
+            "day_selector": None,
         },
     }
-    normalized = domain.normalize_arguments(capability, arguments)
-    assert normalized["title"] == "Daily"
+    normalized = omit_unset_arguments(arguments, schemas)
+    assert "routine_id" not in normalized
     schedule = cast(Mapping[str, object], normalized["schedule"])
-    assert set(schedule) == {"kind", "timezone", "hour", "minute", "day_selector"}
+    assert set(schedule) == {"kind", "timezone", "hour", "minute", "weekdays"}
     _require_exact_revision_timing(normalized)
-    assert _parse_schedule(schedule).kind.value == "calendar"
+    parsed = _parse_schedule(FrozenJsonObject.from_mapping(schedule))
+    assert isinstance(parsed, CalendarSchedule)
+    assert parsed.day_selector.value == "every_day"
 
 
 def test_one_of_rejects_ambiguous_shapes_and_enforces_output_rules():

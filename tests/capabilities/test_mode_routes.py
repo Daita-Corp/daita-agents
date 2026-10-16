@@ -14,6 +14,7 @@ from daita.capabilities import (
     ToolExecution,
     ToolOutput,
     ToolView,
+    omit_unset_arguments,
 )
 from daita.capability_runtime import CapabilityRuntime
 from daita.llm.models import ToolCall
@@ -270,3 +271,62 @@ async def test_invalid_mode_or_route_arguments_never_reach_an_executor(arguments
 
     assert _error_code(outcome) == code
     assert preview_executor.arguments == apply_executor.arguments == []
+
+
+async def test_unset_null_of_another_mode_reaches_the_selected_route_as_omitted():
+    _registry, runtime, preview_executor, apply_executor = _fixture()
+
+    # Models often send every listed key, writing null for the ones unused.
+    outcome = await execute_projected(
+        runtime,
+        _run(),
+        (
+            ToolCall(
+                id="preview",
+                name="test_mode_rows",
+                arguments={"mode": "preview", "target": "row-1", "fingerprint": None},
+            ),
+        ),
+    )
+
+    assert not outcome.ordered_results[0].is_error, outcome.ordered_results[0].output
+    assert preview_executor.arguments == [{"target": "row-1"}]
+    assert apply_executor.arguments == []
+
+
+def test_only_nulls_no_schema_accepts_are_omitted_at_every_level():
+    schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "value": {"type": ["string", "null"]},
+            "choice": {"enum": ["a", None]},
+            "schedule": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string"},
+                    "weekdays": {"type": "array"},
+                },
+            },
+        },
+    }
+    arguments = {
+        "id": None,
+        "value": None,
+        "choice": None,
+        "unknown": None,
+        "schedule": {"kind": "calendar", "weekdays": None},
+    }
+
+    assert omit_unset_arguments(arguments, (schema,)) == {
+        "value": None,
+        "choice": None,
+        # An undeclared key is left for the route check to reject by name.
+        "unknown": None,
+        "schedule": {"kind": "calendar"},
+    }
+    # A null that any candidate route accepts is kept.
+    nullable = {"type": "object", "properties": {"id": {"type": ["string", "null"]}}}
+    assert omit_unset_arguments({"id": None}, (schema, nullable)) == {"id": None}
+    unchanged = {"id": "x"}
+    assert omit_unset_arguments(unchanged, (schema,)) is unchanged
