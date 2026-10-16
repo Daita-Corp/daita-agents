@@ -18,6 +18,8 @@ from typing import cast
 from ..errors import ErrorRetryability
 from ..security import SecretReference
 from ._lifecycle import (
+    FIRST_PROGRESS_TIMEOUT,
+    IDLE_PROGRESS_TIMEOUT,
     NativeOwner,
     await_cleanup,
     closing_stream,
@@ -42,7 +44,12 @@ from .models import (
     ModelStreamEvent,
     ModelUsage,
 )
-from .pricing import CostEstimateStatus, aggregate_cost_estimates
+from .pricing import (
+    STALL_USAGE_UNREPORTED,
+    CostEstimate,
+    CostEstimateStatus,
+    aggregate_cost_estimates,
+)
 from .protocols import (
     ManagedModelProvider,
     ModelProvider,
@@ -463,7 +470,7 @@ class ModelRouter:
                         in_flight = False
                         last_error = error
                         _number_attempt(error, attempt + 1, total_attempts)
-                        attempt_usage.append(error.usage)
+                        attempt_usage.append(_attempt_usage(error))
                         _require_recoverable_usage(request, error, attempt_usage)
                         if not await self._wait_for_retry(
                             request, error, attempt, attempt_usage, total_attempts
@@ -604,7 +611,7 @@ class ModelRouter:
                             if error.provider_id is None:
                                 error.provider_id = registration.provider.provider_id
                             _number_attempt(error, attempt + 1, total_attempts)
-                            attempt_usage.append(error.usage)
+                            attempt_usage.append(_attempt_usage(error))
                         _require_recoverable_usage(
                             request, error, attempt_usage, terminal=emitted
                         )
@@ -781,7 +788,7 @@ def _require_recoverable_usage(
         raise _aggregate_failure(error, usage) from None
 
 
-_STALL_TIMEOUT_CODES = frozenset({"first_progress", "idle_progress"})
+_STALL_TIMEOUT_CODES = frozenset({FIRST_PROGRESS_TIMEOUT, IDLE_PROGRESS_TIMEOUT})
 
 
 def _unreported_stall(error: ModelProviderError) -> bool:
@@ -789,8 +796,10 @@ def _unreported_stall(error: ModelProviderError) -> bool:
 
     Nothing was emitted, no tool ran and cleanup resolved, so replaying the same
     request is safe. The provider reports no usage for it, so only routes without
-    a dollar cap may replay it; the token limit then sees replayed attempts' usage
-    only once a response returns.
+    a dollar cap may replay it. The replayed attempt's tokens are never counted
+    toward the request's token limit, which can therefore be exceeded by one
+    unreported attempt per replay within the bounded retry policy. Routines
+    charge their reservation for it.
     """
 
     diagnostic = error.diagnostic
@@ -798,6 +807,16 @@ def _unreported_stall(error: ModelProviderError) -> bool:
         error.code is ProviderErrorCode.TIMEOUT
         and diagnostic is not None
         and diagnostic.code in _STALL_TIMEOUT_CODES
+    )
+
+
+def _attempt_usage(error: ModelProviderError) -> ModelUsage:
+    """Name a stall's unreported consumption so settlement can charge it."""
+
+    if not _unreported_stall(error):
+        return error.usage
+    return replace(
+        error.usage, cost_estimate=CostEstimate.unavailable(STALL_USAGE_UNREPORTED)
     )
 
 

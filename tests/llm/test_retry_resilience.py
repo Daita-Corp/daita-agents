@@ -27,7 +27,7 @@ from daita.llm.models import (
     ModelTextDelta,
     ModelUsage,
 )
-from daita.llm.pricing import CostEstimate
+from daita.llm.pricing import STALL_USAGE_UNREPORTED, CostEstimate
 from daita.llm.providers.mock import MockModelProvider, MockStreamingModelProvider
 from daita.llm.routing import (
     ModelRoute,
@@ -159,6 +159,8 @@ async def test_silent_stall_replays_under_a_token_limit(stream, code):
         assert response.text == "recovered"
         assert len(provider.requests) == 2
         assert response.usage.total_tokens == 12
+        # The stalled attempt's unreported consumption stays named.
+        assert response.usage.cost_estimate.code == STALL_USAGE_UNREPORTED
     finally:
         await router.close()
 

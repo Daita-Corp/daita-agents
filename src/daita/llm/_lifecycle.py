@@ -12,6 +12,9 @@ from .models import ModelRequest, ModelResponse, ModelStreamEvent
 
 _T = TypeVar("_T")
 _NATIVE_EOF = object()
+# Diagnostic codes for a dispatched stream that went silent.
+FIRST_PROGRESS_TIMEOUT = "first_progress"
+IDLE_PROGRESS_TIMEOUT = "idle_progress"
 
 
 async def await_cleanup(
@@ -419,7 +422,11 @@ class AttemptLifecycle:
                             + self.policy.progress_idle_timeout_seconds
                         )
                     ),
-                    "first_progress" if self.last_progress is None else "idle_progress",
+                    (
+                        FIRST_PROGRESS_TIMEOUT
+                        if self.last_progress is None
+                        else IDLE_PROGRESS_TIMEOUT
+                    ),
                 )
             )
         return min(limits, key=lambda item: item[0])
