@@ -2586,11 +2586,15 @@ class SQLStateStore:
                     # charge, without discarding a larger known partial amount.
                     charged_cost = max(charged_cost, current.reserved_cost_usd)
                     charged_tokens = max(charged_tokens, current.reserved_tokens)
-                    if successful:
-                        contract_failure_code = (
-                            contract_failure_code or "routine_run_usage_incomplete"
-                        )
-                    successful = False
+                    # A token-only routine whose run reported tokens is bounded by
+                    # that charge, as when a replayed stall's attempt reported
+                    # nothing. Otherwise the run cannot be shown to fit and fails.
+                    if dollar_capped or result.usage.total_tokens == 0:
+                        if successful:
+                            contract_failure_code = (
+                                contract_failure_code or "routine_run_usage_incomplete"
+                            )
+                        successful = False
                 if result.usage.total_tokens > current.reserved_tokens or (
                     dollar_capped and charged_cost > current.reserved_cost_usd
                 ):

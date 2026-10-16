@@ -391,7 +391,15 @@ async def test_claim_fault_rolls_back_occurrence_and_budget(
 
 @pytest.mark.parametrize(
     "usage_case",
-    ("normal", "once", "overrun", "unknown", "subscription", "subscription_no_tokens"),
+    (
+        "normal",
+        "once",
+        "overrun",
+        "unknown",
+        "subscription",
+        "subscription_no_tokens",
+        "subscription_replayed_stall",
+    ),
 )
 async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
     tmp_path: Path,
@@ -406,7 +414,7 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
             draft = replace(
                 draft, per_run_max_cost_usd=None, cumulative_max_cost_usd=None
             )
-        if usage_case not in {"normal", "subscription"}:
+        if usage_case not in {"normal", "subscription", "subscription_replayed_stall"}:
             draft = replace(
                 draft,
                 cumulative_max_tokens=5_000,
@@ -472,12 +480,23 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
                     8_000
                     if usage_case == "overrun"
                     else (
-                        100 if usage_case in {"unknown", "once", "subscription"} else 0
+                        100
+                        if usage_case
+                        in {
+                            "unknown",
+                            "once",
+                            "subscription",
+                            "subscription_replayed_stall",
+                        }
+                        else 0
                     )
                 ),
                 cost_estimate=(
                     CostEstimate.partial(Decimal("0.01"), code="provider_usage_missing")
                     if usage_case == "unknown"
+                    # A replayed stall adds an attempt that reported no usage.
+                    else CostEstimate.unavailable("multiple_incomplete_reasons")
+                    if usage_case == "subscription_replayed_stall"
                     else (
                         CostEstimate.unavailable("subscription_billing")
                         if unpriced
@@ -526,7 +545,12 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
         assert first is not None and duplicate is not None
         duplicate_delivery = duplicate[1]
         assert duplicate_delivery is not None
-        completed = usage_case in {"normal", "once", "subscription"}
+        completed = usage_case in {
+            "normal",
+            "once",
+            "subscription",
+            "subscription_replayed_stall",
+        }
         assert first[0].disposition is (
             RoutineOccurrenceDisposition.COMPLETED
             if completed
@@ -550,6 +574,12 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
         assert persisted.last_delivery_ids == ("delivery-routine-1",)
         if usage_case == "normal":
             assert persisted.next_due_at == NOW + timedelta(hours=1)
+        elif usage_case == "subscription_replayed_stall":
+            # Unknown consumption is charged the whole per-run reservation.
+            assert persisted.next_due_at == NOW + timedelta(hours=1)
+            assert persisted.charged_tokens == first[0].charged_tokens
+            assert persisted.charged_tokens == claimed.reserved_tokens > 100
+            assert persisted.charged_cost_usd == Decimal("0")
         elif usage_case == "subscription":
             assert persisted.next_due_at == NOW + timedelta(hours=1)
             assert persisted.charged_tokens == 100
