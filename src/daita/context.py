@@ -1135,12 +1135,13 @@ class AgentContextBuilder:
         # prefix; adapters that hoist system text keep it after the fixed prompt.
         status = ""
         if remaining_tokens is not None:
-            status += (
-                f"Token budget left for this run (not a routine ceiling): {remaining_tokens} tokens. "
-                "Requests consume input plus output; tool results require another request. "
-                "Use bounded results and avoid redundant discovery/inspection. "
-                "Once the requested work is evidenced, answer from its receipts."
+            core += (
+                "\n\nThis run has a token budget. Requests consume input plus output; "
+                "tool results require another request. Use bounded results and avoid "
+                "redundant discovery/inspection. Once the requested work is evidenced, "
+                "answer from its receipts."
             )
+            status += f"Token budget left for this run (not a routine ceiling): {remaining_tokens} tokens."
         for value, name in (
             (request_input_growth_tokens, "request input growth"),
             (remaining_steps, "remaining steps"),

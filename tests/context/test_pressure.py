@@ -165,7 +165,9 @@ async def test_step_status_follows_the_transcript_and_keeps_a_stable_prefix():
     unbounded = builder.project(
         snapshot, (user,), step=1, tool_context=projection.project(tools, (user,))
     )
-    assert unbounded.messages == (first.messages[0], user)
+    assert unbounded.messages[1:] == (user,)
+    assert "This run has a token budget" in repr(first.messages[0])
+    assert "This run has a token budget" not in repr(unbounded.messages[0])
 
 
 async def test_optional_context_uses_run_allowance_without_rejecting_mandatory_input():

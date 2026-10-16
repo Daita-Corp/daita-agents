@@ -276,6 +276,24 @@ async def test_codex_keeps_a_machine_run_start_instruction_as_input():
     ]
 
 
+async def test_codex_keys_its_prompt_cache_by_session_header():
+    client = _Client()
+    provider = CodexSubscriptionProvider(
+        "gpt-test",
+        credential=_credential().to_secret(),
+        max_output_tokens=2_048,
+        client=client,
+    )
+    await provider.generate(_request())
+
+    arguments = client.responses.arguments
+    assert arguments is not None
+    key = arguments["prompt_cache_key"]
+    assert isinstance(key, str) and key.startswith("daita-")
+    # The surface caches by session header; the key alone caches nothing.
+    assert arguments["extra_headers"] == {"session_id": key}
+
+
 def test_codex_default_client_uses_bounded_transport_without_sdk_retries(monkeypatch):
     captured: dict[str, object] = {}
     client = _Client()

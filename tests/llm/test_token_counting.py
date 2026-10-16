@@ -186,8 +186,16 @@ async def test_counted_payload_fits_despite_large_serialized_bytes(kind, stream)
             key: value
             for key, value in generated.items()
             if key
-            not in {"max_output_tokens", "service_tier", "store", "include", "stream"}
+            not in {
+                "max_output_tokens",
+                "service_tier",
+                "store",
+                "include",
+                "stream",
+                "prompt_cache_key",
+            }
         }
+        assert str(generated["prompt_cache_key"]).startswith("daita-")
         assert generated["max_output_tokens"] == 2048
     elif kind == "anthropic":
         assert counted == {
