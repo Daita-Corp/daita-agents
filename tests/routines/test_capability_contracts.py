@@ -16,7 +16,7 @@ from daita.routines.capabilities import (
     _require_exact_revision_timing,
     _spec_schema,
 )
-from daita.routines.models import OnceSchedule
+from daita.routines.models import CalendarSchedule, OnceSchedule
 
 
 @pytest.mark.parametrize("update", [False, True])
@@ -149,6 +149,103 @@ def test_invented_or_incomplete_schedule_shapes_fail_the_declared_schema(schedul
     # kind and incomplete or contradictory selections.
     with pytest.raises((ToolOutputValidationError, CapabilityInputError)):
         _parse_schedule(validate_tool_schema_value(schema, schedule))
+
+
+@pytest.mark.parametrize(
+    "filters,selector",
+    (
+        ({}, "every_day"),
+        ({"weekdays": [1, 3]}, "weekdays"),
+        ({"month_days": [1, 15], "months": [2]}, "month_days"),
+    ),
+)
+def test_calendar_day_selector_follows_the_given_day_filters(filters, selector):
+    schema = cast(
+        Mapping[str, object],
+        cast(Mapping[str, object], _spec_schema(update=False)["properties"])[
+            "schedule"
+        ],
+    )
+    schedule = {
+        "kind": "calendar",
+        "timezone": "America/Chicago",
+        "hour": 9,
+        "minute": 0,
+        **filters,
+    }
+    parsed = _parse_schedule(validate_tool_schema_value(schema, schedule))
+    assert isinstance(parsed, CalendarSchedule)
+    assert parsed.day_selector.value == selector
+
+
+def test_contradictory_calendar_says_how_to_correct_it():
+    with pytest.raises(CapabilityInputError, match="Correct the schedule"):
+        _parse_schedule(
+            FrozenJsonObject.from_mapping(
+                {
+                    "kind": "calendar",
+                    "timezone": "America/Chicago",
+                    "hour": 9,
+                    "minute": 0,
+                    "day_selector": "every_day",
+                    "weekdays": (1,),
+                }
+            )
+        )
+
+
+@pytest.mark.parametrize("update", [False, True])
+def test_blank_keys_of_other_schedule_kinds_are_dropped_before_checks(update):
+    from daita.capabilities import CapabilityDeclarations
+    from daita.routines.capabilities import (
+        ROUTINE_CREATE_CAPABILITY_ID,
+        ROUTINE_DOMAIN_OWNER_ID,
+        ROUTINE_UPDATE_CAPABILITY_ID,
+        RoutineCapabilityDomain,
+        routine_capability_declarations,
+    )
+    from tests.routines._owner_support import _owner, _Store
+
+    owner = _owner(_Store())
+    lifecycle = routine_capability_declarations(owner)
+    domain = RoutineCapabilityDomain(
+        CapabilityDeclarations(
+            domain_owner_id=ROUTINE_DOMAIN_OWNER_ID,
+            capabilities=lifecycle.capabilities,
+            executor_ids=tuple(item.executor_id for item in lifecycle.capabilities),
+            tool_views=lifecycle.tool_views,
+        ),
+        owner,
+    )
+    capability_id = (
+        ROUTINE_UPDATE_CAPABILITY_ID if update else ROUTINE_CREATE_CAPABILITY_ID
+    )
+    capability = next(
+        item for item in lifecycle.capabilities if item.id == capability_id
+    )
+    # The flat schedule invites every kind's keys; blank ones carry no intent.
+    arguments = {
+        "title": "Daily",
+        "schedule": {
+            "kind": "calendar",
+            "timezone": "America/Chicago",
+            "hour": 9,
+            "minute": 0,
+            "day_selector": "every_day",
+            "weekdays": [],
+            "month_days": [],
+            "exact_at": None,
+            "after_seconds": None,
+            "anchor_at": "",
+            "interval_seconds": None,
+        },
+    }
+    normalized = domain.normalize_arguments(capability, arguments)
+    assert normalized["title"] == "Daily"
+    schedule = cast(Mapping[str, object], normalized["schedule"])
+    assert set(schedule) == {"kind", "timezone", "hour", "minute", "day_selector"}
+    _require_exact_revision_timing(normalized)
+    assert _parse_schedule(schedule).kind.value == "calendar"
 
 
 def test_one_of_rejects_ambiguous_shapes_and_enforces_output_rules():

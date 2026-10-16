@@ -330,8 +330,26 @@ class RoutineCapabilityDomain:
         capability: Capability,
         arguments: Mapping[str, object],
     ) -> Mapping[str, object]:
-        del capability
-        return arguments
+        """Drop blank keys from the flat schedule before any check sees them.
+
+        One flat schedule object lists every kind's keys, so a model may send
+        the keys it does not use as null, empty text or an empty list. Those
+        say nothing; removing them leaves only the schedule actually meant.
+        """
+        schedule = arguments.get("schedule")
+        if capability.id not in {
+            ROUTINE_CREATE_CAPABILITY_ID,
+            ROUTINE_UPDATE_CAPABILITY_ID,
+        } or not isinstance(schedule, Mapping):
+            return arguments
+        return {
+            **arguments,
+            "schedule": {
+                key: value
+                for key, value in schedule.items()
+                if value is not None and value != "" and value != () and value != []
+            },
+        }
 
     async def prepare_call(
         self,
@@ -850,7 +868,13 @@ def _parse_schedule(
     except CapabilityInputError:
         raise
     except (TypeError, ValueError) as error:
-        raise CapabilityInputError("routine_schedule_invalid", str(error)) from error
+        message = str(error)
+        if kind == "calendar":
+            message += (
+                ". Correct the schedule: day_selector weekdays takes weekdays, "
+                "month_days takes month_days, every_day takes neither."
+            )
+        raise CapabilityInputError("routine_schedule_invalid", message) from error
 
 
 def _typed_schedule(
@@ -896,7 +920,7 @@ def _typed_schedule(
             timezone=_string(value, "timezone"),
             hour=_integer(value, "hour"),
             minute=_integer(value, "minute"),
-            day_selector=CalendarDaySelector(_string(value, "day_selector")),
+            day_selector=_calendar_day_selector(value),
             weekdays=_optional_integers(value, "weekdays"),
             month_days=_optional_integers(value, "month_days"),
             months=_optional_integers(value, "months"),
@@ -910,6 +934,18 @@ def _typed_schedule(
     raise CapabilityInputError(
         "routine_schedule_invalid", "Schedule kind must be once, interval, or calendar."
     )
+
+
+def _calendar_day_selector(value: Mapping[str, object]) -> CalendarDaySelector:
+    """An omitted selector follows the day filters given; none means every day."""
+
+    if "day_selector" in value:
+        return CalendarDaySelector(_string(value, "day_selector"))
+    if "weekdays" in value and "month_days" not in value:
+        return CalendarDaySelector.WEEKDAYS
+    if "month_days" in value and "weekdays" not in value:
+        return CalendarDaySelector.MONTH_DAYS
+    return CalendarDaySelector.EVERY_DAY
 
 
 def _relative_instant(
@@ -1131,9 +1167,10 @@ def _schedule_schema() -> dict[str, object]:
             "once: exact_at or after_seconds. interval: interval_seconds with "
             "anchor_at or anchor_after_seconds. once_next_weekday: timezone, "
             "weekday (Monday=1), hour, minute. calendar: timezone, hour, minute, "
-            "day_selector, sorted weekdays/month_days/months. Instants are ISO "
-            "8601 with timezone; timezones are IANA. No cron or RRULE. Calendar "
-            "policies default to skip and first."
+            "sorted weekdays or month_days (neither means every day), optional "
+            "months. Omit keys a kind does not use. Instants are ISO 8601 with "
+            "timezone; timezones are IANA. No cron or RRULE. Calendar policies "
+            "default to skip and first."
         ),
         "properties": {
             "kind": {"type": "string", "enum": list(_SCHEDULE_KEYS)},
