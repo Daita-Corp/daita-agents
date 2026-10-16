@@ -9,12 +9,14 @@ from collections.abc import (
     Awaitable,
     Callable,
     Iterable,
+    Mapping,
 )
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import cast
 
+from .._json import FrozenJsonObject
 from ..errors import ErrorRetryability
 from ..security import SecretReference
 from ._lifecycle import (
@@ -33,9 +35,11 @@ from .errors import (
     ProviderFailurePhase,
     before_generation,
     interrupted_model_usage,
+    with_cancelled_model_attempts,
     with_cancelled_model_usage,
 )
 from .models import (
+    ModelAttemptRecord,
     ModelProfile,
     ModelRequest,
     ModelResponse,
@@ -274,6 +278,71 @@ class RunRoute:
         self.candidate_provider_ids = candidates
 
 
+class _AttemptLog:
+    """Read-only copy of each physical attempt the router accounts for.
+
+    Every entry mirrors exactly one ``attempt_usage`` append (plus an attempt
+    interrupted in flight), so the records reconcile with the aggregate usage.
+    Nothing here feeds usage, budgets or retry decisions.
+    """
+
+    def __init__(self) -> None:
+        self._records: list[ModelAttemptRecord] = []
+        self._current: tuple[str, int, int, float] | None = None
+
+    def begin(self, provider_id: str, candidate: int, total: int) -> None:
+        self._current = (provider_id, candidate, total, _monotonic())
+
+    def finish(self, outcome: str, usage: ModelUsage) -> None:
+        current = self._current
+        if current is None:
+            return
+        self._current = None
+        provider_id, candidate, total, started = current
+        try:
+            record = ModelAttemptRecord(
+                provider_id=provider_id,
+                candidate_attempt_number=candidate,
+                total_attempt_number=total,
+                duration_ms=max(0, int((_monotonic() - started) * 1000)),
+                outcome=outcome,
+                retried=False,
+                usage=usage,
+            )
+        except Exception:
+            # A diagnostic can never interrupt routing or accounting.
+            return
+        if self._records:
+            # A later attempt means the previous one was retried or fell back.
+            self._records[-1] = replace(self._records[-1], retried=True)
+        self._records.append(record)
+
+    def interrupted(
+        self, outcome: str, error: BaseException, in_flight: bool
+    ) -> tuple[ModelAttemptRecord, ...]:
+        if in_flight:
+            self.finish(outcome, interrupted_model_usage(error))
+        return self.records()
+
+    def records(self) -> tuple[ModelAttemptRecord, ...]:
+        return tuple(self._records)
+
+
+def _monotonic() -> float:
+    return asyncio.get_running_loop().time()
+
+
+def _attempt_outcome(error: ModelProviderError) -> str:
+    return "stalled" if _unreported_stall(error) else error.code.value
+
+
+def _with_attempts(
+    error: ModelProviderError, attempts: tuple[ModelAttemptRecord, ...]
+) -> ModelProviderError:
+    error.attempts = attempts
+    return error
+
+
 class ModelRouter:
     """Try eligible providers in order; retry only normalized transient failures."""
 
@@ -443,6 +512,7 @@ class ModelRouter:
         total_attempts = 0
         last_error: ModelProviderError | None = None
         attempt_usage: list[ModelUsage] = []
+        attempts = _AttemptLog()
         in_flight = False
         candidates = self._candidates if route is None else self._run_candidates(route)
         try:
@@ -455,6 +525,9 @@ class ModelRouter:
                     )
                     total_attempts += 1
                     in_flight = True
+                    attempts.begin(
+                        registration.provider.provider_id, attempt + 1, total_attempts
+                    )
                     try:
                         permit = await self._admit_provider(
                             registration,
@@ -471,6 +544,7 @@ class ModelRouter:
                         last_error = error
                         _number_attempt(error, attempt + 1, total_attempts)
                         attempt_usage.append(_attempt_usage(error))
+                        attempts.finish(_attempt_outcome(error), attempt_usage[-1])
                         _require_recoverable_usage(request, error, attempt_usage)
                         if not await self._wait_for_retry(
                             request, error, attempt, attempt_usage, total_attempts
@@ -479,40 +553,63 @@ class ModelRouter:
                     else:
                         in_flight = False
                         attempt_usage.append(response.usage)
+                        attempts.finish("completed", response.usage)
                         if route is not None:
                             route.selected_provider_id = (
                                 registration.provider.provider_id
                             )
                         return _number_response(
-                            replace(response, usage=_aggregate_usage(attempt_usage)),
+                            replace(
+                                response,
+                                usage=_aggregate_usage(attempt_usage),
+                                attempts=attempts.records(),
+                            ),
                             attempt + 1,
                             total_attempts,
                         )
         except asyncio.CancelledError as error:
-            raise with_cancelled_model_usage(
-                error,
-                _interruption_usage(error, attempt_usage, in_flight),
+            # Record the in-flight attempt before the aggregate replaces its usage.
+            interrupted = attempts.interrupted("cancelled", error, in_flight)
+            raise with_cancelled_model_attempts(
+                with_cancelled_model_usage(
+                    error,
+                    _interruption_usage(error, attempt_usage, in_flight),
+                ),
+                interrupted,
             ) from None
         except TimeoutError as error:
-            raise ModelProviderError(
-                ProviderErrorCode.TIMEOUT,
-                "The model request deadline expired.",
-                usage=_interruption_usage(error, attempt_usage, in_flight),
+            raise _with_attempts(
+                ModelProviderError(
+                    ProviderErrorCode.TIMEOUT,
+                    "The model request deadline expired.",
+                    usage=_interruption_usage(error, attempt_usage, in_flight),
+                ),
+                attempts.interrupted(ProviderErrorCode.TIMEOUT.value, error, in_flight),
             ) from None
-        except ModelProviderError:
-            raise
+        except ModelProviderError as error:
+            raise _with_attempts(error, attempts.records())
         except Exception as error:
-            raise ModelProviderError(
-                ProviderErrorCode.MALFORMED_RESPONSE,
-                "The model provider boundary failed.",
-                usage=_interruption_usage(error, attempt_usage, in_flight),
+            raise _with_attempts(
+                ModelProviderError(
+                    ProviderErrorCode.MALFORMED_RESPONSE,
+                    "The model provider boundary failed.",
+                    usage=_interruption_usage(error, attempt_usage, in_flight),
+                ),
+                attempts.interrupted(
+                    ProviderErrorCode.MALFORMED_RESPONSE.value, error, in_flight
+                ),
             ) from None
         if last_error is not None:
-            raise _aggregate_failure(last_error, attempt_usage)
-        raise ModelProviderError(
-            ProviderErrorCode.INVALID_REQUEST,
-            "no configured provider can handle this request",
-            usage=_aggregate_usage(attempt_usage),
+            raise _with_attempts(
+                _aggregate_failure(last_error, attempt_usage), attempts.records()
+            )
+        raise _with_attempts(
+            ModelProviderError(
+                ProviderErrorCode.INVALID_REQUEST,
+                "no configured provider can handle this request",
+                usage=_aggregate_usage(attempt_usage),
+            ),
+            attempts.records(),
         )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
@@ -542,6 +639,7 @@ class ModelRouter:
         total_attempts = 0
         last_error: ModelProviderError | None = None
         attempt_usage: list[ModelUsage] = []
+        attempts = _AttemptLog()
         in_flight = False
         candidates = self._candidates if route is None else self._run_candidates(route)
         try:
@@ -560,6 +658,9 @@ class ModelRouter:
                     emitted = False
                     completed = False
                     in_flight = True
+                    attempts.begin(
+                        registration.provider.provider_id, attempt + 1, total_attempts
+                    )
                     try:
                         permit = await self._admit_provider(
                             registration,
@@ -578,9 +679,13 @@ class ModelRouter:
                                         completed = True
                                         in_flight = False
                                         attempt_usage.append(event.response.usage)
+                                        attempts.finish(
+                                            "completed", event.response.usage
+                                        )
                                         terminal = replace(
                                             event.response,
                                             usage=_aggregate_usage(attempt_usage),
+                                            attempts=attempts.records(),
                                         )
                                         break
                                     yield event
@@ -612,6 +717,7 @@ class ModelRouter:
                                 error.provider_id = registration.provider.provider_id
                             _number_attempt(error, attempt + 1, total_attempts)
                             attempt_usage.append(_attempt_usage(error))
+                            attempts.finish(_attempt_outcome(error), attempt_usage[-1])
                         _require_recoverable_usage(
                             request, error, attempt_usage, terminal=emitted
                         )
@@ -620,30 +726,48 @@ class ModelRouter:
                         ):
                             break
         except asyncio.CancelledError as error:
-            raise with_cancelled_model_usage(
-                error,
-                _interruption_usage(error, attempt_usage, in_flight),
+            # Record the in-flight attempt before the aggregate replaces its usage.
+            interrupted = attempts.interrupted("cancelled", error, in_flight)
+            raise with_cancelled_model_attempts(
+                with_cancelled_model_usage(
+                    error,
+                    _interruption_usage(error, attempt_usage, in_flight),
+                ),
+                interrupted,
             ) from None
         except TimeoutError as error:
-            raise ModelProviderError(
-                ProviderErrorCode.TIMEOUT,
-                "The model request deadline expired.",
-                usage=_interruption_usage(error, attempt_usage, in_flight),
+            raise _with_attempts(
+                ModelProviderError(
+                    ProviderErrorCode.TIMEOUT,
+                    "The model request deadline expired.",
+                    usage=_interruption_usage(error, attempt_usage, in_flight),
+                ),
+                attempts.interrupted(ProviderErrorCode.TIMEOUT.value, error, in_flight),
             ) from None
-        except ModelProviderError:
-            raise
+        except ModelProviderError as error:
+            raise _with_attempts(error, attempts.records())
         except Exception as error:
-            raise ModelProviderError(
-                ProviderErrorCode.MALFORMED_RESPONSE,
-                "The model provider stream failed.",
-                usage=_interruption_usage(error, attempt_usage, in_flight),
+            raise _with_attempts(
+                ModelProviderError(
+                    ProviderErrorCode.MALFORMED_RESPONSE,
+                    "The model provider stream failed.",
+                    usage=_interruption_usage(error, attempt_usage, in_flight),
+                ),
+                attempts.interrupted(
+                    ProviderErrorCode.MALFORMED_RESPONSE.value, error, in_flight
+                ),
             ) from None
         if last_error is not None:
-            raise _aggregate_failure(last_error, attempt_usage)
-        raise ModelProviderError(
-            ProviderErrorCode.INVALID_REQUEST,
-            "no configured provider can stream this request",
-            usage=_aggregate_usage(attempt_usage),
+            raise _with_attempts(
+                _aggregate_failure(last_error, attempt_usage), attempts.records()
+            )
+        raise _with_attempts(
+            ModelProviderError(
+                ProviderErrorCode.INVALID_REQUEST,
+                "no configured provider can stream this request",
+                usage=_aggregate_usage(attempt_usage),
+            ),
+            attempts.records(),
         )
 
     async def _admit_provider(
@@ -821,8 +945,6 @@ def _attempt_usage(error: ModelProviderError) -> ModelUsage:
 
 
 def _number_attempt(error: ModelProviderError, candidate: int, total: int) -> None:
-    from .._json import FrozenJsonObject
-
     diagnostic = error.diagnostic or ProviderFailureDiagnostic(
         phase=ProviderFailurePhase.PROVIDER_BOUNDARY, code=error.code.value
     )
@@ -836,8 +958,6 @@ def _number_attempt(error: ModelProviderError, candidate: int, total: int) -> No
 def _number_response(
     response: ModelResponse, candidate: int, total: int
 ) -> ModelResponse:
-    from collections.abc import Mapping
-
     metadata = dict(response.provider_metadata)
     existing = metadata.get("attempt_diagnostic")
     diagnostic = dict(existing) if isinstance(existing, Mapping) else {}
@@ -875,8 +995,6 @@ def _aggregate_failure(
 def _aggregate_usage(items: Iterable[ModelUsage]) -> ModelUsage:
     usage = tuple(items)
     if not usage:
-        from .pricing import CostEstimate
-
         return ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
     return ModelUsage(
         input_tokens=sum(item.input_tokens for item in usage),

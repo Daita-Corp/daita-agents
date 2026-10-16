@@ -22,7 +22,7 @@ from ..errors import (
     LLMError,
     RateLimitError,
 )
-from .models import ModelRequest, ModelResponse, ModelUsage
+from .models import ModelAttemptRecord, ModelRequest, ModelResponse, ModelUsage
 
 
 class ContextWindowExceeded(LLMError):
@@ -533,6 +533,8 @@ class ModelProviderError(LLMError):
                 "diagnostic must be a ProviderFailureDiagnostic when provided"
             )
         self.diagnostic = diagnostic
+        # The router's read-only per-attempt diagnostics; None from a bare provider.
+        self.attempts: tuple[ModelAttemptRecord, ...] | None = None
         retryability = (
             ErrorRetryability.TRANSIENT
             if code
@@ -648,6 +650,30 @@ def with_cancelled_model_usage(
         raise TypeError("cancelled model usage requires cancellation and ModelUsage")
     setattr(error, "_daita_model_usage", usage)
     return error
+
+
+def with_cancelled_model_attempts(
+    error: asyncio.CancelledError, attempts: tuple[ModelAttemptRecord, ...]
+) -> asyncio.CancelledError:
+    """Attach the router's read-only attempt records to an exact cancellation."""
+    if not isinstance(error, asyncio.CancelledError) or any(
+        not isinstance(item, ModelAttemptRecord) for item in attempts
+    ):
+        raise TypeError("cancelled model attempts require cancellation and records")
+    setattr(error, "_daita_model_attempts", tuple(attempts))
+    return error
+
+
+def interrupted_model_attempts(
+    error: BaseException,
+) -> tuple[ModelAttemptRecord, ...] | None:
+    """Return attempt records attached to an interruption, if a router made any."""
+    cancellation = error.__cause__ if isinstance(error, TimeoutError) else error
+    if isinstance(cancellation, asyncio.CancelledError):
+        attempts = getattr(cancellation, "_daita_model_attempts", None)
+        if isinstance(attempts, tuple):
+            return attempts
+    return None
 
 
 def interrupted_model_usage(error: BaseException) -> ModelUsage:
