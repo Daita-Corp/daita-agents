@@ -240,9 +240,11 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             for name in registry.tool_names
             if registry.resolve_tool(name)[0].presentation.toolbox_id is ToolboxId.FILES
         } == {"file_query", "file_read", "file_search"}
-        assert registry.resolve_tool("start_data_profile")[
-            0
-        ].presentation.toolbox_id is (ToolboxId.JOBS)
+        # Profile graphs keep internal capabilities only; data_query profiles.
+        assert not any(
+            registry.resolve_tool(name)[1].id.startswith("jobs.data_profile.")
+            for name in registry.tool_names
+        )
         assert {
             "catalog_schema",
             "catalog_inspect",

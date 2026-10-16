@@ -35,7 +35,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import LoopExitKind
-from tests.support.job_benchmarks import p95_bootstrap_interval
+from tests.support.job_benchmarks import admit_profile_job, p95_bootstrap_interval
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.slow
@@ -291,17 +291,11 @@ async def test_public_composition_throughput_campaign(tmp_path, monkeypatch):
             hold_graph.clear()
             graph_started.clear()
             blocked = True
-            provider.calls = tuple(
-                ToolCall(
-                    id=f"graph-{index}",
-                    name="start_data_profile",
-                    arguments={"resource_ids": [resource_id], "sample_rows": 5},
-                )
-                for index in range(4)
-            )
-            await _run(agent)
-            await asyncio.wait_for(graph_started.wait(), timeout=5)
             provider.calls = ()
+            origin = await _run(agent)
+            for _ in range(4):
+                await admit_profile_job(agent, resource_id, origin, sample_rows=5)
+            await asyncio.wait_for(graph_started.wait(), timeout=5)
             await _run(agent)
             blocked = False
             hold_graph.set()

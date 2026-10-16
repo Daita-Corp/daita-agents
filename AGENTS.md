@@ -528,7 +528,10 @@ graph-aware `JobSupervisor` owns graph-local selection, claims, fencing, recover
 fairness and finalization; all capability work still executes through the one
 `CapabilityRuntime`, and every model task uses the one `AgentLoop` implementation.
 
-`start_data_profile` admits the static effect-free profile graph. `start_graph_job`
+No model tool starts a profile job: models profile data with `data_query`
+aggregates. The static effect-free profile graph keeps its internal executor and
+finalizer (`jobs.data_profile.execute`/`.finalize`) so migrated revision-2 profile
+jobs still run. `start_graph_job`
 admits one code-resolved graph-eligible initial task and internal finalizer when a
 model route is configured. Graph work is bounded by per-task steps, the host
 per-run token ceiling, wall time and `work_units` attempts; graph contracts and

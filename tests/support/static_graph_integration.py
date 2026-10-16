@@ -15,7 +15,6 @@ from daita.capabilities import (
     Capability,
     CapabilityDeclarations,
     CapabilityRegistry,
-    ToolExecution,
 )
 from daita.capability_runtime import CapabilityRuntime
 from daita.distribution.owner import DistributionOwner
@@ -25,12 +24,10 @@ from daita.domains.data.profile_jobs import (
     DATA_PROFILE_FINALIZE_CAPABILITY_ID,
     DataProfileAdmission,
     DataProfileCapabilityDomain,
-    StartDataProfileGraphExecutor,
     data_profile_declarations,
 )
 from daita.domains.data.results import project_result_rows
 from daita.domains.data.sql import ResourceSchema
-from daita.domains.learning import LearningCandidateGuard
 from daita.hosting.execution_governor import RunAdmissionCoordinator
 from daita.identity import AgentIdentity
 from daita.jobs.graph.models import GraphAdmission, GraphInspection, GraphState
@@ -215,7 +212,6 @@ class StaticGraphIntegration:
     supervisor: JobSupervisor
     admission: DataProfileAdmission
     finalizer_capability: Capability
-    starter: StartDataProfileGraphExecutor
     catalog: StaticProfileCatalog
     backend: ObservedReadBackend
     clock: Callable[[], datetime]
@@ -280,12 +276,7 @@ class StaticGraphIntegration:
             executor_ids=tuple(item.executor_id for item in declarations.capabilities),
             tool_views=declarations.tool_views,
         )
-        domain = DataProfileCapabilityDomain(
-            bundle,
-            catalog=catalog,
-            admission=admission,
-            learning=LearningCandidateGuard(),
-        )
+        domain = DataProfileCapabilityDomain(bundle, admission=admission)
         runtime = CapabilityRuntime(
             CapabilityRegistry(
                 declarations=(bundle,),
@@ -319,11 +310,6 @@ class StaticGraphIntegration:
             for item in declarations.capabilities
             if item.id == DATA_PROFILE_FINALIZE_CAPABILITY_ID
         )
-        starter = next(
-            item
-            for item in declarations.executors
-            if isinstance(item, StartDataProfileGraphExecutor)
-        )
         return cls(
             store=store,
             artifacts=artifacts,
@@ -334,7 +320,6 @@ class StaticGraphIntegration:
             supervisor=supervisor,
             admission=admission,
             finalizer_capability=finalizer,
-            starter=starter,
             catalog=catalog,
             backend=resolved_backend,
             clock=resolved_clock,
@@ -370,39 +355,11 @@ class StaticGraphIntegration:
                 "sample_rows": sample_rows,
                 "deadline_seconds": 300,
             },
-            finalizer_capability=self.finalizer_capability,
-            distribution=self.distribution,
-            clock=self.clock,
-            id_factory=self.ids,
         )
 
     async def admit_and_start(self, admission: GraphAdmission) -> None:
         await self.owner.admit(admission)
         await self.supervisor.start()
-
-    async def start_profile(
-        self,
-        resource_ids: tuple[str, ...],
-        *,
-        sample_rows: int = 20,
-    ) -> str:
-        output = await self.starter.execute(
-            ToolExecution(
-                run_id="run-" + "b" * 32,
-                call_id="start-static-profile",
-                capability_id="jobs.data_profile.start",
-                conversation_id=CONVERSATION_ID,
-                arguments={
-                    "resource_ids": resource_ids,
-                    "sample_rows": sample_rows,
-                    "deadline_seconds": 300,
-                },
-            )
-        )
-        job_id = output.data["job_id"]
-        assert isinstance(job_id, str)
-        await self.supervisor.start()
-        return job_id
 
     async def wait_terminal(
         self, job_id: str, *, timeout: float = 5.0

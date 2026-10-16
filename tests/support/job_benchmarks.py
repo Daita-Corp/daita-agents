@@ -10,6 +10,7 @@ import random
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from time import perf_counter
@@ -45,6 +46,7 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import (
     LoopExit,
     LoopExitKind,
+    RunInput,
     Transcript,
     validate_completed_transcript,
 )
@@ -507,16 +509,7 @@ async def seed_completed_profile_agent(
         name,
         distractor_tables=distractor_tables,
     )
-    provider = MockModelProvider(
-        (
-            toolbox_load_response("start_data_profile"),
-            start_profile_response(
-                home.resource_ids[TARGET_PROFILE_TABLE],
-                call_id="seed-profile",
-            ),
-            stop_response("Seed job admitted."),
-        )
-    )
+    provider = MockModelProvider((stop_response("Seed conversation ready."),))
     agent = await Agent.open(
         home.name,
         root=home.root,
@@ -531,9 +524,11 @@ async def seed_completed_profile_agent(
             source_scope_ids=(home.source_id,),
         )
         assert result.kind is LoopExitKind.COMPLETED
+        job_id = await admit_profile_job(
+            agent, home.resource_ids[TARGET_PROFILE_TABLE], result
+        )
         jobs = await agent.list_jobs()
         assert len(jobs) == 1
-        job_id = jobs[0].job_id
         terminal = await wait_for_terminal(agent, job_id)
         assert terminal.job.state is GraphState.SUCCEEDED
         await assert_profile_result(agent, job_id)
@@ -650,17 +645,6 @@ def results_for(
     return tuple(selected)
 
 
-def job_id_from_start(transcript: Transcript) -> str:
-    receipts = results_for(transcript, "start_data_profile")
-    assert len(receipts) == 1
-    data = receipts[0].output.get("data")
-    assert isinstance(data, Mapping)
-    assert data.get("status") == GraphState.QUEUED.value
-    job_id = data.get("job_id")
-    assert isinstance(job_id, str) and job_id
-    return job_id
-
-
 async def wait_for_terminal(agent: Agent, job_id: str, *, timeout: float = 30.0):
     deadline = asyncio.get_running_loop().time() + timeout
     latest = None
@@ -710,25 +694,37 @@ async def assert_profile_result(agent: Agent, job_id: str) -> Mapping[str, objec
     return document
 
 
-def start_profile_response(
+async def admit_profile_job(
+    agent: Agent,
     resource_id: str,
+    origin: LoopExit,
     *,
-    call_id: str = "start-profile",
     sample_rows: int = PROFILE_SAMPLE_ROWS,
-) -> ModelResponse:
-    return ModelResponse(
-        finish_reason=FinishReason.TOOL_CALLS,
-        tool_calls=(
-            ToolCall(
-                id=call_id,
-                name="start_data_profile",
-                arguments={
-                    "resource_ids": [resource_id],
-                    "sample_rows": sample_rows,
-                },
-            ),
+) -> str:
+    """Admit the internal static profile graph in an existing conversation.
+
+    No model tool starts profile jobs; migrated revision-2 profile jobs run the
+    same internal executor and finalizer, so tests admit the graph directly.
+    """
+
+    embedded = agent._embedded
+    admission = await embedded._data_profile_admission.build_static_graph_admission(
+        run=RunInput(
+            id=origin.run_id,
+            agent_id=agent.id,
+            message="Profile one exact resource.",
+            created_at=datetime.now(UTC),
+            conversation_id=origin.conversation_id,
         ),
+        call_id="internal-profile",
+        arguments={
+            "resource_ids": (resource_id,),
+            "sample_rows": sample_rows,
+            "deadline_seconds": 300,
+        },
     )
+    job = await embedded._job_owner.admit(admission)
+    return job.job_id
 
 
 def toolbox_load_response(*tool_names: str) -> ModelResponse:
@@ -832,9 +828,9 @@ __all__ = [
     "capture_run",
     "configured_model_ids",
     "create_live_agent",
+    "admit_profile_job",
     "create_probe_database",
     "create_probe_home",
-    "job_id_from_start",
     "live_provider",
     "logical_names",
     "open_live_home",
@@ -842,7 +838,6 @@ __all__ = [
     "record_metrics",
     "results_for",
     "seed_completed_profile_agent",
-    "start_profile_response",
     "toolbox_load_response",
     "stop_response",
     "transcript_text",

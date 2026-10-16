@@ -66,7 +66,6 @@ from .domains.data.file_capabilities import (
     LOCAL_FILE_READ_TOOL_NAME,
     LOCAL_FILE_SEARCH_CAPABILITY_ID,
 )
-from .domains.data.profile_jobs import START_DATA_PROFILE_CAPABILITY_ID
 from .domains.mcp import MCP_DOMAIN_OWNER_ID, MCP_OUTPUT_KIND
 from .jobs.capabilities import (
     JOB_CANCEL_CAPABILITY_ID,
@@ -3338,15 +3337,6 @@ def _tool_guidance(
     elif job_tools_available:
         instructions.append(
             "job_list is agent-wide; origin_conversation_id is provenance."
-        )
-    if START_DATA_PROFILE_CAPABILITY_ID in capability_ids:
-        instructions.append(
-            "A durable-job start receipt is a handoff, not completion. In that run, "
-            "do not poll, list, inspect, read, or cancel the newly started job or "
-            "claim its outcome. Complete only unrelated explicitly requested work, "
-            "then report the receipt status and job_id. Later user-originated or "
-            "code-owned terminal-job runs may use admitted lifecycle tools for "
-            "existing jobs."
         )
     if ARTIFACT_EDIT_TEXT_CAPABILITY_ID in capability_ids:
         instructions.append(

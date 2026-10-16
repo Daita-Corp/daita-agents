@@ -81,6 +81,7 @@ DATA_QUERY_DESCRIPTION = (
     "total, 100 rows and 16 KB shared."
 )
 _DATA_QUERY_USAGE = (
+    " Profile with aggregates (COUNT, COUNT(DISTINCT), null counts, MIN/MAX)."
     ' Example: {"source_id": "...", "resource_ids": ["..."], "sql": '
     '"SELECT region, sum(total) FROM orders GROUP BY region"}. Mistakes: '
     "columns absent from catalog evidence; trusting truncated rows."

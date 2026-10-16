@@ -2013,9 +2013,7 @@ class EmbeddedAgent:
         )
         data_profile_job_domain = DataProfileCapabilityDomain(
             data_profile_declaration_bundle,
-            catalog=data_view,
             admission=data_profile_admission,
-            learning=learning_candidate_guard,
         )
         if model is not None and context_builder is None:
             assert model_profile is not None

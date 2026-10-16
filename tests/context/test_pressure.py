@@ -9,7 +9,6 @@ from daita.hosting.execution_governor import RunAdmissionCoordinator
 from daita.llm.errors import ContextWindowExceeded
 from tests.support.kernel import (
     NOW,
-    START_DATA_PROFILE_CAPABILITY_ID,
     AgentContextBuilder,
     CanonicalMessage,
     ContextEvidencePressureExceeded,
@@ -241,49 +240,6 @@ async def test_optional_context_uses_run_allowance_without_rejecting_mandatory_i
     )
     # Context shaping cannot replace provider counting with a byte-based refusal.
     assert narrow_request.max_total_tokens is None
-
-
-async def test_context_owns_durable_job_handoff_guidance() -> None:
-    builder = AgentContextBuilder(
-        _SnapshotCatalog(),
-        profile=ModelProfile(
-            id="mock:durable-handoff-context",
-            context_window_tokens=32_000,
-            max_output_tokens=2_000,
-            supports_tools=True,
-        ),
-    )
-    run = RunInput(
-        id="run-durable-handoff-context",
-        agent_id="agent-stage-a",
-        message="Profile the current table in the background.",
-        created_at=NOW,
-        conversation_id="conversation-durable-handoff-context",
-        source_scope_ids=("source-snapshot",),
-    )
-    user = run.start_message()
-    start_tool = ToolDefinition(
-        name="start_data_profile",
-        description="Start one durable data profile.",
-        input_schema={"type": "object", "properties": {}},
-    )
-    projection = ContextToolProjectionAdapter(
-        (start_tool,),
-        capability_ids=(START_DATA_PROFILE_CAPABILITY_ID,),
-    )
-    catalog = await projection.prepare_run(run)
-    request = builder.project(
-        await builder.prepare(run, (user,), catalog),
-        (user,),
-        step=1,
-        tool_context=projection.project(catalog, (user,)),
-    )
-
-    system = request.messages[0].content[0]
-    assert isinstance(system, TextBlock)
-    assert "durable-job start receipt is a handoff" in system.text
-    assert "do not poll, list, inspect, read, or cancel" in system.text
-    assert "code-owned terminal-job run" in system.text
 
 
 @pytest.mark.parametrize("available", (False, True))

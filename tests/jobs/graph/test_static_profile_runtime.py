@@ -225,13 +225,15 @@ async def test_multi_resource_static_profile_graph_completes_once(
         await integration.close()
 
 
-async def test_integration_start_data_profile_emits_only_graph_work(
+async def test_static_profile_graph_emits_only_graph_work(
     tmp_path: Path,
 ) -> None:
     resources = (("source-a", "resource-a"),)
     integration = await StaticGraphIntegration.open(tmp_path, resources)
     try:
-        job_id = await integration.start_profile(("resource-a",))
+        admission = await integration.build(("resource-a",))
+        await integration.admit_and_start(admission)
+        job_id = admission.job.job_id
         terminal = await integration.wait_terminal(job_id)
         assert terminal.job.state is GraphState.SUCCEEDED
         assert integration.supervisor._driver is not None

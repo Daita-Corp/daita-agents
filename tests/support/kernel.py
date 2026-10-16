@@ -3,7 +3,6 @@ from __future__ import annotations
 __all__ = (
     "CATALOG_SEARCH_CAPABILITY_ID",
     "NOW",
-    "START_DATA_PROFILE_CAPABILITY_ID",
     "AgentContextBuilder",
     "AgentLoop",
     "CanonicalMessage",
@@ -76,7 +75,6 @@ from daita.capabilities import (
 from daita.capability_runtime import CapabilityRuntime
 from daita.catalog.capabilities import CATALOG_SEARCH_CAPABILITY_ID
 from daita.context import AgentContextBuilder, _estimate_input_tokens
-from daita.domains.data.profile_jobs import START_DATA_PROFILE_CAPABILITY_ID
 from daita.llm.errors import ContextEvidencePressureExceeded
 from daita.llm.models import (
     CanonicalMessage,

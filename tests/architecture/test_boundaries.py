@@ -591,7 +591,7 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["semantic_view"] == "semantics"
         assert resolved["artifact_create"] == "artifacts"
         assert resolved["artifact_create"] == "artifacts"
-        assert resolved["start_data_profile"] == "data_profile_jobs"
+        assert "data_profile_jobs" not in set(resolved.values())
         assert resolved["job_list"] == "jobs"
         assert resolved["routine_list"] == "routines"
         assert resolved["distribution_destination_list"] == "distribution"
@@ -1233,7 +1233,6 @@ async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_bran
             "routine_save",
             "semantic_save",
             "skill_save",
-            "start_data_profile",
         }
     finally:
         await agent.close()
