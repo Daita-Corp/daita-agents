@@ -26,6 +26,7 @@ from ..llm.errors import (
     ToolCatalogLimitExceeded,
     ToolManifestLimitExceeded,
     ToolSurfaceLimitExceeded,
+    interrupted_model_attempts,
     interrupted_model_usage,
     with_cancelled_model_usage,
 )
@@ -34,6 +35,7 @@ from ..llm.models import (
     CanonicalMessage,
     FinishReason,
     MessageRole,
+    ModelAttemptRecord,
     ModelCallPolicy,
     ModelRequest,
     ModelResponse,
@@ -46,6 +48,7 @@ from ..llm.models import (
     TextBlock,
     ToolCall,
     ToolResultBlock,
+    usage_diagnostic,
 )
 from ..llm.pricing import (
     CostEstimate,
@@ -710,16 +713,36 @@ class AgentLoop:
                         deadline=deadline,
                         run_route=run_route,
                     )
-                except ModelProviderError:
+                except ModelProviderError as error:
                     # Normalized failures carry their own attempt usage below.
+                    if model_started is not None:
+                        self._emit_model_failed(
+                            run,
+                            request,
+                            error.usage,
+                            error.attempts,
+                            _duration_ms(model_started),
+                            model_call_index=step,
+                            error_code=error.code.value,
+                            provider_id=error.provider_id,
+                        )
                     raise
                 except BaseException as error:
                     # Cancellation and the outer deadline can interrupt a billed
                     # request before the provider returns any terminal usage.
-                    usage = _add_usage(
-                        usage,
-                        interrupted_model_usage(error),
-                    )
+                    interrupted = interrupted_model_usage(error)
+                    usage = _add_usage(usage, interrupted)
+                    if model_started is not None:
+                        self._emit_model_failed(
+                            run,
+                            request,
+                            interrupted,
+                            interrupted_model_attempts(error),
+                            _duration_ms(model_started),
+                            model_call_index=step,
+                            error_code=_interruption_code(error),
+                            provider_id=None,
+                        )
                     raise
                 model_duration_ms = (
                     _duration_ms(model_started) if model_started is not None else None
@@ -740,6 +763,7 @@ class AgentLoop:
                     assert model_duration_ms is not None
                     self._emit_model_completed(
                         run,
+                        request,
                         response,
                         model_duration_ms,
                         model_call_index=step,
@@ -1146,25 +1170,53 @@ class AgentLoop:
     def _emit_model_completed(
         self,
         run: RunInput,
+        request: ModelRequest,
         response: ModelResponse,
         duration_ms: int,
         *,
         model_call_index: int,
     ) -> None:
-        self._emit(
-            AgentEventKind.MODEL_COMPLETED,
-            run,
-            {
+        """Observe one completed logical step; the only event counted as a call."""
+
+        try:
+            data: dict[str, object] = {
                 "provider_id": response.provider_id or self._model.provider_id,
                 "model_call_index": model_call_index,
                 "has_text": response.text is not None,
                 "has_tool_calls": bool(response.tool_calls),
                 "duration_ms": duration_ms,
-                "input_tokens": response.usage.input_tokens,
                 "context_input_tokens": response.request_input_tokens,
-                "output_tokens": response.usage.output_tokens,
-            },
-        )
+                **_step_usage_diagnostic(request, response.usage, response.attempts),
+            }
+        except Exception:
+            return
+        self._emit(AgentEventKind.MODEL_COMPLETED, run, data)
+
+    def _emit_model_failed(
+        self,
+        run: RunInput,
+        request: ModelRequest,
+        usage: ModelUsage,
+        attempts: tuple[ModelAttemptRecord, ...] | None,
+        duration_ms: int,
+        *,
+        model_call_index: int,
+        error_code: str,
+        provider_id: str | None,
+    ) -> None:
+        """Observe one failed or cancelled logical step without counting it."""
+
+        try:
+            data: dict[str, object] = {
+                "provider_id": provider_id or self._model.provider_id,
+                "model_call_index": model_call_index,
+                "duration_ms": duration_ms,
+                "error_code": error_code,
+                **_step_usage_diagnostic(request, usage, attempts),
+            }
+        except Exception:
+            return
+        self._emit(AgentEventKind.MODEL_FAILED, run, data)
 
     async def _finish_terminal_model_response(
         self,
@@ -1357,6 +1409,7 @@ class AgentLoop:
                     # Completion carries the authoritative logical-request usage;
                     # stream cleanup does not submit another model request.
                     error.usage = completed.usage
+                    error.attempts = completed.attempts
                 raise
             if completed is None:
                 raise ModelProviderError(
@@ -1587,6 +1640,57 @@ def _add_usage(left: ModelUsage, right: ModelUsage) -> ModelUsage:
             (left.cost_estimate, right.cost_estimate)
         ),
     )
+
+
+def _step_usage_diagnostic(
+    request: ModelRequest,
+    usage: ModelUsage,
+    attempts: tuple[ModelAttemptRecord, ...] | None,
+) -> dict[str, object]:
+    """Payload-free step usage: counted tokens, never an unknown shown as 0.
+
+    The token fields are exactly what the loop added to run usage. When some
+    physical attempts reported no usage, the counted tokens are a lower bound
+    and the status is ``partial``.
+    """
+
+    data = usage_diagnostic(usage)
+    if attempts:
+        reasons = tuple(
+            reason
+            for reason in (item.usage_unavailable_reason for item in attempts)
+            if reason is not None
+        )
+        status = (
+            "reported"
+            if not reasons
+            else "unavailable" if len(reasons) == len(attempts) else "partial"
+        )
+        known = status != "unavailable"
+        data.update(
+            usage_status=status,
+            usage_unavailable_reason=reasons[0] if reasons else None,
+            input_tokens=usage.input_tokens if known else None,
+            output_tokens=usage.output_tokens if known else None,
+            total_tokens=usage.total_tokens if known else None,
+            cache_read_tokens=usage.cache_read_tokens if known else None,
+            cache_write_tokens=usage.cache_write_tokens if known else None,
+            reasoning_tokens=usage.reasoning_tokens if known else None,
+        )
+    data["remaining_tokens_before"] = request.max_total_tokens
+    data["attempt_count"] = None if attempts is None else len(attempts)
+    data["attempts"] = (
+        None if attempts is None else [item.diagnostic() for item in attempts]
+    )
+    return data
+
+
+def _interruption_code(error: BaseException) -> str:
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(error, TimeoutError):
+        return ProviderErrorCode.TIMEOUT.value
+    return "unexpected_internal_error"
 
 
 def _completed_steps(messages: tuple[CanonicalMessage, ...]) -> int:

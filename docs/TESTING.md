@@ -64,6 +64,19 @@ host identifiers. The default observer stream remains unchanged. Observer failur
 change admission or execution. Diagnostics survive close in memory and disappear
 with the composition; no telemetry or agent-home format change is introduced.
 
+Per-call diagnostics show where a run's tokens went. Pass `diagnostics_path` to
+`Agent.create`, `Agent.open` or `Agent.from_storage` (or `--diagnostics-path` to
+`daita run` and `daita host`) to append payload-free JSONL records for foreground,
+routine and graph-task runs. The path must be absolute and outside any directory
+holding a `pyproject.toml`; the file is created `0600` and never followed through a
+symlink. `model.completed` and `model.failed` carry one record per physical router
+attempt (outcome, retry, duration, usage or an explicit unavailable reason such as
+`stall_usage_unreported`), cache and reasoning tokens, the remaining token allowance
+and cost (null when unpriced, including subscriptions). `tool.completed` carries
+`result_bytes` (`stored` and model-facing `model` sizes). Only completed steps count
+as model calls. `daita diagnostics summary PATH` groups a file by run. Records never
+contain prompts, tool arguments or outputs, and a failing file cannot change execution.
+
 ## Local Python live acceptance
 
 `tests/analysis` covers the production native execution slice. The required

@@ -186,11 +186,14 @@ class Agent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
+        diagnostics_path: Path | None = None,
     ) -> Self:
         """Create an agent; injected model providers remain caller-owned.
 
         An injected MCP factory retains caller ownership; its created clients
         are owned and closed by the agent. Omit it to use the built-in SDK client.
+        ``diagnostics_path`` appends payload-free per-call diagnostics for every
+        run origin to one private JSONL file outside any source repository.
         """
 
         _validate_downloads_directory(downloads_directory)
@@ -218,6 +221,7 @@ class Agent:
                 observer=observer,
                 approval_handler=approval_handler,
                 downloads_directory=downloads_directory,
+                diagnostics_path=diagnostics_path,
             )
         )
 
@@ -246,11 +250,14 @@ class Agent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
+        diagnostics_path: Path | None = None,
     ) -> Self:
         """Open an agent; injected model providers remain caller-owned.
 
         An injected MCP factory retains caller ownership; its created clients
         are owned and closed by the agent. Omit it to use the built-in SDK client.
+        ``diagnostics_path`` appends payload-free per-call diagnostics for every
+        run origin to one private JSONL file outside any source repository.
         """
 
         _validate_downloads_directory(downloads_directory)
@@ -278,6 +285,7 @@ class Agent:
                 observer=observer,
                 approval_handler=approval_handler,
                 downloads_directory=downloads_directory,
+                diagnostics_path=diagnostics_path,
             )
         )
 
@@ -304,6 +312,7 @@ class Agent:
         reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
+        diagnostics_path: Path | None = None,
     ) -> Self:
         """Open an admitted agent with caller-owned storage and execution ownership.
 
@@ -336,6 +345,7 @@ class Agent:
                 reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
                 approval_handler=approval_handler,
+                diagnostics_path=diagnostics_path,
             )
         )
 

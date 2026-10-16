@@ -11,7 +11,7 @@ from decimal import Decimal
 from enum import Enum
 
 from .._json import FrozenJsonObject, canonical_json
-from .pricing import CostEstimate, CostEstimateStatus
+from .pricing import CostEstimate, CostEstimateStatus, canonical_decimal
 
 
 def _required_text(value: str, field_name: str) -> None:
@@ -312,6 +312,116 @@ class ModelUsage:
         return self.input_tokens + self.output_tokens
 
 
+# Cost codes that mean the attempt's token counts themselves are unknown, as
+# opposed to known tokens without a price (a subscription or unpriced model).
+_UNMEASURED_USAGE_CODES = frozenset(
+    {"model_attempt_interrupted", "no_model_attempts", "stall_usage_unreported"}
+)
+_NO_USAGE_REPORTED = "no_usage_reported"
+_ATTEMPT_OUTCOME = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+
+
+def usage_unavailable_reason(usage: ModelUsage) -> str | None:
+    """Name why usage tokens are unknown, or None when they were reported.
+
+    A priced estimate (complete or partial) was computed from reported
+    quantities, so its tokens are known even when they are zero. An unpriced
+    estimate is known only when the provider reported tokens. Unknown usage is
+    never presented as a measured zero.
+    """
+
+    estimate = usage.cost_estimate
+    if estimate.status is not CostEstimateStatus.UNAVAILABLE:
+        return None
+    if estimate.code in _UNMEASURED_USAGE_CODES:
+        return estimate.code
+    if (
+        usage.total_tokens
+        or usage.reasoning_tokens
+        or usage.cache_read_tokens
+        or usage.cache_write_tokens
+    ):
+        return None
+    return _NO_USAGE_REPORTED
+
+
+def usage_diagnostic(usage: ModelUsage) -> dict[str, object]:
+    """Payload-free usage fields; unknown counts and prices are null, never 0."""
+
+    reason = usage_unavailable_reason(usage)
+    known = reason is None
+    estimate = usage.cost_estimate
+    return {
+        "usage_status": "reported" if known else "unavailable",
+        "usage_unavailable_reason": reason,
+        "input_tokens": usage.input_tokens if known else None,
+        "output_tokens": usage.output_tokens if known else None,
+        "total_tokens": usage.total_tokens if known else None,
+        "cache_read_tokens": usage.cache_read_tokens if known else None,
+        "cache_write_tokens": usage.cache_write_tokens if known else None,
+        "reasoning_tokens": usage.reasoning_tokens if known else None,
+        "cost_status": estimate.status.value,
+        "cost_code": estimate.code,
+        "cost_amount_usd": (
+            None
+            if estimate.amount_usd is None
+            else canonical_decimal(estimate.amount_usd)
+        ),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class ModelAttemptRecord:
+    """One physical model attempt, copied read-only from the router's accounting.
+
+    Records are diagnostics only. Usage, budgets and ledgers never read them;
+    the router's own attempt usage remains the single accounting owner.
+    """
+
+    provider_id: str
+    candidate_attempt_number: int
+    total_attempt_number: int
+    duration_ms: int
+    outcome: str
+    retried: bool
+    usage: ModelUsage
+
+    def __post_init__(self) -> None:
+        _required_text(self.provider_id, "attempt provider_id")
+        for value, field_name in (
+            (self.candidate_attempt_number, "candidate_attempt_number"),
+            (self.total_attempt_number, "total_attempt_number"),
+        ):
+            if type(value) is not int or not 1 <= value <= 1_000:
+                raise ValueError(f"attempt {field_name} must be a bounded number")
+        if type(self.duration_ms) is not int or self.duration_ms < 0:
+            raise ValueError("attempt duration_ms must be a non-negative integer")
+        if (
+            not isinstance(self.outcome, str)
+            or _ATTEMPT_OUTCOME.fullmatch(self.outcome) is None
+        ):
+            raise ValueError("attempt outcome must be a bounded code")
+        if not isinstance(self.retried, bool):
+            raise TypeError("attempt retried must be boolean")
+        if not isinstance(self.usage, ModelUsage):
+            raise TypeError("attempt usage must be a ModelUsage record")
+
+    @property
+    def usage_unavailable_reason(self) -> str | None:
+        return usage_unavailable_reason(self.usage)
+
+    def diagnostic(self) -> dict[str, object]:
+        return {
+            "provider_id": self.provider_id,
+            "candidate_attempt_number": self.candidate_attempt_number,
+            "total_attempt_number": self.total_attempt_number,
+            "duration_ms": self.duration_ms,
+            "outcome": self.outcome,
+            "retried": self.retried,
+            **usage_diagnostic(self.usage),
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class ModelCallPolicy:
     """Finite code-owned model execution, progress, transport and shutdown bounds."""
@@ -573,6 +683,10 @@ class ModelResponse:
     provider_id: str | None = None
     provider_response_id: str | None = None
     provider_metadata: Mapping[str, object] = field(default_factory=dict)
+    # The router's read-only per-attempt diagnostics; None from a bare provider.
+    attempts: tuple[ModelAttemptRecord, ...] | None = field(
+        default=None, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.finish_reason, FinishReason):
@@ -613,6 +727,11 @@ class ModelResponse:
             _required_text(self.provider_response_id, "provider_response_id")
         if self.provider_id is not None:
             _required_text(self.provider_id, "model-response provider_id")
+        if self.attempts is not None:
+            attempts = tuple(self.attempts)
+            if any(not isinstance(item, ModelAttemptRecord) for item in attempts):
+                raise TypeError("model-response attempts must be attempt records")
+            object.__setattr__(self, "attempts", attempts)
         object.__setattr__(self, "tool_calls", tool_calls)
         object.__setattr__(self, "request_input_tokens", request_input_tokens)
         object.__setattr__(

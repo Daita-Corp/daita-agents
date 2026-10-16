@@ -256,7 +256,12 @@ from ..memory.capabilities import (
     memory_set_declarations,
 )
 from ..memory.store import validate_memory_documents
-from ..observation import AgentObserver, SupervisorStatus
+from ..observation import (
+    AgentObserver,
+    PrivateDiagnosticSink,
+    SupervisorStatus,
+    observe_all,
+)
 from ..routines.capabilities import (
     ROUTINE_DOMAIN_OWNER_ID,
     RoutineCapabilityDomain,
@@ -1082,12 +1087,14 @@ class EmbeddedAgent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
+        diagnostics_path: Path | None = None,
     ) -> Self:
         _validate_workspace_composition(workspace, hosted=hosted)
         if downloads_directory is not None and not isinstance(
             downloads_directory, Path
         ):
             raise TypeError("downloads_directory must be pathlib.Path or None")
+        diagnostics = _diagnostic_sink(diagnostics_path)
         resolved_clock = clock or _utc_now
         resolved_ids = id_factory or _new_id
         credential_session, owns_credential_session = _resolve_credential_session(
@@ -1187,6 +1194,7 @@ class EmbeddedAgent:
                 reviewer_profile=reviewer_profile,
                 reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
+                diagnostics=diagnostics,
                 approval_handler=approval_handler,
                 artifact_store=artifact_store,
                 artifact_delivery=artifact_delivery,
@@ -1240,12 +1248,14 @@ class EmbeddedAgent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
+        diagnostics_path: Path | None = None,
     ) -> Self:
         _validate_workspace_composition(workspace, hosted=hosted)
         if downloads_directory is not None and not isinstance(
             downloads_directory, Path
         ):
             raise TypeError("downloads_directory must be pathlib.Path or None")
+        diagnostics = _diagnostic_sink(diagnostics_path)
         resolved_clock = clock or _utc_now
         resolved_ids = id_factory or _new_id
         credential_session, owns_credential_session = _resolve_credential_session(
@@ -1455,6 +1465,7 @@ class EmbeddedAgent:
                 reviewer_profile=reviewer_profile,
                 reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
+                diagnostics=diagnostics,
                 approval_handler=approval_handler,
                 artifact_store=artifact_store,
                 artifact_delivery=artifact_delivery,
@@ -1494,6 +1505,7 @@ class EmbeddedAgent:
         reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
+        diagnostics_path: Path | None = None,
     ) -> Self:
         """Compose the existing runtime over caller-admitted, borrowed storage.
 
@@ -1505,6 +1517,7 @@ class EmbeddedAgent:
         """
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("agent_id must be non-empty text")
+        diagnostics = _diagnostic_sink(diagnostics_path)
         resolved_clock = clock or _utc_now
         resolved_ids = id_factory or _new_id
 
@@ -1576,6 +1589,7 @@ class EmbeddedAgent:
                     reviewer_profile=reviewer_profile,
                     reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                     observer=observer,
+                    diagnostics=diagnostics,
                     approval_handler=approval_handler,
                     artifact_store=artifact_store,
                     artifact_delivery=None,
@@ -1626,6 +1640,7 @@ class EmbeddedAgent:
         observer: AgentObserver | None,
         approval_handler: ApprovalHandler | None,
         artifact_store: AgentHomeArtifactStore,
+        diagnostics: PrivateDiagnosticSink | None = None,
         artifact_delivery: LocalArtifactDelivery | None,
         advisory_storage: AdvisoryStorage | None = None,
         close_state: bool = True,
@@ -2222,6 +2237,10 @@ class EmbeddedAgent:
         async def resolve_run_sources(run: RunInput):
             return await resolve_effective_source_scope(run, data_view)
 
+        # The one loop and runtime serve foreground, routine and graph-task runs,
+        # so the host diagnostic sink sees every origin beside the caller observer.
+        run_observer = observe_all(observer, diagnostics)
+
         capability_runtime = CapabilityRuntime(
             capabilities,
             domains,
@@ -2235,7 +2254,7 @@ class EmbeddedAgent:
                 SKILL_DOMAIN_OWNER_ID: skill_lock,
             },
             source_scope_resolver=resolve_run_sources,
-            observer=observer,
+            observer=run_observer,
             clock=clock,
             artifacts=artifact_store,
             limits=limits,
@@ -2351,7 +2370,7 @@ class EmbeddedAgent:
                 limits=limits,
                 model_call_policy=model_call_policy,
                 clock=clock,
-                observer=observer,
+                observer=run_observer,
                 stream_model_calls=(
                     model_profile.supports_streaming
                     if model_profile is not None
@@ -6105,6 +6124,14 @@ def _resolve_credential_session(
     if isinstance(keychain, CredentialSession):
         return keychain, False
     return CredentialSession(keychain or KeychainSecretProvider()), True
+
+
+def _diagnostic_sink(path: Path | None) -> PrivateDiagnosticSink | None:
+    if path is None:
+        return None
+    if not isinstance(path, Path):
+        raise TypeError("diagnostics_path must be pathlib.Path or None")
+    return PrivateDiagnosticSink(path)
 
 
 def _configuration_was_injected(

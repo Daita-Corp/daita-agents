@@ -8,6 +8,7 @@ import re
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -78,6 +79,7 @@ from .llm.models import (
     ToolDefinition,
     ToolResultBlock,
     ToolResultRefs,
+    model_tool_result,
     tool_result_refs,
 )
 from .loop.analysis import (
@@ -590,6 +592,11 @@ _UNCERTAIN_OUTCOME = ToolRecovery(
     "further action. Never repeat the call.",
 )
 _CONTROL_TOOL_NAMES = RESERVED_TOOL_NAMES
+# The result_ref each call of the executing batch receives in the transcript, so
+# TOOL_COMPLETED can report the exact size of the model-facing rendering.
+_BATCH_RESULT_REFS: ContextVar[Mapping[str, str] | None] = ContextVar(
+    "daita_batch_result_refs", default=None
+)
 _TOKEN = re.compile(r"[a-z0-9]+")
 
 
@@ -1343,14 +1350,18 @@ class CapabilityRuntime:
         messages: tuple[CanonicalMessage, ...],
         sensitivity: ModelSensitivity,
     ) -> ToolBatchOutcome:
-        return await self._execute_all(
-            run,
-            calls,
-            projection=projection,
-            messages=messages,
-            sensitivity=sensitivity,
-            session=None,
-        )
+        refs = _BATCH_RESULT_REFS.set(_batch_result_refs(messages, calls))
+        try:
+            return await self._execute_all(
+                run,
+                calls,
+                projection=projection,
+                messages=messages,
+                sensitivity=sensitivity,
+                session=None,
+            )
+        finally:
+            _BATCH_RESULT_REFS.reset(refs)
 
     async def execute_session(
         self,
@@ -1363,14 +1374,18 @@ class CapabilityRuntime:
     ) -> ToolBatchOutcome:
         if not isinstance(session, RunSession):
             raise TypeError("session must be RunSession")
-        return await self._execute_all(
-            session.run,
-            calls,
-            projection=projection,
-            messages=messages,
-            sensitivity=sensitivity,
-            session=session,
-        )
+        refs = _BATCH_RESULT_REFS.set(_batch_result_refs(messages, calls))
+        try:
+            return await self._execute_all(
+                session.run,
+                calls,
+                projection=projection,
+                messages=messages,
+                sensitivity=sensitivity,
+                session=session,
+            )
+        finally:
+            _BATCH_RESULT_REFS.reset(refs)
 
     async def _execute_all(
         self,
@@ -4393,6 +4408,10 @@ class CapabilityRuntime:
             "success": not result.is_error,
             "error_code": _result_error_code(result),
         }
+        try:
+            data["result_bytes"] = _result_bytes(result)
+        except Exception:
+            pass
         if capability is not None:
             data["capability_id"] = capability.id
         if catalog_entry is not None:
@@ -4426,6 +4445,32 @@ class CapabilityRuntime:
         except Exception:
             return
         _emit_safely(self._observer, event)
+
+
+def _batch_result_refs(
+    messages: tuple[CanonicalMessage, ...], calls: tuple[ToolCall, ...]
+) -> dict[str, str]:
+    """Each call's result_ref once its result is appended in call order."""
+
+    if any(not isinstance(call, ToolCall) for call in calls):
+        return {}
+    prior = len(tool_result_refs(tuple(messages)).by_call_id)
+    return {call.id: f"r{prior + index}" for index, call in enumerate(calls, 1)}
+
+
+def _result_bytes(result: ToolResultBlock) -> dict[str, int | None]:
+    """Canonical stored-output size and model-facing rendering size.
+
+    Code-owned internal calls are never rendered to a model, so their model
+    size is null rather than an invented number.
+    """
+
+    refs = _BATCH_RESULT_REFS.get()
+    stored = len(canonical_json(result.output).encode("utf-8"))
+    if refs is None:
+        return {"stored": stored, "model": None}
+    rendered = model_tool_result(result, refs.get(result.call_id))
+    return {"stored": stored, "model": len(canonical_json(rendered).encode("utf-8"))}
 
 
 def _sha256_digest(value: object) -> str:

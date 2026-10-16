@@ -580,6 +580,7 @@ def test_run_without_model_opens_the_persisted_route_without_injection():
         workspace=cli._resolve_cli_workspace(arguments),
         root=None,
         observer=None,
+        diagnostics_path=None,
         limits=None,
     )
     agent.run.assert_awaited_once_with(
@@ -720,6 +721,7 @@ def test_future_cli_1_parser_adds_only_explicit_run_continuation_flags():
                 "--conversation-id",
                 "--max-cost-usd",
                 "--events-jsonl",
+                "--diagnostics-path",
                 "--files-only",
             }
         ),
@@ -985,6 +987,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "effects",
         "inbox",
         "jobs",
+        "diagnostics",
     }
     assert _surface(commands["detach"]) == (
         ("name", "source_id"),
@@ -1061,7 +1064,13 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
 
     assert _surface(commands["host"]) == (
         (),
-        frozenset({"-h", "--help", "--agent"}),
+        frozenset({"-h", "--help", "--agent", "--diagnostics-path"}),
+    )
+    diagnostics = _subcommands(commands["diagnostics"])
+    assert set(diagnostics) == {"summary"}
+    assert _surface(diagnostics["summary"]) == (
+        ("path",),
+        frozenset({"-h", "--help"}),
     )
     routines = _subcommands(commands["routines"])
     assert set(routines) == {
