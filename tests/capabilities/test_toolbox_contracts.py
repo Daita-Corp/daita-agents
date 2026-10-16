@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from tests.capabilities._toolbox_support import (
     NOW,
     TOOLBOX_DEFINITIONS,
@@ -40,6 +42,7 @@ from tests.capabilities._toolbox_support import (
     _presentation,
     _run,
     _runtime,
+    canonical_json,
     cast,
     pytest,
     replace,
@@ -312,6 +315,8 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
     "first,second",
     [
         ("artifact_create", "routine_save"),
+        ("routine_save", "artifact_create"),
+        ("skill_save", "artifact_create"),
         ("file_query", "artifact_edit_text"),
     ],
 )
@@ -367,9 +372,10 @@ async def test_contract_schema_survives_replacement_in_real_request(
                 (route["route"], route["capability_id"]) for route in contract["routes"]
             ] == list(view.mode_capability_ids)
             for route in contract["routes"]:
-                assert (
-                    route["input_schema"]
-                    == runtime._registry.capability(route["capability_id"]).input_schema
+                # Each route is stated as changes to the top-level schema, and
+                # applying them restores that route's exact input schema.
+                assert _route_schema(contract["input_schema"], route) == _plain(
+                    runtime._registry.capability(route["capability_id"]).input_schema
                 )
         assert contract["complete"] is True
         assert contract["input_schema_digest"]
@@ -599,3 +605,30 @@ async def test_static_context_stays_frozen_while_provider_definitions_change(
             )
     finally:
         await agent.close()
+
+
+def _route_schema(primary: Any, route: Mapping[str, Any]) -> object:
+    if route.get("input_schema") == "same_as_top_level":
+        return _plain(primary)
+    if "input_schema" in route:
+        return _plain(route["input_schema"])
+    changes = dict(_plain(route["input_schema_changes"]))
+    schema = {
+        key: value
+        for key, value in _plain(primary).items()
+        if key not in changes.pop("removed_keywords", ())
+    }
+    removed = changes.pop("removed_properties", ())
+    properties = {
+        name: value
+        for name, value in schema.get("properties", {}).items()
+        if name not in removed
+    }
+    properties.update(changes.pop("properties", {}))
+    schema.update(changes)
+    schema["properties"] = properties
+    return schema
+
+
+def _plain(value: object) -> Any:
+    return json.loads(canonical_json(value))

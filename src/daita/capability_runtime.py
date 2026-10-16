@@ -4735,15 +4735,18 @@ def _tool_contract(
             operational_effect=entry.capability.operational_effect.value,
         )
         if entry.routes:
-            # A routed tool's top-level schema is its primary route; each
-            # admitted route keeps its own complete contract here.
+            # A routed tool's top-level schema is its primary route; each other
+            # admitted route states only how its input differs from that schema.
             contract.update(
                 route_argument=entry.view.mode_argument,
                 routes=[
                     {
                         "route": mode,
                         "capability_id": route.capability.id,
-                        "input_schema": route.capability.input_schema,
+                        **_route_input_contract(
+                            entry.capability.input_schema,
+                            route.capability.input_schema,
+                        ),
                         "output_kind": route.capability.output_kind,
                         "data_access": route.capability.access_mode.value,
                         "operational_effect": route.capability.operational_effect.value,
@@ -4752,6 +4755,41 @@ def _tool_contract(
                 ],
             )
     return contract
+
+
+def _route_input_contract(
+    primary: Mapping[str, object], schema: Mapping[str, object]
+) -> dict[str, object]:
+    """Describe a route's input as changes to the top-level schema, never a copy."""
+    if schema == primary:
+        return {"input_schema": "same_as_top_level"}
+    primary_properties = primary.get("properties")
+    properties = schema.get("properties")
+    if not isinstance(primary_properties, Mapping) or not isinstance(
+        properties, Mapping
+    ):
+        return {"input_schema": schema}
+    changes: dict[str, object] = {
+        key: value
+        for key, value in schema.items()
+        if key != "properties" and primary.get(key) != value
+    }
+    removed_keywords = sorted(
+        key for key in primary if key != "properties" and key not in schema
+    )
+    if removed_keywords:
+        changes["removed_keywords"] = removed_keywords
+    changed = {
+        name: value
+        for name, value in properties.items()
+        if primary_properties.get(name) != value
+    }
+    if changed:
+        changes["properties"] = changed
+    removed = sorted(name for name in primary_properties if name not in properties)
+    if removed:
+        changes["removed_properties"] = removed
+    return {"input_schema_changes": changes}
 
 
 def _fit_load_contracts(
