@@ -23,7 +23,6 @@ from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     CanonicalMessage,
-    FinishReason,
     MessageRole,
     ModelProfile,
     ModelRequest,
@@ -52,7 +51,7 @@ from daita.loop.models import (
     Transcript,
     validate_completed_transcript,
 )
-from tests.support.live_billing import cost_cap, live_provider, subscription_billing
+from tests.support.live_billing import cost_cap, live_provider
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_STAGE_A_KERNEL"
@@ -77,7 +76,7 @@ pytestmark = [
         os.environ.get(_AUTHORIZATION) != "1",
         reason=(
             f"set {_AUTHORIZATION}=1 only after explicitly authorizing up to "
-            "three live model runs for the Stage A kernel suite"
+            "two live model runs for the Stage A kernel suite"
         ),
     ),
 ]
@@ -343,55 +342,6 @@ async def test_live_tool_round_trip_has_stable_context_and_durable_completion(
         assert reopened_transcript == transcript
         assert persisted.result is not None
         validate_completed_transcript(reopened_transcript, persisted.result)
-
-
-async def test_live_output_exhaustion_never_becomes_normal_completion(
-    tmp_path: Path,
-) -> None:
-    """Force a live provider output limit and require an explicit failed exit."""
-
-    if subscription_billing():
-        pytest.skip(
-            "the ChatGPT subscription surface ignores max_output_tokens, so only "
-            "API billing can force a live output limit"
-        )
-    profile, provider = _live_provider(max_output_tokens=64)
-    async with AsyncExitStack() as resources:
-        resources.push_async_callback(provider.close)
-        agent = await Agent.create(
-            "live-stage-a-output-limit",
-            root=tmp_path / "output-limit-root",
-            model=provider,
-            model_profile=profile,
-            limits=_limits(),
-            workspace=workspace_for(tmp_path / "output-limit-root"),
-        )
-        try:
-            result = await agent.run(
-                "Do not call tools. Output exactly 800 numbered lines. Every line must "
-                "contain its number and the phrase STAGE_A_OUTPUT_LIMIT_PROBE. Do not "
-                "abbreviate, summarize, omit lines, or stop before line 800."
-            )
-            transcript = await agent.transcript(result.run_id)
-        finally:
-            await agent.close()
-
-        assert result.kind is LoopExitKind.FAILED, (
-            result.kind,
-            result.reason,
-            result.final_text,
-        )
-        assert result.reason in {
-            "model_output_limit",
-            ProviderErrorCode.OUTPUT_LIMIT.value,
-        }
-        assert result.final_text is None
-        assert provider.requests
-        assert all(
-            response.finish_reason is not FinishReason.STOP
-            for response in provider.responses
-        )
-        assert transcript.messages[0].content
 
 
 async def test_live_fallback_provider_stays_sticky_through_tool_completion(

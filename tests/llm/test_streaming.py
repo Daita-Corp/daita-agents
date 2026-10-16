@@ -512,6 +512,75 @@ async def test_openai_native_stream_ignores_empty_deltas_and_uses_terminal_respo
     assert client.responses.arguments["stream"] is True
 
 
+async def test_openai_streamed_output_limit_fails_the_run_without_completion():
+    from daita.llm.models import FinishReason
+    from daita.loop import AgentLoop, InMemoryTranscriptStore, LoopExitKind, RunInput
+    from tests.support.loop import NOW, ScriptedTools, TranscriptContext
+
+    partial = "1. STAGE_A_OUTPUT_LIMIT_PROBE"
+    incomplete = {
+        "id": "resp-1",
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "model": "test-model",
+        "output": [
+            {
+                "type": "message",
+                "status": "incomplete",
+                "content": [{"type": "output_text", "text": partial}],
+            }
+        ],
+        "usage": {"input_tokens": 10, "output_tokens": 64, "total_tokens": 74},
+    }
+    client = _OpenAIClient(
+        (
+            {"type": "response.created"},
+            {"type": "response.output_text.delta", "delta": partial},
+            {"type": "response.incomplete", "response": incomplete},
+        )
+    )
+    provider = OpenAIResponsesProvider("test-model", client=cast(Any, client))
+
+    events = await _events(provider, _request())
+    completed = cast(ModelStreamCompleted, events[-1])
+    assert completed.response.finish_reason is FinishReason.LENGTH
+    assert completed.response.text == partial
+
+    class _InputTokens:
+        async def count(self, **kwargs: object) -> object:
+            return {"input_tokens": 10}
+
+    client = _OpenAIClient(
+        (
+            {"type": "response.created"},
+            {"type": "response.output_text.delta", "delta": partial},
+            {"type": "response.incomplete", "response": incomplete},
+        )
+    )
+    # The loop admits each request by counting its input before generation.
+    setattr(client.responses, "input_tokens", _InputTokens())
+    loop = AgentLoop(
+        model=OpenAIResponsesProvider("test-model", client=cast(Any, client)),
+        context_builder=TranscriptContext(),
+        tools=ScriptedTools({}),
+        transcripts=InMemoryTranscriptStore(),
+        clock=lambda: NOW,
+        stream_model_calls=True,
+    )
+    result = await loop.run(
+        RunInput(
+            id="output-limit",
+            agent_id="agent-1",
+            message="Output 800 numbered lines.",
+            created_at=NOW,
+        )
+    )
+
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "model_output_limit"
+    assert result.final_text is None
+
+
 async def test_openai_native_tool_stream_ignores_empty_argument_delta():
     terminal_response = {
         "id": "resp-tool",

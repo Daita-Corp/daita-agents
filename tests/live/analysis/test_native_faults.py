@@ -1164,3 +1164,96 @@ async def test_completed_cpu_and_broker_wait_have_distinct_host_measurements(
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await agent.close()
+
+
+_CLI_SCRIPTED_MODEL = """
+import sys
+from unittest.mock import patch
+
+from daita import cli
+from daita.llm.models import FinishReason, ModelResponse, ToolCall
+from tests.support.toolbox_model import ToolboxAwareMockModelProvider
+
+code, argv = sys.argv[1], sys.argv[2:]
+provider = ToolboxAwareMockModelProvider(
+    (
+        ModelResponse(
+            finish_reason=FinishReason.TOOL_CALLS,
+            tool_calls=(
+                ToolCall(
+                    id="cli-python",
+                    name="python_execute",
+                    arguments={
+                        "code": code,
+                        "expected_state": {"generation": 0, "revision": 0},
+                    },
+                ),
+            ),
+        ),
+        ModelResponse(finish_reason=FinishReason.STOP, text="The sum is 6."),
+    )
+)
+with patch.object(cli, "create_llm_provider", return_value=provider):
+    sys.exit(cli.main(argv))
+"""
+
+
+async def test_cli_run_executes_python_through_the_broker_in_its_own_process(
+    tmp_path, analysis_report
+):
+    """The `daita run` process owns the worker; only the model is scripted."""
+
+    workspace = workspace_for(tmp_path)
+    (workspace.root / "numbers.txt").write_text("1\n2\n3\n")
+    root = tmp_path / "homes"
+    bootstrap = await Agent.create("cli-python", root=root, workspace=workspace)
+    await bootstrap.close()
+    code = (
+        "r=tools.call('file_read', {'path': 'numbers.txt'})\n"
+        "assert not r['is_error']\n"
+        "print({'sum': sum(int(n) for n in r['output']['data']['content'].split())})"
+    )
+    argv = [
+        "--root",
+        str(root),
+        "--workspace",
+        str(workspace.root),
+        "run",
+        "cli-python",
+        "Sum numbers.txt in Python.",
+        "--model",
+        "mock:scripted",
+    ]
+    repository = Path(__file__).resolve().parents[3]
+    environment = {**os.environ, "PYTHONPATH": str(repository)}
+    completed = await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-c", _CLI_SCRIPTED_MODEL, code, *argv],
+        capture_output=True,
+        env=environment,
+        timeout=120,
+    )
+    analysis_report["exit_code"] = completed.returncode
+    analysis_report["stderr"] = completed.stderr.decode()[-8192:]
+    assert completed.returncode == 0, completed.stderr.decode()
+    payload = json.loads(completed.stdout)
+    analysis_report["cli_output"] = payload
+    assert payload["status"] == "completed"
+    assert payload["analysis_usage"]["processes_reaped"] is True
+    assert payload["analysis_usage"]["scratch_deleted"] is True
+
+    reopened = await Agent.open("cli-python", root=root, workspace=workspace)
+    try:
+        records = await capture_run(reopened, payload["run_id"], analysis_report)
+        assert any(
+            record.kind == "child" and record.facts["status"] == "succeeded"
+            for record in records
+        )
+        stdout = [
+            json.loads(canonical_json(record.facts)).get("result", {}).get("stdout", "")
+            for record in records
+            if record.kind == "cell"
+        ]
+        assert any("{'sum': 6}" in item for item in stdout), stdout
+    finally:
+        await reopened.close()
