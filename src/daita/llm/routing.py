@@ -776,8 +776,29 @@ def _require_recoverable_usage(
             or request.max_estimated_cost_usd is not None
         )
         and error.usage.cost_estimate.status is not CostEstimateStatus.COMPLETE
+        and not (request.max_estimated_cost_usd is None and _unreported_stall(error))
     ):
         raise _aggregate_failure(error, usage) from None
+
+
+_STALL_TIMEOUT_CODES = frozenset({"first_progress", "idle_progress"})
+
+
+def _unreported_stall(error: ModelProviderError) -> bool:
+    """A stream that went silent before any canonical output reached the caller.
+
+    Nothing was emitted, no tool ran and cleanup resolved, so replaying the same
+    request is safe. The provider reports no usage for it, so only routes without
+    a dollar cap may replay it; the token limit then sees replayed attempts' usage
+    only once a response returns.
+    """
+
+    diagnostic = error.diagnostic
+    return (
+        error.code is ProviderErrorCode.TIMEOUT
+        and diagnostic is not None
+        and diagnostic.code in _STALL_TIMEOUT_CODES
+    )
 
 
 def _number_attempt(error: ModelProviderError, candidate: int, total: int) -> None:

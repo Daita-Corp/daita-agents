@@ -12,6 +12,8 @@ from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import (
     ModelProviderError,
     ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
     interrupted_model_usage,
     retry_after_from_headers,
 )
@@ -108,6 +110,83 @@ async def test_backoff_interruption_retains_prior_usage(stream, deadline):
         assert observed.total_tokens == 30
         assert observed.cost_estimate.amount_usd == Decimal("0.01")
         assert observed.cost_estimate.status.value == "complete"
+    finally:
+        await router.close()
+
+
+def stalled(code: str = "first_progress") -> ModelProviderError:
+    # A progress deadline before any canonical output: the provider reported
+    # no usage, exactly as a silent stream ends.
+    return ModelProviderError(
+        ProviderErrorCode.TIMEOUT,
+        usage=ModelUsage(cost_estimate=CostEstimate.unavailable("usage_unavailable")),
+        diagnostic=ProviderFailureDiagnostic(
+            phase=ProviderFailurePhase.PROVIDER_BOUNDARY, code=code
+        ),
+    )
+
+
+def stall_then(stream: bool, failure: ModelProviderError):
+    answer = ModelResponse(
+        finish_reason=FinishReason.STOP,
+        text="recovered",
+        usage=ModelUsage(
+            input_tokens=10,
+            output_tokens=2,
+            cost_estimate=CostEstimate.unavailable("subscription_billing"),
+        ),
+    )
+    if stream:
+        return MockStreamingModelProvider(
+            (failure, (ModelTextDelta("recovered"), ModelStreamCompleted(answer)))
+        )
+    return MockModelProvider((failure, answer))
+
+
+async def no_wait(_delay: float) -> None:
+    return None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("code", ["first_progress", "idle_progress"])
+async def test_silent_stall_replays_under_a_token_limit(stream, code):
+    provider = stall_then(stream, stalled(code))
+    router = ModelRouter((registration(provider, streaming=stream),), sleep=no_wait)
+    try:
+        response = await invoke(
+            router, replace(request(), max_total_tokens=1_000), stream
+        )
+        assert response.text == "recovered"
+        assert len(provider.requests) == 2
+        assert response.usage.total_tokens == 12
+    finally:
+        await router.close()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_silent_stall_never_replays_under_a_dollar_cap(stream):
+    provider = stall_then(stream, stalled())
+    router = ModelRouter((registration(provider, streaming=stream),), sleep=no_wait)
+    capped = replace(
+        request(), max_total_tokens=1_000, max_estimated_cost_usd=Decimal("1")
+    )
+    try:
+        with pytest.raises(ModelProviderError) as caught:
+            await invoke(router, capped, stream)
+        assert caught.value.code is ProviderErrorCode.TIMEOUT
+        assert len(provider.requests) == 1
+    finally:
+        await router.close()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_unmeasured_deadline_timeout_is_not_a_replayable_stall(stream):
+    provider = stall_then(stream, stalled("attempt_deadline"))
+    router = ModelRouter((registration(provider, streaming=stream),), sleep=no_wait)
+    try:
+        with pytest.raises(ModelProviderError):
+            await invoke(router, replace(request(), max_total_tokens=1_000), stream)
+        assert len(provider.requests) == 1
     finally:
         await router.close()
 
