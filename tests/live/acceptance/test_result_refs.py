@@ -2,9 +2,8 @@
 
 Two bounded cases on a local SQLite probe home:
 
-* foreground: query a table summary, then make a CSV of that query result;
-  the complete result is already shown, so the CSV cites it rather than
-  querying again;
+* foreground: a first turn queries a table summary and shows it; a second
+  turn asks for a CSV of that result, which cites it without querying again;
 * graph: a durable model worker runs its read and finishes with task_complete.
 
 Pass condition: the right result is referenced on the first try, and no call is
@@ -148,33 +147,41 @@ async def test_l8_csv_of_a_query_result_cites_that_result(
         workspace=workspace_for(home.root),
     )
     try:
+        # Rows are shown first; the follow-up asks for a CSV of what was shown,
+        # which should cite that result rather than query or export again.
+        shown = await agent.run(
+            "Use one query to count the rows in every table of this source.",
+            source_scope_ids=(home.source_id,),
+        )
+        assert shown.kind is LoopExitKind.COMPLETED
+        assert shown.conversation_id is not None
         result = await agent.run(
-            "Use one query to count the rows in every table of this source. "
-            "Then make a CSV of that query result.",
+            "Make a CSV of that result.",
+            conversation_id=shown.conversation_id,
             source_scope_ids=(home.source_id,),
         )
         assert result.kind is LoopExitKind.COMPLETED
+        first = await agent._embedded._store.load(shown.run_id)
         transcript = await agent._embedded._store.load(result.run_id)
+        _assert_no_ref_rejections(first)
         _assert_no_ref_rejections(transcript)
-        pairs = transcript.tool_pairs
+        queries = _successful(first, "data_query")
+        assert queries, "the counts must come from a successful query"
+        assert not [
+            call for call, _result in transcript.tool_pairs if call.name == "data_query"
+        ], "the CSV must not query again"
         artifact_calls = [
-            (index, call, block)
-            for index, (call, block) in enumerate(pairs)
+            (call, block)
+            for call, block in transcript.tool_pairs
             if call.name == "artifact_create"
         ]
         assert len(artifact_calls) == 1, "the CSV must be created on the first try"
-        artifact_index, artifact_call, artifact_result = artifact_calls[0]
+        artifact_call, artifact_result = artifact_calls[0]
         assert artifact_result is not None and not artifact_result.is_error
-        queries = [
-            item
-            for item in _successful(transcript, "data_query")
-            if item[0] < artifact_index
-        ]
-        assert queries, "the CSV must follow a successful query"
         data = artifact_result.output["data"]
         assert isinstance(data, Mapping)
         cited = tuple(cast(tuple[str, ...], data["evidence_call_ids"]))
-        # The visible ref the model cited resolves to the query it just ran.
+        # The visible ref the model cited resolves to the query it ran earlier.
         assert cited == (queries[-1][1].id,)
         assert all(
             not str(ref).startswith(("call_", "toolu_"))
