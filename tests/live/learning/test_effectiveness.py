@@ -18,7 +18,6 @@ from daita import (
     ApprovalRequest,
     LoopLimits,
     SemanticAnnotationState,
-    create_llm_provider,
 )
 from daita.evaluation import (
     BenchmarkJudgment,
@@ -33,7 +32,6 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.profiles import reviewed_model_profile
 from daita.loop.models import Transcript
 from daita.observation import AgentEvent
 from daita.security import EnvironmentSecretProvider, SecretReference
@@ -41,6 +39,7 @@ from tests.support.learning_evaluation import (
     _RecordingProvider,
     _require_completed_phase,
 )
+from tests.support.live_billing import cost_cap, live_provider
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_LEARNING_EVAL"
@@ -208,23 +207,18 @@ def _write_report(report, output_directory: Path, model_id: str) -> tuple[Path, 
 
 
 async def test_live_fixture_baseline_teaching_and_learned_report(tmp_path: Path):
-    model_id = _required_environment(_MODEL_ID)
-    api_key = _required_environment(_MODEL_KEY)
+    model_id = os.environ.get(_MODEL_ID, "openai:gpt-5.6-terra")
     _required_environment(_DATABASE_PASSWORD)
     output_directory = Path(
         os.environ.get(_OUTPUT_DIR, str(tmp_path / "learning-evaluation-reports"))
     ).expanduser()
     if not output_directory.is_absolute():
         pytest.fail(f"{_OUTPUT_DIR} must be absolute when supplied")
-    profile = reviewed_model_profile(model_id)
-    if profile is None:
-        pytest.fail(f"{_MODEL_ID} must name one release-reviewed tool-capable model")
-    if not profile.supports_streaming:
-        pytest.fail(f"{_MODEL_ID} must support streaming for the live learning test")
-    delegate = create_llm_provider(
+    profile, delegate = live_provider(
         model_id,
-        api_key=api_key,
-        max_output_tokens=min(profile.max_output_tokens, 4_096),
+        api_key=lambda: _required_environment(_MODEL_KEY),
+        max_output_tokens=4_096,
+        require_streaming=True,
     )
     provider = _RecordingProvider(delegate)
     async with AsyncExitStack() as resources:
@@ -248,7 +242,7 @@ async def test_live_fixture_baseline_teaching_and_learned_report(tmp_path: Path)
                 return ApprovalDecision.APPROVE
             return ApprovalDecision.DENY
 
-        limits = LoopLimits(max_estimated_cost_usd=_cost_limit())
+        limits = LoopLimits(max_estimated_cost_usd=cost_cap(_cost_limit()))
         async with await Agent.create(
             "live-learning-evaluation",
             root=tmp_path,

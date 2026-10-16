@@ -40,7 +40,6 @@ from daita import (
     LocalFileAccess,
     LocalWorkspace,
     LoopLimits,
-    create_llm_provider,
 )
 from daita._json import canonical_json
 from daita.artifacts.models import ArtifactDeliveryMode, ArtifactDeliveryOutcome
@@ -59,7 +58,6 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.pricing import CostEstimate
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
     ManagedModelProvider,
     StreamingModelProvider,
@@ -71,6 +69,7 @@ from daita.loop.models import (
     Transcript,
     validate_completed_transcript,
 )
+from tests.support.live_billing import cost_cap, live_provider
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_LOCAL_COMPUTER_FILES"
 _MODEL_ID = "DAITA_LOCAL_COMPUTER_FILES_LIVE_MODEL_ID"
@@ -210,22 +209,18 @@ def _live_provider(
     key_environment = _API_KEY_ENVIRONMENT.get(provider_name)
     if key_environment is None:
         pytest.fail(f"{_MODEL_ID} must name one API-backed reviewed model")
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name one release-reviewed tool-capable model")
-    if not profile.supports_streaming:
-        pytest.fail(f"{_MODEL_ID} must name a model with reviewed streaming support")
-    api_key = os.environ.get(_MODEL_KEY) or _required_environment(key_environment)
-    delegate = create_llm_provider(
+    profile, delegate = live_provider(
         model_id,
-        api_key=api_key,
-        max_output_tokens=min(profile.max_output_tokens, 1_536),
+        api_key=lambda: os.environ.get(_MODEL_KEY)
+        or _required_environment(key_environment),
+        max_output_tokens=1_536,
+        require_streaming=True,
     )
     return profile, _RecordingProvider(delegate, first_response=first_response)
 
 
 def _limits() -> LoopLimits:
-    return LoopLimits(max_estimated_cost_usd=_cost_limit())
+    return LoopLimits(max_estimated_cost_usd=cost_cap(_cost_limit()))
 
 
 def _computer_locations(

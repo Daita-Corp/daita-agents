@@ -21,17 +21,21 @@ from daita import (
     ApprovalDecision,
     ApprovalRequest,
     LoopLimits,
-    create_llm_provider,
 )
 from daita.artifacts.models import ArtifactError
 from daita.llm.models import ModelProfile, ToolCall, ToolResultBlock
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import ManagedModelProvider
 from daita.loop.models import (
     LoopExit,
     LoopExitKind,
     Transcript,
     validate_completed_transcript,
+)
+from tests.support.live_billing import (
+    api_equivalent_cost,
+    cost_cap,
+    live_provider,
+    subscription_billing,
 )
 from tests.support.workspace import workspace_for
 
@@ -76,18 +80,17 @@ def _cost_limit() -> Decimal:
 
 def _live_model() -> tuple[ModelProfile, ManagedModelProvider]:
     model_id = os.environ.get(_MODEL_ID, "openai:gpt-5.6-terra")
-    profile = reviewed_model_profile(model_id)
     key_name = _API_KEYS.get(model_id.partition(":")[0])
-    if profile is None or not profile.supports_tools or key_name is None:
+    if key_name is None:
         pytest.fail(f"{_MODEL_ID} must name a reviewed API-backed tool-capable model")
-    key = os.environ.get(_MODEL_KEY) or os.environ.get(key_name)
-    if key is None or not key.strip():
-        pytest.fail(f"set {_MODEL_KEY} or {key_name} for the authorized live test")
-    return profile, create_llm_provider(
-        model_id,
-        api_key=key,
-        max_output_tokens=min(profile.max_output_tokens, 1_024),
-    )
+
+    def api_key() -> str:
+        key = os.environ.get(_MODEL_KEY) or os.environ.get(key_name)
+        if key is None or not key.strip():
+            pytest.fail(f"set {_MODEL_KEY} or {key_name} for the authorized live test")
+        return key
+
+    return live_provider(model_id, api_key=api_key, max_output_tokens=1_024)
 
 
 def _exchanges(
@@ -127,11 +130,18 @@ def _completed(
     validate_completed_transcript(transcript, result)
     assert result.usage.input_tokens is not None and result.usage.input_tokens > 0
     assert result.usage.output_tokens is not None and result.usage.output_tokens > 0
-    cost = result.usage.cost_estimate.amount_usd
-    assert cost is not None and cost <= cost_limit
     record_property(f"artifact_{stage}_run_id", result.run_id)
     record_property(f"artifact_{stage}_input_tokens", result.usage.input_tokens)
     record_property(f"artifact_{stage}_output_tokens", result.usage.output_tokens)
+    if subscription_billing():
+        # Subscription responses are unpriced; record the notional API cost.
+        record_property(
+            f"artifact_{stage}_api_equivalent_cost",
+            str(api_equivalent_cost(result.usage, result.provider_id)),
+        )
+        return
+    cost = result.usage.cost_estimate.amount_usd
+    assert cost is not None and cost <= cost_limit
     record_property(f"artifact_{stage}_estimated_cost_usd", str(cost))
 
 
@@ -141,7 +151,7 @@ async def test_live_model_artifact_creation_reuse_and_deletion_survive_reopen(
 ) -> None:
     profile, provider = _live_model()
     cost_limit = _cost_limit()
-    limits = LoopLimits(max_estimated_cost_usd=cost_limit)
+    limits = LoopLimits(max_estimated_cost_usd=cost_cap(cost_limit))
     root = tmp_path / "artifact-lifecycle-state"
     downloads = tmp_path / "exports"
     downloads.mkdir()

@@ -11,14 +11,13 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent, LoopLimits, create_llm_provider
+from daita import Agent, LoopLimits
 from daita._json import FrozenJsonObject
 from daita.adapters.mcp import (
     MCPAuthentication,
     MCPToolSelection,
     SDKMCPClientFactory,
 )
-from daita.llm.profiles import reviewed_model_profile
 from daita.loop.models import LoopExitKind, validate_completed_transcript
 from daita.security import (
     EmptySecretProvider,
@@ -32,6 +31,7 @@ from tests.support.job_benchmarks import (
     assert_on_demand_invocation,
     results_for,
 )
+from tests.support.live_billing import cost_cap, live_provider
 
 
 @pytest.mark.integration
@@ -123,28 +123,24 @@ async def test_real_model_reads_remote_mcp_after_agent_restart(
         secrets = EmptySecretProvider()
 
     model_id = os.environ.get("DAITA_LIVE_MCP_MODEL_ID", "openai:gpt-5.6-terra")
-    profile = reviewed_model_profile(model_id)
-    if (
-        not model_id.startswith("openai:")
-        or profile is None
-        or not profile.supports_tools
-    ):
+    if not model_id.startswith("openai:"):
         raise ValueError("DAITA_LIVE_MCP_MODEL_ID must be a reviewed OpenAI tool model")
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY is required for the real-model MCP test")
+
+    def api_key() -> str:
+        key = os.environ.get("OPENAI_API_KEY")
+        if not key:
+            raise ValueError("OPENAI_API_KEY is required for the real-model MCP test")
+        return key
+
     amount = Decimal(os.environ.get("DAITA_LIVE_MCP_MAX_COST_USD", "0.50"))
     if not amount.is_finite() or amount <= 0:
         raise ValueError("DAITA_LIVE_MCP_MAX_COST_USD must be finite and positive")
-    limits = LoopLimits(max_estimated_cost_usd=amount)
+    limits = LoopLimits(max_estimated_cost_usd=cost_cap(amount))
 
-    provider = RecordingProvider(
-        create_llm_provider(
-            model_id,
-            api_key=api_key,
-            max_output_tokens=min(profile.max_output_tokens, 2_048),
-        )
+    profile, delegate = live_provider(
+        model_id, api_key=api_key, max_output_tokens=2_048
     )
+    provider = RecordingProvider(delegate)
     agent = await Agent.create(
         "remote-mcp-read",
         root=tmp_path,

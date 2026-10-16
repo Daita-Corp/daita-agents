@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent, LoopLimits, SQLiteSource, create_llm_provider
+from daita import Agent, LoopLimits, SQLiteSource
 from daita._json import canonical_json
 from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
@@ -37,7 +37,6 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.pricing import CostEstimate
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
     ManagedModelProvider,
     StreamingModelProvider,
@@ -53,6 +52,7 @@ from daita.loop.models import (
     Transcript,
     validate_completed_transcript,
 )
+from tests.support.live_billing import cost_cap, live_provider, subscription_billing
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_STAGE_A_KERNEL"
@@ -190,15 +190,11 @@ def _live_provider(
             f"{_MODEL_ID} must name an API-backed provider: "
             + ", ".join(sorted(_API_PROVIDERS))
         )
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name one release-reviewed tool-capable model")
-    if not profile.supports_streaming:
-        pytest.fail(f"{_MODEL_ID} must name a model with reviewed streaming support")
-    delegate = create_llm_provider(
+    profile, delegate = live_provider(
         model_id,
-        api_key=_required_environment(_MODEL_KEY),
-        max_output_tokens=min(profile.max_output_tokens, max_output_tokens),
+        api_key=lambda: _required_environment(_MODEL_KEY),
+        max_output_tokens=max_output_tokens,
+        require_streaming=True,
     )
     return profile, _RecordingProvider(delegate)
 
@@ -239,7 +235,7 @@ def _successful_query(
 
 
 def _limits() -> LoopLimits:
-    return LoopLimits(max_estimated_cost_usd=_cost_limit())
+    return LoopLimits(max_estimated_cost_usd=cost_cap(_cost_limit()))
 
 
 async def test_live_tool_round_trip_has_stable_context_and_durable_completion(
@@ -354,6 +350,11 @@ async def test_live_output_exhaustion_never_becomes_normal_completion(
 ) -> None:
     """Force a live provider output limit and require an explicit failed exit."""
 
+    if subscription_billing():
+        pytest.skip(
+            "the ChatGPT subscription surface ignores max_output_tokens, so only "
+            "API billing can force a live output limit"
+        )
     profile, provider = _live_provider(max_output_tokens=64)
     async with AsyncExitStack() as resources:
         resources.push_async_callback(provider.close)
@@ -425,7 +426,7 @@ async def test_live_fallback_provider_stays_sticky_through_tool_completion(
                 ),
             ),
             retry_policy=RetryPolicy(
-                max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+                max_attempts_per_candidate=1, max_total_attempts=2, backoff_seconds=0
             ),
         )
         database = tmp_path / "stage-a-fallback.sqlite"

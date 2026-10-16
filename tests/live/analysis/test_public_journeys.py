@@ -15,6 +15,7 @@ from daita import Agent, AgentConfig, LocalWorkspace
 from daita._json import canonical_json
 from daita.loop.models import LoopLimits
 from daita.tui.app import DaitaApp
+from tests.support.live_billing import subscription_billing
 
 pytestmark = pytest.mark.requires_llm
 
@@ -68,7 +69,8 @@ async def retain_evidence(agent, result, report):
     generations = [record for record in records if record.kind == "generation"]
     report["cleanup"] = [record.facts.get("cleanup") for record in generations]
     assert result.kind.value == "completed", report
-    assert result.usage.cost_estimate.amount_usd is not None
+    if not subscription_billing():
+        assert result.usage.cost_estimate.amount_usd is not None
     assert generations
     for record in generations:
         assert record.facts["cleanup"]["process_reaped"] is True
@@ -213,6 +215,13 @@ async def test_real_model_dependent_cells_and_error_correction(
         await provider.close()
 
 
+@pytest.mark.skipif(
+    subscription_billing(),
+    reason=(
+        "the CLI subprocess resolves Daita's own model credentials, which "
+        "subscription test billing never reads"
+    ),
+)
 async def test_real_model_cli_python_and_broker(tmp_path, paid_case, analysis_report):
     profile, provider, cost = paid_case
     workspace = tmp_path / "workspace"

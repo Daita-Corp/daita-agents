@@ -65,36 +65,37 @@ def analysis_report(request):
 @pytest.fixture
 def paid_case():
     global _RESERVED
-    from dotenv import load_dotenv
+    from tests.support.live_billing import cost_cap, live_provider
 
-    from daita.llm.factory import create_llm_provider
-    from daita.llm.profiles import reviewed_model_profile
-
-    load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
     per_run = positive_decimal("DAITA_ANALYSIS_LIVE_MAX_COST_USD", "0.50")
     aggregate = positive_decimal("DAITA_ANALYSIS_LIVE_SUITE_MAX_COST_USD", "5.00")
     if _RESERVED + per_run > aggregate:
         pytest.fail("The finite aggregate model-cost ceiling is exhausted")
     _RESERVED += per_run
     model_id = os.environ.get("DAITA_ANALYSIS_LIVE_MODEL_ID", "openai:gpt-5.6-terra")
-    profile = reviewed_model_profile(model_id)
     key_name = {
         "openai": "OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
         "gemini": "GOOGLE_API_KEY",
         "grok": "XAI_API_KEY",
     }.get(model_id.partition(":")[0])
-    key = os.environ.get("DAITA_ANALYSIS_LIVE_LLM_API_KEY") or (
-        os.environ.get(key_name) if key_name else None
-    )
-    if profile is None or not profile.supports_tools or not key:
-        pytest.fail(
-            "Live analysis needs a reviewed tool-capable model and configured credentials"
+
+    def api_key() -> str:
+        from dotenv import load_dotenv
+
+        load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
+        key = os.environ.get("DAITA_ANALYSIS_LIVE_LLM_API_KEY") or (
+            os.environ.get(key_name) if key_name else None
         )
-    provider = create_llm_provider(
-        model_id, api_key=key, max_output_tokens=min(profile.max_output_tokens, 2048)
-    )
-    return profile, provider, per_run
+        if not key:
+            pytest.fail(
+                "Live analysis needs a reviewed tool-capable model and configured "
+                "credentials"
+            )
+        return key
+
+    profile, provider = live_provider(model_id, api_key=api_key, max_output_tokens=2048)
+    return profile, provider, cost_cap(per_run)
 
 
 @pytest.hookimpl(hookwrapper=True)
