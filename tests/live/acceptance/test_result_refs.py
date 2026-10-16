@@ -2,7 +2,8 @@
 
 Two bounded cases on a local SQLite probe home:
 
-* foreground: query a table summary, then make a CSV of that query result;
+* foreground: query a table summary, then make a CSV of that query result
+  without querying again (a derived table that cites the query);
 * graph: a durable model worker runs its read and finishes with task_complete.
 
 Pass condition: the right result is referenced on the first try, and no call is
@@ -147,8 +148,9 @@ async def test_l8_csv_of_a_query_result_cites_that_result(
     )
     try:
         result = await agent.run(
-            "Use one query to count the rows in every table of this source. "
-            "Then make a CSV of that query result.",
+            "Use one query to count the rows in every table of this source and "
+            "show me the counts. Then, without querying again, make a CSV of the "
+            "counts that query returned.",
             source_scope_ids=(home.source_id,),
         )
         assert result.kind is LoopExitKind.COMPLETED
