@@ -99,9 +99,8 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
 
     assert catalog.context_reads == 1
     assert catalog.sensitivity_reads == 1
-    assert (
-        snapshot.static_context_sha256
-        == (second.sensitivity_provenance["static_context_sha256"])
+    assert snapshot.static_context_sha256 == (
+        second.sensitivity_provenance["static_context_sha256"]
     )
     assert first.messages[0] == second.messages[0]
     assert "changed-after-prepare" not in repr(second.messages[0])

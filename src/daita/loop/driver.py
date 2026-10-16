@@ -987,7 +987,9 @@ class AgentLoop:
                 _completed_steps(messages[current_start:]),
                 usage,
                 run_started,
-                provider_id=error.provider_id,
+                # A bare injected provider does not stamp its own identity, and
+                # a failure diagnostic is only valid with one.
+                provider_id=error.provider_id or self._model.provider_id,
                 provider_failure=error.diagnostic,
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),

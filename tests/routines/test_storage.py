@@ -495,16 +495,18 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
                     CostEstimate.partial(Decimal("0.01"), code="provider_usage_missing")
                     if usage_case == "unknown"
                     # A replayed stall adds an attempt that reported no usage.
-                    else CostEstimate.unavailable("multiple_incomplete_reasons")
-                    if usage_case == "subscription_replayed_stall"
                     else (
-                        CostEstimate.unavailable("subscription_billing")
-                        if unpriced
-                        else CostEstimate.complete(
-                            Decimal(
-                                "0.08"
-                                if usage_case == "overrun"
-                                else ("0.01" if usage_case == "once" else "0")
+                        CostEstimate.unavailable("multiple_incomplete_reasons")
+                        if usage_case == "subscription_replayed_stall"
+                        else (
+                            CostEstimate.unavailable("subscription_billing")
+                            if unpriced
+                            else CostEstimate.complete(
+                                Decimal(
+                                    "0.08"
+                                    if usage_case == "overrun"
+                                    else ("0.01" if usage_case == "once" else "0")
+                                )
                             )
                         )
                     )

@@ -29,6 +29,12 @@ from daita.jobs.graph.admission import (
 from daita.jobs.graph.context import TaskContextBundle
 from daita.jobs.graph.models import AttemptState, GraphState, TaskRole, TaskState
 from daita.jobs.supervisor import _fair_graph_dispatch_order
+from daita.llm.errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
+)
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -320,6 +326,42 @@ async def test_normal_assistant_text_is_protocol_violation_and_bounded_retry(
         assert work.attempt_count == 2
         assert terminal.results == ()
         assert integration.reader.calls == []
+        integration.provider.assert_consumed()
+    finally:
+        await integration.close()
+
+
+async def test_model_stall_fails_the_attempt_and_retries_the_task(
+    tmp_path: Path,
+) -> None:
+    stall = ModelProviderError(
+        ProviderErrorCode.TIMEOUT,
+        usage=ModelUsage(
+            cost_estimate=CostEstimate.unavailable("model_attempt_interrupted")
+        ),
+        diagnostic=ProviderFailureDiagnostic(
+            phase=ProviderFailurePhase.PROVIDER_BOUNDARY, code="first_progress"
+        ),
+    )
+    integration = await ModelGraphIntegration.open(
+        tmp_path, script=(stall, *successful_script())
+    )
+    try:
+        admission = integration.build()
+        await integration.admit_and_start(admission)
+        terminal = await integration.wait_terminal(admission.job.job_id)
+
+        assert terminal.job.state is GraphState.SUCCEEDED
+        work = next(item for item in terminal.tasks if item.role is TaskRole.WORKER)
+        attempts = sorted(
+            (item for item in terminal.attempts if item.task_id == work.task_id),
+            key=lambda item: item.ordinal,
+        )
+        assert [item.state for item in attempts] == [
+            AttemptState.FAILED,
+            AttemptState.SUCCEEDED,
+        ]
+        assert attempts[0].error_code == "timeout"
         integration.provider.assert_consumed()
     finally:
         await integration.close()
