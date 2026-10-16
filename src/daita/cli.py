@@ -84,6 +84,7 @@ from .llm import (
 )
 from .llm.profiles import reviewed_model_profile
 from .llm.protocols import ManagedModelProvider
+from .observation import summarize_diagnostics
 from .routines.capabilities import routine_inspection_projection, routine_projection
 from .security import SecretReference
 from .terminal import run_terminal_application
@@ -572,6 +573,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--files-only", action="store_true")
     run.add_argument("--events-jsonl", action="store_true")
     run.add_argument(
+        "--diagnostics-path",
+        type=Path,
+        help="append payload-free per-call diagnostics to this private JSONL file",
+    )
+    run.add_argument(
         "--max-cost-usd",
         type=Decimal,
         help="finite positive estimated model-cost ceiling for this run",
@@ -590,6 +596,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="hold one agent open so scheduled routines can make progress",
     )
     host.add_argument("--agent", dest="host_agent", required=True)
+    host.add_argument(
+        "--diagnostics-path",
+        type=Path,
+        help="append payload-free per-call diagnostics to this private JSONL file",
+    )
+
+    diagnostics = commands.add_parser(
+        "diagnostics",
+        help="summarize a private per-call diagnostics file",
+    )
+    diagnostic_commands = diagnostics.add_subparsers(
+        dest="diagnostics_command", required=True
+    )
+    diagnostic_summary = diagnostic_commands.add_parser(
+        "summary",
+        help="group model attempts, tokens and largest tool results by run",
+    )
+    diagnostic_summary.add_argument("path", type=Path)
 
     jobs = commands.add_parser(
         "jobs",
@@ -864,6 +888,10 @@ def build_parser() -> argparse.ArgumentParser:
     inbox_acknowledge.add_argument("name")
     inbox_acknowledge.add_argument("delivery_id")
     return parser
+
+
+def _absolute_path(path: Path | None) -> Path | None:
+    return None if path is None else path.expanduser().absolute()
 
 
 def _write_event_jsonl(event: AgentEvent) -> None:
@@ -1470,6 +1498,8 @@ async def _execute(args: argparse.Namespace) -> object:
             raise ValueError("delete requires --yes")
         await Agent.delete(args.name, root=args.root)
         return {"name": args.name, "deleted": True}
+    if args.command == "diagnostics":
+        return {"runs": summarize_diagnostics(args.path)}
     workspace = _resolve_cli_workspace(args)
     if args.command == "create":
         agent = await Agent.create(args.name, workspace=workspace, root=args.root)
@@ -1483,6 +1513,7 @@ async def _execute(args: argparse.Namespace) -> object:
             workspace=workspace,
             root=args.root,
             on_ready=_write_resident_ready,
+            diagnostics_path=_absolute_path(args.diagnostics_path),
         )
         return {"agent": args.host_agent, "host": "stopped"}
     if args.command == "jobs":
@@ -1818,6 +1849,7 @@ async def _execute(args: argparse.Namespace) -> object:
                     workspace=workspace,
                     root=args.root,
                     observer=_write_event_jsonl if args.events_jsonl else None,
+                    diagnostics_path=_absolute_path(args.diagnostics_path),
                     limits=(
                         None
                         if args.max_cost_usd is None
@@ -1838,6 +1870,7 @@ async def _execute(args: argparse.Namespace) -> object:
                     model=provider,
                     model_profile=profile,
                     observer=_write_event_jsonl if args.events_jsonl else None,
+                    diagnostics_path=_absolute_path(args.diagnostics_path),
                     limits=(
                         None
                         if args.max_cost_usd is None

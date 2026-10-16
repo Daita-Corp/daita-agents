@@ -33,6 +33,7 @@ async def run_resident_host(
     id_factory: Callable[[str], str] | None = None,
     model: ModelProvider | None = None,
     model_profile: ModelProfile | None = None,
+    diagnostics_path: Path | None = None,
 ) -> None:
     """Run supervisors until termination while owning the normal writer lock."""
 
@@ -60,6 +61,7 @@ async def run_resident_host(
             id_factory=id_factory,
             model=model,
             model_profile=model_profile,
+            diagnostics_path=diagnostics_path,
         )
         if on_ready is not None:
             on_ready(
