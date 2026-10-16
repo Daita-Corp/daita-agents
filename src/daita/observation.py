@@ -29,6 +29,7 @@ class AgentEventKind(str, Enum):
     RUN_STARTED = "run.started"
     MODEL_TEXT_DELTA = "model.text_delta"
     MODEL_COMPLETED = "model.completed"
+    MODEL_FAILED = "model.failed"
     TOOL_STARTED = "tool.started"
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_DECIDED = "approval.decided"

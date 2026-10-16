@@ -179,6 +179,7 @@ def test_event_contract_is_immutable_bounded_and_deeply_frozen():
         AgentEventKind.RUN_STARTED,
         AgentEventKind.MODEL_TEXT_DELTA,
         AgentEventKind.MODEL_COMPLETED,
+        AgentEventKind.MODEL_FAILED,
         AgentEventKind.TOOL_STARTED,
         AgentEventKind.APPROVAL_REQUESTED,
         AgentEventKind.APPROVAL_DECIDED,
@@ -297,6 +298,18 @@ async def test_text_run_order_payloads_and_durable_boundaries():
         "input_tokens",
         "context_input_tokens",
         "output_tokens",
+        "total_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "usage_status",
+        "usage_unavailable_reason",
+        "remaining_tokens_before",
+        "cost_status",
+        "cost_code",
+        "cost_amount_usd",
+        "attempt_count",
+        "attempts",
     }
     assert model_data["provider_id"] == "mock:observed"
     assert model_data["model_call_index"] == 1
@@ -642,8 +655,14 @@ async def test_cancellation_persists_then_emits_interrupted_completion():
     assert persisted.kind is LoopExitKind.INTERRUPTED
     assert _kinds(events) == (
         AgentEventKind.RUN_STARTED,
+        AgentEventKind.MODEL_FAILED,
         AgentEventKind.RUN_COMPLETED,
     )
+    failed = events[1].data.to_dict()
+    assert failed["error_code"] == "cancelled"
+    assert failed["usage_status"] == "unavailable"
+    assert failed["usage_unavailable_reason"] == "model_attempt_interrupted"
+    assert failed["input_tokens"] is None and failed["output_tokens"] is None
     assert events[-1].data["exit_kind"] == "interrupted"
     assert store.actions[-2:] == [
         "persisted:finish:interrupted",
