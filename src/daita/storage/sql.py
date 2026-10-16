@@ -118,7 +118,7 @@ from ..llm.models import (
     ModelSensitivity,
     ToolResultBlock,
 )
-from ..llm.pricing import CostEstimateStatus
+from ..llm.pricing import STALL_USAGE_UNREPORTED, CostEstimateStatus
 from ..loop.analysis import AnalysisEvidence, AnalysisTraceCapacityError
 from ..loop.models import (
     ConversationRun,
@@ -2586,10 +2586,15 @@ class SQLStateStore:
                     # charge, without discarding a larger known partial amount.
                     charged_cost = max(charged_cost, current.reserved_cost_usd)
                     charged_tokens = max(charged_tokens, current.reserved_tokens)
-                    # A token-only routine whose run reported tokens is bounded by
-                    # that charge, as when a replayed stall's attempt reported
-                    # nothing. Otherwise the run cannot be shown to fit and fails.
-                    if dollar_capped or result.usage.total_tokens == 0:
+                    # A token-only run whose unknown is a replayed stall's
+                    # unreported attempt is bounded by that charge and keeps its
+                    # outcome. Other unknown consumption fails the run.
+                    unreported_stall = (
+                        not dollar_capped
+                        and estimate.code == STALL_USAGE_UNREPORTED
+                        and result.usage.total_tokens > 0
+                    )
+                    if not unreported_stall:
                         if successful:
                             contract_failure_code = (
                                 contract_failure_code or "routine_run_usage_incomplete"

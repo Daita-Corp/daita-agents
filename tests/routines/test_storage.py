@@ -18,7 +18,7 @@ from daita.llm.models import (
     ModelUsage,
     TextBlock,
 )
-from daita.llm.pricing import CostEstimate
+from daita.llm.pricing import STALL_USAGE_UNREPORTED, CostEstimate
 from daita.loop.models import (
     InstructionAuthority,
     LoopExit,
@@ -399,6 +399,7 @@ async def test_claim_fault_rolls_back_occurrence_and_budget(
         "subscription",
         "subscription_no_tokens",
         "subscription_replayed_stall",
+        "subscription_other_unknown",
     ),
 )
 async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
@@ -487,6 +488,7 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
                             "once",
                             "subscription",
                             "subscription_replayed_stall",
+                            "subscription_other_unknown",
                         }
                         else 0
                     )
@@ -495,8 +497,11 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
                     CostEstimate.partial(Decimal("0.01"), code="provider_usage_missing")
                     if usage_case == "unknown"
                     # A replayed stall adds an attempt that reported no usage.
-                    else CostEstimate.unavailable("multiple_incomplete_reasons")
+                    else CostEstimate.unavailable(STALL_USAGE_UNREPORTED)
                     if usage_case == "subscription_replayed_stall"
+                    # Other unknown consumption on an unpriced route still fails.
+                    else CostEstimate.unavailable("multiple_incomplete_reasons")
+                    if usage_case == "subscription_other_unknown"
                     else (
                         CostEstimate.unavailable("subscription_billing")
                         if unpriced

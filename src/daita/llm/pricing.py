@@ -986,6 +986,9 @@ def provider_reported_cost_estimate(
     )
 
 
+STALL_USAGE_UNREPORTED = "stall_usage_unreported"
+
+
 def aggregate_cost_estimates(estimates: Iterable[CostEstimate]) -> CostEstimate:
     """Aggregate attempt estimates without inventing prices for unknown work."""
 
@@ -1568,10 +1571,15 @@ def _incomplete_code(estimates: tuple[CostEstimate, ...]) -> str:
     )
     if len(codes) == 1:
         return codes[0]
+    # A stalled attempt's unreported consumption is the unknown that routine
+    # settlement charges conservatively, so it names the combined reason.
+    if STALL_USAGE_UNREPORTED in codes:
+        return STALL_USAGE_UNREPORTED
     return "multiple_incomplete_reasons"
 
 
 __all__ = [
+    "STALL_USAGE_UNREPORTED",
     "BillableQuantity",
     "CostBasis",
     "CostComponent",
