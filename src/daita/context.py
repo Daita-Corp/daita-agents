@@ -124,6 +124,7 @@ _MAXIMUM_PRIOR_MESSAGES = 40
 _MAXIMUM_PRIOR_UTF8_BYTES = 24_000
 _CURRENT_RUN_GROWTH_RESERVE = 2_048
 _PROVIDER_FRAMING_TOKEN_ALLOWANCE = 512
+_FORECAST_OUTPUT_FLOOR = 2_048
 _HISTORY_OMISSION_MARKER = (
     "[Additional earlier conversation history exists outside the active window.]"
 )
@@ -1046,6 +1047,7 @@ class AgentContextBuilder:
         previous_request_input_tokens: int | None = None,
         remaining_tokens: int | None = None,
         request_input_growth_tokens: int | None = None,
+        previous_response_output_tokens: int | None = None,
         remaining_steps: int | None = None,
     ) -> ModelRequest:
         """Project one request from immutable static context plus exact transcript."""
@@ -1144,6 +1146,7 @@ class AgentContextBuilder:
             status += f"Token budget left for this run (not a routine ceiling): {remaining_tokens} tokens."
         for value, name in (
             (request_input_growth_tokens, "request input growth"),
+            (previous_response_output_tokens, "previous response output"),
             (remaining_steps, "remaining steps"),
         ):
             if value is not None and (type(value) is not int or value < 0):
@@ -1162,17 +1165,22 @@ class AgentContextBuilder:
             # growth once for this request and twice for its continuation, with
             # an output allowance for both. No bytes become billing estimates;
             # unseen schemas/results can grow faster and native admission wins.
+            # Allow each request twice the latest measured output, at least
+            # _FORECAST_OUTPUT_FLOOR and never above the profile maximum. The
+            # maximum alone (up to 128k) predicts pressure on every request.
+            output_allowance = min(
+                snapshot.profile.max_output_tokens,
+                max(_FORECAST_OUTPUT_FLOOR, 2 * (previous_response_output_tokens or 0)),
+            )
             forecast = (
-                2 * previous_request_input_tokens
-                + 3 * growth
-                + 2 * snapshot.profile.max_output_tokens
+                2 * previous_request_input_tokens + 3 * growth + 2 * output_allowance
             )
             status += (
                 f" Latest measured request input: {previous_request_input_tokens} tokens; "
                 f"recent input growth: {growth if request_input_growth_tokens is not None else 'not yet measured'}"
                 f"{' tokens' if request_input_growth_tokens is not None else ''}. "
                 f"Advisory forecast for this request plus its continuation: "
-                f"{forecast} tokens, allowing {snapshot.profile.max_output_tokens} output "
+                f"{forecast} tokens, allowing {output_allowance} output "
                 "per request; not reserved capacity or a guaranteed count. "
                 "New tools/results can grow more."
             )

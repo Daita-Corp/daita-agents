@@ -170,6 +170,40 @@ async def test_step_status_follows_the_transcript_and_keeps_a_stable_prefix():
     assert "This run has a token budget" not in repr(unbounded.messages[0])
 
 
+async def test_budget_pressure_forecast_uses_measured_output_not_profile_maximum():
+    catalog = _SnapshotCatalog()
+    profile = ModelProfile(
+        id="mock:large-output",
+        context_window_tokens=400_000,
+        max_output_tokens=128_000,
+        supports_tools=True,
+    )
+    builder = AgentContextBuilder(catalog, profile=profile)
+    run = replace(_run("run-forecast"), source_scope_ids=("source-snapshot",))
+    user = run.start_message()
+    projection = ContextToolProjectionAdapter(())
+    tools = await projection.prepare_run(run)
+    snapshot = await builder.prepare(run, (user,), tools, max_total_tokens=100_000)
+
+    def status(remaining: int) -> str:
+        request = builder.project(
+            snapshot,
+            (user,),
+            step=2,
+            tool_context=projection.project(tools, (user,)),
+            remaining_tokens=remaining,
+            previous_request_input_tokens=2_000,
+            request_input_growth_tokens=500,
+            previous_response_output_tokens=150,
+        )
+        return repr(request.messages[-1])
+
+    # 2 x 2,000 input + 3 x 500 growth + 2 x 2,048 output floor = 9,596 tokens.
+    assert "9596 tokens, allowing 2048 output" in status(98_000)
+    assert "Budget pressure" not in status(98_000)
+    assert "Budget pressure" in status(9_000)
+
+
 async def test_optional_context_uses_run_allowance_without_rejecting_mandatory_input():
     catalog = _SnapshotCatalog()
     profile = ModelProfile(

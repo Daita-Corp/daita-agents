@@ -130,6 +130,7 @@ class ContextBuilder(Protocol):
         previous_request_input_tokens: int | None = None,
         remaining_tokens: int | None = None,
         request_input_growth_tokens: int | None = None,
+        previous_response_output_tokens: int | None = None,
         remaining_steps: int | None = None,
     ) -> ModelRequest: ...
 
@@ -538,6 +539,7 @@ class AgentLoop:
         sensitivity = run.history_sensitivity
         previous_request_input_tokens: int | None = None
         request_input_growth_tokens: int | None = None
+        previous_response_output_tokens: int | None = None
         checkpoint_warning_emitted = False
         run_route: object | None = None if prepared is None else prepared.run_route
         limits = (
@@ -620,6 +622,7 @@ class AgentLoop:
                         0, limits.max_total_tokens - usage.total_tokens
                     ),
                     request_input_growth_tokens=request_input_growth_tokens,
+                    previous_response_output_tokens=previous_response_output_tokens,
                     remaining_steps=limits.max_steps - step + 1,
                 )
                 sensitivity = max(
@@ -731,6 +734,7 @@ class AgentLoop:
                     else None
                 )
                 previous_request_input_tokens = response.request_input_tokens
+                previous_response_output_tokens = response.usage.output_tokens
                 assistant = _assistant_message(response)
                 if self._observer is not None:
                     assert model_duration_ms is not None

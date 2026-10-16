@@ -681,6 +681,7 @@ class _LoopContext:
         previous_request_input_tokens=None,
         remaining_tokens=None,
         request_input_growth_tokens=None,
+        previous_response_output_tokens=None,
         remaining_steps=None,
     ):
         del step, previous_request_input_tokens, tool_context
