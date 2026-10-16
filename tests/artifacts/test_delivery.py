@@ -364,18 +364,23 @@ async def test_delivery_late_cancellation_may_leave_only_a_complete_verified_use
         tmp_path, "delivery-late-cancel", downloads
     )
     published = threading.Event()
+    cancelled = threading.Event()
     original_link = delivery_module.os.link
 
     def observed_link(*args, **kwargs):
         result = original_link(*args, **kwargs)
         published.set()
+        # Hold the save after publication until cancellation is requested, so
+        # a loaded runner cannot finish the save before the cancel lands.
+        cancelled.wait(5)
         return result
 
     monkeypatch.setattr(delivery_module.os, "link", observed_link)
     try:
         saving = asyncio.create_task(agent.save_artifact(artifact_id))
-        await asyncio.to_thread(published.wait, 2)
+        assert await asyncio.to_thread(published.wait, 5)
         saving.cancel()
+        cancelled.set()
         with pytest.raises(asyncio.CancelledError):
             await saving
         copies = tuple(downloads.iterdir())
