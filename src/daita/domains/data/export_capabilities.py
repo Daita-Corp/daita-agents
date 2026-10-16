@@ -1503,7 +1503,9 @@ def artifact_capability_declarations(
         description=(
             "Publish one committed artifact either as a collision-safe new file in "
             "an authorized destination or as an atomic replacement of only the exact "
-            "unchanged local file bound into a text-edit artifact."
+            "unchanged local file bound into a text-edit artifact. Use only when the "
+            "user explicitly asks for a download or local copy; a created artifact "
+            "is already the deliverable."
         ),
         input_schema={
             "type": "object",
@@ -1679,7 +1681,10 @@ def artifact_capability_declarations(
                         load_mode=ToolLoadMode.ON_DEMAND,
                         text_trust=ToolTextTrust.CODE,
                         summary="Save a committed artifact locally or replace its bound local file.",
-                        when_to_use="Use after artifact creation when local delivery is required.",
+                        when_to_use=(
+                            "Use only when the user explicitly asks to download or "
+                            "save an artifact locally; creating one needs no save."
+                        ),
                         keywords=("artifact", "save", "deliver", "local"),
                     ),
                 ),

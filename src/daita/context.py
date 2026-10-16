@@ -3405,8 +3405,10 @@ def _tool_guidance(
                     )
                 )
                 instructions.append(
-                    'For each new artifact use mode="create_new" and destination_id="default" '
-                    "unless another projected destination was selected; one call per new "
+                    "Creating an artifact is the deliverable; save it locally only when "
+                    "the user explicitly asks to download it or save it to a folder. "
+                    'Then use mode="create_new" and destination_id="default" unless '
+                    "another projected destination was selected; one call per requested "
                     "artifact. Bound edits instead use mode=replace_bound_file."
                 )
             else:
