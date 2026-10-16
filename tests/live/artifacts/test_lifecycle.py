@@ -172,7 +172,7 @@ async def test_live_model_artifact_creation_reuse_and_deletion_survive_reopen(
         resources.push_async_callback(agent.close)
         await agent.set_export_destination(downloads)
         created = await agent.run(
-            "Create two plain-text artifacts using artifact_create_document with format txt. "
+            "Create two plain-text artifacts using artifact_create with from=document and format txt. "
             "The first is named lifecycle-proof.txt. "
             f"Its entire content must be exactly this string: {_CONTENT!r}. "
             "The second is named retained-control.txt. Its entire content must be "
@@ -190,7 +190,7 @@ async def test_live_model_artifact_creation_reuse_and_deletion_survive_reopen(
             len(
                 [
                     block
-                    for _, block in _exchanges(original, "artifact_create_document")
+                    for _, block in _exchanges(original, "artifact_create")
                     if not block.is_error
                 ]
             )

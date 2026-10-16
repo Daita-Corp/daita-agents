@@ -29,9 +29,8 @@ from daita.capabilities import (
 )
 from daita.domains.data.export_capabilities import (
     ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
-    ARTIFACT_CREATE_TABULAR_TOOL_NAME,
+    ARTIFACT_CREATE_TOOL_NAME,
     ARTIFACT_READ_TOOL_NAME,
-    DOCUMENT_CREATE_TOOL_NAME,
     artifact_capability_declarations,
 )
 from daita.llm.models import (
@@ -109,13 +108,14 @@ class _LineageTamperingProvider(ToolboxAwareMockModelProvider):
             (
                 _call(
                     "evidence",
-                    DOCUMENT_CREATE_TOOL_NAME,
-                    {"format": "txt", "content": "alpha\n"},
+                    ARTIFACT_CREATE_TOOL_NAME,
+                    {"from": "document", "format": "txt", "content": "alpha\n"},
                 ),
                 _call(
                     "table",
-                    ARTIFACT_CREATE_TABULAR_TOOL_NAME,
+                    ARTIFACT_CREATE_TOOL_NAME,
                     {
+                        "from": "table",
                         "columns": ["answer"],
                         "rows": [["alpha"]],
                         "format": "csv",
@@ -170,12 +170,12 @@ class _LineageTamperingProvider(ToolboxAwareMockModelProvider):
         return await super().generate(request)
 
 
-def test_artifact_create_tabular_is_one_bounded_source_neutral_tool() -> None:
+def test_artifact_create_table_is_one_bounded_source_neutral_tool() -> None:
     declarations = artifact_capability_declarations()
     views = tuple(
         item
         for item in declarations.tool_views
-        if item.name == ARTIFACT_CREATE_TABULAR_TOOL_NAME
+        if item.name == ARTIFACT_CREATE_TOOL_NAME
     )
     assert len(views) == 1
     (view,) = views
@@ -225,20 +225,60 @@ def test_artifact_create_tabular_is_one_bounded_source_neutral_tool() -> None:
     assert isinstance(columns.get("maxItems"), int)
 
 
-async def test_artifact_create_tabular_commits_derived_csv_from_current_run_evidence(
+@pytest.mark.parametrize(
+    ("source", "arguments"),
+    (
+        ("document", {"format": "txt", "content": "x", "columns": ["a"]}),
+        ("table", {"format": "csv", "columns": ["a"], "rows": [], "content": "x"}),
+        ("tool_result", {"result_ref": "r1", "artifact_id": "artifact-" + "0" * 32}),
+        (
+            "artifact",
+            {"artifact_id": "artifact-" + "0" * 32, "format": "csv", "rows": []},
+        ),
+    ),
+)
+async def test_artifact_create_rejects_arguments_of_another_source(
+    tmp_path: Path, source: str, arguments: dict[str, object]
+) -> None:
+    provider = ToolboxAwareMockModelProvider(
+        (
+            _call("wrong", ARTIFACT_CREATE_TOOL_NAME, {"from": source, **arguments}),
+            ModelResponse(finish_reason=FinishReason.STOP, text="done"),
+        ),
+        provider_id="mock:artifact-create-routes",
+    )
+    agent = await Agent.create(
+        "artifact-create-routes",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        result = await agent.run("Create the artifact.")
+        transcript = await agent.transcript(result.run_id)
+    finally:
+        await agent.close()
+    assert result.artifacts == ()
+    assert _error_code(_tool_result(transcript, "wrong")) == "invalid_argument_for_mode"
+
+
+async def test_artifact_create_table_commits_derived_csv_from_current_run_evidence(
     tmp_path: Path,
 ) -> None:
     provider = ToolboxAwareMockModelProvider(
         (
             _call(
                 "evidence",
-                DOCUMENT_CREATE_TOOL_NAME,
-                {"format": "txt", "content": "alpha\n"},
+                ARTIFACT_CREATE_TOOL_NAME,
+                {"from": "document", "format": "txt", "content": "alpha\n"},
             ),
             _call(
                 "table",
-                ARTIFACT_CREATE_TABULAR_TOOL_NAME,
+                ARTIFACT_CREATE_TOOL_NAME,
                 {
+                    "from": "table",
                     "columns": ["answer", "count"],
                     "rows": [["alpha", 1]],
                     "format": "csv",
@@ -309,8 +349,9 @@ async def test_mcp_result_can_feed_tabular_and_document_artifacts_with_inherited
             _call("mcp-result", mcp_tool_name, {"query": "alpha"}),
             _call(
                 "table",
-                ARTIFACT_CREATE_TABULAR_TOOL_NAME,
+                ARTIFACT_CREATE_TOOL_NAME,
                 {
+                    "from": "table",
                     "columns": ["answer"],
                     "rows": [["alpha"]],
                     "format": "csv",
@@ -319,8 +360,9 @@ async def test_mcp_result_can_feed_tabular_and_document_artifacts_with_inherited
             ),
             _call(
                 "document",
-                DOCUMENT_CREATE_TOOL_NAME,
+                ARTIFACT_CREATE_TOOL_NAME,
                 {
+                    "from": "document",
                     "format": "txt",
                     "content": "The admitted result was alpha.\n",
                 },
@@ -395,11 +437,17 @@ async def test_document_evidence_is_derived_from_the_reads_before_it(
     document = {"format": "txt", "content": "Findings.\n"}
     provider = ToolboxAwareMockModelProvider(
         (
-            _call("early-document", DOCUMENT_CREATE_TOOL_NAME, document),
+            _call(
+                "early-document",
+                ARTIFACT_CREATE_TOOL_NAME,
+                {"from": "document", **document},
+            ),
             _call("read-a", lookup, {"query": "alpha"}),
             _call("failed-read", lookup, {"query": ""}),
             _call("read-b", lookup, {"query": "beta"}),
-            _call("document", DOCUMENT_CREATE_TOOL_NAME, document),
+            _call(
+                "document", ARTIFACT_CREATE_TOOL_NAME, {"from": "document", **document}
+            ),
             _call("read-c", lookup, {"query": "gamma"}),
             ModelResponse(finish_reason=FinishReason.STOP, text="done"),
         ),
@@ -430,24 +478,25 @@ async def test_document_evidence_is_derived_from_the_reads_before_it(
         for call in message.tool_calls
         if call.id == "document"
     )
-    assert dict(document_call.arguments) == document
+    assert dict(document_call.arguments) == {"from": "document", **document}
 
 
-async def test_artifact_create_tabular_rejects_cross_run_evidence(
+async def test_artifact_create_table_rejects_cross_run_evidence(
     tmp_path: Path,
 ) -> None:
     provider = ToolboxAwareMockModelProvider(
         (
             _call(
                 "evidence",
-                DOCUMENT_CREATE_TOOL_NAME,
-                {"format": "txt", "content": "alpha\n"},
+                ARTIFACT_CREATE_TOOL_NAME,
+                {"from": "document", "format": "txt", "content": "alpha\n"},
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="first done"),
             _call(
                 "table",
-                ARTIFACT_CREATE_TABULAR_TOOL_NAME,
+                ARTIFACT_CREATE_TOOL_NAME,
                 {
+                    "from": "table",
                     "columns": ["answer"],
                     "rows": [["alpha"]],
                     "format": "csv",
@@ -483,7 +532,7 @@ async def test_artifact_create_tabular_rejects_cross_run_evidence(
     assert _error_code(table_result) == "result_ref_invalid"
 
 
-async def test_artifact_create_tabular_rejects_tampered_execution_lineage(
+async def test_artifact_create_table_rejects_tampered_execution_lineage(
     tmp_path: Path,
 ) -> None:
     provider = _LineageTamperingProvider()
@@ -543,8 +592,9 @@ async def test_relational_evidence_preserves_exact_current_resource_bindings(
             ),
             _call(
                 "table",
-                ARTIFACT_CREATE_TABULAR_TOOL_NAME,
+                ARTIFACT_CREATE_TOOL_NAME,
                 {
+                    "from": "table",
                     "columns": ["answer", "count"],
                     "rows": [["alpha", 1]],
                     "format": "html",
@@ -581,13 +631,14 @@ async def test_artifact_read_previews_model_authored_xlsx_data(
         (
             _call(
                 "evidence",
-                DOCUMENT_CREATE_TOOL_NAME,
-                {"format": "txt", "content": "alpha\n"},
+                ARTIFACT_CREATE_TOOL_NAME,
+                {"from": "document", "format": "txt", "content": "alpha\n"},
             ),
             _call(
                 "table",
-                ARTIFACT_CREATE_TABULAR_TOOL_NAME,
+                ARTIFACT_CREATE_TOOL_NAME,
                 {
+                    "from": "table",
                     "columns": ["formula", "count"],
                     "rows": [["=1+1", 2]],
                     "format": "xlsx",

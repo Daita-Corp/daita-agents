@@ -589,8 +589,8 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["memory_set"] == "memory"
         assert resolved["skill_view"] == "skills"
         assert resolved["semantic_list"] == "semantics"
-        assert resolved["artifact_create_document"] == "artifacts"
-        assert resolved["artifact_create_tabular"] == "artifacts"
+        assert resolved["artifact_create"] == "artifacts"
+        assert resolved["artifact_create"] == "artifacts"
         assert resolved["start_data_profile"] == "data_profile_jobs"
         assert resolved["job_list"] == "jobs"
         assert resolved["routine_list"] == "routines"
@@ -1415,7 +1415,7 @@ def test_artifact_continuity_uses_current_context_and_export_owners():
         assert obsolete_history_owner not in context
     assert 'ARTIFACT_LIST_TOOL_NAME = "artifact_list"' in exports
     assert 'ARTIFACT_READ_TOOL_NAME = "artifact_read"' in exports
-    assert 'ARTIFACT_CONVERT_TOOL_NAME = "artifact_convert"' in exports
+    assert 'ARTIFACT_CREATE_TOOL_NAME = "artifact_create"' in exports
     assert "artifact_list" not in (PACKAGE / "agent.py").read_text(encoding="utf-8")
     assert "artifact_list" not in (PACKAGE / "hosting" / "embedded.py").read_text(
         encoding="utf-8"

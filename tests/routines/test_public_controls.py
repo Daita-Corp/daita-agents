@@ -480,8 +480,9 @@ async def test_public_source_free_once_routine_commits_required_document(
                 tool_calls=(
                     ToolCall(
                         "write-brief",
-                        "artifact_create_document",
+                        "artifact_create",
                         {
+                            "from": "document",
                             "format": "markdown",
                             "content": "# Local briefing\nNo outside research was requested.",
                         },

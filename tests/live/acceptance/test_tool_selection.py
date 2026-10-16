@@ -380,10 +380,10 @@ async def test_live_markdown_report_is_created_then_saved_with_receipt(
     assert result.final_text is not None
     exchanges = _exchanges(transcript)
     names = tuple(call.name for call, _block in exchanges)
-    assert names.index("toolbox_load") < names.index("artifact_create_document")
-    assert names.index("artifact_create_document") < names.index("artifact_save_local")
+    assert names.index("toolbox_load") < names.index("artifact_create")
+    assert names.index("artifact_create") < names.index("artifact_save_local")
     initial = {tool.name for tool in provider.requests[0].tools}
-    assert "artifact_create_document" not in initial
+    assert "artifact_create" not in initial
     assert "artifact_save_local" not in initial
     assert len(result.artifacts) == 1
     assert len(result.artifact_deliveries) == 1

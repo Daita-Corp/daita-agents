@@ -200,7 +200,7 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
                     "read-preview",
                     "python_execute",
                     {
-                        "code": f"r=tools.call('artifact_read', {{'artifact_id':{artifact.artifact_id!r}}})\nassert not r['is_error']\nprint(r['output']['data']['text'])\nlisting=tools.call('artifact_list', {{}})\nassert not listing['is_error']\ndenied=tools.call('artifact_create_document', {{}})\nassert denied['is_error']",
+                        "code": f"r=tools.call('artifact_read', {{'artifact_id':{artifact.artifact_id!r}}})\nassert not r['is_error']\nprint(r['output']['data']['text'])\nlisting=tools.call('artifact_list', {{}})\nassert not listing['is_error']\ndenied=tools.call('artifact_create', {{'from': 'document'}})\nassert denied['is_error']",
                         "expected_state": {"generation": 0, "revision": 0},
                     },
                 ),

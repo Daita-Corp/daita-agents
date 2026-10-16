@@ -3387,11 +3387,11 @@ def _tool_guidance(
             for capability, description in (
                 (
                     DOCUMENT_CREATE_CAPABILITY_ID,
-                    "artifact_create_document for Markdown/TXT.",
+                    "artifact_create from=document for Markdown/TXT.",
                 ),
                 (
                     ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
-                    "artifact_create_tabular creates a bounded derived CSV/XLSX/HTML table from authenticated current-run result IDs and bounded model-authored rows.",
+                    "artifact_create from=table creates a bounded derived CSV/XLSX/HTML table from authenticated current-run result IDs and bounded model-authored rows.",
                 ),
                 (
                     DATA_EXPORT_TABULAR_CAPABILITY_ID,
@@ -3399,7 +3399,7 @@ def _tool_guidance(
                 ),
                 (
                     ARTIFACT_CONVERT_CAPABILITY_ID,
-                    "artifact_convert only converts a verified Daita XLSX Data snapshot to CSV; never rerun a source or supply artifact bytes for conversion.",
+                    "artifact_create from=artifact only converts a verified Daita XLSX Data snapshot to CSV; never rerun a source or supply artifact bytes for conversion.",
                 ),
             ):
                 if capability in capability_ids:

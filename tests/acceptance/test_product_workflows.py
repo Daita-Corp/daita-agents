@@ -159,7 +159,7 @@ async def test_once_mcp_research_creates_sourced_briefing_and_inbox_while_host_o
                     {
                         "tool_names": (
                             fixture.research.local_name,
-                            "artifact_create_document",
+                            "artifact_create",
                         )
                     },
                 )
@@ -172,8 +172,9 @@ async def test_once_mcp_research_creates_sourced_briefing_and_inbox_while_host_o
             response(
                 ToolCall(
                     "briefing",
-                    "artifact_create_document",
+                    "artifact_create",
                     {
+                        "from": "document",
                         "format": "markdown",
                         "content": "# Competitor briefing\n[Research source](https://research.test/report) reports improved status. Coverage is limited; researched claims are not exhaustive.",
                     },

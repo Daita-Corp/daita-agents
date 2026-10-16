@@ -362,8 +362,9 @@ async def test_hosted_artifact_read_save_and_delete_follow_run_caller(tmp_path, 
                 tool_calls=(
                     ToolCall(
                         id="create-artifact",
-                        name="artifact_create_document",
+                        name="artifact_create",
                         arguments={
+                            "from": "document",
                             "format": "txt",
                             "filename": "alice.txt",
                             "content": "Alice owns this artifact.",

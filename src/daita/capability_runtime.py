@@ -4734,6 +4734,23 @@ def _tool_contract(
             data_access=entry.capability.access_mode.value,
             operational_effect=entry.capability.operational_effect.value,
         )
+        if entry.routes:
+            # A routed tool's top-level schema is its primary route; each
+            # admitted route keeps its own complete contract here.
+            contract.update(
+                route_argument=entry.view.mode_argument,
+                routes=[
+                    {
+                        "route": mode,
+                        "capability_id": route.capability.id,
+                        "input_schema": route.capability.input_schema,
+                        "output_kind": route.capability.output_kind,
+                        "data_access": route.capability.access_mode.value,
+                        "operational_effect": route.capability.operational_effect.value,
+                    }
+                    for mode, route in entry.routes
+                ],
+            )
     return contract
 
 

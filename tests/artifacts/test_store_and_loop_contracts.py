@@ -624,8 +624,9 @@ def _document_script() -> tuple[ModelResponse, ...]:
             tool_calls=(
                 ToolCall(
                     id="create",
-                    name="artifact_create_document",
+                    name="artifact_create",
                     arguments={
+                        "from": "document",
                         "format": "txt",
                         "filename": "notes.txt",
                         "content": "retained notes",

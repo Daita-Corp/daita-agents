@@ -221,7 +221,7 @@ async def run() -> None:
                             "tool_names": (
                                 tools["research"].local_name,
                                 tools["notify"].local_name,
-                                "artifact_create_document",
+                                "artifact_create",
                             )
                         },
                     ),
@@ -232,8 +232,9 @@ async def run() -> None:
                     ),
                     tool_response(
                         "brief",
-                        "artifact_create_document",
+                        "artifact_create",
                         {
+                            "from": "document",
                             "format": "markdown",
                             "content": "# Example briefing\n[Source](https://example.test/research) reports growth. Fictional research; coverage is incomplete.",
                         },

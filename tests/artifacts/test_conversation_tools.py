@@ -25,11 +25,10 @@ from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import ToolExecution
 from daita.catalog.models import Sensitivity
 from daita.domains.data.export_capabilities import (
-    ARTIFACT_CONVERT_TOOL_NAME,
+    ARTIFACT_CREATE_TOOL_NAME,
     ARTIFACT_LIST_TOOL_NAME,
     ARTIFACT_READ_TOOL_NAME,
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-    DOCUMENT_CREATE_TOOL_NAME,
     ArtifactListExecutor,
     ArtifactReadExecutor,
 )
@@ -198,8 +197,9 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
             _tools(
                 ToolCall(
                     id="other-document",
-                    name=DOCUMENT_CREATE_TOOL_NAME,
+                    name=ARTIFACT_CREATE_TOOL_NAME,
                     arguments={
+                        "from": "document",
                         "format": "txt",
                         "filename": "other.txt",
                         "content": "not part of the first conversation",
@@ -218,8 +218,9 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
             _tools(
                 ToolCall(
                     id="convert",
-                    name=ARTIFACT_CONVERT_TOOL_NAME,
+                    name=ARTIFACT_CREATE_TOOL_NAME,
                     arguments={
+                        "from": "artifact",
                         "artifact_id": xlsx_id,
                         "format": "csv",
                         "filename": "records-converted.csv",
@@ -254,8 +255,12 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
             _tools(
                 ToolCall(
                     id="cross-convert",
-                    name=ARTIFACT_CONVERT_TOOL_NAME,
-                    arguments={"artifact_id": xlsx_id, "format": "csv"},
+                    name=ARTIFACT_CREATE_TOOL_NAME,
+                    arguments={
+                        "from": "artifact",
+                        "artifact_id": xlsx_id,
+                        "format": "csv",
+                    },
                 )
             ),
             _stop("conversion remained conversation scoped"),
@@ -345,8 +350,12 @@ async def test_exact_artifact_read_does_not_cross_agent_homes(tmp_path: Path) ->
             _tools(
                 ToolCall(
                     id="create",
-                    name=DOCUMENT_CREATE_TOOL_NAME,
-                    arguments={"format": "txt", "content": "private agent artifact"},
+                    name=ARTIFACT_CREATE_TOOL_NAME,
+                    arguments={
+                        "from": "document",
+                        "format": "txt",
+                        "content": "private agent artifact",
+                    },
                 )
             ),
             _stop("created"),
@@ -405,16 +414,20 @@ async def test_artifact_convert_rejects_non_xlsx_without_creating_a_child(
             _tools(
                 ToolCall(
                     id="create",
-                    name=DOCUMENT_CREATE_TOOL_NAME,
-                    arguments={"format": "txt", "content": "hello"},
+                    name=ARTIFACT_CREATE_TOOL_NAME,
+                    arguments={"from": "document", "format": "txt", "content": "hello"},
                 )
             ),
             _stop("created"),
             _tools(
                 ToolCall(
                     id="convert",
-                    name=ARTIFACT_CONVERT_TOOL_NAME,
-                    arguments={"artifact_id": text_id, "format": "csv"},
+                    name=ARTIFACT_CREATE_TOOL_NAME,
+                    arguments={
+                        "from": "artifact",
+                        "artifact_id": text_id,
+                        "format": "csv",
+                    },
                 )
             ),
             _stop("not converted"),
@@ -480,8 +493,12 @@ async def test_artifact_conversion_cancellation_leaves_no_child_or_staging(
             _tools(
                 ToolCall(
                     id="convert",
-                    name=ARTIFACT_CONVERT_TOOL_NAME,
-                    arguments={"artifact_id": xlsx_id, "format": "csv"},
+                    name=ARTIFACT_CREATE_TOOL_NAME,
+                    arguments={
+                        "from": "artifact",
+                        "artifact_id": xlsx_id,
+                        "format": "csv",
+                    },
                 )
             ),
         )

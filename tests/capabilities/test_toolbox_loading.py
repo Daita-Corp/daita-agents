@@ -407,7 +407,7 @@ async def test_terminal_step_load_does_not_create_an_extra_model_request(
                     ToolCall(
                         id="wrap-up-load",
                         name="toolbox_load",
-                        arguments={"tool_names": ["artifact_create_document"]},
+                        arguments={"tool_names": ["artifact_create"]},
                     ),
                 ),
             ),

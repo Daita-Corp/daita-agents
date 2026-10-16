@@ -228,15 +228,12 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             if registry.resolve_tool(name)[0].presentation.toolbox_id
             is ToolboxId.ARTIFACTS
         } == {
-            "artifact_convert",
-            "artifact_create_document",
-            "artifact_create_tabular",
+            "artifact_create",
             "artifact_edit_text",
             "artifact_list",
             "artifact_read",
             "artifact_save_local",
             "artifact_set_export_location",
-            "artifact_snapshot_result",
         }
         assert {
             name
@@ -258,6 +255,12 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             for name in registry.tool_names
             if registry.resolve_tool(name)[0].mode_capability_ids
         } == {
+            "artifact_create": (
+                ("table", "artifact.create_tabular"),
+                ("document", "artifact.create_document"),
+                ("tool_result", "artifact.snapshot_result"),
+                ("artifact", "artifact.convert"),
+            ),
             "data_query": (
                 ("rows", "data.query"),
                 ("csv", "data.export_tabular"),
@@ -287,7 +290,7 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
 @pytest.mark.parametrize(
     "first,second",
     [
-        ("artifact_create_document", "routine_create"),
+        ("artifact_create", "routine_create"),
         ("file_query", "artifact_edit_text"),
     ],
 )
@@ -335,8 +338,18 @@ async def test_contract_schema_survives_replacement_in_real_request(
             if isinstance(block, ToolResultBlock) and block.call_id == "inspect-first"
         )
         contract = cast(Mapping[str, Any], _data(retained))["value"]
-        definition = runtime._registry.tool_definition(first)
-        assert contract["input_schema"] == definition.input_schema
+        view, primary = runtime._registry.resolve_tool(first)
+        assert contract["input_schema"] == primary.input_schema
+        if view.mode_capability_ids:
+            assert contract["route_argument"] == view.mode_argument
+            assert [
+                (route["route"], route["capability_id"]) for route in contract["routes"]
+            ] == list(view.mode_capability_ids)
+            for route in contract["routes"]:
+                assert (
+                    route["input_schema"]
+                    == runtime._registry.capability(route["capability_id"]).input_schema
+                )
         assert contract["complete"] is True
         assert contract["input_schema_digest"]
         assert contract["contract_digest"]
@@ -481,7 +494,7 @@ async def test_static_context_stays_frozen_while_provider_definitions_change(
             run,
             catalog,
             (start,),
-            ("artifact_create_document",),
+            ("artifact_create",),
             call_id="context-load-a",
         )
         assert not result_a.is_error
@@ -501,17 +514,17 @@ async def test_static_context_stays_frozen_while_provider_definitions_change(
                 if isinstance(block, TextBlock)
             )
 
-        # This files-only prepared scope has no catalog tools. Document creation
+        # This files-only prepared scope has no catalog tools. Artifact creation
         # is loaded, while publication remains discoverable for a later step.
         assert "catalog_describe detail=schema" not in system_text(request_initial)
         assert "toolbox_load artifact_save_local" in system_text(request_a)
         assert "then invoke it from the next step" in system_text(request_a)
-        assert "artifact_convert only converts" not in system_text(request_a)
+        assert "artifact_create from=artifact only converts" in system_text(request_a)
         replacement_name = next(
             entry.view.name
             for entry in catalog.entries
             if entry.load_mode is ToolLoadMode.ON_DEMAND
-            and entry.view.name != "artifact_create_document"
+            and entry.view.name != "artifact_create"
         )
         result_b, messages_b, projection_b = await _load(
             runtime,
@@ -536,10 +549,12 @@ async def test_static_context_stays_frozen_while_provider_definitions_change(
         assert {item.name for item in request_initial.tools} != {
             item.name for item in request_a.tools
         }
-        assert "artifact_create_document" in {item.name for item in request_a.tools}
-        assert "artifact_create_document" not in {item.name for item in request_b.tools}
+        assert "artifact_create" in {item.name for item in request_a.tools}
+        assert "artifact_create" not in {item.name for item in request_b.tools}
         assert replacement_name in {item.name for item in request_b.tools}
-        assert "artifact_create_document for Markdown/TXT" not in system_text(request_b)
+        assert "artifact_create from=document for Markdown/TXT" not in system_text(
+            request_b
+        )
         assert projection_a.catalog_digest == projection_b.catalog_digest
         assert projection_a.activation_digest != projection_b.activation_digest
 

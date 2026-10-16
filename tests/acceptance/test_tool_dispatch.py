@@ -107,7 +107,7 @@ PHASE5_ROUTES = {
         (
             "toolbox_search",
             "toolbox_load",
-            "artifact_create_document",
+            "artifact_create",
             "toolbox_search",
             "toolbox_load",
             "artifact_save_local",
@@ -755,12 +755,13 @@ async def test_markdown_report_dispatch_creates_and_delivers_on_request(
             _tool(
                 "report-load-create",
                 "toolbox_load",
-                {"tool_names": ["artifact_create_document"]},
+                {"tool_names": ["artifact_create"]},
             ),
             _tool(
                 "report-create",
-                "artifact_create_document",
+                "artifact_create",
                 {
+                    "from": "document",
                     "format": "markdown",
                     "filename": "report.md",
                     "content": "# Report\n\nNorth: 15\nSouth: 20\n",
@@ -808,12 +809,12 @@ async def test_markdown_report_dispatch_creates_and_delivers_on_request(
         results = _results(transcript)
         create_matches = _data(results["report-search-create"])["matches"]
         save_matches = _data(results["report-search-save"])["matches"]
-        assert create_matches[0]["tool_name"] == "artifact_create_document"  # type: ignore[index]
+        assert create_matches[0]["tool_name"] == "artifact_create"  # type: ignore[index]
         assert save_matches[0]["tool_name"] == "artifact_save_local"  # type: ignore[index]
         save_request = provider.requests[5]
         save_surface = {tool.name for tool in save_request.tools}
         assert "artifact_save_local" in save_surface
-        assert "artifact_create_document" not in save_surface
+        assert "artifact_create" not in save_surface
         assert tuple(item.artifact_id for item in result.artifacts) == (artifact_id,)
         assert tuple(item.artifact_id for item in result.artifact_deliveries) == (
             artifact_id,

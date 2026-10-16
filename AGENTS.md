@@ -465,15 +465,18 @@ Active job artifact reservations block deletion until their attempt finishes.
 Job recovery can publish only under a currently active reservation.
 `artifact_list` returns bounded safe metadata only for the
 current conversation. `artifact_read` returns a bounded preview for an exact
-known artifact ID owned by the current agent home. `artifact_convert` supports
-only a verified Daita-generated XLSX `Data` snapshot converted to CSV and
+known artifact ID owned by the current agent home. `artifact_create` with
+`from="artifact"` supports only a verified Daita-generated XLSX `Data` snapshot converted to CSV and
 records the parent artifact. The typed owner API `Agent.list_artifacts` supplies
 bounded pages across conversations for human management in the TUI's `/artifacts`
 screen; hosted listings retain caller isolation. Model inventory remains
 conversation-scoped. There is no hidden current-file pointer, raw model
 path/byte interface, or alternate artifact execution path.
 
-`artifact_create_tabular` creates one bounded model-authored CSV, XLSX, or
+`artifact_create` routes by `from` to four unchanged capabilities: `table`,
+`document`, `tool_result` (canonical JSON snapshot) and `artifact` (XLSX to CSV
+conversion). Arguments that belong to another route are rejected before
+dispatch. `from="table"` creates one bounded model-authored CSV, XLSX, or
 HTML table from earlier successful results in the current run, cited by their
 visible `result_ref` values in `evidence_refs`. The runtime resolves each ref to
 its call, and the artifact domain authenticates each result against the immutable registry and

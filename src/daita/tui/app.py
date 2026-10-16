@@ -1410,8 +1410,7 @@ class DaitaApp(App[int]):
                 "catalog_describe": "Describing catalog",
                 "data_query": "Querying data source",
                 "python_execute": "Running Python",
-                "artifact_create_document": "Creating document",
-                "artifact_create_tabular": "Creating findings table",
+                "artifact_create": "Creating artifact",
                 "artifact_edit_text": "Preparing local file edit",
                 "artifact_save_local": "Publishing local artifact",
             }.get(

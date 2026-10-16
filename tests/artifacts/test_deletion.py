@@ -54,8 +54,9 @@ async def artifact_agent(tmp_path):
         tuple(
             _tool(
                 f"create-{index}",
-                "artifact_create_document",
+                "artifact_create",
                 {
+                    "from": "document",
                     "format": "txt",
                     "filename": f"result-{index}.txt",
                     "content": f"payload {index}",

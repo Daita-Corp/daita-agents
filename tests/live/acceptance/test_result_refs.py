@@ -158,7 +158,7 @@ async def test_l8_csv_of_a_query_result_cites_that_result(
         artifact_calls = [
             (index, call, block)
             for index, (call, block) in enumerate(pairs)
-            if call.name == "artifact_create_tabular"
+            if call.name == "artifact_create"
         ]
         assert len(artifact_calls) == 1, "the CSV must be created on the first try"
         artifact_index, artifact_call, artifact_result = artifact_calls[0]

@@ -25,8 +25,9 @@ async def test_fake_provider_markdown_vertical_slice_commits_delivers_restarts_a
         (
             _tool(
                 "create-report",
-                "artifact_create_document",
+                "artifact_create",
                 {
+                    "from": "document",
                     "format": "markdown",
                     "filename": "report.md",
                     "content": "# Report\r\n\r\nVerified content.\r\n",
