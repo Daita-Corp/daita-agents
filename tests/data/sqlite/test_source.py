@@ -400,6 +400,6 @@ async def test_invalid_sql_is_a_model_visible_tool_error(tmp_path):
         details = error.output["error"]
         assert isinstance(details, Mapping)
         assert details["code"] == "sql_validation_failed"
-        assert provider.requests[1].messages[-1] == transcript.messages[2]
+        assert provider.requests[1].messages[-2] == transcript.messages[2]
     finally:
         await agent.close()

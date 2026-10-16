@@ -99,8 +99,9 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
 
     assert catalog.context_reads == 1
     assert catalog.sensitivity_reads == 1
-    assert snapshot.static_context_sha256 == (
-        second.sensitivity_provenance["static_context_sha256"]
+    assert (
+        snapshot.static_context_sha256
+        == (second.sensitivity_provenance["static_context_sha256"])
     )
     assert first.messages[0] == second.messages[0]
     assert "changed-after-prepare" not in repr(second.messages[0])
@@ -126,6 +127,45 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
     assert "execution step limit has been reached" not in repr(first.messages[0])
     assert "execution step limit has been reached" not in repr(second.messages[0])
     assert not hasattr(snapshot, "final_static_messages")
+
+
+async def test_step_status_follows_the_transcript_and_keeps_a_stable_prefix():
+    catalog = _SnapshotCatalog()
+    profile = ModelProfile(
+        id="mock:step-status",
+        context_window_tokens=200_000,
+        max_output_tokens=4_096,
+        supports_tools=True,
+    )
+    builder = AgentContextBuilder(catalog, profile=profile)
+    run = replace(_run("run-step-status"), source_scope_ids=("source-snapshot",))
+    user = run.start_message()
+    projection = ContextToolProjectionAdapter(())
+    tools = await projection.prepare_run(run)
+    snapshot = await builder.prepare(run, (user,), tools, max_total_tokens=10_000)
+    first, second = (
+        builder.project(
+            snapshot,
+            (user,),
+            step=step,
+            tool_context=projection.project(tools, (user,)),
+            remaining_tokens=remaining,
+            remaining_steps=24 - step,
+        )
+        for step, remaining in ((1, 10_000), (2, 7_500))
+    )
+    # Budget status changes per step but never rewrites the cacheable prefix.
+    assert first.messages[:-1] == second.messages[:-1] == (first.messages[0], user)
+    assert "Token budget left" not in repr(first.messages[0])
+    for request, remaining in ((first, 10_000), (second, 7_500)):
+        status = request.messages[-1]
+        assert status.role is MessageRole.SYSTEM
+        assert f"{remaining} tokens" in repr(status)
+
+    unbounded = builder.project(
+        snapshot, (user,), step=1, tool_context=projection.project(tools, (user,))
+    )
+    assert unbounded.messages == (first.messages[0], user)
 
 
 async def test_optional_context_uses_run_allowance_without_rejecting_mandatory_input():
@@ -156,9 +196,9 @@ async def test_optional_context_uses_run_allowance_without_rejecting_mandatory_i
     assert '"returned_count":1' in repr(wide_request.messages[0])
     assert '"returned_count":0' in repr(narrow_request.messages[0])
     assert "Token budget left for this run (not a routine ceiling): 1 tokens" in repr(
-        narrow_request.messages[0]
+        narrow_request.messages[-1]
     )
-    assert narrow_request.messages[-1] == user
+    assert narrow_request.messages[-2] == user
     assert wide.initial_sensitivity == narrow.initial_sensitivity
     assert (
         wide.initial_sensitivity_provenance["source_ids"]

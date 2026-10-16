@@ -74,6 +74,16 @@ def _chat_messages(
             continue
         if not text:
             raise ValueError("canonical text message produced no content")
+        if (
+            message.role is MessageRole.SYSTEM
+            and result
+            and result[0]["role"] == "system"
+            and result[-1]["role"] != "system"
+        ):
+            # Some compatible chat templates reject a system turn after the
+            # conversation starts; keep later instructions in the leading one.
+            result[0] = {**result[0], "content": f"{result[0]['content']}\n\n{text}"}
+            continue
         result.append({"role": message.role.value, "content": text})
     if not result:
         raise ModelProviderError(

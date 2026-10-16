@@ -1130,9 +1130,13 @@ class AgentContextBuilder:
                 "no host cost ceiling. Token, attempt and occurrence ceilings always bound a routine; omit both "
                 "dollar ceilings unless the user asks for one, and they are required together when set."
             )
+        # Per-request status changes on every step. It follows the transcript so
+        # the system prompt and the history before it stay a stable, cacheable
+        # prefix; adapters that hoist system text keep it after the fixed prompt.
+        status = ""
         if remaining_tokens is not None:
-            core += (
-                f"\n\nToken budget left for this run (not a routine ceiling): {remaining_tokens} tokens. "
+            status += (
+                f"Token budget left for this run (not a routine ceiling): {remaining_tokens} tokens. "
                 "Requests consume input plus output; tool results require another request. "
                 "Use bounded results and avoid redundant discovery/inspection. "
                 "Once the requested work is evidenced, answer from its receipts."
@@ -1144,9 +1148,11 @@ class AgentContextBuilder:
             if value is not None and (type(value) is not int or value < 0):
                 raise ValueError(f"{name} must be non-negative")
         if remaining_steps is not None:
-            core += f" Remaining model requests including this one: {remaining_steps}."
+            status += (
+                f" Remaining model requests including this one: {remaining_steps}."
+            )
             if remaining_steps == 1:
-                core += (
+                status += (
                     " A tool call now cannot be followed by a model answer in this run."
                 )
         if remaining_tokens is not None and previous_request_input_tokens is not None:
@@ -1160,7 +1166,7 @@ class AgentContextBuilder:
                 + 3 * growth
                 + 2 * snapshot.profile.max_output_tokens
             )
-            core += (
+            status += (
                 f" Latest measured request input: {previous_request_input_tokens} tokens; "
                 f"recent input growth: {growth if request_input_growth_tokens is not None else 'not yet measured'}"
                 f"{' tokens' if request_input_growth_tokens is not None else ''}. "
@@ -1170,7 +1176,7 @@ class AgentContextBuilder:
                 "New tools/results can grow more."
             )
             if forecast > remaining_tokens:
-                core += (
+                status += (
                     " Budget pressure: another round trip may not fit. "
                     "Answer from available evidence and identify unfinished work."
                 )
@@ -1204,16 +1210,21 @@ class AgentContextBuilder:
                 TextBlock(
                     "\n\n".join(
                         item
-                        for item in (
-                            core,
-                            tool_context.limits_guidance,
-                            guidance,
-                            progress_warnings,
-                        )
+                        for item in (core, tool_context.limits_guidance, guidance)
                         if item
                     )
                 ),
             ),
+        )
+        status = "\n\n".join(
+            item for item in (status.strip(), progress_warnings) if item
+        )
+        step_status = (
+            ()
+            if not status
+            else (
+                CanonicalMessage(role=MessageRole.SYSTEM, content=(TextBlock(status),)),
+            )
         )
         static_messages = (projected_system, *snapshot.static_messages[1:])
         provenance = FrozenJsonObject.from_mapping(
@@ -1226,7 +1237,7 @@ class AgentContextBuilder:
             }
         )
         request = ModelRequest(
-            messages=(*static_messages, *messages),
+            messages=(*static_messages, *messages, *step_status),
             tools=tools,
             sensitivity=sensitivity,
             sensitivity_provenance=provenance,

@@ -30,6 +30,7 @@ from daita.jobs.graph.models import TaskRole
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
+    MessageRole,
     ModelProfile,
     ModelRequest,
     ModelResponse,
@@ -91,10 +92,17 @@ def _profile(
     )
 
 
+def _status(request: ModelRequest) -> str:
+    # Per-step status, including progress warnings, follows the transcript.
+    status = request.messages[-1]
+    assert status.role is MessageRole.SYSTEM
+    text = status.content[0]
+    assert isinstance(text, TextBlock)
+    return text.text
+
+
 def _warned(request: ModelRequest) -> bool:
-    system = request.messages[0].content[0]
-    assert isinstance(system, TextBlock)
-    return WARNING in system.text
+    return WARNING in _status(request)
 
 
 def _shape(messages: tuple[CanonicalMessage, ...]) -> tuple[str, ...]:
@@ -185,11 +193,10 @@ async def test_foreground_run_warns_after_second_identical_refusal(
     warned = tuple(_warned(request) for request in provider.requests)
     # Requests 0-4 are the first run; 5-6 are the next run, which starts fresh.
     assert warned == (False, False, True, True, True, False, False)
-    system = provider.requests[4].messages[0].content[0]
-    assert isinstance(system, TextBlock)
-    assert "`warehouse_row_count`" in system.text
-    assert "exact-name searches found no callable tool named" in system.text
-    assert "`data_export_tabular`" in system.text
+    status = _status(provider.requests[4])
+    assert "`warehouse_row_count`" in status
+    assert "exact-name searches found no callable tool named" in status
+    assert "`data_export_tabular`" in status
 
 
 async def test_foreground_transcript_results_and_budgets_match_without_warnings(
@@ -434,9 +441,7 @@ async def test_graph_task_attempts_warn_separately_without_changing_limits(
         False,
         False,
     )
-    system = provider.requests[2].messages[0].content[0]
-    assert isinstance(system, TextBlock)
-    assert "`warehouse_row_count`" in system.text
+    assert "`warehouse_row_count`" in _status(provider.requests[2])
 
     _disable_warnings(monkeypatch)
     silent_provider, silent = await _graph(tmp_path / "silent")
@@ -496,8 +501,6 @@ async def test_repeated_invalid_sql_warns_on_the_second_identical_query(
             False,
             True,
         )
-        system = provider.requests[2].messages[0].content[0]
-        assert isinstance(system, TextBlock)
-        assert "`data_query`" in system.text
+        assert "`data_query`" in _status(provider.requests[2])
     finally:
         await agent.close()
