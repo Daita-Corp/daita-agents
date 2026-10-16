@@ -127,6 +127,18 @@ the positional-binding guidance changes the `data.query` contract. Routines
 retaining older bindings fail closed and require foreground review and approval
 of a revised proposal. Existing bindings are never upgraded implicitly.
 
+The tool consolidation removed `data_export_tabular`, the four artifact
+creation tools, `routine_create`, `routine_update`, `skill_delete`,
+`semantic_list`, `semantic_delete` and `start_data_profile` without aliases.
+Routines bind capability IDs and contract digests, never tool names, so the
+renames alone break no binding. Two automation-eligible contracts did change:
+`data.export_tabular` (now reached through `data_query` with `output`, its
+`format` argument renamed `output`) and `analysis.execute` (its shorter
+description). A retained routine bound to either previous digest fails closed
+at revalidation and needs a revised, approved proposal. The changed
+`routines.*`, `semantic.save` contracts and the removed
+`jobs.data_profile.start` were interactive-only, so no routine retains them.
+
 If an artifact is required, admission also proves that at least one allowed
 producer can satisfy its media type, authorship, exact-source, sensitivity, and
 byte bounds. Impossible contracts fail before the routine is created.
