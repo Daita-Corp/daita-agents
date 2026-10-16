@@ -274,6 +274,10 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
                 ("preview", "data.preview_upsert_rows"),
                 ("apply", "data.upsert_rows"),
             ),
+            "routine_save": (
+                ("create", "routines.create"),
+                ("update", "routines.update"),
+            ),
         }
         for name in (
             "catalog_search",
@@ -290,7 +294,7 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
 @pytest.mark.parametrize(
     "first,second",
     [
-        ("artifact_create", "routine_create"),
+        ("artifact_create", "routine_save"),
         ("file_query", "artifact_edit_text"),
     ],
 )

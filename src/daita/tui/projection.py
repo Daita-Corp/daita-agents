@@ -47,8 +47,7 @@ CAPABILITY_LABELS = {
     "skill_view": "Read skill",
     "skill_save": "Save skill",
     "skill_delete": "Delete skill",
-    "routine_create": "Create routine",
-    "routine_update": "Update routine",
+    "routine_save": "Save routine",
     "routine_control": "Control routine",
 }
 _TOOL_ERROR_HEADINGS = {

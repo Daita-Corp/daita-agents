@@ -265,6 +265,7 @@ from ..observation import (
 )
 from ..routines.capabilities import (
     ROUTINE_DOMAIN_OWNER_ID,
+    ROUTINE_SAVE_TOOL_NAME,
     RoutineCapabilityDomain,
     routine_capability_declarations,
 )
@@ -3626,7 +3627,7 @@ class EmbeddedAgent:
             request = ApprovalRequest(
                 run_id=control_id,
                 call_id=control_id,
-                tool_name="routine_create",
+                tool_name=ROUTINE_SAVE_TOOL_NAME,
                 capability_id="routines.create",
                 arguments=routine_approval_arguments(authority),
                 reason="Approve this exact saved assignment, its standing actions, and its schedule?",
@@ -3689,7 +3690,7 @@ class EmbeddedAgent:
             request = ApprovalRequest(
                 run_id=control_id,
                 call_id=control_id,
-                tool_name="routine_update",
+                tool_name=ROUTINE_SAVE_TOOL_NAME,
                 capability_id="routines.update",
                 arguments=routine_approval_arguments(authority),
                 reason="Replace this saved assignment with the exact proposed revision?",

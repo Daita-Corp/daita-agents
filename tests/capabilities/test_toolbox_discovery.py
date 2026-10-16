@@ -243,7 +243,7 @@ async def test_production_intent_search_distinguishes_current_competing_tools(
         ("create report", "artifact_create", 1),
         ("export findings csv", "artifact_create", 3),
         ("export all database rows csv", "data_query", 1),
-        ("schedule recurring report", "routine_create", 1),
+        ("schedule recurring report", "routine_save", 1),
         ("set default export directory", "artifact_set_export_location", 1),
         ("python_execute", "python_execute", 1),
         ("python workspace", "python_execute", 1),

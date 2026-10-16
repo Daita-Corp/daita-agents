@@ -444,7 +444,7 @@ class Evaluation:
     def routine_is_exact(self, request):
         if (
             self.routine_contract is None
-            or request.tool_name != "routine_create"
+            or request.tool_name != "routine_save"
             or request.capability_id != ROUTINE_CREATE_CAPABILITY_ID
         ):
             return False

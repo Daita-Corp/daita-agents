@@ -996,7 +996,7 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                 assert error["code"] == "routine_model_route_revoked"
                 system = canonical_json(request.messages[0].content[0].text)
                 assert provider.provider_id in system
-                return response(ToolCall("create", "routine_create", arguments))
+                return response(ToolCall("create", "routine_save", arguments))
 
             def authoring_complete(request):
                 created = [
@@ -1017,13 +1017,13 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                         ToolCall(
                             "load-authoring",
                             "toolbox_load",
-                            {"tool_names": ["routine_create"]},
+                            {"tool_names": ["routine_save"]},
                         )
                     ),
                     response(
                         ToolCall(
                             "invalid-route",
-                            "routine_create",
+                            "routine_save",
                             {**arguments, "eligible_model_routes": ["current"]},
                         )
                     ),

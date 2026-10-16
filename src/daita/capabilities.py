@@ -1642,6 +1642,10 @@ class ToolView:
     # value: the first route without it, the second route (which declares and
     # receives it) with it.
     mode_by_presence: bool = False
+    # Optional arguments whose full rules stay in the capability contract
+    # (read with toolbox_inspect) and are summarized in the provider schema.
+    # Validation always uses the capability's complete schema.
+    summarized_arguments: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -1689,6 +1693,14 @@ class ToolView:
         ):
             raise ValueError("tool route selection requires mode routes")
         object.__setattr__(self, "mode_capability_ids", routes)
+        summarized = tuple(self.summarized_arguments)
+        if len(set(summarized)) != len(summarized) or any(
+            not isinstance(item, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", item) is None
+            for item in summarized
+        ):
+            raise ValueError("summarized tool arguments are invalid")
+        object.__setattr__(self, "summarized_arguments", summarized)
         if self.name in RESERVED_TOOL_NAMES:
             raise ValueError(f"reserved runtime control tool name: {self.name}")
         if not isinstance(self.presentation, ToolPresentation):
@@ -1988,6 +2000,16 @@ class CapabilityRegistry:
                     ),
                 )
         self._mode_input_schemas = MappingProxyType(mode_input_schemas)
+        for declaration in declared.values():
+            for view in declaration.tool_views:
+                if view.summarized_arguments:
+                    _summarized_input_schema(
+                        view,
+                        mode_input_schemas.get(
+                            view.name,
+                            self._capabilities[view.capability_id].input_schema,
+                        ),
+                    )
         declared_executor_ids = {
             executor_id
             for declaration in declared.values()
@@ -2087,6 +2109,15 @@ class CapabilityRegistry:
                                             list(item)
                                             for item in view.mode_capability_ids
                                         ],
+                                        **(
+                                            {
+                                                "summarized_arguments": list(
+                                                    view.summarized_arguments
+                                                )
+                                            }
+                                            if view.summarized_arguments
+                                            else {}
+                                        ),
                                         **(
                                             {
                                                 "mode_argument": view.mode_argument,
@@ -2266,6 +2297,8 @@ class CapabilityRegistry:
             input_schema: Mapping[str, object] = capability.input_schema
         else:
             input_schema = self._mode_input_schemas[name]
+        if view.summarized_arguments:
+            input_schema = _summarized_input_schema(view, input_schema)
         description = _provider_description(view)
         policy = capability.execution_admission_policy
         sentence = None if policy is None else policy.limits_sentence()
@@ -2614,6 +2647,36 @@ def _mode_input_schema(
     }
     _check_schema(merged)
     return merged
+
+
+SUMMARIZED_ARGUMENT_DESCRIPTION = "Optional; full rule via toolbox_inspect."
+
+
+def _summarized_input_schema(
+    view: ToolView, schema: Mapping[str, object]
+) -> dict[str, object]:
+    """Replace optional argument rules with a pointer to the full contract."""
+
+    properties = schema.get("properties")
+    required = schema.get("required", ())
+    if not isinstance(properties, Mapping) or not isinstance(required, (tuple, list)):
+        raise ValueError(f"summarized tool schema is malformed: {view.name}")
+    for name in view.summarized_arguments:
+        if name not in properties or name in required:
+            raise ValueError(
+                f"summarized argument must be optional and declared: {view.name}.{name}"
+            )
+    return {
+        **schema,
+        "properties": {
+            name: (
+                {"description": SUMMARIZED_ARGUMENT_DESCRIPTION}
+                if name in view.summarized_arguments
+                else rule
+            )
+            for name, rule in properties.items()
+        },
+    }
 
 
 def _provider_description(view: ToolView) -> str:

@@ -489,7 +489,7 @@ async def test_routine_approval_checks_grant_and_validated_proposal(tamper, prof
     valid = ApprovalRequest(
         "run",
         "call",
-        "routine_create",
+        "routine_save",
         ROUTINE_CREATE_CAPABILITY_ID,
         FrozenJsonObject.from_mapping({"proposal": proposal}),
         "Exact proposal",

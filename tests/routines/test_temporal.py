@@ -193,7 +193,7 @@ async def test_relative_schedule_starts_after_approval_and_uses_trusted_local_ti
         result = await execute_projected(
             agent._embedded._capability_runtime,
             run,
-            (ToolCall("relative-once", "routine_create", arguments),),
+            (ToolCall("relative-once", "routine_save", arguments),),
         )
         assert not result.ordered_results[0].is_error, result.ordered_results[0].output
         assert len(approvals) == 1

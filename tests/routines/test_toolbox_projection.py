@@ -70,7 +70,7 @@ async def test_routine_authoring_choices_are_complete_frozen_and_mandatory(
         assert facts["maximum_per_run_cost_usd"] == cost
         monkeypatch.setattr(owner, "_eligible_model_routes", ("mock:later",))
         result, loaded_messages, projection = await _load(
-            runtime, run, catalog, messages, ("routine_create",), call_id="facts-load"
+            runtime, run, catalog, messages, ("routine_save",), call_id="facts-load"
         )
         assert not result.is_error, result
         request = builder.project(

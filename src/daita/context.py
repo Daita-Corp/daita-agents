@@ -3299,7 +3299,9 @@ def _tool_guidance(
         instructions.append(
             "For scheduled work, use toolbox_search automation_contract for grant "
             "schemas and connector references. Use toolbox_inspect for exact argument schemas "
-            "and contracts marked automation_contract_omitted, without changing the working set. "
+            "and contracts marked automation_contract_omitted, without changing the working set; "
+            "it also gives the full routine_save rules for grants, precheck, connector bindings "
+            "and dollar ceilings. "
             "Fixed/variable grant arguments must use the declared input names and types; "
             "load tools to invoke them. Effect-free "
             "reads need no requested_capability_grants; include their IDs in allowed_capability_ids."

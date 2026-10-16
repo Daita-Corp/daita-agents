@@ -509,7 +509,7 @@ async def _assignment(
         rejected = await execute_projected(
             runtime,
             origin,
-            (ToolCall("private-create", "routine_create", arguments),),
+            (ToolCall("private-create", "routine_save", arguments),),
             sensitivity=ModelSensitivity.RESTRICTED,
         )
         assert rejected.ordered_results[0].is_error
@@ -522,7 +522,7 @@ async def _assignment(
         outcome = await execute_projected(
             runtime,
             origin,
-            (ToolCall("create-effect", "routine_create", arguments),),
+            (ToolCall("create-effect", "routine_save", arguments),),
         )
         assert not outcome.ordered_results[0].is_error, outcome.ordered_results[
             0

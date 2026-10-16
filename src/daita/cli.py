@@ -851,12 +851,12 @@ def build_parser() -> argparse.ArgumentParser:
         action.add_argument("--spec", type=Path, required=True)
         if command == "promote":
             action.add_argument("--basis-run-id", required=True)
-    routine_update = routine_commands.add_parser("update")
-    routine_update.add_argument("name")
-    routine_update.add_argument("routine_id")
-    routine_update.add_argument("expected_revision", type=int)
-    routine_update.add_argument("--spec", type=Path, required=True)
-    routine_update.add_argument("--basis-run-id")
+    routine_revision_parser = routine_commands.add_parser("update")
+    routine_revision_parser.add_argument("name")
+    routine_revision_parser.add_argument("routine_id")
+    routine_revision_parser.add_argument("expected_revision", type=int)
+    routine_revision_parser.add_argument("--spec", type=Path, required=True)
+    routine_revision_parser.add_argument("--basis-run-id")
     for command in ("pause", "resume", "run-now", "disable"):
         action = routine_commands.add_parser(command)
         action.add_argument("name")
