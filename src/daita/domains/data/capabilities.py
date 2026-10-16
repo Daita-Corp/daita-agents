@@ -82,16 +82,16 @@ DATA_QUERY_DESCRIPTION = (
 )
 _DATA_QUERY_USAGE = (
     " Profile with aggregates (COUNT, COUNT(DISTINCT), null counts, MIN/MAX)."
-    ' Example: {"source_id": "...", "resource_ids": ["..."], "sql": '
-    '"SELECT region, sum(total) FROM orders GROUP BY region"}. Mistakes: '
-    "columns absent from catalog evidence; trusting truncated rows."
+    ' Example: "SELECT region, sum(total) FROM orders GROUP BY region".'
+    " Mistakes: columns absent from catalog evidence; trusting truncated rows."
 )
 
 
 def _data_query_description(file_outputs: tuple[str, ...]) -> str:
     file_output = (
-        f" output={'|'.join(file_outputs)} saves one sql result complete as a "
-        f"file artifact ({MAX_CSV_ROWS:,} rows, {MAX_CSV_SECONDS:.0f}s), no rows."
+        f" output={'|'.join(file_outputs)} exports one sql in full as a file "
+        f"({MAX_CSV_ROWS:,} rows, {MAX_CSV_SECONDS:.0f}s), no rows; to save "
+        "rows already shown in full, use artifact_create from=table."
         if file_outputs
         else ""
     )
