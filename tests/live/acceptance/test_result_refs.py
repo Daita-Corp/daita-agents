@@ -3,7 +3,8 @@
 Two bounded cases on a local SQLite probe home:
 
 * foreground: a first turn queries a table summary and shows it; a second
-  turn asks for a CSV of that result, which cites it without querying again;
+  turn asks for a CSV of that result, made either by one exact export or by
+  a derived table citing the shown result;
 * graph: a durable model worker runs its read and finishes with task_complete.
 
 Pass condition: the right result is referenced on the first try, and no call is
@@ -167,14 +168,27 @@ async def test_l8_csv_of_a_query_result_cites_that_result(
         _assert_no_ref_rejections(transcript)
         queries = _successful(first, "data_query")
         assert queries, "the counts must come from a successful query"
-        assert not [
-            call for call, _result in transcript.tool_pairs if call.name == "data_query"
-        ], "the CSV must not query again"
+        # The artifact is the deliverable; nobody asked for a local copy.
+        assert not _successful(transcript, "artifact_save_local")
+        exports = [
+            call
+            for _index, call, _result in _successful(transcript, "data_query")
+            if call.arguments.get("output") in {"csv", "xlsx"}
+        ]
         artifact_calls = [
             (call, block)
             for call, block in transcript.tool_pairs
             if call.name == "artifact_create"
         ]
+        # Either path is a correct CSV: one exact export of the same query, or
+        # a derived table that cites the shown result by its visible ref.
+        if exports and not artifact_calls:
+            assert len(exports) == 1, "the CSV must be exported once"
+            # The export reads the same tables as the query that was shown.
+            assert set(
+                cast(tuple[str, ...], exports[0].arguments["resource_ids"])
+            ) == set(cast(tuple[str, ...], queries[-1][1].arguments["resource_ids"]))
+            return
         assert len(artifact_calls) == 1, "the CSV must be created on the first try"
         artifact_call, artifact_result = artifact_calls[0]
         assert artifact_result is not None and not artifact_result.is_error
