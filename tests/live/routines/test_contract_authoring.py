@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from daita.capabilities import EffectEvidenceBasis
+from tests.support.live_billing import live_model_id
 from tests.support.mcp_routine_harness import (
     assert_completed,
     evaluate,
@@ -67,7 +68,7 @@ async def test_model_authors_scheduled_contract_without_dispatch(
         assert scenario.grant_is_exact(routine.capability_grants[0].material())
         assert routine.allowed_source_ids == routine.allowed_resource_ids == ()
         assert routine.skill_bindings == ()
-        assert routine.eligible_model_routes == (model_id,)
+        assert routine.eligible_model_routes == (live_model_id(model_id),)
         assert routine.maximum_consecutive_failures == 1
         assert len(routine.outcome_contract.effect_requirements) == 1
         requirement = routine.outcome_contract.effect_requirements[0]

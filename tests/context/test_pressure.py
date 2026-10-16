@@ -155,7 +155,7 @@ async def test_optional_context_uses_run_allowance_without_rejecting_mandatory_i
     )
     assert '"returned_count":1' in repr(wide_request.messages[0])
     assert '"returned_count":0' in repr(narrow_request.messages[0])
-    assert "Remaining cumulative run allowance: 1 tokens" in repr(
+    assert "Token budget left for this run (not a routine ceiling): 1 tokens" in repr(
         narrow_request.messages[0]
     )
     assert narrow_request.messages[-1] == user

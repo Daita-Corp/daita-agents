@@ -123,7 +123,11 @@ class RoutineSupervisor:
         )
         if not isinstance(error, StorageUnavailableError):
             self._failed = True
-            _logger.error("routines supervisor stopped (%s)", self._failure_code)
+            _logger.error(
+                "routines supervisor stopped (%s, %s)",
+                self._failure_code,
+                type(error).__name__,
+            )
             if self._driver is not None and self._driver is not asyncio.current_task():
                 self._driver.cancel("supervisor_failed")
         if isinstance(error, StorageUnavailableError):

@@ -178,7 +178,11 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
 
         native_input = arguments.get("input")
         if isinstance(native_input, list):
-            instructions: list[str] = []
+            # The first system message becomes the request instructions. Later
+            # system messages, such as a machine run's start instruction, stay
+            # in place as developer messages: the surface rejects an empty
+            # input, and a machine run has no user message to carry.
+            instructions: str | None = None
             retained: list[object] = []
             for item in native_input:
                 if (
@@ -186,11 +190,14 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
                     and item.get("role") == "system"
                     and isinstance(item.get("content"), str)
                 ):
-                    instructions.append(cast(str, item["content"]))
+                    if instructions is None:
+                        instructions = cast(str, item["content"])
+                    else:
+                        retained.append({**item, "role": "developer"})
                 else:
                     retained.append(item)
-            if instructions:
-                arguments["instructions"] = "\n\n".join(instructions)
+            if instructions is not None:
+                arguments["instructions"] = instructions
                 arguments["input"] = retained
         if request.tools:
             arguments["tool_choice"] = "auto"

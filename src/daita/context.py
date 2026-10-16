@@ -1132,7 +1132,7 @@ class AgentContextBuilder:
             )
         if remaining_tokens is not None:
             core += (
-                f"\n\nRemaining cumulative run allowance: {remaining_tokens} tokens. "
+                f"\n\nToken budget left for this run (not a routine ceiling): {remaining_tokens} tokens. "
                 "Requests consume input plus output; tool results require another request. "
                 "Use bounded results and avoid redundant discovery/inspection. "
                 "Once the requested work is evidenced, answer from its receipts."

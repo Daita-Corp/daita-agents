@@ -303,11 +303,13 @@ async def test_live_tool_round_trip_has_stable_context_and_durable_completion(
             )
             for request in provider.requests
         ]
-        frozen_core = systems[0].split("\n\nRemaining cumulative run allowance:", 1)[0]
+        frozen_core = systems[0].split(
+            "\n\nToken budget left for this run (not a routine ceiling):", 1
+        )[0]
         for request, system in zip(provider.requests, systems, strict=True):
             assert system.startswith(
                 frozen_core
-                + f"\n\nRemaining cumulative run allowance: {request.max_total_tokens} tokens."
+                + f"\n\nToken budget left for this run (not a routine ceiling): {request.max_total_tokens} tokens."
             )
         assert all(
             tuple(tool.name for tool in request.tools)

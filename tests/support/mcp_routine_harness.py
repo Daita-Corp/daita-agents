@@ -34,7 +34,6 @@ from daita import (
     ReportingMode,
     RequestedCapabilityGrant,
     ScheduledRoutineDraft,
-    create_llm_provider,
 )
 from daita._json import FrozenJsonObject, canonical_json
 from daita.adapters.mcp import SDKMCPClientFactory
@@ -48,7 +47,7 @@ from daita.capabilities import (
     OperationalEffect,
 )
 from daita.capability_runtime import CapabilityRuntime
-from daita.llm.models import ModelProfile, ModelSensitivity
+from daita.llm.models import ModelProfile, ModelSensitivity, ModelUsage
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import ManagedModelProvider
 from daita.loop.models import (
@@ -60,6 +59,12 @@ from daita.loop.models import (
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
 from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.job_benchmarks import RecordingProvider
+from tests.support.live_billing import (
+    api_equivalent_cost,
+    cost_cap,
+    live_provider as live_billing_provider,
+    subscription_billing,
+)
 from tests.support.mcp import MCPConformanceTransport, MCPFixtureIdentity
 from tests.support.paths import REPO_ROOT
 from tests.support.workspace import workspace_for
@@ -118,7 +123,7 @@ def limits() -> LoopLimits:
         raise ValueError(f"{COST_ENV} must be a finite positive decimal") from error
     if not amount.is_finite() or amount <= 0:
         raise ValueError(f"{COST_ENV} must be a finite positive decimal")
-    return LoopLimits(max_estimated_cost_usd=amount)
+    return LoopLimits(max_estimated_cost_usd=cost_cap(amount))
 
 
 def live_provider(model_id: str) -> tuple[ModelProfile, ManagedModelProvider]:
@@ -129,24 +134,29 @@ def live_provider(model_id: str) -> tuple[ModelProfile, ManagedModelProvider]:
             f"{AUTHORIZATION}=1 is required before constructing a provider"
         )
     limits()
-    profile = reviewed_model_profile(model_id)
     provider = model_id.partition(":")[0]
-    if (
-        provider not in {"openai", "anthropic", "gemini", "grok"}
-        or profile is None
-        or not profile.supports_tools
-    ):
-        raise ValueError(
-            "Phase F evaluations require a reviewed API tool-capable model"
-        )
-    key = os.environ.get(
-        f"DAITA_PHASE_F_LIVE_{provider.upper()}_API_KEY"
-    ) or os.environ.get("DAITA_PHASE_F_LIVE_LLM_API_KEY")
-    if not key or not key.strip():
-        raise ValueError("Set the Phase F benchmark API key for the selected provider")
-    return profile, create_llm_provider(
-        model_id, api_key=key, max_output_tokens=min(profile.max_output_tokens, 2_048)
-    )
+    if not subscription_billing():
+        profile = reviewed_model_profile(model_id)
+        if (
+            provider not in {"openai", "anthropic", "gemini", "grok"}
+            or profile is None
+            or not profile.supports_tools
+        ):
+            raise ValueError(
+                "Phase F evaluations require a reviewed API tool-capable model"
+            )
+
+    def api_key() -> str:
+        key = os.environ.get(
+            f"DAITA_PHASE_F_LIVE_{provider.upper()}_API_KEY"
+        ) or os.environ.get("DAITA_PHASE_F_LIVE_LLM_API_KEY")
+        if not key or not key.strip():
+            raise ValueError(
+                "Set the Phase F benchmark API key for the selected provider"
+            )
+        return key
+
+    return live_billing_provider(model_id, api_key=api_key, max_output_tokens=2_048)
 
 
 class EvaluationTransport(MCPConformanceTransport):
@@ -297,7 +307,7 @@ class Evaluation:
         self.action_argument_names = action_argument_names
         self.limits = limits()
         self.answer_reviews: list[dict[str, object]] = []
-        assert self.limits.max_estimated_cost_usd is not None
+        # Subscription runs carry no dollar cap, so their routines carry none.
         self.cost_limit = self.limits.max_estimated_cost_usd
         self.conversation_id: str | None = None
         self.clock = NOW
@@ -447,10 +457,7 @@ class Evaluation:
                 and arguments.get("per_run_max_tokens") == self.limits.max_total_tokens
                 and arguments.get("cumulative_max_tokens")
                 == 2 * self.limits.max_total_tokens
-                and Decimal(str(arguments.get("per_run_max_cost_usd")))
-                == self.limits.max_estimated_cost_usd
-                and Decimal(str(arguments.get("cumulative_max_cost_usd")))
-                == 2 * self.cost_limit
+                and self._dollar_ceilings_are_exact(arguments)
                 and arguments.get("expires_at") == EXPIRES.isoformat()
             )
         self.approvals.append(
@@ -461,6 +468,30 @@ class Evaluation:
             }
         )
         return ApprovalDecision.APPROVE if accepted else ApprovalDecision.DENY
+
+    def _dollar_ceilings_are_exact(self, arguments: Mapping[str, object]) -> bool:
+        per_run = arguments.get("per_run_max_cost_usd")
+        cumulative = arguments.get("cumulative_max_cost_usd")
+        if self.cost_limit is None:
+            return per_run is None and cumulative is None
+        return (
+            per_run is not None
+            and cumulative is not None
+            and Decimal(str(per_run)) == self.cost_limit
+            and Decimal(str(cumulative)) == 2 * self.cost_limit
+        )
+
+    def _budget_text(self, lead: str, cumulative_label: str) -> str:
+        tokens = self.limits.max_total_tokens
+        if self.cost_limit is None:
+            return (
+                f"{lead} {tokens} tokens per run and {2 * tokens} tokens "
+                f"{cumulative_label}, with no dollar ceiling. "
+            )
+        return (
+            f"{lead} {tokens} tokens and ${self.cost_limit} per run, "
+            f"{2 * tokens} tokens and ${2 * self.cost_limit} {cumulative_label}. "
+        )
 
     async def run(self, prompt: str) -> tuple[LoopExit, Transcript]:
         started = perf_counter()
@@ -559,9 +590,8 @@ class Evaluation:
                 "If a scheduled time is missed, run only the latest missed occurrence. "
                 "Stop after two occurrences or two attempts, or one consecutive failure, "
                 f"and expire at {EXPIRES.isoformat()}. "
-                f"Use exactly {self.limits.max_total_tokens} tokens and ${self.cost_limit} per run, "
-                f"{2 * self.limits.max_total_tokens} tokens and ${2 * self.cost_limit} total. "
-                "Tell me when the assignment is saved. Do not send an additional notification while setting it up."
+                + self._budget_text("Use exactly", "total")
+                + "Tell me when the assignment is saved. Do not send an additional notification while setting it up."
             )
         contract = {
             "binding_id": self.binding.binding_id,
@@ -580,9 +610,8 @@ class Evaluation:
             "skills, or artifacts. Discover this conversation's inbox destination. Always report, "
             "use latest_only misfire handling, and stop after two occurrences/two attempts or "
             f"{EXPIRES.isoformat()}, with one consecutive failure allowed. "
-            f"Authorize {self.limits.max_total_tokens} tokens and ${self.limits.max_estimated_cost_usd} "
-            f"per run, {2 * self.limits.max_total_tokens} tokens and ${2 * self.cost_limit} "
-            "cumulatively. Keep sensitivity internal, require a terminal conclusion and current-run "
+            + self._budget_text("Authorize", "cumulatively")
+            + "Keep sensitivity internal, require a terminal conclusion and current-run "
             "provenance with exact bindings. Embed this reporting instruction in the saved routine: "
             f"{REPORT_INSTRUCTION} Do not send a separate foreground notification. "
             "These current admission references are provided by the fixture owner; construct "
@@ -688,6 +717,9 @@ class Evaluation:
                     else None
                 ),
                 "cost_complete": complete,
+                "api_equivalent_cost_usd": _api_equivalent_total(
+                    usages, self.provider.provider_id
+                ),
                 "usage_complete": usage_complete,
                 "steps": sum(item[0].steps for item in self.captures),
                 "tool_errors": len(errors),
@@ -787,6 +819,16 @@ class Evaluation:
         }
 
 
+def _api_equivalent_total(usages: list[ModelUsage], provider_id: str) -> str | None:
+    """Sum notional per-response subscription pricing; None for API routes."""
+
+    notional = [api_equivalent_cost(usage, provider_id) for usage in usages]
+    amounts = [item and item["api_equivalent_cost_usd"] for item in notional]
+    if not amounts or any(amount is None for amount in amounts):
+        return None
+    return str(sum((Decimal(cast(str, amount)) for amount in amounts), Decimal(0)))
+
+
 def owner_routine_draft(
     scenario: Evaluation, origin_run_id: str, destination_id: str
 ) -> ScheduledRoutineDraft:
@@ -829,7 +871,7 @@ def owner_routine_draft(
         per_run_max_tokens=scenario.limits.max_total_tokens,
         per_run_max_cost_usd=amount,
         cumulative_max_tokens=2 * scenario.limits.max_total_tokens,
-        cumulative_max_cost_usd=2 * amount,
+        cumulative_max_cost_usd=None if amount is None else 2 * amount,
         cumulative_max_attempts=2,
         cumulative_max_occurrences=2,
         maximum_consecutive_failures=1,

@@ -219,7 +219,10 @@ reviewed `openai:<model>` choice through the matching `codex:<model>` ChatGPT
 subscription route by setting `DAITA_LIVE_BILLING=subscription` alongside their
 usual `DAITA_RUN_*` gate. Adopted suites are PostgreSQL write acceptance,
 write-unavailable, tool selection, result references, the Stage B benchmarks,
-data operations and the live MCP read workflows.
+data operations, the live MCP read workflows, the graph-task, graph-effect and
+graph-planner job cases, Stage D1 routine execution, Stage D2 scheduled
+deliveries, and the Phase F MCP action, routine and contract-authoring
+evaluations.
 
 Log in once through the existing device-code flow:
 

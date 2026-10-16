@@ -19,6 +19,7 @@ from daita.distribution.models import OutcomeState, outcome_contract_projection
 from daita.loop.models import LoopExitKind
 from daita.storage.sqlite_records import EffectResolutionDecision
 from tests.support.distribution import no_artifact_outcome_contract
+from tests.support.live_billing import live_model_id
 from tests.support.postgresql_live import _TABLE, database as database, row
 from tests.support.postgresql_live_harness import (
     AUTHORIZATION,
@@ -503,7 +504,7 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
             "allowed_resource_ids": [database.resource_id],
             "allowed_connector_binding_ids": [],
             "allowed_capability_ids": ["data.preview_upsert_rows", "data.upsert_rows"],
-            "eligible_model_routes": [model_id],
+            "eligible_model_routes": [live_model_id(model_id)],
             "sensitivity_ceiling": FIXTURE_SENSITIVITY.value,
             "skill_bindings": [],
             "precheck": None,
@@ -536,7 +537,7 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
                 {
                     "source_id": database.source_id,
                     "resource_id": database.resource_id,
-                    "model_route": model_id,
+                    "model_route": live_model_id(model_id),
                 }
             )
         )

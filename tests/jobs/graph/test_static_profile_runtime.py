@@ -773,6 +773,27 @@ async def test_heartbeat_and_checkpoint_are_durable(tmp_path: Path) -> None:
         await integration.close()
 
 
+async def test_early_heartbeat_keeps_supervisor_running(tmp_path: Path) -> None:
+    # Renewals paced on the event-loop clock can reach storage before ten
+    # wall-clock seconds have passed; that must not stop the supervisor.
+    resources = (("source-a", "resource-a"),)
+    catalog = StaticProfileCatalog(resources)
+    integration = await StaticGraphIntegration.open(
+        tmp_path,
+        resources,
+        backend=ObservedReadBackend(catalog, delay=0.2),
+    )
+    integration.supervisor._graph_heartbeat_seconds = 0.01
+    try:
+        admission = await integration.build(("resource-a",))
+        await integration.admit_and_start(admission)
+        terminal = await integration.wait_terminal(admission.job.job_id)
+        assert terminal.job.state is GraphState.SUCCEEDED
+        assert integration.supervisor.status.state == "running"
+    finally:
+        await integration.close()
+
+
 @pytest.mark.parametrize("role", (TaskRole.INTERNAL, TaskRole.FINALIZER))
 async def test_heartbeat_racing_completion_keeps_supervisor_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: TaskRole
