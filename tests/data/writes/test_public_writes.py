@@ -428,7 +428,7 @@ async def test_native_insert_discovery_keeps_catalog_and_export_queries_distinct
             3,
         ),
         ("catalog schema columns", "catalog_describe", 1),
-        ("export all database rows csv", "data_export_tabular", 1),
+        ("export all database rows csv", "data_query", 1),
     )
     provider.replace_script(
         (

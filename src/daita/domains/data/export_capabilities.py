@@ -126,7 +126,6 @@ RESULT_SNAPSHOT_TOOL_NAME = "artifact_snapshot_result"
 RESULT_SNAPSHOT_OUTPUT_KIND = "artifact.result_snapshot"
 
 DATA_EXPORT_TABULAR_EXECUTOR_ID = "data.export_tabular.executor"
-DATA_EXPORT_TABULAR_TOOL_NAME = "data_export_tabular"
 TABULAR_EXPORT_OUTPUT_KIND = "artifact.tabular_export"
 
 ARTIFACT_LIST_CAPABILITY_ID = "artifact.list"
@@ -468,7 +467,7 @@ class DataExportTabularExecutor:
         parameters = request.arguments.get("parameters", ())
         resource_ids = request.arguments["resource_ids"]
         adapter_id = request.arguments["_adapter_id"]
-        format_name = request.arguments["format"]
+        format_name = request.arguments["output"]
         filename = request.arguments.get("filename")
         assert isinstance(source_id, str)
         assert isinstance(sql, str)
@@ -977,7 +976,7 @@ class ArtifactSetExportLocationExecutor:
         )
 
 
-def data_export_tabular_declarations(
+def exact_export_declarations(
     agent_id: str,
     sqlite_backend: ExactTabularExportBackend,
     postgresql_backend: ExactTabularExportBackend,
@@ -985,7 +984,7 @@ def data_export_tabular_declarations(
     *,
     arrow_bounds: tuple[int, int, int] | None = None,
 ) -> DataExportTabularDeclarations:
-    declarations = data_export_tabular_capability_declarations(
+    declarations = exact_export_capability_declarations(
         allow_arrow=arrow_bounds is not None
     )
     return DataExportTabularDeclarations(
@@ -1037,50 +1036,24 @@ def artifact_declarations(
     )
 
 
-def data_export_tabular_capability_declarations(
+def exact_export_capability_declarations(
     *, allow_arrow: bool = False
 ) -> CapabilityDeclarations:
+    """Declare the exact export; data_query's file outputs are its only view."""
+
     capability = _tabular_export_capability(allow_arrow=allow_arrow)
-    view = ToolView(
-        name=DATA_EXPORT_TABULAR_TOOL_NAME,
-        capability_id=capability.id,
-        description=capability.description,
-        presentation=ToolPresentation(
-            toolbox_id=ToolboxId.ARTIFACTS,
-            load_mode=ToolLoadMode.ON_DEMAND,
-            text_trust=ToolTextTrust.CODE,
-            summary=(
-                "Export one exact complete relational dataset as CSV, XLSX or Arrow for Python."
-                if allow_arrow
-                else "Export one exact relational query result as CSV or XLSX."
-            ),
-            when_to_use=(
-                "Use existing current catalog evidence for exact source/resource IDs; obtain only missing structure. Complete query results support dataset-wide statistics beyond bounded previews."
-            ),
-            keywords=(
-                "artifact",
-                "data",
-                "export",
-                "relational",
-                "csv",
-                "xlsx",
-                "complete dataset",
-                "all rows",
-                "statistics",
-                *(
-                    ("arrow ipc", "python capture", "typed dataset")
-                    if allow_arrow
-                    else ()
-                ),
-            ),
-        ),
-    )
     return CapabilityDeclarations(
         domain_owner_id="data",
         capabilities=(capability,),
         executor_ids=(DATA_EXPORT_TABULAR_EXECUTOR_ID,),
-        tool_views=(view,),
+        tool_views=(),
     )
+
+
+def exact_export_outputs(*, allow_arrow: bool = False) -> tuple[str, ...]:
+    """The data_query output values the exact export serves."""
+
+    return ("csv", "xlsx", *(("arrow",) if allow_arrow else ()))
 
 
 def artifact_capability_declarations(
@@ -3048,8 +3021,10 @@ def _tabular_export_capability(*, allow_arrow: bool = False) -> Capability:
         ),
         input_schema={
             "type": "object",
+            # Shared arguments keep data_query's exact rules: this capability
+            # is data_query's file output.
             "properties": {
-                "source_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "source_id": {"type": "string"},
                 "resource_ids": {
                     "type": "array",
                     "items": {"type": "string", "minLength": 1, "maxLength": 256},
@@ -3065,11 +3040,12 @@ def _tabular_export_capability(*, allow_arrow: bool = False) -> Capability:
                 "parameters": {
                     "type": "array",
                     "maxItems": MAX_SQL_PARAMETERS,
+                    "description": "SQLite ? values follow SQL occurrence order; PostgreSQL $1, $2, ... by index. Verify filter bindings.",
                 },
-                "format": {"type": "string", "enum": formats},
+                "output": {"type": "string", "enum": formats},
                 "filename": {"type": "string", "minLength": 1, "maxLength": 120},
             },
-            "required": ["source_id", "resource_ids", "sql", "format"],
+            "required": ["source_id", "resource_ids", "sql", "output"],
             "additionalProperties": False,
         },
         output_kind=TABULAR_EXPORT_OUTPUT_KIND,
@@ -3285,7 +3261,6 @@ __all__ = [
     "ArtifactCapabilityDomain",
     "ArtifactDomainCatalog",
     "DATA_EXPORT_TABULAR_EXECUTOR_ID",
-    "DATA_EXPORT_TABULAR_TOOL_NAME",
     "DataExportTabularDeclarations",
     "DataExportTabularExecutor",
     "TABULAR_EXPORT_OUTPUT_KIND",
@@ -3304,7 +3279,7 @@ __all__ = [
     "ResultSnapshotExecutor",
     "artifact_capability_declarations",
     "artifact_declarations",
-    "data_export_tabular_capability_declarations",
-    "data_export_tabular_declarations",
+    "exact_export_capability_declarations",
+    "exact_export_declarations",
     "resolved_exact_export_sensitivity",
 ]

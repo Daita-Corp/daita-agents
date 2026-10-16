@@ -2342,10 +2342,10 @@ def test_exact_tabular_extends_existing_adapter_capability_and_renderer_owners()
 def test_exact_tabular_tool_arguments_contain_query_selection_but_never_rows_or_bytes():
     from daita.domains.data.export_capabilities import (
         DATA_EXPORT_TABULAR_CAPABILITY_ID,
-        data_export_tabular_capability_declarations,
+        exact_export_capability_declarations,
     )
 
-    declarations = data_export_tabular_capability_declarations()
+    declarations = exact_export_capability_declarations()
     for capability in declarations.capabilities:
         if capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID:
             continue
@@ -2356,7 +2356,7 @@ def test_exact_tabular_tool_arguments_contain_query_selection_but_never_rows_or_
             "resource_ids",
             "sql",
             "parameters",
-            "format",
+            "output",
             "filename",
         }
         assert set(properties).isdisjoint(

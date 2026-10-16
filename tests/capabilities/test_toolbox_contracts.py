@@ -237,7 +237,6 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             "artifact_save_local",
             "artifact_set_export_location",
             "artifact_snapshot_result",
-            "data_export_tabular",
         }
         assert {
             name
@@ -259,6 +258,11 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             for name in registry.tool_names
             if registry.resolve_tool(name)[0].mode_capability_ids
         } == {
+            "data_query": (
+                ("rows", "data.query"),
+                ("csv", "data.export_tabular"),
+                ("xlsx", "data.export_tabular"),
+            ),
             "data_update_rows": (
                 ("preview", "data.preview_update_rows"),
                 ("apply", "data.update_rows"),

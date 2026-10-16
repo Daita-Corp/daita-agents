@@ -32,7 +32,7 @@ from daita.domains.data.export_capabilities import (
     RESULT_SNAPSHOT_CAPABILITY_ID,
     RESULT_SNAPSHOT_TOOL_NAME,
     artifact_capability_declarations,
-    data_export_tabular_capability_declarations,
+    exact_export_capability_declarations,
 )
 from daita.llm.models import (
     CanonicalMessage,
@@ -177,7 +177,7 @@ def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -
 
 def test_d2_certifies_only_the_three_accepted_scheduled_artifact_capabilities() -> None:
     declarations = artifact_capability_declarations()
-    data_declarations = data_export_tabular_capability_declarations()
+    data_declarations = exact_export_capability_declarations()
     capabilities = (*declarations.capabilities, *data_declarations.capabilities)
     by_id = {capability.id: capability for capability in capabilities}
     scheduled = {

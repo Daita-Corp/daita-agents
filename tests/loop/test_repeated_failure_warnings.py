@@ -171,13 +171,13 @@ def test_only_an_unavailable_registered_name_is_an_exact_name_check() -> None:
     assert evidence.progress_warnings() == ()
 
     for call_id in ("exact-1", "exact-2"):
-        call = _search_call(call_id, "data_export_tabular")
+        call = _search_call(call_id, "data_update_rows")
         evidence.observe_progress(
             call,
             _search(
                 call,
                 {
-                    "exact_tool_name": "data_export_tabular",
+                    "exact_tool_name": "data_update_rows",
                     "exact_tool_available": False,
                     "total_matches": 3,
                 },
@@ -185,15 +185,15 @@ def test_only_an_unavailable_registered_name_is_an_exact_name_check() -> None:
         )
     (warning,) = evidence.progress_warnings()
     assert "exact-name searches" in warning
-    assert "`data_export_tabular`" in warning
+    assert "`data_update_rows`" in warning
 
-    available = _search_call("exact-3", "data_export_tabular")
+    available = _search_call("exact-3", "data_update_rows")
     evidence.observe_progress(
         available,
         _search(
             available,
             {
-                "exact_tool_name": "data_export_tabular",
+                "exact_tool_name": "data_update_rows",
                 "exact_tool_available": True,
                 "total_matches": 3,
             },
@@ -205,7 +205,7 @@ def test_only_an_unavailable_registered_name_is_an_exact_name_check() -> None:
 def test_search_results_without_control_authority_are_not_exact_name_checks() -> None:
     evidence = RunSessionEvidence()
     for call_id in ("a", "b"):
-        call = _search_call(call_id, "data_export_tabular")
+        call = _search_call(call_id, "data_update_rows")
         evidence.observe_progress(
             call,
             ToolResultBlock(
@@ -213,7 +213,7 @@ def test_search_results_without_control_authority_are_not_exact_name_checks() ->
                 output={
                     "kind": "toolbox_search_result",
                     "data": {
-                        "exact_tool_name": "data_export_tabular",
+                        "exact_tool_name": "data_update_rows",
                         "exact_tool_available": False,
                     },
                 },

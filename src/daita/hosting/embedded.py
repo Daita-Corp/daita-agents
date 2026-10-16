@@ -131,8 +131,9 @@ from ..domains.data import (
     CatalogDataView,
     DataCapabilityDomain,
     artifact_declarations,
-    data_export_tabular_declarations,
     data_query_declarations,
+    exact_export_declarations,
+    exact_export_outputs,
     local_file_declarations,
     relational_update_declarations,
     relational_update_preview_declarations,
@@ -1669,38 +1670,44 @@ class EmbeddedAgent:
         )
         if admission_cleanup is not None:
             admission_cleanup.push_async_callback(postgresql_backend.close)
-        relational_query = data_query_declarations(
-            identity.id,
-            sqlite_backend,
-            postgresql_backend,
-        )
         from ..adapters.analytical_workspace.runtime import runtime_status
 
         scientific_admitted = not hosted and runtime_status()["available"] is True
         admitted_analysis_limits = analysis_limits or AnalysisLimits()
+        export_arrow_bounds = (
+            (
+                min(100_000, admitted_analysis_limits.table_rows),
+                min(256, admitted_analysis_limits.table_columns),
+                min(
+                    admitted_analysis_limits.file_bytes,
+                    admitted_analysis_limits.input_bytes,
+                    admitted_analysis_limits.decoded_bytes,
+                    admitted_analysis_limits.scratch_bytes,
+                ),
+            )
+            if scientific_admitted
+            else None
+        )
         relational_export = (
-            data_export_tabular_declarations(
+            exact_export_declarations(
                 identity.id,
                 sqlite_backend,
                 postgresql_backend,
                 clock,
-                arrow_bounds=(
-                    (
-                        min(100_000, admitted_analysis_limits.table_rows),
-                        min(256, admitted_analysis_limits.table_columns),
-                        min(
-                            admitted_analysis_limits.file_bytes,
-                            admitted_analysis_limits.input_bytes,
-                            admitted_analysis_limits.decoded_bytes,
-                            admitted_analysis_limits.scratch_bytes,
-                        ),
-                    )
-                    if scientific_admitted
-                    else None
-                ),
+                arrow_bounds=export_arrow_bounds,
             )
             if artifact_store.available
             else None
+        )
+        relational_query = data_query_declarations(
+            identity.id,
+            sqlite_backend,
+            postgresql_backend,
+            file_outputs=(
+                exact_export_outputs(allow_arrow=export_arrow_bounds is not None)
+                if relational_export is not None
+                else ()
+            ),
         )
         postgresql_preview_backend = PostgreSQLWriteBackend(
             store,

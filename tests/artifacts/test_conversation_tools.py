@@ -29,7 +29,6 @@ from daita.domains.data.export_capabilities import (
     ARTIFACT_LIST_TOOL_NAME,
     ARTIFACT_READ_TOOL_NAME,
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-    DATA_EXPORT_TABULAR_TOOL_NAME,
     DOCUMENT_CREATE_TOOL_NAME,
     ArtifactListExecutor,
     ArtifactReadExecutor,
@@ -174,12 +173,12 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
             _tools(
                 ToolCall(
                     id="xlsx-export",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source.id,
                         "resource_ids": (resource.id,),
                         "sql": "SELECT label, number FROM records ORDER BY number",
-                        "format": "xlsx",
+                        "output": "xlsx",
                         "filename": "records.xlsx",
                     },
                 )
@@ -468,12 +467,12 @@ async def test_artifact_conversion_cancellation_leaves_no_child_or_staging(
             _tools(
                 ToolCall(
                     id="export",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source.id,
                         "resource_ids": (resource.id,),
                         "sql": "SELECT label FROM records",
-                        "format": "xlsx",
+                        "output": "xlsx",
                     },
                 )
             ),

@@ -542,9 +542,10 @@ class AgentContextBuilder:
             else None
         )
         capability_ids = frozenset(
-            entry.capability.id
+            capability.id
             for entry in tool_context.entries
             if entry.load_mode is ToolLoadMode.PINNED
+            for capability in entry.capabilities
         )
         local_file_context = (
             self._local_file_context
@@ -1190,9 +1191,17 @@ class AgentContextBuilder:
                     "Answer from available evidence and identify unfinished work."
                 )
         guidance = _tool_guidance(
-            frozenset(entry.capability.id for entry in tool_context.callable_entries),
+            frozenset(
+                capability.id
+                for entry in tool_context.callable_entries
+                for capability in entry.capabilities
+            ),
             snapshot.artifact_destinations,
-            frozenset(entry.capability.id for entry in tool_context.catalog_entries),
+            frozenset(
+                capability.id
+                for entry in tool_context.catalog_entries
+                for capability in entry.capabilities
+            ),
             local_file_context=snapshot.local_file_context,
             messages=messages,
             arrow_export_callable=_arrow_export_admitted(tool_context.callable_entries),
@@ -2937,26 +2946,28 @@ def _system_prompt(
 
 def _arrow_export_admitted(entries: tuple[RunToolCatalogEntry, ...]) -> bool:
     for entry in entries:
-        capability = entry.capability
-        if (
-            entry.domain_owner_id != "data"
-            or capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID
-            or capability.access_mode is not AccessMode.READ
-            or capability.operational_effect is not OperationalEffect.NONE
-        ):
-            continue
-        properties = capability.input_schema.get("properties")
-        format_schema = (
-            properties.get("format") if isinstance(properties, Mapping) else None
-        )
-        if (
-            isinstance(format_schema, Mapping)
-            and "arrow" in format_schema.get("enum", ())
-            and capability.artifact_policy is not None
-            and "application/vnd.apache.arrow.file"
-            in capability.artifact_policy.allowed_media_types
-        ):
-            return True
+        for capability in entry.capabilities:
+            if (
+                entry.domain_owner_id != "data"
+                or capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID
+                or capability.access_mode is not AccessMode.READ
+                or capability.operational_effect is not OperationalEffect.NONE
+            ):
+                continue
+            properties = capability.input_schema.get("properties")
+            output_schema = (
+                properties.get(entry.view.mode_argument)
+                if isinstance(properties, Mapping)
+                else None
+            )
+            if (
+                isinstance(output_schema, Mapping)
+                and "arrow" in output_schema.get("enum", ())
+                and capability.artifact_policy is not None
+                and "application/vnd.apache.arrow.file"
+                in capability.artifact_policy.allowed_media_types
+            ):
+                return True
     return False
 
 
@@ -2986,12 +2997,13 @@ def _tool_guidance(
             )
         return f"Access needed for {purpose} is absent from this scope; report the limitation."
 
+    # The exact export rides on pinned data_query, so it adds the artifact
+    # procedures only when the request asks for a file (see below).
     artifact_tools_available = bool(
         capability_ids
         & {
             DOCUMENT_CREATE_CAPABILITY_ID,
             ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
-            DATA_EXPORT_TABULAR_CAPABILITY_ID,
             ARTIFACT_CONVERT_CAPABILITY_ID,
             ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
             ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
@@ -3033,6 +3045,13 @@ def _tool_guidance(
         re.search(r"\btools\.(?:call|batch)\b", query) is not None
     )
     capture_requested = re.search(r"\btools\.capture\b", query) is not None
+    if DATA_EXPORT_TABULAR_CAPABILITY_ID in capability_ids and (
+        re.search(
+            r"\b(exports?|csv|xlsx|excel|spreadsheets?|downloads?|files?)\b", query
+        )
+        is not None
+    ):
+        artifact_tools_available = True
     if "analysis.execute" in candidates and (
         programmatic_reads_requested or (capture_requested and arrow_export_candidate)
     ):
@@ -3131,11 +3150,11 @@ def _tool_guidance(
             )
             if arrow_export_callable:
                 instructions.append(
-                    "Python Arrow: r = tools.capture('data_export_tabular', export_arguments, name='rows') accepts only format='arrow' on the already loaded contract. Check r['is_error'] and retain r['output']['artifact'], including a staging failure. After successful capture, read the installed dataset with pyarrow.ipc.open_file(inputs.path('rows')). The return value is structured evidence; inputs.path uses the exact name supplied to capture. No path is returned on r and directory scanning cannot resolve an authenticated input. Alternatively export, then bind the exact artifact ID in python_execute.inputs. A capture is an input, not a saved output; confirm every requested output reference separately. No automatic query/cell replay."
+                    "Python Arrow: r = tools.capture('data_query', query_arguments, name='rows') accepts only one sql statement with output='arrow' on the already loaded contract. Check r['is_error'] and retain r['output']['artifact'], including a staging failure. After successful capture, read the installed dataset with pyarrow.ipc.open_file(inputs.path('rows')). The return value is structured evidence; inputs.path uses the exact name supplied to capture. No path is returned on r and directory scanning cannot resolve an authenticated input. Alternatively export, then bind the exact artifact ID in python_execute.inputs. A capture is an input, not a saved output; confirm every requested output reference separately. No automatic query/cell replay."
                 )
             elif arrow_export_candidate:
                 instructions.append(
-                    "The exact Arrow export is discoverable but not loaded. Use toolbox_load with data_export_tabular and python_execute together before capture; known names need no search. Loading grants no source authority."
+                    "The exact Arrow export is discoverable but not loaded. Use toolbox_load with data_query and python_execute together before capture; known names need no search. Loading grants no source authority."
                 )
         csv_result = any(
             isinstance(data := block.output.get("data"), Mapping)
@@ -3376,7 +3395,7 @@ def _tool_guidance(
                 ),
                 (
                     DATA_EXPORT_TABULAR_CAPABILITY_ID,
-                    "data_export_tabular for exact CSV/XLSX from the admitted source. Never put source rows or artifact bytes in arguments.",
+                    "data_query output=csv|xlsx for exact complete CSV/XLSX from the admitted source. Never put source rows or artifact bytes in arguments.",
                 ),
                 (
                     ARTIFACT_CONVERT_CAPABILITY_ID,

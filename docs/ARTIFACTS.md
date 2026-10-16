@@ -11,9 +11,12 @@ creation and deletion.
 
 Choose a tabular tool by the kind of evidence you need:
 
-- `data_export_tabular` runs one validated relational query directly against
-  exact current catalog resources and creates a complete CSV or XLSX artifact
-  within fixed source-export bounds. Its provenance is exact source data.
+- `data_query` with `output="csv"` or `output="xlsx"` runs one validated
+  relational `sql` statement directly against exact current catalog resources
+  and creates a complete CSV or XLSX artifact within fixed source-export bounds
+  (100,000 rows, 60 seconds). It returns the artifact reference, never rows,
+  and does not accept `statements`. Its provenance is exact source data. The
+  default `output="rows"` keeps the bounded preview behavior.
 - `artifact_create_tabular` packages bounded model-authored findings as CSV,
   XLSX, or HTML. It requires one or more `evidence_refs`: the visible
   `result_ref` values (`r1`, `r2`, ...) of earlier successful results in the
@@ -105,7 +108,7 @@ embedded text previews. Exported files, application delivery copies, and backups
 also remain. Application hosts must delete their own copies and coordinate
 deletion with any publication of previously fetched bytes.
 
-Exact Arrow IPC exports are available as `data_export_tabular(format="arrow")`
+Exact Arrow IPC exports are available as `data_query(output="arrow")`
 when the supported local scientific runtime is admitted. CSV/XLSX installations
 retain their existing declarations. Arrow reports projected column names and
 scalar types, row count, byte size, query/parameter digests, current resource

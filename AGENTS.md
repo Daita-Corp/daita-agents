@@ -481,7 +481,8 @@ persisted transcript, rejects failed, stale, reordered, cross-run, or tampered
 lineage, inherits the highest result sensitivity, and preserves current
 relational resource revisions where present. The artifact remains explicitly
 derived analysis rather than exact or complete source data. Exact complete
-relational export remains the separate `data_export_tabular` capability.
+relational export remains the separate `data.export_tabular` capability, reached
+through `data_query` with `output="csv"`, `"xlsx"` or `"arrow"`.
 
 ## Remote MCP tools and actions
 

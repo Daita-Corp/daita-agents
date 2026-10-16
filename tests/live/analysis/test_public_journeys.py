@@ -395,7 +395,7 @@ async def test_paired_exact_dataset_handoffs_have_independent_numeric_oracles(
         method = (
             "First export a complete Arrow query, then bind its exact artifact ID in python_execute.inputs."
             if handoff == "export_bind"
-            else "Use tools.capture('data_export_tabular', ..., name='numbers') within Python after loading the exact export and analysis tools together."
+            else "Use tools.capture('data_query', ..., name='numbers') with output='arrow' within Python after loading python_execute."
         )
         started = perf_counter()
         result = await agent.run(
@@ -455,7 +455,8 @@ async def test_paired_exact_dataset_handoffs_have_independent_numeric_oracles(
         exports = [
             output
             for call, output in transcript.tool_pairs
-            if call.name == "data_export_tabular"
+            if call.name == "data_query"
+            and call.arguments.get("output") == "arrow"
             and output is not None
             and not output.is_error
         ]
@@ -463,7 +464,7 @@ async def test_paired_exact_dataset_handoffs_have_independent_numeric_oracles(
             r
             for r in records
             if r.kind == "child"
-            and r.facts["tool_name"] == "data_export_tabular"
+            and r.facts["tool_name"] == "data_query"
             and r.facts["status"] == "succeeded"
         ]
         assert exports if handoff == "export_bind" else captured

@@ -258,12 +258,12 @@ async def test_public_composition_throughput_campaign(tmp_path, monkeypatch):
         provider.calls = (
             ToolCall(
                 id="export",
-                name="data_export_tabular",
+                name="data_query",
                 arguments={
                     "source_id": source_id,
                     "resource_ids": [resource_id],
                     "sql": "SELECT id, label FROM records ORDER BY id",
-                    "format": "csv",
+                    "output": "csv",
                 },
             ),
         )
@@ -382,7 +382,7 @@ async def test_public_composition_throughput_campaign(tmp_path, monkeypatch):
                     "source_id": bindings[0][0],
                     "resource_ids": [bindings[0][1]],
                     "sql": "SELECT id, label FROM records ORDER BY id",
-                    "format": "arrow",
+                    "output": "arrow",
                 }
 
                 async def python_dataset():
@@ -545,11 +545,7 @@ class _NativeProvider(_Provider):
             return ModelResponse(finish_reason=FinishReason.STOP, text="verified")
         required = {
             "python_execute",
-            *(
-                {"data_export_tabular"}
-                if self.mode in {"capture", "export_bind"}
-                else set()
-            ),
+            *({"data_query"} if self.mode in {"capture", "export_bind"} else set()),
         }
         if required - names:
             calls = (
@@ -563,7 +559,7 @@ class _NativeProvider(_Provider):
             calls = (
                 ToolCall(
                     id="export",
-                    name="data_export_tabular",
+                    name="data_query",
                     arguments=self.export_arguments,
                 ),
             )
@@ -573,7 +569,7 @@ class _NativeProvider(_Provider):
             }
             if self.mode in {"capture", "export_bind"}:
                 if self.mode == "capture":
-                    prefix = f"r = tools.capture('data_export_tabular', {self.export_arguments!r}, name='rows')\nassert not r['is_error'], r\n"
+                    prefix = f"r = tools.capture('data_query', {self.export_arguments!r}, name='rows')\nassert not r['is_error'], r\n"
                 else:
                     exported = results["export"]
                     assert not exported.is_error

@@ -5,7 +5,7 @@ import pytest
 from daita.domains.data.capabilities import data_query_capability_declarations
 from daita.domains.data.export_capabilities import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
-    data_export_tabular_capability_declarations,
+    exact_export_capability_declarations,
 )
 from daita.domains.data.sql import (
     MAX_SQL_CHARACTERS,
@@ -478,7 +478,7 @@ def test_model_facing_sql_capabilities_publish_the_same_input_bounds() -> None:
     query_capability = data_query_capability_declarations().capabilities[0]
     export_capability = next(
         item
-        for item in data_export_tabular_capability_declarations().capabilities
+        for item in exact_export_capability_declarations().capabilities
         if item.id == DATA_EXPORT_TABULAR_CAPABILITY_ID
     )
 

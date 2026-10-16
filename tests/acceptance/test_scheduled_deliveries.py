@@ -62,7 +62,6 @@ from daita.catalog.models import (
 from daita.distribution import OutcomeState
 from daita.domains.data.export_capabilities import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
-    DATA_EXPORT_TABULAR_TOOL_NAME,
     DOCUMENT_CREATE_CAPABILITY_ID,
     DOCUMENT_CREATE_TOOL_NAME,
     RESULT_SNAPSHOT_CAPABILITY_ID,
@@ -288,12 +287,12 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
                 _tools(
                     ToolCall(
                         id="sqlite-csv",
-                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                        name="data_query",
                         arguments={
                             "source_id": source.id,
                             "resource_ids": (resource.id,),
                             "sql": "SELECT value FROM current_value",
-                            "format": "csv",
+                            "output": "csv",
                             "filename": "current-value.csv",
                         },
                     )
@@ -412,12 +411,12 @@ async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
                 _tools(
                     ToolCall(
                         id="outside-export",
-                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                        name="data_query",
                         arguments={
                             "source_id": source.id,
                             "resource_ids": (resources["outside_value"].id,),
                             "sql": "SELECT value FROM outside_value",
-                            "format": "csv",
+                            "output": "csv",
                         },
                     )
                 ),
@@ -503,12 +502,12 @@ async def test_restart_after_artifact_and_terminal_commit_does_not_repeat_work(
                 _tools(
                     ToolCall(
                         id="recoverable-csv",
-                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                        name="data_query",
                         arguments={
                             "source_id": source.id,
                             "resource_ids": (resource.id,),
                             "sql": "SELECT value FROM current_value",
-                            "format": "csv",
+                            "output": "csv",
                             "filename": "recoverable.csv",
                         },
                     )
@@ -806,12 +805,12 @@ async def test_scheduled_postgresql_xlsx_uses_the_same_inbox_path(
                 _tools(
                     ToolCall(
                         id="postgresql-xlsx",
-                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                        name="data_query",
                         arguments={
                             "source_id": source.id,
                             "resource_ids": (resource.id,),
                             "sql": "SELECT amount FROM public.orders",
-                            "format": "xlsx",
+                            "output": "xlsx",
                             "filename": "orders.xlsx",
                         },
                     )
