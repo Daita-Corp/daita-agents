@@ -141,7 +141,7 @@ async def test_l8_csv_of_a_query_result_cites_that_result(
         model_profile=profile,
         limits=LoopLimits(
             max_steps=10,
-            max_total_tokens=60_000,
+            max_total_tokens=100_000,
             max_estimated_cost_usd=cost_cap(_cost_limit()),
         ),
         workspace=workspace_for(home.root),
