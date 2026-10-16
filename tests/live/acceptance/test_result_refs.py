@@ -4,7 +4,7 @@ Two bounded cases on a local SQLite probe home:
 
 * foreground: a first turn queries a table summary and shows it; a second
   turn asks for a CSV of that result, made either by one exact export or by
-  a derived table citing the shown result;
+  a derived table citing a query of the same tables;
 * graph: a durable model worker runs its read and finishes with task_complete.
 
 Pass condition: the right result is referenced on the first try, and no call is
@@ -195,8 +195,21 @@ async def test_l8_csv_of_a_query_result_cites_that_result(
         data = artifact_result.output["data"]
         assert isinstance(data, Mapping)
         cited = tuple(cast(tuple[str, ...], data["evidence_call_ids"]))
-        # The visible ref the model cited resolves to the query it ran earlier.
-        assert cited == (queries[-1][1].id,)
+        # The visible ref the model cited resolves to one query of the same
+        # tables: the one shown, or a fresh read of them in this turn.
+        shown_tables = set(
+            cast(tuple[str, ...], queries[-1][1].arguments["resource_ids"])
+        )
+        reads = {
+            call.id
+            for _index, call, _result in (
+                *queries,
+                *_successful(transcript, "data_query"),
+            )
+            if set(cast(tuple[str, ...], call.arguments["resource_ids"]))
+            == shown_tables
+        }
+        assert len(cited) == 1 and cited[0] in reads
         assert all(
             not str(ref).startswith(("call_", "toolu_"))
             for ref in cast(
