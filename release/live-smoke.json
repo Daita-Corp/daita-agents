@@ -1,0 +1,11 @@
+{
+  "billing": "subscription",
+  "cases": {},
+  "recorded_on": null,
+  "status": "pending",
+  "summary": {
+    "passed": 0,
+    "total": 0
+  },
+  "surface_digest": "sha256:ae12f8ecbdf3e48e888cc46b27a086a4cf9656b96cf48e4e41415731e8751dba"
+}
