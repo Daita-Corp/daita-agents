@@ -636,10 +636,14 @@ def _require_call_target_ceiling(
     )
 
 
-_REINSPECT_AFTER_APPROVAL = ToolRecovery(
-    RecoveryKind.REINSPECT_BINDING,
-    "The approved state changed before dispatch; re-read the target and "
-    "preview again before asking for approval.",
+# Drift found after approval is final for that request. Every post-approval
+# ``state_changed`` result carries this one recovery, whatever the capability;
+# staleness found before approval keeps the owning domain's re-preview advice.
+APPROVED_TARGET_CHANGED = ToolRecovery(
+    RecoveryKind.TERMINAL,
+    "The approved target changed while approval was pending; nothing was "
+    "written. Report the conflict and the target's current value to the user. "
+    "Do not preview again or request approval again unless the user asks.",
 )
 _UNCERTAIN_OUTCOME = ToolRecovery(
     RecoveryKind.TERMINAL,
@@ -3851,7 +3855,7 @@ class CapabilityRuntime:
                     raise CapabilityInputError(
                         "state_changed",
                         "Current effect binding changed after approval.",
-                        recovery=_REINSPECT_AFTER_APPROVAL,
+                        recovery=APPROVED_TARGET_CHANGED,
                     )
             if plan.recheck_after_approval:
                 try:
@@ -3876,7 +3880,7 @@ class CapabilityRuntime:
                         raise CapabilityInputError(
                             "state_changed",
                             "Current effect authorization changed after approval.",
-                            recovery=_REINSPECT_AFTER_APPROVAL,
+                            recovery=APPROVED_TARGET_CHANGED,
                         )
                 except asyncio.CancelledError:
                     raise
@@ -3891,7 +3895,7 @@ class CapabilityRuntime:
                             "state_changed",
                             "The validated state changed while approval was pending.",
                             recovery_details(
-                                _REINSPECT_AFTER_APPROVAL,
+                                APPROVED_TARGET_CHANGED,
                                 {"capability_id": capability.id},
                             ),
                         ),
@@ -3905,7 +3909,7 @@ class CapabilityRuntime:
                             "state_changed",
                             "The validated state changed while approval was pending.",
                             recovery_details(
-                                _REINSPECT_AFTER_APPROVAL,
+                                APPROVED_TARGET_CHANGED,
                                 {"capability_id": capability.id},
                             ),
                         ),

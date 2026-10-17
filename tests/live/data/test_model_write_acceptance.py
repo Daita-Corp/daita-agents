@@ -9,13 +9,16 @@ scheduled cases explicitly seed owner fixtures; they do not prove model creation
 
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import replace
 
 import pytest
 
 from daita import EffectRequirement
 from daita.capabilities import EffectEvidenceBasis, EffectOutcome
+from daita.capability_runtime import APPROVED_TARGET_CHANGED
 from daita.distribution.models import OutcomeState, outcome_contract_projection
+from daita.llm.models import ToolResultBlock
 from daita.loop.models import LoopExitKind
 from daita.storage.sqlite_records import EffectResolutionDecision
 from tests.support.distribution import no_artifact_outcome_contract
@@ -292,6 +295,25 @@ async def test_live_drift_during_approval_does_not_reapply(database, scenario_fa
             user_prompt="Please change the name of the company whose domain is existing.test to Updated. Leave everything else alone and let me know the result.",
         )
         assert_exact_preview(scenario, transcript, "update")
+        # Post-approval drift is final for the request in both profiles: the
+        # framework recovery says stop and report, so the user_flow prompt
+        # needs no stop rule and the model never re-previews or re-applies.
+        assert len(calls_for(transcript, "data_update_rows", "apply")) == 1
+        assert len(scenario.approvals) == 1
+        errors = [
+            block.output.get("error")
+            for message in transcript.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock) and block.is_error
+        ]
+        (blocked,) = [
+            error
+            for error in errors
+            if isinstance(error, Mapping) and error.get("code") == "state_changed"
+        ]
+        details = blocked["details"]
+        assert isinstance(details, Mapping)
+        assert dict(details["recovery"]) == APPROVED_TARGET_CHANGED.to_details()
         assert [item["name"] for item in await database.rows()] == ["Concurrent writer"]
         assert not await scenario.agent.list_effects()
         assert database.probe.mutations == database.probe.commit_attempts == 0

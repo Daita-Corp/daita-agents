@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Mapping
+from pathlib import Path
 
 import pytest
 
+from daita import capability_runtime
 from daita.capabilities import (
     CallTargetLane,
     CapabilityInputError,
@@ -13,6 +16,7 @@ from daita.capabilities import (
     ExecutionPreference,
 )
 from daita.capability_runtime import (
+    APPROVED_TARGET_CHANGED,
     _require_call_target_ceiling,
     call_target_lane,
 )
@@ -448,7 +452,7 @@ async def test_correct_arguments_recovery_for_unloaded_tool_names_toolbox_load()
     assert _dispatches(executors) == 0
 
 
-async def test_reinspect_binding_recovery_when_state_changes_during_approval():
+async def test_drift_during_approval_is_final_stop_and_report():
     executors: dict[str, _Executor] = {}
 
     async def approve(request):
@@ -464,9 +468,48 @@ async def test_reinspect_binding_recovery_when_state_changes_during_approval():
     result = await _write_after_load(runtime, run)
 
     assert _error_code(result) == "state_changed"
-    assert _recovery(result)["kind"] == "reinspect_binding"
+    assert dict(_recovery(result)) == APPROVED_TARGET_CHANGED.to_details()
     assert _details(result)["execution_disposition"] == "not_dispatched"
     assert executors["guarded_write"].execute_calls == 0
+
+
+def test_post_approval_drift_recovery_never_suggests_repreview():
+    """Snapshot: every post-approval ``state_changed`` shares one final recovery.
+
+    The runtime owns this recovery for every capability that rechecks after
+    approval (native update/upsert, MCP actions and any other), so no write
+    path can tell the model to preview or request approval again.
+    """
+
+    assert APPROVED_TARGET_CHANGED.to_details() == {
+        "kind": "terminal",
+        "constraint": (
+            "The approved target changed while approval was pending; nothing "
+            "was written. Report the conflict and the target's current value "
+            "to the user. Do not preview again or request approval again "
+            "unless the user asks."
+        ),
+    }
+    tree = ast.parse(Path(capability_runtime.__file__).read_text(encoding="utf-8"))
+    drift_sites = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and any(
+            isinstance(argument, ast.Constant) and argument.value == "state_changed"
+            for argument in node.args
+        )
+    ]
+    assert len(drift_sites) >= 4
+    for node in drift_sites:
+        names = {item.id for item in ast.walk(node) if isinstance(item, ast.Name)}
+        assert "APPROVED_TARGET_CHANGED" in names, ast.unparse(node)
+    reinspect = [
+        ast.unparse(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "REINSPECT_BINDING"
+    ]
+    assert reinspect == []
 
 
 async def _write_after_load(runtime, run: RunInput) -> ToolResultBlock:

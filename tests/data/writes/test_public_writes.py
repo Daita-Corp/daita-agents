@@ -28,6 +28,7 @@ from daita.capabilities import (
     EffectEvidenceBasis,
     EffectOutcome,
 )
+from daita.capability_runtime import APPROVED_TARGET_CHANGED
 from daita.distribution.models import OutcomeState
 from daita.jobs.graph.admission import START_GRAPH_JOB_TOOL_NAME
 from daita.jobs.graph.capabilities import TASK_COMPLETE_TOOL_NAME
@@ -306,6 +307,20 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
         assert "locks matching rows" in document
         assert len(mutations) == (1 if review_action == "approve" else 0)
         assert len(receipts) == (1 if review_action == "approve" else 0)
+        if review_action == "drift":
+            (write,) = [
+                block
+                for message in transcript.messages
+                for block in message.content
+                if isinstance(block, ToolResultBlock) and block.call_id == "write"
+            ]
+            assert write.is_error
+            error = write.output["error"]
+            assert isinstance(error, Mapping)
+            assert error["code"] == "state_changed"
+            assert dict(error["details"]["recovery"]) == (
+                APPROVED_TARGET_CHANGED.to_details()
+            )
         assert (
             not db.rows
         )  # The existing update I/O fixture owns this test's source calls.
@@ -569,6 +584,64 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         assert "Connection: Company research" in document
         assert "Preview: 1 insert, 0 update, 0 unchanged" in document
         assert "Exact validated details:" in document
+    finally:
+        await agent.close()
+
+
+async def test_upsert_drift_during_approval_is_final_with_no_mutation(
+    tmp_path, monkeypatch
+):
+    agent, provider, db, _, binding, _, _, batch, _, _ = await create_fixture(
+        tmp_path, monkeypatch
+    )
+    concurrent = {
+        "id": 42,
+        "domain": "new.test",
+        "name": "Concurrent writer",
+        "evidence_url": "https://source.test/concurrent",
+        "notes": None,
+        "__daita_xmin": "7",
+    }
+    approvals = []
+
+    async def approve_after_concurrent_write(request):
+        approvals.append(request)
+        if request.capability_id == "data.upsert_rows":
+            db.rows["new.test"] = dict(concurrent)
+        return ApprovalDecision.APPROVE
+
+    try:
+        agent._embedded._capability_runtime._approval_handler = (
+            approve_after_concurrent_write
+        )
+        script(provider, binding, batch)
+        result = await agent.run(
+            "Research companies doing business with Acme and save cited findings now."
+        )
+        assert result.reason == "completed"
+        transcript = await agent._embedded._store.load(result.run_id)
+        (write,) = [
+            block
+            for message in transcript.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock) and block.call_id == "write"
+        ]
+        assert write.is_error
+        error = write.output["error"]
+        assert isinstance(error, Mapping)
+        assert error["code"] == "state_changed"
+        assert dict(error["details"]["recovery"]) == (
+            APPROVED_TARGET_CHANGED.to_details()
+        )
+        assert [item.capability_id for item in approvals].count("data.upsert_rows") == 1
+        assert not await agent.list_effects()
+        assert db.rows == {"new.test": concurrent}
+        assert not [
+            item
+            for item in db.log
+            if item[0] in {"fetch", "execute"}
+            and str(item[1]).startswith(("INSERT", "UPDATE", "LOCK TABLE"))
+        ]
     finally:
         await agent.close()
 
