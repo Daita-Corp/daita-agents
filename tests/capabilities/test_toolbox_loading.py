@@ -361,6 +361,48 @@ async def test_replay_pairs_reused_call_ids_with_their_ordered_results() -> None
     )
 
 
+async def test_load_skips_pinned_names_and_loads_the_rest() -> None:
+    runtime, _, _, _ = _runtime()
+    run = _run("run-load-pinned-mix")
+    catalog = await runtime.prepare_run(run)
+
+    result, messages, projection = await _load(
+        runtime,
+        run,
+        catalog,
+        (),
+        ("pinned_read", "on_demand_a"),
+        call_id="load-mixed-pinned",
+    )
+
+    assert not result.is_error
+    receipt = _data(result)
+    assert tuple(cast(list[str], receipt["loaded_names"])) == ("on_demand_a",)
+    assert tuple(cast(list[str], receipt["already_pinned_names"])) == ("pinned_read",)
+    assert tuple(item.view.name for item in projection.loaded_entries) == (
+        "on_demand_a",
+    )
+    assert {"pinned_read", "on_demand_a"} <= {
+        item.name for item in projection.provider_definitions
+    }
+    assert runtime.project(catalog, messages) == projection
+
+    pinned_only, _, after = await _load(
+        runtime,
+        run,
+        catalog,
+        messages,
+        ("pinned_read",),
+        call_id="load-pinned-only",
+    )
+    assert _error_code(pinned_only) == "toolbox_load_invalid"
+    details = cast(dict[str, object], pinned_only.output["error"])["details"]
+    assert tuple(cast(dict[str, list[str]], details)["already_pinned_names"]) == (
+        "pinned_read",
+    )
+    assert tuple(item.view.name for item in after.loaded_entries) == ("on_demand_a",)
+
+
 async def test_only_one_load_succeeds_and_same_response_cannot_use_new_surface() -> (
     None
 ):

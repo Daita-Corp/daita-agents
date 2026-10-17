@@ -638,7 +638,8 @@ def _control_definitions(
             description=(
                 "Atomically load an exact on-demand working set. A successful load "
                 "replaces the prior set on the next model step; ordinary validation "
-                "and governance still apply. Retains bounded contracts in the result; "
+                "and governance still apply. Pinned names are already callable and "
+                "are skipped. Retains bounded contracts in the result; "
                 "use toolbox_inspect for omitted contracts without changing this set."
             ),
             input_schema={
@@ -2350,6 +2351,7 @@ class CapabilityRuntime:
             entry.view.name: entry for entry in projection.catalog_entries
         }
         requested: list[RunToolCatalogEntry] = []
+        already_pinned: list[str] = []
         for name in names:
             entry = entries_by_name.get(name)
             if entry is None:
@@ -2360,12 +2362,8 @@ class CapabilityRuntime:
                     {"tool_name": name},
                 )
             if entry.load_mode is not ToolLoadMode.ON_DEMAND:
-                return _error(
-                    call,
-                    "toolbox_load_invalid",
-                    "Pinned tools cannot be loaded into the on-demand working set.",
-                    {"tool_name": name},
-                )
+                already_pinned.append(name)
+                continue
             if not _entry_resolves_exactly(entry, self._registry):
                 return _error(
                     call,
@@ -2374,6 +2372,13 @@ class CapabilityRuntime:
                     {"tool_name": name},
                 )
             requested.append(entry)
+        if not requested:
+            return _error(
+                call,
+                "toolbox_load_invalid",
+                "Pinned tools are already callable; load only on-demand tools.",
+                {"already_pinned_names": sorted(already_pinned)},
+            )
         loaded = tuple(sorted(requested, key=lambda item: item.view.name))
         definitions = tuple(
             self._registry.tool_definition(entry.view.name) for entry in loaded
@@ -2430,6 +2435,8 @@ class CapabilityRuntime:
                 _tool_contract(entry, include_schemas=False) for entry in loaded
             ],
         }
+        if already_pinned:
+            data["already_pinned_names"] = sorted(already_pinned)
         _fit_load_contracts(data, loaded, self._limits)
         if (
             len(canonical_json(data).encode("utf-8"))
@@ -5154,14 +5161,30 @@ def _verified_loaded_entries(
     limits: LoopLimits,
     registry: CapabilityRegistry,
 ) -> tuple[RunToolCatalogEntry, ...] | None:
-    if set(data) != {
+    receipt_keys = {
         "run_id",
         "catalog_digest",
         "loaded_names",
         "definition_bytes",
         "activation_digest",
         "contracts",
-    }:
+    }
+    if set(data) not in (receipt_keys, receipt_keys | {"already_pinned_names"}):
+        return None
+    by_name = {entry.view.name: entry for entry in catalog_entries}
+    pinned_names = tuple(
+        sorted(
+            name
+            for name in requested_names
+            if name in by_name and by_name[name].load_mode is not ToolLoadMode.ON_DEMAND
+        )
+    )
+    pinned_value = data.get("already_pinned_names", ())
+    if (
+        not isinstance(pinned_value, (tuple, list))
+        or tuple(pinned_value) != pinned_names
+        or ("already_pinned_names" in data and not pinned_names)
+    ):
         return None
     names_value = data.get("loaded_names")
     if not isinstance(names_value, (tuple, list)):
@@ -5169,14 +5192,14 @@ def _verified_loaded_entries(
     names = tuple(name for name in names_value if isinstance(name, str))
     if (
         len(names) != len(names_value)
-        or names != tuple(sorted(requested_names))
+        or names
+        != tuple(sorted(name for name in requested_names if name not in pinned_names))
         or len(names) != len(set(names))
         or len(names) > limits.max_loaded_tools
         or data.get("run_id") != run_id
         or data.get("catalog_digest") != catalog_digest
     ):
         return None
-    by_name = {entry.view.name: entry for entry in catalog_entries}
     try:
         entries = tuple(by_name[name] for name in names)
     except KeyError:
