@@ -32,6 +32,7 @@ from daita.distribution.models import (
     MAX_OUTCOME_ARTIFACT_REQUIREMENTS,
     MAX_OUTCOME_CONCLUSION_PREVIEW_BYTES,
     MAX_OUTCOME_TOTAL_ARTIFACT_BYTES,
+    requirements_need_exact_source_bindings,
 )
 from daita.llm import ModelSensitivity
 from daita.storage.sqlite_codecs import (
@@ -80,6 +81,30 @@ def contract(
         require_current_run_provenance=True,
         require_exact_source_bindings=bool(requirements),
     )
+
+
+@pytest.mark.parametrize(
+    ("authorships", "expected"),
+    (
+        (None, True),
+        ((ArtifactAuthorship.EXACT_SOURCE_DATA,), True),
+        (
+            (
+                ArtifactAuthorship.EXACT_SOURCE_DATA,
+                ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
+            ),
+            False,
+        ),
+        ((), False),
+    ),
+)
+def test_exact_source_rule_follows_what_the_requirements_admit(authorships, expected):
+    requirements = (
+        ()
+        if authorships is None
+        else (replace(requirement(), allowed_authorships=authorships),)
+    )
+    assert requirements_need_exact_source_bindings(requirements) is expected
 
 
 def target(

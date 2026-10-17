@@ -25,6 +25,7 @@ from ..distribution.models import (
     ArtifactRequirement,
     OutcomeContract,
     outcome_artifact_reference,
+    requirements_need_exact_source_bindings,
     validate_outcome_artifact_references,
 )
 from ..distribution.owner import DistributionOwner, construct_graph_job_delivery
@@ -1319,7 +1320,9 @@ class JobSupervisor:
                 inspection.job.specification.authority.sensitivity
             ),
             require_current_run_provenance=True,
-            require_exact_source_bindings=not generic_result,
+            require_exact_source_bindings=requirements_need_exact_source_bindings(
+                (requirement,)
+            ),
         )
         artifact_references = validate_outcome_artifact_references(
             (outcome_artifact_reference(artifact),),

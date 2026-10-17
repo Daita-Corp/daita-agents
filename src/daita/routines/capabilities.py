@@ -39,6 +39,7 @@ from ..distribution.models import (
     ArtifactRequirement,
     EffectRequirement,
     OutcomeContract,
+    requirements_need_exact_source_bindings,
 )
 from ..llm.models import ModelSensitivity, ToolCall
 from ..loop.models import RunInput, RunOrigin
@@ -335,8 +336,12 @@ class RoutineCapabilityDomain:
         capability: Capability,
         arguments: Mapping[str, object],
     ) -> Mapping[str, object]:
-        del capability
-        return arguments
+        if capability.id not in {
+            ROUTINE_CREATE_CAPABILITY_ID,
+            ROUTINE_UPDATE_CAPABILITY_ID,
+        }:
+            return arguments
+        return _without_derived_outcome_rules(arguments)
 
     async def prepare_call(
         self,
@@ -1088,7 +1093,7 @@ def _parse_outcome_contract(value: Mapping[str, object]) -> OutcomeContract:
                 )
                 for item in effects_value
             ),
-            require_terminal_conclusion=_boolean(value, "require_terminal_conclusion"),
+            require_terminal_conclusion=True,
             artifact_requirements=tuple(requirements),
             maximum_total_artifact_bytes=_integer(
                 value, "maximum_total_artifact_bytes"
@@ -1096,11 +1101,9 @@ def _parse_outcome_contract(value: Mapping[str, object]) -> OutcomeContract:
             maximum_effective_sensitivity=ModelSensitivity(
                 _string(value, "maximum_effective_sensitivity")
             ),
-            require_current_run_provenance=_boolean(
-                value, "require_current_run_provenance"
-            ),
-            require_exact_source_bindings=_boolean(
-                value, "require_exact_source_bindings"
+            require_current_run_provenance=True,
+            require_exact_source_bindings=requirements_need_exact_source_bindings(
+                tuple(requirements)
             ),
         )
     except (TypeError, ValueError) as error:
@@ -1401,6 +1404,33 @@ def _identity_array_schema(
     }
 
 
+_DERIVED_OUTCOME_KEYS = frozenset(
+    {
+        "require_terminal_conclusion",
+        "require_current_run_provenance",
+        "require_exact_source_bindings",
+    }
+)
+
+
+def _without_derived_outcome_rules(
+    arguments: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Drop the outcome rules code derives; a copied routine view still has them."""
+
+    contract = arguments.get("outcome_contract")
+    if not isinstance(contract, Mapping):
+        return arguments
+    return {
+        **arguments,
+        "outcome_contract": {
+            key: value
+            for key, value in contract.items()
+            if key not in _DERIVED_OUTCOME_KEYS
+        },
+    }
+
+
 def _outcome_contract_schema() -> dict[str, object]:
     identity_array = _identity_array_schema()
     media_array = {
@@ -1465,7 +1495,6 @@ def _outcome_contract_schema() -> dict[str, object]:
     return {
         "type": "object",
         "properties": {
-            "require_terminal_conclusion": {"type": "boolean"},
             "effect_requirements": {
                 "type": "array",
                 "maxItems": MAX_ROUTINE_IDENTITY_ITEMS,
@@ -1515,16 +1544,11 @@ def _outcome_contract_schema() -> dict[str, object]:
                 "type": "string",
                 "enum": [item.value for item in ModelSensitivity],
             },
-            "require_current_run_provenance": {"type": "boolean"},
-            "require_exact_source_bindings": {"type": "boolean"},
         },
         "required": [
-            "require_terminal_conclusion",
             "artifact_requirements",
             "maximum_total_artifact_bytes",
             "maximum_effective_sensitivity",
-            "require_current_run_provenance",
-            "require_exact_source_bindings",
         ],
         "additionalProperties": False,
     }

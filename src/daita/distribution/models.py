@@ -304,6 +304,22 @@ class OutcomeContract:
         return outcome_contract_digest(self)
 
 
+def requirements_need_exact_source_bindings(
+    requirements: tuple[ArtifactRequirement, ...],
+) -> bool:
+    """Derive the exact-source rule from what the artifact requirements admit.
+
+    It holds unless a requirement admits a non-source authorship, where an
+    empty authorship list admits every authorship.
+    """
+
+    return all(
+        item.allowed_authorships
+        and set(item.allowed_authorships) == {ArtifactAuthorship.EXACT_SOURCE_DATA}
+        for item in requirements
+    )
+
+
 def outcome_contract_digest(value: OutcomeContract) -> str:
     if not isinstance(value, OutcomeContract):
         raise TypeError("outcome contract digest requires OutcomeContract")
