@@ -228,7 +228,6 @@ from ..llm.provider_definitions import (
     tool_schema_incompatibility,
 )
 from ..llm.routing import (
-    AdmittedModelProvider,
     ModelProviderRegistration,
     ModelRoute,
     ModelRouteCandidate,
@@ -416,6 +415,10 @@ _MODEL_CONFIG_NAME = "config.json"
 _MAX_MODEL_CONFIG_BYTES = 64 * 1_024
 _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
 _RUN_ADMISSION_DRAIN_SECONDS = 30.0
+# One-shot validation and candidate review never retry or fall back.
+_ONE_ATTEMPT_RETRY_POLICY = RetryPolicy(
+    max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+)
 _MODEL_VALIDATION_TOOL_NAME = "daita_validate_tool_support"
 _MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 16
 _REASONING_MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 25_000
@@ -1764,20 +1767,17 @@ class EmbeddedAgent:
                 1 if analysis_limits is None else analysis_limits.worker_count
             ),
         )
+        declared_model = model
         model = _admit_host_model(
             model,
             admission_coordinator,
             identity=identity.id,
             home=home,
+            profile=model_profile,
+            owned=owned_model_provider is not None,
         )
         if owned_model_provider is not None:
             owned_model_provider = cast(ManagedModelProvider, model)
-        model_validator = _admit_host_model(
-            model_validator,
-            admission_coordinator,
-            identity=identity.id,
-            home=home,
-        )
         memory_store = MemoryStore(home, memory_lock, storage=advisory_storage)
         skill_store = SkillStore(home, skill_lock, storage=advisory_storage)
         if advisory_storage is not None:
@@ -1811,6 +1811,9 @@ class EmbeddedAgent:
             admission_coordinator,
             identity=identity.id,
             home=home,
+            profile=resolved_reviewer_profile,
+            retry_policy=_ONE_ATTEMPT_RETRY_POLICY,
+            owned=owned_reviewer_model is not None,
         )
         if owned_reviewer_model is not None:
             owned_reviewer_model = cast(
@@ -2112,8 +2115,10 @@ class EmbeddedAgent:
             distribution_declaration_bundle,
             distribution_owner,
         )
+        # The host's retry wrapper is not caller configuration; frozen contracts
+        # keep describing the declared provider and profile.
         model_contracts = _model_execution_contracts(
-            model, model_profile, model_route, model_call_policy
+            declared_model, model_profile, model_route, model_call_policy
         )
 
         async def read_execution_contracts(
@@ -2144,7 +2149,7 @@ class EmbeddedAgent:
             catalog=data_view,
             distribution=distribution_owner,
             skills=skill_store,
-            eligible_model_routes=_stage_c_model_routes(model, model_route),
+            eligible_model_routes=_stage_c_model_routes(declared_model, model_route),
             maximum_per_run_tokens=limits.max_total_tokens,
             maximum_per_run_cost_usd=limits.max_estimated_cost_usd,
             clock=clock,
@@ -2168,7 +2173,7 @@ class EmbeddedAgent:
             *distribution_lifecycle.executors,
             *routine_lifecycle.executors,
         )
-        graph_routes = _stage_c_model_routes(model, model_route)
+        graph_routes = _stage_c_model_routes(declared_model, model_route)
         graph_builder: GraphAdmissionBuilder | None = None
         graph_resolver: RegistryInitialTaskProposalResolver | None = None
         if graph_routes:
@@ -2726,6 +2731,15 @@ class EmbeddedAgent:
                     route,
                     secret_provider=self._secret_provider or self._keychain,
                     injected_provider=self._model_validator,
+                    injected_concurrency_key=(
+                        None
+                        if self._model_validator is None
+                        else _injected_concurrency_key(
+                            self._model_validator.provider_id,
+                            identity=self.identity.id,
+                            home=self._home,
+                        )
+                    ),
                     call_policy=self._model_call_policy,
                     provider_admission=self._provider_admission,
                 )
@@ -5877,8 +5891,19 @@ def _admit_host_model(
     *,
     identity: str,
     home: Path | None,
+    profile: ModelProfile | None = None,
+    retry_policy: RetryPolicy = RetryPolicy(),
+    owned: bool = False,
 ) -> ModelProvider | None:
-    """Bind one host-owned provider at its exact request-attempt boundary."""
+    """Route one host model through the shared router retry and permit boundary.
+
+    A caller-supplied router keeps its own candidates and policy. Any other
+    provider becomes the sole candidate of a host router so injected and
+    configured routes share the same retry, admission and attempt diagnostics.
+    A caller-injected provider stays caller-owned and the router never closes
+    it; a host-owned provider closes with its router. Either keeps serving every
+    request sensitivity the host sends it.
+    """
 
     if model is None:
         return None
@@ -5890,12 +5915,32 @@ def _admit_host_model(
         if not model.provider_admission_bound:
             model.bind_provider_admission(admit)
         return model
-    key = f"injected:{model.provider_id}:{home.resolve() if home is not None else identity}"
-    return AdmittedModelProvider(
-        model,
-        concurrency_key=key,
-        admission=admit,
+    if profile is None:
+        raise AgentNotConfiguredError("a configured model requires its ModelProfile")
+    if model.provider_id != profile.id:
+        raise AgentNotConfiguredError("model and profile identities differ")
+    router = ModelRouter(
+        (
+            ModelProviderRegistration(
+                provider=model,
+                profile=profile,
+                allowed_sensitivities=frozenset(ModelSensitivity),
+                close_with_router=owned,
+                concurrency_key=_injected_concurrency_key(
+                    model.provider_id, identity=identity, home=home
+                ),
+            ),
+        ),
+        retry_policy=retry_policy,
     )
+    router.bind_provider_admission(admit)
+    return router
+
+
+def _injected_concurrency_key(
+    provider_id: str, *, identity: str, home: Path | None
+) -> str:
+    return f"injected:{provider_id}:{home.resolve() if home is not None else identity}"
 
 
 def _source_permission_state_payload(
@@ -6033,9 +6078,7 @@ def _candidate_reviewer_from_route(
                 allowed_sensitivities=primary.allowed_sensitivities,
             ),
         ),
-        retry_policy=RetryPolicy(
-            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
-        ),
+        retry_policy=_ONE_ATTEMPT_RETRY_POLICY,
     )
     return (
         create_model_route_provider(
@@ -6422,6 +6465,7 @@ async def _validate_model_route(
     *,
     secret_provider: SecretProvider,
     injected_provider: ModelProvider | None,
+    injected_concurrency_key: str | None = None,
     call_policy: ModelCallPolicy = _DEFAULT_CALL_POLICY,
     provider_admission: (
         Callable[
@@ -6449,12 +6493,7 @@ async def _validate_model_route(
         )
         for candidate in route.candidates
     )
-    validation_route = ModelRoute(
-        validation_candidates,
-        RetryPolicy(
-            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
-        ),
-    )
+    validation_route = ModelRoute(validation_candidates, _ONE_ATTEMPT_RETRY_POLICY)
     owns_provider = injected_provider is None
     if owns_provider:
         provider = create_model_route_provider(
@@ -6481,10 +6520,13 @@ async def _validate_model_route(
                     provider=injected_provider,
                     profile=candidate.profile,
                     allowed_sensitivities=candidate.allowed_sensitivities,
+                    concurrency_key=injected_concurrency_key,
                 ),
             ),
             retry_policy=validation_route.retry_policy,
         )
+        if provider_admission is not None:
+            provider.bind_provider_admission(provider_admission)
     try:
         await _require_validated_model_provider(
             provider,

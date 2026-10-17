@@ -202,7 +202,9 @@ async def test_foreground_records_are_private_payload_free_and_sized(tmp_path):
     assert first["cache_read_tokens"] == 64
     assert first["cache_read_tokens"] <= first["input_tokens"] == 120
     assert first["remaining_tokens_before"] > second["remaining_tokens_before"]
-    assert first["attempts"] is None and first["attempt_count"] is None
+    # The host routes the injected provider, so each step records its attempt.
+    assert first["attempt_count"] == 1
+    assert [item["outcome"] for item in first["attempts"]] == ["completed"]
     assert first["cost_amount_usd"] == "0.002"
 
     (tool,) = (r["data"] for r in records if r["kind"] == "tool.completed")
