@@ -30,6 +30,8 @@ from .capabilities import (
     ToolPresentation,
     ToolTextTrust,
     ToolView,
+    resource_id_schema,
+    source_id_schema,
 )
 from .capability_runtime import CapabilityFailure, SideEffectPlan
 from .catalog.models import CATALOG_CONTEXT_DEFAULT_LIMIT
@@ -1352,8 +1354,8 @@ def semantic_declarations(
             input_schema={
                 "type": "object",
                 "properties": {
-                    "source_id": _identifier_schema(),
-                    "resource_id": _identifier_schema(),
+                    "source_id": source_id_schema(),
+                    "resource_id": resource_id_schema(),
                     "kind": _kind_schema(),
                     "limit": {
                         "type": "integer",
@@ -2438,14 +2440,14 @@ def _save_input_schema() -> dict[str, object]:
                         "minItems": 1,
                         "maxItems": SEMANTIC_MAX_RESOURCES,
                         "uniqueItems": True,
-                        "items": identifier,
+                        "items": source_id_schema(),
                     },
                     "resource_ids": {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": SEMANTIC_MAX_RESOURCES,
                         "uniqueItems": True,
-                        "items": identifier,
+                        "items": resource_id_schema(),
                     },
                     "fields": {
                         "type": "array",
@@ -2454,7 +2456,7 @@ def _save_input_schema() -> dict[str, object]:
                         "items": {
                             "type": "object",
                             "properties": {
-                                "resource_id": identifier,
+                                "resource_id": resource_id_schema(),
                                 "field_name": {
                                     "type": "string",
                                     "minLength": 1,
@@ -2509,7 +2511,7 @@ def _save_input_schema() -> dict[str, object]:
                 "items": {
                     "type": "object",
                     "properties": {
-                        "resource_id": identifier,
+                        "resource_id": resource_id_schema(),
                         "revision": identifier,
                     },
                     "required": ["resource_id", "revision"],

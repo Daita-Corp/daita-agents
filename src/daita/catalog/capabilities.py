@@ -18,6 +18,8 @@ from ..capabilities import (
     ToolPresentation,
     ToolTextTrust,
     ToolView,
+    resource_id_schema,
+    source_id_schema,
 )
 from .models import (
     CATALOG_DESCRIBE_CURSOR_MAX_CHARACTERS,
@@ -205,11 +207,7 @@ def catalog_declarations(
                     "minLength": 1,
                     "maxLength": CATALOG_TOOL_QUERY_MAX_CHARACTERS,
                 },
-                "source_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": CATALOG_SOURCE_ID_MAX_CHARACTERS,
-                },
+                "source_id": source_id_schema(),
                 "resource_kinds": {
                     "type": "array",
                     "items": {
@@ -258,18 +256,10 @@ def catalog_declarations(
                     "enum": [detail.value for detail in CatalogDescribeDetail],
                     "default": CatalogDescribeDetail.SCHEMA.value,
                 },
-                "source_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": CATALOG_SOURCE_ID_MAX_CHARACTERS,
-                },
+                "source_id": source_id_schema(),
                 "resource_ids": {
                     "type": "array",
-                    "items": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": CATALOG_RESOURCE_ID_MAX_CHARACTERS,
-                    },
+                    "items": resource_id_schema(),
                     "maxItems": CATALOG_SCHEMA_MAX_RESOURCE_IDS,
                     "uniqueItems": True,
                     "default": [],

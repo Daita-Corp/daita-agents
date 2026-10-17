@@ -26,6 +26,7 @@ def _message_input(
     messages: tuple[CanonicalMessage, ...],
     provider_id: str,
     result_refs: Mapping[str, str] | None = None,
+    scope_refs: Mapping[str, str] | None = None,
 ) -> tuple[str | None, list[dict[str, object]]]:
     system_parts: list[str] = []
     provider_messages: list[dict[str, object]] = []
@@ -77,7 +78,9 @@ def _message_input(
                         ),
                         "content": canonical_json(
                             model_tool_result(
-                                block, (result_refs or {}).get(block.call_id)
+                                block,
+                                (result_refs or {}).get(block.call_id),
+                                scope_refs,
                             )
                         ),
                         "is_error": block.is_error,

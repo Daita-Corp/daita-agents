@@ -136,8 +136,8 @@ async def test_routine_reporting_input_error_precedes_binding_and_approval(
             arguments["precheck"] = {
                 "capability_id": "catalog.describe",
                 "contract_digest": "sha256:" + "a" * 64,
-                "source_id": "source",
-                "resource_id": "resource",
+                "source_id": "source:sha256:" + "c" * 64,
+                "resource_id": "catalog-resource:sha256:" + "d" * 64,
             }
         bindings = []
         owner = agent._embedded._routine_owner

@@ -88,6 +88,8 @@ from ...capabilities import (
     ToolPresentation,
     ToolTextTrust,
     ToolView,
+    resource_id_schema,
+    source_id_schema,
 )
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.models import Sensitivity
@@ -101,7 +103,11 @@ from ...llm.models import (
 from ...loop.analysis import AnalysisEvidence
 from ...loop.models import RunInput, RunOrigin, Transcript
 from ...loop.session import RunSession
-from ...scope import SourceScopeCatalog, resolve_effective_source_scope
+from ...scope import (
+    EffectiveSourceScope,
+    SourceScopeCatalog,
+    resolve_effective_source_scope,
+)
 from ..learning import LearningCandidateGuard
 from .controller import DATA_EXPORT_TABULAR_CAPABILITY_ID
 from .sql import (
@@ -1801,6 +1807,7 @@ def _same_current_call(
     persisted: ToolCall,
     current: ToolCall,
     messages: tuple[CanonicalMessage, ...],
+    source_scope: EffectiveSourceScope | None,
 ) -> bool:
     """Match a persisted model call to the call executing now.
 
@@ -1819,7 +1826,7 @@ def _same_current_call(
         if FrozenJsonObject.from_mapping(routed) == current_arguments:
             return True
         resolved = registry.resolved_call_arguments(
-            persisted.name, persisted.arguments, messages
+            persisted.name, persisted.arguments, messages, source_scope
         )
     except (CapabilityInputError, KeyError):
         return False
@@ -2205,7 +2212,11 @@ class ArtifactCapabilityDomain:
             if candidate.id == current_call.id
         )
         if len(current_calls) != 1 or not _same_current_call(
-            registry, current_calls[0][1], current_call, transcript.messages
+            registry,
+            current_calls[0][1],
+            current_call,
+            transcript.messages,
+            run.resolved_source_scope,
         ):
             raise CapabilityInputError(error_code, error_message)
         current_index = current_calls[0][0]
@@ -2311,8 +2322,12 @@ class ArtifactCapabilityDomain:
                     raise ValueError("result execution lineage differs")
                 await registry.validate_arguments_async(
                     producer_capability.id,
-                    registry.target_arguments(
-                        producer_call.name, producer_call.arguments
+                    registry.resolve_scope_refs(
+                        producer_capability,
+                        registry.target_arguments(
+                            producer_call.name, producer_call.arguments
+                        ),
+                        run.resolved_source_scope,
                     ),
                 )
                 if set(block.output) not in (
@@ -3018,10 +3033,10 @@ def _tabular_export_capability(*, allow_arrow: bool = False) -> Capability:
             # Shared arguments keep data_query's exact rules: this capability
             # is data_query's file output.
             "properties": {
-                "source_id": {"type": "string"},
+                "source_id": source_id_schema(),
                 "resource_ids": {
                     "type": "array",
-                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "items": resource_id_schema(),
                     "minItems": 1,
                     "maxItems": 64,
                     "uniqueItems": True,

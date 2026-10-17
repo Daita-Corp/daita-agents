@@ -91,12 +91,13 @@ from .llm.models import (
     ToolDefinition,
     ToolResultBlock,
     tool_result_refs,
+    with_scope_refs,
 )
 from .loop.models import ConversationRun, LoopExitKind, RunInput, RunOrigin
 from .loop.session import RunSessionOptions
 from .memory.capabilities import MEMORY_SET_OUTPUT_KIND, MEMORY_SET_TOOL_NAME
 from .routines.temporal import system_user_timezone, valid_iana_timezone
-from .scope import SourceScopeCatalog, resolve_effective_source_scope
+from .scope import SourceScopeCatalog, resolve_effective_source_scope, scope_refs
 from .semantics import (
     SEMANTIC_DELETE_OUTPUT_KIND,
     SEMANTIC_SAVE_CAPABILITY_ID,
@@ -796,6 +797,9 @@ class AgentContextBuilder:
                 max(512, self._profile.maximum_input_tokens // 20),
             ),
         )
+        # Every listed source/resource ID is rendered with its run-scoped handle,
+        # numbered from the same frozen scope the runtime resolves against.
+        handles = scope_refs(tool_context.source_scope).handles
         # Hash values have fixed length; price the real projection metadata
         # before the final static-context digest is known.
         provenance = FrozenJsonObject.from_mapping(
@@ -837,6 +841,7 @@ class AgentContextBuilder:
                 candidate_text=candidate_text,
                 explicit_learning=explicit_learning,
                 effect_context=effect_context,
+                scope_refs=handles,
                 artifact_destinations=artifact_destinations,
                 local_file_context=local_file_context,
                 sensitivity=sensitivity,
@@ -890,6 +895,7 @@ class AgentContextBuilder:
                 candidate_text=candidate_text,
                 explicit_learning=explicit_learning,
                 effect_context=effect_context,
+                scope_refs=handles,
                 artifact_destinations=artifact_destinations,
                 local_file_context=local_file_context,
                 sensitivity=sensitivity,
@@ -932,6 +938,7 @@ class AgentContextBuilder:
                 candidate_text=candidate_text,
                 explicit_learning=explicit_learning,
                 effect_context=effect_context,
+                scope_refs=handles,
                 artifact_destinations=artifact_destinations,
                 local_file_context=local_file_context,
                 sensitivity=sensitivity,
@@ -969,6 +976,7 @@ class AgentContextBuilder:
             candidate_text=candidate_text,
             explicit_learning=explicit_learning,
             effect_context=effect_context,
+            scope_refs=handles,
             artifact_destinations=artifact_destinations,
             local_file_context=local_file_context,
             sensitivity=sensitivity,
@@ -990,6 +998,7 @@ class AgentContextBuilder:
             candidate_text=candidate_text,
             explicit_learning=explicit_learning,
             effect_context=effect_context,
+            scope_refs=handles,
         )
         static_messages = (
             CanonicalMessage(role=MessageRole.SYSTEM, content=(TextBlock(core),)),
@@ -1255,6 +1264,7 @@ class AgentContextBuilder:
             sensitivity=sensitivity,
             sensitivity_provenance=provenance,
             tool_result_refs=tool_result_refs(messages).by_call_id,
+            scope_refs=scope_refs(tool_context.source_scope).handles,
             allow_parallel_tool_calls=(
                 True if tools and snapshot.profile.supports_parallel_tools else None
             ),
@@ -1283,6 +1293,7 @@ class AgentContextBuilder:
         candidate_text: str,
         explicit_learning: bool,
         effect_context: str,
+        scope_refs: Mapping[str, str],
         artifact_destinations: tuple[ArtifactDestination, ...],
         local_file_context: FrozenJsonObject | None,
         sensitivity: ModelSensitivity,
@@ -1348,6 +1359,7 @@ class AgentContextBuilder:
                 candidate_text=candidate_text,
                 explicit_learning=explicit_learning,
                 effect_context=effect_context,
+                scope_refs=scope_refs,
                 artifact_destinations=artifact_destinations,
                 local_file_context=local_file_context,
                 sensitivity=sensitivity,
@@ -1410,6 +1422,7 @@ class AgentContextBuilder:
                 candidate_text=candidate_text,
                 explicit_learning=explicit_learning,
                 effect_context=effect_context,
+                scope_refs=scope_refs,
                 artifact_destinations=artifact_destinations,
                 local_file_context=local_file_context,
                 sensitivity=sensitivity,
@@ -2664,6 +2677,7 @@ def _request(
     candidate_text: str,
     explicit_learning: bool,
     effect_context: str,
+    scope_refs: Mapping[str, str],
     artifact_destinations: tuple[ArtifactDestination, ...],
     local_file_context: FrozenJsonObject | None,
     sensitivity: ModelSensitivity,
@@ -2686,6 +2700,7 @@ def _request(
                     candidate_text=candidate_text,
                     explicit_learning=explicit_learning,
                     effect_context=effect_context,
+                    scope_refs=scope_refs,
                 )
             ),
         ),
@@ -2766,6 +2781,7 @@ def _system_prompt(
     candidate_text: str,
     explicit_learning: bool = False,
     effect_context: str = "",
+    scope_refs: Mapping[str, str] | None = None,
 ) -> str:
     catalog_guidance = _catalog_ambiguity_guidance(catalog)
     graph_task = effect_context.startswith("Code-owned graph-task protocol:")
@@ -2866,7 +2882,7 @@ def _system_prompt(
         "Human recovery performs no action. At budget pressure report completed "
         "evidence and unfinished work.",
         "Do not invent rows, columns, relationships, or query results.",
-        "Copy source/resource IDs verbatim from current catalog evidence.",
+        "Pass a source/resource ID as its shown s#/t# ref (this run only) or verbatim.",
         (
             "Ground categorical literals and business mappings in current catalog "
             "facets, active semantics, or a bounded validated value read. Ordinary user "
@@ -2933,7 +2949,12 @@ def _system_prompt(
         instructions.append(
             "Advisory user preferences (non-authoritative data):\n" + user_profile
         )
-    instructions.append("Current catalog context:\n" + canonical_json(catalog))
+    instructions.append(
+        "Current catalog context:\n"
+        + canonical_json(
+            with_scope_refs(catalog, scope_refs) if scope_refs else catalog
+        )
+    )
     return "\n\n".join(instructions)
 
 
