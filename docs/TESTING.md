@@ -616,32 +616,28 @@ Scripted models replay old behavior, so a change to what the model is shown
 passes the deterministic suite by construction. The gate makes such a change
 deliberate and requires a short live smoke run before merge.
 
-`tests/fixtures/model-surface/surface.json` (digest in `surface.sha256`) is a
-canonical snapshot computed offline by `tests/support/model_surface.py`: one
-scripted foreground run over a local SQLite source and bounded workspace, with
-a fixed clock, IDs, timezone, downloads folder and native-analysis
-availability. It records every registry tool's name, description, rendered
-input schema, toolbox presentation (`summary`, `when_to_use`, keywords, load
-mode) and any per-lane difference (foreground, graph task, other machine
-runs); the toolbox control tools; the toolbox definitions; and each request's
-instructions and guidance, offered tools and model-facing tool results
-(`catalog_search`, `data_query`, `toolbox_load`) as adapters render them.
-Temporary paths are removed and digests renumbered.
+`tests/fixtures/model-surface/surface.json` (digest in `surface.sha256`) is
+computed offline by `tests/support/model_surface.py` from one scripted
+foreground run with a fixed clock, IDs, timezone, downloads folder and
+native-analysis availability. It holds one line per registry and control tool
+(description, input schema, toolbox presentation, per-lane differences), per
+toolbox, per instruction paragraph and per request step (offered tools and the
+key structure of each rendered tool result). Temporary paths are removed and
+digests renumbered.
 
-`tests/architecture/test_model_surface.py` fails when the snapshot differs,
-naming the tools and sections that changed. Review the diff, then rewrite it:
+`tests/architecture/test_model_surface.py` fails when the snapshot differs and
+names the entries that changed. Review the diff, then rewrite it:
 
 ```bash
 .venv/bin/python scripts/model_surface.py update   # or: check, digest
 ```
 
-The same suite compares `release/live-smoke.json` with the snapshot digest. A
-missing, malformed or stale record always fails: the model-facing surface
-changed since the last live smoke run. A `pending` record for the current digest
-passes locally but fails when `DAITA_REQUIRE_LIVE_SMOKE=1`, which CI sets for
+The same suite checks that `release/live-smoke.json` names the current
+snapshot digest. A missing or malformed record always fails. A stale record is
+skipped locally and fails when `DAITA_REQUIRE_LIVE_SMOKE=1`, which CI sets for
 pull requests. Record a run on the ChatGPT subscription; the runner refuses
-without `DAITA_LIVE_BILLING=subscription` and strips `*_API_KEY` variables from
-every case, so it never falls back to paid API billing:
+without `DAITA_LIVE_BILLING=subscription` and strips `*_API_KEY` variables, so
+it never uses paid API billing:
 
 ```bash
 .venv/bin/python -m tests.support.live_billing login   # once
@@ -650,16 +646,14 @@ DAITA_LIVE_BILLING=subscription .venv/bin/python scripts/live_smoke.py run
 ```
 
 `run` executes one representative case per live suite (about 15 minutes, three
-at a time; cases sharing a fixture run serially), each in its own pytest
-process with the suite's documented `DAITA_RUN_*` flags. The PostgreSQL write
-cases need the configured `postgres-large` fixture and the analysis case needs
-the native macOS ARM64 runtime. A failed case reruns once; a pass on rerun
-counts as passed and is recorded as `passed_on_rerun`. Skips and missing node
-IDs are not rerun and fail the run. Only a full pass rewrites the record with
-the surface digest, date, case outcomes and summary; it contains no machine,
-user, path or credential facts. `--case TEXT` runs a subset for diagnosis and
-never writes the record. Evidence stays in a private temporary directory.
-Commit the updated record with the surface change.
+at a time; cases sharing a fixture run serially) in its own pytest process
+with the suite's `DAITA_RUN_*` flags. The PostgreSQL cases need the
+`postgres-large` fixture and the analysis case the native macOS ARM64 runtime.
+A failed case reruns once and a pass on rerun is recorded as
+`passed_on_rerun`; skips and missing nodes fail the run. Only a full pass
+rewrites the record (`surface_digest`, `recorded_on`, `cases`), which holds no
+machine, user, path or credential facts. `--case TEXT` runs a subset and never
+writes the record. Commit the updated record with the surface change.
 
 ## Creating or reviewing a test
 
