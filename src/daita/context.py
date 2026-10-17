@@ -3561,7 +3561,12 @@ def _neutral_message(message: CanonicalMessage) -> dict[str, object]:
             for call in message.tool_calls
         ],
         "provider_id": message.provider_id,
-        "provider_metadata": message.provider_metadata,
+        # Attempt diagnostics are local records that no adapter replays.
+        "provider_metadata": {
+            key: value
+            for key, value in message.provider_metadata.items()
+            if key != "attempt_diagnostic"
+        },
     }
 
 
