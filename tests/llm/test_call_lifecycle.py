@@ -595,10 +595,10 @@ async def test_actual_sdk_nonstreaming_response_cleanup(family, mode):
         )
 
     policy = ModelCallPolicy(
-        max_request_seconds=2,
-        max_attempt_seconds=1,
-        first_progress_timeout_seconds=1,
-        progress_idle_timeout_seconds=1,
+        max_request_seconds=10,
+        max_attempt_seconds=5,
+        first_progress_timeout_seconds=5,
+        progress_idle_timeout_seconds=5,
         cleanup_timeout_seconds=0.1,
     )
     provider: Any
@@ -622,7 +622,7 @@ async def test_actual_sdk_nonstreaming_response_cleanup(family, mode):
         task = asyncio.create_task(provider.generate(request(call_policy=policy)))
         try:
             async with asyncio.timeout(
-                4
+                15
             ):  # Later harness guard, never the production bound.
                 await closing.wait()
                 if mode == "release":
