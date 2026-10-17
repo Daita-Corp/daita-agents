@@ -102,9 +102,8 @@ ROUTINE_SAVE_DESCRIPTION = (
     "(after_seconds, anchor_after_seconds, once_next_weekday, "
     "expires_after_seconds) and run_immediately are create-only; set "
     "expires_at or expires_after_seconds. Omitted options default to "
-    "misfire_policy skip, this conversation's Inbox, connector bindings of "
-    "allowed capabilities, and no grants, skills, precheck or dollar "
-    "ceilings. The Inbox is report delivery only; an action's target goes "
+    "misfire_policy skip, this conversation's Inbox, bindings of allowed "
+    "capabilities, and no grants, skills, precheck or dollar ceilings. The Inbox is report delivery only; an action's target goes "
     "in its grant fixed_arguments."
 )
 ROUTINE_SAVE_SUMMARIZED_ARGUMENTS = (
