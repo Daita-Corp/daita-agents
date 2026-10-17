@@ -63,24 +63,19 @@ class ScopeRefs:
         return self.ids.get(value)
 
 
-_EMPTY_REFS = ScopeRefs(handles=MappingProxyType({}), ids=MappingProxyType({}))
-
-
+@lru_cache(maxsize=8)
 def scope_refs(scope: EffectiveSourceScope | None) -> ScopeRefs:
     """Number one frozen scope deterministically; one shared definition."""
 
-    if scope is None or not scope.source_ids:
-        return _EMPTY_REFS
-    return _numbered_scope_refs(scope)
-
-
-@lru_cache(maxsize=8)
-def _numbered_scope_refs(scope: EffectiveSourceScope) -> ScopeRefs:
     handles = {
         identity: f"{prefix}{index}"
         for prefix, identities in (
-            (SOURCE_REF_PREFIX, scope.source_ids),
-            (RESOURCE_REF_PREFIX, scope.resource_ids),
+            ()
+            if scope is None
+            else (
+                (SOURCE_REF_PREFIX, scope.source_ids),
+                (RESOURCE_REF_PREFIX, scope.resource_ids),
+            )
         )
         for index, identity in enumerate(sorted(identities), 1)
     }

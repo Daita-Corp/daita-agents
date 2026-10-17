@@ -12,7 +12,7 @@ from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
 from ._json import FrozenJsonObject, canonical_json
 from ._json_schema import project_json_schema, validate_json_schema_value
@@ -1354,22 +1354,19 @@ _RESULT_REF_PATH = re.compile(
 # which the runtime replaces with the full ID before validation.
 SOURCE_ID_PATTERN = r"^source:sha256:[0-9a-f]{64}$"
 RESOURCE_ID_PATTERN = r"^catalog-resource:sha256:[0-9a-f]{64}$"
+# Canonical pattern -> (family, handle prefix, handle-admitting model pattern).
 _IDENTITY_REFS: Mapping[str, tuple[str, str, str]] = MappingProxyType(
     {
-        SOURCE_ID_PATTERN: (
-            "source",
-            SOURCE_REF_PREFIX,
-            r"^(source:sha256:[0-9a-f]{64}|s[1-9][0-9]{0,4})$",
-        ),
-        RESOURCE_ID_PATTERN: (
-            "resource",
-            RESOURCE_REF_PREFIX,
-            r"^(catalog-resource:sha256:[0-9a-f]{64}|t[1-9][0-9]{0,4})$",
-        ),
+        pattern: (family, prefix, f"^({pattern[1:-1]}|{prefix}[1-9][0-9]{{0,4}})$")
+        for pattern, family, prefix in (
+            (SOURCE_ID_PATTERN, "source", SOURCE_REF_PREFIX),
+            (RESOURCE_ID_PATTERN, "resource", RESOURCE_REF_PREFIX),
+        )
     }
 )
 _IDENTITY_HANDLE = re.compile(r"[st][1-9][0-9]{0,4}\Z")
 _DELEGATED_KINDS = frozenset({"input", "grant"})
+_Leaf = Callable[[object, str], object]
 
 
 def source_id_schema() -> dict[str, object]:
@@ -1434,51 +1431,62 @@ def model_identity_schema(schema: Mapping[str, object]) -> Mapping[str, object]:
     return FrozenJsonObject.from_mapping(cast(Mapping[str, object], project(schema)))
 
 
-def _segments(path: str) -> tuple[str, ...]:
-    """Split one argument path, keeping a trailing ``[]`` on its segment."""
+def _map_paths(
+    arguments: Mapping[str, object],
+    leaves: Iterable[tuple[str, _Leaf]],
+    base: str = "",
+) -> Mapping[str, object]:
+    """Apply each ``(dotted argument path, leaf)`` below ``base``.
 
-    return tuple(path.split("."))
-
-
-def _map_argument_path(
-    value: object,
-    segments: tuple[str, ...],
-    path: str,
-    leaf: Callable[[object, str], object],
-) -> object:
-    """Apply ``leaf`` at one dotted path; absent paths are left for validation.
-
-    ``name[]`` walks an array and ``*`` walks every value of an object.
+    ``name[]`` walks an array and ``*`` walks every value of an object; absent
+    paths are left for schema validation.
     """
 
-    if not segments:
-        return leaf(value, path)
-    if not isinstance(value, Mapping):
-        return value
-    head, rest = segments[0], segments[1:]
-    if head == "*":
-        return {
-            key: _map_argument_path(
-                item, rest, f"{path}.{key}" if path else str(key), leaf
-            )
-            for key, item in value.items()
-        }
-    many = head.endswith("[]")
-    key = head[:-2] if many else head
-    if key not in value:
-        return value
-    name = f"{path}.{key}" if path else key
-    item = value[key]
-    if many:
+    def walk(value: object, segments: tuple[str, ...], path: str, leaf: _Leaf) -> Any:
+        if not segments:
+            return leaf(value, path)
+        if not isinstance(value, Mapping):
+            return value
+        head, rest = segments[0], segments[1:]
+        if head == "*":
+            return {
+                key: walk(item, rest, f"{path}.{key}" if path else str(key), leaf)
+                for key, item in value.items()
+            }
+        many = head.endswith("[]")
+        key = head[:-2] if many else head
+        if key not in value:
+            return value
+        name = f"{path}.{key}" if path else key
+        item = value[key]
+        if not many:
+            return {**value, key: walk(item, rest, name, leaf)}
         if not isinstance(item, (list, tuple)):
             return value
-        updated: object = tuple(
-            _map_argument_path(element, rest, f"{name}[{index}]", leaf)
-            for index, element in enumerate(item)
-        )
-    else:
-        updated = _map_argument_path(item, rest, name, leaf)
-    return {**value, key: updated}
+        return {
+            **value,
+            key: tuple(
+                walk(element, rest, f"{name}[{index}]", leaf)
+                for index, element in enumerate(item)
+            ),
+        }
+
+    for spec, leaf in leaves:
+        arguments = walk(arguments, tuple(spec.split(".")), base, leaf)
+    return arguments
+
+
+def _ref_invalid(
+    code: str, message: str, path: str, value: object, constraint: str
+) -> CapabilityInputError:
+    """One model-correctable invalid-ref error, shared by every ref family."""
+
+    return CapabilityInputError(
+        code,
+        message,
+        {"name": path, "value": value},
+        recovery=ToolRecovery(RecoveryKind.CORRECT_ARGUMENTS, constraint),
+    )
 
 
 def resolve_result_refs(
@@ -1486,63 +1494,45 @@ def resolve_result_refs(
     arguments: Mapping[str, object],
     refs: ToolResultRefs | None,
 ) -> Mapping[str, object]:
-    """Replace declared result_ref values with the canonical calls they name.
-
-    Paths are dotted argument names; ``name[]`` walks an array and ``*`` walks
-    every value of an object. Absent paths are left for schema validation.
-    """
-
-    if not capability.result_ref_arguments:
-        return arguments
-
-    def invalid(path: str, value: object) -> CapabilityInputError:
-        valid = () if refs is None else refs.citable[-16:]
-        return CapabilityInputError(
-            "result_ref_invalid",
-            "A result reference must be a result_ref shown on an earlier "
-            "successful result in this run.",
-            {"name": path, "value": value if isinstance(value, str) else None},
-            recovery=ToolRecovery(
-                RecoveryKind.CORRECT_ARGUMENTS,
-                (
-                    "Use one of these result_ref values: " + ", ".join(valid) + "."
-                    if valid
-                    else "No earlier successful result exists in this run yet."
-                ),
-            ),
-        )
+    """Replace declared result_ref values with the canonical calls they name."""
 
     def leaf(value: object, path: str) -> object:
         resolved = None if refs is None else refs.resolve(value)
-        if resolved is None:
-            raise invalid(path, value)
-        return resolved
-
-    resolved = arguments
-    for ref_path in capability.result_ref_arguments:
-        resolved = cast(
-            Mapping[str, object],
-            _map_argument_path(resolved, _segments(ref_path), "", leaf),
+        if resolved is not None:
+            return resolved
+        valid = () if refs is None else refs.citable[-16:]
+        raise _ref_invalid(
+            "result_ref_invalid",
+            "A result reference must be a result_ref shown on an earlier "
+            "successful result in this run.",
+            path,
+            value if isinstance(value, str) else None,
+            (
+                "Use one of these result_ref values: " + ", ".join(valid) + "."
+                if valid
+                else "No earlier successful result exists in this run yet."
+            ),
         )
-    return resolved
+
+    return _map_paths(
+        arguments, ((spec, leaf) for spec in capability.result_ref_arguments)
+    )
 
 
 def resolve_identity_refs(
-    paths: Iterable[tuple[str, str]],
+    schema: Mapping[str, object],
     arguments: Mapping[str, object],
     refs: ScopeRefs,
     *,
     base: str = "",
 ) -> Mapping[str, object]:
-    """Replace run-scoped source/resource handles with the full IDs they name.
+    """Replace run-scoped handles at ``schema``'s identity paths with full IDs.
 
     Full IDs and other values pass through for schema validation. A
     handle-shaped value this run did not issue fails before dispatch.
     """
 
-    def leaf_for(pattern: str) -> Callable[[object, str], object]:
-        family, prefix, _ = _IDENTITY_REFS[pattern]
-
+    def leaf_for(family: str, prefix: str) -> _Leaf:
         def leaf(value: object, path: str) -> object:
             if not isinstance(value, str) or _IDENTITY_HANDLE.match(value) is None:
                 return value
@@ -1550,32 +1540,31 @@ def resolve_identity_refs(
             if resolved is not None:
                 return resolved
             issued = sum(1 for handle in refs.ids if handle.startswith(prefix))
-            raise CapabilityInputError(
+            raise _ref_invalid(
                 f"{family}_ref_invalid",
                 f"{value} is not a {family} ref issued in this run.",
-                {"name": path, "value": value},
-                recovery=ToolRecovery(
-                    RecoveryKind.CORRECT_ARGUMENTS,
-                    (
-                        f"Use a {family}_ref ({prefix}1-{prefix}{issued}) shown "
-                        f"beside its {family}_id in this run, or the exact full "
-                        f"{family}_id."
-                        if issued
-                        else f"This run issued no {family} refs; use the exact "
-                        f"full {family}_id."
-                    ),
+                path,
+                value,
+                (
+                    f"Use a {family}_ref ({prefix}1-{prefix}{issued}) shown "
+                    f"beside its {family}_id in this run, or the exact full "
+                    f"{family}_id."
+                    if issued
+                    else f"This run issued no {family} refs; use the exact "
+                    f"full {family}_id."
                 ),
             )
 
         return leaf
 
-    resolved = arguments
-    for path, pattern in paths:
-        resolved = cast(
-            Mapping[str, object],
-            _map_argument_path(resolved, _segments(path), base, leaf_for(pattern)),
-        )
-    return resolved
+    return _map_paths(
+        arguments,
+        (
+            (path, leaf_for(*_IDENTITY_REFS[pattern][:2]))
+            for path, pattern in identity_ref_paths(schema)
+        ),
+        base,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2600,39 +2589,39 @@ class CapabilityRegistry:
         """Replace source/resource handles in one call with their full IDs."""
 
         refs = scope_refs(source_scope)
-        resolved = resolve_identity_refs(
-            identity_ref_paths(capability.input_schema), arguments, refs
-        )
-        for container, member, kind in capability.delegated_arguments:
 
-            def delegate(value: object, path: str) -> object:
+        def delegated(member: str, kind: str) -> _Leaf:
+            def leaf(value: object, path: str) -> object:
                 if not isinstance(value, Mapping):
                     return value
                 target = self._capabilities.get(cast(str, value.get("capability_id")))
-                if target is None:
+                policy = None if target is None else target.automation_grant_policy
+                if target is None or (kind == "grant" and policy is None):
                     return value
-                if kind == "input":
-                    schema: Mapping[str, object] = target.input_schema
-                elif target.automation_grant_policy is not None:
-                    schema = target.automation_grant_policy.constraints_schema
-                else:
-                    return value
-                paths = identity_ref_paths(schema)
-                if not paths:
+                schema = (
+                    target.input_schema
+                    if policy is None or kind == "input"
+                    else (policy.constraints_schema)
+                )
+                if not identity_ref_paths(schema):
                     return value
 
-                def nested(inner: object, inner_path: str) -> object:
+                def nested(inner: object, at: str) -> object:
                     if not isinstance(inner, Mapping):
                         return inner
-                    return resolve_identity_refs(paths, inner, refs, base=inner_path)
+                    return resolve_identity_refs(schema, inner, refs, base=at)
 
-                return _map_argument_path(value, _segments(member), path, nested)
+                return _map_paths(value, ((member, nested),), path)
 
-            resolved = cast(
-                Mapping[str, object],
-                _map_argument_path(resolved, _segments(container), "", delegate),
-            )
-        return resolved
+            return leaf
+
+        return _map_paths(
+            resolve_identity_refs(capability.input_schema, arguments, refs),
+            (
+                (container, delegated(member, kind))
+                for container, member, kind in capability.delegated_arguments
+            ),
+        )
 
     def resolve_tool_mode(self, name: str, mode: object) -> tuple[ToolView, Capability]:
         """Resolve a mode-routed tool call to the capability its mode selects."""

@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from daita import Agent
+import pytest
+
+from daita import Agent, SQLiteSource
 from daita._json import FrozenJsonObject, canonical_json
 from daita.capabilities import (
     AccessMode,
@@ -27,16 +32,21 @@ from daita.capabilities import (
     source_id_schema,
 )
 from daita.capability_runtime import CapabilityRuntime
+from daita.distribution import outcome_contract_projection
 from daita.llm.models import (
     CanonicalMessage,
+    FinishReason,
     MessageRole,
+    ModelProfile,
     ModelRequest,
+    ModelResponse,
     ModelSensitivity,
     ToolCall,
     ToolResultBlock,
     model_tool_result,
 )
 from daita.llm.providers.anthropic.messages import _message_input
+from daita.llm.providers.mock import MockModelProvider
 from daita.llm.providers.openai.messages import _response_input
 from daita.loop.models import RunInput, Transcript
 from daita.scope import EffectiveSourceScope, scope_refs
@@ -47,6 +57,7 @@ from tests.support.capability_runtime import (
     presentation_metadata,
     static_registry,
 )
+from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.workspace import workspace_for
 
 SOURCE_A = "source:sha256:" + "a" * 64
@@ -55,9 +66,37 @@ RESOURCE_A = "catalog-resource:sha256:" + "1" * 64
 RESOURCE_B = "catalog-resource:sha256:" + "2" * 64
 RESOURCE_C = "catalog-resource:sha256:" + "3" * 64
 SCOPE = EffectiveSourceScope(
-    frozenset({SOURCE_B, SOURCE_A}),
-    frozenset({RESOURCE_C, RESOURCE_A, RESOURCE_B}),
+    frozenset({SOURCE_B, SOURCE_A}), frozenset({RESOURCE_C, RESOURCE_A, RESOURCE_B})
 )
+_RUN = RunInput(
+    id="run-effect",
+    agent_id="agent-effect",
+    message="exact handles",
+    created_at=STARTED_AT,
+    conversation_id="conversation-effect",
+)
+_frozen = FrozenJsonObject.from_mapping
+
+
+def _object(**properties: object) -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+def _array(items: object, maximum: int) -> dict[str, object]:
+    return {"type": "array", "items": items, "minItems": 1, "maxItems": maximum}
+
+
+_IDENTITY = {
+    "source_id": source_id_schema(),
+    "resource_ids": _array(resource_id_schema(), 4),
+}
+_IDENTITY_INPUT = _object(**_IDENTITY)
+_OK_OUTPUT = _object(ok={"type": "boolean"})
 
 
 def test_handles_number_the_frozen_scope_and_differ_when_the_scope_differs():
@@ -74,8 +113,7 @@ def test_handles_number_the_frozen_scope_and_differ_when_the_scope_differs():
     }
     # Every step of one run sees the same frozen scope, hence the same handles.
     again = EffectiveSourceScope(
-        frozenset({SOURCE_A, SOURCE_B}),
-        frozenset({RESOURCE_A, RESOURCE_B, RESOURCE_C}),
+        frozenset({SOURCE_A, SOURCE_B}), frozenset({RESOURCE_A, RESOURCE_B, RESOURCE_C})
     )
     assert dict(scope_refs(again).handles) == dict(refs.handles)
     # Another run's scope numbers its own identities: a handle names nothing
@@ -88,33 +126,20 @@ def test_handles_number_the_frozen_scope_and_differ_when_the_scope_differs():
     assert not scope_refs(EffectiveSourceScope(frozenset(), frozenset())).handles
 
 
-class _Recorder:
-    def __init__(self, executor_id: str) -> None:
-        self.executor_id = executor_id
-        self.requests: list[ToolExecution] = []
-
-    async def execute(self, request: ToolExecution) -> ToolOutput:
-        self.requests.append(request)
-        return ToolOutput(kind="test.scope.output", data={"ok": True})
-
-
-class _Writer:
-    executor_id = "test.scope.write.executor"
-
-    def __init__(self) -> None:
-        self.requests: list[ToolExecution] = []
+@dataclass
+class _Executor:
+    executor_id: str
+    effect: bool
+    requests: list[ToolExecution] = field(default_factory=list)
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        return FrozenJsonObject.from_mapping({"current": True})
+        return _frozen({"current": True})
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         self.requests.append(request)
-        payload = FrozenJsonObject.from_mapping(
-            {
-                "source_id": request.arguments["source_id"],
-                "resource_ids": request.arguments["resource_ids"],
-            }
-        )
+        if not self.effect:
+            return ToolOutput(kind="test.scope.output", data={"ok": True})
+        payload = _frozen({key: request.arguments[key] for key in _IDENTITY})
         return ToolOutput(
             kind="test.scope.write",
             data=payload,
@@ -124,280 +149,202 @@ class _Writer:
         )
 
 
-_IDENTITY_INPUT = {
-    "type": "object",
-    "properties": {
-        "source_id": source_id_schema(),
-        "resource_ids": {
-            "type": "array",
-            "items": resource_id_schema(),
-            "minItems": 1,
-            "maxItems": 4,
-        },
-    },
-    "required": ["source_id", "resource_ids"],
-    "additionalProperties": False,
-}
-_OK_OUTPUT = {
-    "type": "object",
-    "properties": {"ok": {"type": "boolean"}},
-    "required": ["ok"],
-    "additionalProperties": False,
-}
-
-
-def _fixture(store) -> tuple[CapabilityRuntime, _Recorder, _Recorder, _Writer, list]:
-    read = Capability(
-        id="test.scope.read",
-        description="Read one exact source.",
-        input_schema=_IDENTITY_INPUT,
-        output_kind="test.scope.output",
-        output_schema=_OK_OUTPUT,
-        executor_id="test.scope.read.executor",
-        access_mode=AccessMode.READ,
-    )
-    propose = Capability(
-        id="test.scope.propose",
-        description="Retain another capability's exact arguments.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "object",
-                    "properties": {
-                        "capability_id": {"type": "string"},
-                        "arguments": {"type": "object"},
-                    },
-                    "required": ["capability_id", "arguments"],
-                    "additionalProperties": False,
-                }
-            },
-            "required": ["task"],
-            "additionalProperties": False,
-        },
-        output_kind="test.scope.output",
-        output_schema=_OK_OUTPUT,
-        executor_id="test.scope.propose.executor",
-        delegated_arguments=(("task", "arguments", "input"),),
-    )
-    write = Capability(
-        id="test.scope.write",
-        description="Act on one exact source.",
-        input_schema=_IDENTITY_INPUT,
-        output_kind="test.scope.write",
-        output_schema=_IDENTITY_INPUT,
-        executor_id=_Writer.executor_id,
-        access_mode=AccessMode.NONE,
-        operational_effect=OperationalEffect.EXTERNAL_ACTION,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
-        effect_receipt_policy=EffectReceiptPolicy(
-            "test.scope.write", _IDENTITY_INPUT, EffectEvidenceBasis.SERVER_REPORTED
-        ),
-    )
-    views = tuple(
-        ToolView(
-            name=capability.id.rsplit(".", 1)[1],
-            capability_id=capability.id,
-            description=capability.description,
-            presentation=presentation_metadata(
-                load_mode=(
-                    ToolLoadMode.ON_DEMAND
-                    if capability.operational_effect is not OperationalEffect.NONE
-                    else ToolLoadMode.PINNED
-                )
+def _capability(name: str, input_schema: dict[str, object], **kw) -> Capability:
+    capability_id = f"test.scope.{name}"
+    if kw.pop("effect", False):
+        kw |= dict(
+            output_kind="test.scope.write",
+            output_schema=_IDENTITY_INPUT,
+            access_mode=AccessMode.NONE,
+            operational_effect=OperationalEffect.EXTERNAL_ACTION,
+            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+            effect_receipt_policy=EffectReceiptPolicy(
+                capability_id, _IDENTITY_INPUT, EffectEvidenceBasis.SERVER_REPORTED
             ),
         )
-        for capability in (read, propose, write)
+    return Capability(
+        id=capability_id,
+        description=f"Exercise exact identities through {name}.",
+        input_schema=input_schema,
+        executor_id=f"{capability_id}.executor",
+        **{"output_kind": "test.scope.output", "output_schema": _OK_OUTPUT, **kw},
     )
-    domain = StaticTestDomain((read, propose, write), views)
-    reader = _Recorder(read.executor_id)
-    proposer = _Recorder(propose.executor_id)
-    writer = _Writer()
-    approvals: list[ApprovalRequest] = []
 
-    async def approve(request: ApprovalRequest) -> ApprovalDecision:
-        approvals.append(request)
+
+_CAPABILITIES = (
+    _capability("read", _IDENTITY_INPUT, access_mode=AccessMode.READ),
+    # Retains another capability's exact arguments.
+    _capability(
+        "propose",
+        _object(
+            task=_object(capability_id={"type": "string"}, arguments={"type": "object"})
+        ),
+        delegated_arguments=(("task", "arguments", "input"),),
+    ),
+    _capability("write", _IDENTITY_INPUT, effect=True),
+    _capability(
+        "cite",
+        _object(**_IDENTITY, evidence_refs=_array({"type": "string"}, 2)),
+        effect=True,
+        result_ref_arguments=("evidence_refs[]",),
+    ),
+)
+
+
+class _Approvals(list[ApprovalRequest]):
+    """An approval handler that approves and records every request."""
+
+    async def __call__(self, request: ApprovalRequest) -> ApprovalDecision:
+        self.append(request)
         return ApprovalDecision.APPROVE
+
+
+@pytest.fixture
+async def store(tmp_path: Path):
+    store = await _store(tmp_path / "state.db")
+    yield store
+    await store.close()
+
+
+@pytest.fixture
+def rig(store):
+    """A runtime over read/propose/write/cite, its executors and approvals."""
+
+    executors, views = {}, []
+    for capability in _CAPABILITIES:
+        name = capability.id.rsplit(".", 1)[1]
+        effect = capability.effect_receipt_policy is not None
+        executors[name] = _Executor(capability.executor_id, effect)
+        load = ToolLoadMode.ON_DEMAND if effect else ToolLoadMode.PINNED
+        presentation = presentation_metadata(load_mode=load)
+        views.append(
+            ToolView(name, capability.id, capability.description, presentation)
+        )
+    domain = StaticTestDomain(_CAPABILITIES, tuple(views))
+    approvals = _Approvals()
 
     async def resolve_scope(run: RunInput) -> EffectiveSourceScope:
         return SCOPE
 
     runtime = CapabilityRuntime(
-        static_registry(domain, (reader, proposer, writer)),
+        static_registry(domain, tuple(executors.values())),
         (domain,),
         effect_receipts=store,
-        approval_handler=approve,
+        approval_handler=approvals,
         clock=lambda: STARTED_AT,
         source_scope_resolver=resolve_scope,
     )
-    return runtime, reader, proposer, writer, approvals
+    return runtime, {name: item.requests for name, item in executors.items()}, approvals
 
 
-_RUN = RunInput(
-    id="run-effect",
-    agent_id="agent-effect",
-    message="exact handles",
-    created_at=STARTED_AT,
-    conversation_id="conversation-effect",
-)
+def _call(call_id: str, tool: str, source: str, *resources: str) -> ToolCall:
+    """One identity call; ``propose`` nests it as a delegated read task."""
+
+    if tool != "propose":
+        return ToolCall(call_id, tool, {"source_id": source, "resource_ids": resources})
+    arguments = {"source_id": source, "resource_ids": list(resources)}
+    task = {"capability_id": "test.scope.read", "arguments": arguments}
+    return ToolCall(call_id, tool, {"task": task})
 
 
-def _frozen(value: Mapping[str, object]) -> FrozenJsonObject:
-    return FrozenJsonObject.from_mapping(value)
-
-
-def _error(result: ToolResultBlock) -> Mapping[str, object]:
-    assert result.is_error
-    error = result.output["error"]
-    assert isinstance(error, Mapping)
-    details = error["details"]
-    assert isinstance(details, Mapping)
-    assert details["execution_disposition"] == "not_dispatched"
-    return error
-
-
-async def test_handles_reach_execution_approval_and_receipt_as_full_ids(tmp_path):
-    store = await _store(tmp_path / "state.db")
-    runtime, reader, proposer, writer, approvals = _fixture(store)
+async def test_handles_reach_execution_approval_and_receipt_as_full_ids(store, rig):
+    runtime, requests, approvals = rig
     sent = (
-        ToolCall("read", "read", {"source_id": "s2", "resource_ids": ("t1", "t3")}),
-        ToolCall(
-            "propose",
-            "propose",
-            {
-                "task": {
-                    "capability_id": "test.scope.read",
-                    "arguments": {"source_id": "s1", "resource_ids": ["t2"]},
-                }
-            },
-        ),
-        ToolCall("write", "write", {"source_id": "s1", "resource_ids": ("t2",)}),
+        _call("read", "read", "s2", "t1", "t3"),
+        _call("propose", "propose", "s1", "t2"),
+        _call("write", "write", "s1", "t2"),
     )
-    try:
-        outcome = await execute_projected(runtime, _RUN, sent)
-        assert not any(result.is_error for result in outcome.ordered_results)
-        assert reader.requests[0].arguments == _frozen(
-            {"source_id": SOURCE_B, "resource_ids": (RESOURCE_A, RESOURCE_C)}
-        )
-        task = proposer.requests[0].arguments["task"]
-        assert isinstance(task, Mapping)
-        full = _frozen({"source_id": SOURCE_A, "resource_ids": (RESOURCE_B,)})
-        assert task["arguments"] == full
-        assert writer.requests[0].arguments == full
-        assert [request.arguments for request in approvals] == [full]
-        (receipt,) = await store.list_effect_receipts("agent-effect")
-        assert receipt.payload == full
-        # The model's calls keep exactly what it sent.
-        assert sent[2].arguments["source_id"] == "s1"
-
-        # The same operation named by full IDs is the same reserved effect.
-        again = await execute_projected(
-            runtime, _RUN, (ToolCall("write-again", "write", full),)
-        )
-        reference = outcome.ordered_results[2].output["effect_receipt"]
-        assert again.ordered_results[0].output["effect_receipt"] == reference
-        assert len(writer.requests) == 1
-    finally:
-        await store.close()
-
-
-async def test_unissued_handles_and_garbled_ids_fail_before_dispatch(tmp_path):
-    store = await _store(tmp_path / "state.db")
-    runtime, reader, proposer, writer, approvals = _fixture(store)
-    garbled = SOURCE_A[:-1]
-    calls = (
-        ToolCall("unknown", "read", {"source_id": "s3", "resource_ids": ("t1",)}),
-        ToolCall("family", "read", {"source_id": "t1", "resource_ids": ("t1",)}),
-        ToolCall("resource", "read", {"source_id": "s1", "resource_ids": ("t9",)}),
-        ToolCall(
-            "nested",
-            "propose",
-            {
-                "task": {
-                    "capability_id": "test.scope.read",
-                    "arguments": {"source_id": "s7", "resource_ids": ["t1"]},
-                }
-            },
-        ),
-        ToolCall("garbled", "read", {"source_id": garbled, "resource_ids": ("t1",)}),
-        ToolCall("effect", "write", {"source_id": "s5", "resource_ids": ("t1",)}),
+    outcome = await execute_projected(runtime, _RUN, sent)
+    assert not any(result.is_error for result in outcome.ordered_results)
+    assert requests["read"][0].arguments == _frozen(
+        {"source_id": SOURCE_B, "resource_ids": (RESOURCE_A, RESOURCE_C)}
     )
-    try:
-        results = (await execute_projected(runtime, _RUN, calls)).ordered_results
-        errors = [_error(result) for result in results]
-        assert [error["code"] for error in errors] == [
-            "source_ref_invalid",
-            "source_ref_invalid",
-            "resource_ref_invalid",
-            "source_ref_invalid",
-            "invalid_argument_value",
-            "source_ref_invalid",
-        ]
-        recovery = errors[0]["details"]
-        assert isinstance(recovery, Mapping)
-        assert recovery["name"] == "source_id"
-        assert recovery["recovery"] == _frozen(
-            {
-                "kind": "correct_arguments",
-                "constraint": "Use a source_ref (s1-s2) shown beside its source_id "
-                "in this run, or the exact full source_id.",
-            }
+    task = requests["propose"][0].arguments["task"]
+    assert isinstance(task, Mapping)
+    full = _frozen({"source_id": SOURCE_A, "resource_ids": (RESOURCE_B,)})
+    assert task["arguments"] == full
+    assert requests["write"][0].arguments == full
+    assert [request.arguments for request in approvals] == [full]
+    (receipt,) = await store.list_effect_receipts("agent-effect")
+    assert receipt.payload == full
+    # The model's calls keep exactly what it sent.
+    assert sent[2].arguments["source_id"] == "s1"
+
+    # The same operation named by full IDs is the same reserved effect.
+    again = await execute_projected(
+        runtime, _RUN, (ToolCall("write-again", "write", full),)
+    )
+    reference = outcome.ordered_results[2].output["effect_receipt"]
+    assert again.ordered_results[0].output["effect_receipt"] == reference
+    assert len(requests["write"]) == 1
+
+
+async def test_unissued_handles_and_garbled_ids_fail_before_dispatch(store, rig):
+    runtime, requests, approvals = rig
+    cases = (  # (call id, tool, source, resource, error code, details name)
+        ("unknown", "read", "s3", "t1", "source", "source_id"),
+        ("family", "read", "t1", "t1", "source", "source_id"),
+        ("resource", "read", "s1", "t9", "resource", "resource_ids[0]"),
+        ("nested", "propose", "s7", "t1", "source", "task.arguments.source_id"),
+        ("garbled", "read", SOURCE_A[:-1], "t1", None, "source_id"),
+        ("effect", "write", "s5", "t1", "source", "source_id"),
+    )
+    calls = tuple(_call(*case[:4]) for case in cases)
+    results = (await execute_projected(runtime, _RUN, calls)).ordered_results
+    details = []
+    for result, (*_, family, name) in zip(results, cases, strict=True):
+        error = result.output["error"]
+        assert result.is_error and isinstance(error, Mapping)
+        assert error["code"] == (
+            "invalid_argument_value" if family is None else f"{family}_ref_invalid"
         )
-        nested = errors[3]["details"]
-        assert isinstance(nested, Mapping)
-        assert nested["name"] == "task.arguments.source_id"
-        garbled_details = errors[4]["details"]
-        assert isinstance(garbled_details, Mapping)
-        assert garbled_details["name"] == "source_id"
-        assert garbled_details["constraint"] == "pattern"
-        assert not reader.requests and not proposer.requests
-        assert not writer.requests and not approvals
-        assert not await store.list_effect_receipts("agent-effect")
-    finally:
-        await store.close()
+        assert isinstance(detail := error["details"], Mapping)
+        assert detail["execution_disposition"] == "not_dispatched"
+        assert detail["name"] == name
+        details.append(detail)
+    assert details[0]["recovery"] == _frozen(
+        {
+            "kind": "correct_arguments",
+            "constraint": "Use a source_ref (s1-s2) shown beside its source_id "
+            "in this run, or the exact full source_id.",
+        }
+    )
+    assert details[4]["constraint"] == "pattern"
+    assert not any(requests.values()) and not approvals
+    assert not await store.list_effect_receipts("agent-effect")
 
 
 def test_rendered_results_show_each_issued_handle_beside_its_full_id():
-    output = {
-        "kind": "test.scope.output",
-        "data": {
-            "hits": [
-                {"source_id": SOURCE_A, "resource_id": RESOURCE_C, "name": "orders"},
-                {"source_id": "source:sha256:" + "f" * 64, "name": "outside"},
-            ],
-            "resource_ids": [RESOURCE_A, "catalog-resource:sha256:" + "9" * 64],
-            "evidence_call_ids": ["call-1"],
-        },
-    }
-    block = ToolResultBlock(call_id="call-1", output=output)
+    hits = [
+        {"source_id": SOURCE_A, "resource_id": RESOURCE_C, "name": "orders"},
+        {"source_id": "source:sha256:" + "f" * 64, "name": "outside"},
+    ]
+    resource_ids = [RESOURCE_A, "catalog-resource:sha256:" + "9" * 64]
+    data = {"hits": hits, "resource_ids": resource_ids, "evidence_call_ids": ["call-1"]}
+    block = ToolResultBlock("call-1", {"kind": "test.scope.output", "data": data})
     handles = scope_refs(SCOPE).handles
-    rendered = model_tool_result(block, "r1", handles)
-    data = rendered["output"]["data"]  # type: ignore[index]
-    assert data["hits"][0]["source_ref"] == "s1"
-    assert data["hits"][0]["resource_ref"] == "t3"
-    assert "source_ref" not in data["hits"][1]
-    assert data["resource_refs"] == ["t1", None]
-    assert "evidence_call_refs" not in data
+    rendered = model_tool_result(block, "r1", handles)["output"]
+    rendered = rendered["data"]  # type: ignore[index]
+    assert rendered["hits"][0]["source_ref"] == "s1"
+    assert rendered["hits"][0]["resource_ref"] == "t3"
+    assert "source_ref" not in rendered["hits"][1]
+    assert rendered["resource_refs"] == ["t1", None]
+    assert "evidence_call_refs" not in rendered
     # Stored output is unchanged; only the rendering carries handles.
     assert "source_ref" not in canonical_json(block.output)
 
+    call = ToolCall("call-1", "read", {"source_id": "s1"})
     request = ModelRequest(
         messages=(
-            CanonicalMessage(
-                MessageRole.ASSISTANT,
-                tool_calls=(ToolCall("call-1", "read", {"source_id": "s1"}),),
-            ),
+            CanonicalMessage(MessageRole.ASSISTANT, tool_calls=(call,)),
             CanonicalMessage(MessageRole.TOOL, content=(block,)),
         ),
         tool_result_refs={"call-1": "r1"},
         scope_refs=handles,
     )
-    _, anthropic = _message_input(
-        request.messages, "anthropic", request.tool_result_refs, request.scope_refs
-    )
-    openai = _response_input(
-        request.messages, "openai", request.tool_result_refs, request.scope_refs
-    )
+    refs = (request.tool_result_refs, request.scope_refs)
+    _, anthropic = _message_input(request.messages, "anthropic", *refs)
+    openai = _response_input(request.messages, "openai", *refs)
     for text in (
         str(anthropic[-1]["content"][0]["content"]),  # type: ignore[index]
         str(next(item["output"] for item in openai if "output" in item)),
@@ -405,9 +352,7 @@ def test_rendered_results_show_each_issued_handle_beside_its_full_id():
         assert '"resource_ref":"t3"' in text and '"source_ref":"s1"' in text
 
 
-async def test_every_model_facing_identity_argument_admits_handles(
-    tmp_path: Path,
-) -> None:
+async def test_every_model_facing_identity_argument_admits_handles(tmp_path: Path):
     agent = await Agent.create(
         "scope-ref-inventory", root=tmp_path, workspace=workspace_for(tmp_path)
     )
@@ -422,14 +367,13 @@ async def test_every_model_facing_identity_argument_admits_handles(
         if not isinstance(rule, Mapping):
             return
         properties = rule.get("properties")
-        if isinstance(properties, Mapping):
-            for key, child in properties.items():
-                if isinstance(child, Mapping) and str(key).endswith(names):
-                    leaf = child.get("items", child)
-                    assert isinstance(leaf, Mapping)
-                    if leaf.get("type") == "string":
-                        found[f"{tool}:{path}.{key}"] = leaf.get("pattern")
-                visit(tool, child, f"{path}.{key}")
+        for key, child in properties.items() if isinstance(properties, Mapping) else ():
+            if isinstance(child, Mapping) and str(key).endswith(names):
+                leaf = child.get("items", child)
+                assert isinstance(leaf, Mapping)
+                if leaf.get("type") == "string":
+                    found[f"{tool}:{path}.{key}"] = leaf.get("pattern")
+            visit(tool, child, f"{path}.{key}")
         for key in ("items", "additionalProperties"):
             visit(tool, rule.get(key), f"{path}[{key}]")
 
@@ -441,41 +385,21 @@ async def test_every_model_facing_identity_argument_admits_handles(
     finally:
         await agent.close()
 
-    assert {"data_query:input.source_id", "catalog_describe:input.resource_ids"} <= (
-        set(found)
-    )
-    wrong = {
-        path: pattern
-        for path, pattern in found.items()
-        if pattern != patterns["resource" if "resource" in path else "source"]
-    }
-    assert wrong == {}
+    expected = {"data_query:input.source_id", "catalog_describe:input.resource_ids"}
+    assert expected <= set(found)
+    family = {path: "resource" if "resource" in path else "source" for path in found}
+    assert {p: v for p, v in found.items() if v != patterns[family[p]]} == {}
 
 
 async def test_routine_save_persists_full_ids_named_by_handles(tmp_path: Path) -> None:
-    import sqlite3
-    from datetime import UTC, datetime, timedelta
-
-    from daita import SQLiteSource
-    from daita.distribution import outcome_contract_projection
-    from daita.llm.models import FinishReason, ModelProfile, ModelResponse
-    from daita.llm.providers.mock import MockModelProvider
-    from tests.support.distribution import no_artifact_outcome_contract
-
     database = tmp_path / "current.sqlite"
-    connection = sqlite3.connect(database)
-    connection.execute("CREATE TABLE current_value (value INTEGER NOT NULL)")
-    connection.commit()
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE current_value (value INTEGER NOT NULL)")
     connection.close()
     provider = MockModelProvider(
         (ModelResponse(finish_reason=FinishReason.STOP, text="Authorize it."),)
     )
-    approvals: list[ApprovalRequest] = []
-
-    async def approve(request: ApprovalRequest) -> ApprovalDecision:
-        approvals.append(request)
-        return ApprovalDecision.APPROVE
-
+    approvals = _Approvals()
     agent = await Agent.create(
         "scope-ref-routine",
         root=tmp_path,
@@ -488,7 +412,7 @@ async def test_routine_save_persists_full_ids_named_by_handles(tmp_path: Path) -
             supports_tools=True,
             supports_parallel_tools=True,
         ),
-        approval_handler=approve,
+        approval_handler=approvals,
     )
     try:
         source = await agent.attach(SQLiteSource(database, name="Current"))
@@ -534,14 +458,12 @@ async def test_routine_save_persists_full_ids_named_by_handles(tmp_path: Path) -
             run,
             (ToolCall("handle-routine", "routine_save", arguments),),
         )
-        result = created.ordered_results[0]
-        assert not result.is_error, result.output
+        assert not created.ordered_results[0].is_error, created.ordered_results[0]
         (summary,) = await agent.list_routines()
         inspection = await agent.inspect_routine(summary.routine_id)
         assert inspection is not None
-        routine = inspection.routine
-        assert routine.allowed_source_ids == (source.id,)
-        assert routine.allowed_resource_ids == (resource.id,)
+        assert inspection.routine.allowed_source_ids == (source.id,)
+        assert inspection.routine.allowed_resource_ids == (resource.id,)
         assert approvals
         approved = canonical_json(approvals[-1].arguments)
         assert source.id in approved and resource.id in approved
@@ -550,34 +472,8 @@ async def test_routine_save_persists_full_ids_named_by_handles(tmp_path: Path) -
         await agent.close()
 
 
-class _Citer:
-    executor_id = "test.scope.cite.executor"
-
-    def __init__(self) -> None:
-        self.requests: list[ToolExecution] = []
-
-    async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        return FrozenJsonObject.from_mapping({"current": True})
-
-    async def execute(self, request: ToolExecution) -> ToolOutput:
-        self.requests.append(request)
-        payload = FrozenJsonObject.from_mapping(
-            {
-                "source_id": request.arguments["source_id"],
-                "resource_ids": request.arguments["resource_ids"],
-            }
-        )
-        return ToolOutput(
-            kind="test.scope.write",
-            data=payload,
-            effect_observation=EffectObservation(
-                EffectOutcome.SUCCEEDED, EffectEvidenceBasis.SERVER_REPORTED, payload
-            ),
-        )
-
-
 async def test_executed_record_is_exactly_what_execution_approval_and_receipt_saw(
-    tmp_path,
+    store, rig
 ):
     """One resolver derives the executed record every reader shares.
 
@@ -586,161 +482,57 @@ async def test_executed_record_is_exactly_what_execution_approval_and_receipt_sa
     executor's request, the approval request and the receipt payload.
     """
 
-    store = await _store(tmp_path / "state.db")
-    read = Capability(
-        id="test.scope.read",
-        description="Read one exact source.",
-        input_schema=_IDENTITY_INPUT,
-        output_kind="test.scope.output",
-        output_schema=_OK_OUTPUT,
-        executor_id="test.scope.read.executor",
-        access_mode=AccessMode.READ,
-    )
-    cite_input = {
-        "type": "object",
-        "properties": {
-            "source_id": source_id_schema(),
-            "resource_ids": {
-                "type": "array",
-                "items": resource_id_schema(),
-                "minItems": 1,
-                "maxItems": 4,
-            },
-            "evidence_refs": {
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 1,
-                "maxItems": 2,
-            },
-        },
-        "required": ["source_id", "resource_ids", "evidence_refs"],
-        "additionalProperties": False,
-    }
-    cite = Capability(
-        id="test.scope.cite",
-        description="Act on one exact source citing earlier evidence.",
-        input_schema=cite_input,
-        output_kind="test.scope.write",
-        output_schema=_IDENTITY_INPUT,
-        executor_id=_Citer.executor_id,
-        access_mode=AccessMode.NONE,
-        operational_effect=OperationalEffect.EXTERNAL_ACTION,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
-        effect_receipt_policy=EffectReceiptPolicy(
-            "test.scope.cite", _IDENTITY_INPUT, EffectEvidenceBasis.SERVER_REPORTED
-        ),
-        result_ref_arguments=("evidence_refs[]",),
-    )
-    views = tuple(
-        ToolView(
-            name=capability.id.rsplit(".", 1)[1],
-            capability_id=capability.id,
-            description=capability.description,
-            presentation=presentation_metadata(
-                load_mode=(
-                    ToolLoadMode.ON_DEMAND
-                    if capability.operational_effect is not OperationalEffect.NONE
-                    else ToolLoadMode.PINNED
-                )
-            ),
-        )
-        for capability in (read, cite)
-    )
-    domain = StaticTestDomain((read, cite), views)
-    reader = _Recorder(read.executor_id)
-    citer = _Citer()
-    registry = static_registry(domain, (reader, citer))
-    approvals: list[ApprovalRequest] = []
-
-    async def approve(request: ApprovalRequest) -> ApprovalDecision:
-        approvals.append(request)
-        return ApprovalDecision.APPROVE
-
-    async def resolve_scope(run: RunInput) -> EffectiveSourceScope:
-        return SCOPE
-
-    runtime = CapabilityRuntime(
-        registry,
-        (domain,),
-        effect_receipts=store,
-        approval_handler=approve,
-        clock=lambda: STARTED_AT,
-        source_scope_resolver=resolve_scope,
-    )
+    runtime, requests, approvals = rig
+    registry = runtime._registry
     run = await runtime.freeze_source_scope(_RUN)
     assert run.resolved_source_scope == SCOPE
     load = ToolCall("load", "toolbox_load", {"tool_names": ("cite",)})
-    sent_read = ToolCall("read", "read", {"source_id": "s2", "resource_ids": ("t3",)})
+    sent_read = _call("read", "read", "s2", "t3")
     # The control result is numbered r1 but is not citable; the read is r2.
-    sent_cite = ToolCall(
-        "cite",
-        "cite",
-        {
-            "source_id": "s1",
-            "resource_ids": ("t2", RESOURCE_A),
-            "evidence_refs": ("r2",),
-        },
+    cited = {"source_id": "s1", "resource_ids": ("t2", RESOURCE_A)}
+    sent_cite = ToolCall("cite", "cite", {**cited, "evidence_refs": ("r2",)})
+    catalog = await runtime.prepare_run(run)
+    messages: tuple[CanonicalMessage, ...] = (run.start_message(),)
+    for call in (load, sent_read, sent_cite):
+        outcome = await runtime.execute_all(
+            run,
+            (call,),
+            projection=runtime.project(catalog, messages),
+            messages=messages,
+            sensitivity=ModelSensitivity.INTERNAL,
+        )
+        messages = (
+            *messages,
+            CanonicalMessage(MessageRole.ASSISTANT, tool_calls=(call,)),
+            CanonicalMessage(MessageRole.TOOL, content=outcome.ordered_results),
+        )
+    transcript = Transcript(run, messages)
+    results = [result for _, result in transcript.tool_pairs]
+    assert all(result is not None and not result.is_error for result in results)
+
+    load_pair, read_pair, cite_pair = registry.executed_tool_pairs(transcript)
+    assert [load_pair[1], read_pair[1], cite_pair[1]] == results
+    assert load_pair[0] == load
+    assert read_pair[0].arguments == requests["read"][0].arguments
+    assert read_pair[0].arguments == _frozen(
+        {"source_id": SOURCE_B, "resource_ids": (RESOURCE_C,)}
     )
-    try:
-        catalog = await runtime.prepare_run(run)
-        messages: tuple[CanonicalMessage, ...] = (run.start_message(),)
-        for call in (load, sent_read, sent_cite):
-            outcome = await runtime.execute_all(
-                run,
-                (call,),
-                projection=runtime.project(catalog, messages),
-                messages=messages,
-                sensitivity=ModelSensitivity.INTERNAL,
-            )
-            messages = (
-                *messages,
-                CanonicalMessage(MessageRole.ASSISTANT, tool_calls=(call,)),
-                CanonicalMessage(MessageRole.TOOL, content=outcome.ordered_results),
-            )
-        transcript = Transcript(run, messages)
-        results = [result for _, result in transcript.tool_pairs]
-        assert all(result is not None and not result.is_error for result in results)
+    full = {"source_id": SOURCE_A, "resource_ids": (RESOURCE_B, RESOURCE_A)}
+    executed = cite_pair[0].arguments
+    assert executed == _frozen({**full, "evidence_refs": ("read",)})
+    assert executed == requests["cite"][0].arguments
+    assert [request.arguments for request in approvals] == [executed]
+    (receipt,) = await store.list_effect_receipts("agent-effect")
+    assert (receipt.run_id, receipt.call_id) == (run.id, cite_pair[0].id)
+    assert receipt.payload == _frozen(full)
+    # The transcript keeps the model's exact text for provider replay.
+    assert [call for call, _ in transcript.tool_pairs] == [load, sent_read, sent_cite]
 
-        load_pair, read_pair, cite_pair = registry.executed_tool_pairs(transcript)
-        assert [load_pair[1], read_pair[1], cite_pair[1]] == results
-        assert load_pair[0] == load
-        assert read_pair[0].arguments == reader.requests[0].arguments
-        assert read_pair[0].arguments == _frozen(
-            {"source_id": SOURCE_B, "resource_ids": (RESOURCE_C,)}
-        )
-        executed = cite_pair[0].arguments
-        assert executed == _frozen(
-            {
-                "source_id": SOURCE_A,
-                "resource_ids": (RESOURCE_B, RESOURCE_A),
-                "evidence_refs": ("read",),
-            }
-        )
-        assert executed == citer.requests[0].arguments
-        assert [request.arguments for request in approvals] == [executed]
-        (receipt,) = await store.list_effect_receipts("agent-effect")
-        assert (receipt.run_id, receipt.call_id) == (run.id, cite_pair[0].id)
-        assert receipt.payload == _frozen(
-            {"source_id": SOURCE_A, "resource_ids": (RESOURCE_B, RESOURCE_A)}
-        )
-        # The transcript keeps the model's exact text for provider replay.
-        assert [call for call, _ in transcript.tool_pairs] == [
-            load,
-            sent_read,
-            sent_cite,
-        ]
-
-        # A call that never resolved failed before execution and is unchanged.
-        unissued = ToolCall(
-            "unissued", "read", {"source_id": "s9", "resource_ids": ("t1",)}
-        )
+    # A call that never resolved failed before execution and is unchanged.
+    for call, history in (
+        (_call("unissued", "read", "s9", "t1"), messages),
+        (ToolCall("unknown", "not_a_tool", {"source_id": "s1"}), ()),
+    ):
         assert (
-            registry.executed_call(unissued, messages=messages, source_scope=SCOPE)
-            == unissued
+            registry.executed_call(call, messages=history, source_scope=SCOPE) == call
         )
-        unknown = ToolCall("unknown", "not_a_tool", {"source_id": "s1"})
-        assert (
-            registry.executed_call(unknown, messages=(), source_scope=SCOPE) == unknown
-        )
-    finally:
-        await store.close()
