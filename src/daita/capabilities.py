@@ -96,6 +96,17 @@ class ExecutionPreference(str, Enum):
     DURABLE = "durable"
 
 
+class CallTargetLane(str, Enum):
+    """Which enforced per-call target ceiling governs one run's calls.
+
+    Foreground user calls are bounded by the inline ceiling; graph task workers
+    by the graph ceiling. The runtime maps each run origin to at most one lane.
+    """
+
+    FOREGROUND = "foreground"
+    GRAPH_TASK = "graph_task"
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionAdmissionPolicy:
     """Immutable capability facts used for deterministic execution admission.
@@ -146,15 +157,28 @@ class ExecutionAdmissionPolicy:
 
         return asdict(self)
 
-    def limits_sentence(self) -> str | None:
-        """One model-facing sentence for the enforced foreground target bound."""
+    def call_target_ceiling(self, lane: CallTargetLane | None) -> int | None:
+        """The per-call target ceiling enforced for ``lane``, if any.
 
-        if not self.inline_eligible or self.target_count_argument is None:
+        This is the single source for both enforcement and the model-facing
+        limits text, so a run is never shown a bound it is not held to.
+        """
+
+        if lane is not None and not isinstance(lane, CallTargetLane):
+            raise TypeError("call target lane is invalid")
+        if lane is None or self.target_count_argument is None:
             return None
-        return (
-            f"Limits: at most {self.inline_max_targets} "
-            f"{self.target_count_argument} per call."
-        )
+        if lane is CallTargetLane.FOREGROUND:
+            return self.inline_max_targets if self.inline_eligible else None
+        return self.graph_max_targets if self.graph_v1_eligible else None
+
+    def limits_sentence(self, lane: CallTargetLane | None) -> str | None:
+        """One model-facing sentence for the target bound enforced in ``lane``."""
+
+        ceiling = self.call_target_ceiling(lane)
+        if ceiling is None:
+            return None
+        return f"Limits: at most {ceiling} {self.target_count_argument} per call."
 
     def target_count(self, arguments: Mapping[str, object]) -> int:
         if self.target_count_argument is None:
@@ -174,7 +198,10 @@ class ExecutionAdmissionPolicy:
         targets = self.target_count(arguments)
         if targets < 1:
             return "execution_not_supported_for_requested_shape"
-        fits_inline = self.inline_eligible and targets <= self.inline_max_targets
+        inline_ceiling = self.call_target_ceiling(CallTargetLane.FOREGROUND)
+        fits_inline = self.inline_eligible and (
+            inline_ceiling is None or targets <= inline_ceiling
+        )
         fits_graph = (
             self.graph_v1_eligible
             and self.synchronous_only
@@ -2291,7 +2318,11 @@ class CapabilityRegistry:
         view, capability = self.resolve_tool(name, capability_id=capability_id)
         return view, capability, self.resolve_domain_owner(capability.id)
 
-    def tool_definition(self, name: str) -> ToolDefinition:
+    def tool_definition(
+        self, name: str, *, lane: CallTargetLane | None
+    ) -> ToolDefinition:
+        """Project one provider definition with the target bound ``lane`` enforces."""
+
         view, capability = self.resolve_tool(name)
         if not view.mode_capability_ids:
             input_schema: Mapping[str, object] = capability.input_schema
@@ -2301,7 +2332,7 @@ class CapabilityRegistry:
             input_schema = _summarized_input_schema(view, input_schema)
         description = _provider_description(view)
         policy = capability.execution_admission_policy
-        sentence = None if policy is None else policy.limits_sentence()
+        sentence = None if policy is None else policy.limits_sentence(lane)
         if sentence is not None:
             # A description that already states its limits gets the enforced
             # target bound inside that one sentence rather than a second one.
@@ -3029,6 +3060,7 @@ __all__ = [
     "ApprovalRequest",
     "ArtifactPolicy",
     "CallProvenance",
+    "CallTargetLane",
     "Capability",
     "CapabilityInputError",
     "CapabilityRegistry",

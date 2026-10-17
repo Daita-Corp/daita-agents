@@ -23,6 +23,7 @@ from daita._json import FrozenJsonObject, canonical_json
 from daita.adapters import postgresql_write as native
 from daita.capabilities import (
     ApprovalDecision,
+    CallTargetLane,
     CapabilityInputError,
     EffectEvidenceBasis,
     EffectOutcome,
@@ -612,7 +613,9 @@ async def test_upsert_evidence_is_derived_from_earlier_reads_of_the_same_table(
             item for item in approvals if item.capability_id == "data.upsert_rows"
         )
         assert "evidence_call_ids" not in dict(approval.arguments["arguments"])
-        definition = agent._embedded._capabilities.tool_definition("data_upsert_rows")
+        definition = agent._embedded._capabilities.tool_definition(
+            "data_upsert_rows", lane=CallTargetLane.FOREGROUND
+        )
         properties = definition.input_schema["properties"]
         assert isinstance(properties, Mapping)
         assert "evidence_call_ids" not in properties

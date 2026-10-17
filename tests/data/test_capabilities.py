@@ -11,6 +11,7 @@ import pytest
 
 from daita._json import FrozenJsonObject, thaw_json
 from daita.capabilities import (
+    CallTargetLane,
     CapabilityDeclarations,
     CapabilityInputError,
     CapabilityRegistry,
@@ -141,7 +142,9 @@ def test_data_query_file_outputs_route_to_exact_export_with_one_limits_clause() 
         ("csv", DATA_EXPORT_TABULAR_CAPABILITY_ID),
         ("xlsx", DATA_EXPORT_TABULAR_CAPABILITY_ID),
     )
-    definition = registry.tool_definition(DATA_QUERY_TOOL_NAME)
+    definition = registry.tool_definition(
+        DATA_QUERY_TOOL_NAME, lane=CallTargetLane.FOREGROUND
+    )
     assert definition.description.count("Limits:") == 1
     assert len(definition.description.encode()) <= 600
     properties = definition.input_schema["properties"]

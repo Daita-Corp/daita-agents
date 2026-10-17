@@ -4,7 +4,19 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from daita.capabilities import ExecutionAdmissionPolicy
+import pytest
+
+from daita.capabilities import (
+    CallTargetLane,
+    CapabilityInputError,
+    ExecutionAdmissionPolicy,
+    ExecutionPreference,
+)
+from daita.capability_runtime import (
+    _require_call_target_ceiling,
+    call_target_lane,
+)
+from daita.loop.models import RunOrigin
 from tests.capabilities._toolbox_support import (
     AccessMode,
     ApprovalDecision,
@@ -248,6 +260,41 @@ async def test_limits_appear_once_in_description_and_once_in_guidance():
         "Per-call limits: bounded_read at most 4 tables "
         "(up to 16 through submit_durable after toolbox_load)."
     )
+
+
+def test_rendered_and_enforced_target_bounds_read_one_lane_policy():
+    lanes = {origin: call_target_lane(origin) for origin in RunOrigin}
+    assert lanes == {
+        RunOrigin.USER: CallTargetLane.FOREGROUND,
+        RunOrigin.JOB_TASK: CallTargetLane.GRAPH_TASK,
+        RunOrigin.JOB_EVENT: None,
+        RunOrigin.SCHEDULED_ROUTINE: None,
+    }
+    assert _POLICY.call_target_ceiling(lanes[RunOrigin.USER]) == 4
+    assert _POLICY.call_target_ceiling(lanes[RunOrigin.JOB_TASK]) == 16
+    for origin, lane in lanes.items():
+        ceiling = _POLICY.call_target_ceiling(lane)
+        sentence = _POLICY.limits_sentence(lane)
+        if ceiling is None:
+            assert sentence is None
+            continue
+        assert sentence == f"Limits: at most {ceiling} tables per call."
+        fits = {"tables": tuple(f"t{i}" for i in range(ceiling))}
+        over = {"tables": tuple(f"t{i}" for i in range(ceiling + 1))}
+        if origin is RunOrigin.USER:
+            # Foreground admission: the rendered bound is the inline boundary.
+            assert _POLICY.admission_error(fits, ExecutionPreference.AUTO) is None
+            assert _POLICY.admission_error(over, ExecutionPreference.AUTO) is not None
+        else:
+            _require_call_target_ceiling(_POLICY, lane, fits)
+            with pytest.raises(CapabilityInputError) as raised:
+                _require_call_target_ceiling(_POLICY, lane, over)
+            recovery = raised.value.details["recovery"]
+            assert isinstance(recovery, Mapping)
+            assert recovery["kind"] == "reduce_scope"
+            assert recovery["constraint"] == (
+                f"Select at most {ceiling} tables per call."
+            )
 
 
 async def test_durable_available_on_demand_names_the_exact_entrypoint():

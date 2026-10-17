@@ -12,7 +12,7 @@ from daita import (
     ApprovalRequest,
     SemanticEvidenceKind,
 )
-from daita.capabilities import OperationalEffect
+from daita.capabilities import CallTargetLane, OperationalEffect
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -257,7 +257,9 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             )
         )
         definitions = tuple(
-            runtime._registry.tool_definition(entry.view.name)
+            runtime._registry.tool_definition(
+                entry.view.name, lane=CallTargetLane.FOREGROUND
+            )
             for entry in catalog.entries
         )
         names = {item.name for item in definitions}

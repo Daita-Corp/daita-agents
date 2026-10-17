@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from daita.capabilities import (
+    CallTargetLane,
     Capability,
     CapabilityDeclarations,
     CapabilityRegistry,
@@ -124,7 +125,9 @@ def _error_code(outcome: ToolBatchOutcome) -> str:
 def test_mode_routed_tool_exposes_one_merged_schema_over_existing_capabilities():
     registry, _runtime, _preview, _apply = _fixture()
 
-    definition = registry.tool_definition("test_mode_rows")
+    definition = registry.tool_definition(
+        "test_mode_rows", lane=CallTargetLane.FOREGROUND
+    )
     schema = definition.input_schema
     properties = schema["properties"]
     assert isinstance(properties, Mapping)

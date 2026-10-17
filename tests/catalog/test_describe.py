@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from daita.capabilities import CallTargetLane
 from daita.catalog import CatalogDescribeDetail, CatalogDescribeRequest
 from daita.catalog.models import CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT
 from tests.catalog._schema_support import (
@@ -328,9 +329,13 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
     )
     try:
         registry: CapabilityRegistry = agent._embedded._capabilities
-        search_definition = registry.tool_definition("catalog_search")
+        search_definition = registry.tool_definition(
+            "catalog_search", lane=CallTargetLane.FOREGROUND
+        )
         _search_view, search_capability = registry.resolve_tool("catalog_search")
-        describe_definition = registry.tool_definition("catalog_describe")
+        describe_definition = registry.tool_definition(
+            "catalog_describe", lane=CallTargetLane.FOREGROUND
+        )
 
         search_properties = search_definition.input_schema["properties"]
         describe_properties = describe_definition.input_schema["properties"]
@@ -630,12 +635,14 @@ async def test_catalog_describe_replaces_split_tools_without_ordering_rules(
         registry: CapabilityRegistry = agent._embedded._capabilities
         for removed in ("catalog_schema", "catalog_inspect", "catalog_traverse"):
             with pytest.raises(KeyError, match="unknown tool"):
-                registry.tool_definition(removed)
+                registry.tool_definition(removed, lane=CallTargetLane.FOREGROUND)
         for removed_id in ("catalog.schema", "catalog.inspect", "catalog.traverse"):
             with pytest.raises(KeyError):
                 registry.resolve_execution(removed_id)
 
-        description = registry.tool_definition("catalog_describe").description
+        description = registry.tool_definition(
+            "catalog_describe", lane=CallTargetLane.FOREGROUND
+        ).description
         for ordering_rule in ("Do not use with", "later step", "alongside"):
             assert ordering_rule not in description
         assert "multi-hop resolved in code" in description
