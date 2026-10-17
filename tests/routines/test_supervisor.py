@@ -8,7 +8,7 @@ from typing import cast
 
 import pytest
 
-import daita.storage.sql as sqlite_module
+import daita.storage.sql_routines as routine_store_module
 from daita._json import FrozenJsonObject
 from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import AccessMode, OperationalEffect, ToolOutput
@@ -420,7 +420,7 @@ async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = await SQLiteStateStore.open(tmp_path / "state.db")
-    monkeypatch.setattr(sqlite_module, "MAX_DELIVERIES_PER_AGENT", 1)
+    monkeypatch.setattr(routine_store_module, "MAX_DELIVERIES_PER_AGENT", 1)
     await _seed_conversation(store)
     full_routine = await store.admit_scheduled_routine(
         replace(_routine(), routine_id="routine-capacity-first")
