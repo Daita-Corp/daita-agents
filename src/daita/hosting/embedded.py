@@ -2239,6 +2239,7 @@ class EmbeddedAgent:
             artifact_domain.bind_capability_registry(capabilities)
         data_domain.bind_capability_registry(capabilities)
         routine_owner.bind_capability_registry(capabilities)
+        graph_task_lifecycle.bind_capability_registry(capabilities)
 
         async def resolve_run_sources(run: RunInput):
             return await resolve_effective_source_scope(run, data_view)
@@ -2320,6 +2321,7 @@ class EmbeddedAgent:
                 if artifact_domain is not None:
                     artifact_domain.bind_capability_registry(next_registry)
                 routine_owner.bind_capability_registry(next_registry)
+                graph_task_lifecycle.bind_capability_registry(next_registry)
                 if graph_resolver is not None:
                     graph_resolver.bind_capability_registry(next_registry)
                 if graph_builder is not None:
