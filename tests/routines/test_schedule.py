@@ -17,6 +17,7 @@ from daita.routines.models import (
 )
 from daita.routines.schedule import (
     first_slot,
+    forecast_slots,
     manual_slot_key,
     next_slot,
     occurrence_id,
@@ -231,3 +232,60 @@ def test_backward_clock_movement_cannot_recreate_completed_slot() -> None:
         expires_at=_utc("2026-08-28T00:00:00+00:00"),
     ) == _utc("2026-08-27T05:00:00+00:00")
     assert scheduled_slot_key("routine-1", 1, completed) == original_key
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    (
+        IntervalSchedule(3600, _utc("2026-09-01T00:30:00+00:00")),
+        CalendarSchedule(
+            timezone="America/Chicago",
+            hour=9,
+            minute=0,
+            day_selector=CalendarDaySelector.WEEKDAYS,
+            weekdays=(1, 3),
+        ),
+        OnceSchedule(_utc("2026-09-02T00:00:00+00:00")),
+    ),
+)
+def test_forecast_matches_slot_by_slot_iteration(schedule) -> None:
+    not_before = _utc("2026-09-01T00:00:00+00:00")
+    expires = _utc("2026-09-29T00:00:00+00:00")
+    slots = []
+    cursor = first_slot(schedule, not_before=not_before, expires_at=expires)
+    while cursor is not None:
+        slots.append(cursor)
+        cursor = next_slot(schedule, after=cursor, expires_at=expires)
+    for cap in (1, 5, 10_000):
+        forecast = forecast_slots(
+            schedule,
+            not_before=not_before,
+            expires_at=expires,
+            limit=1,
+            count_limit=cap,
+        )
+        assert forecast.occurrences == tuple(slots[:1])
+        assert forecast.reachable_slots == min(cap, len(slots))
+    assert forecast_slots(
+        schedule, not_before=not_before, expires_at=expires, limit=3, count_limit=3
+    ).occurrences == tuple(slots[:3])
+
+
+def test_forecast_reports_a_first_slot_beyond_expiration() -> None:
+    monday = CalendarSchedule(
+        timezone="America/Chicago",
+        hour=9,
+        minute=0,
+        day_selector=CalendarDaySelector.WEEKDAYS,
+        weekdays=(1,),
+    )
+    forecast = forecast_slots(
+        monday,
+        not_before=_utc("2026-09-05T12:00:00+00:00"),
+        expires_at=_utc("2026-09-06T12:00:00+00:00"),
+        limit=3,
+        count_limit=3,
+    )
+    assert forecast.occurrences == ()
+    assert forecast.reachable_slots == 0
+    assert forecast.first_unbounded_at == _utc("2026-09-07T14:00:00+00:00")

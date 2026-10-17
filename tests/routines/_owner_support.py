@@ -41,6 +41,7 @@ from daita.routines.models import (
     MisfirePolicy,
     ReportingMode,
     RoutineOccurrence,
+    RoutineSchedule,
     RoutineState,
     ScheduledRoutine,
 )
@@ -373,6 +374,12 @@ async def _proposal(
     capability_ids: tuple[str, ...] = ("test.read",),
     skill_names: tuple[str, ...] = (),
     basis_run_id: str | None = None,
+    schedule: RoutineSchedule | None = None,
+    expires_at: datetime | None = None,
+    cumulative_max_occurrences: int = 10,
+    distribution_destination_id: str | None = conversation_inbox_destination_id(
+        "conversation-1"
+    ),
 ) -> ScheduledRoutine:
     return await owner.prepare_create(
         run_id="run-origin",
@@ -380,7 +387,7 @@ async def _proposal(
         call_id="call-create",
         title="Current value",
         authorized_instruction="Read the exact current resource and report its value.",
-        schedule=IntervalSchedule(3600, NOW),
+        schedule=IntervalSchedule(3600, NOW) if schedule is None else schedule,
         misfire_policy=MisfirePolicy.LATEST_ONLY,
         reporting_mode=ReportingMode.ALWAYS,
         precheck=None,
@@ -390,16 +397,16 @@ async def _proposal(
         allowed_capability_ids=capability_ids,
         sensitivity_ceiling=ModelSensitivity.INTERNAL,
         outcome_contract=no_artifact_outcome_contract(),
-        distribution_destination_id=conversation_inbox_destination_id("conversation-1"),
+        distribution_destination_id=distribution_destination_id,
         eligible_model_routes=("mock",),
         per_run_max_tokens=1_000,
         per_run_max_cost_usd=Decimal("0.10"),
         cumulative_max_tokens=10_000,
         cumulative_max_cost_usd=Decimal("1"),
         cumulative_max_attempts=10,
-        cumulative_max_occurrences=10,
+        cumulative_max_occurrences=cumulative_max_occurrences,
         maximum_consecutive_failures=3,
-        expires_at=NOW + timedelta(days=30),
+        expires_at=NOW + timedelta(days=30) if expires_at is None else expires_at,
         skill_names=skill_names,
         basis_run_id=basis_run_id,
     )

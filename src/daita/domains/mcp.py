@@ -53,6 +53,7 @@ from ..capabilities import (
     validate_tool_schema_value,
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
+from ..distribution.models import is_distribution_destination_id
 from ..llm.models import ModelSensitivity, ToolCall
 from ..llm.provider_definitions import tool_schema_incompatibility
 from ..loop.models import RunInput
@@ -67,8 +68,16 @@ _MCP_BINDING_CHANGED = ToolRecovery(
 )
 MCP_OUTPUT_KIND = "mcp.tool.result"
 
+_MCP_GRANT_IDENTITY_FIELDS = ("binding_id", "binding_revision", "remote_tool_name")
+_MCP_GRANT_VARIABLE_NAMES_SCHEMA = {
+    "type": "array",
+    "maxItems": 128,
+    "uniqueItems": True,
+    "items": {"type": "string", "minLength": 1, "maxLength": 128},
+}
 MCP_GRANT_POLICY = AutomationGrantPolicy(
     constraints_kind="mcp.tool_call",
+    # Retained grant shape; part of every MCP action's contract digest.
     constraints_schema={
         "type": "object",
         "properties": {
@@ -76,20 +85,50 @@ MCP_GRANT_POLICY = AutomationGrantPolicy(
             "binding_revision": {"type": "integer", "minimum": 1},
             "remote_tool_name": {"type": "string", "maxLength": 256},
             "fixed_arguments": {"type": "object"},
-            "variable_argument_names": {
-                "type": "array",
-                "maxItems": 128,
-                "uniqueItems": True,
-                "items": {"type": "string", "minLength": 1, "maxLength": 128},
-            },
+            "variable_argument_names": _MCP_GRANT_VARIABLE_NAMES_SCHEMA,
         },
         "required": [
-            "binding_id",
-            "binding_revision",
-            "remote_tool_name",
+            *_MCP_GRANT_IDENTITY_FIELDS,
             "fixed_arguments",
             "variable_argument_names",
         ],
+        "additionalProperties": False,
+    },
+    # Authoring shape: the binding, revision and remote tool follow from the
+    # capability_id, so the domain fills them when they are omitted.
+    request_schema={
+        "type": "object",
+        "properties": {
+            "binding_id": {
+                "type": "string",
+                "maxLength": 256,
+                "description": "Optional; derived from capability_id.",
+            },
+            "binding_revision": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional; derived from capability_id.",
+            },
+            "remote_tool_name": {
+                "type": "string",
+                "maxLength": 256,
+                "description": "Optional; derived from capability_id.",
+            },
+            "fixed_arguments": {
+                "type": "object",
+                "description": (
+                    "Exact values for the connector tool's own input arguments, "
+                    "keyed by its input schema property names. A Daita Inbox "
+                    "destination is not a connector argument; report delivery "
+                    "uses distribution_destination_id."
+                ),
+            },
+            "variable_argument_names": {
+                **_MCP_GRANT_VARIABLE_NAMES_SCHEMA,
+                "description": "Connector tool scalar arguments each run may set.",
+            },
+        },
+        "required": ["fixed_arguments", "variable_argument_names"],
         "additionalProperties": False,
     },
 )
@@ -789,18 +828,27 @@ class MCPCapabilityDomain:
                 "automation_grant_unsupported",
                 "This MCP tool does not support the requested unattended invocation contract.",
             )
-        if (
-            proposal.agent_id != self._agent_id
-            or binding.binding_id not in proposal.allowed_connector_binding_ids
-            or (
-                binding.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION
-                and proposal.principal_id != binding.owner_principal_id
-            )
+        if proposal.agent_id != self._agent_id or (
+            binding.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION
+            and proposal.principal_id != binding.owner_principal_id
         ):
             raise CapabilityInputError(
                 "automation_grant_scope_invalid",
                 "The MCP binding is outside the proposed scope.",
             )
+        if binding.binding_id not in proposal.allowed_connector_binding_ids:
+            raise CapabilityInputError(
+                "automation_grant_scope_invalid",
+                "The MCP binding is outside the proposed connector scope.",
+                {"binding_id": binding.binding_id},
+                recovery=ToolRecovery(
+                    RecoveryKind.CORRECT_ARGUMENTS,
+                    "Include this binding_id in allowed_connector_binding_ids; a "
+                    "routine may omit that list to derive it from its capabilities.",
+                ),
+            )
+        constraints = _with_grant_identity(binding, tool, constraints)
+        _reject_delivery_destination_arguments(tool, constraints)
         try:
             await check_personal_connection(
                 binding.authentication,
@@ -926,9 +974,24 @@ class MCPCapabilityDomain:
         try:
             await validate_mcp_schema_value(partial_schema, fixed)
         except ValueError:
+            invalid = []
+            for name in sorted(fixed):
+                try:
+                    await validate_mcp_schema_value(
+                        {**partial_schema, "required": [name]},
+                        {name: fixed[name]},
+                    )
+                except ValueError:
+                    invalid.append(name)
             raise CapabilityInputError(
                 "mcp_grant_constraints_invalid",
-                "Fixed grant arguments do not satisfy the admitted MCP schema.",
+                "Fixed grant arguments do not satisfy the connector tool's input "
+                "schema. Correct the listed values; use toolbox_inspect for the "
+                "exact declared types.",
+                {
+                    "invalid_argument_names": [name[:128] for name in invalid[:32]],
+                    "inspect_tool_name": tool.local_name,
+                },
             ) from None
 
     async def side_effect_plan(
@@ -1239,6 +1302,64 @@ async def activate_mcp_domain(
         connection_provider=connection_provider,
     )
     return domain, tuple(activated), tuple(item.executor for item in activated)
+
+
+def _with_grant_identity(
+    binding: MCPServerBinding, tool: MCPToolBinding, constraints: FrozenJsonObject
+) -> FrozenJsonObject:
+    """Fill identity the capability_id already determines; keep given values.
+
+    Supplied identity values stay and are checked for exact equality later, so
+    a stale or foreign identity is still rejected rather than overwritten.
+    """
+
+    values = constraints.to_dict()
+    for name, value in (
+        ("binding_id", binding.binding_id),
+        ("binding_revision", binding.revision),
+        ("remote_tool_name", tool.remote_name),
+    ):
+        values.setdefault(name, value)
+    return FrozenJsonObject.from_mapping(values)
+
+
+def _reject_delivery_destination_arguments(
+    tool: MCPToolBinding, constraints: FrozenJsonObject
+) -> None:
+    """A Daita Inbox destination never belongs in a connector tool argument."""
+
+    fixed = constraints.get("fixed_arguments")
+    if not isinstance(fixed, Mapping):
+        return
+
+    def contains_destination(value: object) -> bool:
+        if is_distribution_destination_id(value):
+            return True
+        if isinstance(value, Mapping):
+            return any(contains_destination(item) for item in value.values())
+        if isinstance(value, (tuple, list)):
+            return any(contains_destination(item) for item in value)
+        return False
+
+    names = sorted(name for name, value in fixed.items() if contains_destination(value))
+    if names:
+        raise CapabilityInputError(
+            "mcp_grant_delivery_destination_argument",
+            "A Daita Inbox destination id was given as a connector tool argument. "
+            "fixed_arguments are values the connector tool itself receives; Daita "
+            "report delivery is chosen separately.",
+            {
+                "argument_names": [name[:128] for name in names[:32]],
+                "inspect_tool_name": tool.local_name,
+            },
+            recovery=ToolRecovery(
+                RecoveryKind.CORRECT_ARGUMENTS,
+                "Report delivery is separate: a routine takes the Inbox in "
+                "distribution_destination_id, and omitting it selects this "
+                "conversation's Inbox. Fix these arguments to the connector "
+                "tool's own target values from the user's request.",
+            ),
+        )
 
 
 def _require_current_binding(

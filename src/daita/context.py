@@ -616,7 +616,8 @@ class AgentContextBuilder:
             if zone_name is None:
                 time_context = (
                     "Code-owned UTC time at run start: "
-                    f"{now.isoformat()}. User-local IANA timezone is unknown; "
+                    f"{now.strftime('%A')} {now.isoformat()} (ISO weekday "
+                    f"{now.isoweekday()}). User-local IANA timezone is unknown; "
                     "ask before interpreting an unqualified local clock time."
                 )
             effect_context = "\n\n".join(

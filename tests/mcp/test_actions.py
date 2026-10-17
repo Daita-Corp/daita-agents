@@ -277,10 +277,10 @@ async def test_discovery_exposes_exact_automation_contract_without_granting_auth
         for key, value in contract.items()
         if key != "complete"
     )
-    assert (
-        contract["grant_policy"]["constraints_schema"]
-        == MCP_GRANT_POLICY.constraints_schema
-    )
+    # Authors see the request shape: identity follows from capability_id.
+    requested = contract["grant_policy"]["constraints_schema"]
+    assert requested == MCP_GRANT_POLICY.requested_constraints_schema
+    assert requested["required"] == ("fixed_arguments", "variable_argument_names")
     assert contract["connector"]["id"] == action.binding.binding_id
     assert contract["connector"]["binding_revision"] == action.binding.revision
     assert contract["connector"]["remote_tool_name"] == "notify"
@@ -1401,3 +1401,147 @@ def test_action_admission_is_explicit_and_independent_of_data_access():
         replace(action, operational_effect=OperationalEffect.CHANGE_INFRASTRUCTURE)
     with pytest.raises(ValueError, match="effect"):
         replace(read, access_mode=AccessMode.WRITE)
+
+
+async def _routine_save_arguments(action, fixed_arguments):
+    from daita.routines.capabilities import _spec_schema
+    from daita.routines.owner import _routine_proposal_payload
+
+    proposal = await action.agent.propose_routine(
+        replace(await action.draft(), run_immediately=False)
+    )
+    properties = _spec_schema(update=False)["properties"]
+    assert isinstance(properties, Mapping)
+    arguments = {
+        key: value
+        for key, value in _routine_proposal_payload(proposal).items()
+        if key in properties
+        and value is not None
+        and key not in {"allowed_connector_binding_ids", "run_immediately"}
+    }
+    # Author only what the request decides: the connector tool's own arguments.
+    arguments.update(
+        skill_names=(),
+        requested_capability_grants=[
+            {
+                "capability_id": action.tool.capability_id,
+                "constraints": {
+                    "fixed_arguments": fixed_arguments,
+                    "variable_argument_names": ["content"],
+                },
+                "max_calls_per_occurrence": 1,
+            }
+        ],
+    )
+    return proposal, arguments
+
+
+async def test_routine_save_derives_grant_identity_connector_scope_and_inbox(action):
+    from daita.tui.projection import approval_summary
+
+    proposal, arguments = await _routine_save_arguments(
+        action, {"destination": "fixed-room"}
+    )
+    action.model.steps = [
+        response(ToolCall("load", "toolbox_load", {"tool_names": ["routine_save"]})),
+        response(ToolCall("save", "routine_save", arguments)),
+        response(text="Saved; no notification was sent."),
+    ]
+    result = await action.agent.run(
+        "Save the reviewed assignment.", conversation_id=action.origin.conversation_id
+    )
+    assert result.kind.value == "completed"
+    (summary,) = await action.agent.list_routines()
+    inspection = await action.agent.inspect_routine(summary.routine_id)
+    assert inspection is not None
+    routine = inspection.routine
+    assert routine.allowed_connector_binding_ids == (action.binding.binding_id,)
+    assert routine.distribution_plan == proposal.distribution_plan
+    (grant,) = routine.capability_grants
+    assert grant.constraints == proposal.capability_grants[0].constraints
+    assert grant.constraints["binding_revision"] == action.binding.revision
+    assert grant.constraints["remote_tool_name"] == "notify"
+
+    (review,) = action.approvals
+    text = approval_summary(
+        json.dumps(review.arguments.to_dict(), default=list), "routines.create"
+    )
+    destination = proposal.distribution_plan.targets[0].destination_id
+    connector_line = next(
+        line for line in text.splitlines() if line.startswith("Connector tool")
+    )
+    delivery_line = next(
+        line for line in text.splitlines() if line.startswith("Report delivery")
+    )
+    assert '{"destination": "fixed-room"}' in connector_line
+    assert action.binding.binding_id in connector_line
+    assert destination not in connector_line
+    assert destination in delivery_line and "fixed-room" not in delivery_line
+    assert action.server.calls == []
+
+
+async def test_inbox_destination_is_rejected_as_a_connector_argument(action):
+    proposal, arguments = await _routine_save_arguments(action, {})
+    destination = proposal.distribution_plan.targets[0].destination_id
+    arguments["requested_capability_grants"][0]["constraints"]["fixed_arguments"] = {
+        "destination": destination
+    }
+    action.model.steps = [
+        response(ToolCall("load", "toolbox_load", {"tool_names": ["routine_save"]})),
+        response(ToolCall("save", "routine_save", arguments)),
+        response(text="Stopped to correct the grant."),
+    ]
+    result = await action.agent.run(
+        "Save the reviewed assignment.", conversation_id=action.origin.conversation_id
+    )
+    saved = next(
+        item for item in await action.results(result.run_id) if item.call_id == "save"
+    )
+    error = json.loads(canonical_json(saved.output))["error"]
+    assert error["code"] == "mcp_grant_delivery_destination_argument"
+    assert error["details"]["argument_names"] == ["destination"]
+    assert error["details"]["recovery"]["kind"] == "correct_arguments"
+    assert "distribution_destination_id" in error["details"]["recovery"]["constraint"]
+    assert action.approvals == []
+    assert await action.agent.list_routines() == ()
+    assert action.server.calls == []
+
+
+async def test_fixed_grant_values_are_checked_against_the_connector_schema(action):
+    from daita.domains.mcp import MCPCapabilityDomain
+
+    constraints = FrozenJsonObject.from_mapping(
+        {
+            "binding_id": action.binding.binding_id,
+            "binding_revision": action.binding.revision,
+            "remote_tool_name": action.tool.remote_name,
+            "fixed_arguments": {"destination": 7, "content": "fixed"},
+            "variable_argument_names": [],
+        }
+    )
+    with pytest.raises(CapabilityInputError) as failure:
+        await MCPCapabilityDomain._validate_constraints(
+            action.binding, action.tool, constraints
+        )
+    assert failure.value.code == "mcp_grant_constraints_invalid"
+    assert failure.value.details["invalid_argument_names"] == ("destination",)
+
+
+async def test_supplied_grant_identity_must_still_match_the_capability(action):
+    draft = await action.draft()
+    (requested,) = draft.requested_capability_grants
+    stale = replace(
+        requested,
+        constraints=FrozenJsonObject.from_mapping(
+            {
+                **requested.constraints.to_dict(),
+                "binding_revision": action.binding.revision + 1,
+            }
+        ),
+    )
+    with pytest.raises(CapabilityInputError) as failure:
+        await action.agent.propose_routine(
+            replace(draft, requested_capability_grants=(stale,))
+        )
+    assert failure.value.code == "mcp_grant_constraints_invalid"
+    assert failure.value.details["identity_fields"] == ("binding_revision",)

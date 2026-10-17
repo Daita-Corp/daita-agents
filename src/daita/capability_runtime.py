@@ -967,7 +967,7 @@ class CapabilityRuntime:
                 "The proposed ceilings do not admit this effect.",
             )
         requested = self._registry.validate_grant_constraints(
-            capability_id, requested_constraints
+            capability_id, requested_constraints, requested=True
         )
         normalized = await self._domains[owner_id].prepare_automation_grant(
             capability, requested, max_calls_per_occurrence, proposal
@@ -4790,7 +4790,7 @@ def _automation_contract(entry: RunToolCatalogEntry) -> dict[str, object]:
             if policy is None
             else {
                 "constraints_kind": policy.constraints_kind,
-                "constraints_schema": policy.constraints_schema,
+                "constraints_schema": policy.requested_constraints_schema,
             }
         ),
         "effect_evidence_basis": (

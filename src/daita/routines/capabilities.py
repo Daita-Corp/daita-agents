@@ -73,11 +73,13 @@ from .models import (
     ScheduledRoutineSummary,
 )
 from .owner import (
+    MAX_SCHEDULE_PREVIEW_OCCURRENCES,
     RoutineError,
     RoutineOwner,
     _routine_proposal_payload,
     _schedule_payload,
     routine_approval_arguments,
+    schedule_preview,
 )
 from .temporal import next_weekday_utc
 
@@ -100,8 +102,10 @@ ROUTINE_SAVE_DESCRIPTION = (
     "(after_seconds, anchor_after_seconds, once_next_weekday, "
     "expires_after_seconds) and run_immediately are create-only; set "
     "expires_at or expires_after_seconds. Omitted options default to "
-    "misfire_policy skip and no connector bindings, grants, skills, precheck "
-    "or dollar ceilings."
+    "misfire_policy skip, this conversation's Inbox, connector bindings of "
+    "allowed capabilities, and no grants, skills, precheck or dollar "
+    "ceilings. The Inbox is report delivery only; an action's target goes "
+    "in its grant fixed_arguments."
 )
 ROUTINE_SAVE_SUMMARIZED_ARGUMENTS = (
     "requested_capability_grants",
@@ -651,12 +655,6 @@ async def _create_proposal(
         reference_at=reference_at,
         relative_at=relative_at,
     )
-    first_at = _first_absolute_slot(values["schedule"])
-    if first_at is not None and first_at > values["expires_at"]:
-        raise RoutineError(
-            "routine_expiration_before_schedule",
-            "The routine expires before its first scheduled instant.",
-        )
     if (
         commit_time
         and _mapping(request.arguments, "schedule").get("kind") == "once_next_weekday"
@@ -710,12 +708,12 @@ class _ParsedSpec(TypedDict):
     reporting_mode: ReportingMode
     precheck: ResourceRevisionPrecheck | None
     allowed_source_ids: tuple[str, ...]
-    allowed_connector_binding_ids: tuple[str, ...]
+    allowed_connector_binding_ids: tuple[str, ...] | None
     allowed_resource_ids: tuple[str, ...]
     allowed_capability_ids: tuple[str, ...]
     sensitivity_ceiling: ModelSensitivity
     outcome_contract: OutcomeContract
-    distribution_destination_id: str
+    distribution_destination_id: str | None
     eligible_model_routes: tuple[str, ...]
     per_run_max_tokens: int
     per_run_max_cost_usd: Decimal | None
@@ -764,7 +762,7 @@ def _parsed_spec(
         "allowed_connector_binding_ids": (
             _strings(arguments, "allowed_connector_binding_ids")
             if "allowed_connector_binding_ids" in arguments
-            else ()
+            else None
         ),
         "allowed_resource_ids": _strings(arguments, "allowed_resource_ids"),
         "allowed_capability_ids": _strings(arguments, "allowed_capability_ids"),
@@ -774,8 +772,10 @@ def _parsed_spec(
         "outcome_contract": _parse_outcome_contract(
             _mapping(arguments, "outcome_contract")
         ),
-        "distribution_destination_id": _string(
-            arguments, "distribution_destination_id"
+        "distribution_destination_id": (
+            _string(arguments, "distribution_destination_id")
+            if "distribution_destination_id" in arguments
+            else None
         ),
         "eligible_model_routes": _strings(arguments, "eligible_model_routes"),
         "per_run_max_tokens": _integer(arguments, "per_run_max_tokens"),
@@ -1273,7 +1273,6 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
             "additionalProperties": False,
         },
         "allowed_source_ids": _identity_array_schema(),
-        "allowed_connector_binding_ids": _identity_array_schema(),
         "allowed_resource_ids": _identity_array_schema(),
         "allowed_capability_ids": _identity_array_schema(minimum=1),
         "sensitivity_ceiling": {
@@ -1285,6 +1284,11 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
             "type": "string",
             "minLength": 1,
             "maxLength": 1024,
+            "description": "Daita Inbox for each run's report; omit for this conversation's Inbox. Never a connector argument.",
+        },
+        "allowed_connector_binding_ids": {
+            **_identity_array_schema(),
+            "description": "Omit to derive from allowed_capability_ids.",
         },
         "eligible_model_routes": _identity_array_schema(minimum=1),
         "per_run_max_tokens": {
@@ -1343,7 +1347,6 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
         "allowed_capability_ids",
         "sensitivity_ceiling",
         "outcome_contract",
-        "distribution_destination_id",
         "eligible_model_routes",
         "per_run_max_tokens",
         "cumulative_max_tokens",
@@ -1571,6 +1574,7 @@ def _mutation_receipt(action: str, item: ScheduledRoutine) -> dict[str, object]:
             ),
             "reserved_occurrences": item.occurrence_count,
             "reserved_attempts": item.attempt_count,
+            "upcoming": schedule_preview(item, not_before=item.next_due_at),
         },
     }
 
@@ -1585,6 +1589,7 @@ def _mutation_receipt_schema() -> dict[str, object]:
         "next_due_at": {"type": ["string", "null"], "maxLength": 64},
         "reserved_occurrences": {"type": "integer", "minimum": 0},
         "reserved_attempts": {"type": "integer", "minimum": 0},
+        "upcoming": _schedule_preview_schema(),
     }
     return {
         "type": "object",
@@ -1605,6 +1610,35 @@ def _mutation_receipt_schema() -> dict[str, object]:
             },
         },
         "required": ["action", "routine"],
+        "additionalProperties": False,
+    }
+
+
+def _schedule_preview_schema() -> dict[str, object]:
+    text = {"type": "string", "maxLength": 512}
+    fields: dict[str, object] = {
+        "timezone": {"type": "string", "maxLength": 256},
+        "first_occurrences": {
+            "type": "array",
+            "maxItems": MAX_SCHEDULE_PREVIEW_OCCURRENCES,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "at": {"type": "string", "maxLength": 64},
+                    "local": {"type": "string", "maxLength": 128},
+                },
+                "required": ["at", "local"],
+                "additionalProperties": False,
+            },
+        },
+        "immediate_first_run": {"type": "boolean"},
+        "occurrences_before_expiry": {"type": "integer", "minimum": 0},
+        "warnings": {"type": "array", "maxItems": 4, "items": text},
+    }
+    return {
+        "type": "object",
+        "properties": fields,
+        "required": list(fields),
         "additionalProperties": False,
     }
 
