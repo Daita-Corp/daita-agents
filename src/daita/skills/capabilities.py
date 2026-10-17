@@ -443,7 +443,7 @@ class SkillCapabilityDomain:
     ) -> FrozenJsonObject:
         del request_sensitivity
         if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.validate_effect(session, call)
+            self._learning.validate_effect(session, call, arguments)
         if capability.id == SKILL_VIEW_CAPABILITY_ID:
             name = arguments.get("name")
             try:

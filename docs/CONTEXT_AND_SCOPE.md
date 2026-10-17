@@ -141,6 +141,20 @@ The explicit `files_only=True` option excludes both catalog and MCP operations.
 Machine runs use their frozen authorization ceilings; an empty machine source
 ceiling means no sources.
 
+Inside a run the model can name earlier results and scoped sources by short
+run-local handles. The transcript keeps the model's text as written, so its
+tool-call arguments may contain those handles. Use `agent.tool_evidence(run_id)`
+when you need each call as it executed. It returns `(call, result)` pairs whose
+arguments have the handles resolved to full IDs, keeping the tool's own shape,
+with the same resolver the runtime used. Approvals and receipts match these
+calls. A call that never resolved, such as one rejected for a bad reference,
+appears as the model wrote it.
+
+```python
+for call, result in await agent.tool_evidence(result.run_id):
+    print(call.name, dict(call.arguments), result is not None and result.is_error)
+```
+
 Conversation continuity is shared across sources and stays bounded. Private
 answers retain their classification when summarized, when a later question
 narrows its source filter, and after a source is detached or the agent reopens.

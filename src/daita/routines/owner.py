@@ -1380,23 +1380,24 @@ class RoutineOwner:
             ) from error
         capabilities = self._require_capability_registry()
         executed: set[str] = set()
-        for message in transcript.messages:
-            for call in message.tool_calls:
-                if _contains_reference_marker(call.arguments):
-                    raise RoutineError(
-                        "routine_basis_run_has_tool_ref",
-                        "The basis run used a run-bound tool reference.",
-                    )
-                if call.name in RESERVED_TOOL_NAMES:
-                    continue
-                try:
-                    capability = capabilities.call_capability(call.name, call.arguments)
-                except KeyError as error:
-                    raise RoutineError(
-                        "routine_basis_lineage_unknown",
-                        "The basis run contains unknown capability lineage.",
-                    ) from error
-                executed.add(capability.id)
+        # Lineage reads each call as it executed: run-scoped refs and handles
+        # are replaced by the identities they named in the basis run.
+        for call, _ in capabilities.executed_tool_pairs(transcript):
+            if _contains_reference_marker(call.arguments):
+                raise RoutineError(
+                    "routine_basis_run_has_tool_ref",
+                    "The basis run used a run-bound tool reference.",
+                )
+            if call.name in RESERVED_TOOL_NAMES:
+                continue
+            try:
+                capability = capabilities.call_capability(call.name, call.arguments)
+            except KeyError as error:
+                raise RoutineError(
+                    "routine_basis_lineage_unknown",
+                    "The basis run contains unknown capability lineage.",
+                ) from error
+            executed.add(capability.id)
         if not executed or not executed <= set(allowed_capability_ids):
             raise RoutineError(
                 "routine_basis_lineage_outside_scope",

@@ -2562,3 +2562,167 @@ def test_effect_receipts_have_no_textual_user_surface():
     assert "list_effects" not in controller
     assert "inspect_effect" not in controller
     assert "resolve_effect" not in controller
+
+
+# Owners that need the model's exact call text: the loop, current-run context
+# replay, provider adapters, durable codecs and migrations, and the registry
+# and runtime that resolve it. Every other production reader of a run's calls
+# reads CapabilityRegistry.executed_tool_pairs (or executed_messages).
+_RAW_TOOL_CALL_OWNERS = (
+    "loop/",
+    "llm/",
+    "context.py",
+    "capabilities.py",
+    "capability_runtime.py",
+    "storage/sqlite_codecs/",
+    "storage/home_migrations/",
+)
+# Functions that serialize messages already derived from executed records.
+_EXECUTED_MESSAGE_SERIALIZERS = {("learning_candidates.py", "_message_mapping")}
+_CALL_IDENTITY_ATTRIBUTES = {"id", "name"}
+
+
+def _raw_tool_call_reads(relative: str, tree: ast.Module) -> list[str]:
+    """Find raw transcript calls whose content escapes beyond their identity.
+
+    A loop over ``.tool_calls`` or ``.tool_pairs`` may read a call's ``id`` and
+    ``name``; reading ``.arguments``, passing or storing the call, or handing
+    ``.tool_pairs`` itself to other code treats the model's raw text as the
+    executed call.
+    """
+
+    parents: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def enclosing_function(node: ast.AST) -> str | None:
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return node.name
+        return None
+
+    def is_raw(node: ast.AST) -> bool:
+        return isinstance(node, ast.Attribute) and node.attr in {
+            "tool_calls",
+            "tool_pairs",
+        }
+
+    def call_name(target: ast.AST, iterated: ast.Attribute) -> str | None:
+        if isinstance(target, ast.Name):
+            return target.id
+        if (
+            iterated.attr == "tool_pairs"
+            and isinstance(target, ast.Tuple)
+            and target.elts
+            and isinstance(target.elts[0], ast.Name)
+        ):
+            return target.elts[0].id
+        return None
+
+    def escapes(scopes: list[ast.AST], name: str) -> list[int]:
+        lines = []
+        for scope in scopes:
+            for node in ast.walk(scope):
+                if not (
+                    isinstance(node, ast.Name)
+                    and node.id == name
+                    and isinstance(node.ctx, ast.Load)
+                ):
+                    continue
+                parent = parents.get(node)
+                if (
+                    isinstance(parent, ast.Attribute)
+                    and parent.attr in _CALL_IDENTITY_ATTRIBUTES
+                ):
+                    continue
+                lines.append(node.lineno)
+        return lines
+
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if (relative, enclosing_function(node)) in _EXECUTED_MESSAGE_SERIALIZERS:
+            continue
+        loops: list[tuple[ast.AST, ast.AST, list[ast.AST]]] = []
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            loops.append((node.target, node.iter, [*node.body, *node.orelse]))
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+            for generator in node.generators:
+                loops.append(
+                    (
+                        generator.target,
+                        generator.iter,
+                        [node.elt, *(item for g in node.generators for item in g.ifs)],
+                    )
+                )
+        elif isinstance(node, ast.DictComp):
+            for generator in node.generators:
+                loops.append(
+                    (
+                        generator.target,
+                        generator.iter,
+                        [
+                            node.key,
+                            node.value,
+                            *(item for g in node.generators for item in g.ifs),
+                        ],
+                    )
+                )
+        for target, iterated, scopes in loops:
+            if not is_raw(iterated):
+                continue
+            assert isinstance(iterated, ast.Attribute)
+            name = call_name(target, iterated)
+            if name is None:
+                continue
+            found.extend(f"{relative}:{line}" for line in escapes(scopes, name))
+        if (
+            is_raw(node)
+            and isinstance(node, ast.Attribute)
+            and node.attr == "tool_pairs"
+            and not any(
+                isinstance(parent, (ast.For, ast.AsyncFor, ast.comprehension))
+                and parent.iter is node
+                for parent in (parents.get(node),)
+            )
+        ):
+            found.append(f"{relative}:{node.lineno}")
+    return found
+
+
+def test_transcript_call_readers_use_the_executed_record():
+    found: list[str] = []
+    for path in sorted(PACKAGE.rglob("*.py")):
+        relative = path.relative_to(PACKAGE).as_posix()
+        if relative.startswith(_RAW_TOOL_CALL_OWNERS):
+            continue
+        found.extend(_raw_tool_call_reads(relative, _tree(path)))
+    assert found == []
+
+
+def test_raw_tool_call_detector_catches_each_raw_reader_form():
+    sources = {
+        "argument read": (
+            "for message in transcript.messages:\n"
+            "    for call in message.tool_calls:\n"
+            "        call.arguments\n"
+        ),
+        "comprehension read": (
+            "{c.arguments.get('name') for m in t.messages for c in m.tool_calls}\n"
+        ),
+        "stored call": "{c.id: c for m in t.messages for c in m.tool_calls}\n",
+        "passed call": "[target(c) for m in t.messages for c in m.tool_calls]\n",
+        "pair read": "for call, _ in transcript.tool_pairs:\n    call.arguments\n",
+        "pairs handed on": "show(transcript.tool_pairs)\n",
+    }
+    for label, source in sources.items():
+        assert _raw_tool_call_reads("reader.py", ast.parse(source)), label
+    identity_only = (
+        "{c.id for m in t.messages for c in m.tool_calls}\n"
+        "for call, result in transcript.tool_pairs:\n"
+        "    (call.id, call.name, result)\n"
+        "for call, _ in registry.executed_tool_pairs(transcript):\n"
+        "    call.arguments\n"
+    )
+    assert _raw_tool_call_reads("reader.py", ast.parse(identity_only)) == []

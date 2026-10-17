@@ -31,13 +31,14 @@ from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
     ModelRequest,
+    ModelSensitivity,
     ToolCall,
     ToolResultBlock,
     model_tool_result,
 )
 from daita.llm.providers.anthropic.messages import _message_input
 from daita.llm.providers.openai.messages import _response_input
-from daita.loop.models import RunInput
+from daita.loop.models import RunInput, Transcript
 from daita.scope import EffectiveSourceScope, scope_refs
 from tests.capabilities._effect_receipt_support import STARTED_AT, _store
 from tests.support.capability_runtime import (
@@ -547,3 +548,199 @@ async def test_routine_save_persists_full_ids_named_by_handles(tmp_path: Path) -
         assert '"s1"' not in approved and '"t1"' not in approved
     finally:
         await agent.close()
+
+
+class _Citer:
+    executor_id = "test.scope.cite.executor"
+
+    def __init__(self) -> None:
+        self.requests: list[ToolExecution] = []
+
+    async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
+        return FrozenJsonObject.from_mapping({"current": True})
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        self.requests.append(request)
+        payload = FrozenJsonObject.from_mapping(
+            {
+                "source_id": request.arguments["source_id"],
+                "resource_ids": request.arguments["resource_ids"],
+            }
+        )
+        return ToolOutput(
+            kind="test.scope.write",
+            data=payload,
+            effect_observation=EffectObservation(
+                EffectOutcome.SUCCEEDED, EffectEvidenceBasis.SERVER_REPORTED, payload
+            ),
+        )
+
+
+async def test_executed_record_is_exactly_what_execution_approval_and_receipt_saw(
+    tmp_path,
+):
+    """One resolver derives the executed record every reader shares.
+
+    A call naming a result ref and run-scoped handles is persisted as the model
+    sent it; the registry's executed record of that persisted call equals the
+    executor's request, the approval request and the receipt payload.
+    """
+
+    store = await _store(tmp_path / "state.db")
+    read = Capability(
+        id="test.scope.read",
+        description="Read one exact source.",
+        input_schema=_IDENTITY_INPUT,
+        output_kind="test.scope.output",
+        output_schema=_OK_OUTPUT,
+        executor_id="test.scope.read.executor",
+        access_mode=AccessMode.READ,
+    )
+    cite_input = {
+        "type": "object",
+        "properties": {
+            "source_id": source_id_schema(),
+            "resource_ids": {
+                "type": "array",
+                "items": resource_id_schema(),
+                "minItems": 1,
+                "maxItems": 4,
+            },
+            "evidence_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 2,
+            },
+        },
+        "required": ["source_id", "resource_ids", "evidence_refs"],
+        "additionalProperties": False,
+    }
+    cite = Capability(
+        id="test.scope.cite",
+        description="Act on one exact source citing earlier evidence.",
+        input_schema=cite_input,
+        output_kind="test.scope.write",
+        output_schema=_IDENTITY_INPUT,
+        executor_id=_Citer.executor_id,
+        access_mode=AccessMode.NONE,
+        operational_effect=OperationalEffect.EXTERNAL_ACTION,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+        effect_receipt_policy=EffectReceiptPolicy(
+            "test.scope.cite", _IDENTITY_INPUT, EffectEvidenceBasis.SERVER_REPORTED
+        ),
+        result_ref_arguments=("evidence_refs[]",),
+    )
+    views = tuple(
+        ToolView(
+            name=capability.id.rsplit(".", 1)[1],
+            capability_id=capability.id,
+            description=capability.description,
+            presentation=presentation_metadata(
+                load_mode=(
+                    ToolLoadMode.ON_DEMAND
+                    if capability.operational_effect is not OperationalEffect.NONE
+                    else ToolLoadMode.PINNED
+                )
+            ),
+        )
+        for capability in (read, cite)
+    )
+    domain = StaticTestDomain((read, cite), views)
+    reader = _Recorder(read.executor_id)
+    citer = _Citer()
+    registry = static_registry(domain, (reader, citer))
+    approvals: list[ApprovalRequest] = []
+
+    async def approve(request: ApprovalRequest) -> ApprovalDecision:
+        approvals.append(request)
+        return ApprovalDecision.APPROVE
+
+    async def resolve_scope(run: RunInput) -> EffectiveSourceScope:
+        return SCOPE
+
+    runtime = CapabilityRuntime(
+        registry,
+        (domain,),
+        effect_receipts=store,
+        approval_handler=approve,
+        clock=lambda: STARTED_AT,
+        source_scope_resolver=resolve_scope,
+    )
+    run = await runtime.freeze_source_scope(_RUN)
+    assert run.resolved_source_scope == SCOPE
+    load = ToolCall("load", "toolbox_load", {"tool_names": ("cite",)})
+    sent_read = ToolCall("read", "read", {"source_id": "s2", "resource_ids": ("t3",)})
+    # The control result is numbered r1 but is not citable; the read is r2.
+    sent_cite = ToolCall(
+        "cite",
+        "cite",
+        {
+            "source_id": "s1",
+            "resource_ids": ("t2", RESOURCE_A),
+            "evidence_refs": ("r2",),
+        },
+    )
+    try:
+        catalog = await runtime.prepare_run(run)
+        messages: tuple[CanonicalMessage, ...] = (run.start_message(),)
+        for call in (load, sent_read, sent_cite):
+            outcome = await runtime.execute_all(
+                run,
+                (call,),
+                projection=runtime.project(catalog, messages),
+                messages=messages,
+                sensitivity=ModelSensitivity.INTERNAL,
+            )
+            messages = (
+                *messages,
+                CanonicalMessage(MessageRole.ASSISTANT, tool_calls=(call,)),
+                CanonicalMessage(MessageRole.TOOL, content=outcome.ordered_results),
+            )
+        transcript = Transcript(run, messages)
+        results = [result for _, result in transcript.tool_pairs]
+        assert all(result is not None and not result.is_error for result in results)
+
+        load_pair, read_pair, cite_pair = registry.executed_tool_pairs(transcript)
+        assert [load_pair[1], read_pair[1], cite_pair[1]] == results
+        assert load_pair[0] == load
+        assert read_pair[0].arguments == reader.requests[0].arguments
+        assert read_pair[0].arguments == _frozen(
+            {"source_id": SOURCE_B, "resource_ids": (RESOURCE_C,)}
+        )
+        executed = cite_pair[0].arguments
+        assert executed == _frozen(
+            {
+                "source_id": SOURCE_A,
+                "resource_ids": (RESOURCE_B, RESOURCE_A),
+                "evidence_refs": ("read",),
+            }
+        )
+        assert executed == citer.requests[0].arguments
+        assert [request.arguments for request in approvals] == [executed]
+        (receipt,) = await store.list_effect_receipts("agent-effect")
+        assert (receipt.run_id, receipt.call_id) == (run.id, cite_pair[0].id)
+        assert receipt.payload == _frozen(
+            {"source_id": SOURCE_A, "resource_ids": (RESOURCE_B, RESOURCE_A)}
+        )
+        # The transcript keeps the model's exact text for provider replay.
+        assert [call for call, _ in transcript.tool_pairs] == [
+            load,
+            sent_read,
+            sent_cite,
+        ]
+
+        # A call that never resolved failed before execution and is unchanged.
+        unissued = ToolCall(
+            "unissued", "read", {"source_id": "s9", "resource_ids": ("t1",)}
+        )
+        assert (
+            registry.executed_call(unissued, messages=messages, source_scope=SCOPE)
+            == unissued
+        )
+        unknown = ToolCall("unknown", "not_a_tool", {"source_id": "s1"})
+        assert (
+            registry.executed_call(unknown, messages=(), source_scope=SCOPE) == unknown
+        )
+    finally:
+        await store.close()

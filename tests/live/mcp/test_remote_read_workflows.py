@@ -126,10 +126,7 @@ async def test_real_remote_natural_reads_reuse_session_restart_and_answer_follow
             validate_completed_transcript(capture.transcript, capture.result)
             assert_on_demand_invocation(capture, tool.local_name)
             calls = [
-                call
-                for message in capture.transcript.messages
-                for call in message.tool_calls
-                if call.name == tool.local_name
+                call for call, _ in capture.evidence if call.name == tool.local_name
             ]
             assert len(calls) == 1
             assert all(

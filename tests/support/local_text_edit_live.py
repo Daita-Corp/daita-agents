@@ -29,7 +29,6 @@ from daita.llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResul
 from daita.llm.protocols import ManagedModelProvider
 from daita.loop.models import (
     LoopExitKind,
-    Transcript,
     validate_completed_transcript,
 )
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
@@ -112,18 +111,13 @@ def _limits() -> LoopLimits:
 
 
 def _successful_exchanges(
-    transcript: Transcript,
+    evidence: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
 ) -> tuple[tuple[ToolCall, ToolResultBlock], ...]:
-    calls = {
-        call.id: call for message in transcript.messages for call in message.tool_calls
-    }
+    # Executed calls from Agent.tool_evidence, with their successful results.
     return tuple(
-        (calls[block.call_id], block)
-        for message in transcript.messages
-        for block in message.content
-        if isinstance(block, ToolResultBlock)
-        and block.call_id in calls
-        and not block.is_error
+        (call, block)
+        for call, block in evidence
+        if block is not None and not block.is_error
     )
 
 
@@ -167,9 +161,11 @@ async def run_live_text_edit_scenario(
     )
     result = None
     transcript = None
+    evidence = None
     try:
         result = await agent.run(_PROMPT)
         transcript = await agent.transcript(result.run_id)
+        evidence = await agent.tool_evidence(result.run_id)
     finally:
         try:
             await agent.close()
@@ -233,7 +229,7 @@ async def run_live_text_edit_scenario(
                     json.dumps(report, indent=2) + "\n"
                 )
 
-    assert result is not None and transcript is not None
+    assert result is not None and transcript is not None and evidence is not None
     assert result.kind is LoopExitKind.COMPLETED, (
         result.reason,
         result.usage.cost_estimate.code,
@@ -244,7 +240,7 @@ async def run_live_text_edit_scenario(
     assert "45" in result.final_text
     assert _MARKER in result.final_text
 
-    exchanges = _successful_exchanges(transcript)
+    exchanges = _successful_exchanges(evidence)
     workflow = tuple(
         item
         for item in exchanges

@@ -1001,6 +1001,23 @@ class CapabilityRuntime:
             max_calls_per_occurrence=max_calls_per_occurrence,
         )
 
+    async def freeze_source_scope(self, run: RunInput) -> RunInput:
+        """Return ``run`` with its effective source scope resolved before it starts.
+
+        A machine run's transcript then records the same frozen scope its
+        source and resource handles are numbered from, as a foreground run's
+        does, so its executed calls stay derivable from persisted facts.
+        Preparation re-resolves against this scope and can only narrow it.
+        """
+
+        if not isinstance(run, RunInput):
+            raise TypeError("run must be RunInput")
+        if self._source_scope_resolver is None:
+            return run
+        return replace(
+            run, resolved_source_scope=await self._source_scope_resolver(run)
+        )
+
     async def execute_internal(
         self,
         request: InternalCapabilityRequest,
@@ -2556,10 +2573,14 @@ class CapabilityRuntime:
                 capability.id,
                 domain.normalize_arguments(
                     capability,
-                    self._registry.resolve_scope_refs(
-                        capability,
-                        self._registry.target_arguments(call.name, call.arguments),
-                        run.resolved_source_scope,
+                    self._registry.target_arguments(
+                        call.name,
+                        self._registry.resolve_call(
+                            call,
+                            capability=capability,
+                            result_refs=None,
+                            source_scope=run.resolved_source_scope,
+                        ).arguments,
                     ),
                 ),
             )
@@ -3189,14 +3210,16 @@ class CapabilityRuntime:
             await self._validate_execution_contracts(run)
             domain = self._domains[owner_id]
             if validated_arguments is None:
+                # The same resolver derives every reader's executed record
+                # (CapabilityRegistry.executed_tool_pairs) from the transcript.
                 raw_arguments = domain.normalize_arguments(
                     capability,
-                    self._registry.resolve_call_refs(
-                        capability,
-                        call.arguments,
+                    self._registry.resolve_call(
+                        call,
+                        capability=capability,
                         result_refs=result_refs,
                         source_scope=run.resolved_source_scope,
-                    ),
+                    ).arguments,
                 )
                 arguments = await self._registry.validate_arguments_async(
                     capability.id,

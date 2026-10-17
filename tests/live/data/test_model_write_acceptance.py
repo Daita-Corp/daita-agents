@@ -162,8 +162,12 @@ async def test_live_ambiguous_company_then_user_clarifies(database, scenario_fac
             "", user_prompt="Rename Shared Company to Updated in our companies table."
         )
         scenario.assert_completed_runs()
-        assert not calls_for(transcript, "data_update_rows", "apply")
-        assert not calls_for(transcript, "data_upsert_rows", "apply")
+        assert not calls_for(
+            scenario.evidence[transcript.run.id], "data_update_rows", "apply"
+        )
+        assert not calls_for(
+            scenario.evidence[transcript.run.id], "data_upsert_rows", "apply"
+        )
         assert not scenario.approvals and not await scenario.agent.list_effects()
         assert await database.rows() == original
         assert database.probe.mutations == database.probe.commit_attempts == 0
@@ -272,7 +276,16 @@ async def test_live_write_denial_preserves_database(database, scenario_factory, 
             assert (
                 len(scenario.approvals) == 1 and not scenario.approvals[0]["approved"]
             )
-            assert len(calls_for(transcript, "data_upsert_rows", "apply")) == 1
+            assert (
+                len(
+                    calls_for(
+                        scenario.evidence[transcript.run.id],
+                        "data_upsert_rows",
+                        "apply",
+                    )
+                )
+                == 1
+            )
         scenario.stages.append(denial)
         scenario.assert_report(result, "not_applied")
 
@@ -298,7 +311,14 @@ async def test_live_drift_during_approval_does_not_reapply(database, scenario_fa
         # Post-approval drift is final for the request in both profiles: the
         # framework recovery says stop and report, so the user_flow prompt
         # needs no stop rule and the model never re-previews or re-applies.
-        assert len(calls_for(transcript, "data_update_rows", "apply")) == 1
+        assert (
+            len(
+                calls_for(
+                    scenario.evidence[transcript.run.id], "data_update_rows", "apply"
+                )
+            )
+            == 1
+        )
         assert len(scenario.approvals) == 1
         errors = [
             block.output.get("error")
@@ -604,13 +624,17 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
             scenario.stages.append("model_authored_assignment_saved_with_exact_grant")
         immediate, immediate_transcript = await scenario.scheduled_result(1)
         scenario.assert_report(immediate, "succeeded", (1, 0, 0))
-        immediate_call = assert_preview_binding(immediate_transcript)
+        immediate_call = assert_preview_binding(
+            scenario.evidence[immediate_transcript.run.id]
+        )
         scenario.stages.append("immediate_report_and_preview_binding_verified")
         scenario.clock = NEXT_SLOT
         scenario.agent._embedded._routine_supervisor.wake()
         weekly, weekly_transcript = await scenario.scheduled_result(2)
         scenario.assert_report(weekly, "succeeded", (0, 0, 1))
-        weekly_call = assert_preview_binding(weekly_transcript)
+        weekly_call = assert_preview_binding(
+            scenario.evidence[weekly_transcript.run.id]
+        )
         scenario.stages.append("weekly_report_and_preview_binding_verified")
         receipts = await scenario.agent.list_effects()
         assert len(receipts) == 2

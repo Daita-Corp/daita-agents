@@ -697,6 +697,6 @@ async def test_paired_python_relational_reads_preserve_independent_oracle(
     assert children, "Correctness requires current authenticated Python child reads"
     assert any(
         f"tools.{method}" in str(call.arguments.get("code", ""))
-        for call, _ in capture.transcript.tool_pairs
+        for call, _ in capture.evidence
         if call.name == "python_execute"
     )

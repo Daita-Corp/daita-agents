@@ -169,26 +169,19 @@ def _database(path: Path) -> None:
 
 
 def _exchanges(
-    transcript: Transcript,
+    evidence: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
 ) -> tuple[tuple[ToolCall, ToolResultBlock], ...]:
-    calls = {
-        call.id: call for message in transcript.messages for call in message.tool_calls
-    }
-    return tuple(
-        (calls[block.call_id], block)
-        for message in transcript.messages
-        for block in message.content
-        if isinstance(block, ToolResultBlock) and block.call_id in calls
-    )
+    # Executed calls from Agent.tool_evidence, with their results.
+    return tuple((call, block) for call, block in evidence if block is not None)
 
 
 def _successful(
-    transcript: Transcript,
+    evidence: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
     tool_name: str,
 ) -> tuple[tuple[ToolCall, ToolResultBlock], ...]:
     return tuple(
         (call, result)
-        for call, result in _exchanges(transcript)
+        for call, result in _exchanges(evidence)
         if call.name == tool_name and not result.is_error
     )
 
@@ -249,6 +242,7 @@ async def test_live_files_only_ignores_connected_source_and_reads_forecast(
             files_only=True,
         )
         transcript = await agent.transcript(result.run_id)
+        evidence = await agent.tool_evidence(result.run_id)
     finally:
         try:
             await agent.close()
@@ -260,7 +254,7 @@ async def test_live_files_only_ignores_connected_source_and_reads_forecast(
     assert _FILES_TOKEN in result.final_text
     assert "91" in result.final_text
     assert _SOURCE_EXCLUSION_TOKEN not in result.final_text
-    names = tuple(call.name for call, _block in _exchanges(transcript))
+    names = tuple(call.name for call, _block in _exchanges(evidence))
     assert names and names[0] == "file_search"
     assert "file_read" in names
     assert not any(
@@ -309,6 +303,7 @@ async def test_live_mixed_file_source_comparison_uses_separate_queries(
             source_scope_ids=(source.id,),
         )
         transcript = await agent.transcript(result.run_id)
+        evidence = await agent.tool_evidence(result.run_id)
     finally:
         try:
             await agent.close()
@@ -321,7 +316,7 @@ async def test_live_mixed_file_source_comparison_uses_separate_queries(
         token in result.final_text
         for token in (_MIXED_FILE_TOKEN, _MIXED_SOURCE_TOKEN, "15", "20", "2", "1")
     )
-    exchanges = _exchanges(transcript)
+    exchanges = _exchanges(evidence)
     names = tuple(call.name for call, _block in exchanges)
     assert (
         names.index("toolbox_search")
@@ -329,8 +324,8 @@ async def test_live_mixed_file_source_comparison_uses_separate_queries(
         < names.index("file_query")
     )
     assert names.index("catalog_describe") < names.index("data_query")
-    file_call, file_result = _successful(transcript, "file_query")[-1]
-    source_call, source_result = _successful(transcript, "data_query")[-1]
+    file_call, file_result = _successful(evidence, "file_query")[-1]
+    source_call, source_result = _successful(evidence, "data_query")[-1]
     assert file_call.arguments["path_pattern"] == "sales.csv"
     assert "customers" not in str(file_call.arguments["sql"])
     assert "sales.csv" not in str(source_call.arguments["sql"])
@@ -370,6 +365,7 @@ async def test_live_markdown_report_is_created_then_saved_with_receipt(
             "default destination. Claim it was saved only after a successful receipt."
         )
         transcript = await agent.transcript(result.run_id)
+        evidence = await agent.tool_evidence(result.run_id)
     finally:
         try:
             await agent.close()
@@ -378,7 +374,7 @@ async def test_live_markdown_report_is_created_then_saved_with_receipt(
 
     _assert_completed(result, transcript, provider, workspace.root)
     assert result.final_text is not None
-    exchanges = _exchanges(transcript)
+    exchanges = _exchanges(evidence)
     names = tuple(call.name for call, _block in exchanges)
     assert names.index("toolbox_load") < names.index("artifact_create")
     assert names.index("artifact_create") < names.index("artifact_save_local")
@@ -395,7 +391,7 @@ async def test_live_markdown_report_is_created_then_saved_with_receipt(
     assert saved.name == "phase5-report.md"
     content = saved.read_text(encoding="utf-8")
     assert all(token in content for token in (_REPORT_TOKEN, "15", "20"))
-    save_result = _successful(transcript, "artifact_save_local")[-1][1]
+    save_result = _successful(evidence, "artifact_save_local")[-1][1]
     save_data = _mapping(save_result.output.get("data"), "artifact save data")
     assert save_data["outcome"] == "succeeded"
     assert save_data["artifact_id"] == artifact.artifact_id

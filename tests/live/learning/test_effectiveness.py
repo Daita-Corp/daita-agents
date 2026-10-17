@@ -32,7 +32,6 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.loop.models import Transcript
 from daita.observation import AgentEvent
 from daita.security import EnvironmentSecretProvider, SecretReference
 from tests.support.learning_evaluation import (
@@ -101,41 +100,25 @@ def _text(messages: Sequence[CanonicalMessage]) -> str:
     )
 
 
-def _tool_calls(transcript: Transcript, name: str) -> tuple[ToolCall, ...]:
-    return tuple(
-        call
-        for message in transcript.messages
-        for call in message.tool_calls
-        if call.name == name
-    )
+ToolEvidence = tuple[tuple[ToolCall, ToolResultBlock | None], ...]
 
 
-def _tool_results(transcript: Transcript) -> dict[str, ToolResultBlock]:
-    return {
-        block.call_id: block
-        for message in transcript.messages
-        for block in message.content
-        if isinstance(block, ToolResultBlock)
-    }
-
-
-def _successful_sql_call(transcript: Transcript) -> ToolCall | None:
-    results = _tool_results(transcript)
-    for call in reversed(_tool_calls(transcript, "data_query")):
-        result = results.get(call.id)
-        if result is not None and not result.is_error:
+def _successful_sql_call(evidence: ToolEvidence) -> ToolCall | None:
+    # Executed calls from Agent.tool_evidence, never the raw model text.
+    for call, result in reversed(evidence):
+        if call.name == "data_query" and result is not None and not result.is_error:
             return call
     return None
 
 
 def _paid_margin_judgment(
-    transcript: Transcript,
+    evidence: ToolEvidence,
     *,
     final_text: str | None,
     source_id: str,
     definition_recalled: bool,
 ) -> BenchmarkJudgment:
-    call = _successful_sql_call(transcript)
+    call = _successful_sql_call(evidence)
     arguments = {} if call is None else call.arguments
     sql_value = arguments.get("sql")
     sql = sql_value.casefold() if isinstance(sql_value, str) else ""
@@ -273,7 +256,7 @@ async def test_live_fixture_baseline_teaching_and_learned_report(tmp_path: Path)
                 source_scope_ids=(source.id,),
             )
             baseline_events = tuple(events[baseline_start:])
-            baseline_transcript = await agent.transcript(baseline_exit.run_id)
+            baseline_evidence = await agent.tool_evidence(baseline_exit.run_id)
 
             teaching_start = len(events)
             teaching_exit = await agent.learn(
@@ -312,7 +295,7 @@ async def test_live_fixture_baseline_teaching_and_learned_report(tmp_path: Path)
                 "margin by region and currency. Keep currencies separate.",
                 source_scope_ids=(source.id,),
             )
-            learned_transcript = await reopened.transcript(learned_exit.run_id)
+            learned_evidence = await reopened.tool_evidence(learned_exit.run_id)
             learned_events = tuple(events[teaching_start:])
             learned_requests = provider.requests[learned_request_start:]
             learned_request_text = "\n".join(
@@ -327,13 +310,13 @@ async def test_live_fixture_baseline_teaching_and_learned_report(tmp_path: Path)
     _require_completed_phase("teaching", teaching_exit)
     _require_completed_phase("learned", learned_exit)
     baseline_judgment = _paid_margin_judgment(
-        baseline_transcript,
+        baseline_evidence,
         final_text=baseline_exit.final_text,
         source_id=source.id,
         definition_recalled=False,
     )
     learned_judgment = _paid_margin_judgment(
-        learned_transcript,
+        learned_evidence,
         final_text=learned_exit.final_text,
         source_id=source.id,
         definition_recalled=recalled,

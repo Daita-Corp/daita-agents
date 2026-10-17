@@ -6,13 +6,13 @@ import json
 import math
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
 from types import MappingProxyType
-from typing import Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 from ._json import FrozenJsonObject, canonical_json
 from ._json_schema import project_json_schema, validate_json_schema_value
@@ -20,7 +20,9 @@ from .artifacts.models import ArtifactAuthorship, ArtifactDraft
 from .llm.models import (
     CanonicalMessage,
     ModelSensitivity,
+    ToolCall,
     ToolDefinition,
+    ToolResultBlock,
     ToolResultRefs,
     tool_result_refs,
 )
@@ -31,6 +33,9 @@ from .scope import (
     ScopeRefs,
     scope_refs,
 )
+
+if TYPE_CHECKING:
+    from .loop.models import Transcript
 
 _T = TypeVar("_T")
 
@@ -2469,46 +2474,122 @@ class CapabilityRegistry:
             view, self.call_capability(name, arguments), arguments
         )
 
-    def resolved_call_arguments(
+    def resolve_call(
         self,
-        name: str,
-        arguments: Mapping[str, object],
-        messages: tuple[CanonicalMessage, ...],
-        source_scope: EffectiveSourceScope | None = None,
-    ) -> Mapping[str, object]:
-        """Return the arguments one persisted current-run call executed with.
-
-        This removes a mode selector and resolves declared result_ref values
-        against the same current-run transcript the runtime numbered, and
-        source/resource handles against the run's frozen ``source_scope``.
-        """
-
-        return self.resolve_call_refs(
-            self.call_capability(name, arguments),
-            self.target_arguments(name, arguments),
-            result_refs=tool_result_refs(
-                messages, uncitable_tool_names=RESERVED_TOOL_NAMES
-            ),
-            source_scope=source_scope,
-        )
-
-    def resolve_call_refs(
-        self,
-        capability: Capability,
-        arguments: Mapping[str, object],
+        call: ToolCall,
         *,
         result_refs: ToolResultRefs | None,
         source_scope: EffectiveSourceScope | None,
-    ) -> Mapping[str, object]:
-        """Replace every run-scoped handle in one call with the identity it names.
+        capability: Capability | None = None,
+    ) -> ToolCall:
+        """Return one call with every run-scoped handle replaced; the sole resolver.
 
-        Result refs become call IDs; source and resource handles, including those
-        inside delegated arguments or grant constraints, become full IDs. The
-        stored transcript keeps the call exactly as the model sent it.
+        Result refs become the call IDs they name; source and resource handles,
+        including those inside delegated arguments or grant constraints, become
+        full IDs. Without ``capability``, unset nulls are dropped as the runtime
+        drops them and the call's mode selects its capability; a mode selector
+        stays, so the result keeps the tool-level shape the model called.
+        ``capability`` is the route the runtime already selected for an
+        already-routed call. Unknown tools or modes raise ``KeyError`` and
+        invalid refs raise ``CapabilityInputError``. The stored transcript
+        keeps the call exactly as the model sent it.
         """
 
+        arguments: Mapping[str, object] = call.arguments
+        if capability is None:
+            arguments = omit_unset_arguments(
+                arguments,
+                tuple(
+                    self._capabilities[capability_id].input_schema
+                    for capability_id in self.tool_capability_ids(call.name)
+                ),
+            )
+            capability = self.call_capability(call.name, arguments)
         resolved = resolve_result_refs(capability, arguments, result_refs)
-        return self.resolve_scope_refs(capability, resolved, source_scope)
+        resolved = self.resolve_scope_refs(capability, resolved, source_scope)
+        if resolved is call.arguments:
+            return call
+        return replace(call, arguments=resolved)
+
+    def executed_call(
+        self,
+        call: ToolCall,
+        *,
+        messages: tuple[CanonicalMessage, ...],
+        source_scope: EffectiveSourceScope | None,
+        capability: Capability | None = None,
+    ) -> ToolCall:
+        """Return the call one persisted current-run model call executed as.
+
+        ``messages`` are the current-run messages before the call's assistant
+        message, which the runtime numbered result refs from, and
+        ``source_scope`` is the run's frozen effective scope. ``capability``
+        names the route of a call the runtime already routed. A call that never
+        routed or never resolved (an unknown tool, mode or ref) failed before
+        execution and is returned unchanged.
+        """
+
+        try:
+            return self.resolve_call(
+                call,
+                result_refs=tool_result_refs(
+                    messages, uncitable_tool_names=RESERVED_TOOL_NAMES
+                ),
+                source_scope=source_scope,
+                capability=capability,
+            )
+        except (KeyError, CapabilityInputError):
+            return call
+
+    def executed_messages(
+        self,
+        transcript: Transcript,
+        *,
+        source_scope: EffectiveSourceScope | None = None,
+    ) -> tuple[CanonicalMessage, ...]:
+        """Return a transcript's messages with each tool call as it executed.
+
+        Handles resolve against ``source_scope``, by default the transcript's
+        own frozen scope. The stored transcript is unchanged; only the current
+        run's provider replay needs the model's raw call text.
+        """
+
+        scope = (
+            transcript.run.resolved_source_scope
+            if source_scope is None
+            else source_scope
+        )
+        messages = transcript.messages
+        executed: list[CanonicalMessage] = []
+        for index, message in enumerate(messages):
+            calls = tuple(
+                self.executed_call(call, messages=messages[:index], source_scope=scope)
+                for call in message.tool_calls
+            )
+            executed.append(
+                message
+                if calls == message.tool_calls
+                else replace(message, tool_calls=calls)
+            )
+        return tuple(executed)
+
+    def executed_tool_pairs(
+        self,
+        transcript: Transcript,
+        *,
+        source_scope: EffectiveSourceScope | None = None,
+    ) -> tuple[tuple[ToolCall, ToolResultBlock | None], ...]:
+        """Return ``transcript.tool_pairs`` with each call as it executed.
+
+        This is the one record of what a run's calls did. Readers of evidence,
+        approvals, receipts, learning and presentation use it rather than the
+        model's raw call text.
+        """
+
+        return replace(
+            transcript,
+            messages=self.executed_messages(transcript, source_scope=source_scope),
+        ).tool_pairs
 
     def resolve_scope_refs(
         self,

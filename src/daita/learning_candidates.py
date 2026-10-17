@@ -12,7 +12,7 @@ from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 from ._json import FrozenJsonObject, canonical_json
 from .catalog.models import CatalogResource
@@ -57,6 +57,9 @@ from .semantics import (
     semantic_duplicate_identity,
 )
 from .skills import Skill, SkillStore, validate_skill_name
+
+if TYPE_CHECKING:
+    from .capabilities import CapabilityRegistry
 
 LEARNING_CANDIDATE_MAX_RECORDS = 64
 LEARNING_REVIEW_MAX_RUNS = 8
@@ -789,6 +792,8 @@ class _ArtifactState:
 class _ProjectedRun:
     record: ConversationRun
     messages: tuple[CanonicalMessage, ...]
+    # Every call in the run as it executed, never its run-local handle text.
+    calls: tuple[ToolCall, ...]
     reference: LearningCandidateRunReference
     catalog_revisions: tuple[ResourceRevisionBinding, ...]
     catalog_state_sha256: str
@@ -860,6 +865,36 @@ class OneShotCandidateReviewer:
         self._clock = clock
         self._review_lock = asyncio.Lock()
         self._closed = False
+        self._capabilities: CapabilityRegistry | None = None
+
+    def bind_capability_registry(self, capabilities: CapabilityRegistry) -> None:
+        """Bind the registry that derives each reviewed call's executed record."""
+
+        from .capabilities import CapabilityRegistry
+
+        if not isinstance(capabilities, CapabilityRegistry):
+            raise TypeError("candidate reviewer capabilities must be a registry")
+        self._capabilities = capabilities
+
+    def _executed(
+        self, record: ConversationRun
+    ) -> tuple[ConversationRun, tuple[ToolCall, ...]]:
+        """Return a run and its calls as they executed, never its run-local handles."""
+
+        capabilities = self._capabilities
+        if capabilities is None:
+            raise RuntimeError("candidate reviewer capability registry is unbound")
+        executed = replace(
+            record,
+            transcript=replace(
+                record.transcript,
+                messages=capabilities.executed_messages(record.transcript),
+            ),
+        )
+        calls = tuple(
+            call for call, _ in capabilities.executed_tool_pairs(record.transcript)
+        )
+        return executed, calls
 
     @property
     def enabled(self) -> bool:
@@ -1412,13 +1447,16 @@ class OneShotCandidateReviewer:
         for record in reversed(recent):
             if not _eligible_completed_run(record):
                 continue
-            projected_messages = _project_review_run(record)
-            if not projected_messages:
-                continue
             reference = LearningCandidateRunReference(
                 run_id=record.transcript.run.id,
                 transcript_sha256=terminal_transcript_sha256(record),
             )
+            # Projection, grounding and procedure evidence read the executed
+            # record; the reference keeps the exact persisted transcript digest.
+            executed, executed_calls = self._executed(record)
+            projected_messages = _project_review_run(executed)
+            if not projected_messages:
+                continue
             bindings = await self._catalog_bindings(record)
             catalog_digest = _fingerprint(bindings)
             stamp = LearningCandidateReviewStamp(
@@ -1440,6 +1478,7 @@ class OneShotCandidateReviewer:
                 _ProjectedRun(
                     record=record,
                     messages=projected_messages,
+                    calls=executed_calls,
                     reference=reference,
                     catalog_revisions=bindings,
                     catalog_state_sha256=catalog_digest,
@@ -1459,7 +1498,9 @@ class OneShotCandidateReviewer:
         profile: ModelProfile,
     ) -> tuple[ModelRequest, tuple[_ProjectedRun, ...]]:
         selected = list(projected)
-        used_skill_names = _used_skill_names(tuple(item.record for item in selected))
+        used_skill_names = _used_skill_names(
+            tuple(call for item in selected for call in item.calls)
+        )
         skill_bodies: dict[str, FrozenJsonObject] = {}
         for name in used_skill_names:
             skill = await self._skills.read_skill(name)
@@ -1560,7 +1601,11 @@ class OneShotCandidateReviewer:
             by_run_id[run_id] for run_id in proposal.supporting_run_ids
         )
         support = tuple(item.record for item in projected_support)
-        _validate_candidate_support(proposal, support)
+        _validate_candidate_support(
+            proposal,
+            support,
+            tuple(call for item in projected_support for call in item.calls),
+        )
         if any(
             _contains_unsafe_text(text) for text in _candidate_texts(proposal.content)
         ):
@@ -2048,6 +2093,7 @@ def _text_array(
 def _validate_candidate_support(
     proposal: _Proposal,
     support: tuple[ConversationRun, ...],
+    executed_calls: tuple[ToolCall, ...],
 ) -> None:
     user_texts = [
         block.text
@@ -2077,13 +2123,8 @@ def _validate_candidate_support(
             grounding_text,
             explicit_user_texts,
         )
-        calls_by_id = {
-            call.id: call
-            for record in support
-            for message in record.transcript.messages
-            if message.role is MessageRole.ASSISTANT
-            for call in message.tool_calls
-        }
+        # Grounding compares the identities a call executed with.
+        calls_by_id = {call.id: call for call in executed_calls}
         successful_call_ids = {
             block.call_id
             for record in support
@@ -2721,13 +2762,10 @@ def _redact_reviewer_text(value: str) -> str:
     return redacted
 
 
-def _used_skill_names(records: tuple[ConversationRun, ...]) -> tuple[str, ...]:
+def _used_skill_names(executed_calls: tuple[ToolCall, ...]) -> tuple[str, ...]:
     values = {
         name
-        for record in records
-        for message in record.transcript.messages
-        if message.role is MessageRole.ASSISTANT
-        for call in message.tool_calls
+        for call in executed_calls
         if call.name == "skill_view"
         and isinstance((name := call.arguments.get("name")), str)
     }

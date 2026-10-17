@@ -97,11 +97,9 @@ async def test_trace_exhaustion_stops_before_another_model_request(
     try:
         result = await agent.run("Retain bounded computation evidence.")
         records = await capture_run(agent, result.run_id, analysis_report)
-        transcript = await agent.transcript(result.run_id)
+        evidence = await agent.tool_evidence(result.run_id)
         cells = [
-            (call, block)
-            for call, block in transcript.tool_pairs
-            if call.name == "python_execute"
+            (call, block) for call, block in evidence if call.name == "python_execute"
         ]
         assert result.reason == "analysis_trace_budget_exhausted"
         assert result.kind.value == "failed" and result.final_text is None
@@ -150,7 +148,7 @@ async def test_artifact_quota_failure_preserves_execution_and_existing_candidate
         await capture_run(agent, result.run_id, analysis_report)
         cells = [
             block
-            for call, block in (await agent.transcript(result.run_id)).tool_pairs
+            for call, block in await agent.tool_evidence(result.run_id)
             if call.name == "python_execute"
         ]
         assert len(result.artifacts) == 8
@@ -1062,7 +1060,7 @@ async def test_unrelated_foreground_read_progresses_with_running_and_queued_anal
         assert quick.kind.value == "completed"
         assert not tasks[0].done() and not tasks[1].done()
         os.kill(generation.facts["pid"], 0)
-        pairs = (await agent.transcript(quick.run_id)).tool_pairs
+        pairs = await agent.tool_evidence(quick.run_id)
         assert any(
             call.name == "file_read" and block is not None and not block.is_error
             for call, block in pairs

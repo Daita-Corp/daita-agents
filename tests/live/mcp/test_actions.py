@@ -96,7 +96,12 @@ async def test_live_action_discovery_and_catalog_scale(
         result, transcript = await scenario.run(scenario.action_prompt(phrasing))
         assert_completed(result, transcript)
         assert result.usage.total_tokens > 0
-        capture = RunCapture(result, transcript, tuple(scenario.provider.requests))
+        capture = RunCapture(
+            result,
+            transcript,
+            tuple(scenario.provider.requests),
+            await scenario.agent.tool_evidence(result.run_id),
+        )
         assert_on_demand_invocation(capture, scenario.action.local_name)
         await assert_action(scenario)
         assert [

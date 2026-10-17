@@ -2148,7 +2148,8 @@ def _authenticate_evidence(
             "task_result_evidence_invalid", "Task evidence_refs are invalid."
         )
     requested = tuple(str(item) for item in evidence_call_ids)
-    pairs = {call.id: (call, result) for call, result in transcript.tool_pairs}
+    # Evidence is authenticated by call identity and result lineage only.
+    pairs = {call.id: (call.name, result) for call, result in transcript.tool_pairs}
     authenticated: list[dict[str, object]] = []
     sensitivity = ModelSensitivity.PUBLIC
     artifact_ids: set[str] = set()
@@ -2161,7 +2162,7 @@ def _authenticate_evidence(
                 "evidence_refs must name earlier successful results in this run.",
                 details={"expected_reference_kind": "result_ref"},
             )
-        call, result = pair
+        tool_name, result = pair
         assert result is not None
         if result.capability_id is None or result.output_sha256 is None:
             raise CapabilityInputError(
@@ -2211,7 +2212,7 @@ def _authenticate_evidence(
         authenticated.append(
             {
                 "call_id": call_id,
-                "tool_name": call.name,
+                "tool_name": tool_name,
                 "capability_id": result.capability_id,
                 "executor_id": result.executor_id,
                 "output_sha256": result.output_sha256,
