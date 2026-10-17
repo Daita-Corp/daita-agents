@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ..capabilities import CapabilityInputError
@@ -47,11 +49,24 @@ class LearningCandidateGuard:
         selected = self.selected(session)
         return None if selected is None else _candidate_mutation_tool(selected)
 
-    def validate_effect(self, session: RunSession | None, call: ToolCall) -> None:
+    def validate_effect(
+        self,
+        session: RunSession | None,
+        call: ToolCall,
+        arguments: Mapping[str, object],
+    ) -> None:
+        """Match the selected candidate against the arguments the call executes.
+
+        ``arguments`` are the call's resolved arguments, so a run-local handle
+        in the model's call text compares as the full identity it named.
+        """
+
         from ..learning_candidates import candidate_matches_mutation_call
 
         selected = self.selected(session)
-        if selected is not None and not candidate_matches_mutation_call(selected, call):
+        if selected is not None and not candidate_matches_mutation_call(
+            selected, replace(call, arguments=arguments)
+        ):
             raise CapabilityInputError(
                 "candidate_mismatch",
                 "This acceptance run may mutate only the explicitly selected "

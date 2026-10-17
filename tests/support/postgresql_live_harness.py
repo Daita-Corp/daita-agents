@@ -164,11 +164,12 @@ def report_path(case_id):
     return folder / (hashlib.sha256(case_id.encode()).hexdigest()[:20] + ".json")
 
 
-def calls_for(transcript, tool_name, mode=None):
+def calls_for(evidence, tool_name, mode=None):
+    """Select executed calls from ``Agent.tool_evidence`` pairs."""
+
     return [
         call
-        for message in transcript.messages
-        for call in message.tool_calls
+        for call, _ in evidence
         if call.name == tool_name
         and (mode is None or call.arguments.get("mode") == mode)
     ]
@@ -250,6 +251,8 @@ class Evaluation:
         self.stages = []
         self.clock = NOW
         self.captures = []
+        # Each captured run's calls as they executed, keyed by run ID.
+        self.evidence = {}
         self.approvals = []
         self.expected_write = None
         self.deny_write = False
@@ -537,6 +540,7 @@ class Evaluation:
     async def capture(self, result, elapsed=None):
         transcript = await self.agent.transcript(result.run_id)
         self.captures.append((result, transcript, elapsed))
+        self.evidence[result.run_id] = await self.agent.tool_evidence(result.run_id)
         return result, transcript
 
     def assert_report(self, result, status, counts=None):
@@ -950,14 +954,13 @@ def _error_code(block):
     return error.get("code", "error") if isinstance(error, Mapping) else "error"
 
 
-def write_call_summary(transcript, tool_name):
+def write_call_summary(evidence, tool_name):
     errors = {
         block.call_id: _error_code(block)
-        for message in transcript.messages
-        for block in message.content
-        if isinstance(block, ToolResultBlock) and block.is_error
+        for _, block in evidence
+        if block is not None and block.is_error
     }
-    calls = calls_for(transcript, tool_name)
+    calls = calls_for(evidence, tool_name)
     return {
         mode: {
             "calls": sum(
@@ -973,25 +976,22 @@ def write_call_summary(transcript, tool_name):
     }
 
 
-def assert_preview_binding(transcript, operation="upsert"):
+def assert_preview_binding(evidence, operation="upsert"):
     tool_name = f"data_{operation}_rows"
-    calls = calls_for(transcript, tool_name, "apply")
+    calls = calls_for(evidence, tool_name, "apply")
     assert len(calls) == 1, (
         f"Expected exactly one {tool_name} mode=apply call; observed {len(calls)}. "
-        f"Calls by mode: {write_call_summary(transcript, tool_name)}. "
+        f"Calls by mode: {write_call_summary(evidence, tool_name)}. "
         "A missing write or duplicate request fails effectiveness."
     )
     call = calls[0]
     preview_ids = {
-        item.id for item in calls_for(transcript, f"data_{operation}_rows", "preview")
+        item.id for item in calls_for(evidence, f"data_{operation}_rows", "preview")
     }
     previews = [
         block
-        for message in transcript.messages
-        for block in message.content
-        if isinstance(block, ToolResultBlock)
-        and block.call_id in preview_ids
-        and not block.is_error
+        for _, block in evidence
+        if block is not None and block.call_id in preview_ids and not block.is_error
     ]
     assert any(
         isinstance(block.output["data"], Mapping)
@@ -1003,7 +1003,9 @@ def assert_preview_binding(transcript, operation="upsert"):
 
 
 def assert_exact_preview(scenario, transcript, operation="upsert"):
-    call = assert_preview_binding(transcript, operation)
+    # The approval reviewed the call as it executed: run-scoped handles and
+    # result refs resolved, the mode selector kept on the tool-level call.
+    call = assert_preview_binding(scenario.evidence[transcript.run.id], operation)
     matching = [item for item in scenario.approvals if item["call_id"] == call.id]
     assert len(matching) == 1 and matching[0]["approved"], (
         "The harness approval oracle denied the apply call: its arguments do not "

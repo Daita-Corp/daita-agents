@@ -516,7 +516,14 @@ async def test_scheduled_mcp_harness_reaches_both_occurrences_with_one_approval(
                 result.reason == "token_budget_insufficient"
                 and result.final_text is None
             )
-            projected = project_conversation((ConversationRun(0, transcript, result),))
+            projected = project_conversation(
+                (ConversationRun(0, transcript, result),),
+                tool_pairs={
+                    transcript.run.id: await scenario.agent.tool_evidence(
+                        transcript.run.id
+                    )
+                },
+            )
             notice = projected[-1].text
             assert "not rolled back" in notice
             assert details["routine_id"] in notice and "create committed" in notice
@@ -920,7 +927,12 @@ async def test_committed_mcp_effect_survives_budget_stop_without_replay(tmp_path
         await assert_action(scenario)
         assert len(scenario.approvals) == 1
         receipt = (await scenario.agent.list_effects())[0]
-        view = project_conversation((ConversationRun(0, transcript, result),))
+        view = project_conversation(
+            (ConversationRun(0, transcript, result),),
+            tool_pairs={
+                transcript.run.id: await scenario.agent.tool_evidence(transcript.run.id)
+            },
+        )
         text = " ".join(item.text for item in view)
         assert receipt.receipt_id in text and "succeeded" in text
         assert "downstream outcome unverified" in text

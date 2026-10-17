@@ -64,6 +64,7 @@ from daita.learning_candidates import (
     learning_candidate_content_to_mapping,
 )
 from daita.llm import ModelSensitivity
+from daita.llm.models import ToolCall, ToolResultBlock
 from daita.llm.provider_definitions import SUBSCRIPTION_CLIENTS
 from daita.observation import AgentObserver
 from daita.security import (
@@ -1729,6 +1730,11 @@ class PresentationController:
     async def transcript(self, run_id: str) -> Transcript:
         return await self.require_agent().transcript(run_id)
 
+    async def tool_evidence(
+        self, run_id: str
+    ) -> tuple[tuple[ToolCall, ToolResultBlock | None], ...]:
+        return await self.require_agent().tool_evidence(run_id)
+
     async def conversation_runs(
         self,
         conversation_id: str,
@@ -1748,8 +1754,11 @@ class PresentationController:
                     + safe_display(saved_path, fallback="the selected destination")
                 )
         try:
-            transcript = await self.require_agent().transcript(result.run_id)
-            notices.extend(artifact_delivery_messages(transcript.tool_pairs))
+            notices.extend(
+                artifact_delivery_messages(
+                    await self.require_agent().tool_evidence(result.run_id)
+                )
+            )
         except Exception:
             pass
         return tuple(notices)

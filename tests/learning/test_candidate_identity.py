@@ -360,6 +360,11 @@ def _conversation(
     )
 
 
+def _calls(support: ConversationRun) -> tuple[ToolCall, ...]:
+    # Without handles or result refs, each call executed exactly as sent.
+    return tuple(call for call, _ in support.transcript.tool_pairs)
+
+
 def test_unrelated_assistant_claim_is_not_grounded_by_remember_instruction():
     proposal = _Proposal(
         target=LearningCandidateTarget.MEMORY,
@@ -371,19 +376,23 @@ def test_unrelated_assistant_claim_is_not_grounded_by_remember_instruction():
         user_text="Remember that our fiscal year begins in February."
     )
     with pytest.raises(LearningCandidateError, match="explicit user grounding"):
-        _validate_candidate_support(proposal, (support,))
+        _validate_candidate_support(proposal, (support,), _calls(support))
 
     generic_support = _conversation(
         user_text="Remember these durable business conventions."
     )
     with pytest.raises(LearningCandidateError, match="explicit user grounding"):
-        _validate_candidate_support(proposal, (generic_support,))
+        _validate_candidate_support(
+            proposal, (generic_support,), _calls(generic_support)
+        )
 
     negated_support = _conversation(
         user_text=("Remember that our fiscal year does not always end in December.")
     )
     with pytest.raises(LearningCandidateError, match="explicit user grounding"):
-        _validate_candidate_support(proposal, (negated_support,))
+        _validate_candidate_support(
+            proposal, (negated_support,), _calls(negated_support)
+        )
 
 
 def test_unrelated_success_does_not_rescue_a_failed_candidate_procedure():
@@ -427,7 +436,7 @@ def test_unrelated_success_does_not_rescue_a_failed_candidate_procedure():
         ),
     )
     with pytest.raises(LearningCandidateError, match="failed related procedure"):
-        _validate_candidate_support(proposal, (support,))
+        _validate_candidate_support(proposal, (support,), _calls(support))
 
     corrected = ToolCall(
         "successful-invoices",
@@ -446,7 +455,9 @@ def test_unrelated_success_does_not_rescue_a_failed_candidate_procedure():
             ToolResultBlock(corrected.id, {"data": {"returned_rows": 1}}),
         ),
     )
-    _validate_candidate_support(proposal, (corrected_support,))
+    _validate_candidate_support(
+        proposal, (corrected_support,), _calls(corrected_support)
+    )
 
 
 async def test_catalog_derived_skill_keeps_binding_for_read_time_obsolescence(

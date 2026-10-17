@@ -1699,10 +1699,16 @@ def _project_completed_history(
     """Project one bounded completed tail without mutating durable transcripts."""
 
     eligible = [run for run in runs if _eligible_completed_run(run)]
+    # A prior run's handles named its own scope only; history carries the
+    # identities its calls executed with, not that run's raw handle text.
     projected = [
         _historical_turn_projection(
             item.transcript.run.id,
-            item.transcript.messages,
+            (
+                item.transcript.messages
+                if capabilities is None
+                else capabilities.executed_messages(item.transcript)
+            ),
             capabilities=capabilities,
             mcp_tool_contract=mcp_tool_contract,
         )

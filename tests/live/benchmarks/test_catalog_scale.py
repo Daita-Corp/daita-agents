@@ -93,7 +93,7 @@ async def test_profile_target_survives_catalog_distractors(
         target = fixture.resource_ids[TARGET_PROFILE_TABLE]
         queried = [
             call.arguments.get("resource_ids")
-            for call, _ in capture.transcript.tool_pairs
+            for call, _ in capture.evidence
             if call.name == "data_query"
         ]
         assert queried and all(item in ([target], (target,)) for item in queried)

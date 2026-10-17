@@ -120,6 +120,8 @@ class _RunCapture:
     result: LoopExit
     transcript: Transcript
     requests: tuple[ModelRequest, ...]
+    # The run's calls as they executed (Agent.tool_evidence).
+    evidence: tuple[tuple[ToolCall, ToolResultBlock | None], ...]
 
 
 def _required_environment(name: str) -> str:
@@ -191,6 +193,7 @@ async def _run_live(
     try:
         result = await agent.run(prompt)
         transcript = await agent.transcript(result.run_id)
+        evidence = await agent.tool_evidence(result.run_id)
     finally:
         try:
             await agent.close()
@@ -214,24 +217,17 @@ async def _run_live(
     )
     assert str(workspace.root) not in repr(provider.requests)
     assert str(workspace.root) not in repr(transcript)
-    return _RunCapture(result, transcript, tuple(provider.requests))
+    return _RunCapture(result, transcript, tuple(provider.requests), evidence)
 
 
 def _exchanges(
-    transcript: Transcript,
+    evidence: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
     tool_name: str | None = None,
 ) -> tuple[tuple[ToolCall, ToolResultBlock], ...]:
-    calls = {
-        call.id: call
-        for message in transcript.messages
-        for call in message.tool_calls
-        if tool_name is None or call.name == tool_name
-    }
     return tuple(
-        (calls[block.call_id], block)
-        for message in transcript.messages
-        for block in message.content
-        if isinstance(block, ToolResultBlock) and block.call_id in calls
+        (call, block)
+        for call, block in evidence
+        if block is not None and (tool_name is None or call.name == tool_name)
     )
 
 
@@ -296,7 +292,7 @@ async def test_live_model_discovers_loads_and_aggregates_one_csv(
         for request in capture.requests[1:]
     )
 
-    exchanges = _exchanges(capture.transcript)
+    exchanges = _exchanges(capture.evidence)
     names = tuple(call.name for call, _block in exchanges)
     search_index = names.index("toolbox_search")
     load_index = names.index("toolbox_load")
@@ -357,7 +353,7 @@ async def test_live_model_aggregates_one_hundred_twenty_partitions(
 
     successful = tuple(
         (call, block)
-        for call, block in _exchanges(capture.transcript, "file_query")
+        for call, block in _exchanges(capture.evidence, "file_query")
         if not block.is_error
     )
     assert successful, "the live model did not complete file_query"
@@ -413,7 +409,7 @@ async def test_live_model_recovers_from_incompatible_pattern(
         prompt=prompt,
     )
 
-    queries = _exchanges(capture.transcript, "file_query")
+    queries = _exchanges(capture.evidence, "file_query")
     broad = tuple(
         (call, block)
         for call, block in queries
@@ -471,7 +467,7 @@ async def test_live_model_handles_unsafe_sql_without_host_data(
         prompt=prompt,
     )
 
-    queries = _exchanges(capture.transcript, "file_query")
+    queries = _exchanges(capture.evidence, "file_query")
     unsafe = tuple(
         (call, block)
         for call, block in queries
@@ -525,7 +521,7 @@ async def test_live_model_reports_bounded_result_truncation_truthfully(
 
     successful = tuple(
         (call, block)
-        for call, block in _exchanges(capture.transcript, "file_query")
+        for call, block in _exchanges(capture.evidence, "file_query")
         if not block.is_error
     )
     assert successful, "the live model did not complete the bounded query"

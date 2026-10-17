@@ -70,6 +70,9 @@ def test_on_demand_assertion_requires_exact_successful_load_before_invocation(
                 ),
             )
         )
+    transcript = Transcript(
+        RunInput("run-1", "agent-1", "Cancel job-1.", now), tuple(messages)
+    )
     capture = RunCapture(
         result=LoopExit(
             "run-1",
@@ -79,9 +82,7 @@ def test_on_demand_assertion_requires_exact_successful_load_before_invocation(
             now,
             final_text="Done.",
         ),
-        transcript=Transcript(
-            RunInput("run-1", "agent-1", "Cancel job-1.", now), tuple(messages)
-        ),
+        transcript=transcript,
         requests=(
             ModelRequest(
                 (user,),
@@ -91,6 +92,8 @@ def test_on_demand_assertion_requires_exact_successful_load_before_invocation(
                 ),
             ),
         ),
+        # These calls carry no run-scoped refs, so they executed as sent.
+        evidence=transcript.tool_pairs,
     )
     if valid:
         assert_on_demand_invocation(capture, "job_cancel")

@@ -694,3 +694,66 @@ async def test_review_measurements_count_a_model_call_before_persistence_failure
         assert len(reviewer.requests) == 1
     finally:
         await agent.close()
+
+
+async def test_reviewer_reads_calls_as_executed_never_run_local_handles(tmp_path):
+    database = tmp_path / "reviewer-handles.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE orders(total INTEGER)")
+        connection.execute("INSERT INTO orders(total) VALUES (3)")
+    foreground = MockModelProvider(())
+    reviewer = MockModelProvider([_response(json.dumps({"candidates": []}))])
+    agent = await Agent.create(
+        "reviewer-executed-handles",
+        root=tmp_path,
+        model=foreground,
+        model_profile=foreground.model_profile,
+        reviewer_model=reviewer,
+        id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        source = await agent.attach_sqlite(database, name="orders")
+        (resource,) = await agent.list_catalog_resources(source_id=source.id)
+        foreground.replace_script(
+            (
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=(
+                        ToolCall(
+                            id="orders",
+                            name="data_query",
+                            arguments={
+                                "source_id": "s1",
+                                "resource_ids": ("t1",),
+                                "sql": "SELECT total FROM orders",
+                            },
+                        ),
+                    ),
+                ),
+                _response("The order total was inspected."),
+            )
+        )
+        run = await agent.run("Inspect the order total.", source_scope_ids=(source.id,))
+        transcript = await agent.transcript(run.run_id)
+        ((raw, result),) = transcript.tool_pairs
+        assert raw.arguments["source_id"] == "s1"
+        assert result is not None
+        assert not result.is_error, result.output
+
+        review = await agent.review_learning_candidates()
+
+        assert review.status is LearningReviewStatus.COMPLETED
+        rendered = "\n".join(
+            block.text
+            for message in reviewer.requests[0].messages
+            for block in message.content
+            if isinstance(block, TextBlock)
+        )
+        # Learned material is built from the identities the call executed
+        # with; a handle names nothing outside the run that issued it.
+        assert f'"source_id":"{source.id}"' in rendered
+        assert f'"resource_ids":["{resource.id}"]' in rendered
+        assert '"s1"' not in rendered and '"t1"' not in rendered
+    finally:
+        await agent.close()

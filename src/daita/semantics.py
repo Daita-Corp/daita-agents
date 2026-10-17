@@ -1787,7 +1787,7 @@ class SemanticCapabilityDomain:
     ) -> FrozenJsonObject:
         del request_sensitivity
         if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.validate_effect(session, call)
+            self._learning.validate_effect(session, call, arguments)
         await self._validate_source_scope(run, capability, arguments)
         await self._validate_read_scope(run, capability, arguments)
         if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:

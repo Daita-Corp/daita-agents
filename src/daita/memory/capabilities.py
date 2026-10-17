@@ -229,7 +229,7 @@ class MemoryCapabilityDomain:
         session: RunSession | None = None,
     ) -> FrozenJsonObject:
         del request_sensitivity
-        self._learning.validate_effect(session, call)
+        self._learning.validate_effect(session, call, arguments)
         if (
             arguments["target"] == "memory"
             and self._validate_schema_independent is not None

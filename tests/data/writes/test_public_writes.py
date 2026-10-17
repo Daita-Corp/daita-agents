@@ -336,8 +336,19 @@ def script(
     write=True,
     duplicate=False,
     schema=False,
+    handles=False,
 ) -> None:
     research_name = binding.tools[0].local_name
+
+    def named(request: ModelRequest) -> dict[str, object]:
+        # With handles, the model names the table by its run-scoped refs.
+        if not handles:
+            return dict(batch)
+        return {
+            **batch,
+            "source_id": request.scope_refs[batch["source_id"]],
+            "resource_id": request.scope_refs[batch["resource_id"]],
+        }
 
     def apply(request):
         previews = [
@@ -361,7 +372,7 @@ def script(
                 id="write",
                 name="data_upsert_rows",
                 arguments={
-                    **batch,
+                    **named(request),
                     "mode": "apply",
                     "preview_fingerprint": data["preview_fingerprint"],
                 },
@@ -390,11 +401,11 @@ def script(
                 },
             )
         ),
-        response(
+        lambda request: response(
             ToolCall(
                 id="preview",
                 name="data_upsert_rows",
-                arguments={**batch, "mode": "preview"},
+                arguments={**named(request), "mode": "preview"},
             )
         ),
     ]
@@ -511,7 +522,7 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         approvals,
     ) = await create_fixture(tmp_path, monkeypatch)
     try:
-        script(provider, binding, batch, duplicate=True)
+        script(provider, binding, batch, duplicate=True, handles=True)
         result = await agent.run(
             "Research companies doing business with Acme and save cited findings now."
         )
@@ -520,6 +531,7 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
             agent.id, run_id=result.run_id
         )
         assert len(receipts) == 1
+        assert receipts[0].call_id == "write"
         assert receipts[0].outcome is EffectOutcome.SUCCEEDED
         assert receipts[0].evidence_basis is EffectEvidenceBasis.ADAPTER_VERIFIED
         assert db.rows["new.test"]["evidence_url"] == "https://source.test/new"
@@ -554,12 +566,23 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         assert approval_document is not None
         assert set(approval_document["target"]) == TARGET_KEYS
         assert set(approval_document["preview"]) == UPSERT_PREVIEW_KEYS
-        write_call = next(
+        # The model named the table by handles; the executed record carries
+        # the full identities the approval reviewed, in the tool's own shape.
+        raw_write = next(
             call
             for message in transcript.messages
             for call in message.tool_calls
             if call.id == "write"
         )
+        assert raw_write.arguments["source_id"] != batch["source_id"]
+        write_call = next(
+            call
+            for call, _ in await agent.tool_evidence(result.run_id)
+            if call.id == "write"
+        )
+        assert write_call.arguments["mode"] == "apply"
+        assert write_call.arguments["source_id"] == batch["source_id"]
+        assert write_call.arguments["resource_id"] == batch["resource_id"]
         assert dict(approval.arguments["arguments"]) == {
             key: value for key, value in write_call.arguments.items() if key != "mode"
         }

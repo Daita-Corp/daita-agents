@@ -498,7 +498,10 @@ class ReadEvaluation:
             )
             transcript = await self.agent.transcript(result.run_id)
             return RunCapture(
-                result, transcript, tuple(self.provider.requests[request_start:])
+                result,
+                transcript,
+                tuple(self.provider.requests[request_start:]),
+                await self.agent.tool_evidence(result.run_id),
             )
         except BaseException as error:
             failure_type = type(error).__name__

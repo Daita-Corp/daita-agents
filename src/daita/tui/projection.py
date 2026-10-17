@@ -346,6 +346,8 @@ def tool_result_error_code(result: ToolResultBlock) -> str:
 def artifact_delivery_messages(
     pairs: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
 ) -> tuple[str, ...]:
+    """Summarize deliveries from one run's executed tool evidence."""
+
     messages: list[str] = []
     created_artifact_ids: list[str] = []
     local_save_artifact_ids: set[str] = set()
@@ -427,14 +429,20 @@ def artifact_delivery_messages(
     return tuple(messages)
 
 
+ToolPairs = tuple[tuple[ToolCall, ToolResultBlock | None], ...]
+
+
 def project_transcript(
     transcript: Transcript,
     *,
     run_id: str,
+    tool_pairs: ToolPairs,
     tools_expanded: bool = False,
 ) -> tuple[TranscriptBlock, ...]:
+    """Project one run; ``tool_pairs`` is its executed evidence, in call order."""
+
     blocks: list[TranscriptBlock] = []
-    pairs = transcript.tool_pairs
+    pairs = tool_pairs
     tool_index = 0
     for message in transcript.messages:
         if message.role is MessageRole.USER:
@@ -471,8 +479,9 @@ def project_transcript(
                         "assistant", f"{run_id}:assistant:{len(blocks)}", text
                     )
                 )
-            for call in message.tool_calls:
-                result = pairs[tool_index][1] if tool_index < len(pairs) else None
+            for _ in message.tool_calls:
+                # Present the call as it executed, with full identities.
+                call, result = pairs[tool_index]
                 tool_index += 1
                 label = CAPABILITY_LABELS.get(
                     getattr(call, "name", ""),
@@ -511,9 +520,13 @@ def project_transcript(
 def project_conversation(
     runs: Sequence[ConversationRun],
     *,
+    tool_pairs: Mapping[str, ToolPairs],
     tools_expanded: bool = False,
 ) -> tuple[TranscriptBlock, ...]:
-    """Project every persisted run in one conversation in turn order."""
+    """Project every persisted run in one conversation in turn order.
+
+    ``tool_pairs`` maps each run ID to its executed tool evidence.
+    """
 
     blocks: list[TranscriptBlock] = []
     for run in runs:
@@ -521,6 +534,7 @@ def project_conversation(
             project_transcript(
                 run.transcript,
                 run_id=run.transcript.run.id,
+                tool_pairs=tool_pairs[run.transcript.run.id],
                 tools_expanded=tools_expanded,
             )
         )

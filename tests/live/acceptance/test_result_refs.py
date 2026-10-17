@@ -23,15 +23,9 @@ from typing import cast
 import pytest
 
 from daita import Agent, GraphState, LoopLimits
-from daita.capabilities import RESERVED_TOOL_NAMES
 from daita.domains.data import DATA_QUERY_EVIDENCE_KIND
 from daita.jobs.graph.models import AttemptState, TaskRole
-from daita.llm.models import (
-    ModelProfile,
-    ToolCall,
-    ToolResultBlock,
-    tool_result_refs,
-)
+from daita.llm.models import ModelProfile, ToolCall, ToolResultBlock
 from daita.llm.protocols import ManagedModelProvider
 from daita.loop.models import LoopExitKind, Transcript
 from tests.support.job_benchmarks import create_probe_home
@@ -120,12 +114,16 @@ def _assert_no_ref_rejections(transcript: Transcript) -> None:
     assert not rejected, f"result refs were rejected: {rejected}"
 
 
+ToolEvidence = tuple[tuple[ToolCall, ToolResultBlock | None], ...]
+
+
 def _successful(
-    transcript: Transcript, name: str
+    evidence: ToolEvidence, name: str
 ) -> list[tuple[int, ToolCall, ToolResultBlock]]:
+    # Executed calls from Agent.tool_evidence: refs and handles resolved.
     return [
         (index, call, result)
-        for index, (call, result) in enumerate(transcript.tool_pairs)
+        for index, (call, result) in enumerate(evidence)
         if call.name == name and result is not None and not result.is_error
     ]
 
@@ -166,15 +164,19 @@ async def test_l8_csv_of_a_query_result_cites_that_result(
         transcript = await agent._embedded._store.load(result.run_id)
         _assert_no_ref_rejections(first)
         _assert_no_ref_rejections(transcript)
-        queries = _successful(first, "data_query")
+        first_evidence = await agent.tool_evidence(shown.run_id)
+        evidence = await agent.tool_evidence(result.run_id)
+        queries = _successful(first_evidence, "data_query")
         assert queries, "the counts must come from a successful query"
         # The artifact is the deliverable; nobody asked for a local copy.
-        assert not _successful(transcript, "artifact_save_local")
+        assert not _successful(evidence, "artifact_save_local")
         exports = [
             call
-            for _index, call, _result in _successful(transcript, "data_query")
+            for _index, call, _result in _successful(evidence, "data_query")
             if call.arguments.get("output") in {"csv", "xlsx"}
         ]
+        # Raw on purpose: the visible-ref assertion below checks what the
+        # model wrote, before the runtime bound it.
         artifact_calls = [
             (call, block)
             for call, block in transcript.tool_pairs
@@ -204,7 +206,7 @@ async def test_l8_csv_of_a_query_result_cites_that_result(
             call.id
             for _index, call, _result in (
                 *queries,
-                *_successful(transcript, "data_query"),
+                *_successful(evidence, "data_query"),
             )
             if set(cast(tuple[str, ...], call.arguments["resource_ids"]))
             == shown_tables
@@ -287,35 +289,26 @@ async def test_l8_graph_task_complete_cites_its_read(
         assert [item.state for item in attempts] == [AttemptState.SUCCEEDED]
         transcript = await agent._embedded._store.load(attempts[0].run_id)
         _assert_no_ref_rejections(transcript)
+        evidence = await agent.tool_evidence(attempts[0].run_id)
         completions = [
             call
             for call, _result in transcript.tool_pairs
             if call.name == "task_complete"
         ]
         assert len(completions) == 1, "task_complete must succeed on the first try"
-        reads = _successful(transcript, "data_query")
+        reads = _successful(evidence, "data_query")
         assert reads, "the worker must run its read"
         task_result = await agent.read_job_result(jobs[0].job_id)
         assert task_result is not None
-        # The worker cited its read by visible ref; the runtime bound the call.
+        # The worker cited its read by visible ref (raw model text); the
+        # executed record carries the call ids the runtime bound them to.
         refs = completions[0].arguments.get("evidence_refs")
         assert isinstance(refs, tuple) and refs, "task_complete must cite evidence"
-        cited = _cited_call_ids(transcript, completions[0])
+        (executed,) = [
+            call for call, _result in evidence if call.id == completions[0].id
+        ]
+        cited = set(cast(tuple[str, ...], executed.arguments["evidence_refs"]))
         assert cited and cited <= {call.id for _index, call, _result in reads}
     finally:
         await agent.close()
         await provider.close()
-
-
-def _cited_call_ids(transcript: Transcript, completion: ToolCall) -> set[str]:
-    """Resolve the completion's refs the way the model saw them numbered."""
-
-    refs = tool_result_refs(
-        transcript.messages, uncitable_tool_names=RESERVED_TOOL_NAMES
-    )
-    resolved = set()
-    for ref in cast(tuple[str, ...], completion.arguments["evidence_refs"]):
-        call_id = refs.resolve(ref)
-        assert call_id is not None, f"unresolvable ref {ref!r}"
-        resolved.add(call_id)
-    return resolved

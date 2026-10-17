@@ -271,6 +271,8 @@ def test_interrupted_transcript_never_marks_unanswered_tool_done():
             ),
         ),
     )
-    card = project_transcript(transcript, run_id=run.id)[-1].tool_card
+    card = project_transcript(
+        transcript, run_id=run.id, tool_pairs=transcript.tool_pairs
+    )[-1].tool_card
     assert card is not None and card.state == "unknown"
     assert card.details is not None and "outcome is unknown" in card.details.summary

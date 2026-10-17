@@ -506,7 +506,13 @@ class DaitaApp(App[int]):
             screen.set_blocks(())
             return
         runs = await self.controller.conversation_runs(conversation_id)
-        screen.set_blocks(project_conversation(runs))
+        evidence = {
+            run.transcript.run.id: await self.controller.tool_evidence(
+                run.transcript.run.id
+            )
+            for run in runs
+        }
+        screen.set_blocks(project_conversation(runs, tool_pairs=evidence))
 
     def _reset_context_usage(self) -> None:
         self._context_input_tokens = None

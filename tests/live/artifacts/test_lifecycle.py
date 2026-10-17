@@ -94,19 +94,13 @@ def _live_model() -> tuple[ModelProfile, ManagedModelProvider]:
 
 
 def _exchanges(
-    transcript: Transcript, name: str
+    evidence: tuple[tuple[ToolCall, ToolResultBlock | None], ...], name: str
 ) -> tuple[tuple[ToolCall, ToolResultBlock], ...]:
-    calls = {
-        call.id: call
-        for message in transcript.messages
-        for call in message.tool_calls
-        if call.name == name
-    }
+    # Executed calls from Agent.tool_evidence, with their results.
     return tuple(
-        (calls[block.call_id], block)
-        for message in transcript.messages
-        for block in message.content
-        if isinstance(block, ToolResultBlock) and block.call_id in calls
+        (call, block)
+        for call, block in evidence
+        if call.name == name and block is not None
     )
 
 
@@ -200,7 +194,9 @@ async def test_live_model_artifact_creation_reuse_and_deletion_survive_reopen(
             len(
                 [
                     block
-                    for _, block in _exchanges(original, "artifact_create")
+                    for _, block in _exchanges(
+                        await agent.tool_evidence(created.run_id), "artifact_create"
+                    )
                     if not block.is_error
                 ]
             )
@@ -239,7 +235,7 @@ async def test_live_model_artifact_creation_reuse_and_deletion_survive_reopen(
         )
         used_transcript = await agent.transcript(used.run_id)
         _completed(used, used_transcript, record_property, "reuse", cost_limit)
-        reads = _exchanges(used_transcript, "artifact_read")
+        reads = _exchanges(await agent.tool_evidence(used.run_id), "artifact_read")
         assert any(
             call.arguments.get("artifact_id") == ref.artifact_id
             and not block.is_error
@@ -291,14 +287,15 @@ async def test_live_model_artifact_creation_reuse_and_deletion_survive_reopen(
         )
         last = await agent.transcript(unavailable.run_id)
         _completed(unavailable, last, record_property, "after_deletion", cost_limit)
-        lists = _exchanges(last, "artifact_list")
+        evidence = await agent.tool_evidence(unavailable.run_id)
+        lists = _exchanges(evidence, "artifact_list")
         assert lists and all(not block.is_error for _, block in lists)
         for _, block in lists:
             summaries = _data(block)["artifacts"]
             assert isinstance(summaries, tuple)
             assert len(summaries) == 1 and isinstance(summaries[0], Mapping)
             assert summaries[0]["artifact_id"] == control.artifact_id
-        reads = _exchanges(last, "artifact_read")
+        reads = _exchanges(evidence, "artifact_read")
         assert reads and all(
             call.arguments.get("artifact_id") == ref.artifact_id
             and block.is_error

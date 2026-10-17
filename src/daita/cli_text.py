@@ -59,8 +59,9 @@ async def _write_artifact_outcomes(
             file=output_stream,
         )
     try:
-        transcript = await agent.transcript(result.run_id)
-        for message in artifact_delivery_messages(transcript.tool_pairs):
+        for message in artifact_delivery_messages(
+            await agent.tool_evidence(result.run_id)
+        ):
             print(message, file=output_stream)
     except Exception:
         return

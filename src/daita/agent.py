@@ -88,7 +88,7 @@ from .learning_candidates import (
     LearningCandidateView,
     LearningReviewResult,
 )
-from .llm.models import ModelProfile, ModelSensitivity
+from .llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
 from .llm.protocols import ModelProvider
 from .llm.routing import ModelRoute
 from .llm.subscription_auth import CodexDevicePrompt
@@ -469,6 +469,21 @@ class Agent:
         self, run_id: str, *, caller_principal_id: str | None = None
     ) -> Transcript:
         return await self._embedded.transcript(
+            run_id, caller_principal_id=caller_principal_id
+        )
+
+    async def tool_evidence(
+        self, run_id: str, *, caller_principal_id: str | None = None
+    ) -> tuple[tuple[ToolCall, ToolResultBlock | None], ...]:
+        """Return one run's ordered tool calls as they executed, with results.
+
+        This is ``transcript(run_id).tool_pairs`` with each call's run-scoped
+        result refs and source/resource handles replaced by the call IDs and
+        full IDs they named, which are the arguments approvals, receipts and
+        executors saw. ``transcript`` keeps the model's exact call text.
+        """
+
+        return await self._embedded.tool_evidence(
             run_id, caller_principal_id=caller_principal_id
         )
 

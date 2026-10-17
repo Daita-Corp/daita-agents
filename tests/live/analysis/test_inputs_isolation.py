@@ -213,7 +213,7 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
         records = await capture_run(agent, result.run_id, analysis_report)
         cells = [
             block
-            for call, block in (await agent.transcript(result.run_id)).tool_pairs
+            for call, block in await agent.tool_evidence(result.run_id)
             if call.name == "python_execute"
         ]
         assert len(cells) == 2
@@ -373,7 +373,7 @@ async def test_invalid_inputs_and_candidates_never_publish(
         assert not result.artifacts and await agent.list_artifacts() == ()
         pair = next(
             (call, block)
-            for call, block in (await agent.transcript(result.run_id)).tool_pairs
+            for call, block in await agent.tool_evidence(result.run_id)
             if call.name == "python_execute"
         )
         block = pair[1]

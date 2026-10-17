@@ -217,7 +217,9 @@ from ..llm.models import (
     ModelRequest,
     ModelSensitivity,
     TextBlock,
+    ToolCall,
     ToolDefinition,
+    ToolResultBlock,
 )
 from ..llm.profiles import reviewed_model_profile
 from ..llm.protocols import ManagedModelProvider, ModelProvider
@@ -2245,6 +2247,7 @@ class EmbeddedAgent:
         data_domain.bind_capability_registry(capabilities)
         routine_owner.bind_capability_registry(capabilities)
         graph_task_lifecycle.bind_capability_registry(capabilities)
+        candidate_reviewer.bind_capability_registry(capabilities)
 
         async def resolve_run_sources(run: RunInput):
             return await resolve_effective_source_scope(run, data_view)
@@ -2419,6 +2422,7 @@ class EmbeddedAgent:
             )
             if routine is None or routine.revision != occurrence.routine_revision:
                 return None
+            run_input = await capability_runtime.freeze_source_scope(run_input)
             deadline = asyncio.get_running_loop().time() + limits.max_wall_time_seconds
             lease = await admission_coordinator.admit_execution(
                 WorkloadClass.ROUTINE,
@@ -2981,6 +2985,14 @@ class EmbeddedAgent:
         if self._hosted and transcript.run.caller_principal_id != principal_id:
             raise ValueError("run is unavailable to this caller")
         return transcript
+
+    async def tool_evidence(
+        self, run_id: str, *, caller_principal_id: str | None = None
+    ) -> tuple[tuple[ToolCall, ToolResultBlock | None], ...]:
+        transcript = await self.transcript(
+            run_id, caller_principal_id=caller_principal_id
+        )
+        return self._capabilities.executed_tool_pairs(transcript)
 
     async def analysis_evidence(
         self, run_id: str, *, caller_principal_id: str | None = None

@@ -968,6 +968,7 @@ class JobSupervisor:
             start=start,
             history_sensitivity=current_task.specification.authority.sensitivity,
         )
+        run = await self._runtime.freeze_source_scope(run)
         remaining = max(
             0.001,
             (current_attempt.absolute_deadline_at - self._clock()).total_seconds(),
@@ -1066,13 +1067,13 @@ class JobSupervisor:
         )
         stored_task = inspection_task(inspection, original_task.task_id)
         transcript = await self._store.load(attempt.run_id)
-        pairs = transcript.tool_pairs
-        if not pairs or pairs[-1][1] is None or pairs[-1][1].is_error:
+        results = tuple(result for _, result in transcript.tool_pairs)
+        if not results or results[-1] is None or results[-1].is_error:
             raise CapabilityInputError(
                 "task_termination_not_committed",
                 "The machine termination lacks its authenticated tool result.",
             )
-        terminal = pairs[-1][1]
+        terminal = results[-1]
         assert terminal is not None
         data = terminal.output.get("data")
         if not isinstance(data, Mapping):
