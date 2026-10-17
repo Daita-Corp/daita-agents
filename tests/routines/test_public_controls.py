@@ -116,7 +116,7 @@ async def test_routine_reporting_input_error_precedes_binding_and_approval(
         run = (await store.load(origin.run_id)).run
         if update:
             created = await execute_projected(
-                runtime, run, (ToolCall("valid-create", "routine_create", arguments),)
+                runtime, run, (ToolCall("valid-create", "routine_save", arguments),)
             )
             assert not created.ordered_results[0].is_error, created.ordered_results[
                 0
@@ -154,7 +154,7 @@ async def test_routine_reporting_input_error_precedes_binding_and_approval(
             (
                 ToolCall(
                     "invalid-reporting",
-                    "routine_update" if update else "routine_create",
+                    "routine_save",
                     arguments,
                 ),
             ),
@@ -301,7 +301,7 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
             authoring_run,
             catalog,
             messages,
-            ("routine_update",),
+            ("routine_save",),
             call_id="load-revision",
         )
         assert not loaded.is_error
@@ -314,7 +314,7 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
             if isinstance(block, TextBlock)
         )
         assert canonical_json(owner.authoring_facts()) in system
-        assert "routine_update" in {tool.name for tool in request.tools}
+        assert "routine_save" in {tool.name for tool in request.tools}
 
         revision_origin = await agent.run(
             "Authorize the revised scheduled report definition.",
@@ -480,8 +480,9 @@ async def test_public_source_free_once_routine_commits_required_document(
                 tool_calls=(
                     ToolCall(
                         "write-brief",
-                        "artifact_create_document",
+                        "artifact_create",
                         {
+                            "from": "document",
                             "format": "markdown",
                             "content": "# Local briefing\nNo outside research was requested.",
                         },
@@ -672,7 +673,7 @@ async def test_routine_budget_error_precedes_preparation_and_next_step_corrects(
         run = (await agent._embedded._store.load(origin.run_id)).run
         if update:
             created = await execute_projected(
-                runtime, run, (ToolCall("seed", "routine_create", arguments),)
+                runtime, run, (ToolCall("seed", "routine_save", arguments),)
             )
             assert not created.ordered_results[0].is_error
             current = (await agent.list_routines())[0]
@@ -681,7 +682,7 @@ async def test_routine_budget_error_precedes_preparation_and_next_step_corrects(
             )
             arguments.pop("run_immediately")
         approvals.clear()
-        tool = "routine_update" if update else "routine_create"
+        tool = "routine_save"
         invalid = {
             **arguments,
             f"cumulative_max_{budget}": 91_936 if budget == "tokens" else "0.49",
@@ -780,5 +781,163 @@ async def test_routine_budget_error_precedes_preparation_and_next_step_corrects(
             Decimal("1.00"),
         )
         assert not await agent.list_effects()
+    finally:
+        await agent.close()
+
+
+async def test_routine_save_creates_with_narrow_defaults_and_replaces_one_exact_revision(
+    tmp_path,
+):
+    from daita._json import FrozenJsonObject
+    from daita.capabilities import ApprovalDecision
+    from daita.distribution import outcome_contract_projection
+    from daita.llm.models import ToolCall
+    from daita.routines.capabilities import _parsed_spec
+    from tests.support.capability_runtime import execute_projected
+    from tests.support.toolbox_model import ToolboxAwareMockModelProvider
+
+    approvals = []
+
+    async def approve(request):
+        approvals.append(request)
+        return ApprovalDecision.APPROVE
+
+    provider = ToolboxAwareMockModelProvider(
+        [ModelResponse(finish_reason=FinishReason.STOP, text="Ready.")]
+    )
+    agent = await Agent.create(
+        "routine-save",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=provider,
+        model_profile=provider.model_profile,
+        approval_handler=approve,
+    )
+    try:
+        origin = await agent.run("Report hourly.")
+        destinations = await agent.distribution_destinations(origin.conversation_id)
+        now = datetime.now(UTC)
+        common = {
+            "title": "Report",
+            "authorized_instruction": "Report completion.",
+            "schedule": {
+                "kind": "interval",
+                "interval_seconds": 3600,
+                "anchor_at": (now + timedelta(hours=1)).isoformat(),
+            },
+            "reporting_mode": "always",
+            "allowed_source_ids": (),
+            "allowed_resource_ids": (),
+            "allowed_capability_ids": ("artifact.create_document",),
+            "sensitivity_ceiling": "internal",
+            "outcome_contract": outcome_contract_projection(
+                no_artifact_outcome_contract()
+            ),
+            "distribution_destination_id": destinations[0].destination_id,
+            "eligible_model_routes": (provider.provider_id,),
+            "per_run_max_tokens": 100_000,
+            "cumulative_max_tokens": 200_000,
+            "cumulative_max_attempts": 10,
+            "cumulative_max_occurrences": 10,
+            "maximum_consecutive_failures": 3,
+            "expires_at": (now + timedelta(days=30)).isoformat(),
+        }
+        explicit = {
+            **common,
+            "misfire_policy": "skip",
+            "allowed_connector_binding_ids": (),
+            "requested_capability_grants": (),
+            "skill_names": (),
+            "run_immediately": False,
+        }
+        # Omitted options are exactly the narrow explicit contract.
+        assert _parsed_spec(FrozenJsonObject.from_mapping(common)) == _parsed_spec(
+            FrozenJsonObject.from_mapping(explicit)
+        )
+
+        runtime = agent._embedded._capability_runtime
+        run = (await agent._embedded._store.load(origin.run_id)).run
+        created = await execute_projected(
+            runtime, run, (ToolCall("create", "routine_save", common),)
+        )
+        assert not created.ordered_results[0].is_error
+        assert created.ordered_results[0].capability_id == "routines.create"
+        assert [item.tool_name for item in approvals] == ["routine_save"]
+        assert approvals[0].capability_id == "routines.create"
+        (current,) = await agent.list_routines()
+        inspection = await agent.inspect_routine(current.routine_id)
+        assert inspection is not None
+        routine = inspection.routine
+        assert routine.misfire_policy.value == "skip"
+        assert routine.allowed_connector_binding_ids == ()
+        assert routine.skill_bindings == ()
+        assert routine.per_run_max_cost_usd is None
+        assert routine.run_immediately is False
+
+        orphan = await execute_projected(
+            runtime,
+            run,
+            (ToolCall("orphan", "routine_save", {**common, "expected_revision": 1}),),
+        )
+        assert (
+            orphan.ordered_results[0].output["error"]["code"]
+            == "invalid_argument_for_mode"
+        )
+        replacement = {
+            **common,
+            "title": "Revised report",
+            "routine_id": current.routine_id,
+        }
+        stale = await execute_projected(
+            runtime,
+            run,
+            (
+                ToolCall(
+                    "stale",
+                    "routine_save",
+                    {**replacement, "expected_revision": current.revision + 1},
+                ),
+            ),
+        )
+        assert (
+            stale.ordered_results[0].output["error"]["code"]
+            == "routine_revision_changed"
+        )
+        relative = await execute_projected(
+            runtime,
+            run,
+            (
+                ToolCall(
+                    "relative",
+                    "routine_save",
+                    {
+                        **replacement,
+                        "expected_revision": current.revision,
+                        "run_immediately": True,
+                    },
+                ),
+            ),
+        )
+        assert (
+            relative.ordered_results[0].output["error"]["code"]
+            == "routine_timing_create_only"
+        )
+        revised = await execute_projected(
+            runtime,
+            run,
+            (
+                ToolCall(
+                    "revise",
+                    "routine_save",
+                    {**replacement, "expected_revision": current.revision},
+                ),
+            ),
+        )
+        assert not revised.ordered_results[0].is_error
+        assert revised.ordered_results[0].capability_id == "routines.update"
+        assert approvals[-1].capability_id == "routines.update"
+        (after,) = await agent.list_routines()
+        assert after.revision == current.revision + 1
+        assert after.title == "Revised report"
     finally:
         await agent.close()

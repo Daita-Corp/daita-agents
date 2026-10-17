@@ -61,12 +61,10 @@ from daita.catalog.models import (
 )
 from daita.distribution import OutcomeState
 from daita.domains.data.export_capabilities import (
+    ARTIFACT_CREATE_TOOL_NAME,
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
-    DATA_EXPORT_TABULAR_TOOL_NAME,
     DOCUMENT_CREATE_CAPABILITY_ID,
-    DOCUMENT_CREATE_TOOL_NAME,
     RESULT_SNAPSHOT_CAPABILITY_ID,
-    RESULT_SNAPSHOT_TOOL_NAME,
 )
 from daita.llm.models import (
     FinishReason,
@@ -288,12 +286,12 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
                 _tools(
                     ToolCall(
                         id="sqlite-csv",
-                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                        name="data_query",
                         arguments={
                             "source_id": source.id,
                             "resource_ids": (resource.id,),
                             "sql": "SELECT value FROM current_value",
-                            "format": "csv",
+                            "output": "csv",
                             "filename": "current-value.csv",
                         },
                     )
@@ -412,12 +410,12 @@ async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
                 _tools(
                     ToolCall(
                         id="outside-export",
-                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                        name="data_query",
                         arguments={
                             "source_id": source.id,
                             "resource_ids": (resources["outside_value"].id,),
                             "sql": "SELECT value FROM outside_value",
-                            "format": "csv",
+                            "output": "csv",
                         },
                     )
                 ),
@@ -503,12 +501,12 @@ async def test_restart_after_artifact_and_terminal_commit_does_not_repeat_work(
                 _tools(
                     ToolCall(
                         id="recoverable-csv",
-                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                        name="data_query",
                         arguments={
                             "source_id": source.id,
                             "resource_ids": (resource.id,),
                             "sql": "SELECT value FROM current_value",
-                            "format": "csv",
+                            "output": "csv",
                             "filename": "recoverable.csv",
                         },
                     )
@@ -806,12 +804,12 @@ async def test_scheduled_postgresql_xlsx_uses_the_same_inbox_path(
                 _tools(
                     ToolCall(
                         id="postgresql-xlsx",
-                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                        name="data_query",
                         arguments={
                             "source_id": source.id,
                             "resource_ids": (resource.id,),
                             "sql": "SELECT amount FROM public.orders",
-                            "format": "xlsx",
+                            "output": "xlsx",
                             "filename": "orders.xlsx",
                         },
                     )
@@ -899,8 +897,9 @@ async def test_scheduled_mcp_result_snapshot_uses_the_same_inbox_path(
                 _tools(
                     ToolCall(
                         id="mcp-snapshot",
-                        name=RESULT_SNAPSHOT_TOOL_NAME,
+                        name=ARTIFACT_CREATE_TOOL_NAME,
                         arguments={
+                            "from": "tool_result",
                             "result_ref": result_ref("mcp-result"),
                             "filename": "mcp-result.json",
                         },
@@ -985,8 +984,11 @@ async def test_schema_less_mcp_result_cannot_be_snapshotted(
             _tools(
                 ToolCall(
                     id="schema-less-snapshot",
-                    name=RESULT_SNAPSHOT_TOOL_NAME,
-                    arguments={"result_ref": result_ref("schema-less-result")},
+                    name=ARTIFACT_CREATE_TOOL_NAME,
+                    arguments={
+                        "from": "tool_result",
+                        "result_ref": result_ref("schema-less-result"),
+                    },
                 )
             ),
             _stop("The schema-less result was not packaged."),
@@ -1035,13 +1037,21 @@ async def test_schema_less_mcp_result_cannot_be_snapshotted(
                 _tools(
                     ToolCall(
                         id="document-one",
-                        name=DOCUMENT_CREATE_TOOL_NAME,
-                        arguments={"format": "txt", "content": "one"},
+                        name=ARTIFACT_CREATE_TOOL_NAME,
+                        arguments={
+                            "from": "document",
+                            "format": "txt",
+                            "content": "one",
+                        },
                     ),
                     ToolCall(
                         id="document-two",
-                        name=DOCUMENT_CREATE_TOOL_NAME,
-                        arguments={"format": "txt", "content": "two"},
+                        name=ARTIFACT_CREATE_TOOL_NAME,
+                        arguments={
+                            "from": "document",
+                            "format": "txt",
+                            "content": "two",
+                        },
                     ),
                 ),
                 _stop("Two documents were created."),
@@ -1247,8 +1257,12 @@ async def test_corrupt_committed_artifact_is_one_failed_delivery(
                 _tools(
                     ToolCall(
                         id="corrupt-document",
-                        name=DOCUMENT_CREATE_TOOL_NAME,
-                        arguments={"format": "txt", "content": "committed"},
+                        name=ARTIFACT_CREATE_TOOL_NAME,
+                        arguments={
+                            "from": "document",
+                            "format": "txt",
+                            "content": "committed",
+                        },
                     )
                 ),
                 _stop("The document was created."),

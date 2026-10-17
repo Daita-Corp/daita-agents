@@ -92,8 +92,9 @@ async def _create_artifact_agent(
         (
             _tool(
                 "create",
-                "artifact_create_document",
+                "artifact_create",
                 {
+                    "from": "document",
                     "format": "txt",
                     "filename": "result.txt",
                     "content": "surface payload\n",

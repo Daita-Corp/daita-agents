@@ -66,7 +66,6 @@ from .domains.data.file_capabilities import (
     LOCAL_FILE_READ_TOOL_NAME,
     LOCAL_FILE_SEARCH_CAPABILITY_ID,
 )
-from .domains.data.profile_jobs import START_DATA_PROFILE_CAPABILITY_ID
 from .domains.mcp import MCP_DOMAIN_OWNER_ID, MCP_OUTPUT_KIND
 from .jobs.capabilities import (
     JOB_CANCEL_CAPABILITY_ID,
@@ -100,7 +99,6 @@ from .routines.temporal import system_user_timezone, valid_iana_timezone
 from .scope import SourceScopeCatalog, resolve_effective_source_scope
 from .semantics import (
     SEMANTIC_DELETE_OUTPUT_KIND,
-    SEMANTIC_DELETE_TOOL_NAME,
     SEMANTIC_SAVE_CAPABILITY_ID,
     SEMANTIC_SAVE_OUTPUT_KIND,
     SEMANTIC_SAVE_TOOL_NAME,
@@ -112,7 +110,6 @@ from .semantics import (
 )
 from .skills.capabilities import (
     SKILL_DELETE_OUTPUT_KIND,
-    SKILL_DELETE_TOOL_NAME,
     SKILL_SAVE_OUTPUT_KIND,
     SKILL_SAVE_TOOL_NAME,
     SKILL_VIEW_OUTPUT_KIND,
@@ -159,9 +156,7 @@ _SIDE_EFFECT_TOOL_NAMES = frozenset(
     {
         MEMORY_SET_TOOL_NAME,
         SEMANTIC_SAVE_TOOL_NAME,
-        SEMANTIC_DELETE_TOOL_NAME,
         SKILL_SAVE_TOOL_NAME,
-        SKILL_DELETE_TOOL_NAME,
         ARTIFACT_SAVE_LOCAL_TOOL_NAME,
         ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
     }
@@ -542,9 +537,10 @@ class AgentContextBuilder:
             else None
         )
         capability_ids = frozenset(
-            entry.capability.id
+            capability.id
             for entry in tool_context.entries
             if entry.load_mode is ToolLoadMode.PINNED
+            for capability in entry.capabilities
         )
         local_file_context = (
             self._local_file_context
@@ -1190,9 +1186,17 @@ class AgentContextBuilder:
                     "Answer from available evidence and identify unfinished work."
                 )
         guidance = _tool_guidance(
-            frozenset(entry.capability.id for entry in tool_context.callable_entries),
+            frozenset(
+                capability.id
+                for entry in tool_context.callable_entries
+                for capability in entry.capabilities
+            ),
             snapshot.artifact_destinations,
-            frozenset(entry.capability.id for entry in tool_context.catalog_entries),
+            frozenset(
+                capability.id
+                for entry in tool_context.catalog_entries
+                for capability in entry.capabilities
+            ),
             local_file_context=snapshot.local_file_context,
             messages=messages,
             arrow_export_callable=_arrow_export_admitted(tool_context.callable_entries),
@@ -2554,9 +2558,7 @@ def _redacted_arguments(call: ToolCall) -> Mapping[str, object]:
     if call.name in {
         "memory_set",
         "semantic_save",
-        "semantic_delete",
         "skill_save",
-        "skill_delete",
     }:
         return {"redacted": _KNOWLEDGE_WRITE_MARKER}
     return call.arguments
@@ -2937,26 +2939,28 @@ def _system_prompt(
 
 def _arrow_export_admitted(entries: tuple[RunToolCatalogEntry, ...]) -> bool:
     for entry in entries:
-        capability = entry.capability
-        if (
-            entry.domain_owner_id != "data"
-            or capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID
-            or capability.access_mode is not AccessMode.READ
-            or capability.operational_effect is not OperationalEffect.NONE
-        ):
-            continue
-        properties = capability.input_schema.get("properties")
-        format_schema = (
-            properties.get("format") if isinstance(properties, Mapping) else None
-        )
-        if (
-            isinstance(format_schema, Mapping)
-            and "arrow" in format_schema.get("enum", ())
-            and capability.artifact_policy is not None
-            and "application/vnd.apache.arrow.file"
-            in capability.artifact_policy.allowed_media_types
-        ):
-            return True
+        for capability in entry.capabilities:
+            if (
+                entry.domain_owner_id != "data"
+                or capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID
+                or capability.access_mode is not AccessMode.READ
+                or capability.operational_effect is not OperationalEffect.NONE
+            ):
+                continue
+            properties = capability.input_schema.get("properties")
+            output_schema = (
+                properties.get(entry.view.mode_argument)
+                if isinstance(properties, Mapping)
+                else None
+            )
+            if (
+                isinstance(output_schema, Mapping)
+                and "arrow" in output_schema.get("enum", ())
+                and capability.artifact_policy is not None
+                and "application/vnd.apache.arrow.file"
+                in capability.artifact_policy.allowed_media_types
+            ):
+                return True
     return False
 
 
@@ -2986,12 +2990,13 @@ def _tool_guidance(
             )
         return f"Access needed for {purpose} is absent from this scope; report the limitation."
 
+    # The exact export rides on pinned data_query, so it adds the artifact
+    # procedures only when the request asks for a file (see below).
     artifact_tools_available = bool(
         capability_ids
         & {
             DOCUMENT_CREATE_CAPABILITY_ID,
             ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
-            DATA_EXPORT_TABULAR_CAPABILITY_ID,
             ARTIFACT_CONVERT_CAPABILITY_ID,
             ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
             ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
@@ -3033,6 +3038,13 @@ def _tool_guidance(
         re.search(r"\btools\.(?:call|batch)\b", query) is not None
     )
     capture_requested = re.search(r"\btools\.capture\b", query) is not None
+    if DATA_EXPORT_TABULAR_CAPABILITY_ID in capability_ids and (
+        re.search(
+            r"\b(exports?|csv|xlsx|excel|spreadsheets?|downloads?|files?)\b", query
+        )
+        is not None
+    ):
+        artifact_tools_available = True
     if "analysis.execute" in candidates and (
         programmatic_reads_requested or (capture_requested and arrow_export_candidate)
     ):
@@ -3131,11 +3143,11 @@ def _tool_guidance(
             )
             if arrow_export_callable:
                 instructions.append(
-                    "Python Arrow: r = tools.capture('data_export_tabular', export_arguments, name='rows') accepts only format='arrow' on the already loaded contract. Check r['is_error'] and retain r['output']['artifact'], including a staging failure. After successful capture, read the installed dataset with pyarrow.ipc.open_file(inputs.path('rows')). The return value is structured evidence; inputs.path uses the exact name supplied to capture. No path is returned on r and directory scanning cannot resolve an authenticated input. Alternatively export, then bind the exact artifact ID in python_execute.inputs. A capture is an input, not a saved output; confirm every requested output reference separately. No automatic query/cell replay."
+                    "Python Arrow: r = tools.capture('data_query', query_arguments, name='rows') accepts only one sql statement with output='arrow' on the already loaded contract. Check r['is_error'] and retain r['output']['artifact'], including a staging failure. After successful capture, read the installed dataset with pyarrow.ipc.open_file(inputs.path('rows')). The return value is structured evidence; inputs.path uses the exact name supplied to capture. No path is returned on r and directory scanning cannot resolve an authenticated input. Alternatively export, then bind the exact artifact ID in python_execute.inputs. A capture is an input, not a saved output; confirm every requested output reference separately. No automatic query/cell replay."
                 )
             elif arrow_export_candidate:
                 instructions.append(
-                    "The exact Arrow export is discoverable but not loaded. Use toolbox_load with data_export_tabular and python_execute together before capture; known names need no search. Loading grants no source authority."
+                    "The exact Arrow export is discoverable but not loaded. Use toolbox_load with data_query and python_execute together before capture; known names need no search. Loading grants no source authority."
                 )
         csv_result = any(
             isinstance(data := block.output.get("data"), Mapping)
@@ -3280,7 +3292,9 @@ def _tool_guidance(
         instructions.append(
             "For scheduled work, use toolbox_search automation_contract for grant "
             "schemas and connector references. Use toolbox_inspect for exact argument schemas "
-            "and contracts marked automation_contract_omitted, without changing the working set. "
+            "and contracts marked automation_contract_omitted, without changing the working set; "
+            "it also gives the full routine_save rules for grants, precheck, connector bindings "
+            "and dollar ceilings. "
             "Fixed/variable grant arguments must use the declared input names and types; "
             "load tools to invoke them. Effect-free "
             "reads need no requested_capability_grants; include their IDs in allowed_capability_ids."
@@ -3324,15 +3338,6 @@ def _tool_guidance(
         instructions.append(
             "job_list is agent-wide; origin_conversation_id is provenance."
         )
-    if START_DATA_PROFILE_CAPABILITY_ID in capability_ids:
-        instructions.append(
-            "A durable-job start receipt is a handoff, not completion. In that run, "
-            "do not poll, list, inspect, read, or cancel the newly started job or "
-            "claim its outcome. Complete only unrelated explicitly requested work, "
-            "then report the receipt status and job_id. Later user-originated or "
-            "code-owned terminal-job runs may use admitted lifecycle tools for "
-            "existing jobs."
-        )
     if ARTIFACT_EDIT_TEXT_CAPABILITY_ID in capability_ids:
         instructions.append(
             "Local text edits are artifact-backed: obtain a current read of the "
@@ -3368,19 +3373,19 @@ def _tool_guidance(
             for capability, description in (
                 (
                     DOCUMENT_CREATE_CAPABILITY_ID,
-                    "artifact_create_document for Markdown/TXT.",
+                    "artifact_create from=document for Markdown/TXT.",
                 ),
                 (
                     ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
-                    "artifact_create_tabular creates a bounded derived CSV/XLSX/HTML table from authenticated current-run result IDs and bounded model-authored rows.",
+                    "artifact_create from=table creates a bounded derived CSV/XLSX/HTML table from authenticated current-run result IDs and bounded model-authored rows.",
                 ),
                 (
                     DATA_EXPORT_TABULAR_CAPABILITY_ID,
-                    "data_export_tabular for exact CSV/XLSX from the admitted source. Never put source rows or artifact bytes in arguments.",
+                    "data_query output=csv|xlsx for exact complete CSV/XLSX from the admitted source. Never put source rows or artifact bytes in arguments.",
                 ),
                 (
                     ARTIFACT_CONVERT_CAPABILITY_ID,
-                    "artifact_convert only converts a verified Daita XLSX Data snapshot to CSV; never rerun a source or supply artifact bytes for conversion.",
+                    "artifact_create from=artifact only converts a verified Daita XLSX Data snapshot to CSV; never rerun a source or supply artifact bytes for conversion.",
                 ),
             ):
                 if capability in capability_ids:
@@ -3400,8 +3405,10 @@ def _tool_guidance(
                     )
                 )
                 instructions.append(
-                    'For each new artifact use mode="create_new" and destination_id="default" '
-                    "unless another projected destination was selected; one call per new "
+                    "Creating an artifact is the deliverable; save it locally only when "
+                    "the user explicitly asks to download it or save it to a folder. "
+                    'Then use mode="create_new" and destination_id="default" unless '
+                    "another projected destination was selected; one call per requested "
                     "artifact. Bound edits instead use mode=replace_bound_file."
                 )
             else:

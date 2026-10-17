@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent, LoopLimits, create_llm_provider
+from daita import Agent, LoopLimits
 from daita._json import canonical_json
 from daita.llm._lifecycle import closing_stream
 from daita.llm.models import (
@@ -29,7 +29,6 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
     ManagedModelProvider,
     StreamingModelProvider,
@@ -40,6 +39,7 @@ from daita.loop.models import (
     Transcript,
     validate_completed_transcript,
 )
+from tests.support.live_billing import cost_cap, live_provider
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_LOCAL_WORKSPACE"
@@ -138,21 +138,17 @@ def _live_provider() -> tuple[ModelProfile, _RecordingProvider]:
             f"{_MODEL_ID} must name an API-backed provider: "
             + ", ".join(sorted(_API_PROVIDERS))
         )
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name one release-reviewed tool-capable model")
-    if not profile.supports_streaming:
-        pytest.fail(f"{_MODEL_ID} must name a model with reviewed streaming support")
-    delegate = create_llm_provider(
+    profile, delegate = live_provider(
         model_id,
-        api_key=_required_environment(_MODEL_KEY),
-        max_output_tokens=min(profile.max_output_tokens, 1_024),
+        api_key=lambda: _required_environment(_MODEL_KEY),
+        max_output_tokens=1_024,
+        require_streaming=True,
     )
     return profile, _RecordingProvider(delegate)
 
 
 def _limits() -> LoopLimits:
-    return LoopLimits(max_estimated_cost_usd=_cost_limit())
+    return LoopLimits(max_estimated_cost_usd=cost_cap(_cost_limit()))
 
 
 def _successful_exchanges(
@@ -248,9 +244,7 @@ async def test_live_model_finds_latest_log_and_reads_its_end(
     assert read_result.sensitivity_provenance["authority"] == (
         "local_workspace_binding"
     )
-    relative_paths = read_result.sensitivity_provenance["relative_paths"]
-    assert isinstance(relative_paths, tuple)
-    assert _LATEST_PATH in relative_paths
+    assert read_result.sensitivity_provenance["relative_path"] == _LATEST_PATH
 
     assert provider.requests
     assert {tool.name for tool in provider.requests[0].tools} >= {

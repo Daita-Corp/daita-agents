@@ -39,8 +39,7 @@ from daita.artifacts.renderers import (
 from daita.catalog.models import Sensitivity
 from daita.domains.data.export_capabilities import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
-    DATA_EXPORT_TABULAR_TOOL_NAME,
-    data_export_tabular_capability_declarations,
+    exact_export_capability_declarations,
 )
 from daita.domains.data.sql import ResourceSchema
 from daita.llm.models import (
@@ -617,21 +616,11 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
 
 
 def test_semantic_csv_tool_schema_cannot_accept_rows_bytes_or_provenance() -> None:
-    extension = data_export_tabular_capability_declarations()
-    views = {
-        item.name: item
-        for item in extension.tool_views
-        if item.name == DATA_EXPORT_TABULAR_TOOL_NAME
-    }
-    assert set(views) == {DATA_EXPORT_TABULAR_TOOL_NAME}
-    for name, expected_capability in (
-        (DATA_EXPORT_TABULAR_TOOL_NAME, DATA_EXPORT_TABULAR_CAPABILITY_ID),
-    ):
-        view = views[name]
-        assert view.capability_id == expected_capability
-        capability = next(
-            item for item in extension.capabilities if item.id == view.capability_id
-        )
+    extension = exact_export_capability_declarations()
+    assert extension.tool_views == ()
+    for capability in extension.capabilities:
+        if capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID:
+            continue
         properties = capability.input_schema["properties"]
         assert isinstance(properties, Mapping)
         assert set(properties) == {
@@ -639,7 +628,7 @@ def test_semantic_csv_tool_schema_cannot_accept_rows_bytes_or_provenance() -> No
             "resource_ids",
             "sql",
             "parameters",
-            "format",
+            "output",
             "filename",
         }
         assert set(properties).isdisjoint(
@@ -715,13 +704,81 @@ async def test_sqlite_export_is_discoverable_as_an_effect_free_source_read(
         matches = data.get("matches")
         assert isinstance(matches, tuple)
         export_matches = tuple(
-            item
-            for item in matches
-            if item.get("tool_name") == DATA_EXPORT_TABULAR_TOOL_NAME
+            item for item in matches if item.get("tool_name") == "data_query"
         )
         assert len(export_matches) == 1
         assert export_matches[0].get("data_access") == "read"
         assert export_matches[0].get("operational_effect") == "none"
+    finally:
+        await agent.close()
+
+
+async def test_data_query_file_output_is_complete_beyond_row_limit_and_returns_no_rows(
+    tmp_path: Path,
+) -> None:
+    downloads = tmp_path / "downloads-complete"
+    downloads.mkdir()
+    rows = tuple((f"label-{index}", index) for index in range(250))
+    agent, provider, source_id, resource_id, _database = await _sqlite_export_agent(
+        tmp_path, name="csv-complete", rows=rows, downloads=downloads
+    )
+    arguments = {
+        "source_id": source_id,
+        "resource_ids": (resource_id,),
+        "sql": "SELECT label, number FROM records ORDER BY number",
+    }
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(id="preview", name="data_query", arguments=arguments),
+                ToolCall(
+                    id="export",
+                    name="data_query",
+                    arguments={**arguments, "output": "csv"},
+                ),
+                ToolCall(
+                    id="statements",
+                    name="data_query",
+                    arguments={
+                        "source_id": source_id,
+                        "resource_ids": (resource_id,),
+                        "statements": ({"sql": "SELECT label FROM records"},),
+                        "output": "csv",
+                    },
+                ),
+            ),
+            _stop(),
+        )
+    )
+    try:
+        result = await agent.run("Export every record as an exact CSV file.")
+        transcript = await agent.transcript(result.run_id)
+        preview = _result_for_call(transcript, "preview")
+        preview_data = preview.output["data"]
+        assert isinstance(preview_data, Mapping)
+        assert preview_data["truncated"] is True
+        assert len(cast(tuple[object, ...], preview_data["rows"])) < len(rows)
+
+        exported = _result_for_call(transcript, "export")
+        assert exported.is_error is False
+        assert exported.capability_id == DATA_EXPORT_TABULAR_CAPABILITY_ID
+        export_data = exported.output["data"]
+        assert isinstance(export_data, Mapping)
+        assert "rows" not in export_data
+        assert "label-0" not in canonical_json(exported.output)
+        (ref,) = result.artifacts
+        assert ref.provenance.row_count == len(rows)
+        expected = b'"label","number"\r\n' + b"".join(
+            f'"{label}",{number}\r\n'.encode() for label, number in rows
+        )
+        assert (await agent.read_artifact(ref.artifact_id)).content == expected
+
+        rejected = _result_for_call(transcript, "statements")
+        assert rejected.is_error is True
+        error = rejected.output["error"]
+        assert isinstance(error, Mapping)
+        assert error["code"] == "invalid_argument_for_mode"
+        assert len(result.artifacts) == 1
     finally:
         await agent.close()
 
@@ -746,7 +803,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
             _tools(
                 ToolCall(
                     id="export",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (resource_id,),
@@ -755,7 +812,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
                             "WHERE number >= ? ORDER BY number"
                         ),
                         "parameters": [1],
-                        "format": "csv",
+                        "output": "csv",
                         "filename": "records.csv",
                     },
                 )
@@ -849,7 +906,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
             for block in message.content
             if isinstance(block, TextBlock)
         )
-        assert "data_export_tabular" in first_request_text
+        assert "data_query output=csv|xlsx" in first_request_text
         assert "artifact_save_local" in first_request_text
         assert (
             "Never put source rows or artifact bytes in arguments" in first_request_text
@@ -909,13 +966,13 @@ async def test_csv_export_reuses_current_sql_and_catalog_validation(
             _tools(
                 ToolCall(
                     id="invalid",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (resource_id,),
                         "sql": sql,
                         "parameters": list(parameters),
-                        "format": "csv",
+                        "output": "csv",
                     },
                 )
             ),
@@ -956,12 +1013,12 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
                 _tools(
                     ToolCall(
                         id="mismatch",
-                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                        name="data_query",
                         arguments={
                             "source_id": source_id,
                             "resource_ids": (other_resource.id,),
                             "sql": "SELECT label FROM records",
-                            "format": "csv",
+                            "output": "csv",
                         },
                     )
                 ),
@@ -979,12 +1036,12 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
                 _tools(
                     ToolCall(
                         id="stale",
-                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                        name="data_query",
                         arguments={
                             "source_id": source_id,
                             "resource_ids": (resource_id,),
                             "sql": "SELECT label FROM records",
-                            "format": "csv",
+                            "output": "csv",
                         },
                     )
                 ),
@@ -1004,12 +1061,12 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
                 _tools(
                     ToolCall(
                         id="detached",
-                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                        name="data_query",
                         arguments={
                             "source_id": source_id,
                             "resource_ids": (resource_id,),
                             "sql": "SELECT label FROM records",
-                            "format": "csv",
+                            "output": "csv",
                         },
                     )
                 ),
@@ -1050,34 +1107,34 @@ async def test_csv_exports_serialize_one_sqlite_source_and_keep_failed_siblings(
             _tools(
                 ToolCall(
                     id="first",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (resource_id,),
                         "sql": "SELECT label FROM records /* slow_export */ ORDER BY number",
-                        "format": "csv",
+                        "output": "csv",
                         "filename": "first.csv",
                     },
                 ),
                 ToolCall(
                     id="failed",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (resource_id,),
                         "sql": "SELECT label AS duplicate, number AS duplicate FROM records",
-                        "format": "csv",
+                        "output": "csv",
                         "filename": "failed.csv",
                     },
                 ),
                 ToolCall(
                     id="third",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (resource_id,),
                         "sql": "SELECT number FROM records ORDER BY number",
-                        "format": "csv",
+                        "output": "csv",
                         "filename": "third.csv",
                     },
                 ),
@@ -1140,12 +1197,12 @@ async def test_exact_csv_cancellation_emits_no_artifact_or_partial_reference(
             _tools(
                 ToolCall(
                     id="cancelled-export",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (resource_id,),
                         "sql": "SELECT label FROM records",
-                        "format": "csv",
+                        "output": "csv",
                     },
                 )
             ),
@@ -1181,12 +1238,12 @@ async def test_delivery_failure_after_csv_commit_retains_valid_internal_artifact
             _tools(
                 ToolCall(
                     id="export",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (resource_id,),
                         "sql": "SELECT label, number FROM records",
-                        "format": "csv",
+                        "output": "csv",
                         "filename": "retained.csv",
                     },
                 )

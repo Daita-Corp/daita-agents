@@ -505,7 +505,6 @@ async def test_historical_tools_are_rewritten_redacted_and_provider_neutral(
         )
         assert "memory_set" not in repr(historical_assistants)
         assert "skill_save" not in repr(historical_assistants)
-        assert "skill_delete" not in repr(historical_assistants)
 
         historical_results = [
             block

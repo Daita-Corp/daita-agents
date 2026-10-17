@@ -18,7 +18,22 @@ A routine uses one typed schedule:
   to five years; or
 - `calendar` at an exact local hour and minute in an IANA timezone.
 
-The model-facing `routine_create` tool also accepts bounded creation-time timing:
+The model-facing `routine_save` tool creates a routine when `routine_id` is
+absent (`routines.create`) and replaces one exact revision when `routine_id`
+and `expected_revision` are both given (`routines.update`); a stale
+`expected_revision` fails with `routine_revision_changed`. Its schedule is one
+flat object whose `kind` decides which keys are accepted; the owner rejects
+keys that belong to another kind. Optional arguments default to the narrowest
+contract: `misfire_policy="skip"`, no connector bindings, requested grants,
+skills, precheck or dollar ceilings, and no immediate run. The provider schema
+summarizes the rarely used `requested_capability_grants`, `precheck`,
+`allowed_connector_binding_ids`, dollar ceilings and `basis_run_id`; their full
+rules are in the `routine_save` contract that `toolbox_inspect` returns, and
+every call is validated against that full contract. Sharing one schema changes
+the `routines.create` and `routines.update` contract digests; both are
+interactive-only, so no retained routine binds them.
+
+Creation also accepts bounded creation-time timing:
 `once` with `after_seconds`, `interval` with `anchor_after_seconds`, and
 `once_next_weekday` with an IANA timezone, ISO weekday (Monday=1), hour and
 minute. Relative delays are 1 second through 30 days. Creation can use
@@ -111,6 +126,18 @@ The scheduled-analysis addition changes the `analysis.execute` contract, and
 the positional-binding guidance changes the `data.query` contract. Routines
 retaining older bindings fail closed and require foreground review and approval
 of a revised proposal. Existing bindings are never upgraded implicitly.
+
+The tool consolidation removed `data_export_tabular`, the four artifact
+creation tools, `routine_create`, `routine_update`, `skill_delete`,
+`semantic_list`, `semantic_delete` and `start_data_profile` without aliases.
+Routines bind capability IDs and contract digests, never tool names, so the
+renames alone break no binding. Two automation-eligible contracts did change:
+`data.export_tabular` (now reached through `data_query` with `output`, its
+`format` argument renamed `output`) and `analysis.execute` (its shorter
+description). A retained routine bound to either previous digest fails closed
+at revalidation and needs a revised, approved proposal. The changed
+`routines.*`, `semantic.save` contracts and the removed
+`jobs.data_profile.start` were interactive-only, so no routine retains them.
 
 If an artifact is required, admission also proves that at least one allowed
 producer can satisfy its media type, authorship, exact-source, sensitivity, and

@@ -52,7 +52,18 @@ SKILL_SAVE_TOOL_NAME = "skill_save"
 SKILL_DELETE_CAPABILITY_ID = "skill.delete"
 SKILL_DELETE_EXECUTOR_ID = "skill.delete.executor"
 SKILL_DELETE_OUTPUT_KIND = "skill.deleted"
-SKILL_DELETE_TOOL_NAME = "skill_delete"
+
+# skill_save routes action=save (default) to skill.save and action=delete to
+# skill.delete; each keeps its own approval.
+SKILL_SAVE_ACTION_ARGUMENT = "action"
+SKILL_SAVE_DESCRIPTION = (
+    "Create/replace complete bounded procedural SKILL.md via the sole approval "
+    "card. Use for reusable validated steps with use, verification, and failure "
+    "guidance, not one-off results/schema. Description states when, "
+    "process/sources, exclusions, and result. Text ends run: call first. Replace "
+    "via skill_view current_sha256 as expected_sha256; blind/stale fails. "
+    "action=delete removes one named skill after exact approval."
+)
 
 _SKILL_NAME_PATTERN = "^[a-z][a-z0-9-]{0,63}$"
 SKILL_DOMAIN_OWNER_ID = "skills"
@@ -326,48 +337,42 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
     return SkillDeclarations(
         capabilities=capabilities,
         executors=(view, save, delete),
-        tool_views=tuple(
+        tool_views=(
             ToolView(
-                name=name,
-                capability_id=capability.id,
-                description=capability.description,
-                presentation=presentation,
-            )
-            for name, capability, presentation in zip(
-                (
-                    SKILL_VIEW_TOOL_NAME,
-                    SKILL_SAVE_TOOL_NAME,
-                    SKILL_DELETE_TOOL_NAME,
+                name=SKILL_VIEW_TOOL_NAME,
+                capability_id=SKILL_VIEW_CAPABILITY_ID,
+                description=capabilities[0].description,
+                presentation=ToolPresentation(
+                    toolbox_id=ToolboxId.KNOWLEDGE,
+                    load_mode=ToolLoadMode.PINNED,
+                    text_trust=ToolTextTrust.CODE,
+                    summary="Load one complete user-authorized procedural skill.",
+                    when_to_use="Use when an indexed procedure is relevant to the request.",
+                    keywords=("skill", "procedure", "guidance", "view"),
                 ),
-                capabilities,
-                (
-                    ToolPresentation(
-                        toolbox_id=ToolboxId.KNOWLEDGE,
-                        load_mode=ToolLoadMode.PINNED,
-                        text_trust=ToolTextTrust.CODE,
-                        summary="Load one complete user-authorized procedural skill.",
-                        when_to_use="Use when an indexed procedure is relevant to the request.",
-                        keywords=("skill", "procedure", "guidance", "view"),
+            ),
+            ToolView(
+                name=SKILL_SAVE_TOOL_NAME,
+                capability_id=SKILL_SAVE_CAPABILITY_ID,
+                description=SKILL_SAVE_DESCRIPTION,
+                presentation=ToolPresentation(
+                    toolbox_id=ToolboxId.KNOWLEDGE,
+                    load_mode=ToolLoadMode.ON_DEMAND,
+                    text_trust=ToolTextTrust.CODE,
+                    summary="Create, replace or delete one bounded procedural skill.",
+                    when_to_use=(
+                        "Use only for an explicit validated reusable procedure "
+                        "or an explicit exact skill deletion."
                     ),
-                    ToolPresentation(
-                        toolbox_id=ToolboxId.KNOWLEDGE,
-                        load_mode=ToolLoadMode.ON_DEMAND,
-                        text_trust=ToolTextTrust.CODE,
-                        summary="Create or replace one bounded procedural skill.",
-                        when_to_use="Use only for an explicit validated reusable procedure.",
-                        keywords=("skill", "procedure", "save", "learn"),
-                    ),
-                    ToolPresentation(
-                        toolbox_id=ToolboxId.KNOWLEDGE,
-                        load_mode=ToolLoadMode.ON_DEMAND,
-                        text_trust=ToolTextTrust.CODE,
-                        summary="Delete one exact existing procedural skill.",
-                        when_to_use="Use only for an explicit exact skill deletion.",
-                        keywords=("skill", "procedure", "delete"),
-                    ),
+                    keywords=("skill", "procedure", "save", "learn", "delete"),
                 ),
-                strict=True,
-            )
+                mode_capability_ids=(
+                    ("save", SKILL_SAVE_CAPABILITY_ID),
+                    ("delete", SKILL_DELETE_CAPABILITY_ID),
+                ),
+                mode_argument=SKILL_SAVE_ACTION_ARGUMENT,
+                default_mode="save",
+            ),
         ),
     )
 
@@ -660,11 +665,12 @@ __all__ = [
     "SKILL_DELETE_CAPABILITY_ID",
     "SKILL_DELETE_EXECUTOR_ID",
     "SKILL_DELETE_OUTPUT_KIND",
-    "SKILL_DELETE_TOOL_NAME",
     "SKILL_DOMAIN_OWNER_ID",
     "SKILL_SAVE_CAPABILITY_ID",
     "SKILL_SAVE_EXECUTOR_ID",
     "SKILL_SAVE_OUTPUT_KIND",
+    "SKILL_SAVE_ACTION_ARGUMENT",
+    "SKILL_SAVE_DESCRIPTION",
     "SKILL_SAVE_TOOL_NAME",
     "SKILL_VIEW_CAPABILITY_ID",
     "SKILL_VIEW_EXECUTOR_ID",

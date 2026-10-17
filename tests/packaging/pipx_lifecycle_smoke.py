@@ -357,7 +357,7 @@ async def main():
                     ToolCall(
                         id="upgrade-artifact-create-load",
                         name="toolbox_load",
-                        arguments={"tool_names": ["artifact_create_document"]},
+                        arguments={"tool_names": ["artifact_create"]},
                     ),
                 ),
             ),
@@ -366,8 +366,8 @@ async def main():
                 tool_calls=(
                     ToolCall(
                         id="upgrade-artifact-create",
-                        name="artifact_create_document",
-                        arguments={
+                        name="artifact_create",
+                        arguments={"from": "document", 
                             "format": "txt",
                             "filename": "upgrade-notes.txt",
                             "content": "Artifact created by the baseline package.\\n",

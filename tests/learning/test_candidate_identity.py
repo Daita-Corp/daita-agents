@@ -256,6 +256,41 @@ def test_semantic_mutation_match_is_exact_except_for_runtime_owned_evidence():
         )
 
 
+def test_merged_save_tools_match_candidates_by_action():
+    save = _semantic_candidate()
+    arguments = _semantic_arguments()
+    assert candidate_matches_mutation_call(
+        save, ToolCall("save", "semantic_save", {**arguments, "action": "save"})
+    )
+    assert not candidate_matches_mutation_call(
+        save, ToolCall("delete", "semantic_save", {**arguments, "action": "delete"})
+    )
+
+    delete = replace(
+        save,
+        content=SemanticCandidateContent(
+            action=LearningCandidateAction.DELETE,
+            annotation_id="annotation-current",
+        ),
+        catalog_revisions=(),
+        candidate_identity_sha256="",
+    )
+    delete_arguments = {
+        "action": "delete",
+        "id": "annotation-current",
+        "expected_sha256": "f" * 64,
+    }
+    assert candidate_matches_mutation_call(
+        delete, ToolCall("delete", "semantic_save", delete_arguments)
+    )
+    for call in (
+        ToolCall("save", "semantic_save", {**delete_arguments, "action": "save"}),
+        ToolCall("default", "semantic_save", {"id": "annotation-current"}),
+        ToolCall("other", "semantic_save", {**delete_arguments, "id": "other"}),
+    ):
+        assert not candidate_matches_mutation_call(delete, call)
+
+
 def test_semantic_content_cannot_be_edited_outside_its_frozen_scope():
     candidate = _semantic_candidate()
     content = candidate.content

@@ -24,9 +24,7 @@ _LEARNING_REVIEW_MAX_DURATION_MS = int(LEARNING_REVIEW_MAX_WALL_TIME_SECONDS * 1
 _CASE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _CATALOG_TOOLS = frozenset({"catalog_search", "catalog_describe"})
 _SQL_TOOLS = frozenset({"data_query"})
-_LEARNING_WRITE_TOOLS = frozenset(
-    {"memory_set", "semantic_save", "semantic_delete", "skill_save", "skill_delete"}
-)
+_LEARNING_WRITE_TOOLS = frozenset({"memory_set", "semantic_save", "skill_save"})
 _REPORT_ROWS = (
     ("Answer correctness", "answer_correct"),
     ("Business-definition correctness", "business_definition_correct"),

@@ -200,7 +200,7 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
                     "read-preview",
                     "python_execute",
                     {
-                        "code": f"r=tools.call('artifact_read', {{'artifact_id':{artifact.artifact_id!r}}})\nassert not r['is_error']\nprint(r['output']['data']['text'])\nlisting=tools.call('artifact_list', {{}})\nassert not listing['is_error']\ndenied=tools.call('artifact_create_document', {{}})\nassert denied['is_error']",
+                        "code": f"r=tools.call('artifact_read', {{'artifact_id':{artifact.artifact_id!r}}})\nassert not r['is_error']\nprint(r['output']['data']['text'])\nlisting=tools.call('artifact_list', {{}})\nassert not listing['is_error']\ndenied=tools.call('artifact_create', {{'from': 'document'}})\nassert denied['is_error']",
                         "expected_state": {"generation": 0, "revision": 0},
                     },
                 ),
@@ -327,7 +327,15 @@ async def test_arrow_input_preserves_schema_decimal_null_integer_timezone_duplic
 
 
 @pytest.mark.parametrize(
-    "failure", ["symlink", "traversal", "malformed_json", "forged_input", "stale_state"]
+    "failure",
+    [
+        "symlink",
+        "traversal",
+        "malformed_json",
+        "forged_result_ref",
+        "forged_evidence_id",
+        "stale_state",
+    ],
 )
 async def test_invalid_inputs_and_candidates_never_publish(
     tmp_path, failure, analysis_report
@@ -347,8 +355,12 @@ async def test_invalid_inputs_and_candidates_never_publish(
         arguments["code"] = (
             "open('bad.json','w').write('{broken')\noutputs.add('bad','bad.json')"
         )
-    elif failure == "forged_input":
+    elif failure == "forged_result_ref":
         arguments["inputs"] = {"bad": {"kind": "tool_result", "result_ref": "r99"}}
+    elif failure == "forged_evidence_id":
+        arguments["inputs"] = {
+            "bad": {"kind": "tool_result", "evidence_id": "unissued-result"}
+        }
     else:
         arguments["expected_state"] = {"generation": 9, "revision": 99}
     agent = await make_agent(tmp_path, (_tool("invalid", "python_execute", arguments),))
@@ -369,6 +381,14 @@ async def test_invalid_inputs_and_candidates_never_publish(
         output = json.loads(canonical_json(block.output))
         if failure == "stale_state":
             assert block.is_error and output["error"]["code"] == "analysis_stale_state"
+            assert not any(record.kind == "generation" for record in records)
+        elif failure == "forged_result_ref":
+            # The runtime refuses an unissued result_ref before any worker starts.
+            assert block.is_error
+            assert output["error"]["code"] == "result_ref_invalid"
+            assert output["error"]["details"]["execution_disposition"] == (
+                "not_dispatched"
+            )
             assert not any(record.kind == "generation" for record in records)
         else:
             await capture_run(agent, result.run_id, analysis_report)

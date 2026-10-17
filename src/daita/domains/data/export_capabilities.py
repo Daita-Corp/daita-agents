@@ -112,22 +112,30 @@ from .sql import (
 
 DOCUMENT_CREATE_CAPABILITY_ID = "artifact.create_document"
 DOCUMENT_CREATE_EXECUTOR_ID = "artifact.create_document.executor"
-DOCUMENT_CREATE_TOOL_NAME = "artifact_create_document"
 DOCUMENT_CREATE_OUTPUT_KIND = "artifact.document"
 
 ARTIFACT_CREATE_TABULAR_CAPABILITY_ID = "artifact.create_tabular"
 ARTIFACT_CREATE_TABULAR_EXECUTOR_ID = "artifact.create_tabular.executor"
-ARTIFACT_CREATE_TABULAR_TOOL_NAME = "artifact_create_tabular"
 ARTIFACT_CREATE_TABULAR_OUTPUT_KIND = "artifact.tabular"
 
 RESULT_SNAPSHOT_CAPABILITY_ID = "artifact.snapshot_result"
 RESULT_SNAPSHOT_EXECUTOR_ID = "artifact.snapshot_result.executor"
-RESULT_SNAPSHOT_TOOL_NAME = "artifact_snapshot_result"
 RESULT_SNAPSHOT_OUTPUT_KIND = "artifact.result_snapshot"
 
 DATA_EXPORT_TABULAR_EXECUTOR_ID = "data.export_tabular.executor"
-DATA_EXPORT_TABULAR_TOOL_NAME = "data_export_tabular"
 TABULAR_EXPORT_OUTPUT_KIND = "artifact.tabular_export"
+
+ARTIFACT_CREATE_TOOL_NAME = "artifact_create"
+ARTIFACT_CREATE_SOURCE_ARGUMENT = "from"
+ARTIFACT_CREATE_DESCRIPTION = (
+    "Create one artifact; from selects the input. table: bounded derived "
+    "findings (columns, rows, format csv|xlsx|html, evidence_refs = result_refs "
+    "it derives from), not an exact source export. document: format "
+    "markdown|txt with content. tool_result: canonical JSON of one earlier "
+    "successful result (result_ref). artifact: convert a Daita XLSX snapshot "
+    "(artifact_id) to format=csv without rerunning its source. filename is "
+    "optional. Never put artifact bytes in arguments."
+)
 
 ARTIFACT_LIST_CAPABILITY_ID = "artifact.list"
 ARTIFACT_LIST_EXECUTOR_ID = "artifact.list.executor"
@@ -144,7 +152,6 @@ MAX_MODEL_ARTIFACT_XLSX_ROWS = 50
 
 ARTIFACT_CONVERT_CAPABILITY_ID = "artifact.convert"
 ARTIFACT_CONVERT_EXECUTOR_ID = "artifact.convert.executor"
-ARTIFACT_CONVERT_TOOL_NAME = "artifact_convert"
 ARTIFACT_CONVERT_OUTPUT_KIND = "artifact.conversion"
 
 ARTIFACT_EDIT_TEXT_CAPABILITY_ID = "artifact.edit_text"
@@ -468,7 +475,7 @@ class DataExportTabularExecutor:
         parameters = request.arguments.get("parameters", ())
         resource_ids = request.arguments["resource_ids"]
         adapter_id = request.arguments["_adapter_id"]
-        format_name = request.arguments["format"]
+        format_name = request.arguments["output"]
         filename = request.arguments.get("filename")
         assert isinstance(source_id, str)
         assert isinstance(sql, str)
@@ -977,7 +984,7 @@ class ArtifactSetExportLocationExecutor:
         )
 
 
-def data_export_tabular_declarations(
+def exact_export_declarations(
     agent_id: str,
     sqlite_backend: ExactTabularExportBackend,
     postgresql_backend: ExactTabularExportBackend,
@@ -985,7 +992,7 @@ def data_export_tabular_declarations(
     *,
     arrow_bounds: tuple[int, int, int] | None = None,
 ) -> DataExportTabularDeclarations:
-    declarations = data_export_tabular_capability_declarations(
+    declarations = exact_export_capability_declarations(
         allow_arrow=arrow_bounds is not None
     )
     return DataExportTabularDeclarations(
@@ -1037,50 +1044,24 @@ def artifact_declarations(
     )
 
 
-def data_export_tabular_capability_declarations(
+def exact_export_capability_declarations(
     *, allow_arrow: bool = False
 ) -> CapabilityDeclarations:
+    """Declare the exact export; data_query's file outputs are its only view."""
+
     capability = _tabular_export_capability(allow_arrow=allow_arrow)
-    view = ToolView(
-        name=DATA_EXPORT_TABULAR_TOOL_NAME,
-        capability_id=capability.id,
-        description=capability.description,
-        presentation=ToolPresentation(
-            toolbox_id=ToolboxId.ARTIFACTS,
-            load_mode=ToolLoadMode.ON_DEMAND,
-            text_trust=ToolTextTrust.CODE,
-            summary=(
-                "Export one exact complete relational dataset as CSV, XLSX or Arrow for Python."
-                if allow_arrow
-                else "Export one exact relational query result as CSV or XLSX."
-            ),
-            when_to_use=(
-                "Use existing current catalog evidence for exact source/resource IDs; obtain only missing structure. Complete query results support dataset-wide statistics beyond bounded previews."
-            ),
-            keywords=(
-                "artifact",
-                "data",
-                "export",
-                "relational",
-                "csv",
-                "xlsx",
-                "complete dataset",
-                "all rows",
-                "statistics",
-                *(
-                    ("arrow ipc", "python capture", "typed dataset")
-                    if allow_arrow
-                    else ()
-                ),
-            ),
-        ),
-    )
     return CapabilityDeclarations(
         domain_owner_id="data",
         capabilities=(capability,),
         executor_ids=(DATA_EXPORT_TABULAR_EXECUTOR_ID,),
-        tool_views=(view,),
+        tool_views=(),
     )
+
+
+def exact_export_outputs(*, allow_arrow: bool = False) -> tuple[str, ...]:
+    """The data_query output values the exact export serves."""
+
+    return ("csv", "xlsx", *(("arrow",) if allow_arrow else ()))
 
 
 def artifact_capability_declarations(
@@ -1370,7 +1351,7 @@ def artifact_capability_declarations(
         executor_id=ARTIFACT_READ_EXECUTOR_ID,
         automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
-    artifact_convert = Capability(
+    convert = Capability(
         id=ARTIFACT_CONVERT_CAPABILITY_ID,
         description=(
             "Convert one current-conversation Daita-generated XLSX snapshot to "
@@ -1522,7 +1503,9 @@ def artifact_capability_declarations(
         description=(
             "Publish one committed artifact either as a collision-safe new file in "
             "an authorized destination or as an atomic replacement of only the exact "
-            "unchanged local file bound into a text-edit artifact."
+            "unchanged local file bound into a text-edit artifact. Use only when the "
+            "user explicitly asks for a download or local copy; a created artifact "
+            "is already the deliverable."
         ),
         input_schema={
             "type": "object",
@@ -1587,63 +1570,54 @@ def artifact_capability_declarations(
         result_snapshot,
         artifact_list,
         artifact_read,
-        artifact_convert,
+        convert,
         *((artifact_edit_text,) if include_local_edit else ()),
         *((save, set_location) if include_local_delivery else ()),
     )
     views = (
         ToolView(
-            name=DOCUMENT_CREATE_TOOL_NAME,
-            capability_id=document.id,
-            description=document.description,
-            presentation=ToolPresentation(
-                toolbox_id=ToolboxId.ARTIFACTS,
-                load_mode=ToolLoadMode.ON_DEMAND,
-                text_trust=ToolTextTrust.CODE,
-                summary="Create a bounded Markdown or text report document.",
-                when_to_use="Use when the requested deliverable is a document.",
-                keywords=("artifact", "document", "markdown", "text", "report"),
-            ),
-        ),
-        ToolView(
-            name=ARTIFACT_CREATE_TABULAR_TOOL_NAME,
+            name=ARTIFACT_CREATE_TOOL_NAME,
             capability_id=tabular.id,
-            description=tabular.description,
+            description=ARTIFACT_CREATE_DESCRIPTION,
             presentation=ToolPresentation(
                 toolbox_id=ToolboxId.ARTIFACTS,
                 load_mode=ToolLoadMode.ON_DEMAND,
                 text_trust=ToolTextTrust.CODE,
-                summary="Create a bounded derived findings table as CSV, XLSX, or HTML.",
+                summary=(
+                    "Create a derived findings table (CSV, XLSX, HTML), a Markdown "
+                    "or text report document, a JSON result snapshot, or a CSV "
+                    "conversion of a Daita XLSX artifact."
+                ),
                 when_to_use=(
-                    "Use to export analyzed findings from successful current-run tools, "
-                    "not a complete exact source export."
+                    "Use for a requested deliverable built from current-run results "
+                    "or authored text, not a complete exact source export."
                 ),
                 keywords=(
                     "artifact",
+                    "create",
+                    "document",
+                    "markdown",
+                    "text",
+                    "report",
                     "table",
                     "findings",
                     "export",
                     "csv",
                     "xlsx",
                     "html",
+                    "snapshot",
+                    "result",
+                    "json",
+                    "convert",
                 ),
             ),
-        ),
-        ToolView(
-            name=RESULT_SNAPSHOT_TOOL_NAME,
-            capability_id=result_snapshot.id,
-            description=result_snapshot.description,
-            presentation=ToolPresentation(
-                toolbox_id=ToolboxId.ARTIFACTS,
-                load_mode=ToolLoadMode.ON_DEMAND,
-                text_trust=ToolTextTrust.CODE,
-                summary="Snapshot one earlier structured result as canonical JSON.",
-                when_to_use=(
-                    "Use after a successful current-run tool call when its complete "
-                    "validated structured result should become an artifact."
-                ),
-                keywords=("artifact", "snapshot", "result", "json"),
+            mode_capability_ids=(
+                ("table", tabular.id),
+                ("document", document.id),
+                ("tool_result", result_snapshot.id),
+                ("artifact", convert.id),
             ),
+            mode_argument=ARTIFACT_CREATE_SOURCE_ARGUMENT,
         ),
         ToolView(
             name=ARTIFACT_LIST_TOOL_NAME,
@@ -1672,19 +1646,6 @@ def artifact_capability_declarations(
                     "job_read_results."
                 ),
                 keywords=("artifact", "read", "preview", "file"),
-            ),
-        ),
-        ToolView(
-            name=ARTIFACT_CONVERT_TOOL_NAME,
-            capability_id=artifact_convert.id,
-            description=artifact_convert.description,
-            presentation=ToolPresentation(
-                toolbox_id=ToolboxId.ARTIFACTS,
-                load_mode=ToolLoadMode.ON_DEMAND,
-                text_trust=ToolTextTrust.CODE,
-                summary="Convert a verified Daita XLSX Data snapshot to CSV.",
-                when_to_use="Use for exact supported conversion of an existing artifact.",
-                keywords=("artifact", "convert", "xlsx", "csv"),
             ),
         ),
         *(
@@ -1720,7 +1681,10 @@ def artifact_capability_declarations(
                         load_mode=ToolLoadMode.ON_DEMAND,
                         text_trust=ToolTextTrust.CODE,
                         summary="Save a committed artifact locally or replace its bound local file.",
-                        when_to_use="Use after artifact creation when local delivery is required.",
+                        when_to_use=(
+                            "Use only when the user explicitly asks to download or "
+                            "save an artifact locally; creating one needs no save."
+                        ),
                         keywords=("artifact", "save", "deliver", "local"),
                     ),
                 ),
@@ -1848,15 +1812,18 @@ def _same_current_call(
         return False
     if persisted.arguments == current.arguments:
         return True
+    current_arguments = FrozenJsonObject.from_mapping(current.arguments)
     try:
+        # A routed tool's executing call no longer carries its selector.
+        routed = registry.target_arguments(persisted.name, persisted.arguments)
+        if FrozenJsonObject.from_mapping(routed) == current_arguments:
+            return True
         resolved = registry.resolved_call_arguments(
             persisted.name, persisted.arguments, messages
         )
     except (CapabilityInputError, KeyError):
         return False
-    return FrozenJsonObject.from_mapping(resolved) == FrozenJsonObject.from_mapping(
-        current.arguments
-    )
+    return FrozenJsonObject.from_mapping(resolved) == current_arguments
 
 
 class ArtifactCapabilityDomain:
@@ -3048,8 +3015,10 @@ def _tabular_export_capability(*, allow_arrow: bool = False) -> Capability:
         ),
         input_schema={
             "type": "object",
+            # Shared arguments keep data_query's exact rules: this capability
+            # is data_query's file output.
             "properties": {
-                "source_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "source_id": {"type": "string"},
                 "resource_ids": {
                     "type": "array",
                     "items": {"type": "string", "minLength": 1, "maxLength": 256},
@@ -3065,11 +3034,12 @@ def _tabular_export_capability(*, allow_arrow: bool = False) -> Capability:
                 "parameters": {
                     "type": "array",
                     "maxItems": MAX_SQL_PARAMETERS,
+                    "description": "SQLite ? values follow SQL occurrence order; PostgreSQL $1, $2, ... by index. Verify filter bindings.",
                 },
-                "format": {"type": "string", "enum": formats},
+                "output": {"type": "string", "enum": formats},
                 "filename": {"type": "string", "minLength": 1, "maxLength": 120},
             },
-            "required": ["source_id", "resource_ids", "sql", "format"],
+            "required": ["source_id", "resource_ids", "sql", "output"],
             "additionalProperties": False,
         },
         output_kind=TABULAR_EXPORT_OUTPUT_KIND,
@@ -3260,14 +3230,15 @@ __all__ = [
     "ARTIFACT_CREATE_TABULAR_CAPABILITY_ID",
     "ARTIFACT_CREATE_TABULAR_EXECUTOR_ID",
     "ARTIFACT_CREATE_TABULAR_OUTPUT_KIND",
-    "ARTIFACT_CREATE_TABULAR_TOOL_NAME",
     "ARTIFACT_CONVERT_CAPABILITY_ID",
     "ARTIFACT_CONVERT_EXECUTOR_ID",
     "ARTIFACT_CONVERT_OUTPUT_KIND",
-    "ARTIFACT_CONVERT_TOOL_NAME",
     "ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND",
     "ARTIFACT_DOMAIN_OWNER_ID",
     "ARTIFACT_EXPORT_LOCATION_OUTPUT_KIND",
+    "ARTIFACT_CREATE_DESCRIPTION",
+    "ARTIFACT_CREATE_SOURCE_ARGUMENT",
+    "ARTIFACT_CREATE_TOOL_NAME",
     "ARTIFACT_LIST_CAPABILITY_ID",
     "ARTIFACT_LIST_EXECUTOR_ID",
     "ARTIFACT_LIST_OUTPUT_KIND",
@@ -3285,14 +3256,12 @@ __all__ = [
     "ArtifactCapabilityDomain",
     "ArtifactDomainCatalog",
     "DATA_EXPORT_TABULAR_EXECUTOR_ID",
-    "DATA_EXPORT_TABULAR_TOOL_NAME",
     "DataExportTabularDeclarations",
     "DataExportTabularExecutor",
     "TABULAR_EXPORT_OUTPUT_KIND",
     "DOCUMENT_CREATE_CAPABILITY_ID",
     "DOCUMENT_CREATE_EXECUTOR_ID",
     "DOCUMENT_CREATE_OUTPUT_KIND",
-    "DOCUMENT_CREATE_TOOL_NAME",
     "ExactTabularExportBackend",
     "ExactTabularProgress",
     "ExactTabularExportResult",
@@ -3300,11 +3269,10 @@ __all__ = [
     "RESULT_SNAPSHOT_CAPABILITY_ID",
     "RESULT_SNAPSHOT_EXECUTOR_ID",
     "RESULT_SNAPSHOT_OUTPUT_KIND",
-    "RESULT_SNAPSHOT_TOOL_NAME",
     "ResultSnapshotExecutor",
     "artifact_capability_declarations",
     "artifact_declarations",
-    "data_export_tabular_capability_declarations",
-    "data_export_tabular_declarations",
+    "exact_export_capability_declarations",
+    "exact_export_declarations",
     "resolved_exact_export_sensitivity",
 ]

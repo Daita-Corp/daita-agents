@@ -6,9 +6,17 @@ from typing import Any, cast
 import pytest
 
 from daita._json import FrozenJsonObject, canonical_json
-from daita.capabilities import ToolOutputValidationError, validate_tool_schema_value
-from daita.routines.capabilities import _parse_schedule, _spec_schema
-from daita.routines.models import OnceSchedule
+from daita.capabilities import (
+    CapabilityInputError,
+    ToolOutputValidationError,
+    validate_tool_schema_value,
+)
+from daita.routines.capabilities import (
+    _parse_schedule,
+    _require_exact_revision_timing,
+    _spec_schema,
+)
+from daita.routines.models import CalendarSchedule, OnceSchedule
 
 
 @pytest.mark.parametrize("update", [False, True])
@@ -36,12 +44,14 @@ async def test_model_immediate_choice_is_explicit_on_create_and_cannot_run_a_rev
         arguments.pop("run_immediately", None)
     else:
         arguments["run_immediately"] = immediate
-    rejected = (not update and immediate is None) or (update and immediate is True)
-    if rejected:
-        with pytest.raises(ToolOutputValidationError):
-            validate_tool_schema_value(schema, arguments)
+    validated = validate_tool_schema_value(schema, arguments)
+    if update and immediate is True:
+        with pytest.raises(CapabilityInputError, match="create-only"):
+            _require_exact_revision_timing(validated)
     else:
-        validated = validate_tool_schema_value(schema, arguments)
+        if update:
+            _require_exact_revision_timing(validated)
+        # An omitted choice is the narrower scheduled-only default.
         assert _parsed_spec(validated)["run_immediately"] is bool(immediate)
 
 
@@ -135,8 +145,85 @@ def test_invented_or_incomplete_schedule_shapes_fail_the_declared_schema(schedul
             "schedule"
         ],
     )
-    with pytest.raises(ToolOutputValidationError):
-        validate_tool_schema_value(schema, schedule)
+    # The flat schema rejects unknown keys; the owner rejects keys of another
+    # kind and incomplete or contradictory selections.
+    with pytest.raises((ToolOutputValidationError, CapabilityInputError)):
+        _parse_schedule(validate_tool_schema_value(schema, schedule))
+
+
+@pytest.mark.parametrize(
+    "filters,selector",
+    (
+        ({}, "every_day"),
+        ({"weekdays": [], "month_days": []}, "every_day"),
+        ({"weekdays": [1, 3]}, "weekdays"),
+        ({"month_days": [1, 15], "months": [2]}, "month_days"),
+    ),
+)
+def test_calendar_day_selector_follows_the_given_day_filters(filters, selector):
+    schema = cast(
+        Mapping[str, object],
+        cast(Mapping[str, object], _spec_schema(update=False)["properties"])[
+            "schedule"
+        ],
+    )
+    schedule = {
+        "kind": "calendar",
+        "timezone": "America/Chicago",
+        "hour": 9,
+        "minute": 0,
+        **filters,
+    }
+    parsed = _parse_schedule(validate_tool_schema_value(schema, schedule))
+    assert isinstance(parsed, CalendarSchedule)
+    assert parsed.day_selector.value == selector
+
+
+def test_contradictory_calendar_says_how_to_correct_it():
+    with pytest.raises(CapabilityInputError, match="Correct the schedule"):
+        _parse_schedule(
+            FrozenJsonObject.from_mapping(
+                {
+                    "kind": "calendar",
+                    "timezone": "America/Chicago",
+                    "hour": 9,
+                    "minute": 0,
+                    "day_selector": "every_day",
+                    "weekdays": (1,),
+                }
+            )
+        )
+
+
+def test_null_keys_of_other_schedule_kinds_are_omitted_before_checks():
+    from daita.capabilities import omit_unset_arguments
+
+    # routine_save offers both routes, so both schemas are candidates.
+    schemas = (_spec_schema(update=False), _spec_schema(update=True))
+    # The flat schedule lists every kind's keys; models send unused ones null.
+    arguments: dict[str, object] = {
+        "title": "Daily",
+        "routine_id": None,
+        "schedule": {
+            "kind": "calendar",
+            "timezone": "America/Chicago",
+            "hour": 9,
+            "minute": 0,
+            "weekdays": [],
+            "exact_at": None,
+            "after_seconds": None,
+            "interval_seconds": None,
+            "day_selector": None,
+        },
+    }
+    normalized = omit_unset_arguments(arguments, schemas)
+    assert "routine_id" not in normalized
+    schedule = cast(Mapping[str, object], normalized["schedule"])
+    assert set(schedule) == {"kind", "timezone", "hour", "minute", "weekdays"}
+    _require_exact_revision_timing(normalized)
+    parsed = _parse_schedule(FrozenJsonObject.from_mapping(schedule))
+    assert isinstance(parsed, CalendarSchedule)
+    assert parsed.day_selector.value == "every_day"
 
 
 def test_one_of_rejects_ambiguous_shapes_and_enforces_output_rules():
@@ -195,15 +282,17 @@ def test_shared_calendar_constraints_reject_invalid_values_in_every_selector(
     schema = cast(Mapping[str, object], _spec_schema(update=False)["properties"])[
         "schedule"
     ]
-    with pytest.raises(ToolOutputValidationError):
-        validate_tool_schema_value(cast(Mapping[str, object], schema), schedule)
+    with pytest.raises((ToolOutputValidationError, CapabilityInputError)):
+        _parse_schedule(
+            validate_tool_schema_value(cast(Mapping[str, object], schema), schedule)
+        )
 
 
 def test_routine_schema_retains_typed_constraints_with_a_bounded_wire_footprint():
     schema = _spec_schema(update=False)
-    assert len(canonical_json(schema).encode()) < 11000
+    assert len(canonical_json(schema).encode()) < 9000
     properties = cast(Mapping[str, object], schema["properties"])
-    assert len(canonical_json(properties["schedule"]).encode()) < 4200
+    assert len(canonical_json(properties["schedule"]).encode()) < 1800
 
 
 @pytest.mark.parametrize(
@@ -230,8 +319,9 @@ def test_create_accepts_bounded_temporal_intents_but_update_requires_exact_time(
         "schedule"
     ]
     validate_tool_schema_value(cast(Mapping[str, object], create_schema), schedule)
-    with pytest.raises(ToolOutputValidationError):
-        validate_tool_schema_value(cast(Mapping[str, object], update_schema), schedule)
+    validate_tool_schema_value(cast(Mapping[str, object], update_schema), schedule)
+    with pytest.raises(CapabilityInputError, match="create-only"):
+        _require_exact_revision_timing({"schedule": schedule})
 
 
 def test_exact_offset_schedule_is_normalized_to_utc():

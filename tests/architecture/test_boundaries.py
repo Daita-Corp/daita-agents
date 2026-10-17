@@ -588,10 +588,10 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["data_update_rows"] == "data"
         assert resolved["memory_set"] == "memory"
         assert resolved["skill_view"] == "skills"
-        assert resolved["semantic_list"] == "semantics"
-        assert resolved["artifact_create_document"] == "artifacts"
-        assert resolved["artifact_create_tabular"] == "artifacts"
-        assert resolved["start_data_profile"] == "data_profile_jobs"
+        assert resolved["semantic_view"] == "semantics"
+        assert resolved["artifact_create"] == "artifacts"
+        assert resolved["artifact_create"] == "artifacts"
+        assert "data_profile_jobs" not in set(resolved.values())
         assert resolved["job_list"] == "jobs"
         assert resolved["routine_list"] == "routines"
         assert resolved["distribution_destination_list"] == "distribution"
@@ -973,7 +973,7 @@ def test_memory_keeps_storage_separate_from_one_fixed_write_identity():
     assert 'MEMORY_SET_CAPABILITY_ID = "memory.set"' in capability_text
     assert 'MEMORY_SET_EXECUTOR_ID = "memory.set.executor"' in capability_text
     assert 'MEMORY_SET_OUTPUT_KIND = "memory.replacement"' in capability_text
-    for forbidden in ("skill_save", "skill_delete", "SQLiteStateStore"):
+    for forbidden in ("skill_save", "skill_view", "SQLiteStateStore"):
         assert forbidden not in capability_text
 
     registry_text = (PACKAGE / "capabilities.py").read_text(encoding="utf-8")
@@ -1015,7 +1015,7 @@ def test_skills_extend_the_advisory_owner_with_two_writes():
     assert 'SKILL_SAVE_CAPABILITY_ID = "skill.save"' in capability_text
     assert 'SKILL_SAVE_EXECUTOR_ID = "skill.save.executor"' in capability_text
     assert 'SKILL_SAVE_OUTPUT_KIND = "skill.saved"' in capability_text
-    assert 'SKILL_DELETE_TOOL_NAME = "skill_delete"' in capability_text
+    assert 'SKILL_SAVE_ACTION_ARGUMENT = "action"' in capability_text
     assert 'SKILL_DELETE_CAPABILITY_ID = "skill.delete"' in capability_text
     assert 'SKILL_DELETE_EXECUTOR_ID = "skill.delete.executor"' in capability_text
     assert 'SKILL_DELETE_OUTPUT_KIND = "skill.deleted"' in capability_text
@@ -1052,7 +1052,7 @@ def test_semantics_use_existing_storage_context_and_runtime_owners():
     assert _class_owners("SemanticAnnotation") == {"semantics.py"}
     assert _class_owners("SemanticSubject") == {"semantics.py"}
     assert 'SEMANTIC_SAVE_TOOL_NAME = "semantic_save"' in semantics
-    assert 'SEMANTIC_DELETE_TOOL_NAME = "semantic_delete"' in semantics
+    assert 'SEMANTIC_SAVE_ACTION_ARGUMENT = "action"' in semantics
     assert "semantic_annotations" in CURRENT_SCHEMA.tables
     assert "class SemanticCapabilityDomain" in semantics
     assert "semantic_resource_facts" in semantics
@@ -1230,13 +1230,9 @@ async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_bran
             "job_cancel",
             "memory_set",
             "routine_control",
-            "routine_create",
-            "routine_update",
-            "semantic_delete",
+            "routine_save",
             "semantic_save",
             "skill_save",
-            "skill_delete",
-            "start_data_profile",
         }
     finally:
         await agent.close()
@@ -1415,7 +1411,7 @@ def test_artifact_continuity_uses_current_context_and_export_owners():
         assert obsolete_history_owner not in context
     assert 'ARTIFACT_LIST_TOOL_NAME = "artifact_list"' in exports
     assert 'ARTIFACT_READ_TOOL_NAME = "artifact_read"' in exports
-    assert 'ARTIFACT_CONVERT_TOOL_NAME = "artifact_convert"' in exports
+    assert 'ARTIFACT_CREATE_TOOL_NAME = "artifact_create"' in exports
     assert "artifact_list" not in (PACKAGE / "agent.py").read_text(encoding="utf-8")
     assert "artifact_list" not in (PACKAGE / "hosting" / "embedded.py").read_text(
         encoding="utf-8"
@@ -2342,10 +2338,10 @@ def test_exact_tabular_extends_existing_adapter_capability_and_renderer_owners()
 def test_exact_tabular_tool_arguments_contain_query_selection_but_never_rows_or_bytes():
     from daita.domains.data.export_capabilities import (
         DATA_EXPORT_TABULAR_CAPABILITY_ID,
-        data_export_tabular_capability_declarations,
+        exact_export_capability_declarations,
     )
 
-    declarations = data_export_tabular_capability_declarations()
+    declarations = exact_export_capability_declarations()
     for capability in declarations.capabilities:
         if capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID:
             continue
@@ -2356,7 +2352,7 @@ def test_exact_tabular_tool_arguments_contain_query_selection_but_never_rows_or_
             "resource_ids",
             "sql",
             "parameters",
-            "format",
+            "output",
             "filename",
         }
         assert set(properties).isdisjoint(

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent, LoopLimits, SQLiteSource, create_llm_provider
+from daita import Agent, LoopLimits, SQLiteSource
 from daita.catalog.models import Sensitivity
 from daita.llm._lifecycle import closing_stream
 from daita.llm.models import (
@@ -21,7 +21,6 @@ from daita.llm.models import (
     ModelSensitivity,
     ModelStreamEvent,
 )
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
     ManagedModelProvider,
     StreamingModelProvider,
@@ -33,6 +32,7 @@ from daita.llm.routing import (
     RetryPolicy,
 )
 from daita.loop.models import LoopExitKind
+from tests.support.live_billing import cost_cap, live_provider
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_STAGE0_SENSITIVITY"
@@ -147,20 +147,15 @@ async def test_live_model_route_admits_internal_scope_and_blocks_public_only_rou
             f"{_MODEL_ID} must name an API-backed provider: "
             + ", ".join(sorted(_API_PROVIDERS))
         )
-    api_key = _required_environment(_MODEL_KEY)
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name one release-reviewed tool-capable model")
-
-    delegate = create_llm_provider(
+    profile, delegate = live_provider(
         model_id,
-        api_key=api_key,
-        max_output_tokens=min(profile.max_output_tokens, 1_024),
+        api_key=lambda: _required_environment(_MODEL_KEY),
+        max_output_tokens=1_024,
     )
     provider = _RecordingProvider(delegate)
     async with AsyncExitStack() as cleanup:
         cleanup.push_async_callback(provider.close)
-        limits = LoopLimits(max_estimated_cost_usd=_cost_limit())
+        limits = LoopLimits(max_estimated_cost_usd=cost_cap(_cost_limit()))
         database = tmp_path / "stage0-live.sqlite"
         _database(database)
 

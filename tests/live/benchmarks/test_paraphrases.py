@@ -9,8 +9,9 @@ live provider.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -26,13 +27,13 @@ from tests.support.job_benchmarks import (
     PROFILE_SAMPLE_ROWS,
     TARGET_IMMEDIATE_TABLE,
     TARGET_PROFILE_TABLE,
+    admit_profile_job,
     assert_completed,
     assert_on_demand_invocation,
     assert_profile_result,
     benchmark_marks,
     capture_run,
     create_live_agent,
-    job_id_from_start,
     logical_names,
     record_metrics,
     results_for,
@@ -64,23 +65,21 @@ _IMMEDIATE_PROMPTS = (
     ),
 )
 
-_START_PROMPTS = (
+_PROFILE_PROMPTS = (
     (
-        "background",
-        "Please profile stage_b_profile_probe in the background, looking at no "
-        "more than five rows. Tell me once the work has been accepted; I don't "
-        "need you to wait for it to finish.",
+        "profile-summary",
+        "Please profile stage_b_profile_probe: how many rows does it have, and "
+        "how many nullable_code values are null?",
     ),
     (
-        "durable",
-        "Kick off a durable profile of stage_b_profile_probe with a five-row "
-        "sample and let me know the identifier for the work.",
+        "data-quality",
+        "Give me a quick data-quality check of stage_b_profile_probe: the row "
+        "count and the number of missing nullable_code values.",
     ),
     (
-        "outlive-chat",
-        "This profiling work may outlive our chat. Start it for "
-        "stage_b_profile_probe using five sample rows, then return after it is "
-        "queued rather than polling it.",
+        "background-wording",
+        "Profile stage_b_profile_probe in the background if you need to, but I "
+        "only want its total row count and nullable_code null count.",
     ),
 )
 
@@ -112,18 +111,19 @@ _RESULT_PROMPTS = (
     ),
 )
 
+# No model tool starts a profile job; each case admits the internal profile
+# graph in the conversation of one short setup interaction, then asks the model
+# to cancel it.
 _CANCEL_CASES = (
     (
         "stop-exact",
-        "Start a background profile of stage_b_profile_probe using five sample "
-        "rows. Return as soon as the work is accepted instead of waiting.",
+        "I am about to ask you about a background job. Reply with the word ready.",
         "Stop the running job {job_id}. Request the cancellation now and tell me "
         "which job received the request.",
     ),
     (
         "cancel-plain-language",
-        "Set a durable five-row profile of stage_b_profile_probe running and give "
-        "me its job identifier once admitted.",
+        "Before my next request, just acknowledge this message in one word.",
         "I no longer want {job_id} to run. Cancel that exact background job now.",
     ),
 )
@@ -155,7 +155,6 @@ async def test_paraphrased_immediate_reads_do_not_create_jobs(
         record_metrics(record_property, DEFAULT_MODEL_ID, capture)
         names = logical_names(capture.transcript)
         assert "data_query" in names
-        assert "start_data_profile" not in names
         assert await fixture.agent.list_jobs() == ()
         assert capture.result.final_text is not None
         assert IMMEDIATE_TOKEN in capture.result.final_text
@@ -166,10 +165,10 @@ async def test_paraphrased_immediate_reads_do_not_create_jobs(
 
 @pytest.mark.parametrize(
     ("case_id", "prompt"),
-    _START_PROMPTS,
-    ids=tuple(item[0] for item in _START_PROMPTS),
+    _PROFILE_PROMPTS,
+    ids=tuple(item[0] for item in _PROFILE_PROMPTS),
 )
-async def test_paraphrased_background_requests_admit_one_exact_job(
+async def test_paraphrased_profile_requests_use_aggregates_without_jobs(
     tmp_path: Path,
     case_id: str,
     prompt: str,
@@ -177,7 +176,7 @@ async def test_paraphrased_background_requests_admit_one_exact_job(
 ) -> None:
     fixture = await create_live_agent(
         tmp_path,
-        f"paraphrase-start-{case_id}",
+        f"paraphrase-profile-{case_id}",
         DEFAULT_MODEL_ID,
     )
     try:
@@ -188,19 +187,19 @@ async def test_paraphrased_background_requests_admit_one_exact_job(
         )
         assert_completed(capture)
         record_metrics(record_property, DEFAULT_MODEL_ID, capture)
-        assert_on_demand_invocation(capture, "start_data_profile")
         names = logical_names(capture.transcript)
+        assert "data_query" in names
         assert not (LIFECYCLE_TOOLS & set(names))
-        assert "data_query" not in names
-        job_id = job_id_from_start(capture.transcript)
-        jobs = await fixture.agent.list_jobs()
-        assert len(jobs) == 1 and jobs[0].job_id == job_id
-        inspection = await wait_for_terminal(fixture.agent, job_id)
-        assert inspection.job.state is GraphState.SUCCEEDED
-        assert inspection.job.specification.authority.resource_ids == (
-            fixture.resource_ids[TARGET_PROFILE_TABLE],
+        assert await fixture.agent.list_jobs() == ()
+        target = fixture.resource_ids[TARGET_PROFILE_TABLE]
+        assert any(
+            target in cast(Sequence[str], call.arguments.get("resource_ids", ()))
+            for call, _ in capture.transcript.tool_pairs
+            if call.name == "data_query"
         )
-        await assert_profile_result(fixture.agent, job_id)
+        assert capture.result.final_text is not None
+        assert str(PROFILE_SAMPLE_ROWS) in capture.result.final_text
+        assert str(PROFILE_NULL_VALUES) in capture.result.final_text
     finally:
         await fixture.close()
 
@@ -281,7 +280,7 @@ async def test_paraphrased_result_questions_recover_exact_artifacts(
 
 
 @pytest.mark.parametrize(
-    ("case_id", "start_prompt", "cancel_prompt"),
+    ("case_id", "setup_prompt", "cancel_prompt"),
     _CANCEL_CASES,
     ids=tuple(item[0] for item in _CANCEL_CASES),
 )
@@ -289,7 +288,7 @@ async def test_paraphrased_cancellation_targets_one_running_job(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     case_id: str,
-    start_prompt: str,
+    setup_prompt: str,
     cancel_prompt: str,
     record_property: Callable[[str, object], None],
 ) -> None:
@@ -314,12 +313,13 @@ async def test_paraphrased_cancellation_targets_one_running_job(
     try:
         started = await capture_run(
             fixture,
-            start_prompt,
+            setup_prompt,
             source_id=fixture.source_id,
         )
         assert_completed(started)
-        assert_on_demand_invocation(started, "start_data_profile")
-        job_id = job_id_from_start(started.transcript)
+        job_id = await admit_profile_job(
+            fixture.agent, fixture.resource_ids[TARGET_PROFILE_TABLE], started.result
+        )
         await asyncio.wait_for(execution_started.wait(), timeout=5)
         await wait_for_running(fixture.agent, job_id)
 
@@ -330,8 +330,6 @@ async def test_paraphrased_cancellation_targets_one_running_job(
         assert_completed(cancelled)
         record_metrics(record_property, DEFAULT_MODEL_ID, cancelled)
         assert_on_demand_invocation(cancelled, "job_cancel")
-        names = logical_names(cancelled.transcript)
-        assert "start_data_profile" not in names
         cancel_results = results_for(cancelled.transcript, "job_cancel")
         assert len(cancel_results) == 1
         assert job_id in canonical_json(cancel_results[0].output)
@@ -346,7 +344,7 @@ async def test_paraphrased_cancellation_targets_one_running_job(
 def test_paraphrase_case_inventory_is_bounded_and_nonduplicative() -> None:
     cases = (
         *_IMMEDIATE_PROMPTS,
-        *_START_PROMPTS,
+        *_PROFILE_PROMPTS,
         *_STATUS_PROMPTS,
         *_RESULT_PROMPTS,
         *((case_id, start) for case_id, start, _ in _CANCEL_CASES),
@@ -362,7 +360,7 @@ def test_paraphrase_case_inventory_is_bounded_and_nonduplicative() -> None:
         for forbidden in (
             "toolbox_search",
             "toolbox_load",
-            "start_data_profile",
+            "data_query",
             "job_list",
             "job_read_results",
             "job_cancel",

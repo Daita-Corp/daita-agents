@@ -148,7 +148,7 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
                         {
                             "tool_names": [
                                 "python_execute",
-                                *(["data_export_tabular"] if captured else []),
+                                *(["data_query"] if captured else []),
                             ]
                         },
                     ),
@@ -183,7 +183,7 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
                             "assert not r['is_error'], r\n"
                             "assert r['output']['data']['rows'] == [{'n':42}], r\n"
                             + (
-                                f"c = tools.capture('data_export_tabular', {{'source_id':{source.id!r}, 'resource_ids':[{resource.id!r}], 'sql':'SELECT n FROM numbers', 'format':'arrow'}}, name='current')\nassert not c['is_error'], c\nimport pyarrow.ipc as ipc\nwith ipc.open_file(inputs.path('current')) as reader:\n    assert reader.read_all().to_pydict() == {{'n':[42]}}\n"
+                                f"c = tools.capture('data_query', {{'source_id':{source.id!r}, 'resource_ids':[{resource.id!r}], 'sql':'SELECT n FROM numbers', 'output':'arrow'}}, name='current')\nassert not c['is_error'], c\nimport pyarrow.ipc as ipc\nwith ipc.open_file(inputs.path('current')) as reader:\n    assert reader.read_all().to_pydict() == {{'n':[42]}}\n"
                                 if captured
                                 else ""
                             )
@@ -1130,13 +1130,13 @@ async def test_exact_arrow_export_bind_compute_and_reopen(tmp_path, handoff):
             "source_id": source.id,
             "resource_ids": [resource.id],
             "sql": "SELECT n AS alias, label, payload FROM values_data ORDER BY seq",
-            "format": "arrow",
+            "output": "arrow",
         }
 
         def compute(request):
             inputs = {}
             if handoff == "capture":
-                prefix = f"captured = tools.capture('data_export_tabular', {export_arguments!r}, name='rows')\nassert not captured['is_error'], captured\nreference = captured['output']['artifact']\n"
+                prefix = f"captured = tools.capture('data_query', {export_arguments!r}, name='rows')\nassert not captured['is_error'], captured\nreference = captured['output']['artifact']\n"
                 digest_expression = "reference['sha256'].removeprefix('sha256:')"
             else:
                 exported = next(
@@ -1189,11 +1189,11 @@ async def test_exact_arrow_export_bind_compute_and_reopen(tmp_path, handoff):
                 _tool(
                     "load-arrow",
                     "toolbox_load",
-                    {"tool_names": ["data_export_tabular", "python_execute"]},
+                    {"tool_names": ["data_query", "python_execute"]},
                 ),
                 *(
                     (
-                        _tool("export-arrow", "data_export_tabular", export_arguments),
+                        _tool("export-arrow", "data_query", export_arguments),
                         ModelResponse(
                             finish_reason=FinishReason.STOP, text="bind-arrow"
                         ),
@@ -1234,9 +1234,7 @@ async def test_exact_arrow_export_bind_compute_and_reopen(tmp_path, handoff):
                 if r.kind == "child"
             ]
             assert len(evidence) == 1 and evidence[0].facts["status"] == "succeeded"
-            assert all(
-                call.name != "data_export_tabular" for call, _ in transcript.tool_pairs
-            )
+            assert all(call.name != "data_query" for call, _ in transcript.tool_pairs)
         content = (await agent.read_artifact(reference.artifact_id)).content
         assert reference.sha256 == "sha256:" + sha256(content).hexdigest()
         from importlib import import_module
@@ -1262,7 +1260,7 @@ async def test_exact_arrow_export_bind_compute_and_reopen(tmp_path, handoff):
     "failure",
     (
         "name",
-        "unloaded",
+        "statements",
         "format",
         "publication",
         "parser",
@@ -1356,8 +1354,12 @@ async def test_capture_failure_retains_publication_without_query_replay(
     arguments = {
         "source_id": source.id,
         "resource_ids": [resource.id],
-        "sql": "SELECT n FROM numbers",
-        "format": "csv" if failure == "format" else "arrow",
+        **(
+            {"statements": [{"sql": "SELECT n FROM numbers"}]}
+            if failure == "statements"
+            else {"sql": "SELECT n FROM numbers"}
+        ),
+        "output": "csv" if failure == "format" else "arrow",
     }
     name = "../outside" if failure == "name" else "numbers"
     model.replace_script(
@@ -1368,7 +1370,7 @@ async def test_capture_failure_retains_publication_without_query_replay(
                 {
                     "tool_names": [
                         "python_execute",
-                        *([] if failure == "unloaded" else ["data_export_tabular"]),
+                        "data_query",
                     ]
                 },
             ),
@@ -1376,7 +1378,7 @@ async def test_capture_failure_retains_publication_without_query_replay(
                 "capture",
                 "python_execute",
                 {
-                    "code": f"r = tools.capture('data_export_tabular', {arguments!r}, name={name!r})\nassert r['is_error'], r\n"
+                    "code": f"r = tools.capture('data_query', {arguments!r}, name={name!r})\nassert r['is_error'], r\n"
                     + (
                         "assert 'artifact' in r['output']\n"
                         if failure == "parser"
@@ -1441,7 +1443,7 @@ async def test_capture_failure_retains_publication_without_query_replay(
         evidence = await agent.analysis_evidence(result.run_id)
         children = [r for r in evidence if r.kind == "child"]
         assert len(children) == 1
-        assert calls == (0 if failure in {"name", "unloaded", "format"} else 1)
+        assert calls == (0 if failure in {"name", "statements", "format"} else 1)
         committed = failure in {
             "parser",
             "revocation",
@@ -1528,21 +1530,21 @@ async def test_capture_metadata_delivery_bound_keeps_committed_reference(
             "source_id": source.id,
             "resource_ids": [resource.id],
             "sql": "SELECT * FROM wide",
-            "format": "arrow",
+            "output": "arrow",
         }
         model.replace_script(
             (
                 _tool(
                     "load",
                     "toolbox_load",
-                    {"tool_names": ["python_execute", "data_export_tabular"]},
+                    {"tool_names": ["python_execute", "data_query"]},
                 ),
                 _tool(
                     "capture",
                     "python_execute",
                     {
                         "expected_state": {"generation": 0, "revision": 0},
-                        "code": f"r = tools.capture('data_export_tabular', {arguments!r}, name='wide')\nassert r['is_error'], r\nassert r['output']['artifact']['artifact_id']\nprint('reference retained')",
+                        "code": f"r = tools.capture('data_query', {arguments!r}, name='wide')\nassert r['is_error'], r\nassert r['output']['artifact']['artifact_id']\nprint('reference retained')",
                     },
                 ),
                 ModelResponse(

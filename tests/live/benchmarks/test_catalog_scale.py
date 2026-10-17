@@ -1,7 +1,7 @@
 """Live Stage B resource-selection benchmark with look-alike catalog entries.
 
 The complete module authorizes at most six live ``Agent.run`` interactions for
-the default model: one immediate read and one durable admission at each of three
+the default model: one immediate read and one aggregate profile at each of three
 catalog sizes. Every interaction retains the shared cost and runtime ceilings.
 """
 
@@ -12,23 +12,19 @@ from pathlib import Path
 
 import pytest
 
-from daita import GraphState
 from tests.support.job_benchmarks import (
     DEFAULT_MODEL_ID,
     IMMEDIATE_AMOUNT,
     IMMEDIATE_TOKEN,
+    PROFILE_NULL_VALUES,
     PROFILE_SAMPLE_ROWS,
     TARGET_PROFILE_TABLE,
     assert_completed,
-    assert_on_demand_invocation,
-    assert_profile_result,
     benchmark_marks,
     capture_run,
     create_live_agent,
-    job_id_from_start,
     logical_names,
     record_metrics,
-    wait_for_terminal,
 )
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_STAGE_B_CATALOG_BENCHMARK"
@@ -62,7 +58,6 @@ async def test_immediate_target_survives_catalog_distractors(
         record_metrics(record_property, DEFAULT_MODEL_ID, capture)
         names = logical_names(capture.transcript)
         assert "data_query" in names
-        assert "start_data_profile" not in names
         assert await fixture.agent.list_jobs() == ()
         assert capture.result.final_text is not None
         assert IMMEDIATE_TOKEN in capture.result.final_text
@@ -86,24 +81,25 @@ async def test_profile_target_survives_catalog_distractors(
     try:
         capture = await capture_run(
             fixture,
-            "Start a durable background profile for the exact current table "
-            "stage_b_profile_probe with a five-row sample. Do not choose any "
-            "archive or backup table, and return as soon as the work is accepted.",
+            "Profile the exact current table stage_b_profile_probe: report its row "
+            "count and how many nullable_code values are null. Do not choose any "
+            "archive or backup table.",
             source_id=fixture.source_id,
         )
         assert_completed(capture)
         record_metrics(record_property, DEFAULT_MODEL_ID, capture)
-        assert_on_demand_invocation(capture, "start_data_profile")
-        job_id = job_id_from_start(capture.transcript)
-        terminal = await wait_for_terminal(fixture.agent, job_id)
-        assert terminal.job.state is GraphState.SUCCEEDED
-        assert terminal.job.specification.authority.resource_ids == (
-            fixture.resource_ids[TARGET_PROFILE_TABLE],
-        )
-        result = await fixture.agent.read_job_result(job_id)
-        assert result is not None
-        assert result.payload["sampled_rows"] == PROFILE_SAMPLE_ROWS
-        await assert_profile_result(fixture.agent, job_id)
+        assert "data_query" in logical_names(capture.transcript)
+        assert await fixture.agent.list_jobs() == ()
+        target = fixture.resource_ids[TARGET_PROFILE_TABLE]
+        queried = [
+            call.arguments.get("resource_ids")
+            for call, _ in capture.transcript.tool_pairs
+            if call.name == "data_query"
+        ]
+        assert queried and all(item in ([target], (target,)) for item in queried)
+        assert capture.result.final_text is not None
+        assert str(PROFILE_SAMPLE_ROWS) in capture.result.final_text
+        assert str(PROFILE_NULL_VALUES) in capture.result.final_text
     finally:
         await fixture.close()
 

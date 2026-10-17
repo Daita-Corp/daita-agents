@@ -90,10 +90,27 @@ ROUTINE_INSPECT_EXECUTOR_ID = "routines.inspect.executor"
 ROUTINE_INSPECT_TOOL_NAME = "routine_inspect"
 ROUTINE_CREATE_CAPABILITY_ID = "routines.create"
 ROUTINE_CREATE_EXECUTOR_ID = "routines.create.executor"
-ROUTINE_CREATE_TOOL_NAME = "routine_create"
 ROUTINE_UPDATE_CAPABILITY_ID = "routines.update"
 ROUTINE_UPDATE_EXECUTOR_ID = "routines.update.executor"
-ROUTINE_UPDATE_TOOL_NAME = "routine_update"
+ROUTINE_SAVE_TOOL_NAME = "routine_save"
+ROUTINE_SAVE_DESCRIPTION = (
+    "Save one finite routine with frozen grants from a self-contained "
+    "instruction. Omit routine_id to create; pass routine_id and "
+    "expected_revision to replace that exact revision. Relative timing "
+    "(after_seconds, anchor_after_seconds, once_next_weekday, "
+    "expires_after_seconds) and run_immediately are create-only; set "
+    "expires_at or expires_after_seconds. Omitted options default to "
+    "misfire_policy skip and no connector bindings, grants, skills, precheck "
+    "or dollar ceilings."
+)
+ROUTINE_SAVE_SUMMARIZED_ARGUMENTS = (
+    "requested_capability_grants",
+    "precheck",
+    "allowed_connector_binding_ids",
+    "per_run_max_cost_usd",
+    "cumulative_max_cost_usd",
+    "basis_run_id",
+)
 ROUTINE_CONTROL_CAPABILITY_ID = "routines.control"
 ROUTINE_CONTROL_EXECUTOR_ID = "routines.control.executor"
 ROUTINE_CONTROL_TOOL_NAME = "routine_control"
@@ -303,15 +320,9 @@ class RoutineCapabilityDomain:
     async def project(self, run: RunInput) -> tuple[str, ...]:
         if run.agent_id != self._owner.agent_id or run.origin is not RunOrigin.USER:
             return ()
-        names = {ROUTINE_LIST_TOOL_NAME, ROUTINE_CREATE_TOOL_NAME}
+        names = {ROUTINE_LIST_TOOL_NAME, ROUTINE_SAVE_TOOL_NAME}
         if await self._owner.list(limit=1):
-            names.update(
-                {
-                    ROUTINE_INSPECT_TOOL_NAME,
-                    ROUTINE_UPDATE_TOOL_NAME,
-                    ROUTINE_CONTROL_TOOL_NAME,
-                }
-            )
+            names.update({ROUTINE_INSPECT_TOOL_NAME, ROUTINE_CONTROL_TOOL_NAME})
         return tuple(view.name for view in self._views if view.name in names)
 
     def normalize_arguments(
@@ -351,6 +362,8 @@ class RoutineCapabilityDomain:
                     "routine_instruction_sensitivity_exceeded",
                     "The saved instruction must retain the full request sensitivity.",
                 )
+        if capability.id == ROUTINE_UPDATE_CAPABILITY_ID:
+            _require_exact_revision_timing(arguments)
         if capability.id == ROUTINE_CREATE_CAPABILITY_ID and _has_temporal_intent(
             arguments
         ):
@@ -547,59 +560,71 @@ def routine_capability_declarations(
         RoutineUpdateExecutor(owner),
         RoutineControlExecutor(owner),
     )
-    names = {
-        ROUTINE_LIST_CAPABILITY_ID: ROUTINE_LIST_TOOL_NAME,
-        ROUTINE_INSPECT_CAPABILITY_ID: ROUTINE_INSPECT_TOOL_NAME,
-        ROUTINE_CREATE_CAPABILITY_ID: ROUTINE_CREATE_TOOL_NAME,
-        ROUTINE_UPDATE_CAPABILITY_ID: ROUTINE_UPDATE_TOOL_NAME,
-        ROUTINE_CONTROL_CAPABILITY_ID: ROUTINE_CONTROL_TOOL_NAME,
-    }
-    guidance = {
-        ROUTINE_LIST_CAPABILITY_ID: (
-            "List scheduled routines.",
-            "Use for routine inventory.",
-            ("routine", "list"),
-        ),
-        ROUTINE_INSPECT_CAPABILITY_ID: (
-            "Inspect one scheduled routine.",
-            "Use for exact schedule, scope, budget, and recent occurrence details.",
-            ("routine", "inspect", "history"),
-        ),
-        ROUTINE_CREATE_CAPABILITY_ID: (
-            "Create one scheduled assignment with exact action limits.",
-            "Discover assignment capabilities and their automation_contract in toolbox_search, and the Inbox destination. Load routine_create to author the schedule and exact grants; relative once and interval timing need no clock query. Assignment execution tools need not be loaded.",
-            ("routine", "schedule", "create"),
-        ),
-        ROUTINE_UPDATE_CAPABILITY_ID: (
-            "Revise one scheduled routine.",
-            "Use to replace a routine contract at an exact revision.",
-            ("routine", "update", "revise"),
-        ),
-        ROUTINE_CONTROL_CAPABILITY_ID: (
-            "Control one scheduled routine.",
-            "Use to pause, resume, run now, or disable an exact revision.",
-            ("routine", "pause", "resume", "disable"),
-        ),
-    }
-    views = tuple(
-        ToolView(
-            name=names[capability.id],
-            capability_id=capability.id,
-            description=capability.description,
-            presentation=ToolPresentation(
-                toolbox_id=ToolboxId.ROUTINES,
-                load_mode=(
-                    ToolLoadMode.PINNED
-                    if capability.id == ROUTINE_LIST_CAPABILITY_ID
-                    else ToolLoadMode.ON_DEMAND
-                ),
-                text_trust=ToolTextTrust.CODE,
-                summary=guidance[capability.id][0],
-                when_to_use=guidance[capability.id][1],
-                keywords=guidance[capability.id][2],
-            ),
+
+    def presentation(
+        summary: str,
+        when_to_use: str,
+        keywords: tuple[str, ...],
+        load_mode: ToolLoadMode = ToolLoadMode.ON_DEMAND,
+    ) -> ToolPresentation:
+        return ToolPresentation(
+            toolbox_id=ToolboxId.ROUTINES,
+            load_mode=load_mode,
+            text_trust=ToolTextTrust.CODE,
+            summary=summary,
+            when_to_use=when_to_use,
+            keywords=keywords,
         )
-        for capability in capabilities
+
+    views = (
+        ToolView(
+            name=ROUTINE_LIST_TOOL_NAME,
+            capability_id=list_capability.id,
+            description=list_capability.description,
+            presentation=presentation(
+                "List scheduled routines.",
+                "Use for routine inventory.",
+                ("routine", "list"),
+                ToolLoadMode.PINNED,
+            ),
+        ),
+        ToolView(
+            name=ROUTINE_INSPECT_TOOL_NAME,
+            capability_id=inspect_capability.id,
+            description=inspect_capability.description,
+            presentation=presentation(
+                "Inspect one scheduled routine.",
+                "Use for exact schedule, scope, budget, and recent occurrence details.",
+                ("routine", "inspect", "history"),
+            ),
+        ),
+        ToolView(
+            name=ROUTINE_SAVE_TOOL_NAME,
+            capability_id=create_capability.id,
+            description=ROUTINE_SAVE_DESCRIPTION,
+            presentation=presentation(
+                "Create or revise one scheduled assignment with exact action limits.",
+                "Discover assignment capabilities and their automation_contract in toolbox_search, and the Inbox destination. Load routine_save to author the schedule and exact grants; relative once and interval timing need no clock query. Assignment execution tools need not be loaded.",
+                ("routine", "schedule", "create", "update", "revise"),
+            ),
+            mode_capability_ids=(
+                ("create", create_capability.id),
+                ("update", update_capability.id),
+            ),
+            mode_argument="routine_id",
+            mode_by_presence=True,
+            summarized_arguments=ROUTINE_SAVE_SUMMARIZED_ARGUMENTS,
+        ),
+        ToolView(
+            name=ROUTINE_CONTROL_TOOL_NAME,
+            capability_id=control_capability.id,
+            description=control_capability.description,
+            presentation=presentation(
+                "Control one scheduled routine.",
+                "Use to pause, resume, run now, or disable an exact revision.",
+                ("routine", "pause", "resume", "disable"),
+            ),
+        ),
     )
     return RoutineCapabilityDeclarations(capabilities, executors, views)
 
@@ -658,6 +683,7 @@ async def _update_proposal(
             "routine_conversation_required",
             "Routine revision requires an exact conversation.",
         )
+    _require_exact_revision_timing(request.arguments)
     routine_id = _string(request.arguments, "routine_id")
     expected = _integer(request.arguments, "expected_revision")
     inspection = await owner.inspect(routine_id)
@@ -727,12 +753,18 @@ def _parsed_spec(
             reference_at=reference_at,
             relative_at=relative_at,
         ),
-        "misfire_policy": MisfirePolicy(_string(arguments, "misfire_policy")),
+        "misfire_policy": MisfirePolicy(
+            _string(arguments, "misfire_policy")
+            if "misfire_policy" in arguments
+            else MisfirePolicy.SKIP.value
+        ),
         "reporting_mode": ReportingMode(_string(arguments, "reporting_mode")),
         "precheck": _parse_precheck(arguments.get("precheck")),
         "allowed_source_ids": _strings(arguments, "allowed_source_ids"),
-        "allowed_connector_binding_ids": _strings(
-            arguments, "allowed_connector_binding_ids"
+        "allowed_connector_binding_ids": (
+            _strings(arguments, "allowed_connector_binding_ids")
+            if "allowed_connector_binding_ids" in arguments
+            else ()
         ),
         "allowed_resource_ids": _strings(arguments, "allowed_resource_ids"),
         "allowed_capability_ids": _strings(arguments, "allowed_capability_ids"),
@@ -757,18 +789,29 @@ def _parsed_spec(
         "maximum_consecutive_failures": _integer(
             arguments, "maximum_consecutive_failures"
         ),
-        "expires_at": (
-            _relative_instant(arguments, "expires_after_seconds", relative_at)
-            if "expires_after_seconds" in arguments
-            else _datetime(_string(arguments, "expires_at"))
+        "expires_at": _expires_at(arguments, relative_at),
+        "skill_names": (
+            _strings(arguments, "skill_names") if "skill_names" in arguments else ()
         ),
-        "skill_names": _strings(arguments, "skill_names"),
         "basis_run_id": (
             None
             if arguments.get("basis_run_id") is None
             else _string(arguments, "basis_run_id")
         ),
     }
+
+
+def _expires_at(
+    arguments: Mapping[str, object], relative_at: datetime | None
+) -> datetime:
+    if ("expires_at" in arguments) == ("expires_after_seconds" in arguments):
+        raise CapabilityInputError(
+            "routine_expiration_invalid",
+            "Set exactly one of expires_at or expires_after_seconds.",
+        )
+    if "expires_after_seconds" in arguments:
+        return _relative_instant(arguments, "expires_after_seconds", relative_at)
+    return _datetime(_string(arguments, "expires_at"))
 
 
 def _parse_schedule(
@@ -778,6 +821,51 @@ def _parse_schedule(
     relative_at: datetime | None = None,
 ) -> RoutineSchedule:
     kind = _string(value, "kind")
+    unexpected = set(value) - {"kind"} - _SCHEDULE_KEYS.get(kind, frozenset())
+    if kind not in _SCHEDULE_KEYS or unexpected:
+        raise CapabilityInputError(
+            "routine_schedule_invalid",
+            (
+                f"Schedule kind {kind!r} does not accept: {', '.join(sorted(unexpected))}."
+                if kind in _SCHEDULE_KEYS
+                else "Schedule kind must be once, interval, once_next_weekday, or calendar."
+            ),
+        )
+    if kind == "once" and ("exact_at" in value) == ("after_seconds" in value):
+        raise CapabilityInputError(
+            "routine_schedule_invalid",
+            "A once schedule needs exact_at or after_seconds.",
+        )
+    if kind == "interval" and ("anchor_at" in value) == (
+        "anchor_after_seconds" in value
+    ):
+        raise CapabilityInputError(
+            "routine_schedule_invalid",
+            "An interval schedule needs anchor_at or anchor_after_seconds.",
+        )
+    try:
+        return _typed_schedule(
+            value, kind, reference_at=reference_at, relative_at=relative_at
+        )
+    except CapabilityInputError:
+        raise
+    except (TypeError, ValueError) as error:
+        message = str(error)
+        if kind == "calendar":
+            message += (
+                ". Correct the schedule: day_selector weekdays takes weekdays, "
+                "month_days takes month_days, every_day takes neither."
+            )
+        raise CapabilityInputError("routine_schedule_invalid", message) from error
+
+
+def _typed_schedule(
+    value: Mapping[str, object],
+    kind: str,
+    *,
+    reference_at: datetime | None = None,
+    relative_at: datetime | None = None,
+) -> RoutineSchedule:
     if kind == "once":
         if "after_seconds" in value:
             return OnceSchedule(_relative_instant(value, "after_seconds", relative_at))
@@ -814,7 +902,7 @@ def _parse_schedule(
             timezone=_string(value, "timezone"),
             hour=_integer(value, "hour"),
             minute=_integer(value, "minute"),
-            day_selector=CalendarDaySelector(_string(value, "day_selector")),
+            day_selector=_calendar_day_selector(value),
             weekdays=_optional_integers(value, "weekdays"),
             month_days=_optional_integers(value, "month_days"),
             months=_optional_integers(value, "months"),
@@ -828,6 +916,19 @@ def _parse_schedule(
     raise CapabilityInputError(
         "routine_schedule_invalid", "Schedule kind must be once, interval, or calendar."
     )
+
+
+def _calendar_day_selector(value: Mapping[str, object]) -> CalendarDaySelector:
+    """An omitted selector follows the day filters given; none means every day."""
+
+    if "day_selector" in value:
+        return CalendarDaySelector(_string(value, "day_selector"))
+    weekdays, month_days = value.get("weekdays"), value.get("month_days")
+    if weekdays and not month_days:
+        return CalendarDaySelector.WEEKDAYS
+    if month_days and not weekdays:
+        return CalendarDaySelector.MONTH_DAYS
+    return CalendarDaySelector.EVERY_DAY
 
 
 def _relative_instant(
@@ -858,6 +959,18 @@ def _has_relative_timing(arguments: Mapping[str, object]) -> bool:
             and ("after_seconds" in schedule or "anchor_after_seconds" in schedule)
         )
     )
+
+
+def _require_exact_revision_timing(arguments: Mapping[str, object]) -> None:
+    """A replacement keeps exact timing; creation alone resolves relative intent."""
+
+    if _has_temporal_intent(arguments) or arguments.get("run_immediately") is True:
+        raise CapabilityInputError(
+            "routine_timing_create_only",
+            "Relative or next-weekday timing, expires_after_seconds and "
+            "run_immediately are create-only; a replacement uses exact "
+            "timestamps and expires_at.",
+        )
 
 
 def _has_temporal_intent(arguments: Mapping[str, object]) -> bool:
@@ -994,179 +1107,98 @@ def _parse_outcome_contract(value: Mapping[str, object]) -> OutcomeContract:
         ) from error
 
 
-def _schedule_schema(*, relative: bool = False) -> dict[str, object]:
-    """The model sees the same finite schedule family the owner accepts."""
-    calendar: dict[str, object] = {
-        "kind": {"type": "string", "enum": ["calendar"]},
-        "timezone": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256,
-            "description": "Exact IANA timezone, such as America/Chicago.",
-        },
-        "hour": {"type": "integer", "minimum": 0, "maximum": 23},
-        "minute": {"type": "integer", "minimum": 0, "maximum": 59},
-        "months": {
+_SCHEDULE_KEYS: dict[str, frozenset[str]] = {
+    "once": frozenset({"exact_at", "after_seconds"}),
+    "interval": frozenset({"interval_seconds", "anchor_at", "anchor_after_seconds"}),
+    "once_next_weekday": frozenset({"timezone", "weekday", "hour", "minute"}),
+    "calendar": frozenset(
+        {
+            "timezone",
+            "hour",
+            "minute",
+            "day_selector",
+            "weekdays",
+            "month_days",
+            "months",
+            "nonexistent_time_policy",
+            "ambiguous_time_policy",
+        }
+    ),
+}
+
+
+def _schedule_schema() -> dict[str, object]:
+    """One flat typed schedule; the owner checks which keys each kind uses."""
+
+    def days(maximum: int) -> dict[str, object]:
+        return {
             "type": "array",
             "uniqueItems": True,
-            "maxItems": 12,
-            "items": {"type": "integer", "minimum": 1, "maximum": 12},
-            "description": "Sorted month numbers; omit or use [] for every month.",
-        },
-        "nonexistent_time_policy": {
-            "type": "string",
-            "enum": [item.value for item in NonexistentTimePolicy],
-            "description": "Default: skip.",
-        },
-        "ambiguous_time_policy": {
-            "type": "string",
-            "enum": [item.value for item in AmbiguousTimePolicy],
-            "description": "Default: first.",
-        },
-    }
-    branches: list[dict[str, object]] = [
-        {
-            "type": "object",
-            "properties": {
-                "kind": {"type": "string", "enum": ["once"]},
-                "exact_at": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 64,
-                    "description": "Exact ISO 8601 timestamp with timezone.",
-                },
-            },
-            "required": ["kind", "exact_at"],
-            "additionalProperties": False,
-        },
-        {
-            "type": "object",
-            "properties": {
-                "kind": {"type": "string", "enum": ["interval"]},
-                "interval_seconds": {
-                    "type": "integer",
-                    "minimum": MIN_ROUTINE_INTERVAL_SECONDS,
-                    "maximum": MAX_ROUTINE_INTERVAL_SECONDS,
-                },
-                "anchor_at": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 64,
-                    "description": "Exact ISO 8601 anchor timestamp with timezone.",
-                },
-            },
-            "required": ["kind", "interval_seconds", "anchor_at"],
-            "additionalProperties": False,
-        },
-    ]
-    if relative:
-        branches.extend(
-            (
-                {
-                    "type": "object",
-                    "properties": {
-                        "kind": {"type": "string", "enum": ["once"]},
-                        "after_seconds": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": MAX_RELATIVE_SCHEDULE_SECONDS,
-                            "description": "Run once this many seconds after approval and creation.",
-                        },
-                    },
-                    "required": ["kind", "after_seconds"],
-                    "additionalProperties": False,
-                },
-                {
-                    "type": "object",
-                    "properties": {
-                        "kind": {"type": "string", "enum": ["interval"]},
-                        "interval_seconds": {
-                            "type": "integer",
-                            "minimum": MIN_ROUTINE_INTERVAL_SECONDS,
-                            "maximum": MAX_ROUTINE_INTERVAL_SECONDS,
-                        },
-                        "anchor_after_seconds": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "maximum": MAX_RELATIVE_SCHEDULE_SECONDS,
-                            "description": "First scheduled slot this many seconds after creation; use run_immediately for an additional immediate slot.",
-                        },
-                    },
-                    "required": ["kind", "interval_seconds", "anchor_after_seconds"],
-                    "additionalProperties": False,
-                },
-                {
-                    "type": "object",
-                    "description": "Run once at the next occurrence of this local weekday and time.",
-                    "properties": {
-                        "kind": {"type": "string", "enum": ["once_next_weekday"]},
-                        "timezone": {
-                            "type": "string",
-                            "minLength": 1,
-                            "maxLength": 128,
-                            "description": "Exact IANA timezone; use the trusted user-local timezone when not specified by the user.",
-                        },
-                        "weekday": {"type": "integer", "minimum": 1, "maximum": 7},
-                        "hour": {"type": "integer", "minimum": 0, "maximum": 23},
-                        "minute": {"type": "integer", "minimum": 0, "maximum": 59},
-                    },
-                    "required": ["kind", "timezone", "weekday", "hour", "minute"],
-                    "additionalProperties": False,
-                },
-            )
-        )
-    calendar["day_selector"] = {
-        "type": "string",
-        "enum": [item.value for item in CalendarDaySelector],
-    }
-    for name, maximum in (("weekdays", 7), ("month_days", 31)):
-        calendar[name] = {
-            "type": "array",
-            "uniqueItems": True,
+            "maxItems": maximum,
             "items": {"type": "integer", "minimum": 1, "maximum": maximum},
-            "description": (
-                "Sorted numbers. ISO weekdays: Monday=1, Sunday=7."
-                if name == "weekdays"
-                else "Sorted day-of-month numbers; nonexistent dates are skipped."
-            ),
         }
-    selectors = []
-    for selector in CalendarDaySelector:
-        properties: dict[str, object] = {
-            "day_selector": {"enum": [selector.value]},
-        }
-        required = ["day_selector"]
-        for name, maximum, selected in (
-            ("weekdays", 7, selector is CalendarDaySelector.WEEKDAYS),
-            ("month_days", 31, selector is CalendarDaySelector.MONTH_DAYS),
-        ):
-            properties[name] = {
-                "minItems": 1 if selected else 0,
-                "maxItems": maximum if selected else 0,
-            }
-            if selected:
-                required.append(name)
-        selectors.append(
-            {"type": "object", "properties": properties, "required": required}
-        )
-    # Shared calendar constraints apply once; selectors only add their differences.
-    branches.append(
-        {
-            "type": "object",
-            "properties": calendar,
-            "required": ["kind", "timezone", "hour", "minute", "day_selector"],
-            "additionalProperties": False,
-            "oneOf": selectors,
-        }
-    )
+
+    relative = {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": MAX_RELATIVE_SCHEDULE_SECONDS,
+    }
+    instant = {"type": "string", "minLength": 1, "maxLength": 64}
     return {
         "type": "object",
-        "description": "Use exactly one typed schedule. Cron expressions and RRULE strings are unsupported.",
-        "oneOf": branches,
+        "description": (
+            "once: exact_at or after_seconds. interval: interval_seconds with "
+            "anchor_at or anchor_after_seconds. once_next_weekday: timezone, "
+            "weekday (Monday=1), hour, minute. calendar: timezone, hour, minute, "
+            "sorted weekdays or month_days (neither means every day), optional "
+            "months. Omit keys a kind does not use. Instants are ISO 8601 with "
+            "timezone; timezones are IANA. No cron or RRULE. Calendar policies "
+            "default to skip and first."
+        ),
+        "properties": {
+            "kind": {"type": "string", "enum": list(_SCHEDULE_KEYS)},
+            "exact_at": instant,
+            "after_seconds": relative,
+            "interval_seconds": {
+                "type": "integer",
+                "minimum": MIN_ROUTINE_INTERVAL_SECONDS,
+                "maximum": MAX_ROUTINE_INTERVAL_SECONDS,
+            },
+            "anchor_at": instant,
+            "anchor_after_seconds": relative,
+            "timezone": {"type": "string", "minLength": 1, "maxLength": 256},
+            "weekday": {"type": "integer", "minimum": 1, "maximum": 7},
+            "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+            "minute": {"type": "integer", "minimum": 0, "maximum": 59},
+            "day_selector": {
+                "type": "string",
+                "enum": [item.value for item in CalendarDaySelector],
+            },
+            "weekdays": days(7),
+            "month_days": days(31),
+            "months": days(12),
+            "nonexistent_time_policy": {
+                "type": "string",
+                "enum": [item.value for item in NonexistentTimePolicy],
+            },
+            "ambiguous_time_policy": {
+                "type": "string",
+                "enum": [item.value for item in AmbiguousTimePolicy],
+            },
+        },
+        "required": ["kind"],
+        "additionalProperties": False,
     }
 
 
 def _spec_schema(*, update: bool) -> dict[str, object]:
+    """Create and update share every common rule so routine_save can merge them.
+
+    Optional arguments have code-owned defaults that never widen scope, grants
+    or budgets: misfire skip, no connector bindings, grants, skills, precheck,
+    dollar ceilings or immediate run. Relative timing is create-only.
+    """
+
     properties: dict[str, object] = {
         "title": {
             "type": "string",
@@ -1178,19 +1210,11 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
             "minLength": 1,
             "maxLength": MAX_ROUTINE_INSTRUCTION_BYTES,
         },
-        "schedule": _schedule_schema(relative=not update),
-        "run_immediately": (
-            {
-                "type": "boolean",
-                "enum": [False],
-                "description": "Omit or use false for a revision. Immediate execution belongs to creation; use the existing run-now control separately.",
-            }
-            if update
-            else {
-                "type": "boolean",
-                "description": "True adds one immediate interval/calendar occurrence; false is scheduled-only, including once schedules.",
-            }
-        ),
+        "schedule": _schedule_schema(),
+        "run_immediately": {
+            "type": "boolean",
+            "description": "Create only: true adds one immediate occurrence.",
+        },
         "requested_capability_grants": {
             "type": "array",
             "maxItems": MAX_ROUTINE_IDENTITY_ITEMS,
@@ -1291,6 +1315,12 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
             "maximum": MAX_ROUTINE_CONSECUTIVE_FAILURES,
         },
         "expires_at": {"type": "string", "minLength": 1, "maxLength": 64},
+        "expires_after_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": MAX_RELATIVE_SCHEDULE_SECONDS,
+            "description": "Create only, instead of expires_at: seconds after creation.",
+        },
         "skill_names": {
             "type": "array",
             "items": {
@@ -1307,10 +1337,8 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
         "title",
         "authorized_instruction",
         "schedule",
-        "misfire_policy",
         "reporting_mode",
         "allowed_source_ids",
-        "allowed_connector_binding_ids",
         "allowed_resource_ids",
         "allowed_capability_ids",
         "sensitivity_ceiling",
@@ -1322,10 +1350,8 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
         "cumulative_max_attempts",
         "cumulative_max_occurrences",
         "maximum_consecutive_failures",
-        "skill_names",
     ]
     if update:
-        required.append("expires_at")
         properties.update(
             {
                 "routine_id": {"type": "string", "minLength": 1, "maxLength": 1024},
@@ -1333,26 +1359,12 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
             }
         )
         required.extend(("routine_id", "expected_revision"))
-    else:
-        required.append("run_immediately")
-        properties["expires_after_seconds"] = {
-            "type": "integer",
-            "minimum": 1,
-            "maximum": MAX_RELATIVE_SCHEDULE_SECONDS,
-            "description": "Expire this many seconds after approval and creation; choose a finite window after the last requested slot.",
-        }
-    result: dict[str, object] = {
+    return {
         "type": "object",
         "properties": properties,
         "required": required,
         "additionalProperties": False,
     }
-    if not update:
-        result["oneOf"] = [
-            {"type": "object", "required": ["expires_at"]},
-            {"type": "object", "required": ["expires_after_seconds"]},
-        ]
-    return result
 
 
 def _routine_id_schema() -> dict[str, object]:

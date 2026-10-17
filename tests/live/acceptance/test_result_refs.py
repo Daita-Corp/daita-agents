@@ -2,7 +2,9 @@
 
 Two bounded cases on a local SQLite probe home:
 
-* foreground: query a table summary, then make a CSV of that query result;
+* foreground: a first turn queries a table summary and shows it; a second
+  turn asks for a CSV of that result, made either by one exact export or by
+  a derived table citing a query of the same tables;
 * graph: a durable model worker runs its read and finishes with task_complete.
 
 Pass condition: the right result is referenced on the first try, and no call is
@@ -140,40 +142,74 @@ async def test_l8_csv_of_a_query_result_cites_that_result(
         model_profile=profile,
         limits=LoopLimits(
             max_steps=10,
-            max_total_tokens=60_000,
+            max_total_tokens=100_000,
             max_estimated_cost_usd=cost_cap(_cost_limit()),
         ),
         workspace=workspace_for(home.root),
     )
     try:
+        # Rows are shown first; the follow-up asks for a CSV of what was shown,
+        # which should cite that result rather than query or export again.
+        shown = await agent.run(
+            "Use one query to count the rows in every table of this source.",
+            source_scope_ids=(home.source_id,),
+        )
+        assert shown.kind is LoopExitKind.COMPLETED
+        assert shown.conversation_id is not None
         result = await agent.run(
-            "Use one query to count the rows in every table of this source. "
-            "Then make a CSV of that query result.",
+            "Make a CSV of that result.",
+            conversation_id=shown.conversation_id,
             source_scope_ids=(home.source_id,),
         )
         assert result.kind is LoopExitKind.COMPLETED
+        first = await agent._embedded._store.load(shown.run_id)
         transcript = await agent._embedded._store.load(result.run_id)
+        _assert_no_ref_rejections(first)
         _assert_no_ref_rejections(transcript)
-        pairs = transcript.tool_pairs
+        queries = _successful(first, "data_query")
+        assert queries, "the counts must come from a successful query"
+        # The artifact is the deliverable; nobody asked for a local copy.
+        assert not _successful(transcript, "artifact_save_local")
+        exports = [
+            call
+            for _index, call, _result in _successful(transcript, "data_query")
+            if call.arguments.get("output") in {"csv", "xlsx"}
+        ]
         artifact_calls = [
-            (index, call, block)
-            for index, (call, block) in enumerate(pairs)
-            if call.name == "artifact_create_tabular"
+            (call, block)
+            for call, block in transcript.tool_pairs
+            if call.name == "artifact_create"
         ]
+        # Either path is a correct CSV: one exact export of the same query, or
+        # a derived table that cites the shown result by its visible ref.
+        if exports and not artifact_calls:
+            assert len(exports) == 1, "the CSV must be exported once"
+            # The export reads the same tables as the query that was shown.
+            assert set(
+                cast(tuple[str, ...], exports[0].arguments["resource_ids"])
+            ) == set(cast(tuple[str, ...], queries[-1][1].arguments["resource_ids"]))
+            return
         assert len(artifact_calls) == 1, "the CSV must be created on the first try"
-        artifact_index, artifact_call, artifact_result = artifact_calls[0]
+        artifact_call, artifact_result = artifact_calls[0]
         assert artifact_result is not None and not artifact_result.is_error
-        queries = [
-            item
-            for item in _successful(transcript, "data_query")
-            if item[0] < artifact_index
-        ]
-        assert queries, "the CSV must follow a successful query"
         data = artifact_result.output["data"]
         assert isinstance(data, Mapping)
         cited = tuple(cast(tuple[str, ...], data["evidence_call_ids"]))
-        # The visible ref the model cited resolves to the query it just ran.
-        assert cited == (queries[-1][1].id,)
+        # The visible ref the model cited resolves to one query of the same
+        # tables: the one shown, or a fresh read of them in this turn.
+        shown_tables = set(
+            cast(tuple[str, ...], queries[-1][1].arguments["resource_ids"])
+        )
+        reads = {
+            call.id
+            for _index, call, _result in (
+                *queries,
+                *_successful(transcript, "data_query"),
+            )
+            if set(cast(tuple[str, ...], call.arguments["resource_ids"]))
+            == shown_tables
+        }
+        assert len(cited) == 1 and cited[0] in reads
         assert all(
             not str(ref).startswith(("call_", "toolu_"))
             for ref in cast(

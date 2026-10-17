@@ -113,10 +113,9 @@ async def test_memory_set_identity_projection_and_read_tools_never_ask_approval(
         names = tuple(item.view.name for item in catalog.entries)
         assert len(names) == len(set(names))
         assert {
-            "artifact_create_document",
+            "artifact_create",
             "artifact_set_export_location",
             "memory_set",
-            "skill_delete",
             "skill_save",
             "skill_view",
         } <= set(names)

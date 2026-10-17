@@ -163,8 +163,12 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
                 tool_calls=(
                     ToolCall(
                         id="create",
-                        name="artifact_create_document",
-                        arguments={"format": "txt", "content": "report"},
+                        name="artifact_create",
+                        arguments={
+                            "from": "document",
+                            "format": "txt",
+                            "content": "report",
+                        },
                     ),
                 ),
             ),

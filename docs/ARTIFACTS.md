@@ -11,25 +11,28 @@ creation and deletion.
 
 Choose a tabular tool by the kind of evidence you need:
 
-- `data_export_tabular` runs one validated relational query directly against
-  exact current catalog resources and creates a complete CSV or XLSX artifact
-  within fixed source-export bounds. Its provenance is exact source data.
-- `artifact_create_tabular` packages bounded model-authored findings as CSV,
+- `data_query` with `output="csv"` or `output="xlsx"` runs one validated
+  relational `sql` statement directly against exact current catalog resources
+  and creates a complete CSV or XLSX artifact within fixed source-export bounds
+  (100,000 rows, 60 seconds). It returns the artifact reference, never rows,
+  and does not accept `statements`. Its provenance is exact source data. The
+  default `output="rows"` keeps the bounded preview behavior.
+- `artifact_create` with `from="table"` packages bounded model-authored findings as CSV,
   XLSX, or HTML. It requires one or more `evidence_refs`: the visible
   `result_ref` values (`r1`, `r2`, ...) of earlier successful results in the
   current run. Those results may come from catalog-backed data,
   local files, or admitted MCP tools.
 
-`artifact_create_tabular` does not claim that its rows are a complete or exact
+A `from="table"` artifact does not claim that its rows are a complete or exact
 copy of a source. Daita authenticates the referenced results against the
 current run transcript and immutable capability registry, inherits their
 highest sensitivity, and records their call IDs. Relational evidence also
 retains exact current catalog resource revisions.
 
-Use `artifact_create_document` for bounded Markdown or plain-text narrative.
+Use `artifact_create` with `from="document"` for bounded Markdown or plain-text narrative.
 It takes no evidence argument: the runtime records the preceding successful
 reads of the run as its evidence, with the same authentication, sensitivity,
-and provenance treatment. Use `artifact_snapshot_result` with one `result_ref`
+and provenance treatment. Use `from="tool_result"` with one `result_ref`
 when the requirement is an exact canonical JSON copy of one validated
 structured tool result rather than model-authored analysis.
 
@@ -66,7 +69,7 @@ Hosted listings filter by authenticated `caller_principal_id`. Only ready
 artifacts appear; clearing conversation history does not remove them.
 
 `artifact_list` lists metadata for the current conversation. `artifact_read`
-previews an exact artifact ID. `artifact_convert` converts a verified exact
+previews an exact artifact ID. `artifact_create` with `from="artifact"` converts a verified exact
 Daita XLSX snapshot to CSV without rerunning its source. `artifact_save_local`
 saves a copy to an approved local destination.
 
@@ -105,7 +108,7 @@ embedded text previews. Exported files, application delivery copies, and backups
 also remain. Application hosts must delete their own copies and coordinate
 deletion with any publication of previously fetched bytes.
 
-Exact Arrow IPC exports are available as `data_export_tabular(format="arrow")`
+Exact Arrow IPC exports are available as `data_query(output="arrow")`
 when the supported local scientific runtime is admitted. CSV/XLSX installations
 retain their existing declarations. Arrow reports projected column names and
 scalar types, row count, byte size, query/parameter digests, current resource

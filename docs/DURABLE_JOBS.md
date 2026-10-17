@@ -5,10 +5,13 @@ records its tasks, dependencies, attempts, results, and blockers in the agent
 home. Work can resume after the host reopens, but it progresses only while an
 agent host is open.
 
-Ask Daita to profile admitted data without changing it, or to start a bounded
-graph job for a larger objective. `start_data_profile` creates a fixed,
-read-only profile. `start_graph_job` starts one eligible task and a finalizer;
-the job can add bounded tasks when planning is authorized. A model route is
+Ask Daita to start a bounded graph job for a larger objective.
+`start_graph_job` starts one eligible task and a finalizer; the job can add
+bounded tasks when planning is authorized. Profiling a table needs no job:
+Daita answers with `data_query` aggregates (row counts, distinct counts, null
+counts, minimum and maximum) over the whole table. Profile jobs saved before
+the revision-2 home upgrade still run through their internal profile task and
+finalizer, and their results stay readable with the job tools. A model route is
 required for model-driven jobs. Like turn limits in other agent harnesses, each
 model task is bounded by its step (model-turn) limit, the host per-run token
 ceiling, its wall time and three attempts. Graph jobs carry no dollar ceiling,

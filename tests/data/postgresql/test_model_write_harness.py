@@ -407,18 +407,23 @@ async def test_exact_write_approval_fails_closed(tamper):
     )
 
 
+@pytest.mark.parametrize("profile", ["strict", "user_flow"])
 @pytest.mark.parametrize(
-    "column,value,accepted",
+    "where,accepted",
     [
-        ("id", 1, True),
-        ("domain", "existing.test", True),
-        ("name", "existing.test", False),
-        ("id", 2, False),
-        ("domain", "different.test", False),
+        ((("id", 1),), True),
+        ((("domain", "existing.test"),), True),
+        # A guard on the intended row's current value is the same approved write.
+        ((("domain", "existing.test"), ("name", "Before")), True),
+        ((("id", 1), ("domain", "existing.test"), ("name", "Before")), True),
+        ((("name", "existing.test"),), False),
+        ((("name", "Before"),), False),
+        ((("id", 2),), False),
+        ((("domain", "different.test"),), False),
     ],
 )
 async def test_update_approval_distinguishes_identity_from_a_positive_wrong_match(
-    column, value, accepted
+    where, accepted, profile
 ):
     # Both entities have a legitimate one-row selector. Count alone cannot
     # distinguish the intended domain from the other company's name.
@@ -426,9 +431,22 @@ async def test_update_approval_distinguishes_identity_from_a_positive_wrong_matc
         {"id": 1, "domain": "existing.test", "name": "Before"},
         {"id": 2, "domain": "different.test", "name": "existing.test"},
     ]
-    assert len([row for row in fixture_rows if row[column] == value]) == 1
+    assert (
+        len(
+            [
+                row
+                for row in fixture_rows
+                if all(row[column] == value for column, value in where)
+            ]
+        )
+        == 1
+    )
     scenario = Evaluation(
-        SimpleNamespace(source_id="source", resource_id="table"), None, [], 1
+        SimpleNamespace(source_id="source", resource_id="table"),
+        None,
+        [],
+        1,
+        profile=profile,
     )
     scenario.expect_update()
     assert scenario.expected_write is not None
@@ -441,11 +459,24 @@ async def test_update_approval_distinguishes_identity_from_a_positive_wrong_matc
             {
                 "arguments": {
                     **scenario.expected_write,
-                    "where": [{"column": column, "operator": "eq", "value": value}],
+                    "where": [
+                        {"column": column, "operator": "eq", "value": value}
+                        for column, value in where
+                    ],
                     "preview_fingerprint": "sha256:" + "a" * 64,
                 },
                 "target": {"source_id": "source", "resource_id": "table"},
-                "preview": {},
+                "preview": {
+                    "matched_rows": 1,
+                    "samples": [
+                        {
+                            "primary_key": [{"column": "id", "value": 1}],
+                            "before": [{"column": "name", "value": "Before"}],
+                            "after": [{"column": "name", "value": "Updated"}],
+                        }
+                    ],
+                    "warnings": [],
+                },
             }
         ),
         "Review the exact selected company",
@@ -489,7 +520,7 @@ async def test_routine_approval_checks_grant_and_validated_proposal(tamper, prof
     valid = ApprovalRequest(
         "run",
         "call",
-        "routine_create",
+        "routine_save",
         ROUTINE_CREATE_CAPABILITY_ID,
         FrozenJsonObject.from_mapping({"proposal": proposal}),
         "Exact proposal",

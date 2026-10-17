@@ -35,7 +35,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import LoopExitKind
-from tests.support.job_benchmarks import p95_bootstrap_interval
+from tests.support.job_benchmarks import admit_profile_job, p95_bootstrap_interval
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.slow
@@ -258,12 +258,12 @@ async def test_public_composition_throughput_campaign(tmp_path, monkeypatch):
         provider.calls = (
             ToolCall(
                 id="export",
-                name="data_export_tabular",
+                name="data_query",
                 arguments={
                     "source_id": source_id,
                     "resource_ids": [resource_id],
                     "sql": "SELECT id, label FROM records ORDER BY id",
-                    "format": "csv",
+                    "output": "csv",
                 },
             ),
         )
@@ -291,17 +291,11 @@ async def test_public_composition_throughput_campaign(tmp_path, monkeypatch):
             hold_graph.clear()
             graph_started.clear()
             blocked = True
-            provider.calls = tuple(
-                ToolCall(
-                    id=f"graph-{index}",
-                    name="start_data_profile",
-                    arguments={"resource_ids": [resource_id], "sample_rows": 5},
-                )
-                for index in range(4)
-            )
-            await _run(agent)
-            await asyncio.wait_for(graph_started.wait(), timeout=5)
             provider.calls = ()
+            origin = await _run(agent)
+            for _ in range(4):
+                await admit_profile_job(agent, resource_id, origin, sample_rows=5)
+            await asyncio.wait_for(graph_started.wait(), timeout=5)
             await _run(agent)
             blocked = False
             hold_graph.set()
@@ -382,7 +376,7 @@ async def test_public_composition_throughput_campaign(tmp_path, monkeypatch):
                     "source_id": bindings[0][0],
                     "resource_ids": [bindings[0][1]],
                     "sql": "SELECT id, label FROM records ORDER BY id",
-                    "format": "arrow",
+                    "output": "arrow",
                 }
 
                 async def python_dataset():
@@ -545,11 +539,7 @@ class _NativeProvider(_Provider):
             return ModelResponse(finish_reason=FinishReason.STOP, text="verified")
         required = {
             "python_execute",
-            *(
-                {"data_export_tabular"}
-                if self.mode in {"capture", "export_bind"}
-                else set()
-            ),
+            *({"data_query"} if self.mode in {"capture", "export_bind"} else set()),
         }
         if required - names:
             calls = (
@@ -563,7 +553,7 @@ class _NativeProvider(_Provider):
             calls = (
                 ToolCall(
                     id="export",
-                    name="data_export_tabular",
+                    name="data_query",
                     arguments=self.export_arguments,
                 ),
             )
@@ -573,7 +563,7 @@ class _NativeProvider(_Provider):
             }
             if self.mode in {"capture", "export_bind"}:
                 if self.mode == "capture":
-                    prefix = f"r = tools.capture('data_export_tabular', {self.export_arguments!r}, name='rows')\nassert not r['is_error'], r\n"
+                    prefix = f"r = tools.capture('data_query', {self.export_arguments!r}, name='rows')\nassert not r['is_error'], r\n"
                 else:
                     exported = results["export"]
                     assert not exported.is_error

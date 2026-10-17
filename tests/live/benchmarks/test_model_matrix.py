@@ -23,6 +23,7 @@ from tests.support.job_benchmarks import (
     PROFILE_NULL_VALUES,
     PROFILE_SAMPLE_ROWS,
     TARGET_PROFILE_TABLE,
+    admit_profile_job,
     assert_completed,
     assert_on_demand_invocation,
     assert_profile_result,
@@ -30,7 +31,6 @@ from tests.support.job_benchmarks import (
     capture_run,
     configured_model_ids,
     create_live_agent,
-    job_id_from_start,
     logical_names,
     record_metrics,
     results_for,
@@ -68,7 +68,6 @@ async def test_model_certification_immediate_selection(
         record_metrics(record_property, model_id, capture)
         names = logical_names(capture.transcript)
         assert "data_query" in names
-        assert "start_data_profile" not in names
         assert await fixture.agent.list_jobs() == ()
         assert capture.result.final_text is not None
         assert IMMEDIATE_TOKEN in capture.result.final_text
@@ -114,7 +113,7 @@ async def test_model_certification_cross_conversation_result(
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS, ids=_MODEL_IDS)
-async def test_model_certification_start_and_cancel(
+async def test_model_certification_cancel(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     model_id: str,
@@ -135,15 +134,17 @@ async def test_model_certification_start_and_cancel(
 
     monkeypatch.setattr(executor, "execute", held_execute)
     try:
+        # No model tool starts a profile job; admit the internal profile graph
+        # in the conversation of one short setup interaction.
         started = await capture_run(
             fixture,
-            "Start a durable five-row profile of stage_b_profile_probe in the "
-            "background and return once it has been accepted.",
+            "I will ask about a background job next. Reply with the word ready.",
             source_id=fixture.source_id,
         )
         assert_completed(started)
-        assert_on_demand_invocation(started, "start_data_profile")
-        job_id = job_id_from_start(started.transcript)
+        job_id = await admit_profile_job(
+            fixture.agent, fixture.resource_ids[TARGET_PROFILE_TABLE], started.result
+        )
         inspection = await fixture.agent.inspect_job(job_id)
         assert inspection is not None
         assert inspection.job.specification.authority.resource_ids == (

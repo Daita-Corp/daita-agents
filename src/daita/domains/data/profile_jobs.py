@@ -27,12 +27,8 @@ from ...capabilities import (
     CapabilityInputError,
     Executor,
     OperationalEffect,
-    ToolboxId,
     ToolExecution,
-    ToolLoadMode,
     ToolOutput,
-    ToolPresentation,
-    ToolTextTrust,
     ToolView,
     capability_contract_digest,
 )
@@ -64,17 +60,11 @@ from ...jobs.owner import JobError, JobOwner
 from ...llm.models import ModelSensitivity, ToolCall
 from ...loop.models import RunInput
 from ...loop.session import RunSession
-from ...scope import resolve_effective_source_scope
 from ...storage.sqlite_records import SourcePermissionStateError
-from ..learning import LearningCandidateGuard
 from .capabilities import SqlReadBackend, SqlReadResult
 from .sql import ResourceSchema, validate_postgresql_read
 
 DATA_PROFILE_DOMAIN_OWNER_ID = "data_profile_jobs"
-START_DATA_PROFILE_CAPABILITY_ID = "jobs.data_profile.start"
-START_DATA_PROFILE_EXECUTOR_ID = "jobs.data_profile.start.executor"
-START_DATA_PROFILE_OUTPUT_KIND = "job.start_receipt"
-START_DATA_PROFILE_TOOL_NAME = "start_data_profile"
 DATA_PROFILE_EXECUTION_CAPABILITY_ID = "jobs.data_profile.execute"
 DATA_PROFILE_EXECUTION_EXECUTOR_ID = "jobs.data_profile.execute.executor"
 DATA_PROFILE_EXECUTION_OUTPUT_KIND = "job.data_profile.result"
@@ -177,7 +167,11 @@ class DataProfileSpecification:
 
 
 class DataProfileAdmission:
-    """Resolve exact current resource facts for one frozen profile specification."""
+    """Resolve exact current resource facts for one frozen profile specification.
+
+    It also builds the code-authored static profile graph run by the internal
+    executor and finalizer; no model tool starts one.
+    """
 
     def __init__(
         self,
@@ -186,11 +180,19 @@ class DataProfileAdmission:
         catalog: DataProfileCatalog,
         owner: JobOwner,
         execution_capability: Capability,
+        finalizer_capability: Capability,
+        distribution: DistributionOwner,
+        clock: Callable[[], datetime],
+        id_factory: Callable[[str], str],
     ) -> None:
         self._agent_id = agent_id
         self._catalog = catalog
         self._owner = owner
         self._execution_capability = execution_capability
+        self._finalizer_capability = finalizer_capability
+        self._distribution = distribution
+        self._clock = clock
+        self._id_factory = id_factory
         self._execution_contract_digest = capability_contract_digest(
             execution_capability,
             domain_owner_id=DATA_PROFILE_DOMAIN_OWNER_ID,
@@ -251,12 +253,13 @@ class DataProfileAdmission:
         run: RunInput,
         call_id: str,
         arguments: Mapping[str, object],
-        finalizer_capability: Capability,
-        distribution: DistributionOwner,
-        clock: Callable[[], datetime],
-        id_factory: Callable[[str], str],
     ) -> GraphAdmission:
         """Build the current code-authored static profile graph."""
+
+        finalizer_capability = self._finalizer_capability
+        distribution = self._distribution
+        clock = self._clock
+        id_factory = self._id_factory
 
         if run.agent_id != self._agent_id or run.conversation_id is None:
             raise CapabilityInputError(
@@ -641,106 +644,6 @@ class DataProfileAdmission:
         )
 
 
-class StartDataProfileGraphExecutor:
-    """Start the current code-authored static data-profile graph."""
-
-    executor_id = START_DATA_PROFILE_EXECUTOR_ID
-
-    def __init__(
-        self,
-        *,
-        owner: JobOwner,
-        admission: DataProfileAdmission,
-        finalizer_capability: Capability,
-        distribution: DistributionOwner,
-        clock: Callable[[], datetime],
-        id_factory: Callable[[str], str],
-    ) -> None:
-        self._owner = owner
-        self._admission = admission
-        self._finalizer_capability = finalizer_capability
-        self._distribution = distribution
-        self._clock = clock
-        self._id_factory = id_factory
-
-    async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        prepared = dict(request.arguments)
-        if not isinstance(prepared.get("_deadline_at"), str):
-            raise CapabilityInputError(
-                "data_profile_invalid", "The frozen data-profile deadline is missing."
-            )
-        max_wall_time = prepared.get("_max_wall_time_seconds")
-        if not isinstance(max_wall_time, (int, float)) or isinstance(
-            max_wall_time, bool
-        ):
-            raise CapabilityInputError(
-                "data_profile_invalid",
-                "The frozen data-profile wall-time limit is missing.",
-            )
-        specification = await self._admission.build_specification(prepared)
-        return FrozenJsonObject.from_mapping(
-            {
-                "profile_specification_digest": specification.digest,
-                "resource_ids": tuple(
-                    item.resource_id for item in specification.resource_bindings
-                ),
-                "graph_kind": "static_data_profile",
-            }
-        )
-
-    async def execute(self, request: ToolExecution) -> ToolOutput:
-        if request.conversation_id is None:
-            raise CapabilityInputError(
-                "graph_profile_origin_invalid",
-                "A static profile graph requires the exact owned conversation.",
-            )
-        admission = await self._admission.build_static_graph_admission(
-            run=RunInput(
-                id=request.run_id,
-                agent_id=self._owner.agent_id,
-                message="Start the exact admitted static data-profile graph.",
-                created_at=self._clock(),
-                conversation_id=request.conversation_id,
-                source_scope_ids=(
-                    ()
-                    if request.source_scope is None
-                    else tuple(sorted(request.source_scope.source_ids))
-                ),
-                resolved_source_scope=request.source_scope,
-            ),
-            call_id=request.call_id,
-            arguments=request.arguments,
-            finalizer_capability=self._finalizer_capability,
-            distribution=self._distribution,
-            clock=self._clock,
-            id_factory=self._id_factory,
-        )
-        job = await self._owner.admit(admission)
-        work_capability_id = DATA_PROFILE_EXECUTION_CAPABILITY_ID
-        work_contract = job.specification.authority.contract_bindings.get(
-            work_capability_id
-        )
-        assert isinstance(work_contract, str)
-        return ToolOutput(
-            kind=START_DATA_PROFILE_OUTPUT_KIND,
-            data={
-                "job_id": job.job_id,
-                "job_kind": "data_profile",
-                "status": job.state.value,
-                "execution_kind": "graph",
-                "specification_digest": job.specification_digest,
-                "execution_capability_id": work_capability_id,
-                "execution_contract_digest": work_contract,
-            },
-            sensitivity=job.specification.authority.sensitivity,
-            sensitivity_provenance={
-                "authority": "frozen_static_graph_resource_scope",
-                "job_id": job.job_id,
-                "resource_ids": job.specification.authority.resource_ids,
-            },
-        )
-
-
 class DataProfileExecutor:
     executor_id = DATA_PROFILE_EXECUTION_EXECUTOR_ID
 
@@ -1021,37 +924,36 @@ class DataProfileFinalizerExecutor:
 
 
 class DataProfileCapabilityDomain:
+    """Validate internal profile graph tasks; this domain projects no tools.
+
+    Profile graphs keep their internal executor and finalizer so migrated
+    revision-2 profile jobs still run. Models profile data with data_query
+    aggregates instead of a durable job.
+    """
+
     domain_owner_id = DATA_PROFILE_DOMAIN_OWNER_ID
 
     def __init__(
         self,
         declarations: CapabilityDeclarations,
         *,
-        catalog: DataProfileCatalog,
         admission: DataProfileAdmission,
-        learning: LearningCandidateGuard,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("data-profile declarations have the wrong owner")
         capability_ids = {item.id for item in declarations.capabilities}
         if capability_ids not in (
+            {DATA_PROFILE_EXECUTION_CAPABILITY_ID},
             {
-                START_DATA_PROFILE_CAPABILITY_ID,
-                DATA_PROFILE_EXECUTION_CAPABILITY_ID,
-            },
-            {
-                START_DATA_PROFILE_CAPABILITY_ID,
                 DATA_PROFILE_EXECUTION_CAPABILITY_ID,
                 DATA_PROFILE_FINALIZE_CAPABILITY_ID,
             },
         ):
             raise ValueError("data-profile domain requires its exact capabilities")
+        if declarations.tool_views:
+            raise ValueError("data-profile capabilities are internal only")
         self._declarations = declarations
-        self._catalog = catalog
         self._admission = admission
-        self._learning = learning
-        self._views = tuple(declarations.tool_views)
-        self._capabilities = {item.id: item for item in declarations.capabilities}
 
     @property
     def declarations(self) -> CapabilityDeclarations:
@@ -1062,26 +964,8 @@ class DataProfileCapabilityDomain:
         run: RunInput,
         session: RunSession | None = None,
     ) -> tuple[str, ...]:
-        files_only = session is not None and session.options.files_only
-        if files_only:
-            return ()
-        scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=files_only
-        )
-        facts = (
-            ()
-            if not scope.resource_ids
-            else await self._catalog.source_routing_facts(
-                run.agent_id, tuple(sorted(scope.source_ids))
-            )
-        )
-        if not facts:
-            return ()
-        return tuple(
-            view.name
-            for view in self._views
-            if self._learning.allows(session, view.name, effectful=True)
-        )
+        del run, session
+        return ()
 
     project_session = project
 
@@ -1102,39 +986,7 @@ class DataProfileCapabilityDomain:
         request_sensitivity: ModelSensitivity,
         session: RunSession | None = None,
     ) -> FrozenJsonObject:
-        del request_sensitivity
-        if capability.id == START_DATA_PROFILE_CAPABILITY_ID:
-            self._learning.validate_effect(session, call)
-            deadline_seconds = arguments.get("deadline_seconds", 300)
-            if not isinstance(deadline_seconds, int):
-                raise CapabilityInputError(
-                    "data_profile_invalid",
-                    "The data-profile deadline is malformed.",
-                )
-            prepared = dict(arguments)
-            prepared["_deadline_at"] = (
-                run.created_at + timedelta(seconds=deadline_seconds)
-            ).isoformat()
-            prepared["_max_wall_time_seconds"] = min(
-                float(deadline_seconds),
-                MAX_JOB_WALL_TIME_SECONDS,
-            )
-            specification = await self._admission.build_specification(prepared)
-            scope = await resolve_effective_source_scope(
-                run,
-                self._catalog,
-                files_only=session is not None and session.options.files_only,
-            )
-            if any(
-                item.source_id not in scope.source_ids
-                or item.resource_id not in scope.resource_ids
-                for item in specification.resource_bindings
-            ):
-                raise CapabilityInputError(
-                    "source_scope_violation",
-                    "This run can only profile resources in its effective scope.",
-                )
-            return FrozenJsonObject.from_mapping(prepared)
+        del run, call, request_sensitivity, session
         if capability.id == DATA_PROFILE_FINALIZE_CAPABILITY_ID:
             return arguments
         await self._admission.validate_internal(arguments)
@@ -1162,14 +1014,7 @@ class DataProfileCapabilityDomain:
         execution: ToolExecution,
         fingerprint: FrozenJsonObject,
     ) -> SideEffectPlan:
-        if capability.id != START_DATA_PROFILE_CAPABILITY_ID:
-            raise ValueError(
-                "internal data-profile execution has no operational effect"
-            )
-        return SideEffectPlan(
-            approval_required=False,
-            recheck_after_approval=True,
-        )
+        raise ValueError("internal data-profile execution has no operational effect")
 
     async def finalize_output(
         self,
@@ -1182,9 +1027,7 @@ class DataProfileCapabilityDomain:
         request_sensitivity: ModelSensitivity,
         session: RunSession | None = None,
     ) -> ToolOutput:
-        del arguments, request_sensitivity
-        if capability.id == START_DATA_PROFILE_CAPABILITY_ID:
-            self._learning.mark_effect_succeeded(session, call.id)
+        del run, call, capability, arguments, request_sensitivity, session
         return output
 
     finalize_session_output = finalize_output
@@ -1212,7 +1055,7 @@ def data_profile_declarations(
     clock: Callable[[], datetime],
     id_factory: Callable[[str], str],
 ) -> tuple[DataProfileDeclarations, DataProfileAdmission]:
-    """Compose the current static data-profile graph entrypoint and executors."""
+    """Compose the internal static data-profile graph executors."""
 
     internal = Capability(
         id=DATA_PROFILE_EXECUTION_CAPABILITY_ID,
@@ -1234,26 +1077,6 @@ def data_profile_declarations(
             max_total_bytes_per_call=_MAX_PROFILE_ARTIFACT_BYTES,
         ),
     )
-    admission = DataProfileAdmission(
-        agent_id=agent_id,
-        catalog=catalog,
-        owner=owner,
-        execution_capability=internal,
-    )
-    start = Capability(
-        id=START_DATA_PROFILE_CAPABILITY_ID,
-        description=(
-            "Start one bounded durable read-only data-profile graph over exact "
-            "current resources."
-        ),
-        input_schema=_start_input_schema(),
-        output_kind=START_DATA_PROFILE_OUTPUT_KIND,
-        output_schema=_start_output_schema(),
-        executor_id=START_DATA_PROFILE_EXECUTOR_ID,
-        access_mode=AccessMode.READ,
-        operational_effect=OperationalEffect.START_JOB,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
-    )
     finalizer = Capability(
         id=DATA_PROFILE_FINALIZE_CAPABILITY_ID,
         description="Finalize authenticated static data-profile task results.",
@@ -1274,18 +1097,20 @@ def data_profile_declarations(
             max_total_bytes_per_call=_MAX_PROFILE_ARTIFACT_BYTES,
         ),
     )
+    admission = DataProfileAdmission(
+        agent_id=agent_id,
+        catalog=catalog,
+        owner=owner,
+        execution_capability=internal,
+        finalizer_capability=finalizer,
+        distribution=distribution,
+        clock=clock,
+        id_factory=id_factory,
+    )
     return (
         DataProfileDeclarations(
-            capabilities=(start, internal, finalizer),
+            capabilities=(internal, finalizer),
             executors=(
-                StartDataProfileGraphExecutor(
-                    owner=owner,
-                    admission=admission,
-                    finalizer_capability=finalizer,
-                    distribution=distribution,
-                    clock=clock,
-                    id_factory=id_factory,
-                ),
                 DataProfileExecutor(
                     agent_id=agent_id,
                     catalog=catalog,
@@ -1294,59 +1119,10 @@ def data_profile_declarations(
                 ),
                 DataProfileFinalizerExecutor(artifacts),
             ),
-            tool_views=(
-                ToolView(
-                    name=START_DATA_PROFILE_TOOL_NAME,
-                    capability_id=start.id,
-                    description=start.description,
-                    presentation=ToolPresentation(
-                        toolbox_id=ToolboxId.JOBS,
-                        load_mode=ToolLoadMode.ON_DEMAND,
-                        text_trust=ToolTextTrust.CODE,
-                        summary=(
-                            "Start a bounded durable profile graph over exact data "
-                            "resources."
-                        ),
-                        when_to_use=(
-                            "Use when profiling should continue after this reasoning "
-                            "run."
-                        ),
-                        keywords=("data", "profile", "job", "durable", "graph"),
-                    ),
-                ),
-            ),
+            tool_views=(),
         ),
         admission,
     )
-
-
-def _start_input_schema() -> dict[str, object]:
-    return {
-        "type": "object",
-        "properties": {
-            "resource_ids": {
-                "type": "array",
-                "items": {"type": "string", "minLength": 1, "maxLength": 512},
-                "minItems": 1,
-                "maxItems": MAX_JOB_RESOURCE_BINDINGS,
-                "uniqueItems": True,
-            },
-            "sample_rows": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": _MAX_PROFILE_SAMPLE_ROWS,
-                "default": _MAX_PROFILE_SAMPLE_ROWS,
-            },
-            "deadline_seconds": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": int(MAX_JOB_DEADLINE_SECONDS),
-                "default": 300,
-            },
-        },
-        "required": ["resource_ids"],
-        "additionalProperties": False,
-    }
 
 
 def _binding_schema() -> dict[str, object]:
@@ -1398,24 +1174,6 @@ def _internal_input_schema() -> dict[str, object]:
             "sample_rows",
             "resource_bindings",
         ],
-        "additionalProperties": False,
-    }
-
-
-def _start_output_schema() -> dict[str, object]:
-    properties = {
-        "job_id": {"type": "string"},
-        "job_kind": {"type": "string"},
-        "status": {"type": "string"},
-        "execution_kind": {"type": "string", "const": "graph"},
-        "specification_digest": {"type": "string"},
-        "execution_capability_id": {"type": "string"},
-        "execution_contract_digest": {"type": "string"},
-    }
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": list(properties),
         "additionalProperties": False,
     }
 
@@ -1638,10 +1396,6 @@ __all__ = [
     "DataProfileDeclarations",
     "DataProfileSpecification",
     "ProfileResourceBinding",
-    "StartDataProfileGraphExecutor",
-    "START_DATA_PROFILE_CAPABILITY_ID",
-    "START_DATA_PROFILE_EXECUTOR_ID",
-    "START_DATA_PROFILE_TOOL_NAME",
     "data_profile_declarations",
     "job_resource_bindings_payload",
 ]

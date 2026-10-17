@@ -387,7 +387,7 @@ async def test_mcp_contract_survives_authoring_switch_and_exact_inspection(actio
             )
         ),
         response(
-            ToolCall("authoring", "toolbox_load", {"tool_names": ["routine_create"]})
+            ToolCall("authoring", "toolbox_load", {"tool_names": ["routine_save"]})
         ),
         response(
             ToolCall(
@@ -403,7 +403,7 @@ async def test_mcp_contract_survives_authoring_switch_and_exact_inspection(actio
     )
     assert result.kind.value == "completed"
     request = action.model.requests[2]
-    assert "routine_create" in {tool.name for tool in request.tools}
+    assert "routine_save" in {tool.name for tool in request.tools}
     assert action.tool.local_name not in {tool.name for tool in request.tools}
     retained = next(
         block
@@ -524,12 +524,10 @@ async def test_grant_correction_details_reach_next_real_request_before_any_appro
             )
         ),
         response(
-            ToolCall(
-                "routine-schema", "toolbox_load", {"tool_names": ["routine_create"]}
-            )
+            ToolCall("routine-schema", "toolbox_load", {"tool_names": ["routine_save"]})
         ),
-        response(ToolCall("invalid-grant", "routine_create", invalid)),
-        response(ToolCall("correct-grant", "routine_create", arguments)),
+        response(ToolCall("invalid-grant", "routine_save", invalid)),
+        response(ToolCall("correct-grant", "routine_save", arguments)),
         response(text="Assignment saved; no notification was sent."),
     ]
     approvals_before_correction = []
@@ -684,11 +682,11 @@ async def test_immediate_and_recurring_mcp_only_assignment_uses_standing_grant(a
             ToolCall(
                 id="load-create",
                 name="toolbox_load",
-                arguments={"tool_names": ("routine_create",)},
+                arguments={"tool_names": ("routine_save",)},
             )
         ),
         response(
-            ToolCall(id="create-assignment", name="routine_create", arguments=arguments)
+            ToolCall(id="create-assignment", name="routine_save", arguments=arguments)
         ),
         response(text="The exact assignment was approved."),
         *action.model.steps,

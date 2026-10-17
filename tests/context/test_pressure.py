@@ -9,7 +9,6 @@ from daita.hosting.execution_governor import RunAdmissionCoordinator
 from daita.llm.errors import ContextWindowExceeded
 from tests.support.kernel import (
     NOW,
-    START_DATA_PROFILE_CAPABILITY_ID,
     AgentContextBuilder,
     CanonicalMessage,
     ContextEvidencePressureExceeded,
@@ -241,49 +240,6 @@ async def test_optional_context_uses_run_allowance_without_rejecting_mandatory_i
     )
     # Context shaping cannot replace provider counting with a byte-based refusal.
     assert narrow_request.max_total_tokens is None
-
-
-async def test_context_owns_durable_job_handoff_guidance() -> None:
-    builder = AgentContextBuilder(
-        _SnapshotCatalog(),
-        profile=ModelProfile(
-            id="mock:durable-handoff-context",
-            context_window_tokens=32_000,
-            max_output_tokens=2_000,
-            supports_tools=True,
-        ),
-    )
-    run = RunInput(
-        id="run-durable-handoff-context",
-        agent_id="agent-stage-a",
-        message="Profile the current table in the background.",
-        created_at=NOW,
-        conversation_id="conversation-durable-handoff-context",
-        source_scope_ids=("source-snapshot",),
-    )
-    user = run.start_message()
-    start_tool = ToolDefinition(
-        name="start_data_profile",
-        description="Start one durable data profile.",
-        input_schema={"type": "object", "properties": {}},
-    )
-    projection = ContextToolProjectionAdapter(
-        (start_tool,),
-        capability_ids=(START_DATA_PROFILE_CAPABILITY_ID,),
-    )
-    catalog = await projection.prepare_run(run)
-    request = builder.project(
-        await builder.prepare(run, (user,), catalog),
-        (user,),
-        step=1,
-        tool_context=projection.project(catalog, (user,)),
-    )
-
-    system = request.messages[0].content[0]
-    assert isinstance(system, TextBlock)
-    assert "durable-job start receipt is a handoff" in system.text
-    assert "do not poll, list, inspect, read, or cancel" in system.text
-    assert "code-owned terminal-job run" in system.text
 
 
 @pytest.mark.parametrize("available", (False, True))
@@ -636,36 +592,56 @@ def test_token_estimate_is_conservative_accounting_not_raw_byte_count():
     (
         ("Compute statistics from a complete dataset.", True),
         ("Use Python to compute over every row of the connected table.", True),
-        ("Use tools.capture('data_export_tabular', args, name='numbers').", True),
+        ("Use tools.capture('data_query', args, name='numbers').", True),
         ("Normalize retained JSON records.", False),
     ),
 )
 async def test_dataset_guidance_requires_exact_loaded_export_metadata(
     monkeypatch, arrow, message, dataset_requested
 ):
-    from daita.capabilities import ToolExecution, ToolOutput
+    from daita.capabilities import (
+        CapabilityDeclarations,
+        ToolExecution,
+        ToolOutput,
+    )
+    from daita.domains.data.capabilities import data_query_capability_declarations
     from daita.domains.data.export_capabilities import (
-        data_export_tabular_capability_declarations,
+        exact_export_capability_declarations,
+        exact_export_outputs,
     )
     from tests.support.capability_runtime import StaticTestDomain
 
     monkeypatch.setattr("daita.domains.analysis.domain.available", lambda: True)
     analysis = AnalysisCapabilityDomain(RunAdmissionCoordinator())
-    exports = data_export_tabular_capability_declarations(allow_arrow=arrow)
+    exports = exact_export_capability_declarations(allow_arrow=arrow)
+    query = data_query_capability_declarations(
+        file_outputs=exact_export_outputs(allow_arrow=arrow),
+        file_capability_id=exports.capabilities[0].id,
+    )
+    declarations = CapabilityDeclarations(
+        domain_owner_id="data",
+        capabilities=(*query.capabilities, *exports.capabilities),
+        executor_ids=(*query.executor_ids, *exports.executor_ids),
+        tool_views=query.tool_views,
+    )
     data = StaticTestDomain(
-        exports.capabilities, exports.tool_views, domain_owner_id="data"
+        declarations.capabilities, declarations.tool_views, domain_owner_id="data"
     )
 
     class Export:
-        executor_id = exports.executor_ids[0]
+        def __init__(self, executor_id: str) -> None:
+            self.executor_id = executor_id
 
         async def execute(self, request: ToolExecution) -> ToolOutput:
-            raise AssertionError("Guidance and loading cannot execute an export")
+            raise AssertionError("Guidance and loading cannot execute a query")
 
     runtime = CapabilityRuntime(
         CapabilityRegistry(
-            declarations=(analysis.declarations, exports),
-            executors=(analysis, Export()),
+            declarations=(analysis.declarations, declarations),
+            executors=(
+                analysis,
+                *(Export(item) for item in declarations.executor_ids),
+            ),
         ),
         (analysis, data),
     )
@@ -682,7 +658,8 @@ async def test_dataset_guidance_requires_exact_loaded_export_metadata(
     messages: tuple[CanonicalMessage, ...] = (run.start_message(),)
     catalog = await runtime.prepare_run(run)
     snapshot = await builder.prepare(run, messages, catalog)
-    for names in (("python_execute",), ("python_execute", "data_export_tabular")):
+    # data_query is pinned, so loading python_execute makes the export callable.
+    for names in (("python_execute",),):
         call = ToolCall(
             id=f"load-{len(names)}",
             name="toolbox_load",
@@ -711,8 +688,6 @@ async def test_dataset_guidance_requires_exact_loaded_export_metadata(
         )
         text = cast(TextBlock, request.messages[0].content[0]).text
         assert "tools.batch" in text and "in submission order" in text
-        assert ("tools.capture(" in text) is (
-            arrow and len(names) == 2 and dataset_requested
-        )
+        assert ("tools.capture(" in text) is (arrow and dataset_requested)
         assert request.messages[-len(messages) :] == messages
         assert _estimate_input_tokens(request) <= snapshot.profile.maximum_input_tokens

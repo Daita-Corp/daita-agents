@@ -465,15 +465,18 @@ Active job artifact reservations block deletion until their attempt finishes.
 Job recovery can publish only under a currently active reservation.
 `artifact_list` returns bounded safe metadata only for the
 current conversation. `artifact_read` returns a bounded preview for an exact
-known artifact ID owned by the current agent home. `artifact_convert` supports
-only a verified Daita-generated XLSX `Data` snapshot converted to CSV and
+known artifact ID owned by the current agent home. `artifact_create` with
+`from="artifact"` supports only a verified Daita-generated XLSX `Data` snapshot converted to CSV and
 records the parent artifact. The typed owner API `Agent.list_artifacts` supplies
 bounded pages across conversations for human management in the TUI's `/artifacts`
 screen; hosted listings retain caller isolation. Model inventory remains
 conversation-scoped. There is no hidden current-file pointer, raw model
 path/byte interface, or alternate artifact execution path.
 
-`artifact_create_tabular` creates one bounded model-authored CSV, XLSX, or
+`artifact_create` routes by `from` to four unchanged capabilities: `table`,
+`document`, `tool_result` (canonical JSON snapshot) and `artifact` (XLSX to CSV
+conversion). Arguments that belong to another route are rejected before
+dispatch. `from="table"` creates one bounded model-authored CSV, XLSX, or
 HTML table from earlier successful results in the current run, cited by their
 visible `result_ref` values in `evidence_refs`. The runtime resolves each ref to
 its call, and the artifact domain authenticates each result against the immutable registry and
@@ -481,7 +484,8 @@ persisted transcript, rejects failed, stale, reordered, cross-run, or tampered
 lineage, inherits the highest result sensitivity, and preserves current
 relational resource revisions where present. The artifact remains explicitly
 derived analysis rather than exact or complete source data. Exact complete
-relational export remains the separate `data_export_tabular` capability.
+relational export remains the separate `data.export_tabular` capability, reached
+through `data_query` with `output="csv"`, `"xlsx"` or `"arrow"`.
 
 ## Remote MCP tools and actions
 
@@ -524,7 +528,10 @@ graph-aware `JobSupervisor` owns graph-local selection, claims, fencing, recover
 fairness and finalization; all capability work still executes through the one
 `CapabilityRuntime`, and every model task uses the one `AgentLoop` implementation.
 
-`start_data_profile` admits the static effect-free profile graph. `start_graph_job`
+No model tool starts a profile job: models profile data with `data_query`
+aggregates. The static effect-free profile graph keeps its internal executor and
+finalizer (`jobs.data_profile.execute`/`.finalize`) so migrated revision-2 profile
+jobs still run. `start_graph_job`
 admits one code-resolved graph-eligible initial task and internal finalizer when a
 model route is configured. Graph work is bounded by per-task steps, the host
 per-run token ceiling, wall time and `work_units` attempts; graph contracts and

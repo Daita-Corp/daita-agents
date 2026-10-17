@@ -240,8 +240,18 @@ async def _assignment(
         for item in declarations.capabilities
         if item.id == DOCUMENT_CREATE_CAPABILITY_ID
     )
-    document_view = next(
-        item for item in declarations.tool_views if item.capability_id == document.id
+    # A document-only projection of artifact_create keeps this domain to the
+    # one executor these assignments use.
+    create_view = next(
+        item
+        for item in declarations.tool_views
+        if document.id in dict(item.mode_capability_ids).values()
+    )
+    document_view = ToolView(
+        name=create_view.name,
+        capability_id=document.id,
+        description=document.description,
+        presentation=create_view.presentation,
     )
     document_domain = _DocumentDomain(
         (document,), (document_view,), domain_owner_id="artifact"
@@ -499,7 +509,7 @@ async def _assignment(
         rejected = await execute_projected(
             runtime,
             origin,
-            (ToolCall("private-create", "routine_create", arguments),),
+            (ToolCall("private-create", "routine_save", arguments),),
             sensitivity=ModelSensitivity.RESTRICTED,
         )
         assert rejected.ordered_results[0].is_error
@@ -512,7 +522,7 @@ async def _assignment(
         outcome = await execute_projected(
             runtime,
             origin,
-            (ToolCall("create-effect", "routine_create", arguments),),
+            (ToolCall("create-effect", "routine_save", arguments),),
         )
         assert not outcome.ordered_results[0].is_error, outcome.ordered_results[
             0

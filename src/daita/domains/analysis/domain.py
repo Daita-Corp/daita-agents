@@ -138,17 +138,15 @@ class AnalysisCapabilityDomain:
         self._limits = limits
         self._observer = observer
         description = (
-            "Execute Python in an isolated, bounded macOS workspace for computation, simulation, "
-            "text processing, structured-data validation, analysis and transformation of authenticated tool results. "
-            "Variables and scratch files persist only within this run. "
-            "Use expected_state={generation:0,revision:0} initially; then use the returned state. "
-            "tools.call(name, arguments) returns a dict: r['is_error'], r['output']['data'], r['evidence_id']. "
-            "Write relative scratch filenames; outputs.add('name','file.png') registers a file. "
-            "Output names start with a letter and contain only letters, digits, '_' or '-'; "
-            "Registered files are temporary candidates, not retained artifacts. "
-            "Use save_outputs=[name,...] to publish all requested files in this call; "
-            "save_output selects one name. Check the returned artifact references before claiming retention. "
-            "Print bounded previews. NumPy, pandas, SciPy, PyArrow, Matplotlib, NetworkX and DuckDB are installed."
+            "Run Python in an isolated bounded workspace to compute over or transform "
+            "authenticated tool results. Prefer data_query for SQL and aggregates, "
+            "file_query for local file data. Start with expected_state={generation:0,"
+            "revision:0}, then pass the returned state. r=tools.call(name, args): "
+            "r['is_error'], r['output']['data'], r['evidence_id']. outputs.add('name',"
+            "'f.png') registers a temporary file (letter, then letters, digits, _ or "
+            "-); save_outputs=[...] keeps it; check returned refs. Print bounded "
+            "previews. NumPy, pandas, SciPy, PyArrow, Matplotlib, NetworkX, DuckDB "
+            "installed."
         )
         capability = Capability(
             id=CAPABILITY,

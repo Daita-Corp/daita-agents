@@ -425,7 +425,7 @@ class Evaluation:
             )
         if (
             not already_approved
-            and request.tool_name == "routine_create"
+            and request.tool_name == "routine_save"
             and self.routine
         ):
             proposal = arguments.get("proposal")

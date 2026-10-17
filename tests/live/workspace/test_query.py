@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent, LocalWorkspace, LoopLimits, create_llm_provider
+from daita import Agent, LocalWorkspace, LoopLimits
 from daita.llm._lifecycle import closing_stream
 from daita.llm.models import (
     ModelProfile,
@@ -31,7 +31,6 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
     ManagedModelProvider,
     StreamingModelProvider,
@@ -43,6 +42,7 @@ from daita.loop.models import (
     Transcript,
     validate_completed_transcript,
 )
+from tests.support.live_billing import cost_cap, live_provider
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_LOCAL_FILE_QUERY"
@@ -158,21 +158,17 @@ def _live_provider() -> tuple[ModelProfile, _RecordingProvider]:
             f"{_MODEL_ID} must name an API-backed provider: "
             + ", ".join(sorted(_API_KEY_ENVIRONMENT))
         )
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name one release-reviewed tool-capable model")
-    if not profile.supports_streaming:
-        pytest.fail(f"{_MODEL_ID} must name a model with reviewed streaming support")
-    delegate = create_llm_provider(
+    profile, delegate = live_provider(
         model_id,
-        api_key=_api_key(provider_name),
-        max_output_tokens=min(profile.max_output_tokens, 1_536),
+        api_key=lambda: _api_key(provider_name),
+        max_output_tokens=1_536,
+        require_streaming=True,
     )
     return profile, _RecordingProvider(delegate)
 
 
 def _limits() -> LoopLimits:
-    return LoopLimits(max_estimated_cost_usd=_cost_limit())
+    return LoopLimits(max_estimated_cost_usd=cost_cap(_cost_limit()))
 
 
 async def _run_live(

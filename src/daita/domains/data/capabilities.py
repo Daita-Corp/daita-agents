@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject, canonical_json
+from ...artifacts.renderers import MAX_CSV_ROWS, MAX_CSV_SECONDS
 from ...capabilities import (
     AccessMode,
     AutomationEligibility,
@@ -34,6 +35,7 @@ from ...capabilities import (
 )
 from ...errors import DaitaError
 from .controller import (
+    DATA_EXPORT_TABULAR_CAPABILITY_ID,
     DATA_QUERY_CAPABILITY_ID,
     DATA_QUERY_EVIDENCE_KIND,
     RELATIONAL_UPDATE_CAPABILITY_ID,
@@ -59,7 +61,9 @@ RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID = "data.preview_update_rows.executor"
 RELATIONAL_UPDATE_EXECUTOR_ID = "data.update_rows.executor"
 RELATIONAL_UPDATE_TOOL_NAME = "data_update_rows"
 RELATIONAL_UPSERT_TOOL_NAME = "data_upsert_rows"
-DATA_QUERY_DESCRIPTION = (
+# The data.query capability description is part of its contract digest, which
+# retained routine and graph bindings revalidate; the model reads the view's.
+_DATA_QUERY_CAPABILITY_DESCRIPTION = (
     "Run read-only SQL on exact catalog resources of one source. Use sql, or "
     "statements for up to 8 reads in one call; resource_ids must list every "
     "table read. Returns columns, rows, tables_touched, truncation "
@@ -70,6 +74,30 @@ DATA_QUERY_DESCRIPTION = (
     "Mistakes: columns absent from catalog evidence; joining on matching "
     "names alone; treating truncated rows as complete."
 )
+DATA_QUERY_DESCRIPTION = (
+    "Read-only SQL on exact catalog resources of one source; list every table "
+    "read in resource_ids. Use sql, or statements for up to 8 reads. "
+    "Limits: 5s per statement, 15s "
+    "total, 100 rows and 16 KB shared."
+)
+_DATA_QUERY_USAGE = (
+    " Profile with aggregates (COUNT, COUNT(DISTINCT), null counts, MIN/MAX)."
+    ' Example: "SELECT region, sum(total) FROM orders GROUP BY region".'
+    " Mistakes: columns absent from catalog evidence; trusting truncated rows."
+)
+
+
+def _data_query_description(file_outputs: tuple[str, ...]) -> str:
+    file_output = (
+        f" output={'|'.join(file_outputs)} exports one sql in full as a file "
+        f"({MAX_CSV_ROWS:,} rows, {MAX_CSV_SECONDS:.0f}s), no rows; to save "
+        "rows already shown in full, use artifact_create from=table."
+        if file_outputs
+        else ""
+    )
+    return DATA_QUERY_DESCRIPTION + file_output + _DATA_QUERY_USAGE
+
+
 RELATIONAL_UPDATE_DESCRIPTION = (
     "Update rows in one PostgreSQL catalog table. mode=preview "
     "changes nothing and returns matched_rows, samples and "
@@ -893,9 +921,14 @@ def data_query_declarations(
     agent_id: str,
     sqlite_backend: SQLiteReadBackend,
     postgresql_backend: PostgreSQLReadBackend,
+    *,
+    file_outputs: tuple[str, ...] = (),
 ) -> DataQueryDeclarations:
     executor = DataQueryExecutor(agent_id, sqlite_backend, postgresql_backend)
-    declarations = data_query_capability_declarations()
+    declarations = data_query_capability_declarations(
+        file_outputs=file_outputs,
+        file_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID if file_outputs else None,
+    )
     return DataQueryDeclarations(
         declarations.capabilities, (executor,), declarations.tool_views
     )
@@ -927,19 +960,55 @@ def relational_update_declarations(
     )
 
 
-def data_query_capability_declarations() -> CapabilityDeclarations:
+def data_query_capability_declarations(
+    *,
+    file_outputs: tuple[str, ...] = (),
+    file_capability_id: str | None = None,
+) -> CapabilityDeclarations:
+    """Declare data_query; file outputs route to the exact export capability."""
+
     return _query_declarations(
         ToolPresentation(
             toolbox_id=ToolboxId.SOURCES,
             load_mode=ToolLoadMode.PINNED,
             text_trust=ToolTextTrust.CODE,
-            summary="Run one bounded validated read-only relational query.",
+            summary=(
+                "Run one bounded validated read-only relational query, or export "
+                "one exact complete query result as a CSV or XLSX file."
+                if file_outputs
+                else "Run one bounded validated read-only relational query."
+            ),
             when_to_use=(
                 "Use exact source/resource IDs and columns from current catalog evidence; "
                 "obtain missing structure only through admitted, callable tools."
+                + (
+                    " Exports cover all database rows the query selects."
+                    if file_outputs
+                    else ""
+                )
             ),
-            keywords=("data", "query", "relational", "sql"),
+            keywords=(
+                "data",
+                "query",
+                "relational",
+                "sql",
+                "profile",
+                *(
+                    (
+                        "export",
+                        "csv",
+                        "xlsx",
+                        "database",
+                        "complete dataset",
+                        "all rows",
+                    )
+                    if file_outputs
+                    else ()
+                ),
+            ),
         ),
+        file_outputs=file_outputs,
+        file_capability_id=file_capability_id,
     )
 
 
@@ -1159,7 +1228,12 @@ def relational_update_capability_declarations() -> CapabilityDeclarations:
 
 def _query_declarations(
     presentation: ToolPresentation,
+    *,
+    file_outputs: tuple[str, ...] = (),
+    file_capability_id: str | None = None,
 ) -> CapabilityDeclarations:
+    if bool(file_outputs) != (file_capability_id is not None):
+        raise ValueError("data_query file outputs require their export capability")
     sql_rule = {"type": "string", "minLength": 1, "maxLength": MAX_SQL_CHARACTERS}
     parameters_rule = {
         "type": "array",
@@ -1168,7 +1242,7 @@ def _query_declarations(
     }
     capability = Capability(
         id=DATA_QUERY_CAPABILITY_ID,
-        description=DATA_QUERY_DESCRIPTION,
+        description=_DATA_QUERY_CAPABILITY_DESCRIPTION,
         input_schema={
             "type": "object",
             "properties": {
@@ -1218,8 +1292,18 @@ def _query_declarations(
     view = ToolView(
         name=DATA_QUERY_TOOL_NAME,
         capability_id=capability.id,
-        description=capability.description,
+        description=_data_query_description(file_outputs),
         presentation=presentation,
+        mode_capability_ids=(
+            (
+                ("rows", capability.id),
+                *((output, cast(str, file_capability_id)) for output in file_outputs),
+            )
+            if file_outputs
+            else ()
+        ),
+        mode_argument="output" if file_outputs else "mode",
+        default_mode="rows" if file_outputs else None,
     )
     return CapabilityDeclarations(
         domain_owner_id="data",

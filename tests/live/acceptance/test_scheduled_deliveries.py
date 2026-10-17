@@ -33,7 +33,6 @@ from daita.artifacts.models import ArtifactAuthorship
 from daita.catalog.capabilities import CATALOG_DESCRIBE_CAPABILITY_ID
 from daita.domains.data.export_capabilities import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
-    DATA_EXPORT_TABULAR_TOOL_NAME,
 )
 from daita.llm.models import (
     FinishReason,
@@ -244,11 +243,13 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
             call for message in transcript.messages for call in message.tool_calls
         )
         export_calls = tuple(
-            call for call in calls if call.name == DATA_EXPORT_TABULAR_TOOL_NAME
+            call
+            for call in calls
+            if call.name == "data_query" and "output" in call.arguments
         )
         assert len(export_calls) == 1
         assert export_calls[0].arguments["source_id"] == source.id
-        assert export_calls[0].arguments["format"] == "csv"
+        assert export_calls[0].arguments["output"] == "csv"
         payload = await agent.read_artifact(reference.artifact_id)
         assert _TOKEN.encode("utf-8") in payload.content
     finally:

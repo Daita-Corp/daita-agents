@@ -21,7 +21,7 @@ from daita.capabilities import (
     ToolView,
 )
 from daita.capability_runtime import CapabilityRuntime
-from daita.domains.data.export_capabilities import DOCUMENT_CREATE_TOOL_NAME
+from daita.domains.data.export_capabilities import ARTIFACT_CREATE_TOOL_NAME
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
@@ -172,8 +172,8 @@ async def test_agent_requests_carry_refs_while_the_transcript_stays_exact(
                 tool_calls=(
                     ToolCall(
                         "document",
-                        DOCUMENT_CREATE_TOOL_NAME,
-                        {"format": "txt", "content": "alpha\n"},
+                        ARTIFACT_CREATE_TOOL_NAME,
+                        {"from": "document", "format": "txt", "content": "alpha\n"},
                     ),
                 ),
             ),

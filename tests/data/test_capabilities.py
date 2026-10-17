@@ -9,17 +9,18 @@ from typing import cast
 
 import pytest
 
-from daita._json import FrozenJsonObject
+from daita._json import FrozenJsonObject, thaw_json
 from daita.capabilities import (
     CapabilityDeclarations,
     CapabilityInputError,
+    CapabilityRegistry,
     ToolExecution,
+    ToolOutput,
 )
 from daita.catalog.capabilities import CatalogProjection, catalog_declarations
 from daita.catalog.models import Sensitivity
 from daita.domains.data import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
-    DATA_EXPORT_TABULAR_TOOL_NAME,
     DATA_QUERY_CAPABILITY_ID,
     DATA_QUERY_EVIDENCE_KIND,
     DATA_QUERY_TOOL_NAME,
@@ -31,8 +32,9 @@ from daita.domains.data import (
     PostgreSQLReadResult,
     ResourceSchema,
     SQLiteReadResult,
-    data_export_tabular_capability_declarations,
     data_query_capability_declarations,
+    exact_export_capability_declarations,
+    exact_export_outputs,
     local_file_capability_declarations,
     project_result_rows,
     relational_update_capability_declarations,
@@ -76,14 +78,12 @@ def test_data_query_is_one_backend_neutral_model_tool() -> None:
 
 
 def test_data_export_is_one_backend_neutral_model_tool() -> None:
-    declarations = data_export_tabular_capability_declarations()
+    declarations = exact_export_capability_declarations()
 
     assert tuple(item.id for item in declarations.capabilities) == (
         DATA_EXPORT_TABULAR_CAPABILITY_ID,
     )
-    assert tuple(item.name for item in declarations.tool_views) == (
-        DATA_EXPORT_TABULAR_TOOL_NAME,
-    )
+    assert declarations.tool_views == ()
     capability = declarations.capabilities[0]
     properties = capability.input_schema["properties"]
     assert isinstance(properties, Mapping)
@@ -92,18 +92,65 @@ def test_data_export_is_one_backend_neutral_model_tool() -> None:
         "resource_ids",
         "sql",
         "parameters",
-        "format",
+        "output",
         "filename",
     }
     assert set(cast(list[str], capability.input_schema["required"])) == {
         "source_id",
         "resource_ids",
         "sql",
-        "format",
+        "output",
     }
     assert set(properties).isdisjoint(
         {"adapter", "adapter_id", "backend", "connection", "executor_id"}
     )
+
+
+def test_data_query_file_outputs_route_to_exact_export_with_one_limits_clause() -> None:
+    exports = exact_export_capability_declarations()
+    query = data_query_capability_declarations(
+        file_outputs=exact_export_outputs(allow_arrow=False),
+        file_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
+    )
+
+    class Executor:
+        def __init__(self, executor_id: str) -> None:
+            self.executor_id = executor_id
+
+        async def execute(self, request: ToolExecution) -> ToolOutput:
+            raise AssertionError("Registration cannot execute a query")
+
+    registry = CapabilityRegistry(
+        declarations=(
+            CapabilityDeclarations(
+                domain_owner_id="data",
+                capabilities=(*query.capabilities, *exports.capabilities),
+                executor_ids=(*query.executor_ids, *exports.executor_ids),
+                tool_views=query.tool_views,
+            ),
+        ),
+        executors=tuple(
+            Executor(item) for item in (*query.executor_ids, *exports.executor_ids)
+        ),
+    )
+    view = registry.resolve_tool(DATA_QUERY_TOOL_NAME)[0]
+    assert view.mode_argument == "output"
+    assert view.default_mode == "rows"
+    assert view.mode_capability_ids == (
+        ("rows", DATA_QUERY_CAPABILITY_ID),
+        ("csv", DATA_EXPORT_TABULAR_CAPABILITY_ID),
+        ("xlsx", DATA_EXPORT_TABULAR_CAPABILITY_ID),
+    )
+    definition = registry.tool_definition(DATA_QUERY_TOOL_NAME)
+    assert definition.description.count("Limits:") == 1
+    assert len(definition.description.encode()) <= 600
+    properties = definition.input_schema["properties"]
+    assert isinstance(properties, Mapping)
+    assert thaw_json(properties["output"]) == {
+        "type": "string",
+        "enum": ["rows", "csv", "xlsx"],
+    }
+    assert "output" not in cast(list[str], definition.input_schema["required"])
 
 
 class _Catalog:
@@ -229,8 +276,11 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
     catalog_bundle = catalog_declarations(
         "agent-relational", cast(CatalogProjection, catalog)
     )
-    query_bundle = data_query_capability_declarations()
-    export_bundle = data_export_tabular_capability_declarations()
+    query_bundle = data_query_capability_declarations(
+        file_outputs=exact_export_outputs(allow_arrow=False),
+        file_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
+    )
+    export_bundle = exact_export_capability_declarations()
     preview_bundle = relational_update_preview_capability_declarations()
     update_bundle = relational_update_capability_declarations()
     upsert_bundle = relational_upsert_capability_declarations()
@@ -271,9 +321,7 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
     )
 
 
-@pytest.mark.parametrize(
-    "tool_name", (None, DATA_QUERY_TOOL_NAME, DATA_EXPORT_TABULAR_TOOL_NAME)
-)
+@pytest.mark.parametrize("tool_name", (None, DATA_QUERY_TOOL_NAME))
 async def test_mixed_relational_catalog_projects_each_semantic_tool_once(
     tool_name,
 ) -> None:
@@ -287,9 +335,6 @@ async def test_mixed_relational_catalog_projects_each_semantic_tool_once(
     )
     assert projected.count(DATA_QUERY_TOOL_NAME) == (
         tool_name in {None, DATA_QUERY_TOOL_NAME}
-    )
-    assert projected.count(DATA_EXPORT_TABULAR_TOOL_NAME) == (
-        tool_name in {None, DATA_EXPORT_TABULAR_TOOL_NAME}
     )
     assert catalog.write_applicability_calls == (
         ["update", "upsert"] if tool_name is None else []
@@ -607,7 +652,7 @@ async def test_data_export_routes_each_catalog_binding_to_exactly_one_backend() 
                     "source_id": f"source-{adapter_id}",
                     "resource_ids": (f"resource-{adapter_id}",),
                     "sql": "SELECT id FROM items",
-                    "format": "csv",
+                    "output": "csv",
                     "_adapter_id": adapter_id,
                 },
             )

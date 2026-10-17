@@ -113,9 +113,9 @@ async def test_contract_comparison_harness_freezes_schema_and_prevents_dispatch(
         )
         model.steps = [
             response(
-                ToolCall("load", "toolbox_load", {"tool_names": ["routine_create"]})
+                ToolCall("load", "toolbox_load", {"tool_names": ["routine_save"]})
             ),
-            response(ToolCall("create", "routine_create", arguments)),
+            response(ToolCall("create", "routine_save", arguments)),
             response(
                 text="Assignment saved for next Monday; no notification was sent."
             ),
@@ -154,7 +154,7 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
                     ToolCall(
                         "load-routine",
                         "toolbox_load",
-                        {"tool_names": ["routine_create"]},
+                        {"tool_names": ["routine_save"]},
                     )
                 ),
                 usage=ModelUsage(
@@ -477,10 +477,10 @@ async def test_scheduled_mcp_harness_reaches_both_occurrences_with_one_approval(
         model.steps = [
             response(
                 ToolCall(
-                    "load-routine", "toolbox_load", {"tool_names": ["routine_create"]}
+                    "load-routine", "toolbox_load", {"tool_names": ["routine_save"]}
                 )
             ),
-            response(ToolCall("create", "routine_create", arguments)),
+            response(ToolCall("create", "routine_save", arguments)),
             response(text="Created the approved routine."),
             *action_script(scenario),
         ]
@@ -491,7 +491,7 @@ async def test_scheduled_mcp_harness_reaches_both_occurrences_with_one_approval(
         receipt = next(
             outcome
             for call, outcome in transcript.tool_pairs
-            if call.name == "routine_create"
+            if call.name == "routine_save"
         )
         assert receipt is not None and not receipt.is_error
         assert len(canonical_json(receipt.output).encode()) < 1600
@@ -784,7 +784,7 @@ async def test_independent_scheduled_live_fixture_needs_no_model_creation(tmp_pa
     assert report["setup_mode"] == "owner_admitted_fixture"
     assert len(report["routine_states"]) == 1
     assert len(report["runs"]) == 2
-    assert report["metrics"]["tool_calls_by_name"].get("routine_create", 0) == 0
+    assert report["metrics"]["tool_calls_by_name"].get("routine_save", 0) == 0
 
 
 @pytest.mark.parametrize("selected", [None, "strict", "user_flow", "unknown"])

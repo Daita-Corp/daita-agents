@@ -80,9 +80,10 @@ contain prompts, tool arguments or outputs, and a failing file cannot change exe
 ## Local Python live acceptance
 
 `tests/analysis` covers the production native execution slice. The required
-opt-in acceptance suite is `tests/live/analysis`: real-model API, CLI and mounted
-TUI journeys plus real-worker faults, resource accounting, active revocation,
-crash/reopen, data fidelity, output formats and managed installation. Model turns
+opt-in acceptance suite is `tests/live/analysis`: real-model API and mounted TUI
+journeys, a scripted-model CLI journey, real-worker faults, resource accounting,
+active revocation, crash/reopen, data fidelity, output formats and managed
+installation. Model turns
 may be scripted for deterministic faults; native execution and teardown are real.
 
 Run on macOS ARM64 with `.[dev,analysis]` installed. The live model defaults to
@@ -225,17 +226,20 @@ estimated cost cap per agent run in both evaluation profiles. Configure it with
 `DAITA_PHASE_F_LIVE_MAX_COST_USD`; it must remain finite and positive. These
 suites use real model providers with simulated MCP servers.
 
+The routine contract-authoring comparison
+(`tests/live/routines/test_contract_authoring.py`) uses the same harness, so it
+needs `DAITA_RUN_LIVE_PHASE_F_MCP=1` and a `DAITA_PHASE_F_LIVE_PROFILE` (for
+example `user_flow`) in addition to its own `DAITA_RUN_CONTRACT_QUALIFICATION=1`
+gate. Choose its model with `DAITA_CONTRACT_MODEL_ID`.
+
 ### Subscription-billed live runs
 
-Live suites bill API keys by default. Adopted suites can instead run their
+Live suites bill API keys by default. Every live model suite can instead run its
 reviewed `openai:<model>` choice through the matching `codex:<model>` ChatGPT
-subscription route by setting `DAITA_LIVE_BILLING=subscription` alongside their
-usual `DAITA_RUN_*` gate. Adopted suites are PostgreSQL write acceptance,
-write-unavailable, tool selection, result references, the Stage B benchmarks,
-data operations, the live MCP read workflows, the graph-task, graph-effect and
-graph-planner job cases, Stage D1 routine execution, Stage D2 scheduled
-deliveries, and the Phase F MCP action, routine and contract-authoring
-evaluations.
+subscription route by setting `DAITA_LIVE_BILLING=subscription` alongside its
+usual `DAITA_RUN_*` gate. Behavior a subscription route cannot produce, such as a
+forced output limit or a token-count fault, is covered by deterministic tests
+instead of live ones.
 
 Log in once through the existing device-code flow:
 
@@ -257,8 +261,8 @@ token and wall-time limits. Token limits are checked after each returned
 response, so a run can exceed its token limit by at most one response. Graph
 tasks, background jobs and routines run too: graph tasks are bounded by turns,
 tokens, time and attempts, and subscription routines are admitted without dollar
-ceilings. Cost-accounting assertions run only under API billing; keep a small
-API-billed run for that evidence.
+ceilings. Dollar-cost assertions run only under API billing; pricing arithmetic
+and dollar-cap admission are covered by the deterministic `tests/llm` suite.
 
 Reports from subscription runs record `api_equivalent_cost`: reported tokens
 priced at the matching `openai:<model>` list rates with basis

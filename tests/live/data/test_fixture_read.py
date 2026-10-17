@@ -73,6 +73,9 @@ class _GroundedFixtureProvider:
     def supports_request_policy(self, request: ModelRequest) -> bool:
         return isinstance(request, ModelRequest)
 
+    async def close(self, *, deadline: float | None = None) -> None:
+        return None
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         if len(self.requests) == 1:

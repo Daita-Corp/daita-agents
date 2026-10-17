@@ -1830,7 +1830,7 @@ def test_cli_stopped_run_retains_committed_routine_without_dumping_contract():
                 tool_calls=(
                     ToolCall(
                         "call-create",
-                        "routine_create",
+                        "routine_save",
                         {"authorized_instruction": "PRIVATE INSTRUCTION"},
                     ),
                 ),

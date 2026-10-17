@@ -152,8 +152,9 @@ async def test_model_document_and_later_artifact_read_keep_full_request_classifi
                 tool_calls=(
                     ToolCall(
                         "document",
-                        "artifact_create_document",
+                        "artifact_create",
                         {
+                            "from": "document",
                             "format": "markdown",
                             "content": "Confidential analysis from the current request.",
                         },

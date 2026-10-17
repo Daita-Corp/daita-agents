@@ -26,7 +26,6 @@ from .artifacts.models import (
 from .artifacts.store import AgentHomeArtifactStore
 from .capabilities import (
     RESERVED_TOOL_NAMES,
-    TOOL_MODE_ARGUMENT,
     TOOLBOX_DEFINITIONS,
     AccessMode,
     ApprovalDecision,
@@ -61,8 +60,12 @@ from .capabilities import (
     ToolOutputValidationError,
     ToolRecovery,
     ToolView,
+    omit_unset_arguments,
     recovery_details,
     resolve_result_refs,
+    tool_call_mode,
+    tool_route_arguments,
+    tool_route_unknown_arguments,
     validate_tool_schema_value,
 )
 from .errors import DaitaError
@@ -635,7 +638,8 @@ def _control_definitions(
             description=(
                 "Atomically load an exact on-demand working set. A successful load "
                 "replaces the prior set on the next model step; ordinary validation "
-                "and governance still apply. Retains bounded contracts in the result; "
+                "and governance still apply. Pinned names are already callable and "
+                "are skipped. Retains bounded contracts in the result; "
                 "use toolbox_inspect for omitted contracts without changing this set."
             ),
             input_schema={
@@ -1114,31 +1118,30 @@ class CapabilityRuntime:
                 if name in projected:
                     raise ValueError(f"tool projected by multiple domains: {name}")
                 view = self._registry.resolve_tool(name)[0]
-                routed: list[tuple[str, RunToolCatalogEntry]] = []
-                modes = dict(
-                    (capability_id, mode)
-                    for mode, capability_id in view.mode_capability_ids
-                )
-                for capability_id in self._registry.tool_capability_ids(name):
-                    admitted = self._admitted_catalog_entry(
+                admitted_by_capability = {
+                    capability_id: self._admitted_catalog_entry(
                         run,
                         session,
                         name,
                         owner_id,
                         capability_id,
                     )
-                    if admitted is not None:
-                        routed.append((modes.get(capability_id, ""), admitted))
-                if not routed:
-                    continue
+                    for capability_id in self._registry.tool_capability_ids(name)
+                }
                 if not view.mode_capability_ids:
-                    projected[name] = routed[0][1]
+                    admitted = admitted_by_capability[view.capability_id]
+                    if admitted is not None:
+                        projected[name] = admitted
                     continue
-                mode_order = [mode for mode, _ in view.mode_capability_ids]
                 routes = tuple(
-                    sorted(routed, key=lambda item: mode_order.index(item[0]))
+                    (mode, admitted)
+                    for mode, capability_id in view.mode_capability_ids
+                    if (admitted := admitted_by_capability[capability_id]) is not None
                 )
-                projected[name] = replace(routed[0][1], routes=routes)
+                if not routes:
+                    continue
+                primary = admitted_by_capability[view.capability_id] or routes[0][1]
+                projected[name] = replace(primary, routes=routes)
         entries = tuple(projected[name] for name in sorted(projected))
         manifest = _toolbox_manifest(entries)
         manifest_bytes = len(canonical_json(_manifest_material(manifest)).encode())
@@ -1733,28 +1736,66 @@ class CapabilityRuntime:
             entry.view.name: entry for entry in projection.callable_entries
         }
         entry = callable_entries.get(call.name)
+        if entry is not None:
+            # Unset nulls are dropped once, for every tool, before the mode is
+            # chosen; the outer call keeps exactly what the model sent.
+            outer = call
+            call = replace(
+                call,
+                arguments=omit_unset_arguments(
+                    call.arguments,
+                    tuple(item.input_schema for item in entry.capabilities),
+                ),
+            )
         if entry is not None and entry.routes:
             # A mode-routed tool selects one admitted capability; the selected
             # capability then runs its own unchanged execution path.
-            mode = call.arguments.get(TOOL_MODE_ARGUMENT)
+            selector = entry.view.mode_argument
+            mode = tool_call_mode(entry.view, call.arguments)
             routed = entry.route(mode)
             if routed is None:
+                if entry.view.mode_by_presence:
+                    present = selector in call.arguments
+                    return _ResolvedCall(
+                        outer,
+                        call,
+                        failure=_error(
+                            call,
+                            "invalid_argument_value",
+                            "This form of the tool is not available in this run.",
+                            recovery_details(
+                                ToolRecovery(
+                                    RecoveryKind.CORRECT_ARGUMENTS,
+                                    (
+                                        f"Omit {selector}."
+                                        if present
+                                        else f"Provide {selector}."
+                                    ),
+                                ),
+                                {
+                                    "name": selector,
+                                    "constraint": "presence",
+                                    "execution_disposition": "not_dispatched",
+                                },
+                            ),
+                        ),
+                    )
                 return _ResolvedCall(
-                    call,
+                    outer,
                     call,
                     failure=_error(
                         call,
                         "invalid_argument_value",
-                        "Choose one of the modes this tool admits in this run.",
+                        f"Choose one {selector} this tool admits in this run.",
                         recovery_details(
                             ToolRecovery(
                                 RecoveryKind.CORRECT_ARGUMENTS,
-                                "Set mode to one of: "
+                                f"Set {selector} to one of: "
                                 + ", ".join(name for name, _ in entry.routes)
                                 + ".",
                             ),
                             {
-                                "name": TOOL_MODE_ARGUMENT,
+                                "name": selector,
                                 "constraint": "enum",
                                 "allowed": [name for name, _ in entry.routes],
                                 "execution_disposition": "not_dispatched",
@@ -1762,17 +1803,48 @@ class CapabilityRuntime:
                         ),
                     ),
                 )
+            unknown = tool_route_unknown_arguments(
+                entry.view, routed.capability, call.arguments
+            )
+            if unknown:
+                if entry.view.mode_by_presence:
+                    condition = (
+                        f"with {selector}"
+                        if selector in call.arguments
+                        else f"without {selector}"
+                    )
+                else:
+                    condition = f"when {selector}={mode}"
+                return _ResolvedCall(
+                    outer,
+                    call,
+                    failure=_error(
+                        call,
+                        "invalid_argument_for_mode",
+                        f"{', '.join(unknown)} do not apply {condition}.",
+                        recovery_details(
+                            ToolRecovery(
+                                RecoveryKind.CORRECT_ARGUMENTS,
+                                f"Remove {', '.join(unknown)} or choose the "
+                                f"{selector} they belong to.",
+                            ),
+                            {
+                                "names": list(unknown),
+                                "constraint": "route_arguments",
+                                "execution_disposition": "not_dispatched",
+                            },
+                        ),
+                    ),
+                )
             target = replace(
                 call,
-                arguments={
-                    key: value
-                    for key, value in call.arguments.items()
-                    if key != TOOL_MODE_ARGUMENT
-                },
+                arguments=tool_route_arguments(
+                    entry.view, routed.capability, call.arguments
+                ),
             )
-            return _ResolvedCall(call, target, entry=routed)
+            return _ResolvedCall(outer, target, entry=routed)
         if entry is not None:
-            return _ResolvedCall(call, call, entry=entry)
+            return _ResolvedCall(outer, call, entry=entry)
         control_names = {item.name for item in projection.provider_definitions}
         if call.name not in _CONTROL_TOOL_NAMES or call.name not in control_names:
             loadable = "toolbox_load" in control_names and any(
@@ -2279,6 +2351,7 @@ class CapabilityRuntime:
             entry.view.name: entry for entry in projection.catalog_entries
         }
         requested: list[RunToolCatalogEntry] = []
+        already_pinned: list[str] = []
         for name in names:
             entry = entries_by_name.get(name)
             if entry is None:
@@ -2289,12 +2362,8 @@ class CapabilityRuntime:
                     {"tool_name": name},
                 )
             if entry.load_mode is not ToolLoadMode.ON_DEMAND:
-                return _error(
-                    call,
-                    "toolbox_load_invalid",
-                    "Pinned tools cannot be loaded into the on-demand working set.",
-                    {"tool_name": name},
-                )
+                already_pinned.append(name)
+                continue
             if not _entry_resolves_exactly(entry, self._registry):
                 return _error(
                     call,
@@ -2303,6 +2372,13 @@ class CapabilityRuntime:
                     {"tool_name": name},
                 )
             requested.append(entry)
+        if not requested:
+            return _error(
+                call,
+                "toolbox_load_invalid",
+                "Pinned tools are already callable; load only on-demand tools.",
+                {"already_pinned_names": sorted(already_pinned)},
+            )
         loaded = tuple(sorted(requested, key=lambda item: item.view.name))
         definitions = tuple(
             self._registry.tool_definition(entry.view.name) for entry in loaded
@@ -2359,6 +2435,8 @@ class CapabilityRuntime:
                 _tool_contract(entry, include_schemas=False) for entry in loaded
             ],
         }
+        if already_pinned:
+            data["already_pinned_names"] = sorted(already_pinned)
         _fit_load_contracts(data, loaded, self._limits)
         if (
             len(canonical_json(data).encode("utf-8"))
@@ -2444,7 +2522,6 @@ class CapabilityRuntime:
         policy = capability.artifact_policy
         return (
             owner == "data"
-            and capability.id == "data.export_tabular"
             and capability.access_mode is AccessMode.READ
             and capability.operational_effect is OperationalEffect.NONE
             and capability.machine_run_directive_kind is None
@@ -2467,6 +2544,9 @@ class CapabilityRuntime:
             if self._analysis_read_eligible(entry.domain_owner_id, entry.capability)
             or self._analysis_capture_eligible(entry.domain_owner_id, entry.capability)
         }
+        # A routed child executes its selected capability with that route's
+        # arguments; the child call itself keeps the arguments it was given.
+        targets: dict[str, ToolCall] = {}
         sequence = 0
         child_limit = cast(
             "AnalysisCapabilityDomain", self._domains["analysis"]
@@ -2483,6 +2563,20 @@ class CapabilityRuntime:
                 arguments=arguments,
             )
             entry = entries.get(name)
+            if entry is not None and entry.routes:
+                routed = entry.route(tool_call_mode(entry.view, arguments))
+                if routed is None or tool_route_unknown_arguments(
+                    entry.view, routed.capability, arguments
+                ):
+                    entry = None
+                else:
+                    targets[child.id] = replace(
+                        child,
+                        arguments=tool_route_arguments(
+                            entry.view, routed.capability, arguments
+                        ),
+                    )
+                    entry = routed
             facts = {
                 "status": "admitted",
                 "parent_call_id": parent.id,
@@ -2519,7 +2613,6 @@ class CapabilityRuntime:
                         run_id=run.id, caller_principal_id=run.caller_principal_id
                     )
                     if ref.call_id == child.id
-                    and ref.capability_id == "data.export_tabular"
                 ),
                 None,
             )
@@ -2594,8 +2687,6 @@ class CapabilityRuntime:
                     )
                     and not (
                         capture
-                        and name == "data_export_tabular"
-                        and arguments.get("format") == "arrow"
                         and self._analysis_capture_eligible(
                             entry.domain_owner_id, entry.capability
                         )
@@ -2624,7 +2715,7 @@ class CapabilityRuntime:
 
                     result = await self._execute_one(
                         run,
-                        child,
+                        targets.get(child.id, child),
                         entry,
                         sensitivity=sensitivity,
                         validated_arguments=None,
@@ -2925,7 +3016,25 @@ class CapabilityRuntime:
             sensitivity: ModelSensitivity,
             denial: str | None,
         ) -> ProgrammaticReadResult:
-            if name != "data_export_tabular" or arguments.get("format") != "arrow":
+            entry = entries.get(name)
+            routed = (
+                None
+                if entry is None or not entry.routes
+                else entry.route(tool_call_mode(entry.view, arguments))
+            )
+            # A capture installs one Arrow dataset: only an Arrow-producing
+            # route of a capture-eligible capability qualifies.
+            if (
+                routed is None
+                or entry is None
+                or not self._analysis_capture_eligible(
+                    routed.domain_owner_id, routed.capability
+                )
+                or tool_route_arguments(entry.view, routed.capability, arguments).get(
+                    entry.view.mode_argument
+                )
+                != "arrow"
+            ):
                 denial = "analysis_capture_not_admitted"
             return await invoke(
                 name, arguments, sensitivity, capture=True, denial=denial
@@ -4644,7 +4753,62 @@ def _tool_contract(
             data_access=entry.capability.access_mode.value,
             operational_effect=entry.capability.operational_effect.value,
         )
+        if entry.routes:
+            # A routed tool's top-level schema is its primary route; each other
+            # admitted route states only how its input differs from that schema.
+            contract.update(
+                route_argument=entry.view.mode_argument,
+                routes=[
+                    {
+                        "route": mode,
+                        "capability_id": route.capability.id,
+                        **_route_input_contract(
+                            entry.capability.input_schema,
+                            route.capability.input_schema,
+                        ),
+                        "output_kind": route.capability.output_kind,
+                        "data_access": route.capability.access_mode.value,
+                        "operational_effect": route.capability.operational_effect.value,
+                    }
+                    for mode, route in entry.routes
+                ],
+            )
     return contract
+
+
+def _route_input_contract(
+    primary: Mapping[str, object], schema: Mapping[str, object]
+) -> dict[str, object]:
+    """Describe a route's input as changes to the top-level schema, never a copy."""
+    if schema == primary:
+        return {"input_schema": "same_as_top_level"}
+    primary_properties = primary.get("properties")
+    properties = schema.get("properties")
+    if not isinstance(primary_properties, Mapping) or not isinstance(
+        properties, Mapping
+    ):
+        return {"input_schema": schema}
+    changes: dict[str, object] = {
+        key: value
+        for key, value in schema.items()
+        if key != "properties" and primary.get(key) != value
+    }
+    removed_keywords = sorted(
+        key for key in primary if key != "properties" and key not in schema
+    )
+    if removed_keywords:
+        changes["removed_keywords"] = removed_keywords
+    changed = {
+        name: value
+        for name, value in properties.items()
+        if primary_properties.get(name) != value
+    }
+    if changed:
+        changes["properties"] = changed
+    removed = sorted(name for name in primary_properties if name not in properties)
+    if removed:
+        changes["removed_properties"] = removed
+    return {"input_schema_changes": changes}
 
 
 def _fit_load_contracts(
@@ -4997,14 +5161,30 @@ def _verified_loaded_entries(
     limits: LoopLimits,
     registry: CapabilityRegistry,
 ) -> tuple[RunToolCatalogEntry, ...] | None:
-    if set(data) != {
+    receipt_keys = {
         "run_id",
         "catalog_digest",
         "loaded_names",
         "definition_bytes",
         "activation_digest",
         "contracts",
-    }:
+    }
+    if set(data) not in (receipt_keys, receipt_keys | {"already_pinned_names"}):
+        return None
+    by_name = {entry.view.name: entry for entry in catalog_entries}
+    pinned_names = tuple(
+        sorted(
+            name
+            for name in requested_names
+            if name in by_name and by_name[name].load_mode is not ToolLoadMode.ON_DEMAND
+        )
+    )
+    pinned_value = data.get("already_pinned_names", ())
+    if (
+        not isinstance(pinned_value, (tuple, list))
+        or tuple(pinned_value) != pinned_names
+        or ("already_pinned_names" in data and not pinned_names)
+    ):
         return None
     names_value = data.get("loaded_names")
     if not isinstance(names_value, (tuple, list)):
@@ -5012,14 +5192,14 @@ def _verified_loaded_entries(
     names = tuple(name for name in names_value if isinstance(name, str))
     if (
         len(names) != len(names_value)
-        or names != tuple(sorted(requested_names))
+        or names
+        != tuple(sorted(name for name in requested_names if name not in pinned_names))
         or len(names) != len(set(names))
         or len(names) > limits.max_loaded_tools
         or data.get("run_id") != run_id
         or data.get("catalog_digest") != catalog_digest
     ):
         return None
-    by_name = {entry.view.name: entry for entry in catalog_entries}
     try:
         entries = tuple(by_name[name] for name in names)
     except KeyError:

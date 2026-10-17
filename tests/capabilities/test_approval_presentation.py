@@ -28,7 +28,7 @@ def test_approval_rejects_secret_fields_without_confusing_token_budgets(
         }
     )
     assert approval_review_document(
-        tool_name="routine_create", capability_id="routines.create", arguments_text=safe
+        tool_name="routine_save", capability_id="routines.create", arguments_text=safe
     )[1]
     unsafe = json.dumps({"nested": {field: "sensitive"}})
     assert not approval_review_document(

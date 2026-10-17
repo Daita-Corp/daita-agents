@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from tests.capabilities._toolbox_support import (
     NOW,
     TOOLBOX_DEFINITIONS,
@@ -40,6 +42,7 @@ from tests.capabilities._toolbox_support import (
     _presentation,
     _run,
     _runtime,
+    canonical_json,
     cast,
     pytest,
     replace,
@@ -228,25 +231,23 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             if registry.resolve_tool(name)[0].presentation.toolbox_id
             is ToolboxId.ARTIFACTS
         } == {
-            "artifact_convert",
-            "artifact_create_document",
-            "artifact_create_tabular",
+            "artifact_create",
             "artifact_edit_text",
             "artifact_list",
             "artifact_read",
             "artifact_save_local",
             "artifact_set_export_location",
-            "artifact_snapshot_result",
-            "data_export_tabular",
         }
         assert {
             name
             for name in registry.tool_names
             if registry.resolve_tool(name)[0].presentation.toolbox_id is ToolboxId.FILES
         } == {"file_query", "file_read", "file_search"}
-        assert registry.resolve_tool("start_data_profile")[
-            0
-        ].presentation.toolbox_id is (ToolboxId.JOBS)
+        # Profile graphs keep internal capabilities only; data_query profiles.
+        assert not any(
+            registry.resolve_tool(name)[1].id.startswith("jobs.data_profile.")
+            for name in registry.tool_names
+        )
         assert {
             "catalog_schema",
             "catalog_inspect",
@@ -259,6 +260,17 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             for name in registry.tool_names
             if registry.resolve_tool(name)[0].mode_capability_ids
         } == {
+            "artifact_create": (
+                ("table", "artifact.create_tabular"),
+                ("document", "artifact.create_document"),
+                ("tool_result", "artifact.snapshot_result"),
+                ("artifact", "artifact.convert"),
+            ),
+            "data_query": (
+                ("rows", "data.query"),
+                ("csv", "data.export_tabular"),
+                ("xlsx", "data.export_tabular"),
+            ),
             "data_update_rows": (
                 ("preview", "data.preview_update_rows"),
                 ("apply", "data.update_rows"),
@@ -267,6 +279,22 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
                 ("preview", "data.preview_upsert_rows"),
                 ("apply", "data.upsert_rows"),
             ),
+            "routine_save": (
+                ("create", "routines.create"),
+                ("update", "routines.update"),
+            ),
+            "semantic_save": (
+                ("save", "semantic.save"),
+                ("delete", "semantic.delete"),
+            ),
+            "semantic_view": (
+                ("list", "semantic.list"),
+                ("view", "semantic.view"),
+            ),
+            "skill_save": (
+                ("save", "skill.save"),
+                ("delete", "skill.delete"),
+            ),
         }
         for name in (
             "catalog_search",
@@ -274,6 +302,9 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             "data_query",
             "data_update_rows",
             "data_upsert_rows",
+            "semantic_save",
+            "semantic_view",
+            "skill_save",
         ):
             assert len(registry.tool_definition(name).description.encode()) <= 600
     finally:
@@ -283,7 +314,9 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
 @pytest.mark.parametrize(
     "first,second",
     [
-        ("artifact_create_document", "routine_create"),
+        ("artifact_create", "routine_save"),
+        ("routine_save", "artifact_create"),
+        ("skill_save", "artifact_create"),
         ("file_query", "artifact_edit_text"),
     ],
 )
@@ -331,8 +364,19 @@ async def test_contract_schema_survives_replacement_in_real_request(
             if isinstance(block, ToolResultBlock) and block.call_id == "inspect-first"
         )
         contract = cast(Mapping[str, Any], _data(retained))["value"]
-        definition = runtime._registry.tool_definition(first)
-        assert contract["input_schema"] == definition.input_schema
+        view, primary = runtime._registry.resolve_tool(first)
+        assert contract["input_schema"] == primary.input_schema
+        if view.mode_capability_ids:
+            assert contract["route_argument"] == view.mode_argument
+            assert [
+                (route["route"], route["capability_id"]) for route in contract["routes"]
+            ] == list(view.mode_capability_ids)
+            for route in contract["routes"]:
+                # Each route is stated as changes to the top-level schema, and
+                # applying them restores that route's exact input schema.
+                assert _route_schema(contract["input_schema"], route) == _plain(
+                    runtime._registry.capability(route["capability_id"]).input_schema
+                )
         assert contract["complete"] is True
         assert contract["input_schema_digest"]
         assert contract["contract_digest"]
@@ -477,7 +521,7 @@ async def test_static_context_stays_frozen_while_provider_definitions_change(
             run,
             catalog,
             (start,),
-            ("artifact_create_document",),
+            ("artifact_create",),
             call_id="context-load-a",
         )
         assert not result_a.is_error
@@ -497,17 +541,17 @@ async def test_static_context_stays_frozen_while_provider_definitions_change(
                 if isinstance(block, TextBlock)
             )
 
-        # This files-only prepared scope has no catalog tools. Document creation
+        # This files-only prepared scope has no catalog tools. Artifact creation
         # is loaded, while publication remains discoverable for a later step.
         assert "catalog_describe detail=schema" not in system_text(request_initial)
         assert "toolbox_load artifact_save_local" in system_text(request_a)
         assert "then invoke it from the next step" in system_text(request_a)
-        assert "artifact_convert only converts" not in system_text(request_a)
+        assert "artifact_create from=artifact only converts" in system_text(request_a)
         replacement_name = next(
             entry.view.name
             for entry in catalog.entries
             if entry.load_mode is ToolLoadMode.ON_DEMAND
-            and entry.view.name != "artifact_create_document"
+            and entry.view.name != "artifact_create"
         )
         result_b, messages_b, projection_b = await _load(
             runtime,
@@ -532,10 +576,12 @@ async def test_static_context_stays_frozen_while_provider_definitions_change(
         assert {item.name for item in request_initial.tools} != {
             item.name for item in request_a.tools
         }
-        assert "artifact_create_document" in {item.name for item in request_a.tools}
-        assert "artifact_create_document" not in {item.name for item in request_b.tools}
+        assert "artifact_create" in {item.name for item in request_a.tools}
+        assert "artifact_create" not in {item.name for item in request_b.tools}
         assert replacement_name in {item.name for item in request_b.tools}
-        assert "artifact_create_document for Markdown/TXT" not in system_text(request_b)
+        assert "artifact_create from=document for Markdown/TXT" not in system_text(
+            request_b
+        )
         assert projection_a.catalog_digest == projection_b.catalog_digest
         assert projection_a.activation_digest != projection_b.activation_digest
 
@@ -559,3 +605,30 @@ async def test_static_context_stays_frozen_while_provider_definitions_change(
             )
     finally:
         await agent.close()
+
+
+def _route_schema(primary: Any, route: Mapping[str, Any]) -> object:
+    if route.get("input_schema") == "same_as_top_level":
+        return _plain(primary)
+    if "input_schema" in route:
+        return _plain(route["input_schema"])
+    changes = dict(_plain(route["input_schema_changes"]))
+    schema = {
+        key: value
+        for key, value in _plain(primary).items()
+        if key not in changes.pop("removed_keywords", ())
+    }
+    removed = changes.pop("removed_properties", ())
+    properties = {
+        name: value
+        for name, value in schema.get("properties", {}).items()
+        if name not in removed
+    }
+    properties.update(changes.pop("properties", {}))
+    schema.update(changes)
+    schema["properties"] = properties
+    return schema
+
+
+def _plain(value: object) -> Any:
+    return json.loads(canonical_json(value))

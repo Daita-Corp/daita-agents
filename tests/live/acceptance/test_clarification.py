@@ -20,11 +20,9 @@ from daita import (
     MCPAuthentication,
     MCPToolSelection,
     SQLiteSource,
-    create_llm_provider,
 )
 from daita.adapters.mcp import SDKMCPClientFactory
 from daita.llm.models import ModelProfile, ToolCall, ToolResultBlock
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import ManagedModelProvider
 from daita.loop.models import (
     LoopExit,
@@ -33,6 +31,7 @@ from daita.loop.models import (
     validate_completed_transcript,
 )
 from daita.security import SecretReference
+from tests.support.live_billing import cost_cap, live_provider
 from tests.support.mcp import (
     MappingSecretProvider,
     conformance_identities,
@@ -92,26 +91,20 @@ def _live_provider() -> tuple[ModelProfile, ManagedModelProvider]:
     if os.environ.get(_AUTHORIZATION) != "1":
         pytest.fail(f"{_AUTHORIZATION}=1 is required before constructing a provider")
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
-    provider_name = model_id.partition(":")[0]
-    key_environment = _API_KEY_ENVIRONMENT.get(provider_name)
+    key_environment = _API_KEY_ENVIRONMENT.get(model_id.partition(":")[0])
     if key_environment is None:
         pytest.fail(f"{_MODEL_ID} must name one API-backed reviewed model")
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name one release-reviewed tool-capable model")
-    if not profile.supports_streaming:
-        pytest.fail(f"{_MODEL_ID} must name a model with reviewed streaming support")
-    api_key = os.environ.get(_MODEL_KEY) or _required_environment(key_environment)
-    provider = create_llm_provider(
+    return live_provider(
         model_id,
-        api_key=api_key,
-        max_output_tokens=min(profile.max_output_tokens, 1_536),
+        api_key=lambda: os.environ.get(_MODEL_KEY)
+        or _required_environment(key_environment),
+        max_output_tokens=1_536,
+        require_streaming=True,
     )
-    return profile, provider
 
 
 def _limits() -> LoopLimits:
-    return LoopLimits(max_estimated_cost_usd=_cost_limit())
+    return LoopLimits(max_estimated_cost_usd=cost_cap(_cost_limit()))
 
 
 def _orders_database(path: Path) -> None:

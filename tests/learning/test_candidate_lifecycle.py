@@ -318,13 +318,7 @@ async def test_semantic_acceptance_projects_only_its_exact_write_tool(tmp_path):
         catalog = await runtime.prepare_session(session)
         names = {entry.view.name for entry in catalog.entries}
 
-        write_tools = {
-            "memory_set",
-            "semantic_delete",
-            "semantic_save",
-            "skill_delete",
-            "skill_save",
-        }
+        write_tools = {"memory_set", "semantic_save", "skill_save"}
         assert names & write_tools == {"semantic_save"}
     finally:
         await agent.close()
@@ -452,7 +446,7 @@ async def test_semantic_tools_cannot_cross_the_selected_source_boundary(tmp_path
                 ModelResponse(
                     finish_reason=FinishReason.TOOL_CALLS,
                     tool_calls=(
-                        ToolCall("list", "semantic_list", {}),
+                        ToolCall("list", "semantic_view", {}),
                         ToolCall(
                             "view-cross-source",
                             "semantic_view",
@@ -460,8 +454,9 @@ async def test_semantic_tools_cannot_cross_the_selected_source_boundary(tmp_path
                         ),
                         ToolCall(
                             "delete-cross-source",
-                            "semantic_delete",
+                            "semantic_save",
                             {
+                                "action": "delete",
                                 "id": "second-definition",
                                 "expected_sha256": second_view.sha256,
                             },

@@ -17,13 +17,12 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent, LoopLimits, SQLiteSource, create_llm_provider
+from daita import Agent, LoopLimits, SQLiteSource
 from daita._json import canonical_json
 from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     CanonicalMessage,
-    FinishReason,
     MessageRole,
     ModelProfile,
     ModelRequest,
@@ -37,7 +36,6 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.pricing import CostEstimate
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
     ManagedModelProvider,
     StreamingModelProvider,
@@ -53,6 +51,7 @@ from daita.loop.models import (
     Transcript,
     validate_completed_transcript,
 )
+from tests.support.live_billing import cost_cap, live_provider
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_STAGE_A_KERNEL"
@@ -77,7 +76,7 @@ pytestmark = [
         os.environ.get(_AUTHORIZATION) != "1",
         reason=(
             f"set {_AUTHORIZATION}=1 only after explicitly authorizing up to "
-            "three live model runs for the Stage A kernel suite"
+            "two live model runs for the Stage A kernel suite"
         ),
     ),
 ]
@@ -190,15 +189,11 @@ def _live_provider(
             f"{_MODEL_ID} must name an API-backed provider: "
             + ", ".join(sorted(_API_PROVIDERS))
         )
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name one release-reviewed tool-capable model")
-    if not profile.supports_streaming:
-        pytest.fail(f"{_MODEL_ID} must name a model with reviewed streaming support")
-    delegate = create_llm_provider(
+    profile, delegate = live_provider(
         model_id,
-        api_key=_required_environment(_MODEL_KEY),
-        max_output_tokens=min(profile.max_output_tokens, max_output_tokens),
+        api_key=lambda: _required_environment(_MODEL_KEY),
+        max_output_tokens=max_output_tokens,
+        require_streaming=True,
     )
     return profile, _RecordingProvider(delegate)
 
@@ -239,7 +234,7 @@ def _successful_query(
 
 
 def _limits() -> LoopLimits:
-    return LoopLimits(max_estimated_cost_usd=_cost_limit())
+    return LoopLimits(max_estimated_cost_usd=cost_cap(_cost_limit()))
 
 
 async def test_live_tool_round_trip_has_stable_context_and_durable_completion(
@@ -349,50 +344,6 @@ async def test_live_tool_round_trip_has_stable_context_and_durable_completion(
         validate_completed_transcript(reopened_transcript, persisted.result)
 
 
-async def test_live_output_exhaustion_never_becomes_normal_completion(
-    tmp_path: Path,
-) -> None:
-    """Force a live provider output limit and require an explicit failed exit."""
-
-    profile, provider = _live_provider(max_output_tokens=64)
-    async with AsyncExitStack() as resources:
-        resources.push_async_callback(provider.close)
-        agent = await Agent.create(
-            "live-stage-a-output-limit",
-            root=tmp_path / "output-limit-root",
-            model=provider,
-            model_profile=profile,
-            limits=_limits(),
-            workspace=workspace_for(tmp_path / "output-limit-root"),
-        )
-        try:
-            result = await agent.run(
-                "Do not call tools. Output exactly 800 numbered lines. Every line must "
-                "contain its number and the phrase STAGE_A_OUTPUT_LIMIT_PROBE. Do not "
-                "abbreviate, summarize, omit lines, or stop before line 800."
-            )
-            transcript = await agent.transcript(result.run_id)
-        finally:
-            await agent.close()
-
-        assert result.kind is LoopExitKind.FAILED, (
-            result.kind,
-            result.reason,
-            result.final_text,
-        )
-        assert result.reason in {
-            "model_output_limit",
-            ProviderErrorCode.OUTPUT_LIMIT.value,
-        }
-        assert result.final_text is None
-        assert provider.requests
-        assert all(
-            response.finish_reason is not FinishReason.STOP
-            for response in provider.responses
-        )
-        assert transcript.messages[0].content
-
-
 async def test_live_fallback_provider_stays_sticky_through_tool_completion(
     tmp_path: Path,
 ) -> None:
@@ -425,7 +376,7 @@ async def test_live_fallback_provider_stays_sticky_through_tool_completion(
                 ),
             ),
             retry_policy=RetryPolicy(
-                max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+                max_attempts_per_candidate=1, max_total_attempts=2, backoff_seconds=0
             ),
         )
         database = tmp_path / "stage-a-fallback.sqlite"

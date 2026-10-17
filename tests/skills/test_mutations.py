@@ -8,7 +8,6 @@ from tests.support.approval_learning import (
     SKILL_DELETE_CAPABILITY_ID,
     SKILL_DELETE_EXECUTOR_ID,
     SKILL_DELETE_OUTPUT_KIND,
-    SKILL_DELETE_TOOL_NAME,
     SKILL_SAVE_CAPABILITY_ID,
     SKILL_SAVE_EXECUTOR_ID,
     SKILL_SAVE_OUTPUT_KIND,
@@ -222,23 +221,27 @@ async def test_loaded_skill_is_replaced_instead_of_duplicated(tmp_path):
 async def test_skill_write_identities_use_the_existing_registry_and_runtime(tmp_path):
     agent = await _agent(tmp_path, "skill-identities")
     try:
+        # skill_save routes action=delete to the existing delete capability.
         expected = {
-            SKILL_SAVE_TOOL_NAME: (
+            "save": (
                 SKILL_SAVE_CAPABILITY_ID,
                 SKILL_SAVE_EXECUTOR_ID,
                 SKILL_SAVE_OUTPUT_KIND,
             ),
-            SKILL_DELETE_TOOL_NAME: (
+            "delete": (
                 SKILL_DELETE_CAPABILITY_ID,
                 SKILL_DELETE_EXECUTOR_ID,
                 SKILL_DELETE_OUTPUT_KIND,
             ),
         }
         registry = agent._embedded._capabilities
-        for tool_name, identity in expected.items():
-            view, capability = registry.resolve_tool(tool_name)
+        view = registry.resolve_tool(SKILL_SAVE_TOOL_NAME)[0]
+        assert view.capability_id == SKILL_SAVE_CAPABILITY_ID
+        for action, identity in expected.items():
+            capability = registry.call_capability(
+                SKILL_SAVE_TOOL_NAME, {"action": action}
+            )
             resolved, executor = registry.resolve_execution(capability.id)
-            assert view.capability_id == capability.id
             assert resolved == capability
             assert (
                 capability.id,

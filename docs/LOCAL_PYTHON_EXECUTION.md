@@ -316,11 +316,11 @@ real-worker, real-model and managed-install qualification command and reports.
 
 Use an exact Arrow export for dataset statistics, rather than treating bounded
 `data_query` rows as complete data. The two-call path exports with
-`data_export_tabular(format="arrow")`, then binds the returned exact artifact ID
-in `python_execute.inputs`. Within a cell, the loaded export can also be captured:
+`data_query(output="arrow")`, then binds the returned exact artifact ID
+in `python_execute.inputs`. Within a cell, the same export can also be captured:
 
 ```python
-captured = tools.capture("data_export_tabular", export_arguments, name="orders")
+captured = tools.capture("data_query", export_arguments, name="orders")
 if captured["is_error"]:
     raise ValueError(captured["output"])
 import pyarrow.ipc as ipc

@@ -22,12 +22,10 @@ from daita import (
     ApprovalDecision,
     ApprovalRequest,
     LoopLimits,
-    create_llm_provider,
 )
 from daita._json import canonical_json
 from daita.artifacts.models import ArtifactDeliveryMode, ArtifactDeliveryOutcome
 from daita.llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import ManagedModelProvider
 from daita.loop.models import (
     LoopExitKind,
@@ -36,6 +34,7 @@ from daita.loop.models import (
 )
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
 from tests.support.job_benchmarks import RecordingProvider
+from tests.support.live_billing import cost_cap, live_provider
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_LOCAL_TEXT_EDIT"
@@ -91,20 +90,16 @@ def _cost_limit() -> Decimal:
 
 def _live_model() -> tuple[ModelProfile, ManagedModelProvider]:
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name one release-reviewed tool-capable model")
-    if not profile.supports_streaming:
-        pytest.fail(f"{_MODEL_ID} must name a model with reviewed streaming support")
     provider_name = model_id.partition(":")[0]
     key_environment = _API_KEY_ENVIRONMENT.get(provider_name)
     if key_environment is None:
         pytest.fail(f"{_MODEL_ID} must name one API-backed reviewed model")
-    api_key = os.environ.get(_MODEL_KEY) or _required_environment(key_environment)
-    provider = create_llm_provider(
+    profile, provider = live_provider(
         model_id,
-        api_key=api_key,
-        max_output_tokens=min(profile.max_output_tokens, 1_024),
+        api_key=lambda: os.environ.get(_MODEL_KEY)
+        or _required_environment(key_environment),
+        max_output_tokens=1_024,
+        require_streaming=True,
     )
     return profile, provider
 
@@ -113,7 +108,7 @@ def _limits() -> LoopLimits:
     profile = os.environ.get("DAITA_LOCAL_TEXT_EDIT_LIVE_PROFILE", "strict")
     if profile not in {"strict", "user_flow"}:
         raise ValueError("local text edit profile must be strict or user_flow")
-    return LoopLimits(max_estimated_cost_usd=_cost_limit())
+    return LoopLimits(max_estimated_cost_usd=cost_cap(_cost_limit()))
 
 
 def _successful_exchanges(

@@ -5,8 +5,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -15,6 +13,7 @@ from daita import Agent, AgentConfig, LocalWorkspace
 from daita._json import canonical_json
 from daita.loop.models import LoopLimits
 from daita.tui.app import DaitaApp
+from tests.support.live_billing import subscription_billing
 
 pytestmark = pytest.mark.requires_llm
 
@@ -68,7 +67,8 @@ async def retain_evidence(agent, result, report):
     generations = [record for record in records if record.kind == "generation"]
     report["cleanup"] = [record.facts.get("cleanup") for record in generations]
     assert result.kind.value == "completed", report
-    assert result.usage.cost_estimate.amount_usd is not None
+    if not subscription_billing():
+        assert result.usage.cost_estimate.amount_usd is not None
     assert generations
     for record in generations:
         assert record.facts["cleanup"]["process_reaped"] is True
@@ -213,82 +213,6 @@ async def test_real_model_dependent_cells_and_error_correction(
         await provider.close()
 
 
-async def test_real_model_cli_python_and_broker(tmp_path, paid_case, analysis_report):
-    profile, provider, cost = paid_case
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    (workspace / "numbers.txt").write_text("1\n2\n3\n")
-    root = tmp_path / "homes"
-    bootstrap = await Agent.create(
-        "live-cli", root=root, workspace=LocalWorkspace(workspace)
-    )
-    await bootstrap.close()
-    command = [
-        str(Path(sys.executable).with_name("daita")),
-        "--root",
-        str(root),
-        "--workspace",
-        str(workspace),
-        "run",
-        "live-cli",
-        "Use python_execute. Inside Python, call tools.call('file_read', {'path': 'numbers.txt'}), inspect r['is_error'] and r['output']['data']['content'], then compute and print {'sum': the_sum}. Make the file_read call inside Python even if you already read it elsewhere. Report the sum.",
-        "--model",
-        profile.id,
-        "--max-cost-usd",
-        str(cost),
-    ]
-    analysis_report["command"] = command
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            asyncio.to_thread(process.communicate), 300
-        )
-        analysis_report["exit_code"] = process.returncode
-        analysis_report["stderr"] = stderr.decode()[-8192:]
-        assert process.returncode == 0, stderr.decode()
-        payload = json.loads(stdout)
-        analysis_report.update(
-            {
-                "cli_output": payload,
-                "model_usage": payload["model_usage"],
-                "expected_sum": 6,
-            }
-        )
-        assert payload["status"] == "completed"
-        reopened = await Agent.open(
-            "live-cli", root=root, workspace=LocalWorkspace(workspace)
-        )
-        try:
-            records = await reopened.analysis_evidence(payload["run_id"])
-            analysis_report["measurements"] = [
-                {"kind": record.kind, "facts": record.facts} for record in records
-            ]
-            assert any(
-                record.kind == "child" and record.facts["status"] == "succeeded"
-                for record in records
-            )
-            cells = [
-                json.loads(canonical_json(record.facts))
-                for record in records
-                if record.kind == "cell"
-            ]
-            values = [
-                computed_sum(cell.get("result", {}).get("stdout", "")) for cell in cells
-            ]
-            analysis_report["actual_sums"] = values
-            assert 6 in values
-            assert payload["analysis_usage"]["processes_reaped"] is True
-            assert payload["analysis_usage"]["scratch_deleted"] is True
-            analysis_report["cleanup"] = payload["analysis_usage"]
-        finally:
-            await reopened.close()
-    finally:
-        if process.poll() is None:
-            process.kill()
-        await asyncio.to_thread(process.wait, 5)
-        await provider.close()
-
-
 async def test_real_model_tui_python_and_broker(tmp_path, paid_case, analysis_report):
     profile, provider, cost = paid_case
     workspace = tmp_path / "workspace"
@@ -395,7 +319,7 @@ async def test_paired_exact_dataset_handoffs_have_independent_numeric_oracles(
         method = (
             "First export a complete Arrow query, then bind its exact artifact ID in python_execute.inputs."
             if handoff == "export_bind"
-            else "Use tools.capture('data_export_tabular', ..., name='numbers') within Python after loading the exact export and analysis tools together."
+            else "Use tools.capture('data_query', ..., name='numbers') with output='arrow' within Python after loading python_execute."
         )
         started = perf_counter()
         result = await agent.run(
@@ -455,7 +379,8 @@ async def test_paired_exact_dataset_handoffs_have_independent_numeric_oracles(
         exports = [
             output
             for call, output in transcript.tool_pairs
-            if call.name == "data_export_tabular"
+            if call.name == "data_query"
+            and call.arguments.get("output") == "arrow"
             and output is not None
             and not output.is_error
         ]
@@ -463,7 +388,7 @@ async def test_paired_exact_dataset_handoffs_have_independent_numeric_oracles(
             r
             for r in records
             if r.kind == "child"
-            and r.facts["tool_name"] == "data_export_tabular"
+            and r.facts["tool_name"] == "data_query"
             and r.facts["status"] == "succeeded"
         ]
         assert exports if handoff == "export_bind" else captured

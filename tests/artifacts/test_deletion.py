@@ -36,10 +36,9 @@ from tests.artifacts._public_surface_support import (
 from tests.support.job_benchmarks import (
     OFFLINE_EAGER_LIMITS,
     TARGET_PROFILE_TABLE,
+    admit_profile_job,
     create_probe_home,
-    start_profile_response,
     stop_response,
-    toolbox_load_response,
     wait_for_terminal,
 )
 
@@ -54,8 +53,9 @@ async def artifact_agent(tmp_path):
         tuple(
             _tool(
                 f"create-{index}",
-                "artifact_create_document",
+                "artifact_create",
                 {
+                    "from": "document",
                     "format": "txt",
                     "filename": f"result-{index}.txt",
                     "content": f"payload {index}",
@@ -378,13 +378,7 @@ async def test_active_job_reservation_prevents_deletion_until_result_is_accepted
     tmp_path, monkeypatch
 ):
     home = await create_probe_home(tmp_path, "active-artifact")
-    provider = MockModelProvider(
-        (
-            toolbox_load_response("start_data_profile"),
-            start_profile_response(home.resource_ids[TARGET_PROFILE_TABLE]),
-            stop_response(),
-        )
-    )
+    provider = MockModelProvider((stop_response(),))
     agent = await Agent.open(
         home.name,
         root=home.root,
@@ -408,7 +402,10 @@ async def test_active_job_reservation_prevents_deletion_until_result_is_accepted
 
     monkeypatch.setattr(supervisor, "_promote_graph_artifact", pause_promotion)
     try:
-        await agent.run("Profile this table.", source_scope_ids=(home.source_id,))
+        origin = await agent.run(
+            "Profile this table.", source_scope_ids=(home.source_id,)
+        )
+        await admit_profile_job(agent, home.resource_ids[TARGET_PROFILE_TABLE], origin)
         await asyncio.wait_for(entered.wait(), timeout=10)
         (ref,) = observed
         with pytest.raises(ArtifactError) as busy:
@@ -433,13 +430,7 @@ async def test_graph_and_delivery_artifact_deletion_survives_reopen(
     tmp_path, clear_history, source_revision
 ):
     home = await create_probe_home(tmp_path, "graph-deletion")
-    provider = MockModelProvider(
-        (
-            toolbox_load_response("start_data_profile"),
-            start_profile_response(home.resource_ids[TARGET_PROFILE_TABLE]),
-            stop_response(),
-        )
-    )
+    provider = MockModelProvider((stop_response(),))
     agent = await Agent.open(
         home.name,
         root=home.root,
@@ -449,7 +440,10 @@ async def test_graph_and_delivery_artifact_deletion_survives_reopen(
         workspace=workspace_for(home.root),
     )
     try:
-        await agent.run("Profile this table.", source_scope_ids=(home.source_id,))
+        origin = await agent.run(
+            "Profile this table.", source_scope_ids=(home.source_id,)
+        )
+        await admit_profile_job(agent, home.resource_ids[TARGET_PROFILE_TABLE], origin)
         (job,) = await agent.list_jobs()
         await wait_for_terminal(agent, job.job_id)
         result = await agent.read_job_result(job.job_id)

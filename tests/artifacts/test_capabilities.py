@@ -19,20 +19,21 @@ from daita.artifacts.models import ArtifactRef
 from daita.capabilities import AccessMode, AutomationEligibility, OperationalEffect
 from daita.context import AgentContextBuilder
 from daita.domains.data.export_capabilities import (
-    ARTIFACT_CONVERT_TOOL_NAME,
+    ARTIFACT_CONVERT_CAPABILITY_ID,
     ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
+    ARTIFACT_CREATE_TOOL_NAME,
     ARTIFACT_EDIT_TEXT_TOOL_NAME,
+    ARTIFACT_LIST_CAPABILITY_ID,
     ARTIFACT_LIST_TOOL_NAME,
+    ARTIFACT_READ_CAPABILITY_ID,
     ARTIFACT_READ_TOOL_NAME,
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
     ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
     DOCUMENT_CREATE_CAPABILITY_ID,
-    DOCUMENT_CREATE_TOOL_NAME,
     RESULT_SNAPSHOT_CAPABILITY_ID,
-    RESULT_SNAPSHOT_TOOL_NAME,
     artifact_capability_declarations,
-    data_export_tabular_capability_declarations,
+    exact_export_capability_declarations,
 )
 from daita.llm.models import (
     CanonicalMessage,
@@ -117,8 +118,13 @@ def _stop(text: str = "done") -> ModelResponse:
 def _document_call() -> ModelResponse:
     return _call(
         "create",
-        "artifact_create_document",
-        {"format": "txt", "filename": "result.txt", "content": "result\n"},
+        "artifact_create",
+        {
+            "from": "document",
+            "format": "txt",
+            "filename": "result.txt",
+            "content": "result\n",
+        },
     )
 
 
@@ -145,24 +151,21 @@ def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -
     assert not hasattr(data_controller, "_explicit_artifact_request")
     assert not hasattr(data_controller, "_explicit_default_location_request")
     declarations = artifact_capability_declarations()
+    by_id = {item.id: item for item in declarations.capabilities}
     schemas = {
-        view.name: next(
-            item for item in declarations.capabilities if item.id == view.capability_id
-        ).input_schema
-        for view in declarations.tool_views
-        if view.name
-        in {
-            ARTIFACT_LIST_TOOL_NAME,
-            ARTIFACT_READ_TOOL_NAME,
-            ARTIFACT_CONVERT_TOOL_NAME,
-        }
+        name: by_id[capability_id].input_schema
+        for name, capability_id in (
+            (ARTIFACT_LIST_TOOL_NAME, ARTIFACT_LIST_CAPABILITY_ID),
+            (ARTIFACT_READ_TOOL_NAME, ARTIFACT_READ_CAPABILITY_ID),
+            (ARTIFACT_CREATE_TOOL_NAME, ARTIFACT_CONVERT_CAPABILITY_ID),
+        )
     }
     properties = {name: schema.get("properties") for name, schema in schemas.items()}
     assert all(isinstance(value, Mapping) for value in properties.values())
     list_properties = cast(Mapping[str, object], properties[ARTIFACT_LIST_TOOL_NAME])
     read_properties = cast(Mapping[str, object], properties[ARTIFACT_READ_TOOL_NAME])
     convert_properties = cast(
-        Mapping[str, object], properties[ARTIFACT_CONVERT_TOOL_NAME]
+        Mapping[str, object], properties[ARTIFACT_CREATE_TOOL_NAME]
     )
     assert set(list_properties) == set()
     assert set(read_properties) == {"artifact_id"}
@@ -171,13 +174,25 @@ def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -
         "format",
         "filename",
     }
+    (create_view,) = (
+        view
+        for view in declarations.tool_views
+        if view.name == ARTIFACT_CREATE_TOOL_NAME
+    )
+    assert create_view.mode_argument == "from"
+    assert create_view.mode_capability_ids == (
+        ("table", ARTIFACT_CREATE_TABULAR_CAPABILITY_ID),
+        ("document", DOCUMENT_CREATE_CAPABILITY_ID),
+        ("tool_result", RESULT_SNAPSHOT_CAPABILITY_ID),
+        ("artifact", ARTIFACT_CONVERT_CAPABILITY_ID),
+    )
     for schema in schemas.values():
         assert schema["additionalProperties"] is False
 
 
 def test_d2_certifies_only_the_three_accepted_scheduled_artifact_capabilities() -> None:
     declarations = artifact_capability_declarations()
-    data_declarations = data_export_tabular_capability_declarations()
+    data_declarations = exact_export_capability_declarations()
     capabilities = (*declarations.capabilities, *data_declarations.capabilities)
     by_id = {capability.id: capability for capability in capabilities}
     scheduled = {
@@ -213,8 +228,12 @@ async def test_result_snapshot_commits_exact_current_run_result_with_lineage(
             _document_call(),
             _call(
                 "snapshot",
-                RESULT_SNAPSHOT_TOOL_NAME,
-                {"result_ref": result_ref("create"), "filename": "result.json"},
+                ARTIFACT_CREATE_TOOL_NAME,
+                {
+                    "from": "tool_result",
+                    "result_ref": result_ref("create"),
+                    "filename": "result.json",
+                },
             ),
             _stop(),
         ),
@@ -263,8 +282,8 @@ async def test_result_snapshot_rejects_cross_run_evidence(tmp_path: Path) -> Non
             _stop("first run complete"),
             _call(
                 "snapshot",
-                RESULT_SNAPSHOT_TOOL_NAME,
-                {"result_ref": result_ref("create")},
+                ARTIFACT_CREATE_TOOL_NAME,
+                {"from": "tool_result", "result_ref": result_ref("create")},
             ),
             _stop("second run complete"),
         ),
@@ -315,8 +334,8 @@ async def test_result_snapshot_rejects_cross_agent_evidence(tmp_path: Path) -> N
         (
             _call(
                 "snapshot",
-                RESULT_SNAPSHOT_TOOL_NAME,
-                {"result_ref": result_ref("create")},
+                ARTIFACT_CREATE_TOOL_NAME,
+                {"from": "tool_result", "result_ref": result_ref("create")},
             ),
             _stop(),
         ),
@@ -346,13 +365,13 @@ async def test_result_snapshot_rejects_failed_call_evidence(tmp_path: Path) -> N
         (
             _call(
                 "failed",
-                DOCUMENT_CREATE_TOOL_NAME,
-                {"format": "pdf", "content": "not admitted"},
+                ARTIFACT_CREATE_TOOL_NAME,
+                {"from": "document", "format": "pdf", "content": "not admitted"},
             ),
             _call(
                 "snapshot",
-                RESULT_SNAPSHOT_TOOL_NAME,
-                {"result_ref": result_ref("failed")},
+                ARTIFACT_CREATE_TOOL_NAME,
+                {"from": "tool_result", "result_ref": result_ref("failed")},
             ),
             _stop(),
         ),
@@ -391,8 +410,8 @@ class _TranscriptTamperingProvider(MockModelProvider):
                 _document_call(),
                 _call(
                     "snapshot",
-                    RESULT_SNAPSHOT_TOOL_NAME,
-                    {"result_ref": result_ref("create")},
+                    ARTIFACT_CREATE_TOOL_NAME,
+                    {"from": "tool_result", "result_ref": result_ref("create")},
                 ),
                 _stop(),
             ),
@@ -522,8 +541,8 @@ async def test_result_snapshot_obeys_the_existing_artifact_quota(
             _document_call(),
             _call(
                 "snapshot",
-                RESULT_SNAPSHOT_TOOL_NAME,
-                {"result_ref": result_ref("create")},
+                ARTIFACT_CREATE_TOOL_NAME,
+                {"from": "tool_result", "result_ref": result_ref("create")},
             ),
             _stop(),
         ),
@@ -557,8 +576,8 @@ async def test_result_snapshot_cancellation_cannot_publish_a_partial_artifact(
             _document_call(),
             _call(
                 "snapshot",
-                RESULT_SNAPSHOT_TOOL_NAME,
-                {"result_ref": result_ref("create")},
+                ARTIFACT_CREATE_TOOL_NAME,
+                {"from": "tool_result", "result_ref": result_ref("create")},
             ),
             _stop(),
         ),
@@ -997,7 +1016,7 @@ async def test_context_requires_default_delivery_before_final_text_for_explicit_
                 "toolbox_load",
                 {
                     "tool_names": [
-                        DOCUMENT_CREATE_TOOL_NAME,
+                        ARTIFACT_CREATE_TOOL_NAME,
                         ARTIFACT_SAVE_LOCAL_TOOL_NAME,
                     ]
                 },
@@ -1023,7 +1042,7 @@ async def test_context_requires_default_delivery_before_final_text_for_explicit_
             for block in message.content
             if isinstance(block, TextBlock)
         )
-        assert "artifact_create_document" in system
+        assert "artifact_create" in system
         assert (
             "artifact_save_local" in system
             and 'mode="create_new" and destination_id="default"' in system
@@ -1088,9 +1107,9 @@ async def test_model_artifact_tools_use_exact_pinned_surface_without_classificat
         } <= projected
         assert {"toolbox_search", "toolbox_load"} <= projected
         assert {
-            DOCUMENT_CREATE_TOOL_NAME,
+            ARTIFACT_CREATE_TOOL_NAME,
             ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
-            ARTIFACT_CONVERT_TOOL_NAME,
+            ARTIFACT_CREATE_TOOL_NAME,
             ARTIFACT_SAVE_LOCAL_TOOL_NAME,
         }.isdisjoint(projected)
         assert not tuple(downloads.iterdir())
@@ -1130,7 +1149,7 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
         assert {
             ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
             ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-            DOCUMENT_CREATE_TOOL_NAME,
+            ARTIFACT_CREATE_TOOL_NAME,
         }.isdisjoint(projected)
         system = "\n".join(
             block.text
@@ -1140,7 +1159,7 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
             if isinstance(block, TextBlock)
         )
         assert "Call artifact_set_export_location only" in system
-        assert "call artifact_create_document and then call" not in system
+        assert "call artifact_create and then call" not in system
     finally:
         await agent.close()
 

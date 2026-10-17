@@ -131,8 +131,9 @@ from ..domains.data import (
     CatalogDataView,
     DataCapabilityDomain,
     artifact_declarations,
-    data_export_tabular_declarations,
     data_query_declarations,
+    exact_export_declarations,
+    exact_export_outputs,
     local_file_declarations,
     relational_update_declarations,
     relational_update_preview_declarations,
@@ -264,6 +265,7 @@ from ..observation import (
 )
 from ..routines.capabilities import (
     ROUTINE_DOMAIN_OWNER_ID,
+    ROUTINE_SAVE_TOOL_NAME,
     RoutineCapabilityDomain,
     routine_capability_declarations,
 )
@@ -1669,38 +1671,44 @@ class EmbeddedAgent:
         )
         if admission_cleanup is not None:
             admission_cleanup.push_async_callback(postgresql_backend.close)
-        relational_query = data_query_declarations(
-            identity.id,
-            sqlite_backend,
-            postgresql_backend,
-        )
         from ..adapters.analytical_workspace.runtime import runtime_status
 
         scientific_admitted = not hosted and runtime_status()["available"] is True
         admitted_analysis_limits = analysis_limits or AnalysisLimits()
+        export_arrow_bounds = (
+            (
+                min(100_000, admitted_analysis_limits.table_rows),
+                min(256, admitted_analysis_limits.table_columns),
+                min(
+                    admitted_analysis_limits.file_bytes,
+                    admitted_analysis_limits.input_bytes,
+                    admitted_analysis_limits.decoded_bytes,
+                    admitted_analysis_limits.scratch_bytes,
+                ),
+            )
+            if scientific_admitted
+            else None
+        )
         relational_export = (
-            data_export_tabular_declarations(
+            exact_export_declarations(
                 identity.id,
                 sqlite_backend,
                 postgresql_backend,
                 clock,
-                arrow_bounds=(
-                    (
-                        min(100_000, admitted_analysis_limits.table_rows),
-                        min(256, admitted_analysis_limits.table_columns),
-                        min(
-                            admitted_analysis_limits.file_bytes,
-                            admitted_analysis_limits.input_bytes,
-                            admitted_analysis_limits.decoded_bytes,
-                            admitted_analysis_limits.scratch_bytes,
-                        ),
-                    )
-                    if scientific_admitted
-                    else None
-                ),
+                arrow_bounds=export_arrow_bounds,
             )
             if artifact_store.available
             else None
+        )
+        relational_query = data_query_declarations(
+            identity.id,
+            sqlite_backend,
+            postgresql_backend,
+            file_outputs=(
+                exact_export_outputs(allow_arrow=export_arrow_bounds is not None)
+                if relational_export is not None
+                else ()
+            ),
         )
         postgresql_preview_backend = PostgreSQLWriteBackend(
             store,
@@ -2005,9 +2013,7 @@ class EmbeddedAgent:
         )
         data_profile_job_domain = DataProfileCapabilityDomain(
             data_profile_declaration_bundle,
-            catalog=data_view,
             admission=data_profile_admission,
-            learning=learning_candidate_guard,
         )
         if model is not None and context_builder is None:
             assert model_profile is not None
@@ -3619,7 +3625,7 @@ class EmbeddedAgent:
             request = ApprovalRequest(
                 run_id=control_id,
                 call_id=control_id,
-                tool_name="routine_create",
+                tool_name=ROUTINE_SAVE_TOOL_NAME,
                 capability_id="routines.create",
                 arguments=routine_approval_arguments(authority),
                 reason="Approve this exact saved assignment, its standing actions, and its schedule?",
@@ -3682,7 +3688,7 @@ class EmbeddedAgent:
             request = ApprovalRequest(
                 run_id=control_id,
                 call_id=control_id,
-                tool_name="routine_update",
+                tool_name=ROUTINE_SAVE_TOOL_NAME,
                 capability_id="routines.update",
                 arguments=routine_approval_arguments(authority),
                 reason="Replace this saved assignment with the exact proposed revision?",

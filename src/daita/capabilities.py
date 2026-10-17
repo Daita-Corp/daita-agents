@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -36,6 +36,7 @@ MAX_TOOL_PRESENTATION_GUIDANCE_CHARACTERS = 512
 MAX_TOOL_PRESENTATION_KEYWORDS = 16
 MAX_TOOL_PRESENTATION_KEYWORD_CHARACTERS = 64
 RESERVED_TOOL_NAMES = frozenset({"toolbox_search", "toolbox_load", "toolbox_inspect"})
+TOOL_MODE_ARGUMENT = "mode"
 MAX_EXECUTION_SCOPE_IDENTITIES = 256
 MAX_EXECUTION_SCOPE_IDENTITY_CHARACTERS = 2_048
 
@@ -1628,10 +1629,23 @@ class ToolView:
     origin_revision_digest: str | None = None
     presentation_sensitivity: ModelSensitivity = ModelSensitivity.PUBLIC
     connector_presentation: FrozenJsonObject | None = None
-    # One model-visible tool may select among existing capabilities by its
-    # ``mode`` argument. Each mode keeps its capability's own execution path,
-    # effects, approvals and receipts; ``capability_id`` is the primary mode.
+    # One model-visible tool may select among existing capabilities by one
+    # selector argument (``mode`` unless ``mode_argument`` names another). Each
+    # route keeps its capability's own execution path, effects, approvals and
+    # receipts; ``capability_id`` is the primary route. A capability reached by
+    # several routes receives the selector value as its own argument.
     mode_capability_ids: tuple[tuple[str, str], ...] = ()
+    mode_argument: str = TOOL_MODE_ARGUMENT
+    # The route of a call that omits the selector argument.
+    default_mode: str | None = None
+    # Route by whether the selector argument is present rather than by its
+    # value: the first route without it, the second route (which declares and
+    # receives it) with it.
+    mode_by_presence: bool = False
+    # Optional arguments whose full rules stay in the capability contract
+    # (read with toolbox_inspect) and are summarized in the provider schema.
+    # Validation always uses the capability's complete schema.
+    summarized_arguments: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -1653,15 +1667,40 @@ class ToolView:
                     for mode in modes
                 )
                 or len(set(modes)) != len(modes)
-                or len(set(capability_ids)) != len(capability_ids)
                 or self.capability_id not in capability_ids
+                or not isinstance(self.mode_argument, str)
+                or re.fullmatch(r"[a-z][a-z_]{0,31}", self.mode_argument) is None
+                or (self.default_mode is not None and self.default_mode not in modes)
+                or not isinstance(self.mode_by_presence, bool)
+                or (
+                    self.mode_by_presence
+                    and (
+                        len(routes) != 2
+                        or self.default_mode is not None
+                        or capability_ids[0] == capability_ids[1]
+                    )
+                )
             ):
                 raise ValueError("tool mode routes are invalid")
             for capability_id in capability_ids:
                 _text(capability_id, "tool mode capability_id")
             if self.connector_presentation is not None:
                 raise ValueError("connector tools cannot route by mode")
+        elif (
+            self.mode_argument != TOOL_MODE_ARGUMENT
+            or self.default_mode is not None
+            or self.mode_by_presence
+        ):
+            raise ValueError("tool route selection requires mode routes")
         object.__setattr__(self, "mode_capability_ids", routes)
+        summarized = tuple(self.summarized_arguments)
+        if len(set(summarized)) != len(summarized) or any(
+            not isinstance(item, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", item) is None
+            for item in summarized
+        ):
+            raise ValueError("summarized tool arguments are invalid")
+        object.__setattr__(self, "summarized_arguments", summarized)
         if self.name in RESERVED_TOOL_NAMES:
             raise ValueError(f"reserved runtime control tool name: {self.name}")
         if not isinstance(self.presentation, ToolPresentation):
@@ -1922,13 +1961,55 @@ class CapabilityRegistry:
                 owners = {self._domain_owners[item] for item in routed_ids}
                 if len(owners) != 1:
                     raise ValueError(f"mode routes must share one domain: {view.name}")
+                for capability_id in set(routed_ids):
+                    modes = tuple(
+                        mode
+                        for mode, routed in view.mode_capability_ids
+                        if routed == capability_id
+                    )
+                    declares_selector = _declares(
+                        self._capabilities[capability_id], view.mode_argument
+                    )
+                    if len(modes) > 1 and not declares_selector:
+                        raise ValueError(
+                            "a capability reached by several routes must declare "
+                            f"the selector: {view.name}"
+                        )
+                    if declares_selector and not view.mode_by_presence:
+                        properties = self._capabilities[capability_id].input_schema[
+                            "properties"
+                        ]
+                        rule = (
+                            properties.get(view.mode_argument)
+                            if isinstance(properties, Mapping)
+                            else None
+                        )
+                        if (
+                            not isinstance(rule, Mapping)
+                            or not isinstance(rule.get("enum"), (tuple, list))
+                            or not set(modes) <= set(rule["enum"])
+                        ):
+                            raise ValueError(
+                                f"routed selector values are undeclared: {view.name}"
+                            )
                 mode_input_schemas[view.name] = _mode_input_schema(
+                    view,
                     tuple(
                         (mode, self._capabilities[capability_id].input_schema)
                         for mode, capability_id in view.mode_capability_ids
-                    )
+                    ),
                 )
         self._mode_input_schemas = MappingProxyType(mode_input_schemas)
+        for declaration in declared.values():
+            for view in declaration.tool_views:
+                if view.summarized_arguments:
+                    _summarized_input_schema(
+                        view,
+                        mode_input_schemas.get(
+                            view.name,
+                            self._capabilities[view.capability_id].input_schema,
+                        ),
+                    )
         declared_executor_ids = {
             executor_id
             for declaration in declared.values()
@@ -2028,6 +2109,26 @@ class CapabilityRegistry:
                                             list(item)
                                             for item in view.mode_capability_ids
                                         ],
+                                        **(
+                                            {
+                                                "summarized_arguments": list(
+                                                    view.summarized_arguments
+                                                )
+                                            }
+                                            if view.summarized_arguments
+                                            else {}
+                                        ),
+                                        **(
+                                            {
+                                                "mode_argument": view.mode_argument,
+                                                "default_mode": view.default_mode,
+                                                "mode_by_presence": (
+                                                    view.mode_by_presence
+                                                ),
+                                            }
+                                            if view.mode_capability_ids
+                                            else {}
+                                        ),
                                     }
                                     for view in sorted(
                                         declaration.tool_views,
@@ -2065,9 +2166,11 @@ class CapabilityRegistry:
         except KeyError as error:
             raise KeyError(f"unknown tool: {name}") from error
         routed = tuple(
-            capability_id
-            for _, capability_id in view.mode_capability_ids
-            if capability_id != view.capability_id
+            dict.fromkeys(
+                capability_id
+                for _, capability_id in view.mode_capability_ids
+                if capability_id != view.capability_id
+            )
         )
         return (view.capability_id, *routed)
 
@@ -2105,7 +2208,7 @@ class CapabilityRegistry:
 
         view = self._views.get(name)
         if view is not None and view.mode_capability_ids:
-            return self.resolve_tool_mode(name, arguments.get(TOOL_MODE_ARGUMENT))[1]
+            return self.resolve_tool_mode(name, tool_call_mode(view, arguments))[1]
         return self.tool_capability(name)
 
     def target_arguments(
@@ -2115,16 +2218,17 @@ class CapabilityRegistry:
     ) -> Mapping[str, object]:
         """Return the arguments the selected capability of one call receives.
 
-        A mode-routed tool removes its ``mode`` selector; every other tool, and
-        any name this registry does not know, keeps its arguments unchanged.
+        A mode-routed tool removes its selector unless the selected capability
+        declares it; every other tool, and any name this registry does not
+        know, keeps its arguments unchanged.
         """
 
         view = self._views.get(name)
         if view is None or not view.mode_capability_ids:
             return arguments
-        return {
-            key: value for key, value in arguments.items() if key != TOOL_MODE_ARGUMENT
-        }
+        return tool_route_arguments(
+            view, self.call_capability(name, arguments), arguments
+        )
 
     def resolved_call_arguments(
         self,
@@ -2193,11 +2297,22 @@ class CapabilityRegistry:
             input_schema: Mapping[str, object] = capability.input_schema
         else:
             input_schema = self._mode_input_schemas[name]
+        if view.summarized_arguments:
+            input_schema = _summarized_input_schema(view, input_schema)
         description = _provider_description(view)
         policy = capability.execution_admission_policy
         sentence = None if policy is None else policy.limits_sentence()
         if sentence is not None:
-            description = f"{description} {sentence}"
+            # A description that already states its limits gets the enforced
+            # target bound inside that one sentence rather than a second one.
+            label = "Limits: "
+            if label in description:
+                clause = sentence.removeprefix(label).removesuffix(" per call.")
+                description = description.replace(
+                    label, f"{label}{clause} per call, ", 1
+                )
+            else:
+                description = f"{description} {sentence}"
         return ToolDefinition(
             name=view.name,
             description=description,
@@ -2391,26 +2506,164 @@ def _unique(items: Iterable[_T], key: Callable[[_T], str], name: str) -> dict[st
     return result
 
 
-TOOL_MODE_ARGUMENT = "mode"
+def tool_call_mode(view: ToolView, arguments: Mapping[str, object]) -> object:
+    """Return the route one call of a mode-routed view selects.
+
+    The value can be anything the call supplied; callers resolve it against
+    the admitted routes and reject an unknown one.
+    """
+
+    if not view.mode_capability_ids:
+        return None
+    if view.mode_by_presence:
+        present = view.mode_argument in arguments
+        return view.mode_capability_ids[1 if present else 0][0]
+    if view.mode_argument not in arguments:
+        return view.default_mode
+    return arguments.get(view.mode_argument)
+
+
+def _declares(capability: Capability, name: str) -> bool:
+    properties = capability.input_schema.get("properties", {})
+    return isinstance(properties, Mapping) and name in properties
+
+
+def omit_unset_arguments(
+    arguments: Mapping[str, object],
+    schemas: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    """Treat a null the schema never accepts as an argument the model left out.
+
+    Models often send every optional key a schema lists, writing null for the
+    ones they mean to leave unset. Where no candidate schema accepts null for
+    that property, the null carries no intent, so it is removed here, at every
+    nested object level, before mode selection or validation sees the call. A
+    null a schema does accept is kept unchanged.
+    """
+
+    property_schemas: dict[str, list[Mapping[str, object]]] = {}
+    for schema in schemas:
+        properties = schema.get("properties")
+        if isinstance(properties, Mapping):
+            for name, rule in properties.items():
+                if isinstance(rule, Mapping):
+                    property_schemas.setdefault(name, []).append(rule)
+    result: dict[str, object] = {}
+    changed = False
+    for name, value in arguments.items():
+        rules = property_schemas.get(name, [])
+        if value is None:
+            if rules and not any(_accepts_null(rule) for rule in rules):
+                changed = True
+                continue
+        elif isinstance(value, Mapping):
+            nested = omit_unset_arguments(value, rules)
+            if nested is not value:
+                changed = True
+                value = nested
+        result[name] = value
+    return result if changed else arguments
+
+
+def _accepts_null(rule: Mapping[str, object]) -> bool:
+    for keyword in ("anyOf", "oneOf"):
+        branches = rule.get(keyword)
+        if isinstance(branches, (list, tuple)):
+            return any(
+                isinstance(branch, Mapping) and _accepts_null(branch)
+                for branch in branches
+            )
+    if "const" in rule:
+        return rule["const"] is None
+    enum = rule.get("enum")
+    if isinstance(enum, (list, tuple)):
+        return None in enum
+    kind = rule.get("type")
+    if kind is None:
+        return "properties" not in rule
+    return kind == "null" or (isinstance(kind, (list, tuple)) and "null" in kind)
+
+
+def tool_route_arguments(
+    view: ToolView,
+    capability: Capability,
+    arguments: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Return the arguments one routed capability receives from a call.
+
+    The selector is kept only for a capability that declares it as its own
+    argument; an omitted selector with a default is supplied to such a
+    capability.
+    """
+
+    if not view.mode_capability_ids:
+        return arguments
+    selector = view.mode_argument
+    if _declares(capability, selector):
+        if selector not in arguments and view.default_mode is not None:
+            return {**arguments, selector: view.default_mode}
+        return arguments
+    return {key: value for key, value in arguments.items() if key != selector}
+
+
+def tool_route_unknown_arguments(
+    view: ToolView,
+    capability: Capability,
+    arguments: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Return argument names the selected route does not accept."""
+
+    properties = capability.input_schema.get("properties", {})
+    if not isinstance(properties, Mapping):
+        return ()
+    return tuple(
+        sorted(
+            name
+            for name in tool_route_arguments(view, capability, arguments)
+            if name not in properties
+        )
+    )
+
+
+def _merge_route_rule(name: str, current: object, rule: object) -> object:
+    """Shared arguments must agree; string enums of the same rule merge."""
+
+    if canonical_json(current) == canonical_json(rule):
+        return current
+    if isinstance(current, Mapping) and isinstance(rule, Mapping):
+        left = {key: value for key, value in current.items() if key != "enum"}
+        right = {key: value for key, value in rule.items() if key != "enum"}
+        left_enum = current.get("enum")
+        right_enum = rule.get("enum")
+        if (
+            isinstance(left_enum, (tuple, list))
+            and isinstance(right_enum, (tuple, list))
+            and canonical_json(left) == canonical_json(right)
+        ):
+            return {**left, "enum": list(dict.fromkeys((*left_enum, *right_enum)))}
+    raise ValueError(f"mode routes disagree on argument {name}")
 
 
 def _mode_input_schema(
+    view: ToolView,
     routes: tuple[tuple[str, Mapping[str, object]], ...],
 ) -> dict[str, object]:
-    """Merge route schemas into one flat schema keyed by ``mode``.
+    """Merge route schemas into one flat schema keyed by the view's selector.
 
-    Shared properties must be identical. Arguments that only one mode accepts
-    stay optional here and are enforced by that mode's own capability schema.
+    Shared properties must be identical, except string enums, which merge.
+    Arguments that only some routes accept stay optional here and are enforced
+    by the selected route's own capability schema.
     """
 
-    properties: dict[str, object] = {
-        TOOL_MODE_ARGUMENT: {
+    selector = view.mode_argument
+    properties: dict[str, object] = {}
+    if not view.mode_by_presence:
+        properties[selector] = {
             "type": "string",
             "enum": [mode for mode, _ in routes],
         }
-    }
     required: set[str] | None = None
-    for _mode, schema in routes:
+    for index, (_mode, schema) in enumerate(routes):
         if (
             schema.get("type") != "object"
             or schema.get("additionalProperties") is not False
@@ -2422,24 +2675,64 @@ def _mode_input_schema(
             route_required, (tuple, list)
         ):
             raise ValueError("mode route schema is malformed")
-        if TOOL_MODE_ARGUMENT in route_properties:
-            raise ValueError("mode route schemas cannot declare mode")
+        if view.mode_by_presence and (selector in route_properties) != (index == 1):
+            raise ValueError("only the second presence route declares its selector")
         for name, rule in route_properties.items():
-            if name in properties and canonical_json(
-                properties[name]
-            ) != canonical_json(rule):
-                raise ValueError(f"mode routes disagree on argument {name}")
-            properties[name] = rule
+            if name == selector and not view.mode_by_presence:
+                continue
+            properties[name] = (
+                rule
+                if name not in properties
+                else _merge_route_rule(name, properties[name], rule)
+            )
         names = {str(item) for item in route_required}
         required = names if required is None else required & names
+    required = (required or set()) - {selector}
     merged = {
         "type": "object",
         "properties": properties,
-        "required": [TOOL_MODE_ARGUMENT, *sorted(required or ())],
+        "required": [
+            *(
+                [selector]
+                if view.default_mode is None and not view.mode_by_presence
+                else []
+            ),
+            *sorted(required),
+        ],
         "additionalProperties": False,
     }
     _check_schema(merged)
     return merged
+
+
+SUMMARIZED_ARGUMENT_DESCRIPTION = "Optional; full rule via toolbox_inspect."
+
+
+def _summarized_input_schema(
+    view: ToolView, schema: Mapping[str, object]
+) -> dict[str, object]:
+    """Replace optional argument rules with a pointer to the full contract."""
+
+    properties = schema.get("properties")
+    required = schema.get("required", ())
+    if not isinstance(properties, Mapping) or not isinstance(required, (tuple, list)):
+        raise ValueError(f"summarized tool schema is malformed: {view.name}")
+    for name in view.summarized_arguments:
+        if name not in properties or name in required:
+            raise ValueError(
+                f"summarized argument must be optional and declared: {view.name}.{name}"
+            )
+    return {
+        **schema,
+        "properties": {
+            name: (
+                {"description": SUMMARIZED_ARGUMENT_DESCRIPTION}
+                if name in view.summarized_arguments
+                else rule
+            )
+            for name, rule in properties.items()
+        },
+    }
 
 
 def _provider_description(view: ToolView) -> str:
@@ -2729,6 +3022,7 @@ def _matches_type(value: object, expected: object) -> bool:
 
 
 __all__ = [
+    "omit_unset_arguments",
     "AccessMode",
     "ApprovalDecision",
     "ApprovalHandler",

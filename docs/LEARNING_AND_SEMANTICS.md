@@ -19,6 +19,16 @@ knowledge and semantic annotations, `/user` for your profile, and `/skills`
 to manage procedures. A skill can guide work but cannot connect to a source
 or grant an action.
 
+The model reaches this knowledge through a few tools. `skill_view` reads one
+skill, and `skill_save` creates or replaces one; with `action: "delete"` it
+removes one named skill instead. `semantic_view` lists annotations when no `id`
+is given (filtered by source, resource, kind and limit) and loads one
+annotation with its `current_sha256` when an `id` is given. `semantic_save`
+creates, replaces or supersedes an annotation; with `action: "delete"` it
+deletes one. Each save and delete keeps its own exact approval card, and
+replacement, supersession and deletion all require the `expected_sha256` from
+the latest view.
+
 ## Suggestions from completed work
 
 `/review` can inspect completed runs and suggest reusable lessons. This review

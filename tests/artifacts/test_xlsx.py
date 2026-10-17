@@ -43,8 +43,7 @@ from daita.artifacts.renderers import (
 from daita.catalog.models import Sensitivity
 from daita.domains.data.export_capabilities import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
-    DATA_EXPORT_TABULAR_TOOL_NAME,
-    data_export_tabular_capability_declarations,
+    exact_export_capability_declarations,
 )
 from daita.llm.models import (
     FinishReason,
@@ -442,17 +441,11 @@ def test_exact_xlsx_source_failure_never_returns_a_partial_workbook() -> None:
 def test_tabular_tool_schemas_add_xlsx_without_accepting_rows_bytes_or_workbook_control() -> (
     None
 ):
-    declarations = data_export_tabular_capability_declarations()
-    views = {
-        item.name: item
-        for item in declarations.tool_views
-        if item.name == DATA_EXPORT_TABULAR_TOOL_NAME
-    }
-    assert set(views) == {DATA_EXPORT_TABULAR_TOOL_NAME}
-    for view in views.values():
-        capability = next(
-            item for item in declarations.capabilities if item.id == view.capability_id
-        )
+    declarations = exact_export_capability_declarations()
+    assert declarations.tool_views == ()
+    for capability in declarations.capabilities:
+        if capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID:
+            continue
         properties = capability.input_schema["properties"]
         assert isinstance(properties, Mapping)
         assert set(properties) == {
@@ -460,10 +453,10 @@ def test_tabular_tool_schemas_add_xlsx_without_accepting_rows_bytes_or_workbook_
             "resource_ids",
             "sql",
             "parameters",
-            "format",
+            "output",
             "filename",
         }
-        format_schema = properties["format"]
+        format_schema = properties["output"]
         assert isinstance(format_schema, Mapping)
         assert format_schema["type"] == "string"
         assert format_schema["enum"] == ("csv", "xlsx")
@@ -529,12 +522,12 @@ async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
             _tools(
                 ToolCall(
                     id="export",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (resource_id,),
                         "sql": "SELECT label, number FROM records ORDER BY number",
-                        "format": "xlsx",
+                        "output": "xlsx",
                         "filename": "records.xlsx",
                     },
                 )
@@ -609,7 +602,7 @@ async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
             for block in message.content
             if isinstance(block, TextBlock)
         )
-        assert "data_export_tabular for exact CSV/XLSX" in first_request
+        assert "data_query output=csv|xlsx for exact" in first_request
         assert "Never put source rows or artifact bytes in arguments" in first_request
     finally:
         await agent.close()
@@ -759,34 +752,34 @@ async def test_concurrent_csv_xlsx_exports_keep_order_and_failed_siblings(
             _tools(
                 ToolCall(
                     id="first-xlsx",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (resource_id,),
                         "sql": "SELECT label FROM records /* slow_export */ ORDER BY number",
-                        "format": "xlsx",
+                        "output": "xlsx",
                         "filename": "first.xlsx",
                     },
                 ),
                 ToolCall(
                     id="failed",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (resource_id,),
                         "sql": "SELECT label AS duplicate, number AS duplicate FROM records",
-                        "format": "xlsx",
+                        "output": "xlsx",
                         "filename": "failed.xlsx",
                     },
                 ),
                 ToolCall(
                     id="third-csv",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (resource_id,),
                         "sql": "SELECT number FROM records ORDER BY number",
-                        "format": "csv",
+                        "output": "csv",
                         "filename": "third.csv",
                     },
                 ),
@@ -838,12 +831,12 @@ async def test_delivery_failure_after_xlsx_commit_retains_verified_artifact(
             _tools(
                 ToolCall(
                     id="export",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (resource_id,),
                         "sql": "SELECT label, number FROM records",
-                        "format": "xlsx",
+                        "output": "xlsx",
                         "filename": "retained.xlsx",
                     },
                 )
@@ -907,12 +900,12 @@ async def test_xlsx_cancellation_emits_no_artifact_bytes_reference_or_delivery(
             _tools(
                 ToolCall(
                     id="cancelled-export",
-                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
+                    name="data_query",
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (resource_id,),
                         "sql": "SELECT label FROM records",
-                        "format": "xlsx",
+                        "output": "xlsx",
                     },
                 )
             ),
