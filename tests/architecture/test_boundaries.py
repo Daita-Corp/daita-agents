@@ -5,7 +5,7 @@ from functools import cache
 from pathlib import Path
 
 import daita
-from daita.capabilities import AccessMode, OperationalEffect
+from daita.capabilities import AccessMode, CallTargetLane, OperationalEffect
 from daita.storage.sqlite_schema import CURRENT_SCHEMA
 from tests.support.workspace import workspace_for
 
@@ -598,7 +598,9 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["delivery_list"] == "distribution"
         assert resolved["delivery_inspect"] == "distribution"
 
-        query_schema = registry.tool_definition("data_query").input_schema
+        query_schema = registry.tool_definition(
+            "data_query", lane=CallTargetLane.FOREGROUND
+        ).input_schema
         query_required = query_schema.get("required")
         assert isinstance(query_required, (tuple, list))
         assert {"source_id", "resource_ids"} <= set(query_required)

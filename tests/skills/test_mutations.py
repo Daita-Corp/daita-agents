@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from daita.capabilities import CallTargetLane
 from tests.support.approval_learning import (
     EAGER_LIMITS,
     MEMORY_SET_TOOL_NAME,
@@ -118,7 +119,9 @@ async def test_learning_tool_descriptions_route_documents_and_require_write_firs
         runtime = _runtime(agent)
         catalog = await runtime.prepare_run(_run(agent))
         definitions = {
-            entry.view.name: runtime._registry.tool_definition(entry.view.name)
+            entry.view.name: runtime._registry.tool_definition(
+                entry.view.name, lane=CallTargetLane.FOREGROUND
+            )
             for entry in catalog.entries
         }
         memory_description = definitions[MEMORY_SET_TOOL_NAME].description

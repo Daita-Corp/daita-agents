@@ -32,6 +32,8 @@ from ...capabilities import (
     ToolRecovery,
     ToolTextTrust,
     ToolView,
+    resource_id_schema,
+    source_id_schema,
 )
 from ...errors import DaitaError
 from .controller import (
@@ -99,27 +101,27 @@ def _data_query_description(file_outputs: tuple[str, ...]) -> str:
 
 
 RELATIONAL_UPDATE_DESCRIPTION = (
-    "Update rows in one PostgreSQL catalog table. mode=preview "
-    "changes nothing and returns matched_rows, samples and "
-    "preview_fingerprint. mode=apply repeats those arguments plus "
-    "preview_fingerprint and expected_affected_rows=matched_rows; calling it "
-    "is what requests approval. Only outcome=committed proves it. Limits: "
-    "structured filters, literal values, no SQL. "
-    'Example: {"mode": "preview", "where": [{"column": "id", "operator": '
-    '"eq", "value": 7}], "assignments": [{"column": "status", "value": '
-    '"paid"}], ...}. Mistakes: asking for approval in chat; applying a '
-    "zero-match preview; retrying after denial."
+    "Update rows in a PostgreSQL table. mode=preview changes nothing and "
+    "returns matched_rows, samples, preview_fingerprint. mode=apply "
+    "resends the arguments plus preview_fingerprint and "
+    "expected_affected_rows=matched_rows; calling it is what requests "
+    "approval. Only outcome=committed proves it; a change after approval is "
+    "final for the request. Limits: structured filters, no SQL. "
+    'Example: {"where": [{"column": "id", "operator": "eq", "value": 7}], '
+    '"assignments": [{"column": "status", "value": "paid"}], ...}. '
+    "Mistakes: asking for approval in chat; applying a zero-match preview; "
+    "retrying after denial."
 )
 RELATIONAL_UPSERT_DESCRIPTION = (
-    "Insert missing rows and update existing ones in one PostgreSQL table, "
-    "matched on key_columns; needs upsert permission. mode=preview changes "
-    "nothing and classifies rows as insert, update or unchanged. mode=apply "
-    "sends the same batch plus preview_fingerprint, requests approval, locks "
-    "the table briefly and reports verified counts. Limits: one uniform batch "
-    "of up to 1000 scalar rows, no chunking. "
-    'Example: {"mode": "preview", "key_columns": ["sku"], "rows": '
-    '[{"sku": "A1", "qty": 3}], ...}. Mistakes: omitting a column to clear '
-    "it (send null); retrying after denial or failure."
+    "Insert missing rows and update existing ones in one PostgreSQL table by "
+    "key_columns; needs upsert permission. mode=preview changes nothing and "
+    "classifies rows as insert, update or unchanged. mode=apply sends the "
+    "same batch plus preview_fingerprint, requests approval, locks the table "
+    "briefly and reports verified counts; a change after approval is final "
+    "for the request. Limits: one uniform batch of up to 1000 scalar rows, no "
+    'chunking. Example: {"key_columns": ["sku"], "rows": [{"sku": "A1", '
+    '"qty": 3}], ...}. Mistakes: omitting a column to clear it (send null); '
+    "retrying after denial or failure."
 )
 _REPREVIEW = ToolRecovery(
     RecoveryKind.REINSPECT_BINDING,
@@ -1246,10 +1248,10 @@ def _query_declarations(
         input_schema={
             "type": "object",
             "properties": {
-                "source_id": {"type": "string"},
+                "source_id": source_id_schema(),
                 "resource_ids": {
                     "type": "array",
-                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "items": resource_id_schema(),
                     "minItems": 1,
                     "maxItems": DATA_QUERY_MAX_RESOURCES,
                     "uniqueItems": True,

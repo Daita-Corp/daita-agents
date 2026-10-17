@@ -250,17 +250,7 @@ async def test_unexpected_discovery_replans_with_immutable_replacement(
                 "expected_revision": 1,
                 "idempotency_key": "replace-discovered-work",
                 "task_id": worker.task_id,
-                "replacement": {
-                    "client_key": "replacement",
-                    "title": "Read the discovered bounded source",
-                    "description": "Execute the replacement read within root scope.",
-                    "result_kind": "test.graph.read",
-                    "capability_id": READ_CAPABILITY_ID,
-                    "arguments": {"resource_ids": resource_ids},
-                    "parent_task_ids": (),
-                    "input_result_ids": (),
-                    "reduction": False,
-                },
+                "note": "Execute the replacement read within root scope.",
             },
         ),
         _tool_response(

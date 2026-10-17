@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
+from daita._json import FrozenJsonObject
 from daita.capabilities import (
     AutomationEligibility,
     CapabilityRegistry,
     OperationalEffect,
+    validate_tool_schema_value,
 )
+from daita.distribution import conversation_inbox_destination_id
 from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -25,18 +30,23 @@ from daita.loop.models import LoopExit, LoopExitKind, RunInput, Transcript
 from daita.routines.capabilities import (
     ROUTINE_CREATE_CAPABILITY_ID,
     ROUTINE_LIST_TOOL_NAME,
+    _mutation_receipt,
+    _mutation_receipt_schema,
     routine_capability_declarations,
 )
 from daita.routines.models import (
+    CalendarDaySelector,
+    CalendarSchedule,
     IntervalSchedule,
     RoutineControlAction,
     RoutineState,
 )
-from daita.routines.owner import RoutineError
+from daita.routines.owner import RoutineError, routine_approval_arguments
 from daita.skills import SkillStore
 from daita.skills.capabilities import (
     SKILL_VIEW_CAPABILITY_ID,
 )
+from daita.tui.projection import approval_summary
 from tests.routines._owner_support import (
     NOW,
     _owner,
@@ -378,3 +388,92 @@ async def test_routine_owner_never_accepts_a_new_current_contract_without_revisi
     # Only a fresh explicit proposal captures the changed current references.
     revised_proposal = await _proposal(owner)
     assert revised_proposal.contract_bindings != expected
+
+
+def _schedule_preview(snapshot: FrozenJsonObject) -> dict[str, Any]:
+    return cast(dict[str, Any], snapshot.to_dict()["schedule_preview"])
+
+
+MONDAY_CHICAGO = CalendarSchedule(
+    timezone="America/Chicago",
+    hour=9,
+    minute=0,
+    day_selector=CalendarDaySelector.WEEKDAYS,
+    weekdays=(1,),
+)
+
+
+async def test_proposal_approval_and_receipt_show_computed_first_runs() -> None:
+    store = _Store()
+    owner = _owner(store)
+    proposal = await _proposal(
+        owner,
+        schedule=MONDAY_CHICAGO,
+        expires_at=datetime(2026, 9, 15, 12, tzinfo=UTC),
+        cumulative_max_occurrences=3,
+    )
+    review = routine_approval_arguments(
+        await owner.proposal_authority_snapshot(proposal)
+    )
+    # NOW is Friday 2026-08-28; the first Monday 09:00 CDT is 14:00 UTC.
+    expected = [
+        {"at": "2026-08-31T14:00:00+00:00", "local": "Monday 2026-08-31 09:00 CDT"},
+        {"at": "2026-09-07T14:00:00+00:00", "local": "Monday 2026-09-07 09:00 CDT"},
+        {"at": "2026-09-14T14:00:00+00:00", "local": "Monday 2026-09-14 09:00 CDT"},
+    ]
+    preview = _schedule_preview(review)
+    assert preview["timezone"] == "America/Chicago"
+    assert preview["first_occurrences"] == expected
+    assert preview["occurrences_before_expiry"] == 3
+    assert preview["warnings"] == []
+    summary = approval_summary(
+        json.dumps(review.to_dict()), ROUTINE_CREATE_CAPABILITY_ID
+    )
+    assert "Monday 2026-08-31 09:00 CDT (2026-08-31T14:00:00+00:00)" in summary
+
+    stored = await owner.admit(proposal)
+    receipt = _mutation_receipt("create", stored)
+    validate_tool_schema_value(_mutation_receipt_schema(), receipt)
+    upcoming = cast(dict[str, Any], receipt["routine"])["upcoming"]
+    assert list(upcoming["first_occurrences"]) == expected
+
+
+async def test_calendar_whose_first_run_is_after_expiry_is_rejected() -> None:
+    owner = _owner(_Store())
+    with pytest.raises(RoutineError) as raised:
+        await _proposal(
+            owner,
+            schedule=MONDAY_CHICAGO,
+            # Sunday noon UTC, before Monday's first 09:00 CDT run.
+            expires_at=datetime(2026, 8, 30, 12, tzinfo=UTC),
+        )
+    assert raised.value.code == "routine_expiration_before_schedule"
+    assert "Monday 2026-08-31 09:00 CDT" in str(raised.value)
+
+
+async def test_unreachable_occurrence_cap_is_flagged_before_approval() -> None:
+    owner = _owner(_Store())
+    proposal = await _proposal(
+        owner,
+        schedule=MONDAY_CHICAGO,
+        # Monday 2026-09-07 07:00 CDT: only the 08-31 run fits a cap of two.
+        expires_at=datetime(2026, 9, 7, 12, tzinfo=UTC),
+        cumulative_max_occurrences=2,
+    )
+    preview = _schedule_preview(await owner.proposal_authority_snapshot(proposal))
+    assert preview["occurrences_before_expiry"] == 1
+    (warning,) = preview["warnings"]
+    assert "allows 2 more run(s), but only 1 fit" in warning
+
+
+async def test_omitted_distribution_destination_defaults_to_the_conversation_inbox() -> (
+    None
+):
+    owner = _owner(_Store())
+    proposal = await _proposal(owner, distribution_destination_id=None)
+    assert proposal.distribution_plan.targets[0].destination_id == (
+        conversation_inbox_destination_id("conversation-1")
+    )
+    with pytest.raises(RoutineError) as raised:
+        await _proposal(owner, distribution_destination_id="conversation_inbox:other")
+    assert raised.value.code == "routine_distribution_destination_invalid"

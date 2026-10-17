@@ -24,7 +24,13 @@ from .llm.models import (
     ToolResultRefs,
     tool_result_refs,
 )
-from .scope import EffectiveSourceScope
+from .scope import (
+    RESOURCE_REF_PREFIX,
+    SOURCE_REF_PREFIX,
+    EffectiveSourceScope,
+    ScopeRefs,
+    scope_refs,
+)
 
 _T = TypeVar("_T")
 
@@ -96,6 +102,17 @@ class ExecutionPreference(str, Enum):
     DURABLE = "durable"
 
 
+class CallTargetLane(str, Enum):
+    """Which enforced per-call target ceiling governs one run's calls.
+
+    Foreground user calls are bounded by the inline ceiling; graph task workers
+    by the graph ceiling. The runtime maps each run origin to at most one lane.
+    """
+
+    FOREGROUND = "foreground"
+    GRAPH_TASK = "graph_task"
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionAdmissionPolicy:
     """Immutable capability facts used for deterministic execution admission.
@@ -146,15 +163,28 @@ class ExecutionAdmissionPolicy:
 
         return asdict(self)
 
-    def limits_sentence(self) -> str | None:
-        """One model-facing sentence for the enforced foreground target bound."""
+    def call_target_ceiling(self, lane: CallTargetLane | None) -> int | None:
+        """The per-call target ceiling enforced for ``lane``, if any.
 
-        if not self.inline_eligible or self.target_count_argument is None:
+        This is the single source for both enforcement and the model-facing
+        limits text, so a run is never shown a bound it is not held to.
+        """
+
+        if lane is not None and not isinstance(lane, CallTargetLane):
+            raise TypeError("call target lane is invalid")
+        if lane is None or self.target_count_argument is None:
             return None
-        return (
-            f"Limits: at most {self.inline_max_targets} "
-            f"{self.target_count_argument} per call."
-        )
+        if lane is CallTargetLane.FOREGROUND:
+            return self.inline_max_targets if self.inline_eligible else None
+        return self.graph_max_targets if self.graph_v1_eligible else None
+
+    def limits_sentence(self, lane: CallTargetLane | None) -> str | None:
+        """One model-facing sentence for the target bound enforced in ``lane``."""
+
+        ceiling = self.call_target_ceiling(lane)
+        if ceiling is None:
+            return None
+        return f"Limits: at most {ceiling} {self.target_count_argument} per call."
 
     def target_count(self, arguments: Mapping[str, object]) -> int:
         if self.target_count_argument is None:
@@ -174,7 +204,10 @@ class ExecutionAdmissionPolicy:
         targets = self.target_count(arguments)
         if targets < 1:
             return "execution_not_supported_for_requested_shape"
-        fits_inline = self.inline_eligible and targets <= self.inline_max_targets
+        inline_ceiling = self.call_target_ceiling(CallTargetLane.FOREGROUND)
+        fits_inline = self.inline_eligible and (
+            inline_ceiling is None or targets <= inline_ceiling
+        )
         fits_graph = (
             self.graph_v1_eligible
             and self.synchronous_only
@@ -391,19 +424,42 @@ class EffectObservation:
 
 @dataclass(frozen=True, slots=True)
 class AutomationGrantPolicy:
+    """Grant shapes: what an author may request, and what is retained.
+
+    ``constraints_schema`` is the exact domain-normalized constraint shape that
+    approval retains and execution enforces; it is part of the capability
+    contract digest. ``request_schema`` is the authoring input the domain
+    normalizes from, defaulting to the retained shape. It may omit values the
+    domain derives itself and carry descriptions; because every requested value
+    is normalized and then validated against ``constraints_schema``, it is not
+    execution authority and is not part of the contract digest.
+    """
+
     constraints_kind: str
     constraints_schema: Mapping[str, object]
+    request_schema: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         _scope_identities((self.constraints_kind,), "constraints kind")
-        schema = FrozenJsonObject.from_mapping(self.constraints_schema)
-        _check_schema(schema)
-        if (
-            schema.get("type") != "object"
-            or len(canonical_json(schema).encode("utf-8")) > 32 * 1024
-        ):
-            raise ValueError("grant constraints require a bounded object schema")
-        object.__setattr__(self, "constraints_schema", schema)
+        for name in ("constraints_schema", "request_schema"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            schema = FrozenJsonObject.from_mapping(value)
+            _check_schema(schema)
+            if (
+                schema.get("type") != "object"
+                or len(canonical_json(schema).encode("utf-8")) > 32 * 1024
+            ):
+                raise ValueError("grant constraints require a bounded object schema")
+            object.__setattr__(self, name, schema)
+        if self.request_schema is None:
+            object.__setattr__(self, "request_schema", self.constraints_schema)
+
+    @property
+    def requested_constraints_schema(self) -> Mapping[str, object]:
+        assert self.request_schema is not None
+        return self.request_schema
 
 
 @dataclass(frozen=True, slots=True)
@@ -1288,6 +1344,137 @@ _RESULT_REF_PATH = re.compile(
     r"[a-z][a-z0-9_]{0,63}(\[\])?(\.(\*|[a-z][a-z0-9_]{0,63}(\[\])?)){0,3}\Z"
 )
 
+# Canonical persisted identities. Capability contracts validate these exact
+# forms; model-facing schemas additionally admit the run-scoped short handle,
+# which the runtime replaces with the full ID before validation.
+SOURCE_ID_PATTERN = r"^source:sha256:[0-9a-f]{64}$"
+RESOURCE_ID_PATTERN = r"^catalog-resource:sha256:[0-9a-f]{64}$"
+_IDENTITY_REFS: Mapping[str, tuple[str, str, str]] = MappingProxyType(
+    {
+        SOURCE_ID_PATTERN: (
+            "source",
+            SOURCE_REF_PREFIX,
+            r"^(source:sha256:[0-9a-f]{64}|s[1-9][0-9]{0,4})$",
+        ),
+        RESOURCE_ID_PATTERN: (
+            "resource",
+            RESOURCE_REF_PREFIX,
+            r"^(catalog-resource:sha256:[0-9a-f]{64}|t[1-9][0-9]{0,4})$",
+        ),
+    }
+)
+_IDENTITY_HANDLE = re.compile(r"[st][1-9][0-9]{0,4}\Z")
+_DELEGATED_KINDS = frozenset({"input", "grant"})
+
+
+def source_id_schema() -> dict[str, object]:
+    """One canonical source ID argument; the model may pass its ``s`` handle."""
+
+    return {"type": "string", "pattern": SOURCE_ID_PATTERN}
+
+
+def resource_id_schema() -> dict[str, object]:
+    """One canonical resource ID argument; the model may pass its ``t`` handle."""
+
+    return {"type": "string", "pattern": RESOURCE_ID_PATTERN}
+
+
+def identity_ref_paths(schema: Mapping[str, object]) -> tuple[tuple[str, str], ...]:
+    """Return ``(argument path, canonical pattern)`` for each declared identity.
+
+    A string rule whose pattern is a canonical source or resource ID pattern is
+    the declaration, so every tool using the shared schemas is covered. Paths
+    use the result_ref path grammar.
+    """
+
+    found: list[tuple[str, str]] = []
+
+    def visit(rule: object, path: str) -> None:
+        if not isinstance(rule, Mapping):
+            return
+        pattern = rule.get("pattern")
+        if path and isinstance(pattern, str) and pattern in _IDENTITY_REFS:
+            found.append((path, pattern))
+            return
+        properties = rule.get("properties")
+        if isinstance(properties, Mapping):
+            for name, child in properties.items():
+                visit(child, f"{path}.{name}" if path else str(name))
+        items = rule.get("items")
+        if path and isinstance(items, Mapping):
+            visit(items, f"{path}[]")
+        extra = rule.get("additionalProperties")
+        if isinstance(extra, Mapping):
+            visit(extra, f"{path}.*" if path else "*")
+
+    visit(schema, "")
+    return tuple(found)
+
+
+def model_identity_schema(schema: Mapping[str, object]) -> Mapping[str, object]:
+    """Project canonical identity patterns to their handle-admitting form."""
+
+    def project(rule: object) -> object:
+        if isinstance(rule, Mapping):
+            pattern = rule.get("pattern")
+            if isinstance(pattern, str) and pattern in _IDENTITY_REFS:
+                return {**rule, "pattern": _IDENTITY_REFS[pattern][2]}
+            return {key: project(value) for key, value in rule.items()}
+        if isinstance(rule, (list, tuple)):
+            return [project(item) for item in rule]
+        return rule
+
+    if not identity_ref_paths(schema):
+        return schema
+    return FrozenJsonObject.from_mapping(cast(Mapping[str, object], project(schema)))
+
+
+def _segments(path: str) -> tuple[str, ...]:
+    """Split one argument path, keeping a trailing ``[]`` on its segment."""
+
+    return tuple(path.split("."))
+
+
+def _map_argument_path(
+    value: object,
+    segments: tuple[str, ...],
+    path: str,
+    leaf: Callable[[object, str], object],
+) -> object:
+    """Apply ``leaf`` at one dotted path; absent paths are left for validation.
+
+    ``name[]`` walks an array and ``*`` walks every value of an object.
+    """
+
+    if not segments:
+        return leaf(value, path)
+    if not isinstance(value, Mapping):
+        return value
+    head, rest = segments[0], segments[1:]
+    if head == "*":
+        return {
+            key: _map_argument_path(
+                item, rest, f"{path}.{key}" if path else str(key), leaf
+            )
+            for key, item in value.items()
+        }
+    many = head.endswith("[]")
+    key = head[:-2] if many else head
+    if key not in value:
+        return value
+    name = f"{path}.{key}" if path else key
+    item = value[key]
+    if many:
+        if not isinstance(item, (list, tuple)):
+            return value
+        updated: object = tuple(
+            _map_argument_path(element, rest, f"{name}[{index}]", leaf)
+            for index, element in enumerate(item)
+        )
+    else:
+        updated = _map_argument_path(item, rest, name, leaf)
+    return {**value, key: updated}
+
 
 def resolve_result_refs(
     capability: Capability,
@@ -1320,41 +1507,68 @@ def resolve_result_refs(
             ),
         )
 
-    def walk(value: object, segments: tuple[str, ...], path: str) -> object:
-        if not segments:
-            resolved = None if refs is None else refs.resolve(value)
-            if resolved is None:
-                raise invalid(path, value)
-            return resolved
-        if not isinstance(value, Mapping):
-            return value
-        head, rest = segments[0], segments[1:]
-        if head == "*":
-            return {
-                key: walk(item, rest, f"{path}.{key}" if path else str(key))
-                for key, item in value.items()
-            }
-        many = head.endswith("[]")
-        key = head[:-2] if many else head
-        if key not in value:
-            return value
-        name = f"{path}.{key}" if path else key
-        item = value[key]
-        if many:
-            if not isinstance(item, (list, tuple)):
-                return value
-            updated: object = tuple(
-                walk(element, rest, f"{name}[{index}]")
-                for index, element in enumerate(item)
-            )
-        else:
-            updated = walk(item, rest, name)
-        return {**value, key: updated}
+    def leaf(value: object, path: str) -> object:
+        resolved = None if refs is None else refs.resolve(value)
+        if resolved is None:
+            raise invalid(path, value)
+        return resolved
 
     resolved = arguments
     for ref_path in capability.result_ref_arguments:
         resolved = cast(
-            Mapping[str, object], walk(resolved, tuple(ref_path.split(".")), "")
+            Mapping[str, object],
+            _map_argument_path(resolved, _segments(ref_path), "", leaf),
+        )
+    return resolved
+
+
+def resolve_identity_refs(
+    paths: Iterable[tuple[str, str]],
+    arguments: Mapping[str, object],
+    refs: ScopeRefs,
+    *,
+    base: str = "",
+) -> Mapping[str, object]:
+    """Replace run-scoped source/resource handles with the full IDs they name.
+
+    Full IDs and other values pass through for schema validation. A
+    handle-shaped value this run did not issue fails before dispatch.
+    """
+
+    def leaf_for(pattern: str) -> Callable[[object, str], object]:
+        family, prefix, _ = _IDENTITY_REFS[pattern]
+
+        def leaf(value: object, path: str) -> object:
+            if not isinstance(value, str) or _IDENTITY_HANDLE.match(value) is None:
+                return value
+            resolved = refs.resolve(prefix, value)
+            if resolved is not None:
+                return resolved
+            issued = sum(1 for handle in refs.ids if handle.startswith(prefix))
+            raise CapabilityInputError(
+                f"{family}_ref_invalid",
+                f"{value} is not a {family} ref issued in this run.",
+                {"name": path, "value": value},
+                recovery=ToolRecovery(
+                    RecoveryKind.CORRECT_ARGUMENTS,
+                    (
+                        f"Use a {family}_ref ({prefix}1-{prefix}{issued}) shown "
+                        f"beside its {family}_id in this run, or the exact full "
+                        f"{family}_id."
+                        if issued
+                        else f"This run issued no {family} refs; use the exact "
+                        f"full {family}_id."
+                    ),
+                ),
+            )
+
+        return leaf
+
+    resolved = arguments
+    for path, pattern in paths:
+        resolved = cast(
+            Mapping[str, object],
+            _map_argument_path(resolved, _segments(path), base, leaf_for(pattern)),
         )
     return resolved
 
@@ -1399,6 +1613,11 @@ class Capability:
     # Argument paths that name an earlier result by its model-visible
     # result_ref; the runtime resolves them to ToolCall.id before validation.
     result_ref_arguments: tuple[str, ...] = ()
+    # ``(container path, member path, kind)``: the member holds input arguments
+    # ("input") or grant constraints ("grant") for the capability that the
+    # container's ``capability_id`` names. The runtime resolves that
+    # capability's source/resource handles there before validation too.
+    delegated_arguments: tuple[tuple[str, str, str], ...] = ()
     # The owning domain derives this call's evidence from the transcript.
     derives_call_provenance: bool = False
 
@@ -1496,6 +1715,17 @@ class Capability:
         ):
             raise ValueError("result_ref_arguments are invalid")
         object.__setattr__(self, "result_ref_arguments", ref_paths)
+        delegated = tuple(tuple(item) for item in self.delegated_arguments)
+        if len(delegated) != len(set(delegated)) or any(
+            len(item) != 3
+            or not all(isinstance(part, str) for part in item)
+            or _RESULT_REF_PATH.fullmatch(item[0]) is None
+            or _RESULT_REF_PATH.fullmatch(item[1]) is None
+            or item[2] not in _DELEGATED_KINDS
+            for item in delegated
+        ):
+            raise ValueError("delegated_arguments are invalid")
+        object.__setattr__(self, "delegated_arguments", delegated)
         input_schema = FrozenJsonObject.from_mapping(self.input_schema)
         output_schema = FrozenJsonObject.from_mapping(self.output_schema)
         if self.external_input_schema is None:
@@ -1614,6 +1844,15 @@ def capability_contract_digest(
         **(
             {"derives_call_provenance": True}
             if capability.derives_call_provenance
+            else {}
+        ),
+        **(
+            {
+                "delegated_arguments": [
+                    list(item) for item in capability.delegated_arguments
+                ]
+            }
+            if capability.delegated_arguments
             else {}
         ),
     }
@@ -2235,18 +2474,84 @@ class CapabilityRegistry:
         name: str,
         arguments: Mapping[str, object],
         messages: tuple[CanonicalMessage, ...],
+        source_scope: EffectiveSourceScope | None = None,
     ) -> Mapping[str, object]:
         """Return the arguments one persisted current-run call executed with.
 
         This removes a mode selector and resolves declared result_ref values
-        against the same current-run transcript the runtime numbered.
+        against the same current-run transcript the runtime numbered, and
+        source/resource handles against the run's frozen ``source_scope``.
         """
 
-        return resolve_result_refs(
+        return self.resolve_call_refs(
             self.call_capability(name, arguments),
             self.target_arguments(name, arguments),
-            tool_result_refs(messages, uncitable_tool_names=RESERVED_TOOL_NAMES),
+            result_refs=tool_result_refs(
+                messages, uncitable_tool_names=RESERVED_TOOL_NAMES
+            ),
+            source_scope=source_scope,
         )
+
+    def resolve_call_refs(
+        self,
+        capability: Capability,
+        arguments: Mapping[str, object],
+        *,
+        result_refs: ToolResultRefs | None,
+        source_scope: EffectiveSourceScope | None,
+    ) -> Mapping[str, object]:
+        """Replace every run-scoped handle in one call with the identity it names.
+
+        Result refs become call IDs; source and resource handles, including those
+        inside delegated arguments or grant constraints, become full IDs. The
+        stored transcript keeps the call exactly as the model sent it.
+        """
+
+        resolved = resolve_result_refs(capability, arguments, result_refs)
+        return self.resolve_scope_refs(capability, resolved, source_scope)
+
+    def resolve_scope_refs(
+        self,
+        capability: Capability,
+        arguments: Mapping[str, object],
+        source_scope: EffectiveSourceScope | None,
+    ) -> Mapping[str, object]:
+        """Replace source/resource handles in one call with their full IDs."""
+
+        refs = scope_refs(source_scope)
+        resolved = resolve_identity_refs(
+            identity_ref_paths(capability.input_schema), arguments, refs
+        )
+        for container, member, kind in capability.delegated_arguments:
+
+            def delegate(value: object, path: str) -> object:
+                if not isinstance(value, Mapping):
+                    return value
+                target = self._capabilities.get(cast(str, value.get("capability_id")))
+                if target is None:
+                    return value
+                if kind == "input":
+                    schema: Mapping[str, object] = target.input_schema
+                elif target.automation_grant_policy is not None:
+                    schema = target.automation_grant_policy.constraints_schema
+                else:
+                    return value
+                paths = identity_ref_paths(schema)
+                if not paths:
+                    return value
+
+                def nested(inner: object, inner_path: str) -> object:
+                    if not isinstance(inner, Mapping):
+                        return inner
+                    return resolve_identity_refs(paths, inner, refs, base=inner_path)
+
+                return _map_argument_path(value, _segments(member), path, nested)
+
+            resolved = cast(
+                Mapping[str, object],
+                _map_argument_path(resolved, _segments(container), "", delegate),
+            )
+        return resolved
 
     def resolve_tool_mode(self, name: str, mode: object) -> tuple[ToolView, Capability]:
         """Resolve a mode-routed tool call to the capability its mode selects."""
@@ -2291,7 +2596,11 @@ class CapabilityRegistry:
         view, capability = self.resolve_tool(name, capability_id=capability_id)
         return view, capability, self.resolve_domain_owner(capability.id)
 
-    def tool_definition(self, name: str) -> ToolDefinition:
+    def tool_definition(
+        self, name: str, *, lane: CallTargetLane | None
+    ) -> ToolDefinition:
+        """Project one provider definition with the target bound ``lane`` enforces."""
+
         view, capability = self.resolve_tool(name)
         if not view.mode_capability_ids:
             input_schema: Mapping[str, object] = capability.input_schema
@@ -2301,7 +2610,7 @@ class CapabilityRegistry:
             input_schema = _summarized_input_schema(view, input_schema)
         description = _provider_description(view)
         policy = capability.execution_admission_policy
-        sentence = None if policy is None else policy.limits_sentence()
+        sentence = None if policy is None else policy.limits_sentence(lane)
         if sentence is not None:
             # A description that already states its limits gets the enforced
             # target bound inside that one sentence rather than a second one.
@@ -2316,7 +2625,7 @@ class CapabilityRegistry:
         return ToolDefinition(
             name=view.name,
             description=description,
-            input_schema=input_schema,
+            input_schema=model_identity_schema(input_schema),
         )
 
     def validate_arguments(
@@ -2438,8 +2747,14 @@ class CapabilityRegistry:
         return output
 
     def validate_grant_constraints(
-        self, capability_id: str, constraints: Mapping[str, object]
+        self,
+        capability_id: str,
+        constraints: Mapping[str, object],
+        *,
+        requested: bool = False,
     ) -> FrozenJsonObject:
+        """Validate retained constraints, or an author's request when ``requested``."""
+
         policy = self._capabilities[capability_id].automation_grant_policy
         if policy is None:
             raise CapabilityInputError(
@@ -2452,7 +2767,14 @@ class CapabilityRegistry:
                 "automation_grant_invalid", "Grant constraints exceed their byte bound."
             )
         _validate_rule(
-            "constraints", value, policy.constraints_schema, CapabilityInputError
+            "constraints",
+            value,
+            (
+                policy.requested_constraints_schema
+                if requested
+                else policy.constraints_schema
+            ),
+            CapabilityInputError,
         )
         return value
 
@@ -3029,6 +3351,7 @@ __all__ = [
     "ApprovalRequest",
     "ArtifactPolicy",
     "CallProvenance",
+    "CallTargetLane",
     "Capability",
     "CapabilityInputError",
     "CapabilityRegistry",
@@ -3055,4 +3378,11 @@ __all__ = [
     "render_approval_arguments",
     "validate_tool_schema_value",
     "resolve_result_refs",
+    "resolve_identity_refs",
+    "identity_ref_paths",
+    "model_identity_schema",
+    "RESOURCE_ID_PATTERN",
+    "SOURCE_ID_PATTERN",
+    "resource_id_schema",
+    "source_id_schema",
 ]

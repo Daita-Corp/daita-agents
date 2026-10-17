@@ -19,6 +19,7 @@ def _response_input(
     messages: tuple[CanonicalMessage, ...],
     provider_id: str,
     result_refs: Mapping[str, str] | None = None,
+    scope_refs: Mapping[str, str] | None = None,
 ) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
     provider_call_ids: dict[str, str] = {}
@@ -72,7 +73,9 @@ def _response_input(
                         "call_id": provider_call_ids.get(block.call_id, block.call_id),
                         "output": canonical_json(
                             model_tool_result(
-                                block, (result_refs or {}).get(block.call_id)
+                                block,
+                                (result_refs or {}).get(block.call_id),
+                                scope_refs,
                             )
                         ),
                     }

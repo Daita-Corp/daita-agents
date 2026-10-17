@@ -68,7 +68,7 @@ def _ids():
 def _profile(provider: ToolboxAwareMockModelProvider) -> ModelProfile:
     return ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=32_000,
+        context_window_tokens=40_000,
         max_output_tokens=4_000,
         supports_tools=True,
         supports_parallel_tools=True,

@@ -77,7 +77,9 @@ PROFILE_ENV = "DAITA_PHASE_F_LIVE_PROFILE"
 REPORT_ENV = "DAITA_PHASE_F_LIVE_REPORT_DIR"
 NOW = datetime(2026, 9, 6, 12, tzinfo=UTC)
 NEXT_SLOT = datetime(2026, 9, 7, 14, tzinfo=UTC)
-EXPIRES = datetime(2026, 9, 14, 12, tzinfo=UTC)
+# Tuesday 07:00 America/Chicago: after the second Monday 09:00 run, so the
+# two-occurrence cap is reachable with or without an immediate first run.
+EXPIRES = datetime(2026, 9, 15, 12, tzinfo=UTC)
 DESTINATION = "release-room"
 CONTENT = "Release readiness check F_37C2"
 SOURCE = "https://research.fixture.test/release-readiness"
@@ -575,7 +577,7 @@ class Evaluation:
             timing = (
                 "now and every Monday at 09:00 America/Chicago. "
                 if self.run_immediately
-                else "every Monday at 09:00 America/Chicago, starting next Monday; do not run it today. "
+                else "every Monday at 09:00 America/Chicago, starting tomorrow, Monday 2026-09-07; do not run it today. "
             )
             return (
                 "Set up a saved assignment using our connected release research and notifications: "

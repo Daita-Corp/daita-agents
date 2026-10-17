@@ -483,6 +483,8 @@ def validate_mutation(
                 "mutation_actor", "new task creator differs from mutation actor"
             )
         _validate_contract_binding_coverage(task)
+        if request.actor_kind == "planner_attempt":
+            _validate_model_created_call(task)
     all_tasks = (*existing_tasks, *request.tasks)
     all_ids = {task.task_id for task in all_tasks}
     existing_pairs = {
@@ -656,6 +658,50 @@ def validate_mutation(
         existing_results,
     )
     return tuple(all_tasks)
+
+
+_MODEL_CREATED_CALL_KEYS = frozenset(
+    {"capability_id", "callable_tool_names", "arguments"}
+)
+
+
+def _validate_model_created_call(task: GraphTask) -> None:
+    """Reject a model-created worker whose frozen call is not admitted shape.
+
+    Planner mutations admit the call against the registry before proposing the
+    task; this pure check keeps a task without that admitted record, which a
+    worker could never execute, out of the graph.
+    """
+
+    if task.role is not TaskRole.WORKER:
+        return
+    contract = task.specification.expected_result_contract
+    call = contract.get("initial_call")
+    if contract.get("reduction") is True:
+        if call is not None:
+            raise GraphValidationError(
+                "model_task_call_invalid", "a reduction task carries no initial call"
+            )
+        return
+    authority = task.specification.authority
+    names = None if not isinstance(call, Mapping) else call.get("callable_tool_names")
+    capability_id = None if not isinstance(call, Mapping) else call.get("capability_id")
+    if (
+        not isinstance(call, Mapping)
+        or set(call) != _MODEL_CREATED_CALL_KEYS
+        or not isinstance(capability_id, str)
+        or capability_id.startswith("jobs.graph.")
+        or capability_id not in authority.capability_ids
+        or not isinstance(call.get("arguments"), Mapping)
+        or not isinstance(names, (tuple, list))
+        or not names
+        or any(not isinstance(name, str) or not name for name in names)
+        or tuple(names) != tuple(sorted(set(names)))
+    ):
+        raise GraphValidationError(
+            "model_task_call_invalid",
+            "a model-created worker requires one admitted initial call",
+        )
 
 
 def _validate_contract_binding_coverage(task: GraphTask) -> None:

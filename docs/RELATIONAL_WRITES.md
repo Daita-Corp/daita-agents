@@ -212,7 +212,9 @@ rechecks the live catalog, table guardrails, Daita permissions, PostgreSQL
 privileges, matched row count, primary-key set, and current assigned values.
 
 If anything changed after the preview, Daita rolls back before the `UPDATE` and
-requires a fresh preview and approval. Otherwise it executes the parameterized
+writes nothing. A change detected after approval is final for that request: the
+agent reports the conflict and the current value, and previews or asks for
+approval again only when you ask it to. Otherwise it executes the parameterized
 statement once and requires PostgreSQL's affected-row count to equal the
 approved expectation.
 

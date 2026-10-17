@@ -12,7 +12,7 @@ from daita import (
     ApprovalRequest,
     SemanticEvidenceKind,
 )
-from daita.capabilities import OperationalEffect
+from daita.capabilities import CallTargetLane, OperationalEffect
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -50,7 +50,7 @@ EAGER_LIMITS = LoopLimits()
 def _profile(provider: MockModelProvider) -> ModelProfile:
     return ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=32_000,
+        context_window_tokens=40_000,
         max_output_tokens=2_000,
         supports_tools=True,
         supports_parallel_tools=True,
@@ -257,7 +257,9 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             )
         )
         definitions = tuple(
-            runtime._registry.tool_definition(entry.view.name)
+            runtime._registry.tool_definition(
+                entry.view.name, lane=CallTargetLane.FOREGROUND
+            )
             for entry in catalog.entries
         )
         names = {item.name for item in definitions}
@@ -412,14 +414,16 @@ async def test_catalog_and_transcript_evidence_fail_before_approval(tmp_path):
         return ApprovalDecision.APPROVE
 
     calls = (
+        # Well-formed IDs the catalog does not hold; malformed IDs fail earlier
+        # as schema input errors.
         _semantic_call(
             source.id,
-            "missing-resource",
+            "catalog-resource:sha256:" + "e" * 64,
             "missing-revision",
             annotation_id="missing-resource",
         ),
         _semantic_call(
-            "source-other",
+            "source:sha256:" + "f" * 64,
             resource.id,
             resource.current_revision,
             annotation_id="source-mismatch",

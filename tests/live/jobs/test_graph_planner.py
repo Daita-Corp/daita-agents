@@ -96,10 +96,10 @@ async def test_live_planner_uses_typed_replacement_without_production_cutover(
         planner_specification = dict(raw_planner_specification)
         planner_specification["description"] = (
             "Inspect the blocked worker, then call graph_supersede_unstarted exactly "
-            "once to create an equivalent replacement using the same admitted "
-            "initial capability and arguments. Use expected graph revision 1 and a "
-            "stable idempotency key. Then finish with task_complete and result kind "
-            "graph.plan. Do not call the source capability from this planner task."
+            "once with only its task_id, expected graph revision 1 and a stable "
+            "idempotency key, so the replacement copies the worker's frozen call. "
+            "Then finish with task_complete and result kind graph.plan. Do not "
+            "call the source capability from this planner task."
         )
         planner_template["specification"] = planner_specification
         job_specification = replace(

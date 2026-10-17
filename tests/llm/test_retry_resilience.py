@@ -8,6 +8,7 @@ from decimal import Decimal
 import httpx
 import pytest
 
+from daita._json import FrozenJsonObject
 from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import (
     ModelProviderError,
@@ -189,6 +190,89 @@ async def test_unmeasured_deadline_timeout_is_not_a_replayable_stall(stream):
         with pytest.raises(ModelProviderError):
             await invoke(router, replace(request(), max_total_tokens=1_000), stream)
         assert len(provider.requests) == 1
+    finally:
+        await router.close()
+
+
+def unreported(code: ProviderErrorCode, transport: str | None = None):
+    # A transient failure before any output whose consumption is unknown.
+    return ModelProviderError(
+        code,
+        usage=ModelUsage(cost_estimate=CostEstimate.unavailable("usage_unavailable")),
+        diagnostic=(
+            None
+            if transport is None
+            else ProviderFailureDiagnostic(
+                phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
+                code=code.value,
+                attempt=FrozenJsonObject.from_mapping(
+                    {"transport_error_kind": transport}
+                ),
+            )
+        ),
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "code, transport",
+    [
+        (ProviderErrorCode.RATE_LIMIT_ERROR, None),
+        (ProviderErrorCode.PROVIDER_UNAVAILABLE, None),
+        (ProviderErrorCode.PROVIDER_UNAVAILABLE, "remote_protocol_error"),
+        (ProviderErrorCode.TIMEOUT, "connect_timeout"),
+    ],
+    ids=["rate_limited", "unavailable", "transport_drop", "connect_timeout"],
+)
+async def test_failure_before_output_replays_under_a_token_limit(
+    stream, code, transport
+):
+    failure = unreported(code, transport)
+    provider = stall_then(stream, failure)
+    router = ModelRouter((registration(provider, streaming=stream),), sleep=no_wait)
+    try:
+        response = await invoke(
+            router, replace(request(), max_total_tokens=1_000), stream
+        )
+        assert response.text == "recovered"
+        assert len(provider.requests) == 2
+        assert response.attempts is not None
+        assert [item.outcome for item in response.attempts] == [
+            failure.code.value,
+            "completed",
+        ]
+        assert [item.retried for item in response.attempts] == [True, False]
+    finally:
+        await router.close()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("proven_zero", [False, True])
+async def test_dollar_cap_replays_only_a_failure_with_proven_zero_usage(
+    stream, proven_zero
+):
+    failure = unreported(ProviderErrorCode.PROVIDER_UNAVAILABLE)
+    if proven_zero:
+        failure.usage = ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+    provider = stall_then(stream, failure)
+    router = ModelRouter((registration(provider, streaming=stream),), sleep=no_wait)
+    capped = replace(
+        request(), max_total_tokens=1_000, max_estimated_cost_usd=Decimal("1")
+    )
+    try:
+        if proven_zero:
+            assert (await invoke(router, capped, stream)).text == "recovered"
+            assert len(provider.requests) == 2
+        else:
+            with pytest.raises(ModelProviderError) as caught:
+                await invoke(router, capped, stream)
+            assert caught.value.code is ProviderErrorCode.PROVIDER_UNAVAILABLE
+            assert caught.value.usage.cost_estimate.status.value == "unavailable"
+            assert caught.value.attempts is not None
+            assert [item.outcome for item in caught.value.attempts] == [
+                "provider_unavailable"
+            ]
+            assert len(provider.requests) == 1
     finally:
         await router.close()
 

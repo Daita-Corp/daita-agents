@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+from daita.capabilities import CallTargetLane
 from tests.capabilities._toolbox_support import (
     NOW,
     TOOLBOX_DEFINITIONS,
@@ -306,7 +307,14 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             "semantic_view",
             "skill_save",
         ):
-            assert len(registry.tool_definition(name).description.encode()) <= 600
+            assert (
+                len(
+                    registry.tool_definition(
+                        name, lane=CallTargetLane.FOREGROUND
+                    ).description.encode()
+                )
+                <= 600
+            )
     finally:
         await agent.close()
 

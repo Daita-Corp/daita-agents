@@ -11,6 +11,7 @@ from daita import Agent
 from daita._json import canonical_json
 from daita.capabilities import (
     AccessMode,
+    CallTargetLane,
     Capability,
     CapabilityRegistry,
     ToolboxId,
@@ -429,7 +430,7 @@ async def test_no_model_facing_schema_asks_for_a_tool_call_id(tmp_path: Path) ->
         registry = agent._embedded._capabilities
         violations: list[str] = []
         for name in sorted(registry.tool_names):
-            definition = registry.tool_definition(name)
+            definition = registry.tool_definition(name, lane=CallTargetLane.FOREGROUND)
             if _CALL_ID_TEXT.search(definition.description):
                 violations.append(f"{name}: description")
             violations.extend(
