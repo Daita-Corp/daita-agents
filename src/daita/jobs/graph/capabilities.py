@@ -1885,6 +1885,7 @@ def graph_task_capability_declarations(
             "required": ["expected_revision", "idempotency_key", "children"],
             "additionalProperties": False,
         },
+        delegated_arguments=(("children[]", "arguments", "input"),),
         output_kind="graph.mutation",
         output_schema=planner_read_output,
         executor_id=PlannerCreateChildrenExecutor.executor_id,

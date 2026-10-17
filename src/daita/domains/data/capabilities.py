@@ -32,6 +32,8 @@ from ...capabilities import (
     ToolRecovery,
     ToolTextTrust,
     ToolView,
+    resource_id_schema,
+    source_id_schema,
 )
 from ...errors import DaitaError
 from .controller import (
@@ -1246,10 +1248,10 @@ def _query_declarations(
         input_schema={
             "type": "object",
             "properties": {
-                "source_id": {"type": "string"},
+                "source_id": source_id_schema(),
                 "resource_ids": {
                     "type": "array",
-                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "items": resource_id_schema(),
                     "minItems": 1,
                     "maxItems": DATA_QUERY_MAX_RESOURCES,
                     "uniqueItems": True,

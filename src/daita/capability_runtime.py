@@ -63,7 +63,6 @@ from .capabilities import (
     ToolView,
     omit_unset_arguments,
     recovery_details,
-    resolve_result_refs,
     tool_call_mode,
     tool_route_arguments,
     tool_route_unknown_arguments,
@@ -102,7 +101,7 @@ from .loop.models import (
 )
 from .loop.session import RunCancellationToken, RunSession
 from .observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
-from .scope import EffectiveSourceScope
+from .scope import SOURCE_REF_PREFIX, EffectiveSourceScope, scope_refs
 
 if TYPE_CHECKING:
     from .domains.analysis.domain import AnalysisCapabilityDomain
@@ -2557,7 +2556,11 @@ class CapabilityRuntime:
                 capability.id,
                 domain.normalize_arguments(
                     capability,
-                    self._registry.target_arguments(call.name, call.arguments),
+                    self._registry.resolve_scope_refs(
+                        capability,
+                        self._registry.target_arguments(call.name, call.arguments),
+                        run.resolved_source_scope,
+                    ),
                 ),
             )
             await _domain_prepare_call(
@@ -3188,7 +3191,12 @@ class CapabilityRuntime:
             if validated_arguments is None:
                 raw_arguments = domain.normalize_arguments(
                     capability,
-                    resolve_result_refs(capability, call.arguments, result_refs),
+                    self._registry.resolve_call_refs(
+                        capability,
+                        call.arguments,
+                        result_refs=result_refs,
+                        source_scope=run.resolved_source_scope,
+                    ),
                 )
                 arguments = await self._registry.validate_arguments_async(
                     capability.id,
@@ -5792,7 +5800,11 @@ def _validate_output_execution_scope(
 def _source_pressure_key(run: RunInput, call: ToolCall) -> str:
     source_id = call.arguments.get("source_id")
     if isinstance(source_id, str):
-        return source_id
+        # A source handle and its full ID share one per-source gate.
+        return (
+            scope_refs(run.resolved_source_scope).resolve(SOURCE_REF_PREFIX, source_id)
+            or source_id
+        )
     return "__agent_local__"
 
 

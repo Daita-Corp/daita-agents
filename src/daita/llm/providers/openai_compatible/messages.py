@@ -21,6 +21,7 @@ def _chat_messages(
     messages: tuple[CanonicalMessage, ...],
     provider_id: str,
     result_refs: Mapping[str, str] | None = None,
+    scope_refs: Mapping[str, str] | None = None,
 ) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
     call_ids: dict[str, str] = {}
@@ -66,7 +67,9 @@ def _chat_messages(
                         "tool_call_id": call_ids.get(block.call_id, block.call_id),
                         "content": canonical_json(
                             model_tool_result(
-                                block, (result_refs or {}).get(block.call_id)
+                                block,
+                                (result_refs or {}).get(block.call_id),
+                                scope_refs,
                             )
                         ),
                     }

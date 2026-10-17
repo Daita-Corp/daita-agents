@@ -414,14 +414,16 @@ async def test_catalog_and_transcript_evidence_fail_before_approval(tmp_path):
         return ApprovalDecision.APPROVE
 
     calls = (
+        # Well-formed IDs the catalog does not hold; malformed IDs fail earlier
+        # as schema input errors.
         _semantic_call(
             source.id,
-            "missing-resource",
+            "catalog-resource:sha256:" + "e" * 64,
             "missing-revision",
             annotation_id="missing-resource",
         ),
         _semantic_call(
-            "source-other",
+            "source:sha256:" + "f" * 64,
             resource.id,
             resource.current_revision,
             annotation_id="source-mismatch",

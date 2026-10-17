@@ -30,6 +30,8 @@ from ...capabilities import (
     ToolPresentation,
     ToolTextTrust,
     ToolView,
+    resource_id_schema,
+    source_id_schema,
 )
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...distribution.owner import DistributionOwner
@@ -1160,13 +1162,13 @@ def graph_admission_declarations(
                             "properties": {
                                 "source_ids": {
                                     "type": "array",
-                                    "items": {"type": "string", "minLength": 1},
+                                    "items": source_id_schema(),
                                     "uniqueItems": True,
                                     "maxItems": 16,
                                 },
                                 "resource_ids": {
                                     "type": "array",
-                                    "items": {"type": "string", "minLength": 1},
+                                    "items": resource_id_schema(),
                                     "uniqueItems": True,
                                     "maxItems": 16,
                                 },
@@ -1203,6 +1205,10 @@ def graph_admission_declarations(
             ],
             "additionalProperties": False,
         },
+        delegated_arguments=(
+            ("initial_task", "arguments", "input"),
+            ("initial_task", "effect_grant.constraints", "grant"),
+        ),
         output_kind=START_GRAPH_JOB_OUTPUT_KIND,
         output_schema={"type": "object", "additionalProperties": True},
         executor_id=START_GRAPH_JOB_EXECUTOR_ID,

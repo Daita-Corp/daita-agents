@@ -76,21 +76,25 @@ class _InteractiveExecutor:
         return ToolOutput(kind="test.interactive", data={"ok": True})
 
 
+# A canonical source ID: routine contracts admit only exact full IDs.
+SOURCE_ID = "source:sha256:" + "1" * 64
+
+
 class _Catalog:
     async def readable_resource_ids(
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
     ) -> frozenset[str]:
-        if agent_id == "agent-1" and source_ids == ("source-1",):
+        if agent_id == "agent-1" and source_ids == (SOURCE_ID,):
             return frozenset({RESOURCE.id})
         return frozenset()
 
 
 RESOURCE = CatalogResource(
-    id=catalog_resource_id("source-1", ResourceKind.TABLE, "main.current"),
+    id=catalog_resource_id(SOURCE_ID, ResourceKind.TABLE, "main.current"),
     agent_id="agent-1",
-    source_id="source-1",
+    source_id=SOURCE_ID,
     native_identity="main.current",
     external_uri="sqlite:///test.db#main.current",
     kind=ResourceKind.TABLE,
@@ -391,7 +395,7 @@ async def _proposal(
         misfire_policy=MisfirePolicy.LATEST_ONLY,
         reporting_mode=ReportingMode.ALWAYS,
         precheck=None,
-        allowed_source_ids=("source-1",),
+        allowed_source_ids=(SOURCE_ID,),
         allowed_connector_binding_ids=(),
         allowed_resource_ids=(RESOURCE.id,),
         allowed_capability_ids=capability_ids,

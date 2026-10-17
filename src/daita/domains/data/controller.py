@@ -959,7 +959,7 @@ class DataCapabilityDomain:
             )
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.mark_effect_succeeded(session, call.id)
-        return await self._classify(run, call, capability, output)
+        return await self._classify(run, capability, arguments, output)
 
     finalize_session_output = finalize_output
 
@@ -1720,8 +1720,23 @@ class DataCapabilityDomain:
                 "The native call does not match its persisted current-run identity.",
             )
         current_index = current_calls[0][0]
+
+        def executed(candidate: ToolCall) -> ToolCall:
+            # Earlier calls are compared by the identities they executed with,
+            # not the run-scoped source/resource handles the model sent.
+            routed = target(candidate)
+            try:
+                arguments = registry.resolve_scope_refs(
+                    registry.call_capability(candidate.name, candidate.arguments),
+                    routed.arguments,
+                    run.resolved_source_scope,
+                )
+            except (CapabilityInputError, KeyError):
+                return routed
+            return replace(routed, arguments=arguments)
+
         calls = {
-            candidate.id: target(candidate)
+            candidate.id: executed(candidate)
             for message in transcript.messages[:current_index]
             for candidate in message.tool_calls
         }
@@ -1813,8 +1828,8 @@ class DataCapabilityDomain:
     async def _classify(
         self,
         run: RunInput,
-        call: ToolCall,
         capability: Capability,
+        arguments: FrozenJsonObject,
         output: ToolOutput,
     ) -> ToolOutput:
         if capability.id in LOCAL_FILE_CAPABILITY_IDS:
@@ -1830,7 +1845,8 @@ class DataCapabilityDomain:
             run, self._catalog, files_only=False
         )
         run = replace(run, resolved_source_scope=scope)
-        source_id = call.arguments.get("source_id")
+        # Resolved arguments carry full IDs; the call keeps what the model sent.
+        source_id = arguments.get("source_id")
         source_ids = (
             (source_id,)
             if isinstance(source_id, str)

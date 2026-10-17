@@ -27,6 +27,8 @@ from ..capabilities import (
     ToolPresentation,
     ToolTextTrust,
     ToolView,
+    resource_id_schema,
+    source_id_schema,
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
 from ..distribution.models import (
@@ -508,6 +510,7 @@ def routine_capability_declarations(
             "and typed absolute, relative, or user-local schedule."
         ),
         input_schema=_spec_schema(update=False),
+        delegated_arguments=_GRANT_DELEGATION,
         output_kind="routine.receipt",
         output_schema=_mutation_receipt_schema(),
         executor_id=ROUTINE_CREATE_EXECUTOR_ID,
@@ -519,6 +522,7 @@ def routine_capability_declarations(
         id=ROUTINE_UPDATE_CAPABILITY_ID,
         description="Replace one routine's material contract with an exact new revision.",
         input_schema=_spec_schema(update=True),
+        delegated_arguments=_GRANT_DELEGATION,
         output_kind="routine.receipt",
         output_schema=_mutation_receipt_schema(),
         executor_id=ROUTINE_UPDATE_EXECUTOR_ID,
@@ -1260,8 +1264,8 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
                     "type": "string",
                     "pattern": "^sha256:[0-9a-f]{64}$",
                 },
-                "source_id": {"type": "string", "minLength": 1, "maxLength": 1024},
-                "resource_id": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "source_id": source_id_schema(),
+                "resource_id": resource_id_schema(),
             },
             "required": [
                 "capability_id",
@@ -1271,8 +1275,8 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
             ],
             "additionalProperties": False,
         },
-        "allowed_source_ids": _identity_array_schema(),
-        "allowed_resource_ids": _identity_array_schema(),
+        "allowed_source_ids": _identity_array_schema(source_id_schema()),
+        "allowed_resource_ids": _identity_array_schema(resource_id_schema()),
         "allowed_capability_ids": _identity_array_schema(minimum=1),
         "sensitivity_ceiling": {
             "type": "string",
@@ -1380,10 +1384,17 @@ def _routine_id_schema() -> dict[str, object]:
     }
 
 
-def _identity_array_schema(*, minimum: int = 0) -> dict[str, object]:
+# Requested grant constraints carry the named capability's own source/resource
+# identities, so their run-scoped handles resolve before validation.
+_GRANT_DELEGATION = (("requested_capability_grants[]", "constraints", "grant"),)
+
+
+def _identity_array_schema(
+    items: Mapping[str, object] | None = None, *, minimum: int = 0
+) -> dict[str, object]:
     return {
         "type": "array",
-        "items": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "items": items or {"type": "string", "minLength": 1, "maxLength": 1024},
         "minItems": minimum,
         "maxItems": MAX_ROUTINE_IDENTITY_ITEMS,
         "uniqueItems": True,
