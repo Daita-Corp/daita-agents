@@ -77,6 +77,7 @@ async def test_hosted_run_does_not_claim_the_host_timezone_as_the_users(
         assert isinstance(system_block, TextBlock)
         system_text = system_block.text
         assert "User-local IANA timezone is unknown" in system_text
+        assert "Wednesday 2026-09-23T16:00:00+00:00 (ISO weekday 3)" in system_text
         assert "detected user-local" not in system_text
     finally:
         await agent.close()

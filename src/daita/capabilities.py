@@ -391,19 +391,42 @@ class EffectObservation:
 
 @dataclass(frozen=True, slots=True)
 class AutomationGrantPolicy:
+    """Grant shapes: what an author may request, and what is retained.
+
+    ``constraints_schema`` is the exact domain-normalized constraint shape that
+    approval retains and execution enforces; it is part of the capability
+    contract digest. ``request_schema`` is the authoring input the domain
+    normalizes from, defaulting to the retained shape. It may omit values the
+    domain derives itself and carry descriptions; because every requested value
+    is normalized and then validated against ``constraints_schema``, it is not
+    execution authority and is not part of the contract digest.
+    """
+
     constraints_kind: str
     constraints_schema: Mapping[str, object]
+    request_schema: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         _scope_identities((self.constraints_kind,), "constraints kind")
-        schema = FrozenJsonObject.from_mapping(self.constraints_schema)
-        _check_schema(schema)
-        if (
-            schema.get("type") != "object"
-            or len(canonical_json(schema).encode("utf-8")) > 32 * 1024
-        ):
-            raise ValueError("grant constraints require a bounded object schema")
-        object.__setattr__(self, "constraints_schema", schema)
+        for name in ("constraints_schema", "request_schema"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            schema = FrozenJsonObject.from_mapping(value)
+            _check_schema(schema)
+            if (
+                schema.get("type") != "object"
+                or len(canonical_json(schema).encode("utf-8")) > 32 * 1024
+            ):
+                raise ValueError("grant constraints require a bounded object schema")
+            object.__setattr__(self, name, schema)
+        if self.request_schema is None:
+            object.__setattr__(self, "request_schema", self.constraints_schema)
+
+    @property
+    def requested_constraints_schema(self) -> Mapping[str, object]:
+        assert self.request_schema is not None
+        return self.request_schema
 
 
 @dataclass(frozen=True, slots=True)
@@ -2438,8 +2461,14 @@ class CapabilityRegistry:
         return output
 
     def validate_grant_constraints(
-        self, capability_id: str, constraints: Mapping[str, object]
+        self,
+        capability_id: str,
+        constraints: Mapping[str, object],
+        *,
+        requested: bool = False,
     ) -> FrozenJsonObject:
+        """Validate retained constraints, or an author's request when ``requested``."""
+
         policy = self._capabilities[capability_id].automation_grant_policy
         if policy is None:
             raise CapabilityInputError(
@@ -2452,7 +2481,14 @@ class CapabilityRegistry:
                 "automation_grant_invalid", "Grant constraints exceed their byte bound."
             )
         _validate_rule(
-            "constraints", value, policy.constraints_schema, CapabilityInputError
+            "constraints",
+            value,
+            (
+                policy.requested_constraints_schema
+                if requested
+                else policy.constraints_schema
+            ),
+            CapabilityInputError,
         )
         return value
 

@@ -310,9 +310,26 @@ def outcome_contract_digest(value: OutcomeContract) -> str:
     return _sha256_mapping(_outcome_contract_mapping(value))
 
 
+_CONVERSATION_INBOX_PREFIX = "conversation_inbox:"
+
+
 def conversation_inbox_destination_id(conversation_id: str) -> str:
     _text(conversation_id, "conversation inbox conversation_id")
-    return f"conversation_inbox:{conversation_id}"
+    return f"{_CONVERSATION_INBOX_PREFIX}{conversation_id}"
+
+
+def is_distribution_destination_id(value: object) -> bool:
+    """Whether a value names a Daita report-delivery destination.
+
+    Destination identities are code-owned, so other owners can recognize one
+    supplied where an external action target belongs.
+    """
+
+    return (
+        isinstance(value, str)
+        and value.startswith(_CONVERSATION_INBOX_PREFIX)
+        and len(value) > len(_CONVERSATION_INBOX_PREFIX)
+    )
 
 
 def target_fingerprint(

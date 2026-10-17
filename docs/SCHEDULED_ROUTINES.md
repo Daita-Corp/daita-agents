@@ -24,8 +24,11 @@ and `expected_revision` are both given (`routines.update`); a stale
 `expected_revision` fails with `routine_revision_changed`. Its schedule is one
 flat object whose `kind` decides which keys are accepted; the owner rejects
 keys that belong to another kind. Optional arguments default to the narrowest
-contract: `misfire_policy="skip"`, no connector bindings, requested grants,
-skills, precheck or dollar ceilings, and no immediate run. The provider schema
+contract: `misfire_policy="skip"`, no requested grants, skills, precheck or
+dollar ceilings, and no immediate run. An omitted `distribution_destination_id`
+selects the conversation Inbox when it is the only selectable destination, and
+omitted `allowed_connector_binding_ids` are the bindings of the allowed connector
+capabilities; explicit values are validated as before. The provider schema
 summarizes the rarely used `requested_capability_grants`, `precheck`,
 `allowed_connector_binding_ids`, dollar ceilings and `basis_run_id`; their full
 rules are in the `routine_save` contract that `toolbox_inspect` returns, and
@@ -359,7 +362,12 @@ runtime approval handler.
 The review summarizes the instruction, schedule, immediate occurrence, budgets,
 permissions and completion requirements, followed by the complete validated
 authority snapshot. Connector names are presentation; exact identities and
-digests remain visible. An approval cannot add a connector permission or promise
+digests remain visible. The review and the `routine_save` receipt list the first
+scheduled runs, computed by the schedule owner, in UTC and as schedule-local
+weekday time. A schedule whose first run is after `expires_at` is rejected with
+`routine_expiration_before_schedule`, and a `cumulative_max_occurrences` that
+cannot be reached before expiration is flagged as a warning. Connector tool
+arguments and report delivery are shown as separate lines. An approval cannot add a connector permission or promise
 stronger evidence than the selected producer supports. Model cost ceilings do not
 cap third-party service fees.
 
