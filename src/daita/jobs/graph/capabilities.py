@@ -42,7 +42,7 @@ from ...catalog.models import Sensitivity
 from ...llm.models import ModelSensitivity, ToolCall
 from ...loop.models import RunInput, RunOrigin, Transcript
 from ..owner import JobError, JobOwner
-from .calls import AdmittedGraphCall, GraphCallAdmission
+from .calls import AdmittedGraphCall, GraphCallAdmission, admit_graph_call
 from .models import (
     BudgetAmount,
     ControlKind,
@@ -808,7 +808,7 @@ class _PlannerMutationExecutor(_PlannerExecutor):
         calls: GraphCallAdmission | None = None,
     ) -> None:
         super().__init__(owner, transcripts, clock=clock, id_factory=id_factory)
-        self._calls = calls
+        self._calls = calls or GraphCallAdmission()
 
     async def _admit_call(
         self,
@@ -833,11 +833,7 @@ class _PlannerMutationExecutor(_PlannerExecutor):
                     "Use the capability_id of a task this graph already admits.",
                 ),
             )
-        if self._calls is None:
-            raise CapabilityInputError(
-                "graph_call_admission_unavailable",
-                "Graph call admission is not available in this host.",
-            )
+        registry = self._calls.registry
         if not isinstance(arguments, Mapping):
             raise CapabilityInputError(
                 "invalid_argument_type",
@@ -847,10 +843,10 @@ class _PlannerMutationExecutor(_PlannerExecutor):
                     f"Send the arguments object for {capability_id}.",
                 ),
             )
-        admitted = await self._calls.admit(
-            capability_id, arguments, resource_ids=resource_ids
+        admitted = await admit_graph_call(
+            registry, capability_id, arguments, resource_ids=resource_ids
         )
-        capability = self._calls.registry.capability(capability_id)
+        capability = registry.capability(capability_id)
         if (
             capability.operational_effect is not OperationalEffect.NONE
             or capability.effect_receipt_policy is not None
@@ -969,7 +965,7 @@ class PlannerCreateChildrenExecutor(_PlannerMutationExecutor):
                     arguments,
                     resource_ids=planner.specification.authority.resource_ids,
                 )
-            child = _planner_child_task(
+            child, child_edges = _planner_child_task(
                 inspection,
                 planner,
                 raw,
@@ -978,20 +974,7 @@ class PlannerCreateChildrenExecutor(_PlannerMutationExecutor):
                 created_at=created_at,
             )
             tasks.append(child)
-            parent_ids = raw.get("parent_task_ids", ())
-            assert isinstance(parent_ids, tuple)
-            edges.extend(
-                TaskDependency(
-                    agent_id=planner.agent_id,
-                    job_id=planner.job_id,
-                    upstream_task_id=str(parent_id),
-                    downstream_task_id=child_id,
-                    edge_kind=EdgeKind.REQUIRES_ACCEPTED_SUCCESS,
-                    created_at=created_at,
-                    creator_key=planner.task_id,
-                )
-                for parent_id in parent_ids
-            )
+            edges.extend(child_edges)
         output = await self._commit(
             request,
             inspection,
@@ -1142,11 +1125,7 @@ class PlannerSupersedeExecutor(_PlannerMutationExecutor):
                 ),
             )
             if override:
-                authority = _planner_child_authority(
-                    planner,
-                    (*_planner_lifecycle_ids(planner), admitted.capability_id),
-                    admitted,
-                )
+                authority = _planner_child_authority(planner, admitted)
                 max_wall_time_seconds = min(
                     max_wall_time_seconds,
                     admitted.execution_policy.graph_max_wall_seconds,
@@ -1179,38 +1158,14 @@ class PlannerSupersedeExecutor(_PlannerMutationExecutor):
                 "planner_supersede_invalid",
                 "The replacement exceeds a task specification bound.",
             ) from error
-        replacement = GraphTask(
-            agent_id=planner.agent_id,
-            job_id=planner.job_id,
+        replacement, edges = _planner_worker_task(
+            planner,
+            replacement_spec,
             task_id=replacement_id,
-            state=TaskState.PENDING if parent_ids else TaskState.READY,
-            role=TaskRole.WORKER,
-            execution_kind=TaskExecutionKind.MODEL,
+            parent_ids=parent_ids,
             priority=replaced.priority,
-            not_before=None,
-            current_attempt_id=None,
-            task_revision=1,
-            specification=replacement_spec,
-            task_spec_digest=replacement_spec.digest,
-            task_scope_digest=authority.digest,
-            attempt_count=0,
-            failure_streak=0,
-            fencing_epoch=0,
             created_at=created_at,
-            updated_at=created_at,
             supersedes_task_id=replaced_id,
-        )
-        edges = tuple(
-            TaskDependency(
-                agent_id=planner.agent_id,
-                job_id=planner.job_id,
-                upstream_task_id=parent_id,
-                downstream_task_id=replacement_id,
-                edge_kind=EdgeKind.REQUIRES_ACCEPTED_SUCCESS,
-                created_at=created_at,
-                creator_key=planner.task_id,
-            )
-            for parent_id in parent_ids
         )
         return await self._commit(
             request,
@@ -1260,28 +1215,31 @@ def _stable_graph_id(
     return f"{prefix}-{digest.removeprefix('sha256:')[:32]}"
 
 
-def _planner_lifecycle_ids(planner: GraphTask) -> tuple[str, ...]:
-    return tuple(
-        capability_id
-        for capability_id in (
-            TASK_CHECKPOINT_CAPABILITY_ID,
-            TASK_COMMENT_CAPABILITY_ID,
-            TASK_COMPLETE_CAPABILITY_ID,
-            TASK_BLOCK_CAPABILITY_ID,
-            TASK_REQUEST_REVIEW_CAPABILITY_ID,
-        )
-        if capability_id in planner.specification.authority.capability_ids
-    )
-
-
 def _planner_child_authority(
-    planner: GraphTask,
-    capability_ids: tuple[str, ...],
-    admitted: AdmittedGraphCall | None,
+    planner: GraphTask, admitted: AdmittedGraphCall | None
 ) -> GraphAuthority:
-    """Derive one effect-free child authority inside the planner's ceiling."""
-    child_capability_ids = tuple(sorted(set(capability_ids)))
+    """Derive one effect-free child authority inside the planner's ceiling.
+
+    The child keeps the planner's lifecycle tools plus the admitted call's
+    capability; a reduction (no admitted call) keeps only the lifecycle tools.
+    """
     planner_authority = planner.specification.authority
+    child_capability_ids = tuple(
+        sorted(
+            {
+                item
+                for item in (
+                    TASK_CHECKPOINT_CAPABILITY_ID,
+                    TASK_COMMENT_CAPABILITY_ID,
+                    TASK_COMPLETE_CAPABILITY_ID,
+                    TASK_BLOCK_CAPABILITY_ID,
+                    TASK_REQUEST_REVIEW_CAPABILITY_ID,
+                )
+                if item in planner_authority.capability_ids
+            }
+            | ({admitted.capability_id} if admitted is not None else set())
+        )
+    )
     material = planner_authority.contract_bindings
     raw_capabilities = material.get("capability_contracts", {})
     raw_resources = material.get("resource_revisions", {})
@@ -1350,8 +1308,8 @@ def _planner_child_task(
     *,
     task_id: str,
     created_at: datetime,
-) -> GraphTask:
-    """Build one planner child from its admitted call, or a reduction."""
+) -> tuple[GraphTask, tuple[TaskDependency, ...]]:
+    """Build one planner child and its parent edges from its admitted call."""
     title = raw.get("title")
     description = raw.get("description")
     result_kind = raw.get("result_kind")
@@ -1375,30 +1333,19 @@ def _planner_child_task(
         raise CapabilityInputError(
             "parent_limit", "The proposed task exceeds the direct-parent bound."
         )
-    lifecycle_ids = _planner_lifecycle_ids(planner)
+    # The caller admits exactly the non-reduction children, so ``admitted`` is
+    # present precisely when ``reduction`` is false.
+    if reduction and (raw.get("capability_id") is not None or len(parent_ids) < 2):
+        raise CapabilityInputError(
+            "planner_reduction_invalid",
+            "A reduction task needs at least two parents and no executor call.",
+        )
     max_wall_time_seconds = planner.specification.max_wall_time_seconds
-    if reduction:
-        if (
-            admitted is not None
-            or raw.get("capability_id") is not None
-            or len(parent_ids) < 2
-        ):
-            raise CapabilityInputError(
-                "planner_reduction_invalid",
-                "A reduction task needs at least two parents and no executor call.",
-            )
-        child_capability_ids = lifecycle_ids
-    else:
-        if admitted is None:
-            raise CapabilityInputError(
-                "planner_capability_invalid",
-                "A non-reduction child needs one admitted executor call.",
-            )
-        child_capability_ids = (*lifecycle_ids, admitted.capability_id)
+    if admitted is not None:
         max_wall_time_seconds = min(
             max_wall_time_seconds, admitted.execution_policy.graph_max_wall_seconds
         )
-    authority = _planner_child_authority(planner, child_capability_ids, admitted)
+    authority = _planner_child_authority(planner, admitted)
     expected: dict[str, object] = {
         "kind": "model_task",
         "result_kind": result_kind,
@@ -1422,26 +1369,61 @@ def _planner_child_task(
         max_wall_time_seconds=max_wall_time_seconds,
         created_by=planner.task_id,
     )
-    return GraphTask(
+    return _planner_worker_task(
+        planner,
+        spec,
+        task_id=task_id,
+        parent_ids=parent_ids,
+        priority=100,
+        created_at=created_at,
+    )
+
+
+def _planner_worker_task(
+    planner: GraphTask,
+    spec: GraphTaskSpecification,
+    *,
+    task_id: str,
+    parent_ids: tuple[str, ...],
+    priority: int,
+    created_at: datetime,
+    supersedes_task_id: str | None = None,
+) -> tuple[GraphTask, tuple[TaskDependency, ...]]:
+    """Return one fresh planner-created model worker and its parent edges."""
+    task = GraphTask(
         agent_id=planner.agent_id,
         job_id=planner.job_id,
         task_id=task_id,
         state=TaskState.PENDING if parent_ids else TaskState.READY,
         role=TaskRole.WORKER,
         execution_kind=TaskExecutionKind.MODEL,
-        priority=100,
+        priority=priority,
         not_before=None,
         current_attempt_id=None,
         task_revision=1,
         specification=spec,
         task_spec_digest=spec.digest,
-        task_scope_digest=authority.digest,
+        task_scope_digest=spec.authority.digest,
         attempt_count=0,
         failure_streak=0,
         fencing_epoch=0,
         created_at=created_at,
         updated_at=created_at,
+        supersedes_task_id=supersedes_task_id,
     )
+    edges = tuple(
+        TaskDependency(
+            agent_id=planner.agent_id,
+            job_id=planner.job_id,
+            upstream_task_id=parent_id,
+            downstream_task_id=task_id,
+            edge_kind=EdgeKind.REQUIRES_ACCEPTED_SUCCESS,
+            created_at=created_at,
+            creator_key=planner.task_id,
+        )
+        for parent_id in parent_ids
+    )
+    return task, edges
 
 
 class GraphTaskCapabilityDomain:

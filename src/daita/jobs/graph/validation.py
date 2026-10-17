@@ -684,11 +684,11 @@ def _validate_model_created_call(task: GraphTask) -> None:
             )
         return
     authority = task.specification.authority
-    names = None if not isinstance(call, Mapping) else call.get("callable_tool_names")
-    capability_id = None if not isinstance(call, Mapping) else call.get("capability_id")
+    call = call if isinstance(call, Mapping) else {}
+    names = call.get("callable_tool_names")
+    capability_id = call.get("capability_id")
     if (
-        not isinstance(call, Mapping)
-        or set(call) != _MODEL_CREATED_CALL_KEYS
+        set(call) != _MODEL_CREATED_CALL_KEYS
         or not isinstance(capability_id, str)
         or capability_id.startswith("jobs.graph.")
         or capability_id not in authority.capability_ids

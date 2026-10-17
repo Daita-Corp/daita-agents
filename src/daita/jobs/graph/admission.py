@@ -351,8 +351,6 @@ class RegistryInitialTaskProposalResolver:
             argument_capability_id=preview_capability_id,
             resource_ids=resource_ids,
         )
-        validated = call.arguments
-        policy = call.execution_policy
         if effectful and (
             capability.automation_eligibility
             is not AutomationEligibility.AUTOMATION_DIRECT
@@ -410,7 +408,7 @@ class RegistryInitialTaskProposalResolver:
             )
         return InitialTaskProposal(
             capability_id=capability_id,
-            arguments=validated,
+            arguments=call.arguments,
             expected_result_contract=result_contract,
             source_ids=source_ids,
             resource_ids=resource_ids,
@@ -419,9 +417,9 @@ class RegistryInitialTaskProposalResolver:
             model_route_id=self._model_route_id,
             sensitivity=sensitivity,
             contract_bindings=bindings,
-            execution_policy=policy,
+            execution_policy=call.execution_policy,
             max_steps=self._max_steps,
-            max_wall_time_seconds=policy.graph_max_wall_seconds,
+            max_wall_time_seconds=call.execution_policy.graph_max_wall_seconds,
             per_run_max_tokens=self._per_run_max_tokens,
             preview_capability_id=preview_capability_id,
             requested_grant_constraints=requested_constraints,

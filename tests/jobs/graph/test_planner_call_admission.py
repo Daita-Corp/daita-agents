@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -10,20 +10,7 @@ from pathlib import Path
 import pytest
 
 from daita._json import FrozenJsonObject
-from daita.capabilities import (
-    AccessMode,
-    AutomationEligibility,
-    Capability,
-    CapabilityDeclarations,
-    CapabilityInputError,
-    CapabilityRegistry,
-    ExecutionAdmissionPolicy,
-    ToolboxId,
-    ToolLoadMode,
-    ToolPresentation,
-    ToolTextTrust,
-    ToolView,
-)
+from daita.capabilities import CapabilityInputError, CapabilityRegistry
 from daita.jobs.graph.admission import RegistryInitialTaskProposalResolver
 from daita.jobs.graph.calls import admit_graph_call
 from daita.jobs.graph.models import (
@@ -33,10 +20,9 @@ from daita.jobs.graph.models import (
     TaskRole,
     TaskState,
 )
-from daita.jobs.graph.validation import GraphValidationError
+from daita.jobs.graph.validation import GraphValidationError, validate_mutation
 from daita.llm.models import (
     FinishReason,
-    ModelRequest,
     ModelResponse,
     ModelSensitivity,
     ModelUsage,
@@ -51,70 +37,65 @@ from tests.support.model_graph_integration import (
     READ_CAPABILITY_ID,
     READ_TOOL_NAME,
     ModelGraphIntegration,
+    graph_read_declarations,
 )
 from tests.support.toolbox_model import RefCitingMockModelProvider, result_ref
 
 pytestmark = pytest.mark.integration
 
 _USAGE = ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+_Call = tuple[str, str, Mapping[str, object]]
+_FIX = "correct_arguments"
+_EXTRA = "unexpected_arguments"
+_OUTSIDE = "source_scope_violation"
+_UNFIT = "execution_not_supported_for_requested_shape"
 
 
-def _response(*calls: tuple[str, str, Mapping[str, object]]) -> ModelResponse:
-    return ModelResponse(
-        finish_reason=FinishReason.TOOL_CALLS,
-        tool_calls=tuple(
-            ToolCall(id=call_id, name=name, arguments=dict(arguments))
-            for call_id, name, arguments in calls
-        ),
-        usage=_USAGE,
-    )
+def _response(*calls: _Call) -> ModelResponse:
+    tool_calls = tuple(ToolCall(id=i, name=n, arguments=dict(a)) for i, n, a in calls)
+    return ModelResponse(FinishReason.TOOL_CALLS, tool_calls=tool_calls, usage=_USAGE)
 
 
 def _complete(call_id: str, result_kind: str, cited: str) -> ModelResponse:
-    return _response(
-        (
-            call_id,
-            "task_complete",
-            {
-                "result_kind": result_kind,
-                "summary": "Completed.",
-                "payload": {"done": True},
-                "evidence_refs": (result_ref(cited),),
-                "artifact_ids": (),
-                "residual_risk": None,
-                "downstream_constraints": {},
-            },
-        )
-    )
-
-
-def _block_for_replan() -> ModelResponse:
-    return _response(
-        (
-            "discover",
-            "task_block",
-            {
-                "kind": "needs_replan",
-                "message": "The admitted work needs one replacement.",
-                "details": {"evidence_references": ()},
-            },
-        )
-    )
-
-
-def _results(requests: tuple[ModelRequest, ...]) -> dict[str, ToolResultBlock]:
-    return {
-        block.call_id: block
-        for request in requests
-        for message in request.messages
-        for block in message.content
-        if isinstance(block, ToolResultBlock)
+    payload: dict[str, object] = {
+        "result_kind": result_kind,
+        "summary": "Completed.",
+        "payload": {"done": True},
+        "evidence_refs": (result_ref(cited),),
+        "artifact_ids": (),
+        "residual_risk": None,
+        "downstream_constraints": {},
     }
+    return _response((call_id, "task_complete", payload))
 
 
-def _child(client_key: str, arguments: Mapping[str, object]) -> dict[str, object]:
-    return {
-        "client_key": client_key,
+def _script(ids: tuple[str, ...], *turns: tuple[_Call, ...], cited: str):
+    """Block for replan, run the planner turns, then execute the replacement."""
+    message = "The admitted work needs one replacement."
+    details: dict[str, object] = {"evidence_references": ()}
+    block: dict[str, object] = {
+        "kind": "needs_replan",
+        "message": message,
+        "details": details,
+    }
+    return (
+        _response(("discover", "task_block", block)),
+        *(_response(*turn) for turn in turns),
+        _complete("complete-plan", "graph.plan", cited),
+        _response(("replacement-read", READ_TOOL_NAME, {"resource_ids": ids})),
+        _complete("complete-replacement", "test.graph.read", "replacement-read"),
+    )
+
+
+def _supersede(call_id: str, worker: GraphTask, **extra: object) -> _Call:
+    common: dict[str, object] = {"expected_revision": 1, "idempotency_key": call_id}
+    arguments = {**common, "task_id": worker.task_id, **extra}
+    return (call_id, "graph_supersede_unstarted", arguments)
+
+
+def _children(call_id: str, label: str, arguments: Mapping[str, object]) -> _Call:
+    child: dict[str, object] = {
+        "client_key": label,
         "title": "Read one bounded source",
         "description": "Read inside the admitted scope.",
         "result_kind": "test.graph.read",
@@ -124,13 +105,25 @@ def _child(client_key: str, arguments: Mapping[str, object]) -> dict[str, object
         "input_result_ids": (),
         "reduction": False,
     }
+    common = {"expected_revision": 1, "idempotency_key": call_id}
+    return (call_id, "graph_create_children", {**common, "children": (child,)})
 
 
-async def _run(
-    integration: ModelGraphIntegration,
-    admission,
-    script: tuple[ModelResponse, ...],
-):
+def _worker(tasks: tuple[GraphTask, ...]) -> GraphTask:
+    return next(item for item in tasks if item.role is TaskRole.WORKER)
+
+
+@pytest.fixture
+async def integration(tmp_path: Path) -> AsyncIterator[ModelGraphIntegration]:
+    opened = await ModelGraphIntegration.open(tmp_path)
+    try:
+        yield opened
+    finally:
+        await opened.close()
+
+
+async def _run_to_replacement(integration: ModelGraphIntegration, admission, script):
+    """Run one admission to success; return its tool results, terminal, replacement."""
     provider = RefCitingMockModelProvider(
         script, provider_id=MODEL_ROUTE_ID, complete_pricing=True
     )
@@ -139,159 +132,90 @@ async def _run(
     integration.provider = provider
     await integration.admit_and_start(admission)
     terminal = await integration.wait_terminal(admission.job.job_id)
-    return provider, terminal
-
-
-def _replacement(terminal, original: GraphTask) -> GraphTask:
-    current = next(item for item in terminal.tasks if item.task_id == original.task_id)
-    assert current.state is TaskState.SUPERSEDED
-    return next(
-        item for item in terminal.tasks if item.task_id == current.superseded_by_task_id
-    )
+    assert terminal.job.state is GraphState.SUCCEEDED
+    provider.assert_consumed()
+    results = {
+        block.call_id: block
+        for request in provider.requests
+        for message in request.messages
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+    }
+    by_id = {item.task_id: item for item in terminal.tasks}
+    replaced = by_id[_worker(admission.tasks).task_id]
+    assert replaced.state is TaskState.SUPERSEDED
+    assert replaced.superseded_by_task_id is not None
+    return results, terminal, by_id[replaced.superseded_by_task_id]
 
 
 async def test_invalid_planner_calls_are_rejected_and_supersede_copies_by_reference(
-    tmp_path: Path,
+    integration: ModelGraphIntegration,
 ) -> None:
-    integration = await ModelGraphIntegration.open(tmp_path)
     admission = integration.build()
-    worker = next(item for item in admission.tasks if item.role is TaskRole.WORKER)
-    resource_ids = worker.specification.authority.resource_ids
-    nested_spec = {
+    worker = _worker(admission.tasks)
+    ids = worker.specification.authority.resource_ids
+    nested = {
         "title": "Read",
         "capability_id": READ_CAPABILITY_ID,
-        "arguments": {"resource_ids": resource_ids},
+        "arguments": {"resource_ids": ids},
         "result_kind": "test.graph.read",
     }
-    invalid_arguments: dict[str, Mapping[str, object]] = {
-        "wrong-type": {"resource_ids": resource_ids[0]},
-        "empty": {},
-        "out-of-scope": {"resource_ids": ("resource-99",)},
-        "extra-key": {"resource_ids": resource_ids, "sql": "select 1"},
-        "nested-spec": nested_spec,
-    }
-    supersede_common = {"expected_revision": 1, "task_id": worker.task_id}
-    bad_calls: list[tuple[str, str, Mapping[str, object]]] = []
-    for label, arguments in invalid_arguments.items():
-        bad_calls.append(
-            (
-                f"supersede-{label}",
-                "graph_supersede_unstarted",
-                {
-                    **supersede_common,
-                    "idempotency_key": f"supersede-{label}",
-                    "arguments": arguments,
-                },
-            )
-        )
-        bad_calls.append(
-            (
-                f"children-{label}",
-                "graph_create_children",
-                {
-                    "expected_revision": 1,
-                    "idempotency_key": f"children-{label}",
-                    "children": (_child(label, arguments),),
-                },
-            )
-        )
-    bad_calls.append(
-        (
-            "supersede-foreign-capability",
-            "graph_supersede_unstarted",
-            {
-                **supersede_common,
-                "idempotency_key": "supersede-foreign-capability",
-                "capability_id": "jobs.graph.task_complete",
-                "arguments": {},
-            },
-        )
-    )
-    script = (
-        _block_for_replan(),
-        _response(*bad_calls),
-        _response(
-            (
-                "replace-by-reference",
-                "graph_supersede_unstarted",
-                {**supersede_common, "idempotency_key": "replace-by-reference"},
-            )
-        ),
-        _complete("complete-plan", "graph.plan", "replace-by-reference"),
-        _response(("replacement-read", READ_TOOL_NAME, {"resource_ids": resource_ids})),
-        _complete("complete-replacement", "test.graph.read", "replacement-read"),
-    )
-    try:
-        provider, terminal = await _run(integration, admission, script)
-
-        assert terminal.job.state is GraphState.SUCCEEDED
-        provider.assert_consumed()
-        results = _results(provider.requests)
-        codes = {}
-        for call_id, _name, _arguments in bad_calls:
-            block = results[call_id]
-            assert block.is_error, call_id
-            error = block.output["error"]
-            assert isinstance(error, Mapping)
-            codes[call_id] = error["code"]
-        assert codes["supersede-out-of-scope"] == "source_scope_violation"
-        assert codes["children-out-of-scope"] == "source_scope_violation"
-        assert codes["supersede-wrong-type"] == "invalid_argument_type"
-        assert codes["children-wrong-type"] == "invalid_argument_type"
-        assert codes["supersede-foreign-capability"] == "planner_capability_invalid"
-        expected_codes = {
-            "empty": "missing_arguments",
-            "extra-key": "unexpected_arguments",
-            "nested-spec": "missing_arguments",
+    invalid: dict[str, tuple[Mapping[str, object], str, str | None]] = (
+        {  # label: (arguments, error code, recovery kind when asserted)
+            "wrong-type": ({"resource_ids": ids[0]}, "invalid_argument_type", None),
+            "empty": ({}, "missing_arguments", _FIX),
+            "out-of-scope": ({"resource_ids": ("resource-99",)}, _OUTSIDE, None),
+            "extra-key": ({"resource_ids": ids, "sql": "select 1"}, _EXTRA, _FIX),
+            "nested-spec": (nested, "missing_arguments", _FIX),
         }
-        for label, code in expected_codes.items():
-            for kind in ("supersede", "children"):
-                error = results[f"{kind}-{label}"].output["error"]
-                assert isinstance(error, Mapping)
-                assert error["code"] == code, (kind, label)
-                details = error["details"]
-                assert isinstance(details, Mapping)
-                assert details["recovery"]["kind"] == "correct_arguments"
-        assert not results["replace-by-reference"].is_error
-
-        # Only the policy planner and the one by-reference replacement were added.
-        created = {item.task_id for item in terminal.tasks} - {
-            item.task_id for item in admission.tasks
+    )
+    bad_calls: list[_Call] = []
+    expected: dict[str, tuple[str, str | None]] = {}
+    for label, (arguments, code, recovery) in invalid.items():
+        bad_calls.append(_supersede(f"supersede-{label}", worker, arguments=arguments))
+        bad_calls.append(_children(f"children-{label}", label, arguments))
+        expected |= {
+            f"{kind}-{label}": (code, recovery) for kind in ("supersede", "children")
         }
-        roles = sorted(
-            item.role.value for item in terminal.tasks if item.task_id in created
-        )
-        assert roles == ["planner", "worker"]
+    foreign = {"capability_id": "jobs.graph.task_complete", "arguments": {}}
+    bad_calls.append(_supersede("supersede-foreign-capability", worker, **foreign))
+    expected["supersede-foreign-capability"] = ("planner_capability_invalid", None)
+    by_reference = (_supersede("replace-by-reference", worker),)
+    script = _script(ids, tuple(bad_calls), by_reference, cited="replace-by-reference")
 
-        replacement = _replacement(terminal, worker)
-        assert replacement.state is TaskState.SUCCEEDED
-        original_spec = worker.specification
-        replacement_spec = replacement.specification
-        assert (
-            replacement_spec.expected_result_contract
-            == original_spec.expected_result_contract
-        )
-        initial_call = replacement_spec.expected_result_contract["initial_call"]
-        assert isinstance(initial_call, Mapping)
-        assert initial_call["callable_tool_names"] == (READ_TOOL_NAME,)
-        assert replacement_spec.authority == original_spec.authority
-        assert replacement_spec.budgets == original_spec.budgets
-        assert replacement_spec.title == original_spec.title
-        assert replacement_spec.max_steps == original_spec.max_steps
-        assert (
-            replacement_spec.max_wall_time_seconds
-            == original_spec.max_wall_time_seconds
-        )
-        assert len(integration.reader.calls) == 1
-    finally:
-        await integration.close()
+    results, terminal, replacement = await _run_to_replacement(
+        integration, admission, script
+    )
+
+    for call_id, (code, recovery) in expected.items():
+        assert results[call_id].is_error, call_id
+        error = results[call_id].output["error"]
+        assert isinstance(error, Mapping) and error["code"] == code, call_id
+        if recovery is not None:
+            assert isinstance(details := error["details"], Mapping)
+            assert details["recovery"]["kind"] == recovery, call_id
+    assert not results["replace-by-reference"].is_error
+    # Only the policy planner and the one by-reference replacement were added.
+    original = {item.task_id for item in admission.tasks}
+    created = [item for item in terminal.tasks if item.task_id not in original]
+    assert sorted(item.role.value for item in created) == ["planner", "worker"]
+    assert replacement.state is TaskState.SUCCEEDED
+    copied = ("expected_result_contract", "authority", "budgets", "title", "max_steps")
+    for field in (*copied, "max_wall_time_seconds"):
+        assert getattr(replacement.specification, field) == getattr(
+            worker.specification, field
+        ), field
+    initial_call = replacement.specification.expected_result_contract["initial_call"]
+    assert isinstance(initial_call, Mapping)
+    assert initial_call["callable_tool_names"] == (READ_TOOL_NAME,)
+    assert len(integration.reader.calls) == 1
 
 
 async def test_owner_and_planner_admission_freeze_the_same_call(
-    tmp_path: Path,
+    integration: ModelGraphIntegration,
 ) -> None:
-    integration = await ModelGraphIntegration.open(tmp_path)
     resource_ids = ("resource-1", "resource-0")
+    scope = tuple(sorted(resource_ids))
     raw_arguments = {"resource_ids": list(resource_ids)}
     resolver = RegistryInitialTaskProposalResolver(
         agent_id=integration.owner.agent_id,
@@ -301,16 +225,13 @@ async def test_owner_and_planner_admission_freeze_the_same_call(
         max_steps=6,
         per_run_max_tokens=10_000,
     )
+    references = {"source_ids": (), "resource_ids": scope, "connector_binding_ids": ()}
     proposal = await resolver(
         proposal={
             "capability_id": READ_CAPABILITY_ID,
             "arguments": raw_arguments,
             "expected_result_contract": {"result_kind": "test.graph.read"},
-            "retained_references": {
-                "source_ids": (),
-                "resource_ids": tuple(sorted(resource_ids)),
-                "connector_binding_ids": (),
-            },
+            "retained_references": references,
         },
         source_scope=None,
         sensitivity=ModelSensitivity.INTERNAL,
@@ -324,149 +245,76 @@ async def test_owner_and_planner_admission_freeze_the_same_call(
         deadline_seconds=300,
         proposal=proposal,
     )
-    worker = next(item for item in admission.tasks if item.role is TaskRole.WORKER)
+    worker = _worker(admission.tasks)
     owner_call = worker.specification.expected_result_contract["initial_call"]
-    script = (
-        _block_for_replan(),
-        _response(
-            (
-                "replace-with-override",
-                "graph_supersede_unstarted",
-                {
-                    "expected_revision": 1,
-                    "idempotency_key": "replace-with-override",
-                    "task_id": worker.task_id,
-                    "capability_id": READ_CAPABILITY_ID,
-                    "arguments": raw_arguments,
-                    "note": "Same call, admitted again by the planner.",
-                },
-            )
-        ),
-        _complete("complete-plan", "graph.plan", "replace-with-override"),
-        _response(("replacement-read", READ_TOOL_NAME, {"resource_ids": resource_ids})),
-        _complete("complete-replacement", "test.graph.read", "replacement-read"),
-    )
-    try:
-        provider, terminal = await _run(integration, admission, script)
+    note = "Same call, admitted again by the planner."
+    override = {"capability_id": READ_CAPABILITY_ID, "arguments": raw_arguments}
+    turn = (_supersede("replace-with-override", worker, **override, note=note),)
+    script = _script(resource_ids, turn, cited="replace-with-override")
 
-        assert terminal.job.state is GraphState.SUCCEEDED
-        provider.assert_consumed()
-        replacement = _replacement(terminal, worker)
-        planner_call = replacement.specification.expected_result_contract[
-            "initial_call"
-        ]
-        assert planner_call == owner_call
-        assert isinstance(owner_call, Mapping)
-        assert owner_call["callable_tool_names"] == (READ_TOOL_NAME,)
-        assert replacement.specification.description.endswith(
-            "Planner replacement note: Same call, admitted again by the planner."
-        )
-        direct = await admit_graph_call(
-            integration.registry,
-            READ_CAPABILITY_ID,
-            raw_arguments,
-            resource_ids=tuple(sorted(resource_ids)),
-        )
-        assert FrozenJsonObject.from_mapping(direct.material()) == owner_call
-    finally:
-        await integration.close()
+    _, _, replacement = await _run_to_replacement(integration, admission, script)
+
+    spec = replacement.specification
+    assert spec.expected_result_contract["initial_call"] == owner_call
+    assert isinstance(owner_call, Mapping)
+    assert owner_call["callable_tool_names"] == (READ_TOOL_NAME,)
+    assert spec.description.endswith(f"Planner replacement note: {note}")
+    direct = await admit_graph_call(
+        integration.registry, READ_CAPABILITY_ID, raw_arguments, resource_ids=scope
+    )
+    assert FrozenJsonObject.from_mapping(direct.material()) == owner_call
 
 
 def _optional_registry() -> CapabilityRegistry:
-    capability = Capability(
-        id="test.graph.optional_read",
-        description="Read with one optional bound.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "resource_ids": {
-                    "type": "array",
-                    "items": {"type": "string", "minLength": 1},
-                    "minItems": 1,
-                    "maxItems": 16,
-                },
-                "limit": {"type": "integer", "minimum": 1},
-            },
-            "required": ["resource_ids"],
-            "additionalProperties": False,
-        },
-        output_kind="test.graph.optional_read",
-        output_schema={"type": "object", "additionalProperties": True},
-        executor_id="test.graph.optional_read.executor",
-        access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
-        execution_admission_policy=ExecutionAdmissionPolicy(
-            shape="relational_read",
-            inline_eligible=True,
-            graph_v1_eligible=True,
-            target_count_argument="resource_ids",
-            inline_max_targets=2,
-            graph_max_targets=3,
+    """The graph read with one optional bound and a graph limit of three targets."""
+    declarations, executor = graph_read_declarations()
+    read = declarations.capabilities[0]
+    assert read.execution_admission_policy is not None
+    properties = read.input_schema["properties"]
+    assert isinstance(properties, Mapping)
+    properties = {**properties, "limit": {"type": "integer", "minimum": 1}}
+    capability = replace(
+        read,
+        input_schema={**read.input_schema, "properties": properties},
+        execution_admission_policy=replace(
+            read.execution_admission_policy, inline_max_targets=2, graph_max_targets=3
         ),
     )
-    view = ToolView(
-        name="optional_read",
-        capability_id=capability.id,
-        description=capability.description,
-        presentation=ToolPresentation(
-            toolbox_id=ToolboxId.SOURCES,
-            load_mode=ToolLoadMode.PINNED,
-            text_trust=ToolTextTrust.CODE,
-            summary=capability.description,
-            when_to_use="Use for the optional graph read test.",
-            keywords=("graph", "read"),
-        ),
-    )
-
-    class _Executor:
-        executor_id = capability.executor_id
-
-        async def execute(self, request):  # pragma: no cover - never dispatched
-            raise AssertionError(request)
-
-    return CapabilityRegistry(
-        declarations=(
-            CapabilityDeclarations(
-                domain_owner_id="test.graph.optional",
-                capabilities=(capability,),
-                executor_ids=(capability.executor_id,),
-                tool_views=(view,),
-            ),
-        ),
-        executors=(_Executor(),),
-    )
+    declarations = replace(declarations, capabilities=(capability,))
+    return CapabilityRegistry(declarations=(declarations,), executors=(executor,))
 
 
-async def test_shared_call_admission_normalises_unset_nulls_and_checks_bounds() -> None:
-    registry = _optional_registry()
+async def test_shared_call_admission_normalises_unset_nulls() -> None:
     admitted = await admit_graph_call(
-        registry,
-        "test.graph.optional_read",
+        _optional_registry(),
+        READ_CAPABILITY_ID,
         {"resource_ids": ["a"], "limit": None},
         resource_ids=("a", "b"),
     )
     assert dict(admitted.arguments) == {"resource_ids": ("a",)}
-    assert admitted.callable_tool_names == ("optional_read",)
+    assert admitted.callable_tool_names == (READ_TOOL_NAME,)
 
+
+@pytest.mark.parametrize(
+    ("capability_id", "arguments", "scope", "code"),
+    (
+        (READ_CAPABILITY_ID, {"resource_ids": list("abcd")}, tuple("abcd"), _UNFIT),
+        (READ_CAPABILITY_ID, {"resource_ids": ["a", "z"]}, ("a",), _OUTSIDE),
+        ("test.graph.unknown", {}, (), _UNFIT),
+    ),
+    ids=("over-graph-bound", "outside-scope", "unregistered"),
+)
+async def test_shared_call_admission_checks_bounds(
+    capability_id: str, arguments: dict[str, object], scope: tuple[str, ...], code: str
+) -> None:
     with pytest.raises(CapabilityInputError) as error:
         await admit_graph_call(
-            registry,
-            "test.graph.optional_read",
-            {"resource_ids": ["a", "b", "c", "d"]},
-            resource_ids=("a", "b", "c", "d"),
+            _optional_registry(), capability_id, arguments, resource_ids=scope
         )
-    assert error.value.code == "execution_not_supported_for_requested_shape"
-    with pytest.raises(CapabilityInputError) as error:
-        await admit_graph_call(
-            registry,
-            "test.graph.optional_read",
-            {"resource_ids": ["a", "z"]},
-            resource_ids=("a",),
-        )
-    assert error.value.code == "source_scope_violation"
-    with pytest.raises(CapabilityInputError) as error:
-        await admit_graph_call(registry, "test.graph.unknown", {})
-    assert error.value.code == "execution_not_supported_for_requested_shape"
+    assert error.value.code == code
+
+
+_CALL = {"capability_id": "capability.read", "callable_tool_names": ("read",)}
 
 
 @pytest.mark.parametrize(
@@ -474,31 +322,17 @@ async def test_shared_call_admission_normalises_unset_nulls_and_checks_bounds() 
     (
         None,
         {"capability_id": "capability.read", "arguments": {}},
-        {
-            "capability_id": "capability.read",
-            "callable_tool_names": (),
-            "arguments": {},
-        },
-        {
-            "capability_id": "capability.read",
-            "callable_tool_names": ("read",),
-            "arguments": "not-an-object",
-        },
-        {
-            "capability_id": "capability.other",
-            "callable_tool_names": ("read",),
-            "arguments": {},
-        },
+        {**_CALL, "callable_tool_names": (), "arguments": {}},
+        {**_CALL, "arguments": "not-an-object"},
+        {**_CALL, "capability_id": "capability.other", "arguments": {}},
     ),
+    ids=("missing", "no-tool-names", "empty-tool-names", "bad-arguments", "outside"),
 )
 def test_validate_mutation_rejects_unadmitted_model_created_calls(
     initial_call: object,
 ) -> None:
-    from daita.jobs.graph.models import GraphJob, JobGraph
-    from daita.jobs.graph.validation import validate_mutation
-
     admission = graph_admission()
-    worker = next(item for item in admission.tasks if item.role is TaskRole.WORKER)
+    worker = _worker(admission.tasks)
     contract = dict(worker.specification.expected_result_contract)
     contract.pop("initial_call", None)
     if initial_call is not None:
@@ -515,34 +349,31 @@ def test_validate_mutation_rejects_unadmitted_model_created_calls(
         specification=spec,
         task_spec_digest=spec.digest,
     )
-    job: GraphJob = admission.job
-    graph: JobGraph = admission.graph
+    job, graph = admission.job, admission.graph
     limits = job.specification.limits
+    bounds = "max_tasks max_edges max_depth max_direct_parents max_fan_out".split()
+    request = GraphMutationRequest(
+        agent_id=job.agent_id,
+        job_id=job.job_id,
+        mutation_id="mutation-model-created",
+        actor_kind="planner_attempt",
+        actor_key="planner-task",
+        idempotency_key="model-created",
+        expected_revision=graph.revision,
+        created_at=GRAPH_NOW,
+        tasks=(child,),
+        creator_task_id="planner-task",
+        creator_attempt_id="attempt-planner",
+        claim_token="claim-planner",
+        fencing_epoch=1,
+    )
     with pytest.raises(GraphValidationError) as error:
         validate_mutation(
             job_authority=job.specification.authority,
             graph=graph,
             existing_tasks=admission.tasks,
             existing_dependencies=admission.dependencies,
-            request=GraphMutationRequest(
-                agent_id=job.agent_id,
-                job_id=job.job_id,
-                mutation_id="mutation-model-created",
-                actor_kind="planner_attempt",
-                actor_key="planner-task",
-                idempotency_key="model-created",
-                expected_revision=graph.revision,
-                created_at=GRAPH_NOW,
-                tasks=(child,),
-                creator_task_id="planner-task",
-                creator_attempt_id="attempt-planner",
-                claim_token="claim-planner",
-                fencing_epoch=1,
-            ),
-            max_tasks=limits.max_tasks,
-            max_edges=limits.max_edges,
-            max_depth=limits.max_depth,
-            max_direct_parents=limits.max_direct_parents,
-            max_fan_out=limits.max_fan_out,
+            request=request,
+            **{name: getattr(limits, name) for name in bounds},
         )
     assert error.value.code == "model_task_call_invalid"
