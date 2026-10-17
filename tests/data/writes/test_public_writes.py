@@ -41,6 +41,12 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import LoopLimits
+from tests.support.data_write_approval import (
+    TARGET_KEYS,
+    UPDATE_PREVIEW_KEYS,
+    UPSERT_PREVIEW_KEYS,
+    data_write_approval,
+)
 from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.native_writes import (
     NOW,
@@ -261,6 +267,14 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
             if isinstance(block, ToolResultBlock) and block.is_error
         ]
         approval = approvals[0]
+        approval_document = data_write_approval(approval)
+        assert approval_document is not None
+        assert set(approval_document["target"]) == TARGET_KEYS
+        assert set(approval_document["preview"]) == UPDATE_PREVIEW_KEYS
+        assert (
+            approval_document["arguments"]["expected_affected_rows"]
+            == approval_document["preview"]["matched_rows"]
+        )
         call = next(
             call
             for message in transcript.messages
@@ -520,6 +534,10 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         approval = next(
             item for item in approvals if item.capability_id == "data.upsert_rows"
         )
+        approval_document = data_write_approval(approval)
+        assert approval_document is not None
+        assert set(approval_document["target"]) == TARGET_KEYS
+        assert set(approval_document["preview"]) == UPSERT_PREVIEW_KEYS
         write_call = next(
             call
             for message in transcript.messages

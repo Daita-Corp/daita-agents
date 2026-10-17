@@ -26,6 +26,7 @@ from tests.data.postgresql._large_fixture_support import (
     update_constraints,
     workspace_for,
 )
+from tests.support.data_write_approval import data_write_approval
 
 
 @pytest.mark.acceptance
@@ -383,9 +384,12 @@ async def test_bulk_update_uses_exact_preview_approval_commit_and_readback(
         assert len(approvals) == 2
         assert all(item.tool_name == "data_update_rows" for item in approvals)
         for request in approvals:
-            expected_rows = request.arguments["expected_affected_rows"]
-            preview_fingerprint = request.arguments["preview_fingerprint"]
+            document = data_write_approval(request)
+            assert document is not None
+            expected_rows = document["arguments"]["expected_affected_rows"]
+            preview_fingerprint = document["arguments"]["preview_fingerprint"]
             assert isinstance(expected_rows, int)
+            assert expected_rows == document["preview"]["matched_rows"]
             assert expected_rows > 1
             assert isinstance(preview_fingerprint, str)
             assert preview_fingerprint.startswith("sha256:")

@@ -20,7 +20,7 @@ from daita.loop.models import LoopExitKind
 from daita.storage.sqlite_records import EffectResolutionDecision
 from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.live_billing import live_model_id
-from tests.support.postgresql_live import _TABLE, database as database, row
+from tests.support.postgresql_live import _TABLE, row
 from tests.support.postgresql_live_harness import (
     AUTHORIZATION,
     EXPIRES,
@@ -107,7 +107,7 @@ async def test_live_source_free_update(database, scenario_factory, phrasing):
         scenario.expect_update()
         result, transcript = await scenario.run(
             (
-                "Find the companies table and change the name of existing.test to Updated. Change exactly that one name; preserve every other value.",
+                "Find the companies table and change the name of the company whose domain is existing.test to Updated. Change exactly that one name; preserve every other value.",
                 "Our stored company existing.test needs its name corrected to Updated. Locate the record and save that correction, leaving all other fields alone.",
                 "Change the name of the company whose domain is existing.test to Updated. Preserve every other field and company.",
             )[phrasing]
@@ -287,7 +287,7 @@ async def test_live_drift_during_approval_does_not_reapply(database, scenario_fa
 
         scenario.approval_hook = change_row
         result, transcript = await scenario.run(
-            "Change only the name of existing.test to Updated in the companies table. If the target changes during approval, stop and report the conflict without overwriting it. "
+            "Change only the name of the company whose domain is existing.test to Updated in the companies table. If the target changes during approval, stop and report the conflict without overwriting it. "
             + REPORT_INSTRUCTION,
             user_prompt="Please change the name of the company whose domain is existing.test to Updated. Leave everything else alone and let me know the result.",
         )

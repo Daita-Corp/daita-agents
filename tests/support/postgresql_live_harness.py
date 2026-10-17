@@ -37,6 +37,11 @@ from daita.security import (
     SecretReference,
 )
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
+from tests.support.data_write_approval import (
+    TARGET_KEYS,
+    UPDATE_PREVIEW_KEYS,
+    data_write_approval,
+)
 from tests.support.job_benchmarks import RecordingProvider
 from tests.support.live_billing import (
     CREDENTIAL as LIVE_CREDENTIAL,
@@ -316,12 +321,10 @@ class Evaluation:
             or request.capability_id != f"data.{operation}_rows"
         ):
             return False
-        review = request.arguments.to_dict()
-        if set(review) != {"arguments", "target", "preview"}:
+        review = data_write_approval(request)
+        if review is None:
             return False
         args = review["arguments"]
-        if not isinstance(args, dict):
-            return False
         if not isinstance(review["target"], dict) or (
             review["target"].get("source_id") != self.db.source_id
             or review["target"].get("resource_id") != self.db.resource_id
@@ -337,18 +340,11 @@ class Evaluation:
         # approval. Its presence cannot change the approved target or row values.
         args.pop("evidence_call_ids", None)
         expected = dict(self.expected_write)
-        domain_selector = [
-            {"column": "domain", "operator": "eq", "value": "existing.test"}
-        ]
-        if operation == "update" and self.profile == "user_flow":
-            if set(review["target"]) - {
-                "source_id",
-                "resource_id",
-                "name",
-                "aliases",
-                "source_name",
-                "revision",
-            }:
+        # Any equality-only selector of the intended row that names a unique key
+        # is the same approved write in both profiles; production re-checks the
+        # preview fingerprint for drift before applying it.
+        if operation == "update":
+            if set(review["target"]) - TARGET_KEYS:
                 return False
             where = args.get("where")
             if not isinstance(where, list) or not 1 <= len(where) <= 16:
@@ -367,11 +363,7 @@ class Evaluation:
             if not self._intended_update_cells(cells, require_key=True):
                 return False
             preview = review["preview"]
-            if not isinstance(preview, dict) or set(preview) != {
-                "matched_rows",
-                "samples",
-                "warnings",
-            }:
+            if set(preview) != UPDATE_PREVIEW_KEYS:
                 return False
             if (
                 type(preview["matched_rows"]) is not int
@@ -401,12 +393,6 @@ class Evaluation:
             ):
                 return False
             expected["where"] = where
-        elif operation == "update" and canonical_json(
-            args.get("where")
-        ) == canonical_json(domain_selector):
-            # This fixture's unique domain identifies the same approved row as
-            # id=1. No other predicate, count or assignment becomes acceptable.
-            expected["where"] = domain_selector
         for key in ("rows", "key_columns", "insert_columns", "update_columns"):
             if key in args and key in expected:
                 args[key] = sorted(args[key], key=canonical_json)
