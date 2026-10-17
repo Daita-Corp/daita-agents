@@ -15,6 +15,7 @@ from ..artifacts.store import AgentHomeArtifactStore
 from ..capabilities import ExecutionScope, ExecutionScopeKind
 from ..capability_runtime import CapabilityRuntime, InternalCapabilityRequest
 from ..distribution import DistributionOwner, OutcomeArtifactReference
+from ..hosting.execution_governor import AdmissionClosedError
 from ..llm.errors import ProviderErrorCode
 from ..loop.models import (
     InstructionAuthority,
@@ -91,6 +92,7 @@ class RoutineSupervisor:
         self._driver: asyncio.Task[None] | None = None
         self._worker: asyncio.Task[None] | None = None
         self._closing = False
+        self._host_closed = False
         self._failed = False
         self._failure_code: str | None = None
         self._consecutive_failures = 0
@@ -114,7 +116,21 @@ class RoutineSupervisor:
             failure_code=self._failure_code,
         )
 
+    def _stop_for_host_close(self) -> None:
+        """Stop claiming work once host admission closes; this is not a failure.
+
+        The host drains admitted work and then joins this supervisor's tasks in
+        ``close`` before any storage closes.
+        """
+        if not self._host_closed:
+            self._host_closed = True
+            _logger.info("routines supervisor stopped (host_closing)")
+        self._wake.set()
+
     def _record_failure(self, error: BaseException) -> None:
+        if isinstance(error, AdmissionClosedError):
+            self._stop_for_host_close()
+            return
         if self._failed:
             return
         self._consecutive_failures += 1
@@ -170,7 +186,7 @@ class RoutineSupervisor:
 
     async def _drive(self) -> None:
         try:
-            while not self._closing and not self._failed:
+            while not self._closing and not self._failed and not self._host_closed:
                 while (
                     remaining := self._retry_at - asyncio.get_running_loop().time()
                 ) > 0:
@@ -191,6 +207,9 @@ class RoutineSupervisor:
                             timeout,
                             max(0.05, (deadline - self._clock()).total_seconds()),
                         )
+                except AdmissionClosedError:
+                    self._stop_for_host_close()
+                    break
                 except StorageUnavailableError as error:
                     self._record_failure(error)
                     continue
@@ -273,7 +292,11 @@ class RoutineSupervisor:
             return
 
     def _launch(self, occurrence: RoutineOccurrence) -> None:
-        if self._failed or self._retry_at > asyncio.get_running_loop().time():
+        if (
+            self._failed
+            or self._host_closed
+            or self._retry_at > asyncio.get_running_loop().time()
+        ):
             return
         task = asyncio.create_task(
             self._run_claimed(occurrence),
