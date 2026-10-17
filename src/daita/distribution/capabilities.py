@@ -263,7 +263,8 @@ def distribution_capability_declarations(
             id=DISTRIBUTION_DESTINATION_LIST_CAPABILITY_ID,
             description=(
                 "List exact currently selectable distribution destinations for "
-                "this foreground conversation."
+                "this foreground conversation. A destination receives Daita "
+                "reports; it is never a connector tool's target argument."
             ),
             input_schema={
                 "type": "object",

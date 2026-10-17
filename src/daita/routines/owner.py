@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 from .._json import FrozenJsonObject, canonical_json
 from ..adapters.mcp import MCPBindingState, MCPServerBinding
@@ -69,7 +70,7 @@ from .models import (
     validate_budget_relationships,
     validate_reporting_precheck,
 )
-from .schedule import validate_schedule
+from .schedule import forecast_slots, validate_schedule
 
 
 class RoutineError(DaitaError):
@@ -352,6 +353,55 @@ class RoutineOwner:
                 "An exact requested execution contract is unavailable.",
             ) from error
 
+    def _connector_binding_ids(
+        self, capability_ids: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """Derive the connector bindings that the exact capabilities belong to.
+
+        The registry's connector identity is code-owned by the connector domain.
+        Contract binding still loads each binding and checks every capability's
+        exact origin, so a derived binding is verified like an explicit one.
+        """
+
+        registry = self._require_capability_registry()
+        wanted = set(capability_ids)
+        found: set[str] = set()
+        for name in registry.tool_names:
+            view, _capability = registry.resolve_tool(name)
+            connector = view.connector_presentation
+            if (
+                view.capability_id in wanted
+                and connector is not None
+                and connector.get("kind") == "mcp_binding"
+                and isinstance(connector.get("id"), str)
+            ):
+                found.add(str(connector["id"]))
+        return tuple(sorted(found))
+
+    def _distribution_destination_id(
+        self,
+        conversation_id: str,
+        destination_id: str | None,
+        sensitivity_ceiling: ModelSensitivity,
+    ) -> str:
+        """Default report delivery to the one selectable destination."""
+
+        if destination_id is not None:
+            return destination_id
+        selectable = tuple(
+            item
+            for item in self._distribution.list_destinations(
+                conversation_id, sensitivity_ceiling=sensitivity_ceiling
+            )
+            if item.selectable
+        )
+        if len(selectable) != 1:
+            raise RoutineError(
+                "routine_distribution_destination_required",
+                "Choose distribution_destination_id from distribution_destination_list.",
+            )
+        return selectable[0].destination_id
+
     def bind_capability_registry(self, capabilities: CapabilityRegistry) -> None:
         """Bind the host's complete immutable registry between executions."""
         if not isinstance(capabilities, CapabilityRegistry):
@@ -396,12 +446,12 @@ class RoutineOwner:
         reporting_mode: ReportingMode,
         precheck: ResourceRevisionPrecheck | None,
         allowed_source_ids: tuple[str, ...],
-        allowed_connector_binding_ids: tuple[str, ...],
+        allowed_connector_binding_ids: tuple[str, ...] | None,
         allowed_resource_ids: tuple[str, ...],
         allowed_capability_ids: tuple[str, ...],
         sensitivity_ceiling: ModelSensitivity,
         outcome_contract: OutcomeContract,
-        distribution_destination_id: str,
+        distribution_destination_id: str | None,
         eligible_model_routes: tuple[str, ...],
         per_run_max_tokens: int,
         per_run_max_cost_usd: Decimal | None,
@@ -417,6 +467,13 @@ class RoutineOwner:
         run_immediately: bool = False,
     ) -> ScheduledRoutine:
         origin = await self._owned_run(run_id, conversation_id, sensitivity_ceiling)
+        if allowed_connector_binding_ids is None:
+            allowed_connector_binding_ids = self._connector_binding_ids(
+                allowed_capability_ids
+            )
+        distribution_destination_id = self._distribution_destination_id(
+            conversation_id, distribution_destination_id, sensitivity_ceiling
+        )
         self._validate_budgets(
             per_run_max_tokens,
             cumulative_max_tokens,
@@ -575,12 +632,12 @@ class RoutineOwner:
         reporting_mode: ReportingMode,
         precheck: ResourceRevisionPrecheck | None,
         allowed_source_ids: tuple[str, ...],
-        allowed_connector_binding_ids: tuple[str, ...],
+        allowed_connector_binding_ids: tuple[str, ...] | None,
         allowed_resource_ids: tuple[str, ...],
         allowed_capability_ids: tuple[str, ...],
         sensitivity_ceiling: ModelSensitivity,
         outcome_contract: OutcomeContract,
-        distribution_destination_id: str,
+        distribution_destination_id: str | None,
         eligible_model_routes: tuple[str, ...],
         per_run_max_tokens: int,
         per_run_max_cost_usd: Decimal | None,
@@ -606,6 +663,13 @@ class RoutineOwner:
                 "routine_revision_changed",
                 "The routine changed after this foreground run began.",
             )
+        if allowed_connector_binding_ids is None:
+            allowed_connector_binding_ids = self._connector_binding_ids(
+                allowed_capability_ids
+            )
+        distribution_destination_id = self._distribution_destination_id(
+            conversation_id, distribution_destination_id, sensitivity_ceiling
+        )
         self._validate_budgets(
             per_run_max_tokens,
             cumulative_max_tokens,
@@ -877,12 +941,20 @@ class RoutineOwner:
     async def proposal_authority_snapshot(
         self, routine: ScheduledRoutine
     ) -> FrozenJsonObject:
-        """Revalidate a proposal before its exact skill bytes are retained."""
+        """Revalidate a proposal before its exact skill bytes are retained.
 
-        return await self._authority_snapshot(
+        The snapshot also carries the code-computed first occurrences, so the
+        approval shows real dates instead of asking anyone to derive them.
+        """
+
+        preview = schedule_preview(
+            routine, not_before=routine.updated_at, pending_immediate=True
+        )
+        snapshot = await self._authority_snapshot(
             routine,
             allow_unretained_skills=True,
         )
+        return FrozenJsonObject.from_mapping({**snapshot, "schedule_preview": preview})
 
     async def _authority_snapshot(
         self,
@@ -1308,23 +1380,24 @@ class RoutineOwner:
             ) from error
         capabilities = self._require_capability_registry()
         executed: set[str] = set()
-        for message in transcript.messages:
-            for call in message.tool_calls:
-                if _contains_reference_marker(call.arguments):
-                    raise RoutineError(
-                        "routine_basis_run_has_tool_ref",
-                        "The basis run used a run-bound tool reference.",
-                    )
-                if call.name in RESERVED_TOOL_NAMES:
-                    continue
-                try:
-                    capability = capabilities.call_capability(call.name, call.arguments)
-                except KeyError as error:
-                    raise RoutineError(
-                        "routine_basis_lineage_unknown",
-                        "The basis run contains unknown capability lineage.",
-                    ) from error
-                executed.add(capability.id)
+        # Lineage reads each call as it executed: run-scoped refs and handles
+        # are replaced by the identities they named in the basis run.
+        for call, _ in capabilities.executed_tool_pairs(transcript):
+            if _contains_reference_marker(call.arguments):
+                raise RoutineError(
+                    "routine_basis_run_has_tool_ref",
+                    "The basis run used a run-bound tool reference.",
+                )
+            if call.name in RESERVED_TOOL_NAMES:
+                continue
+            try:
+                capability = capabilities.call_capability(call.name, call.arguments)
+            except KeyError as error:
+                raise RoutineError(
+                    "routine_basis_lineage_unknown",
+                    "The basis run contains unknown capability lineage.",
+                ) from error
+            executed.add(capability.id)
         if not executed or not executed <= set(allowed_capability_ids):
             raise RoutineError(
                 "routine_basis_lineage_outside_scope",
@@ -1610,12 +1683,92 @@ def _schedule_payload(schedule: RoutineSchedule) -> dict[str, object]:
 
 def routine_approval_arguments(authority: FrozenJsonObject) -> FrozenJsonObject:
     """Keep one exact product review envelope over the validated snapshot."""
-    return FrozenJsonObject.from_mapping(
-        {
-            "proposal": authority["routine"],
-            "authority": authority["authority"],
-        }
+    envelope = {
+        "proposal": authority["routine"],
+        "authority": authority["authority"],
+    }
+    if "schedule_preview" in authority:
+        envelope["schedule_preview"] = authority["schedule_preview"]
+    return FrozenJsonObject.from_mapping(envelope)
+
+
+MAX_SCHEDULE_PREVIEW_OCCURRENCES = 3
+
+
+def schedule_preview(
+    routine: ScheduledRoutine,
+    *,
+    not_before: datetime | None,
+    pending_immediate: bool = False,
+) -> dict[str, object]:
+    """Project the next scheduled runs as UTC and schedule-local weekday text.
+
+    ``not_before`` is the instant the store materializes the first slot from:
+    the proposal's creation/revision time, or a stored routine's next due slot.
+    ``pending_immediate`` counts a not-yet-admitted immediate first run.
+    A calendar or slot whose first run falls after expiration is rejected, the
+    same rule once and interval schedules already enforce. A cumulative
+    occurrence cap that expiration makes unreachable is reported as a warning.
+    """
+
+    zone_name = (
+        routine.schedule.timezone
+        if isinstance(routine.schedule, CalendarSchedule)
+        else "UTC"
     )
+    remaining = routine.cumulative_max_occurrences - routine.occurrence_count
+    immediate = pending_immediate and routine.run_immediately
+    if not_before is None or remaining < 1:
+        return {
+            "timezone": zone_name,
+            "first_occurrences": (),
+            "immediate_first_run": False,
+            "occurrences_before_expiry": 0,
+            "warnings": (),
+        }
+    forecast = forecast_slots(
+        routine.schedule,
+        not_before=not_before,
+        expires_at=routine.expires_at,
+        limit=min(MAX_SCHEDULE_PREVIEW_OCCURRENCES, remaining),
+        count_limit=remaining,
+    )
+    if (
+        forecast.first_unbounded_at is not None
+        and forecast.first_unbounded_at > routine.expires_at
+    ):
+        raise RoutineError(
+            "routine_expiration_before_schedule",
+            "The routine expires before its first scheduled run at "
+            f"{_local_slot_text(forecast.first_unbounded_at, zone_name)} "
+            f"({forecast.first_unbounded_at.isoformat()}); expires_at is "
+            f"{_local_slot_text(routine.expires_at, zone_name)}. Move expires_at "
+            "after the first run or choose an earlier schedule.",
+        )
+    available = forecast.reachable_slots + (1 if immediate else 0)
+    warnings: list[str] = []
+    if available < remaining:
+        warnings.append(
+            f"cumulative_max_occurrences allows {remaining} more run(s), but only "
+            f"{available} fit before expires_at "
+            f"{_local_slot_text(routine.expires_at, zone_name)}; the routine "
+            "expires first. Extend expires_at or lower the cap if that is unintended."
+        )
+    return {
+        "timezone": zone_name,
+        "first_occurrences": tuple(
+            {"at": slot.isoformat(), "local": _local_slot_text(slot, zone_name)}
+            for slot in forecast.occurrences
+        ),
+        "immediate_first_run": immediate,
+        "occurrences_before_expiry": available,
+        "warnings": tuple(warnings),
+    }
+
+
+def _local_slot_text(value: datetime, zone_name: str) -> str:
+    local = value.astimezone(UTC if zone_name == "UTC" else ZoneInfo(zone_name))
+    return local.strftime("%A %Y-%m-%d %H:%M %Z")
 
 
 def _optional_decimal_text(value: Decimal | None) -> str | None:
@@ -1689,8 +1842,10 @@ def _routine_proposal_payload(routine: ScheduledRoutine) -> dict[str, object]:
 
 
 __all__ = [
+    "MAX_SCHEDULE_PREVIEW_OCCURRENCES",
     "RoutineCatalog",
     "RoutineError",
     "RoutineOwner",
     "RoutineStore",
+    "schedule_preview",
 ]

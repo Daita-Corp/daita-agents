@@ -15,6 +15,7 @@ from daita.routines.capabilities import (
     _parse_schedule,
     _require_exact_revision_timing,
     _spec_schema,
+    _without_derived_outcome_rules,
 )
 from daita.routines.models import CalendarSchedule, OnceSchedule
 
@@ -34,7 +35,9 @@ async def test_model_immediate_choice_is_explicit_on_create_and_cannot_run_a_rev
     properties = cast(Mapping[str, object], schema["properties"])
     arguments = {
         key: value
-        for key, value in _routine_proposal_payload(proposal).items()
+        for key, value in _without_derived_outcome_rules(
+            _routine_proposal_payload(proposal)
+        ).items()
         if key in properties and value is not None
     }
     arguments.update(skill_names=(), distribution_destination_id="destination")
@@ -501,3 +504,35 @@ async def test_dollar_ceilings_are_optional_and_travel_together():
                 per_run_max_cost_usd=Decimal("0.01"),
                 cumulative_max_cost_usd=None,
             )
+
+
+async def test_outcome_rules_are_derived_and_a_copied_view_cannot_loosen_them():
+    from daita.routines.capabilities import _parsed_spec
+    from daita.routines.owner import _routine_proposal_payload
+    from tests.routines._owner_support import _owner, _proposal, _Store
+
+    proposal = await _proposal(_owner(_Store()))
+    schema = _spec_schema(update=False)
+    properties = cast(Mapping[str, object], schema["properties"])
+    contract = cast(Mapping[str, object], properties["outcome_contract"])
+    assert not {
+        "require_terminal_conclusion",
+        "require_current_run_provenance",
+        "require_exact_source_bindings",
+    } & set(cast(Mapping[str, object], contract["properties"]))
+    payload = dict(_routine_proposal_payload(proposal))
+    payload["outcome_contract"] = {
+        **cast(Mapping[str, object], payload["outcome_contract"]),
+        "require_exact_source_bindings": False,
+    }
+    arguments = {
+        key: value
+        for key, value in _without_derived_outcome_rules(payload).items()
+        if key in properties and value is not None
+    }
+    arguments.update(skill_names=(), distribution_destination_id="destination")
+    parsed = _parsed_spec(validate_tool_schema_value(schema, arguments))
+    outcome = parsed["outcome_contract"]
+    assert outcome.require_terminal_conclusion is True
+    assert outcome.require_current_run_provenance is True
+    assert outcome.require_exact_source_bindings is True

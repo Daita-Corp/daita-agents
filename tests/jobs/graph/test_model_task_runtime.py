@@ -292,6 +292,36 @@ async def test_real_context_builder_uses_only_the_immutable_task_bundle(
         await integration.close()
 
 
+async def test_job_worker_sees_and_is_held_to_the_graph_target_bound(
+    tmp_path: Path,
+) -> None:
+    integration = await ModelGraphIntegration.open(tmp_path)
+    loop = integration.supervisor._graph_model_loop
+    assert loop is not None
+    loop._context_builder = AgentContextBuilder(
+        CatalogSpy(),
+        profile=integration.provider.model_profile,
+    )
+    try:
+        admission = integration.build()
+        await integration.admit_and_start(admission)
+        terminal = await integration.wait_terminal(admission.job.job_id)
+        assert terminal.job.state is GraphState.SUCCEEDED
+        request = integration.provider.requests[0]
+        system = request.messages[0].content[0]
+        assert isinstance(system, TextBlock)
+        assert "Per-call limits: graph_read at most 16 resource_ids." in system.text
+        assert "at most 4 resource_ids" not in system.text
+        read = next(tool for tool in request.tools if tool.name == "graph_read")
+        assert read.description.endswith("Limits: at most 16 resource_ids per call.")
+        # The five-resource call the inline bound would refuse is admitted.
+        assert [
+            call.arguments["resource_ids"] for call in integration.reader.calls
+        ] == [tuple(f"resource-{index}" for index in range(5))]
+    finally:
+        await integration.close()
+
+
 async def test_normal_assistant_text_is_protocol_violation_and_bounded_retry(
     tmp_path: Path,
 ) -> None:

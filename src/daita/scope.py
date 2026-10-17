@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import lru_cache
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -34,6 +36,55 @@ class EffectiveSourceScope:
             "source_ids": tuple(sorted(self.source_ids)),
             "resource_ids": tuple(sorted(self.resource_ids)),
         }
+
+
+SOURCE_REF_PREFIX = "s"
+RESOURCE_REF_PREFIX = "t"
+
+
+@dataclass(frozen=True, slots=True)
+class ScopeRefs:
+    """Run-scoped short handles for the source and resource IDs of one scope.
+
+    Sources are ``s1``, ``s2``... and resources ``t1``, ``t2``... in sorted
+    full-ID order of the run's frozen effective scope, so every step of a run
+    numbers them identically. Handles are presentation only: a handle names
+    nothing outside the run whose scope issued it.
+    """
+
+    handles: Mapping[str, str]
+    ids: Mapping[str, str]
+
+    def resolve(self, prefix: str, value: object) -> str | None:
+        """Return the full ID one handle of ``prefix``'s family names, else None."""
+
+        if not isinstance(value, str) or not value.startswith(prefix):
+            return None
+        return self.ids.get(value)
+
+
+@lru_cache(maxsize=8)
+def scope_refs(scope: EffectiveSourceScope | None) -> ScopeRefs:
+    """Number one frozen scope deterministically; one shared definition."""
+
+    handles = {
+        identity: f"{prefix}{index}"
+        for prefix, identities in (
+            ()
+            if scope is None
+            else (
+                (SOURCE_REF_PREFIX, scope.source_ids),
+                (RESOURCE_REF_PREFIX, scope.resource_ids),
+            )
+        )
+        for index, identity in enumerate(sorted(identities), 1)
+    }
+    return ScopeRefs(
+        handles=MappingProxyType(handles),
+        ids=MappingProxyType(
+            {handle: identity for identity, handle in handles.items()}
+        ),
+    )
 
 
 class SourceScopeCatalog(Protocol):

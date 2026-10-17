@@ -325,7 +325,10 @@ class OpenAICompatibleProvider:
             arguments: dict[str, object] = {
                 "max_tokens": self._max_tokens,
                 "messages": _chat_messages(
-                    request.messages, self.provider_id, request.tool_result_refs
+                    request.messages,
+                    self.provider_id,
+                    request.tool_result_refs,
+                    request.scope_refs,
                 ),
                 "model": self.model,
             }

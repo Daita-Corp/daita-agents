@@ -18,7 +18,7 @@ from daita.catalog import (
     CatalogTraversalRequest,
 )
 from daita.catalog.capabilities import CatalogProjection, catalog_declarations
-from daita.catalog.models import CatalogResource
+from daita.catalog.models import CatalogResource, ResourceKind, catalog_resource_id
 from daita.catalog.protocols import CatalogResourceNotFoundError
 from daita.llm.models import ToolCall
 from daita.loop.models import RunInput
@@ -302,7 +302,12 @@ async def test_runtime_denies_guessed_and_multi_resource_reads_before_io(
                 name="data_query",
                 arguments={
                     "source_id": source_id,
-                    "resource_ids": (f"{source_id}:main.guessed_secret",),
+                    # A well-formed ID for a table the catalog never admitted.
+                    "resource_ids": (
+                        catalog_resource_id(
+                            source_id, ResourceKind.TABLE, "main.guessed_secret"
+                        ),
+                    ),
                     "sql": "SELECT * FROM guessed_secret",
                 },
             ),

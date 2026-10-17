@@ -25,6 +25,7 @@ from daita.llm.models import (
     ToolCall,
 )
 from daita.llm.pricing import CostEstimate
+from daita.loop.models import LoopExitKind
 from daita.routines.capabilities import _spec_schema
 from daita.routines.owner import _routine_proposal_payload
 from tests.support.job_benchmarks import RecordingProvider
@@ -485,7 +486,7 @@ async def test_scheduled_mcp_harness_reaches_both_occurrences_with_one_approval(
             *action_script(scenario),
         ]
         result, transcript = await scenario.run(scenario.routine_prompt())
-        from daita.loop.models import ConversationRun, LoopExitKind
+        from daita.loop.models import ConversationRun
         from daita.tui.projection import project_conversation
 
         receipt = next(
@@ -515,7 +516,14 @@ async def test_scheduled_mcp_harness_reaches_both_occurrences_with_one_approval(
                 result.reason == "token_budget_insufficient"
                 and result.final_text is None
             )
-            projected = project_conversation((ConversationRun(0, transcript, result),))
+            projected = project_conversation(
+                (ConversationRun(0, transcript, result),),
+                tool_pairs={
+                    transcript.run.id: await scenario.agent.tool_evidence(
+                        transcript.run.id
+                    )
+                },
+            )
             notice = projected[-1].text
             assert "not rolled back" in notice
             assert details["routine_id"] in notice and "create committed" in notice
@@ -562,13 +570,15 @@ async def test_scheduled_mcp_provider_failure_retains_unknown_usage_and_closes_p
 
     model = FailedModel()
     path = tmp_path / "phase-f-provider-error.json"
-    with pytest.raises(RuntimeError, match="fixture provider failed"):
-        async with evaluate(
-            tmp_path / "home", model, model.model_profile, path
-        ) as scenario:
-            await scenario.run("Notify the release room.")
+    async with evaluate(
+        tmp_path / "home", model, model.model_profile, path
+    ) as scenario:
+        # The host router normalizes an injected provider's boundary failure.
+        result, _ = await scenario.run("Notify the release room.")
+    assert result.kind is LoopExitKind.FAILED
+    assert result.reason == "malformed_response"
+    assert result.usage.cost_estimate.status.value == "unavailable"
     report = json.loads(path.read_text())
-    assert report["status"] == "failed"
     assert report["metrics"]["model_requests"] == 1
     assert report["metrics"]["model_responses"] == 0
     assert report["metrics"]["estimated_cost_usd"] is None
@@ -917,7 +927,12 @@ async def test_committed_mcp_effect_survives_budget_stop_without_replay(tmp_path
         await assert_action(scenario)
         assert len(scenario.approvals) == 1
         receipt = (await scenario.agent.list_effects())[0]
-        view = project_conversation((ConversationRun(0, transcript, result),))
+        view = project_conversation(
+            (ConversationRun(0, transcript, result),),
+            tool_pairs={
+                transcript.run.id: await scenario.agent.tool_evidence(transcript.run.id)
+            },
+        )
         text = " ".join(item.text for item in view)
         assert receipt.receipt_id in text and "succeeded" in text
         assert "downstream outcome unverified" in text

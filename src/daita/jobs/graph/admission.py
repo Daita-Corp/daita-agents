@@ -30,6 +30,8 @@ from ...capabilities import (
     ToolPresentation,
     ToolTextTrust,
     ToolView,
+    resource_id_schema,
+    source_id_schema,
 )
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...distribution.owner import DistributionOwner
@@ -38,6 +40,7 @@ from ...loop.models import RunInput, RunOrigin
 from ...loop.session import RunSession
 from ...scope import EffectiveSourceScope
 from ..owner import JobError, JobOwner
+from .calls import admit_graph_call, graph_call_material, graph_callable_tool_names
 from .capabilities import (
     GRAPH_RESULT_FINALIZE_CAPABILITY_ID,
     PLANNER_CAPABILITY_IDS,
@@ -306,7 +309,6 @@ class RegistryInitialTaskProposalResolver:
                 "execution_not_supported_for_requested_shape",
                 "The proposed capability is not registered for this host.",
             ) from error
-        policy = capability.execution_admission_policy
         effectful = capability.operational_effect is not OperationalEffect.NONE
         preview_capability_id: str | None = None
         requested_constraints: Mapping[str, object] | None = None
@@ -334,43 +336,31 @@ class RegistryInitialTaskProposalResolver:
             requested_constraints = requested_grant["constraints"]
             if native:
                 preview_capability_id = _native_preview_capability(capability_id)
-                validated = await self._registry.validate_arguments_async(
-                    preview_capability_id, arguments
-                )
-            else:
-                validated = await self._registry.validate_arguments_async(
-                    capability_id, arguments
-                )
-        else:
-            if requested_grant is not None:
-                raise CapabilityInputError(
-                    "graph_effect_grant_invalid",
-                    "Effect-free graph work cannot retain an effect grant.",
-                )
-            validated = await self._registry.validate_arguments_async(
-                capability_id, arguments
+        elif requested_grant is not None:
+            raise CapabilityInputError(
+                "graph_effect_grant_invalid",
+                "Effect-free graph work cannot retain an effect grant.",
             )
-        if (
-            policy is None
-            or policy.admission_error(validated, ExecutionPreference.DURABLE)
-            != "durable_execution_required"
-            or (
-                effectful
-                and (
-                    capability.automation_eligibility
-                    is not AutomationEligibility.AUTOMATION_DIRECT
-                    or capability.effect_receipt_policy is None
-                    or capability.automation_grant_policy is None
-                )
-            )
+        source_ids = _reference_ids(references, "source_ids")
+        resource_ids = _reference_ids(references, "resource_ids")
+        connector_ids = _reference_ids(references, "connector_binding_ids")
+        call = await admit_graph_call(
+            self._registry,
+            capability_id,
+            arguments,
+            argument_capability_id=preview_capability_id,
+            resource_ids=resource_ids,
+        )
+        if effectful and (
+            capability.automation_eligibility
+            is not AutomationEligibility.AUTOMATION_DIRECT
+            or capability.effect_receipt_policy is None
+            or capability.automation_grant_policy is None
         ):
             raise CapabilityInputError(
                 "execution_not_supported_for_requested_shape",
                 "The proposed task is not eligible for the released graph contract.",
             )
-        source_ids = _reference_ids(references, "source_ids")
-        resource_ids = _reference_ids(references, "resource_ids")
-        connector_ids = _reference_ids(references, "connector_binding_ids")
         if source_scope is not None and (
             not set(source_ids) <= set(source_scope.source_ids)
             or not set(resource_ids) <= set(source_scope.resource_ids)
@@ -418,7 +408,7 @@ class RegistryInitialTaskProposalResolver:
             )
         return InitialTaskProposal(
             capability_id=capability_id,
-            arguments=validated,
+            arguments=call.arguments,
             expected_result_contract=result_contract,
             source_ids=source_ids,
             resource_ids=resource_ids,
@@ -427,9 +417,9 @@ class RegistryInitialTaskProposalResolver:
             model_route_id=self._model_route_id,
             sensitivity=sensitivity,
             contract_bindings=bindings,
-            execution_policy=policy,
+            execution_policy=call.execution_policy,
             max_steps=self._max_steps,
-            max_wall_time_seconds=policy.graph_max_wall_seconds,
+            max_wall_time_seconds=call.execution_policy.graph_max_wall_seconds,
             per_run_max_tokens=self._per_run_max_tokens,
             preview_capability_id=preview_capability_id,
             requested_grant_constraints=requested_constraints,
@@ -615,18 +605,9 @@ class GraphAdmissionBuilder:
             for capability in reviewer_capabilities
         ):
             raise ValueError("graph reviewer capability must be effect-free and local")
-        callable_tool_names = tuple(
-            sorted(
-                name
-                for name in self._registry.tool_names
-                if proposal.capability_id in self._registry.tool_capability_ids(name)
-            )
+        callable_tool_names = graph_callable_tool_names(
+            self._registry, proposal.capability_id
         )
-        if not callable_tool_names:
-            raise CapabilityInputError(
-                "execution_not_supported_for_requested_shape",
-                "The proposed capability has no model-visible tool in this host.",
-            )
         now = self._clock()
         deadline = now + timedelta(seconds=deadline_seconds)
         job_id = self._id_factory("job")
@@ -818,26 +799,17 @@ class GraphAdmissionBuilder:
             },
         )
         if grant is None:
-            initial_call: Mapping[str, object] = {
-                "capability_id": proposal.capability_id,
-                "callable_tool_names": callable_tool_names,
-                "arguments": proposal.arguments,
-            }
+            initial_call: Mapping[str, object] = graph_call_material(
+                proposal.capability_id, callable_tool_names, proposal.arguments
+            )
         else:
-            preview_names = tuple(
-                sorted(
-                    name
-                    for name in self._registry.tool_names
-                    if proposal.preview_capability_id is not None
-                    and proposal.preview_capability_id
-                    in self._registry.tool_capability_ids(name)
+            preview_names = (
+                ()
+                if proposal.preview_capability_id is None
+                else graph_callable_tool_names(
+                    self._registry, proposal.preview_capability_id
                 )
             )
-            if proposal.preview_capability_id is not None and not preview_names:
-                raise CapabilityInputError(
-                    "execution_not_supported_for_requested_shape",
-                    "The required native preview has no model-visible tool.",
-                )
             initial_call = {
                 "effect_call": {
                     "capability_id": proposal.capability_id,
@@ -1188,13 +1160,13 @@ def graph_admission_declarations(
                             "properties": {
                                 "source_ids": {
                                     "type": "array",
-                                    "items": {"type": "string", "minLength": 1},
+                                    "items": source_id_schema(),
                                     "uniqueItems": True,
                                     "maxItems": 16,
                                 },
                                 "resource_ids": {
                                     "type": "array",
-                                    "items": {"type": "string", "minLength": 1},
+                                    "items": resource_id_schema(),
                                     "uniqueItems": True,
                                     "maxItems": 16,
                                 },
@@ -1231,6 +1203,10 @@ def graph_admission_declarations(
             ],
             "additionalProperties": False,
         },
+        delegated_arguments=(
+            ("initial_task", "arguments", "input"),
+            ("initial_task", "effect_grant.constraints", "grant"),
+        ),
         output_kind=START_GRAPH_JOB_OUTPUT_KIND,
         output_schema={"type": "object", "additionalProperties": True},
         executor_id=START_GRAPH_JOB_EXECUTOR_ID,

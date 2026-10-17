@@ -610,6 +610,51 @@ The fully offline job concurrency soak retains its explicit enable flag:
 Do not load `.env`, enable a live gate, or spend an external resource merely to
 make validation green. Diagnose deterministic failures at their offline owner.
 
+## Model-surface gate
+
+Scripted models replay old behavior, so a change to what the model is shown
+passes the deterministic suite by construction. The gate makes such a change
+deliberate and requires a short live smoke run before merge.
+
+`tests/fixtures/model-surface/surface.json` (digest in `surface.sha256`) is
+computed offline by `tests/support/model_surface.py` from one scripted
+foreground run with a fixed clock, IDs, timezone, downloads folder and
+native-analysis availability. It holds one line per registry and control tool
+(description, input schema, toolbox presentation, per-lane differences), per
+toolbox, per instruction paragraph and per request step (offered tools and the
+key structure of each rendered tool result). Temporary paths are removed and
+digests renumbered.
+
+`tests/architecture/test_model_surface.py` fails when the snapshot differs and
+names the entries that changed. Review the diff, then rewrite it:
+
+```bash
+.venv/bin/python scripts/model_surface.py update   # or: check, digest
+```
+
+The same suite checks that `release/live-smoke.json` names the current
+snapshot digest. A missing or malformed record always fails. A stale record is
+skipped locally and fails when `DAITA_REQUIRE_LIVE_SMOKE=1`, which CI sets for
+pull requests. Record a run on the ChatGPT subscription; the runner refuses
+without `DAITA_LIVE_BILLING=subscription` and strips `*_API_KEY` variables, so
+it never uses paid API billing:
+
+```bash
+.venv/bin/python -m tests.support.live_billing login   # once
+.venv/bin/python scripts/live_smoke.py list            # cases and their flags
+DAITA_LIVE_BILLING=subscription .venv/bin/python scripts/live_smoke.py run
+```
+
+`run` executes one representative case per live suite (about 15 minutes, three
+at a time; cases sharing a fixture run serially) in its own pytest process
+with the suite's `DAITA_RUN_*` flags. The PostgreSQL cases need the
+`postgres-large` fixture and the analysis case the native macOS ARM64 runtime.
+A failed case reruns once and a pass on rerun is recorded as
+`passed_on_rerun`; skips and missing nodes fail the run. Only a full pass
+rewrites the record (`surface_digest`, `recorded_on`, `cases`), which holds no
+machine, user, path or credential facts. `--case TEXT` runs a subset and never
+writes the record. Commit the updated record with the surface change.
+
 ## Creating or reviewing a test
 
 Identify the current contract, production owner, defect, scenario, and

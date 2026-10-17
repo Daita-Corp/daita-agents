@@ -1217,7 +1217,7 @@ class SQLStateStore:
                 ).fetchone()
             return None if row is None else decode_identity(row[0])
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def load_deletion_credential_inventory(
         self,
@@ -1269,7 +1269,7 @@ class SQLStateStore:
                     mcp_references.append(reference)
             return identity, tuple(references), tuple(mcp_references)
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def load_mcp_binding(
         self,
@@ -1293,7 +1293,7 @@ class SQLStateStore:
                 )
             )
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def list_mcp_bindings(
         self,
@@ -1329,7 +1329,7 @@ class SQLStateStore:
                 )
             return bindings
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def store_mcp_binding(
         self,
@@ -1642,7 +1642,7 @@ class SQLStateStore:
                 loaded = _load_routine_row(connection, agent_id, routine_id)
             return None if loaded is None else loaded[0]
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def list_scheduled_routines(
         self,
@@ -1687,7 +1687,7 @@ class SQLStateStore:
                 )[:limit]
             )
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def list_routine_occurrences(
         self,
@@ -1722,7 +1722,7 @@ class SQLStateStore:
                 for occurrence_id, data in rows
             )
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def revise_scheduled_routine(
         self,
@@ -1893,7 +1893,7 @@ class SQLStateStore:
                     return routine.next_due_at
             return None
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def load_routine_occurrence(
         self,
@@ -1909,7 +1909,7 @@ class SQLStateStore:
                 )
             return None if loaded is None else loaded[0]
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def claim_due_routine_occurrence(
         self,
@@ -2987,7 +2987,7 @@ class SQLStateStore:
                 loaded = _load_delivery_row(connection, agent_id, delivery_id)
                 return None if loaded is None else loaded[0]
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def list_deliveries(
         self,
@@ -3022,7 +3022,7 @@ class SQLStateStore:
                 for delivery_id, data in rows
             )
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def acknowledge_delivery(
         self,
@@ -3124,7 +3124,7 @@ class SQLStateStore:
                     )
                 )
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def list_sources(self, agent_id: str) -> tuple[SourceRegistration, ...]:
         def read() -> tuple[SourceRegistration, ...]:
@@ -3159,7 +3159,7 @@ class SQLStateStore:
                     ) in rows
                 )
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def load_source_read_scope(
         self,
@@ -3183,7 +3183,7 @@ class SQLStateStore:
                 )
                 return _decode_owned_read_scope(connection, registration, row[3])
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def list_relational_write_scopes(
         self,
@@ -3234,7 +3234,7 @@ class SQLStateStore:
                         "stored PostgreSQL update scope is undecodable"
                     ) from None
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def replace_source_permission_scopes(
         self,
@@ -3375,7 +3375,7 @@ class SQLStateStore:
                 ).fetchone()
             return None if row is None else decode_receipt(row[0])
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def load_effect_receipt_for_call(
         self,
@@ -3396,7 +3396,7 @@ class SQLStateStore:
                 ).fetchone()
             return None if row is None else decode_receipt(row[0])
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def load_effect_receipt_for_operation(
         self, agent_id: str, operation_key: str
@@ -3416,7 +3416,7 @@ class SQLStateStore:
                 ).fetchone()
                 return None if row is None else decode_receipt(row[0])
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def list_effect_receipts(
         self,
@@ -3486,7 +3486,7 @@ class SQLStateStore:
                     )
                 return tuple(decode_receipt(row[0]) for row in rows)
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def require_effects_unblocked(
         self, agent_id: str, *, run_id: str | None = None, routine_id: str | None = None
@@ -3497,7 +3497,7 @@ class SQLStateStore:
                     connection, agent_id, run_id=run_id, routine_id=routine_id
                 )
 
-        await asyncio.to_thread(read)
+        await settled_thread(read)
 
     async def start_effect_receipt(
         self,
@@ -3823,7 +3823,7 @@ class SQLStateStore:
                 )
                 return tuple(decode_receipt(row[0]) for row in rows)
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def reconcile_graph_effect_attempt(
         self,
@@ -4299,7 +4299,7 @@ class SQLStateStore:
                 )
             )
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def load_current_snapshot(
         self,
@@ -4312,7 +4312,7 @@ class SQLStateStore:
         async with self._decoded_catalog_snapshot_lock:
             cached = self._decoded_catalog_snapshots.get(key)
             if cached is not None:
-                current_sync_id = await asyncio.to_thread(
+                current_sync_id = await settled_thread(
                     _current_snapshot_sync_id,
                     self._database,
                     ref.agent_id,
@@ -4323,7 +4323,7 @@ class SQLStateStore:
                     return None
                 return cached
 
-            row = await asyncio.to_thread(
+            row = await settled_thread(
                 _current_snapshot_row,
                 self._database,
                 ref.agent_id,
@@ -4331,7 +4331,7 @@ class SQLStateStore:
             )
             if row is None or row[0] != ref.sync_id:
                 return None
-            snapshot = await asyncio.to_thread(_decode_catalog_snapshot, row[1])
+            snapshot = await settled_thread(_decode_catalog_snapshot, row[1])
             if (
                 snapshot.sync.agent_id != ref.agent_id
                 or snapshot.sync.source_id != ref.source_id
@@ -4340,7 +4340,7 @@ class SQLStateStore:
                 raise CatalogStoreError(
                     "stored catalog snapshot does not match its exact reference"
                 )
-            current_sync_id = await asyncio.to_thread(
+            current_sync_id = await settled_thread(
                 _current_snapshot_sync_id,
                 self._database,
                 ref.agent_id,
@@ -4360,7 +4360,7 @@ class SQLStateStore:
                 ).fetchone()
             return None if row is None else decode_catalog_sync(row[0])
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def summarize_catalog(
         self,
@@ -4492,7 +4492,7 @@ class SQLStateStore:
                 )
             return tuple(decode_semantic_annotation(data) for (data,) in rows)
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def load_semantic_annotation(
         self,
@@ -4513,7 +4513,7 @@ class SQLStateStore:
                 ).fetchone()
             return None if row is None else decode_semantic_annotation(row[0])
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def preflight_semantic_save(
         self,
@@ -4534,7 +4534,7 @@ class SQLStateStore:
                     expected_sha256,
                 )
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def save_semantic_annotation(
         self,
@@ -4588,7 +4588,7 @@ class SQLStateStore:
                     expected_sha256,
                 )
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def delete_semantic_annotation(
         self,
@@ -4678,7 +4678,7 @@ class SQLStateStore:
                 unreadable_run_count=unreadable_run_count,
             )
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def list_learning_candidates(
         self,
@@ -4692,7 +4692,7 @@ class SQLStateStore:
             with _connect_read_only(self._database) as connection:
                 return _learning_candidate_rows(connection, agent_id)
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def load_learning_candidate(
         self,
@@ -4711,7 +4711,7 @@ class SQLStateStore:
                 ).fetchone()
             return None if row is None else decode_learning_candidate(row[0])
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def learning_candidate_review_stamps(
         self,
@@ -4723,7 +4723,7 @@ class SQLStateStore:
             with _connect_read_only(self._database) as connection:
                 return _learning_review_stamps(connection, agent_id)
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def save_learning_candidate_review(
         self,
@@ -5068,7 +5068,7 @@ class SQLStateStore:
                 assert row is not None
                 return int(row[0])
 
-        await self.append_at(run_id, await asyncio.to_thread(position), message)
+        await self.append_at(run_id, await settled_thread(position), message)
 
     async def append_at(
         self,
@@ -5280,7 +5280,7 @@ class SQLStateStore:
                 messages=tuple(decode_message(row[0]) for row in rows),
             )
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def result(self, run_id: str) -> LoopExit | None:
         def read() -> LoopExit | None:
@@ -5292,7 +5292,7 @@ class SQLStateStore:
                 raise KeyError(f"unknown run: {run_id}")
             return None if row[0] is None else decode_loop_exit(row[0])
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def get_artifact_record(self, artifact_id: str) -> ArtifactRecord | None:
         return await _run_graph_read(
@@ -5641,7 +5641,7 @@ class SQLStateStore:
                 ).fetchone()
             return row is not None
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def record_analysis_evidence(
         self, agent_id: str, evidence: AnalysisEvidence
@@ -6046,7 +6046,7 @@ class SQLStateStore:
             records.reverse()
             return exists, tuple(records), older_completed_exists
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def latest_terminal_conversation_run(
         self,
@@ -6088,7 +6088,7 @@ class SQLStateStore:
             finally:
                 connection.close()
 
-        return await asyncio.to_thread(read)
+        return await settled_thread(read)
 
     async def _snapshots(
         self,
@@ -6456,6 +6456,33 @@ def _require_candidate_transition(
         )
 
 
+async def settled_thread(
+    function: Callable[..., _T],
+    /,
+    *arguments: object,
+) -> _T:
+    """Run bounded state work in a thread that settles before cancellation.
+
+    A cancelled ``asyncio.to_thread`` caller returns while its thread keeps a
+    database connection open. Waiting for the thread keeps every connection a
+    task opened released before that task finishes, so owners that join their
+    tasks before closing storage leave no connection behind. The worker's own
+    result or failure is discarded when the caller was cancelled.
+    """
+    worker = asyncio.ensure_future(asyncio.to_thread(function, *arguments))
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        if not worker.cancelled():
+            worker.exception()  # Retrieve it so the loop does not report it.
+        raise asyncio.CancelledError
+    return worker.result()
+
+
 async def run_sql_transaction(
     database: SQLDatabase,
     callback: Callable[[SQLConnection], _T],
@@ -6564,7 +6591,7 @@ async def _run_graph_read(
         except Exception as error:
             raise path.normalize_error(error) from None
 
-    return await asyncio.to_thread(read)
+    return await settled_thread(read)
 
 
 def _validate_current_mcp_binding_bounds(connection: SQLConnection) -> None:

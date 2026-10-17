@@ -181,6 +181,8 @@ class _RunCapture:
     result: LoopExit
     transcript: Transcript
     requests: tuple[ModelRequest, ...]
+    # The run's calls as they executed (Agent.tool_evidence).
+    evidence: tuple[tuple[ToolCall, ToolResultBlock | None], ...]
 
 
 def _required_environment(name: str) -> str:
@@ -286,6 +288,7 @@ async def _run_live(
     try:
         result = await agent.run(prompt)
         transcript = await agent.transcript(result.run_id)
+        evidence = await agent.tool_evidence(result.run_id)
     finally:
         try:
             await agent.close()
@@ -313,30 +316,22 @@ async def _run_live(
     assert str(locations.working) in initial_context
     assert str(locations.downloads) in initial_context
     assert str(locations.documents) in initial_context
-    return _RunCapture(result, transcript, tuple(provider.requests))
+    return _RunCapture(result, transcript, tuple(provider.requests), evidence)
 
 
 def _exchanges(
-    transcript: Transcript,
+    evidence: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
 ) -> tuple[tuple[ToolCall, ToolResultBlock], ...]:
-    calls = {
-        call.id: call for message in transcript.messages for call in message.tool_calls
-    }
-    return tuple(
-        (calls[block.call_id], block)
-        for message in transcript.messages
-        for block in message.content
-        if isinstance(block, ToolResultBlock) and block.call_id in calls
-    )
+    return tuple((call, block) for call, block in evidence if block is not None)
 
 
 def _successful(
-    transcript: Transcript,
+    evidence: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
     tool_name: str,
 ) -> tuple[tuple[ToolCall, ToolResultBlock], ...]:
     return tuple(
         (call, result)
-        for call, result in _exchanges(transcript)
+        for call, result in _exchanges(evidence)
         if call.name == tool_name and not result.is_error
     )
 
@@ -391,8 +386,8 @@ async def test_live_model_finds_latest_download_with_glob_only_search(
     )
 
     assert _LATEST_TOKEN in (capture.result.final_text or "")
-    searches = _successful(capture.transcript, "file_search")
-    reads = _successful(capture.transcript, "file_read")
+    searches = _successful(capture.evidence, "file_search")
+    reads = _successful(capture.evidence, "file_read")
     search_call, search_result = next(
         item for item in searches if str(latest) in canonical_json(item[1].output)
     )
@@ -440,7 +435,7 @@ async def test_live_model_compares_downloads_and_documents_files(
     assert _DOWNLOAD_COMPARE_TOKEN in final
     assert _DOCUMENT_COMPARE_TOKEN in final
     assert "19" in final
-    reads = _successful(capture.transcript, "file_read")
+    reads = _successful(capture.evidence, "file_read")
     read_paths = {
         call.arguments.get("path")
         for call, _result in reads
@@ -483,7 +478,7 @@ async def test_live_model_reports_incomplete_multi_location_coverage(
         ),
     )
 
-    searches = _successful(capture.transcript, "file_search")
+    searches = _successful(capture.evidence, "file_search")
     assert len(searches) == 1
     search_call, search_result = searches[0]
     requested_paths = search_call.arguments.get("paths")
@@ -501,7 +496,7 @@ async def test_live_model_reports_incomplete_multi_location_coverage(
     }
     assert by_path[str(locations.downloads)]["status"] == "complete"
     assert by_path[str(missing)]["status"] == "failed"
-    _result_with_text(_exchanges(capture.transcript), "file_read", _PARTIAL_TOKEN)
+    _result_with_text(_exchanges(capture.evidence), "file_read", _PARTIAL_TOKEN)
     final = (capture.result.final_text or "").casefold().replace("*", "")
     assert _PARTIAL_TOKEN.casefold() in final
     assert any(
@@ -558,7 +553,7 @@ async def test_live_model_approved_edit_replaces_exact_documents_file(
     assert "45" in (capture.result.final_text or "")
     workflow = tuple(
         item
-        for item in _exchanges(capture.transcript)
+        for item in _exchanges(capture.evidence)
         if item[0].name in {"file_read", "artifact_edit_text", "artifact_save_local"}
         and not item[1].is_error
     )
@@ -633,7 +628,7 @@ async def test_live_model_recovers_from_invalid_glob_without_claiming_no_access(
         ),
     )
 
-    exchanges = _exchanges(capture.transcript)
+    exchanges = _exchanges(capture.evidence)
     invalid_call, invalid_result = exchanges[0]
     assert invalid_call.id == "injected-invalid-computer-search"
     assert invalid_result.is_error

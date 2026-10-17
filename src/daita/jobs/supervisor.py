@@ -25,11 +25,16 @@ from ..distribution.models import (
     ArtifactRequirement,
     OutcomeContract,
     outcome_artifact_reference,
+    requirements_need_exact_source_bindings,
     validate_outcome_artifact_references,
 )
 from ..distribution.owner import DistributionOwner, construct_graph_job_delivery
 from ..errors import DaitaError, ErrorRetryability
-from ..hosting.execution_governor import RunAdmissionCoordinator, WorkloadClass
+from ..hosting.execution_governor import (
+    AdmissionClosedError,
+    RunAdmissionCoordinator,
+    WorkloadClass,
+)
 from ..llm.errors import ProviderErrorCode
 from ..llm.models import ModelSensitivity
 from ..loop.driver import AgentLoop
@@ -153,6 +158,7 @@ class JobSupervisor:
         self._last_graph_dispatch_job_id: str | None = None
         self._consecutive_graph_dispatches = 0
         self._closing = False
+        self._host_closed = False
         self._failed = False
         self._failure_code: str | None = None
         self._consecutive_failures = 0
@@ -175,7 +181,21 @@ class JobSupervisor:
             failure_code=self._failure_code,
         )
 
+    def _stop_for_host_close(self) -> None:
+        """Stop launching work once host admission closes; this is not a failure.
+
+        The host drains admitted work and then joins this supervisor's tasks in
+        ``close`` before any storage closes.
+        """
+        if not self._host_closed:
+            self._host_closed = True
+            _logger.info("jobs supervisor stopped (host_closing)")
+        self._wake.set()
+
     def _record_failure(self, error: BaseException) -> None:
+        if isinstance(error, AdmissionClosedError):
+            self._stop_for_host_close()
+            return
         if self._failed:
             return
         self._consecutive_failures += 1
@@ -378,7 +398,7 @@ class JobSupervisor:
         # second while explicit submissions still wake it immediately.
         delay = self._poll_seconds
         try:
-            while not self._closing and not self._failed:
+            while not self._closing and not self._failed and not self._host_closed:
                 while (
                     remaining := self._retry_at - asyncio.get_running_loop().time()
                 ) > 0:
@@ -393,6 +413,9 @@ class JobSupervisor:
                         )
                     )
                     await self._launch_ready_graph_tasks()
+                except AdmissionClosedError:
+                    self._stop_for_host_close()
+                    break
                 except StorageUnavailableError as error:
                     self._record_failure(error)
                     continue
@@ -461,7 +484,11 @@ class JobSupervisor:
                 limit=64,
             )
         )
-        if self._failed or self._retry_at > asyncio.get_running_loop().time():
+        if (
+            self._failed
+            or self._host_closed
+            or self._retry_at > asyncio.get_running_loop().time()
+        ):
             return
         ready = fair_graph_dispatch_order(
             ready,
@@ -942,6 +969,7 @@ class JobSupervisor:
             start=start,
             history_sensitivity=current_task.specification.authority.sensitivity,
         )
+        run = await self._runtime.freeze_source_scope(run)
         remaining = max(
             0.001,
             (current_attempt.absolute_deadline_at - self._clock()).total_seconds(),
@@ -1040,13 +1068,13 @@ class JobSupervisor:
         )
         stored_task = inspection_task(inspection, original_task.task_id)
         transcript = await self._store.load(attempt.run_id)
-        pairs = transcript.tool_pairs
-        if not pairs or pairs[-1][1] is None or pairs[-1][1].is_error:
+        results = tuple(result for _, result in transcript.tool_pairs)
+        if not results or results[-1] is None or results[-1].is_error:
             raise CapabilityInputError(
                 "task_termination_not_committed",
                 "The machine termination lacks its authenticated tool result.",
             )
-        terminal = pairs[-1][1]
+        terminal = results[-1]
         assert terminal is not None
         data = terminal.output.get("data")
         if not isinstance(data, Mapping):
@@ -1292,7 +1320,9 @@ class JobSupervisor:
                 inspection.job.specification.authority.sensitivity
             ),
             require_current_run_provenance=True,
-            require_exact_source_bindings=not generic_result,
+            require_exact_source_bindings=requirements_need_exact_source_bindings(
+                (requirement,)
+            ),
         )
         artifact_references = validate_outcome_artifact_references(
             (outcome_artifact_reference(artifact),),

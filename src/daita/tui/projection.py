@@ -346,6 +346,8 @@ def tool_result_error_code(result: ToolResultBlock) -> str:
 def artifact_delivery_messages(
     pairs: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
 ) -> tuple[str, ...]:
+    """Summarize deliveries from one run's executed tool evidence."""
+
     messages: list[str] = []
     created_artifact_ids: list[str] = []
     local_save_artifact_ids: set[str] = set()
@@ -427,14 +429,20 @@ def artifact_delivery_messages(
     return tuple(messages)
 
 
+ToolPairs = tuple[tuple[ToolCall, ToolResultBlock | None], ...]
+
+
 def project_transcript(
     transcript: Transcript,
     *,
     run_id: str,
+    tool_pairs: ToolPairs,
     tools_expanded: bool = False,
 ) -> tuple[TranscriptBlock, ...]:
+    """Project one run; ``tool_pairs`` is its executed evidence, in call order."""
+
     blocks: list[TranscriptBlock] = []
-    pairs = transcript.tool_pairs
+    pairs = tool_pairs
     tool_index = 0
     for message in transcript.messages:
         if message.role is MessageRole.USER:
@@ -471,8 +479,9 @@ def project_transcript(
                         "assistant", f"{run_id}:assistant:{len(blocks)}", text
                     )
                 )
-            for call in message.tool_calls:
-                result = pairs[tool_index][1] if tool_index < len(pairs) else None
+            for _ in message.tool_calls:
+                # Present the call as it executed, with full identities.
+                call, result = pairs[tool_index]
                 tool_index += 1
                 label = CAPABILITY_LABELS.get(
                     getattr(call, "name", ""),
@@ -511,9 +520,13 @@ def project_transcript(
 def project_conversation(
     runs: Sequence[ConversationRun],
     *,
+    tool_pairs: Mapping[str, ToolPairs],
     tools_expanded: bool = False,
 ) -> tuple[TranscriptBlock, ...]:
-    """Project every persisted run in one conversation in turn order."""
+    """Project every persisted run in one conversation in turn order.
+
+    ``tool_pairs`` maps each run ID to its executed tool evidence.
+    """
 
     blocks: list[TranscriptBlock] = []
     for run in runs:
@@ -521,6 +534,7 @@ def project_conversation(
             project_transcript(
                 run.transcript,
                 run_id=run.transcript.run.id,
+                tool_pairs=tool_pairs[run.transcript.run.id],
                 tools_expanded=tools_expanded,
             )
         )
@@ -723,6 +737,20 @@ def looks_secret_shaped(value: str) -> bool:
         return True
 
 
+def _delivery_targets(plan: object) -> str:
+    targets = plan.get("targets") if isinstance(plan, dict) else None
+    names = [
+        f"{target.get('kind')} {target.get('destination_id')}"
+        for target in (targets if isinstance(targets, list) else ())
+        if isinstance(target, dict)
+    ]
+    return (
+        ", ".join(names) + " (Daita Inbox, not a connector argument)"
+        if names
+        else "the originating conversation inbox"
+    )
+
+
 def approval_summary(arguments_text: str, capability_id: str) -> str:
     """Summarize only the frozen document handed to the approval handler."""
     try:
@@ -822,10 +850,29 @@ def approval_summary(arguments_text: str, capability_id: str) -> str:
             f"Sensitivity ceiling: {routine.get('sensitivity_ceiling')}; model routes: {routine.get('eligible_model_routes')}.",
             "Connections, exact resources, operations, columns, keys, argument restrictions, call ceilings, "
             "retained skills and required effects/artifacts are listed below.",
-            "Results go to the originating conversation inbox. Execution requires an open host and shares its run lock.",
+            "Report delivery: "
+            + _delivery_targets(routine.get("distribution_plan"))
+            + ". Execution requires an open host and shares its run lock.",
             "This revision grants no missing connector permissions. Uncertain actions pause work; actions are never automatically replayed.",
             "Model-cost limits do not cap third-party service fees.",
         ]
+        preview = document.get("schedule_preview")
+        if isinstance(preview, dict):
+            runs = [
+                f"{item.get('local')} ({item.get('at')})"
+                for item in preview.get("first_occurrences", ())
+                if isinstance(item, dict)
+            ]
+            if preview.get("immediate_first_run"):
+                runs.insert(0, "immediately after approval")
+            lines.insert(
+                3,
+                "First runs: "
+                + ("; ".join(runs) if runs else "none before expiry")
+                + f"; {preview.get('occurrences_before_expiry')} run(s) fit before expiry.",
+            )
+            for warning in preview.get("warnings", ()):
+                lines.insert(4, f"Warning: {warning}")
         timing = document.get("timing_intent")
         if isinstance(timing, dict):
             requested = timing.get("schedule")
@@ -885,7 +932,9 @@ def approval_summary(arguments_text: str, capability_id: str) -> str:
                 )
             if "fixed_arguments" in constraints:
                 lines.append(
-                    "Fixed arguments: "
+                    f"Connector tool arguments for {constraints.get('remote_tool_name')} "
+                    f"(binding {constraints.get('binding_id')}, revision "
+                    f"{constraints.get('binding_revision')}): fixed "
                     + json.dumps(
                         constraints["fixed_arguments"],
                         ensure_ascii=True,
@@ -893,7 +942,7 @@ def approval_summary(arguments_text: str, capability_id: str) -> str:
                     )
                     + "; variable scalar arguments: "
                     + str(constraints.get("variable_argument_names"))
-                    + "."
+                    + ". These go to the connector, separate from report delivery."
                 )
         outcome = routine.get("outcome_contract", {})
         if isinstance(outcome, dict):

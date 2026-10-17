@@ -34,6 +34,7 @@ from .capabilities import (
     AutomationEligibility,
     AutomationScopeProposal,
     CallProvenance,
+    CallTargetLane,
     Capability,
     CapabilityDeclarations,
     CapabilityGrant,
@@ -62,7 +63,6 @@ from .capabilities import (
     ToolView,
     omit_unset_arguments,
     recovery_details,
-    resolve_result_refs,
     tool_call_mode,
     tool_route_arguments,
     tool_route_unknown_arguments,
@@ -101,7 +101,7 @@ from .loop.models import (
 )
 from .loop.session import RunCancellationToken, RunSession
 from .observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
-from .scope import EffectiveSourceScope
+from .scope import SOURCE_REF_PREFIX, EffectiveSourceScope, scope_refs
 
 if TYPE_CHECKING:
     from .domains.analysis.domain import AnalysisCapabilityDomain
@@ -441,6 +441,7 @@ class RunToolCatalog:
     aggregate_bytes: int
     manifest_bytes: int
     manifest_token_limit: int
+    call_target_lane: CallTargetLane | None
     source_scope: EffectiveSourceScope | None = None
     session: RunSession | None = field(default=None, repr=False, compare=False)
 
@@ -480,6 +481,7 @@ class StepToolProjection:
     callable_entries: tuple[RunToolCatalogEntry, ...]
     loaded_entries: tuple[RunToolCatalogEntry, ...]
     loaded_definition_bytes: int
+    call_target_lane: CallTargetLane | None
     source_scope: EffectiveSourceScope | None = None
     session: RunSession | None = field(default=None, repr=False, compare=False)
 
@@ -487,31 +489,38 @@ class StepToolProjection:
     def limits_guidance(self) -> str:
         """One compact line of enforced per-call bounds for callable tools.
 
-        A durable bound is named only when a prepared durable entrypoint
+        Each bound is the ceiling this run's lane enforces. A durable bound is
+        named only for foreground runs with a prepared durable entrypoint that
         extends the foreground bound; execution still rechecks applicability.
         """
 
-        durable = next(
-            (
-                entry
-                for entry in self.catalog_entries
-                if entry.capability.durable_foreground_entrypoint
-            ),
-            None,
+        durable = (
+            next(
+                (
+                    entry
+                    for entry in self.catalog_entries
+                    if entry.capability.durable_foreground_entrypoint
+                ),
+                None,
+            )
+            if self.call_target_lane is CallTargetLane.FOREGROUND
+            else None
         )
         parts: list[str] = []
         for entry in self.callable_entries:
             policy = entry.capability.execution_admission_policy
-            if policy is None or policy.limits_sentence() is None:
-                continue
-            part = (
-                f"{entry.view.name} at most {policy.inline_max_targets} "
-                f"{policy.target_count_argument}"
+            ceiling = (
+                None
+                if policy is None
+                else policy.call_target_ceiling(self.call_target_lane)
             )
+            if policy is None or ceiling is None:
+                continue
+            part = f"{entry.view.name} at most {ceiling} {policy.target_count_argument}"
             if (
                 durable is not None
                 and policy.graph_v1_eligible
-                and policy.graph_max_targets > policy.inline_max_targets
+                and policy.graph_max_targets > ceiling
             ):
                 part += (
                     f" (up to {policy.graph_max_targets} through "
@@ -584,10 +593,56 @@ class _ToolOutcomeUnknown(RuntimeError):
     pass
 
 
-_REINSPECT_AFTER_APPROVAL = ToolRecovery(
-    RecoveryKind.REINSPECT_BINDING,
-    "The approved state changed before dispatch; re-read the target and "
-    "preview again before asking for approval.",
+def call_target_lane(origin: RunOrigin) -> CallTargetLane | None:
+    """Return the per-call target lane a run origin is held to.
+
+    Enforcement and every model-facing limit text read the lane through this
+    one mapping, so a run is shown exactly the ceiling that admits its calls.
+    Foreground user calls use the inline ceiling, graph task workers the graph
+    ceiling; other machine origins carry no per-call target ceiling.
+    """
+
+    if origin is RunOrigin.USER:
+        return CallTargetLane.FOREGROUND
+    if origin is RunOrigin.JOB_TASK:
+        return CallTargetLane.GRAPH_TASK
+    return None
+
+
+def _require_call_target_ceiling(
+    policy: ExecutionAdmissionPolicy | None,
+    lane: CallTargetLane | None,
+    arguments: Mapping[str, object],
+) -> None:
+    """Reject a machine-run call above the ceiling its lane renders."""
+
+    ceiling = None if policy is None else policy.call_target_ceiling(lane)
+    if policy is None or ceiling is None:
+        return
+    requested = policy.target_count(arguments)
+    if requested <= ceiling:
+        return
+    argument = policy.target_count_argument
+    raise CapabilityInputError(
+        "execution_not_supported_for_requested_shape",
+        f"No query ran: {requested} {argument} exceed the per-call bound "
+        f"of {ceiling}.",
+        {"requested_targets": requested, "execution_limits": policy.projection()},
+        recovery=ToolRecovery(
+            RecoveryKind.REDUCE_SCOPE,
+            f"Select at most {ceiling} {argument} per call.",
+        ),
+    )
+
+
+# Drift found after approval is final for that request. Every post-approval
+# ``state_changed`` result carries this one recovery, whatever the capability;
+# staleness found before approval keeps the owning domain's re-preview advice.
+APPROVED_TARGET_CHANGED = ToolRecovery(
+    RecoveryKind.TERMINAL,
+    "The approved target changed while approval was pending; nothing was "
+    "written. Report the conflict and the target's current value to the user. "
+    "Do not preview again or request approval again unless the user asks.",
 )
 _UNCERTAIN_OUTCOME = ToolRecovery(
     RecoveryKind.TERMINAL,
@@ -911,7 +966,7 @@ class CapabilityRuntime:
                 "The proposed ceilings do not admit this effect.",
             )
         requested = self._registry.validate_grant_constraints(
-            capability_id, requested_constraints
+            capability_id, requested_constraints, requested=True
         )
         normalized = await self._domains[owner_id].prepare_automation_grant(
             capability, requested, max_calls_per_occurrence, proposal
@@ -944,6 +999,23 @@ class CapabilityRuntime:
             constraints_kind=policy.constraints_kind,
             constraints=normalized,
             max_calls_per_occurrence=max_calls_per_occurrence,
+        )
+
+    async def freeze_source_scope(self, run: RunInput) -> RunInput:
+        """Return ``run`` with its effective source scope resolved before it starts.
+
+        A machine run's transcript then records the same frozen scope its
+        source and resource handles are numbered from, as a foreground run's
+        does, so its executed calls stay derivable from persisted facts.
+        Preparation re-resolves against this scope and can only narrow it.
+        """
+
+        if not isinstance(run, RunInput):
+            raise TypeError("run must be RunInput")
+        if self._source_scope_resolver is None:
+            return run
+        return replace(
+            run, resolved_source_scope=await self._source_scope_resolver(run)
         )
 
     async def execute_internal(
@@ -1187,13 +1259,14 @@ class CapabilityRuntime:
                 maximum_catalog_bytes=self._limits.max_run_tool_catalog_bytes,
             )
         catalog_digest = _sha256_digest(catalog_material)
+        lane = call_target_lane(run.origin)
         pinned_entries = tuple(
             entry for entry in entries if entry.load_mode is ToolLoadMode.PINNED
         )
         pinned_definitions = tuple(
             sorted(
                 (
-                    self._registry.tool_definition(entry.view.name)
+                    self._registry.tool_definition(entry.view.name, lane=lane)
                     for entry in pinned_entries
                 ),
                 key=lambda item: item.name,
@@ -1218,6 +1291,7 @@ class CapabilityRuntime:
             aggregate_bytes=aggregate_bytes,
             manifest_bytes=manifest_bytes,
             manifest_token_limit=self._limits.max_toolbox_manifest_tokens,
+            call_target_lane=lane,
             source_scope=run.resolved_source_scope,
             session=session,
         )
@@ -1295,6 +1369,7 @@ class CapabilityRuntime:
             messages=messages,
             limits=self._limits,
             registry=self._registry,
+            lane=catalog.call_target_lane,
         )
         pinned = tuple(
             entry for entry in catalog.entries if entry.load_mode is ToolLoadMode.PINNED
@@ -1306,7 +1381,9 @@ class CapabilityRuntime:
             sorted(
                 (
                     *(
-                        self._registry.tool_definition(entry.view.name)
+                        self._registry.tool_definition(
+                            entry.view.name, lane=catalog.call_target_lane
+                        )
                         for entry in callable_entries
                     ),
                     *catalog.control_definitions,
@@ -1316,7 +1393,12 @@ class CapabilityRuntime:
         )
         _validate_step_surface(provider_definitions, self._limits)
         loaded_definition_bytes = _definition_bytes(
-            tuple(self._registry.tool_definition(entry.view.name) for entry in loaded)
+            tuple(
+                self._registry.tool_definition(
+                    entry.view.name, lane=catalog.call_target_lane
+                )
+                for entry in loaded
+            )
         )
         return StepToolProjection(
             run_id=catalog.run_id,
@@ -1332,6 +1414,7 @@ class CapabilityRuntime:
                 callable_entries=callable_entries,
                 loaded_entries=loaded,
                 activation_digest=activation_digest,
+                call_target_lane=catalog.call_target_lane,
                 source_scope=catalog.source_scope,
             ),
             activation_digest=activation_digest,
@@ -1340,6 +1423,7 @@ class CapabilityRuntime:
             callable_entries=callable_entries,
             loaded_entries=loaded,
             loaded_definition_bytes=loaded_definition_bytes,
+            call_target_lane=catalog.call_target_lane,
             source_scope=catalog.source_scope,
             session=catalog.session,
         )
@@ -1431,9 +1515,11 @@ class CapabilityRuntime:
             messages=messages,
             limits=self._limits,
             registry=self._registry,
+            lane=projection.call_target_lane,
         )
         if (
-            projection.loaded_entries != loaded
+            projection.call_target_lane is not call_target_lane(run.origin)
+            or projection.loaded_entries != loaded
             or projection.activation_digest != activation_digest
             or projection.transcript_digest != transcript_digest
         ):
@@ -2381,7 +2467,10 @@ class CapabilityRuntime:
             )
         loaded = tuple(sorted(requested, key=lambda item: item.view.name))
         definitions = tuple(
-            self._registry.tool_definition(entry.view.name) for entry in loaded
+            self._registry.tool_definition(
+                entry.view.name, lane=projection.call_target_lane
+            )
+            for entry in loaded
         )
         definition_bytes = _definition_bytes(definitions)
         if (
@@ -2403,7 +2492,9 @@ class CapabilityRuntime:
             sorted(
                 (
                     *(
-                        self._registry.tool_definition(item.view.name)
+                        self._registry.tool_definition(
+                            item.view.name, lane=projection.call_target_lane
+                        )
                         for item in pinned
                     ),
                     *definitions,
@@ -2482,7 +2573,15 @@ class CapabilityRuntime:
                 capability.id,
                 domain.normalize_arguments(
                     capability,
-                    self._registry.target_arguments(call.name, call.arguments),
+                    self._registry.target_arguments(
+                        call.name,
+                        self._registry.resolve_call(
+                            call,
+                            capability=capability,
+                            result_refs=None,
+                            source_scope=run.resolved_source_scope,
+                        ).arguments,
+                    ),
                 ),
             )
             await _domain_prepare_call(
@@ -3111,9 +3210,16 @@ class CapabilityRuntime:
             await self._validate_execution_contracts(run)
             domain = self._domains[owner_id]
             if validated_arguments is None:
+                # The same resolver derives every reader's executed record
+                # (CapabilityRegistry.executed_tool_pairs) from the transcript.
                 raw_arguments = domain.normalize_arguments(
                     capability,
-                    resolve_result_refs(capability, call.arguments, result_refs),
+                    self._registry.resolve_call(
+                        call,
+                        capability=capability,
+                        result_refs=result_refs,
+                        source_scope=run.resolved_source_scope,
+                    ).arguments,
                 )
                 arguments = await self._registry.validate_arguments_async(
                     capability.id,
@@ -3161,6 +3267,12 @@ class CapabilityRuntime:
                             "execution is not available for it.",
                         ),
                     )
+            else:
+                _require_call_target_ceiling(
+                    capability.execution_admission_policy,
+                    call_target_lane(run.origin),
+                    arguments,
+                )
             arguments = await _domain_prepare_call(
                 domain,
                 run,
@@ -3774,7 +3886,7 @@ class CapabilityRuntime:
                     raise CapabilityInputError(
                         "state_changed",
                         "Current effect binding changed after approval.",
-                        recovery=_REINSPECT_AFTER_APPROVAL,
+                        recovery=APPROVED_TARGET_CHANGED,
                     )
             if plan.recheck_after_approval:
                 try:
@@ -3799,7 +3911,7 @@ class CapabilityRuntime:
                         raise CapabilityInputError(
                             "state_changed",
                             "Current effect authorization changed after approval.",
-                            recovery=_REINSPECT_AFTER_APPROVAL,
+                            recovery=APPROVED_TARGET_CHANGED,
                         )
                 except asyncio.CancelledError:
                     raise
@@ -3814,7 +3926,7 @@ class CapabilityRuntime:
                             "state_changed",
                             "The validated state changed while approval was pending.",
                             recovery_details(
-                                _REINSPECT_AFTER_APPROVAL,
+                                APPROVED_TARGET_CHANGED,
                                 {"capability_id": capability.id},
                             ),
                         ),
@@ -3828,7 +3940,7 @@ class CapabilityRuntime:
                             "state_changed",
                             "The validated state changed while approval was pending.",
                             recovery_details(
-                                _REINSPECT_AFTER_APPROVAL,
+                                APPROVED_TARGET_CHANGED,
                                 {"capability_id": capability.id},
                             ),
                         ),
@@ -4709,7 +4821,7 @@ def _automation_contract(entry: RunToolCatalogEntry) -> dict[str, object]:
             if policy is None
             else {
                 "constraints_kind": policy.constraints_kind,
-                "constraints_schema": policy.constraints_schema,
+                "constraints_schema": policy.requested_constraints_schema,
             }
         ),
         "effect_evidence_basis": (
@@ -5043,6 +5155,7 @@ def _loaded_tool_receipt(
     messages: tuple[object, ...],
     limits: LoopLimits,
     registry: CapabilityRegistry,
+    lane: CallTargetLane | None,
 ) -> tuple[tuple[RunToolCatalogEntry, ...], str, str]:
     exchanges = _ordered_tool_exchanges(messages)
     loaded: tuple[RunToolCatalogEntry, ...] = ()
@@ -5074,6 +5187,7 @@ def _loaded_tool_receipt(
             catalog_entries=catalog_entries,
             limits=limits,
             registry=registry,
+            lane=lane,
         )
         if candidate is None:
             continue
@@ -5160,6 +5274,7 @@ def _verified_loaded_entries(
     catalog_entries: tuple[RunToolCatalogEntry, ...],
     limits: LoopLimits,
     registry: CapabilityRegistry,
+    lane: CallTargetLane | None,
 ) -> tuple[RunToolCatalogEntry, ...] | None:
     receipt_keys = {
         "run_id",
@@ -5210,7 +5325,9 @@ def _verified_loaded_entries(
         for entry in entries
     ):
         return None
-    definitions = tuple(registry.tool_definition(entry.view.name) for entry in entries)
+    definitions = tuple(
+        registry.tool_definition(entry.view.name, lane=lane) for entry in entries
+    )
     definition_bytes = _definition_bytes(definitions)
     expected_activation = _activation_digest(run_id, catalog_digest, entries)
     expected_data: dict[str, object] = dict(data)
@@ -5312,6 +5429,7 @@ def _projection_digest(
     callable_entries: tuple[RunToolCatalogEntry, ...],
     loaded_entries: tuple[RunToolCatalogEntry, ...],
     activation_digest: str,
+    call_target_lane: CallTargetLane | None,
     source_scope: EffectiveSourceScope | None = None,
 ) -> str:
     return _sha256_digest(
@@ -5326,6 +5444,9 @@ def _projection_digest(
             "callable_tools": [entry.view.name for entry in callable_entries],
             "loaded_tools": [entry.view.name for entry in loaded_entries],
             "activation_digest": activation_digest,
+            "call_target_lane": (
+                None if call_target_lane is None else call_target_lane.value
+            ),
             "source_scope": None if source_scope is None else source_scope.to_mapping(),
         }
     )
@@ -5345,6 +5466,7 @@ def _step_projection_digest(projection: StepToolProjection) -> str:
         callable_entries=projection.callable_entries,
         loaded_entries=projection.loaded_entries,
         activation_digest=projection.activation_digest,
+        call_target_lane=projection.call_target_lane,
         source_scope=projection.source_scope,
     )
 
@@ -5380,7 +5502,8 @@ def _validate_step_projection(
     if projection.callable_entries != expected_callable:
         raise ValueError("step projection callable set is invalid")
     loaded_definitions = tuple(
-        registry.tool_definition(entry.view.name) for entry in loaded
+        registry.tool_definition(entry.view.name, lane=projection.call_target_lane)
+        for entry in loaded
     )
     if (
         len(loaded) > limits.max_loaded_tools
@@ -5397,7 +5520,9 @@ def _validate_step_projection(
         sorted(
             (
                 *(
-                    registry.tool_definition(entry.view.name)
+                    registry.tool_definition(
+                        entry.view.name, lane=projection.call_target_lane
+                    )
                     for entry in expected_callable
                 ),
                 *controls,
@@ -5698,7 +5823,11 @@ def _validate_output_execution_scope(
 def _source_pressure_key(run: RunInput, call: ToolCall) -> str:
     source_id = call.arguments.get("source_id")
     if isinstance(source_id, str):
-        return source_id
+        # A source handle and its full ID share one per-source gate.
+        return (
+            scope_refs(run.resolved_source_scope).resolve(SOURCE_REF_PREFIX, source_id)
+            or source_id
+        )
     return "__agent_local__"
 
 

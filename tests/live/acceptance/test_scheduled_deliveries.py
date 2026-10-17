@@ -240,7 +240,7 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
             DATA_EXPORT_TABULAR_CAPABILITY_ID,
         )
         calls = tuple(
-            call for message in transcript.messages for call in message.tool_calls
+            call for call, _ in await agent.tool_evidence(delivery.resulting_run_id)
         )
         export_calls = tuple(
             call

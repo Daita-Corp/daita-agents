@@ -99,6 +99,7 @@ def _gemini_contents(
     messages: tuple[CanonicalMessage, ...],
     provider_id: str,
     result_refs: Mapping[str, str] | None = None,
+    scope_refs: Mapping[str, str] | None = None,
 ) -> tuple[list[dict[str, object]], str | None]:
     contents: list[dict[str, object]] = []
     system_parts: list[str] = []
@@ -164,7 +165,7 @@ def _gemini_contents(
                 function_response: dict[str, object] = {
                     "name": name,
                     "response": model_tool_result(
-                        block, (result_refs or {}).get(block.call_id)
+                        block, (result_refs or {}).get(block.call_id), scope_refs
                     ),
                 }
                 if native_id is not None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from daita.capabilities import CallTargetLane
 from daita.catalog import CatalogDescribeDetail, CatalogDescribeRequest
 from daita.catalog.models import CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT
 from tests.catalog._schema_support import (
@@ -9,12 +10,10 @@ from tests.catalog._schema_support import (
     CATALOG_DESCRIBE_CAPABILITY_ID,
     CATALOG_DESCRIBE_EVIDENCE_KIND,
     CATALOG_MAX_LIMIT,
-    CATALOG_RESOURCE_ID_MAX_CHARACTERS,
     CATALOG_SCHEMA_MAX_RESOURCE_IDS,
     CATALOG_SEARCH_CAPABILITY_ID,
     CATALOG_SEARCH_REQUEST_DEFAULT_LIMIT,
     CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
-    CATALOG_SOURCE_ID_MAX_CHARACTERS,
     CATALOG_TOOL_DEFAULT_LIMIT,
     CATALOG_TOOL_QUERY_MAX_CHARACTERS,
     Agent,
@@ -328,9 +327,13 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
     )
     try:
         registry: CapabilityRegistry = agent._embedded._capabilities
-        search_definition = registry.tool_definition("catalog_search")
+        search_definition = registry.tool_definition(
+            "catalog_search", lane=CallTargetLane.FOREGROUND
+        )
         _search_view, search_capability = registry.resolve_tool("catalog_search")
-        describe_definition = registry.tool_definition("catalog_describe")
+        describe_definition = registry.tool_definition(
+            "catalog_describe", lane=CallTargetLane.FOREGROUND
+        )
 
         search_properties = search_definition.input_schema["properties"]
         describe_properties = describe_definition.input_schema["properties"]
@@ -366,10 +369,10 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
             "minLength": 1,
             "maxLength": CATALOG_TOOL_QUERY_MAX_CHARACTERS,
         }
+        # The model may pass the full ID or the run-scoped handle shown beside it.
         source_rule = {
             "type": "string",
-            "minLength": 1,
-            "maxLength": CATALOG_SOURCE_ID_MAX_CHARACTERS,
+            "pattern": "^(source:sha256:[0-9a-f]{64}|s[1-9][0-9]{0,4})$",
         }
         limit_rule = {
             "type": "integer",
@@ -425,8 +428,9 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
                 "type": "array",
                 "items": {
                     "type": "string",
-                    "minLength": 1,
-                    "maxLength": CATALOG_RESOURCE_ID_MAX_CHARACTERS,
+                    "pattern": (
+                        "^(catalog-resource:sha256:[0-9a-f]{64}|t[1-9][0-9]{0,4})$"
+                    ),
                 },
                 "maxItems": CATALOG_SCHEMA_MAX_RESOURCE_IDS,
                 "uniqueItems": True,
@@ -447,6 +451,34 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
             assert _validation_details(invalid_limit.value) == {
                 "constraint": "maximum",
                 "name": "limit",
+            }
+
+        # The executed contract admits only exact full IDs; a garbled one (here
+        # one hex character short) is a correctable input error, not a lookup.
+        garbled_source = "source:sha256:" + "a" * 63
+        garbled_resource = "catalog-resource:sha256:" + "b" * 65
+        for capability_id, arguments, name in (
+            (
+                CATALOG_SEARCH_CAPABILITY_ID,
+                {"query": "orders", "source_id": garbled_source},
+                "source_id",
+            ),
+            (
+                CATALOG_DESCRIBE_CAPABILITY_ID,
+                {"resource_ids": (garbled_resource,)},
+                "resource_ids[0]",
+            ),
+            (
+                CATALOG_DESCRIBE_CAPABILITY_ID,
+                {"source_id": "s1"},
+                "source_id",
+            ),
+        ):
+            with pytest.raises(CapabilityInputError) as garbled:
+                registry.validate_arguments(capability_id, arguments)
+            assert _validation_details(garbled.value) == {
+                "constraint": "pattern",
+                "name": name,
             }
 
         with pytest.raises(CapabilityInputError) as invalid_kind:
@@ -630,12 +662,14 @@ async def test_catalog_describe_replaces_split_tools_without_ordering_rules(
         registry: CapabilityRegistry = agent._embedded._capabilities
         for removed in ("catalog_schema", "catalog_inspect", "catalog_traverse"):
             with pytest.raises(KeyError, match="unknown tool"):
-                registry.tool_definition(removed)
+                registry.tool_definition(removed, lane=CallTargetLane.FOREGROUND)
         for removed_id in ("catalog.schema", "catalog.inspect", "catalog.traverse"):
             with pytest.raises(KeyError):
                 registry.resolve_execution(removed_id)
 
-        description = registry.tool_definition("catalog_describe").description
+        description = registry.tool_definition(
+            "catalog_describe", lane=CallTargetLane.FOREGROUND
+        ).description
         for ordering_rule in ("Do not use with", "later step", "alongside"):
             assert ordering_rule not in description
         assert "multi-hop resolved in code" in description

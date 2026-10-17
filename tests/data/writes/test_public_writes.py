@@ -23,10 +23,12 @@ from daita._json import FrozenJsonObject, canonical_json
 from daita.adapters import postgresql_write as native
 from daita.capabilities import (
     ApprovalDecision,
+    CallTargetLane,
     CapabilityInputError,
     EffectEvidenceBasis,
     EffectOutcome,
 )
+from daita.capability_runtime import APPROVED_TARGET_CHANGED
 from daita.distribution.models import OutcomeState
 from daita.jobs.graph.admission import START_GRAPH_JOB_TOOL_NAME
 from daita.jobs.graph.capabilities import TASK_COMPLETE_TOOL_NAME
@@ -305,6 +307,20 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
         assert "locks matching rows" in document
         assert len(mutations) == (1 if review_action == "approve" else 0)
         assert len(receipts) == (1 if review_action == "approve" else 0)
+        if review_action == "drift":
+            (write,) = [
+                block
+                for message in transcript.messages
+                for block in message.content
+                if isinstance(block, ToolResultBlock) and block.call_id == "write"
+            ]
+            assert write.is_error
+            error = write.output["error"]
+            assert isinstance(error, Mapping)
+            assert error["code"] == "state_changed"
+            assert dict(error["details"]["recovery"]) == (
+                APPROVED_TARGET_CHANGED.to_details()
+            )
         assert (
             not db.rows
         )  # The existing update I/O fixture owns this test's source calls.
@@ -320,8 +336,19 @@ def script(
     write=True,
     duplicate=False,
     schema=False,
+    handles=False,
 ) -> None:
     research_name = binding.tools[0].local_name
+
+    def named(request: ModelRequest) -> dict[str, object]:
+        # With handles, the model names the table by its run-scoped refs.
+        if not handles:
+            return dict(batch)
+        return {
+            **batch,
+            "source_id": request.scope_refs[batch["source_id"]],
+            "resource_id": request.scope_refs[batch["resource_id"]],
+        }
 
     def apply(request):
         previews = [
@@ -345,7 +372,7 @@ def script(
                 id="write",
                 name="data_upsert_rows",
                 arguments={
-                    **batch,
+                    **named(request),
                     "mode": "apply",
                     "preview_fingerprint": data["preview_fingerprint"],
                 },
@@ -374,11 +401,11 @@ def script(
                 },
             )
         ),
-        response(
+        lambda request: response(
             ToolCall(
                 id="preview",
                 name="data_upsert_rows",
-                arguments={**batch, "mode": "preview"},
+                arguments={**named(request), "mode": "preview"},
             )
         ),
     ]
@@ -495,7 +522,7 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         approvals,
     ) = await create_fixture(tmp_path, monkeypatch)
     try:
-        script(provider, binding, batch, duplicate=True)
+        script(provider, binding, batch, duplicate=True, handles=True)
         result = await agent.run(
             "Research companies doing business with Acme and save cited findings now."
         )
@@ -504,6 +531,7 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
             agent.id, run_id=result.run_id
         )
         assert len(receipts) == 1
+        assert receipts[0].call_id == "write"
         assert receipts[0].outcome is EffectOutcome.SUCCEEDED
         assert receipts[0].evidence_basis is EffectEvidenceBasis.ADAPTER_VERIFIED
         assert db.rows["new.test"]["evidence_url"] == "https://source.test/new"
@@ -538,12 +566,23 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         assert approval_document is not None
         assert set(approval_document["target"]) == TARGET_KEYS
         assert set(approval_document["preview"]) == UPSERT_PREVIEW_KEYS
-        write_call = next(
+        # The model named the table by handles; the executed record carries
+        # the full identities the approval reviewed, in the tool's own shape.
+        raw_write = next(
             call
             for message in transcript.messages
             for call in message.tool_calls
             if call.id == "write"
         )
+        assert raw_write.arguments["source_id"] != batch["source_id"]
+        write_call = next(
+            call
+            for call, _ in await agent.tool_evidence(result.run_id)
+            if call.id == "write"
+        )
+        assert write_call.arguments["mode"] == "apply"
+        assert write_call.arguments["source_id"] == batch["source_id"]
+        assert write_call.arguments["resource_id"] == batch["resource_id"]
         assert dict(approval.arguments["arguments"]) == {
             key: value for key, value in write_call.arguments.items() if key != "mode"
         }
@@ -568,6 +607,64 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         assert "Connection: Company research" in document
         assert "Preview: 1 insert, 0 update, 0 unchanged" in document
         assert "Exact validated details:" in document
+    finally:
+        await agent.close()
+
+
+async def test_upsert_drift_during_approval_is_final_with_no_mutation(
+    tmp_path, monkeypatch
+):
+    agent, provider, db, _, binding, _, _, batch, _, _ = await create_fixture(
+        tmp_path, monkeypatch
+    )
+    concurrent = {
+        "id": 42,
+        "domain": "new.test",
+        "name": "Concurrent writer",
+        "evidence_url": "https://source.test/concurrent",
+        "notes": None,
+        "__daita_xmin": "7",
+    }
+    approvals = []
+
+    async def approve_after_concurrent_write(request):
+        approvals.append(request)
+        if request.capability_id == "data.upsert_rows":
+            db.rows["new.test"] = dict(concurrent)
+        return ApprovalDecision.APPROVE
+
+    try:
+        agent._embedded._capability_runtime._approval_handler = (
+            approve_after_concurrent_write
+        )
+        script(provider, binding, batch)
+        result = await agent.run(
+            "Research companies doing business with Acme and save cited findings now."
+        )
+        assert result.reason == "completed"
+        transcript = await agent._embedded._store.load(result.run_id)
+        (write,) = [
+            block
+            for message in transcript.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock) and block.call_id == "write"
+        ]
+        assert write.is_error
+        error = write.output["error"]
+        assert isinstance(error, Mapping)
+        assert error["code"] == "state_changed"
+        assert dict(error["details"]["recovery"]) == (
+            APPROVED_TARGET_CHANGED.to_details()
+        )
+        assert [item.capability_id for item in approvals].count("data.upsert_rows") == 1
+        assert not await agent.list_effects()
+        assert db.rows == {"new.test": concurrent}
+        assert not [
+            item
+            for item in db.log
+            if item[0] in {"fetch", "execute"}
+            and str(item[1]).startswith(("INSERT", "UPDATE", "LOCK TABLE"))
+        ]
     finally:
         await agent.close()
 
@@ -612,7 +709,9 @@ async def test_upsert_evidence_is_derived_from_earlier_reads_of_the_same_table(
             item for item in approvals if item.capability_id == "data.upsert_rows"
         )
         assert "evidence_call_ids" not in dict(approval.arguments["arguments"])
-        definition = agent._embedded._capabilities.tool_definition("data_upsert_rows")
+        definition = agent._embedded._capabilities.tool_definition(
+            "data_upsert_rows", lane=CallTargetLane.FOREGROUND
+        )
         properties = definition.input_schema["properties"]
         assert isinstance(properties, Mapping)
         assert "evidence_call_ids" not in properties

@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from enum import Enum
+from typing import Any
 
 from .._json import FrozenJsonObject, canonical_json
 from .pricing import CostEstimate, CostEstimateStatus, canonical_decimal
@@ -488,6 +489,9 @@ class ModelRequest:
     # Run-scoped model-visible handles keyed by canonical ToolCall.id; adapters
     # render them beside each result and the stored transcript never holds them.
     tool_result_refs: Mapping[str, str] = field(default_factory=dict)
+    # Run-scoped source/resource handles keyed by full ID (``s1``, ``t1``...);
+    # adapters render each beside the ID it names in tool results.
+    scope_refs: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         messages = tuple(self.messages)
@@ -565,6 +569,8 @@ class ModelRequest:
         ):
             raise ValueError("model-request tool_result_refs are invalid")
         object.__setattr__(self, "tool_result_refs", refs)
+        if not isinstance(self.scope_refs, Mapping):
+            raise TypeError("model-request scope_refs must be a mapping")
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
         object.__setattr__(self, "response_schema", response_schema)
@@ -662,6 +668,7 @@ def tool_result_refs(
 def model_tool_result(
     block: ToolResultBlock,
     result_ref: str | None,
+    scope_refs: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Return the one model-facing rendering of a tool result for every adapter."""
 
@@ -669,8 +676,50 @@ def model_tool_result(
         {} if result_ref is None else {"result_ref": result_ref}
     )
     rendered["is_error"] = block.is_error
-    rendered["output"] = FrozenJsonObject.from_mapping(block.output).to_dict()
+    output = FrozenJsonObject.from_mapping(block.output).to_dict()
+    rendered["output"] = with_scope_refs(output, scope_refs) if scope_refs else output
     return rendered
+
+
+def _ref_key(key: str) -> str | None:
+    """``source_id`` -> ``source_ref``; ``resource_ids`` -> ``resource_refs``."""
+
+    for suffix, replacement in (("ids", "refs"), ("id", "ref")):
+        if key == suffix or key.endswith("_" + suffix):
+            return key[: -len(suffix)] + replacement
+    return None
+
+
+def with_scope_refs(value: object, scope_refs: Mapping[str, str]) -> Any:
+    """Add each issued handle beside the full ID it names, recursively.
+
+    A key ``x_id`` whose value is an issued ID gains ``x_ref``; a key ``x_ids``
+    whose list holds issued IDs gains an aligned ``x_refs`` (null where none).
+    The full IDs stay unchanged; other values are copied as they are.
+    """
+
+    if isinstance(value, Mapping):
+        rendered: dict[str, object] = {}
+        for key, item in value.items():
+            rendered[key] = with_scope_refs(item, scope_refs)
+            ref_key = _ref_key(key) if isinstance(key, str) else None
+            if ref_key is None or ref_key in value:
+                continue
+            if isinstance(item, str) and item in scope_refs:
+                rendered[ref_key] = scope_refs[item]
+            elif (
+                isinstance(item, (list, tuple))
+                and item
+                and all(isinstance(element, str) for element in item)
+                and any(element in scope_refs for element in item)
+            ):
+                rendered[ref_key] = type(item)(
+                    scope_refs.get(element) for element in item
+                )
+        return rendered
+    if isinstance(value, (list, tuple)):
+        return type(value)(with_scope_refs(item, scope_refs) for item in value)
+    return value
 
 
 @dataclass(frozen=True, slots=True)

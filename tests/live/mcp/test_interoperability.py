@@ -211,15 +211,13 @@ async def test_real_model_reads_remote_mcp_after_agent_restart(
             assert result.final_text and result.usage.total_tokens > 0
             validate_completed_transcript(transcript, result)
             capture = RunCapture(
-                result, transcript, tuple(provider.requests[request_start:])
+                result,
+                transcript,
+                tuple(provider.requests[request_start:]),
+                await agent.tool_evidence(result.run_id),
             )
             assert_on_demand_invocation(capture, local_name)
-            calls = [
-                call
-                for message in transcript.messages
-                for call in message.tool_calls
-                if call.name == local_name
-            ]
+            calls = [call for call, _ in capture.evidence if call.name == local_name]
             assert len(calls) == 1 and calls[
                 0
             ].arguments == FrozenJsonObject.from_mapping(arguments)

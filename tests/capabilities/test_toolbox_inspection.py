@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from daita.capabilities import CallTargetLane
 from tests.capabilities._toolbox_support import (
     Any,
     CanonicalMessage,
@@ -46,7 +47,10 @@ async def test_exact_contract_inspection_never_activates_or_executes():
     assert not inspected.is_error, inspected
     contract = cast(Mapping[str, Any], _data(inspected))["value"]
     assert (
-        contract["input_schema"] == registry.tool_definition("on_demand_a").input_schema
+        contract["input_schema"]
+        == registry.tool_definition(
+            "on_demand_a", lane=CallTargetLane.FOREGROUND
+        ).input_schema
     )
     assert _data(inspected)["complete"] is True
     call = ToolCall("inspect", "toolbox_inspect", {"tool_name": "on_demand_a"})
@@ -250,7 +254,9 @@ async def test_omitted_load_contract_has_exact_inspection_reference():
     assert not inspected.is_error
     assert (
         _data(inspected)["value"]
-        == registry.tool_definition("on_demand_a").input_schema
+        == registry.tool_definition(
+            "on_demand_a", lane=CallTargetLane.FOREGROUND
+        ).input_schema
     )
 
 

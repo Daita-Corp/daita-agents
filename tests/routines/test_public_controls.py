@@ -136,8 +136,8 @@ async def test_routine_reporting_input_error_precedes_binding_and_approval(
             arguments["precheck"] = {
                 "capability_id": "catalog.describe",
                 "contract_digest": "sha256:" + "a" * 64,
-                "source_id": "source",
-                "resource_id": "resource",
+                "source_id": "source:sha256:" + "c" * 64,
+                "resource_id": "catalog-resource:sha256:" + "d" * 64,
             }
         bindings = []
         owner = agent._embedded._routine_owner
@@ -833,7 +833,6 @@ async def test_routine_save_creates_with_narrow_defaults_and_replaces_one_exact_
             "outcome_contract": outcome_contract_projection(
                 no_artifact_outcome_contract()
             ),
-            "distribution_destination_id": destinations[0].destination_id,
             "eligible_model_routes": (provider.provider_id,),
             "per_run_max_tokens": 100_000,
             "cumulative_max_tokens": 200_000,
@@ -842,10 +841,10 @@ async def test_routine_save_creates_with_narrow_defaults_and_replaces_one_exact_
             "maximum_consecutive_failures": 3,
             "expires_at": (now + timedelta(days=30)).isoformat(),
         }
+        # Connector bindings and the Inbox are derived by the owner when omitted.
         explicit = {
             **common,
             "misfire_policy": "skip",
-            "allowed_connector_binding_ids": (),
             "requested_capability_grants": (),
             "skill_names": (),
             "run_immediately": False,
@@ -870,6 +869,9 @@ async def test_routine_save_creates_with_narrow_defaults_and_replaces_one_exact_
         routine = inspection.routine
         assert routine.misfire_policy.value == "skip"
         assert routine.allowed_connector_binding_ids == ()
+        assert routine.distribution_plan.targets[0].destination_id == (
+            destinations[0].destination_id
+        )
         assert routine.skill_bindings == ()
         assert routine.per_run_max_cost_usd is None
         assert routine.run_immediately is False

@@ -32,7 +32,7 @@ def computed_sum(stdout):
 
 
 async def retain_evidence(agent, result, report):
-    transcript = await agent.transcript(result.run_id)
+    evidence = await agent.tool_evidence(result.run_id)
     records = await agent.analysis_evidence(result.run_id)
     report.update(
         {
@@ -56,7 +56,7 @@ async def retain_evidence(agent, result, report):
                     "arguments": call.arguments,
                     "output": None if output is None else output.output,
                 }
-                for call, output in transcript.tool_pairs
+                for call, output in evidence
             ],
             "measurements": [
                 {"id": record.evidence_id, "kind": record.kind, "facts": record.facts}
@@ -75,7 +75,7 @@ async def retain_evidence(agent, result, report):
         assert record.facts["cleanup"]["scratch_deleted"] is True
         if "scratch" in record.facts:
             assert not Path(record.facts["scratch"]).exists()
-    return transcript, records
+    return evidence, records
 
 
 async def test_real_model_python_broker_duckdb_chart_dataset_and_artifact_lifecycle(
@@ -111,7 +111,7 @@ async def test_real_model_python_broker_duckdb_chart_dataset_and_artifact_lifecy
             "Create a Matplotlib PNG chart and a JSON dataset containing total_usd and by_region, register both named output candidates, "
             "and explicitly save both as two artifacts through separate analysis calls. Do not deliver them to external directories. Report the total."
         )
-        transcript, records = await retain_evidence(agent, result, analysis_report)
+        evidence, records = await retain_evidence(agent, result, analysis_report)
         children = [
             record
             for record in records
@@ -121,7 +121,7 @@ async def test_real_model_python_broker_duckdb_chart_dataset_and_artifact_lifecy
         assert len(result.artifacts) == 2
         assert any(
             "duckdb" in str(call.arguments.get("code", "")).lower()
-            for call, _ in transcript.tool_pairs
+            for call, _ in evidence
         )
         dataset = next(
             ref for ref in result.artifacts if ref.media_type == "application/json"
@@ -189,10 +189,10 @@ async def test_real_model_dependent_cells_and_error_correction(
             "After inspecting that Python error, run a third cell that prints retained_value+1 without resetting the variable. Report its value. "
             "Do not catch the intentional exception or replay either earlier cell."
         )
-        transcript, _ = await retain_evidence(agent, result, analysis_report)
+        evidence, _ = await retain_evidence(agent, result, analysis_report)
         cells = [
             output.output["data"]
-            for call, output in transcript.tool_pairs
+            for call, output in evidence
             if call.name == "python_execute"
             and output is not None
             and not output.is_error
@@ -330,7 +330,7 @@ async def test_paired_exact_dataset_handoffs_have_independent_numeric_oracles(
             source_scope_ids=(source.id,),
         )
         elapsed = perf_counter() - started
-        transcript = await agent.transcript(result.run_id)
+        evidence = await agent.tool_evidence(result.run_id)
         records = await agent.analysis_evidence(result.run_id)
         analysis_report.update(
             {
@@ -354,7 +354,7 @@ async def test_paired_exact_dataset_handoffs_have_independent_numeric_oracles(
                         "name": call.name,
                         "output": None if output is None else output.output,
                     }
-                    for call, output in transcript.tool_pairs
+                    for call, output in evidence
                 ],
                 "measurements": [{"kind": r.kind, "facts": r.facts} for r in records],
                 "cleanup": [
@@ -378,7 +378,7 @@ async def test_paired_exact_dataset_handoffs_have_independent_numeric_oracles(
         assert actual == expected
         exports = [
             output
-            for call, output in transcript.tool_pairs
+            for call, output in evidence
             if call.name == "data_query"
             and call.arguments.get("output") == "arrow"
             and output is not None

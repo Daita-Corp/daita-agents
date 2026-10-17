@@ -222,6 +222,7 @@ class ModelGraphIntegration:
             declarations=(business, lifecycle_bundle),
             executors=(reader, *lifecycle.executors),
         )
+        lifecycle.bind_capability_registry(registry)
         contract_state = {"revoked": False}
 
         async def contracts(

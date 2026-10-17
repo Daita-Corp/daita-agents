@@ -66,6 +66,63 @@ def first_slot(
     return candidate
 
 
+@dataclass(frozen=True, slots=True)
+class ScheduleForecast:
+    """Code-computed upcoming slots, so authors never do calendar arithmetic.
+
+    ``first_unbounded_at`` ignores expiration; when it is later than the
+    expiration the schedule can never run. ``reachable_slots`` counts slots
+    before expiration, stopping once ``count_limit`` is reached.
+    """
+
+    occurrences: tuple[datetime, ...]
+    first_unbounded_at: datetime | None
+    reachable_slots: int
+
+
+def forecast_slots(
+    schedule: RoutineSchedule,
+    *,
+    not_before: datetime,
+    expires_at: datetime,
+    limit: int,
+    count_limit: int,
+) -> ScheduleForecast:
+    """Return the first ``limit`` slots and a bounded count before expiration."""
+
+    _utc(not_before, "schedule not_before")
+    _utc(expires_at, "schedule expires_at")
+    if not 1 <= limit <= count_limit <= MAX_ROUTINE_OCCURRENCES:
+        raise ValueError("schedule forecast bounds are invalid")
+    try:
+        unbounded = _next_slot(schedule, boundary=not_before, inclusive=True)
+    except ValueError:
+        unbounded = None
+    slots: list[datetime] = []
+    count = 0
+    cursor = unbounded
+    while cursor is not None and cursor <= expires_at and count < count_limit:
+        if len(slots) < limit:
+            slots.append(cursor)
+        count += 1
+        if isinstance(schedule, IntervalSchedule):
+            # Interval slots are arithmetic; count them without iterating.
+            remaining = _timedelta_microseconds(expires_at - cursor) // (
+                schedule.interval_seconds * 1_000_000
+            )
+            while len(slots) < limit and len(slots) <= remaining:
+                slots.append(
+                    cursor + timedelta(seconds=len(slots) * schedule.interval_seconds)
+                )
+            count = min(count_limit, 1 + remaining)
+            break
+        try:
+            cursor = _next_slot(schedule, boundary=cursor, inclusive=False)
+        except ValueError:
+            break
+    return ScheduleForecast(tuple(slots), unbounded, count)
+
+
 def next_slot(
     schedule: RoutineSchedule,
     *,

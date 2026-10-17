@@ -36,7 +36,6 @@ from daita.llm.protocols import (
 )
 from daita.loop.models import (
     LoopExitKind,
-    Transcript,
     validate_completed_transcript,
 )
 from tests.support.live_billing import cost_cap, live_provider
@@ -152,22 +151,14 @@ def _limits() -> LoopLimits:
 
 
 def _successful_exchanges(
-    transcript: Transcript,
+    evidence: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
     tool_name: str,
 ) -> tuple[tuple[ToolCall, ToolResultBlock], ...]:
-    calls = {
-        call.id: call
-        for message in transcript.messages
-        for call in message.tool_calls
-        if call.name == tool_name
-    }
+    # Executed calls from Agent.tool_evidence, with their successful results.
     return tuple(
-        (calls[block.call_id], block)
-        for message in transcript.messages
-        for block in message.content
-        if isinstance(block, ToolResultBlock)
-        and block.call_id in calls
-        and not block.is_error
+        (call, block)
+        for call, block in evidence
+        if call.name == tool_name and block is not None and not block.is_error
     )
 
 
@@ -205,6 +196,7 @@ async def test_live_model_finds_latest_log_and_reads_its_end(
     try:
         result = await agent.run(_PROMPT)
         transcript = await agent.transcript(result.run_id)
+        evidence = await agent.tool_evidence(result.run_id)
     finally:
         try:
             await agent.close()
@@ -221,8 +213,8 @@ async def test_live_model_finds_latest_log_and_reads_its_end(
     assert _EXPECTED_COUNT in result.final_text
     validate_completed_transcript(transcript, result)
 
-    searches = _successful_exchanges(transcript, "file_search")
-    reads = _successful_exchanges(transcript, "file_read")
+    searches = _successful_exchanges(evidence, "file_search")
+    reads = _successful_exchanges(evidence, "file_read")
     assert searches, "the live model did not complete file_search"
     assert reads, "the live model did not complete file_read"
     search_call, search_result = next(

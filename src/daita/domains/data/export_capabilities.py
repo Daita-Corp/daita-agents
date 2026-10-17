@@ -88,6 +88,8 @@ from ...capabilities import (
     ToolPresentation,
     ToolTextTrust,
     ToolView,
+    resource_id_schema,
+    source_id_schema,
 )
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.models import Sensitivity
@@ -101,7 +103,11 @@ from ...llm.models import (
 from ...loop.analysis import AnalysisEvidence
 from ...loop.models import RunInput, RunOrigin, Transcript
 from ...loop.session import RunSession
-from ...scope import SourceScopeCatalog, resolve_effective_source_scope
+from ...scope import (
+    EffectiveSourceScope,
+    SourceScopeCatalog,
+    resolve_effective_source_scope,
+)
 from ..learning import LearningCandidateGuard
 from .controller import DATA_EXPORT_TABULAR_CAPABILITY_ID
 from .sql import (
@@ -1798,32 +1804,37 @@ class _ValidatedArtifactEvidence:
 
 def _same_current_call(
     registry: CapabilityRegistry,
-    persisted: ToolCall,
+    executed: ToolCall,
     current: ToolCall,
     messages: tuple[CanonicalMessage, ...],
+    source_scope: EffectiveSourceScope | None,
 ) -> bool:
-    """Match a persisted model call to the call executing now.
+    """Match a persisted call's executed record to the call executing now.
 
-    The executing call may carry the canonical calls its result_ref values
-    named; the persisted call keeps exactly what the model sent.
+    The executing call is either already resolved or the runtime's routed call
+    before resolution; the latter is resolved by the same registry resolver,
+    against the same current-run ``messages`` before the persisted call.
     """
 
-    if persisted.name != current.name:
+    if executed.name != current.name:
         return False
-    if persisted.arguments == current.arguments:
-        return True
-    current_arguments = FrozenJsonObject.from_mapping(current.arguments)
     try:
-        # A routed tool's executing call no longer carries its selector.
-        routed = registry.target_arguments(persisted.name, persisted.arguments)
-        if FrozenJsonObject.from_mapping(routed) == current_arguments:
-            return True
-        resolved = registry.resolved_call_arguments(
-            persisted.name, persisted.arguments, messages
+        capability = registry.call_capability(executed.name, executed.arguments)
+        expected = (
+            FrozenJsonObject.from_mapping(executed.arguments),
+            FrozenJsonObject.from_mapping(
+                registry.target_arguments(executed.name, executed.arguments)
+            ),
         )
-    except (CapabilityInputError, KeyError):
+    except KeyError:
         return False
-    return FrozenJsonObject.from_mapping(resolved) == current_arguments
+    resolved = registry.executed_call(
+        current, messages=messages, source_scope=source_scope, capability=capability
+    )
+    return any(
+        FrozenJsonObject.from_mapping(candidate.arguments) in expected
+        for candidate in (current, resolved)
+    )
 
 
 class ArtifactCapabilityDomain:
@@ -2012,7 +2023,7 @@ class ArtifactCapabilityDomain:
                 ) from error
             return arguments
         if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.validate_effect(session, call)
+            self._learning.validate_effect(session, call, arguments)
         scope = await resolve_effective_source_scope(run, self._catalog)
         supplied_source_id = arguments.get("source_id")
         if (
@@ -2197,23 +2208,36 @@ class ArtifactCapabilityDomain:
         if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
             raise CapabilityInputError(error_code, error_message)
 
-        current_calls = tuple(
-            (message_index, candidate)
+        try:
+            executed = {
+                call.id: call
+                for call, _ in registry.executed_tool_pairs(
+                    transcript, source_scope=run.resolved_source_scope
+                )
+            }
+        except ValueError as error:
+            raise CapabilityInputError(error_code, error_message) from error
+        current_positions = tuple(
+            message_index
             for message_index, message in enumerate(transcript.messages)
             if message.role is MessageRole.ASSISTANT
             for candidate in message.tool_calls
             if candidate.id == current_call.id
         )
-        if len(current_calls) != 1 or not _same_current_call(
-            registry, current_calls[0][1], current_call, transcript.messages
+        if len(current_positions) != 1 or not _same_current_call(
+            registry,
+            executed[current_call.id],
+            current_call,
+            transcript.messages[: current_positions[0]],
+            run.resolved_source_scope,
         ):
             raise CapabilityInputError(error_code, error_message)
-        current_index = current_calls[0][0]
+        current_index = current_positions[0]
 
         validated: list[_ValidatedArtifactEvidence] = []
         for evidence_call_id in evidence_call_ids:
             evidence_calls = tuple(
-                (message_index, candidate)
+                message_index
                 for message_index, message in enumerate(transcript.messages)
                 if message.role is MessageRole.ASSISTANT
                 for candidate in message.tool_calls
@@ -2230,10 +2254,10 @@ class ArtifactCapabilityDomain:
             ordered = (
                 len(evidence_calls) == 1
                 and len(evidence_results) == 1
-                and evidence_calls[0][0] < evidence_results[0][0] < current_index
+                and evidence_calls[0] < evidence_results[0][0] < current_index
             )
             block = evidence_results[0][1] if len(evidence_results) == 1 else None
-            producer_call = evidence_calls[0][1] if evidence_calls else None
+            producer_call = executed[evidence_call_id] if evidence_calls else None
             if not evidence_calls:
                 children = await self._transcripts.load_analysis_evidence(
                     run.agent_id, run.id
@@ -2250,7 +2274,7 @@ class ArtifactCapabilityDomain:
                 if child is not None and child.facts.get("status") == "succeeded":
                     parent_id = child.facts.get("parent_call_id")
                     parent_calls = [
-                        (index, candidate)
+                        index
                         for index, message in enumerate(transcript.messages)
                         for candidate in message.tool_calls
                         if candidate.id == parent_id
@@ -2264,7 +2288,7 @@ class ArtifactCapabilityDomain:
                     ]
                     ordered = (
                         len(parent_calls) == len(parent_results) == 1
-                        and parent_calls[0][0] < parent_results[0][0] < current_index
+                        and parent_calls[0] < parent_results[0][0] < current_index
                     )
                     facts = child.facts
                     producer_call = ToolCall(
@@ -3018,10 +3042,10 @@ def _tabular_export_capability(*, allow_arrow: bool = False) -> Capability:
             # Shared arguments keep data_query's exact rules: this capability
             # is data_query's file output.
             "properties": {
-                "source_id": {"type": "string"},
+                "source_id": source_id_schema(),
                 "resource_ids": {
                     "type": "array",
-                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "items": resource_id_schema(),
                     "minItems": 1,
                     "maxItems": 64,
                     "uniqueItems": True,

@@ -38,7 +38,9 @@ def _database(path: Path, table: str) -> None:
 def _profile(provider: MockModelProvider) -> ModelProfile:
     return ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=32_000,
+        # Room for two sources' complete catalog evidence; the budget itself
+        # is not under test here.
+        context_window_tokens=40_000,
         max_output_tokens=1_000,
         supports_tools=True,
     )

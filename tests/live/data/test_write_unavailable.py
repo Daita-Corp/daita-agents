@@ -24,7 +24,7 @@ from daita.llm.models import (
 )
 from daita.llm.pricing import CostEstimate
 from daita.llm.protocols import ManagedModelProvider, provider_has_complete_pricing
-from daita.loop.models import LoopExitKind, Transcript
+from daita.loop.models import LoopExitKind
 from daita.security import EnvironmentSecretProvider, SecretReference
 from tests.support.live_billing import cost_cap, live_provider
 from tests.support.relational_writes import update_constraints
@@ -198,8 +198,11 @@ async def _customer_snapshot(
         await connection.close()
 
 
-def _tool_calls(transcript: Transcript) -> tuple[ToolCall, ...]:
-    return tuple(call for message in transcript.messages for call in message.tool_calls)
+def _tool_calls(
+    evidence: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
+) -> tuple[ToolCall, ...]:
+    # Executed calls from Agent.tool_evidence.
+    return tuple(call for call, _ in evidence)
 
 
 def _tool_results(
@@ -290,8 +293,9 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
             source_scope_ids=(source.id,),
         )
         transcript = await agent.transcript(exit.run_id)
+        evidence = await agent.tool_evidence(exit.run_id)
         update_receipts = []
-        for call in _tool_calls(transcript):
+        for call in _tool_calls(evidence):
             if (
                 call.name == RELATIONAL_UPDATE_TOOL_NAME
                 and call.arguments.get("mode") == "apply"
@@ -327,7 +331,7 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
     results = _tool_results(transcript.messages)
     write_calls = tuple(
         call
-        for call in _tool_calls(transcript)
+        for call in _tool_calls(evidence)
         if call.name == RELATIONAL_UPDATE_TOOL_NAME
     )
     assert write_calls

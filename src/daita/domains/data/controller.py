@@ -584,7 +584,7 @@ class DataCapabilityDomain:
         )
         run = replace(run, resolved_source_scope=scope)
         if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.validate_effect(session, call)
+            self._learning.validate_effect(session, call, arguments)
         await self._validate_source_scope(run, capability, arguments)
         self._validate_execution_resource_scope(run, capability, arguments)
         await self._validate_resource_read_scope(run, capability, arguments)
@@ -959,7 +959,7 @@ class DataCapabilityDomain:
             )
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.mark_effect_succeeded(session, call.id)
-        return await self._classify(run, call, capability, output)
+        return await self._classify(run, capability, arguments, output)
 
     finalize_session_output = finalize_output
 
@@ -1575,7 +1575,7 @@ class DataCapabilityDomain:
     ) -> None:
         if not execution and not evidence_ids:
             return
-        calls, results = await self._authenticated_prior_results(run, call)
+        calls, results = await self._authenticated_prior_results(run, call, capability)
         if (
             evidence_ids
             and tuple(
@@ -1659,7 +1659,7 @@ class DataCapabilityDomain:
         if capability.id not in _UPSERT_CAPABILITIES or registry is None:
             return CallProvenance()
         try:
-            _, results = await self._authenticated_prior_results(run, call)
+            _, results = await self._authenticated_prior_results(run, call, capability)
         except CapabilityInputError:
             return CallProvenance()
         source_id, resource_id = arguments["source_id"], arguments["resource_id"]
@@ -1682,6 +1682,7 @@ class DataCapabilityDomain:
         self,
         run: RunInput,
         call: ToolCall,
+        capability: Capability,
     ) -> tuple[dict[str, ToolCall], list[ToolResultBlock]]:
         """Return this call's earlier successful results with verified lineage."""
 
@@ -1708,20 +1709,45 @@ class DataCapabilityDomain:
                 ),
             )
 
-        current_calls = [
-            (index, target(candidate))
+        # Calls are compared by the arguments they executed with, not the
+        # run-scoped refs and handles the model sent.
+        try:
+            executed = {
+                candidate.id: target(candidate)
+                for candidate, _ in registry.executed_tool_pairs(
+                    transcript, source_scope=run.resolved_source_scope
+                )
+            }
+        except ValueError as error:
+            raise CapabilityInputError(
+                "write_preview_not_authenticated",
+                "Current-run native lineage is malformed.",
+            ) from error
+        positions = [
+            index
             for index, message in enumerate(transcript.messages)
             for candidate in message.tool_calls
             if candidate.id == call.id
         ]
-        if len(current_calls) != 1 or current_calls[0][1] != call:
+        # The runtime's routed call, resolved by the same resolver.
+        executing = (
+            None
+            if len(positions) != 1
+            else registry.executed_call(
+                call,
+                messages=transcript.messages[: positions[0]],
+                source_scope=run.resolved_source_scope,
+                capability=capability,
+            )
+        )
+        if executing is None or executed.get(call.id) != executing:
             raise CapabilityInputError(
                 "write_preview_not_authenticated",
                 "The native call does not match its persisted current-run identity.",
             )
-        current_index = current_calls[0][0]
+        current_index = positions[0]
         calls = {
-            candidate.id: target(candidate)
+            candidate.id: executed[candidate.id]
             for message in transcript.messages[:current_index]
             for candidate in message.tool_calls
         }
@@ -1736,7 +1762,7 @@ class DataCapabilityDomain:
                 ):
                     continue
                 producers = [
-                    (index, candidate)
+                    index
                     for index, item in enumerate(transcript.messages)
                     for candidate in item.tool_calls
                     if candidate.id == block.call_id
@@ -1751,7 +1777,7 @@ class DataCapabilityDomain:
                 if (
                     len(producers) != 1
                     or result_count != 1
-                    or not producers[0][0] < result_index < current_index
+                    or not producers[0] < result_index < current_index
                 ):
                     continue
                 if (
@@ -1813,8 +1839,8 @@ class DataCapabilityDomain:
     async def _classify(
         self,
         run: RunInput,
-        call: ToolCall,
         capability: Capability,
+        arguments: FrozenJsonObject,
         output: ToolOutput,
     ) -> ToolOutput:
         if capability.id in LOCAL_FILE_CAPABILITY_IDS:
@@ -1830,7 +1856,8 @@ class DataCapabilityDomain:
             run, self._catalog, files_only=False
         )
         run = replace(run, resolved_source_scope=scope)
-        source_id = call.arguments.get("source_id")
+        # Resolved arguments carry full IDs; the call keeps what the model sent.
+        source_id = arguments.get("source_id")
         source_ids = (
             (source_id,)
             if isinstance(source_id, str)

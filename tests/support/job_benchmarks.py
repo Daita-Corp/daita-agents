@@ -120,6 +120,9 @@ class RunCapture:
     result: LoopExit
     transcript: Transcript
     requests: tuple[ModelRequest, ...]
+    # The run's calls as they executed (Agent.tool_evidence); oracles read
+    # call arguments here, never from the transcript's raw model text.
+    evidence: tuple[tuple[ToolCall, ToolResultBlock | None], ...]
 
 
 class RecordingProvider:
@@ -564,6 +567,7 @@ async def capture_run(
         result=result,
         transcript=transcript,
         requests=tuple(fixture.provider.requests[start:]),
+        evidence=await fixture.agent.tool_evidence(result.run_id),
     )
 
 
@@ -588,23 +592,17 @@ def assert_on_demand_invocation(capture: RunCapture, tool_name: str) -> None:
     assert tool_name not in visible_names
     # Search is optional when the exact name is known. A successful load of
     # that name must still precede its successful invocation.
-    calls: dict[str, ToolCall] = {}
     loaded = False
-    for message in capture.transcript.messages:
-        calls.update((call.id, call) for call in message.tool_calls)
-        for block in message.content:
-            if not isinstance(block, ToolResultBlock) or block.is_error:
-                continue
-            call = calls.get(block.call_id)
-            if call is None:
-                continue
-            if call.name == "toolbox_load":
-                requested = call.arguments.get("tool_names")
-                if isinstance(requested, (list, tuple)) and tool_name in requested:
-                    loaded = True
-            elif call.name == tool_name:
-                assert loaded, f"{tool_name} succeeded before its exact successful load"
-                return
+    for call, block in capture.evidence:
+        if block is None or block.is_error:
+            continue
+        if call.name == "toolbox_load":
+            requested = call.arguments.get("tool_names")
+            if isinstance(requested, (list, tuple)) and tool_name in requested:
+                loaded = True
+        elif call.name == tool_name:
+            assert loaded, f"{tool_name} succeeded before its exact successful load"
+            return
     raise AssertionError(f"No successful invocation of {tool_name}")
 
 

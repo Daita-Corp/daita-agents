@@ -194,7 +194,7 @@ async def test_paraphrased_profile_requests_use_aggregates_without_jobs(
         target = fixture.resource_ids[TARGET_PROFILE_TABLE]
         assert any(
             target in cast(Sequence[str], call.arguments.get("resource_ids", ()))
-            for call, _ in capture.transcript.tool_pairs
+            for call, _ in capture.evidence
             if call.name == "data_query"
         )
         assert capture.result.final_text is not None

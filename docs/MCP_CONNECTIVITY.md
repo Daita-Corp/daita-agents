@@ -422,6 +422,14 @@ constraints = {
 }
 ```
 
+`binding_id`, `binding_revision` and `remote_tool_name` follow from the
+capability ID: a request may omit them and the domain fills the current admitted
+values, while any supplied value must still match exactly. `fixed_arguments` are
+values for the connector tool's own input arguments and are validated against
+its declared property schema when the grant is prepared. A Daita Inbox
+destination ID is report delivery, not a connector argument, and is rejected
+there with a correction pointing to `distribution_destination_id`.
+
 The enclosing `RequestedCapabilityGrant` supplies the exact capability ID and
 `max_calls_per_occurrence` (1 to 256, further bounded by the run). The constraints
 kind is `mcp.tool_call`; it is assigned by the domain policy, not sent to the server.
