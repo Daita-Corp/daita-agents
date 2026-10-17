@@ -1,7 +1,8 @@
 {
-  "billing": "subscription",
+  "surface_digest": "sha256:dde4f4d2948294e9cecf36e00fa462f54f621bedded10828e8a37629772508cd",
+  "recorded_on": "2026-10-17",
   "cases": {
-    "tests/live/acceptance/test_result_refs.py::test_l8_graph_task_complete_cites_its_read[0]": "passed_on_rerun",
+    "tests/live/acceptance/test_result_refs.py::test_l8_graph_task_complete_cites_its_read[0]": "passed",
     "tests/live/analysis/test_public_journeys.py::test_real_model_dependent_cells_and_error_correction": "passed",
     "tests/live/artifacts/test_lifecycle.py::test_live_model_artifact_creation_reuse_and_deletion_survive_reopen": "passed",
     "tests/live/benchmarks/test_catalog_scale.py::test_immediate_target_survives_catalog_distractors[64]": "passed",
@@ -13,13 +14,6 @@
     "tests/live/mcp/test_actions.py::test_live_research_and_honest_action_evidence[openai:gpt-5.6-terra-0-success]": "passed",
     "tests/live/mcp/test_read_workflows.py::test_live_dependent_reads_discover_tools_and_bind_returned_account[0-2-2026-07-28-normal]": "passed",
     "tests/live/routines/test_contract_authoring.py::test_model_authors_scheduled_contract_without_dispatch[0-familiar]": "passed",
-    "tests/live/workspace/test_text_edit.py::test_live_model_reads_edits_approves_and_replaces_exact_bound_file": "passed_on_rerun"
-  },
-  "recorded_on": "2026-10-17",
-  "status": "recorded",
-  "summary": {
-    "passed": 13,
-    "total": 13
-  },
-  "surface_digest": "sha256:ae12f8ecbdf3e48e888cc46b27a086a4cf9656b96cf48e4e41415731e8751dba"
+    "tests/live/workspace/test_text_edit.py::test_live_model_reads_edits_approves_and_replaces_exact_bound_file": "passed"
+  }
 }
