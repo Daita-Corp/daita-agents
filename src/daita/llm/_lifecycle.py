@@ -15,6 +15,10 @@ _NATIVE_EOF = object()
 # Diagnostic codes for a dispatched stream that went silent.
 FIRST_PROGRESS_TIMEOUT = "first_progress"
 IDLE_PROGRESS_TIMEOUT = "idle_progress"
+# Transport failure kinds raised before request bytes could reach the provider.
+UNSENT_TRANSPORT_FAILURES = frozenset(
+    {"connect_error", "connect_timeout", "pool_timeout"}
+)
 
 
 async def await_cleanup(
@@ -463,10 +467,43 @@ class AttemptLifecycle:
         if isinstance(error, asyncio.CancelledError):
             with_cancelled_model_usage(error, self.usage())
         elif isinstance(error, ModelProviderError) and (
-            self.terminal_response is not None or self.dispatched is None
+            self.terminal_response is not None
+            or self.dispatched is None
+            or self._rejected_before_generation()
         ):
             error.usage = self.usage()
         return False
+
+    def _rejected_before_generation(self) -> bool:
+        """Prove that a dispatched request was refused before any generation.
+
+        Either the transport failed before the request could be sent, or the
+        provider answered with an HTTP error status (such as 429 or 503) and no
+        native event, canonical output or terminal response followed. Neither
+        incurs generation, so the attempt's usage is proven zero. A dropped or
+        silent accepted stream remains unknown.
+        """
+
+        values = self.values
+        if (
+            self.dispatched is None
+            or self.terminal_response is not None
+            or self.canonical_emitted
+            or self.owner.poisoned
+            or values.get("first_native_event_seconds") is not None
+        ):
+            return False
+        if (
+            values.get("transport_error_phase") == "generation"
+            and values.get("transport_error_kind") in UNSENT_TRANSPORT_FAILURES
+        ):
+            return True
+        status = values.get("generation_http_status")
+        return (
+            type(status) is int
+            and status >= 400
+            and values.get("generation_headers_availability") == "status_only"
+        )
 
     def usage(self):
         from decimal import Decimal
@@ -479,7 +516,7 @@ class AttemptLifecycle:
         return ModelUsage(
             cost_estimate=(
                 CostEstimate.complete(Decimal(0))
-                if self.dispatched is None
+                if self.dispatched is None or self._rejected_before_generation()
                 else CostEstimate.unavailable("model_attempt_interrupted")
             )
         )

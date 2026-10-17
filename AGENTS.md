@@ -790,9 +790,15 @@ The router owns model retries. API SDK retries are disabled on owned clients and
 on borrowed-client request views without changing or closing the caller's client.
 Every retried attempt receives the remaining logical-request allowance. Unknown
 failed-attempt consumption stops budgeted routing; it cannot fund a retry or
-fallback. A provider-reported charge alone does not establish advance price
-coverage. Subscription output bounds remain advisory where the external surface
-does not support a wire limit; returned usage still controls loop progression.
+fallback. The one exception is a transient failure before any output (a rate
+limit, an unavailable provider or dropped connection, a silent stall or an
+unsent transport timeout): without a dollar cap it may replay, so a token limit
+can be exceeded by at most one unmeasured attempt per replay. An HTTP rejection
+or unsent request before any native event proves zero usage, so dollar-capped
+routes replay it too; unknown usage under a dollar cap still fails closed.
+A provider-reported charge alone does not establish advance price coverage.
+Subscription output bounds remain advisory where the external surface does not
+support a wire limit; returned usage still controls loop progression.
 
 Retry accounting covers active attempts, backoff, cancellation, and stream cleanup.
 Visible stream progress, including terminal completion, closes retry/fallback
@@ -801,9 +807,13 @@ retry delays are honored without shortening; waits exceeding 60 seconds or the
 remaining deadline stop recovery. Local exponential backoff uses bounded jitter.
 `RetryPolicy` defaults to `max_attempts_per_candidate=2` and
 `max_total_attempts=3`. Both limits are one for one-shot validation/review.
-Every configured route uses `ModelRouter`, including a one-candidate route.
-Injected providers retain caller ownership and must honor the canonical policy;
-they do not gain an implicit router. Tests exercise both compositions.
+Every host route uses `ModelRouter`, including a one-candidate route. The host
+places an injected non-router provider in a one-candidate router with the
+default `RetryPolicy` (one attempt for validation and review) under its
+`injected:` provider permit key, so every route shares retry, admission and
+attempt diagnostics. Injected providers retain caller ownership, must honor the
+canonical policy and are never closed by that router; their frozen model
+contracts still describe the declared provider and profile.
 
 Provider lifecycle follows explicit ownership. Providers constructed from an
 agent's persisted model route are closed by `EmbeddedAgent` after runs and

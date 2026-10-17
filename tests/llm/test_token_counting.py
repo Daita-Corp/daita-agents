@@ -68,9 +68,13 @@ async def test_actual_sdk_retains_transport_timeout_cause_without_error_text(
     assert diagnostic["transport_error_kind"] == expected
     assert diagnostic["transport_error_phase"] == stage
     assert "PRIVATE_TRANSPORT_DETAIL" not in json.dumps(recording.timings)
-    assert recording.timings[-1]["usage_complete"] is (stage == "count")
-    if stage == "count":
+    # A request that could not be sent proves zero usage; a sent one stays unknown.
+    unsent = stage == "count" or expected in {"connect_timeout", "pool_timeout"}
+    assert recording.timings[-1]["usage_complete"] is unsent
+    if unsent:
         assert caught.value.usage.total_tokens == 0
+        assert caught.value.usage.cost_estimate.status.value == "complete"
+    if stage == "count":
         assert diagnostic["generation_submitted_seconds"] is None
 
 
@@ -808,4 +812,7 @@ async def test_generation_http_errors_retain_status_without_invented_header_time
     assert attempt["generation_http_status"] == 503
     assert attempt["generation_headers_availability"] == "status_only"
     assert attempt["generation_headers_seconds"] is None
-    assert len(paths) == 2 and recorder.timings[0]["usage_complete"] is False
+    # An HTTP rejection before any generation proves zero usage.
+    assert len(paths) == 2 and recorder.timings[0]["usage_complete"] is True
+    assert caught.value.usage.total_tokens == 0
+    assert caught.value.usage.cost_estimate.status.value == "complete"

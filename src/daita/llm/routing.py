@@ -22,6 +22,7 @@ from ..security import SecretReference
 from ._lifecycle import (
     FIRST_PROGRESS_TIMEOUT,
     IDLE_PROGRESS_TIMEOUT,
+    UNSENT_TRANSPORT_FAILURES,
     NativeOwner,
     await_cleanup,
     closing_stream,
@@ -71,58 +72,6 @@ ProviderAdmission = Callable[
 @asynccontextmanager
 async def _unadmitted_provider_attempt() -> AsyncIterator[None]:
     yield None
-
-
-class AdmittedModelProvider:
-    """Place one non-router provider behind the host attempt permit boundary."""
-
-    def __init__(
-        self,
-        provider: ModelProvider,
-        *,
-        concurrency_key: str,
-        admission: ProviderAdmission,
-    ) -> None:
-        if not isinstance(concurrency_key, str) or not concurrency_key:
-            raise ValueError("provider concurrency key must be non-empty text")
-        if not callable(admission):
-            raise TypeError("provider admission must be callable")
-        self._provider = provider
-        self._concurrency_key = concurrency_key
-        self._admission = admission
-
-    @property
-    def provider_id(self) -> str:
-        return self._provider.provider_id
-
-    def supports_request_policy(self, request: ModelRequest) -> bool:
-        return provider_supports_request_policy(self._provider, request)
-
-    def has_complete_pricing(self, request: ModelRequest) -> bool:
-        return provider_has_complete_pricing(self._provider, request)
-
-    async def generate(self, request: ModelRequest) -> ModelResponse:
-        permit = await self._admission(self._concurrency_key, request.deadline)
-        async with permit:
-            return await self._provider.generate(request)
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        provider = self._provider
-        if not isinstance(provider, StreamingModelProvider):
-            permit = await self._admission(self._concurrency_key, request.deadline)
-            async with permit:
-                response = await provider.generate(request)
-            yield ModelStreamCompleted(response)
-            return
-        permit = await self._admission(self._concurrency_key, request.deadline)
-        async with permit:
-            async with closing_stream(provider.stream(request)) as events:
-                async for event in events:
-                    yield event
-
-    async def close(self, *, deadline: float | None = None) -> None:
-        if isinstance(self._provider, ManagedModelProvider):
-            await self._provider.close(deadline=deadline)
 
 
 @dataclass(frozen=True, slots=True)
@@ -646,9 +595,7 @@ class ModelRouter:
             for registration in candidates:
                 if not _eligible(registration, request):
                     continue
-                if not registration.profile.supports_streaming or not isinstance(
-                    registration.provider, StreamingModelProvider
-                ):
+                if not registration.profile.supports_streaming:
                     continue
                 for attempt in range(self._retry_policy.max_attempts_per_candidate):
                     attempt_request = self._admit_attempt(
@@ -668,7 +615,9 @@ class ModelRouter:
                         )
                         async with permit:
                             async with closing_stream(
-                                registration.provider.stream(attempt_request)
+                                _candidate_stream(
+                                    registration.provider, attempt_request
+                                )
                             ) as events:
                                 async for event in events:
                                     # Completion is visible progress. The permit is
@@ -907,12 +856,44 @@ def _require_recoverable_usage(
             or request.max_estimated_cost_usd is not None
         )
         and error.usage.cost_estimate.status is not CostEstimateStatus.COMPLETE
-        and not (request.max_estimated_cost_usd is None and _unreported_stall(error))
+        and not (
+            request.max_estimated_cost_usd is None and _failed_before_output(error)
+        )
     ):
         raise _aggregate_failure(error, usage) from None
 
 
 _STALL_TIMEOUT_CODES = frozenset({FIRST_PROGRESS_TIMEOUT, IDLE_PROGRESS_TIMEOUT})
+
+
+def _failed_before_output(error: ModelProviderError) -> bool:
+    """A transient failure that ended an attempt before any model output.
+
+    The caller has already excluded visible or terminal output and unresolved
+    cleanup. Rate limits, unavailable providers (5xx and dropped connections),
+    silent stalls and unsent transport timeouts produced nothing the run could
+    observe, so replaying the identical request is safe. Their consumption may
+    be unreported: without a dollar cap the token limit can be exceeded by at
+    most one unmeasured attempt per replay within the bounded retry policy, and
+    a dollar-capped request replays only when the attempt proved zero usage.
+    Attempt-deadline timeouts may have generated unobservable output and are
+    never exempt.
+    """
+
+    if error.code in {
+        ProviderErrorCode.RATE_LIMIT_ERROR,
+        ProviderErrorCode.PROVIDER_UNAVAILABLE,
+    }:
+        return True
+    if error.code is not ProviderErrorCode.TIMEOUT:
+        return False
+    if _unreported_stall(error):
+        return True
+    attempt = None if error.diagnostic is None else error.diagnostic.attempt
+    return (
+        attempt is not None
+        and attempt.get("transport_error_kind") in UNSENT_TRANSPORT_FAILURES
+    )
 
 
 def _unreported_stall(error: ModelProviderError) -> bool:
@@ -932,6 +913,22 @@ def _unreported_stall(error: ModelProviderError) -> bool:
         and diagnostic is not None
         and diagnostic.code in _STALL_TIMEOUT_CODES
     )
+
+
+def _candidate_stream(
+    provider: ModelProvider, request: ModelRequest
+) -> AsyncIterator[ModelStreamEvent]:
+    """Stream a candidate directly, or present generate-only work as completion."""
+
+    if isinstance(provider, StreamingModelProvider):
+        return provider.stream(request)
+    return _generated_stream(provider, request)
+
+
+async def _generated_stream(
+    provider: ModelProvider, request: ModelRequest
+) -> AsyncIterator[ModelStreamEvent]:
+    yield ModelStreamCompleted(await provider.generate(request))
 
 
 def _attempt_usage(error: ModelProviderError) -> ModelUsage:
@@ -1007,7 +1004,6 @@ def _aggregate_usage(items: Iterable[ModelUsage]) -> ModelUsage:
 
 
 __all__ = [
-    "AdmittedModelProvider",
     "ModelProviderRegistration",
     "ModelRoute",
     "ModelRouteCandidate",
