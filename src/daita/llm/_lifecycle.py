@@ -247,21 +247,26 @@ class NativeStream:
         self._demand.set()
         timeout = None
         lifecycle = self.lifecycle
-        if lifecycle is not None:
-            lifecycle.check_execution()
-            timeout = max(0, lifecycle._expiry()[0] - asyncio.get_running_loop().time())
-        done, _ = await asyncio.wait(
-            (self._result, self.task),
-            timeout=timeout,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if not done:
-            assert lifecycle is not None
-            lifecycle.timeout_reason = lifecycle._expiry()[1]
-            raise lifecycle._timeout_error()
+        while True:
+            if lifecycle is not None:
+                lifecycle.check_execution()
+                timeout = max(
+                    0, lifecycle._expiry()[0] - asyncio.get_running_loop().time()
+                )
+            done, _ = await asyncio.wait(
+                (self._result, self.task),
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Liveness the native task observed while waiting extends the stall
+            # deadline; check_execution raises once a real limit has passed.
+            if done:
+                break
         if self._result in done:
             present, value = self._result.result()
             if present:
+                if lifecycle is not None:
+                    lifecycle.alive()
                 return value
         else:
             self.task.result()
@@ -393,6 +398,7 @@ class AttemptLifecycle:
         self.phase = "admitted"
         self.first_progress: float | None = None
         self.last_progress: float | None = None
+        self.last_alive: float | None = None
         self.dispatched: float | None = None
         self.terminal_response = None
         self.canonical_emitted = False
@@ -419,11 +425,19 @@ class AttemptLifecycle:
             limits.append(
                 (
                     (
-                        (self.dispatched + self.policy.first_progress_timeout_seconds)
-                        if self.last_progress is None
-                        else (
-                            self.last_progress
-                            + self.policy.progress_idle_timeout_seconds
+                        max(
+                            mark
+                            for mark in (
+                                self.dispatched,
+                                self.last_progress,
+                                self.last_alive,
+                            )
+                            if mark is not None
+                        )
+                        + (
+                            self.policy.first_progress_timeout_seconds
+                            if self.last_progress is None
+                            else self.policy.progress_idle_timeout_seconds
                         )
                     ),
                     (
@@ -608,6 +622,37 @@ class AttemptLifecycle:
         if self.first_progress is None:
             self.first_progress = now
         self.last_progress = now
+
+    def alive(self) -> None:
+        """Native stream activity: the provider is still working, not output.
+
+        It resets only the stall window. The attempt deadline stays the hard cap,
+        and output-dependent decisions keep using ``progress``.
+        """
+        if self.phase == "generating":
+            self.last_alive = asyncio.get_running_loop().time()
+
+    def track_liveness(self, response: object) -> None:
+        """Count raw stream bytes, including keepalives an SDK discards, as alive."""
+        import httpx
+
+        if not isinstance(response, httpx.Response):
+            return
+        if not isinstance(response.stream, httpx.AsyncByteStream):
+            return
+        source: httpx.AsyncByteStream = response.stream
+        attempt = self
+
+        class LiveResponseStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                async for chunk in source:
+                    attempt.alive()
+                    yield chunk
+
+            async def aclose(self) -> None:
+                await source.aclose()
+
+        response.stream = LiveResponseStream()
 
     def canonical(self, event) -> None:
         self._require_phase("generating", "terminal_received")

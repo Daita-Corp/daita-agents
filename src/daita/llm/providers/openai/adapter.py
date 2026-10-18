@@ -395,9 +395,7 @@ class OpenAIResponsesProvider:
                 lambda: self.client.responses.create(
                     **arguments, timeout=transport_timeout(request)
                 ),
-                observe=lambda stream: self._observe_headers(
-                    attempt, "generation", _safe_field(stream, "response")
-                ),
+                observe=lambda stream: self._observe_stream(attempt, stream),
             )
         except asyncio.CancelledError:
             raise
@@ -471,6 +469,13 @@ class OpenAIResponsesProvider:
             )
         except Exception:
             pass  # Optional diagnostics cannot change provider execution.
+
+    @classmethod
+    def _observe_stream(cls, attempt: AttemptLifecycle, stream: object) -> None:
+        response = _safe_field(stream, "response")
+        # The SDK drops SSE keepalives; raw bytes still prove the provider is working.
+        attempt.track_liveness(response)
+        cls._observe_headers(attempt, "generation", response)
 
     @staticmethod
     def _observe_headers(
