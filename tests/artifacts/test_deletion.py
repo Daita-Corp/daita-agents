@@ -23,7 +23,7 @@ from daita.artifacts.models import (
 from daita.capabilities import ArtifactPolicy
 from daita.errors import StateCompatibilityError
 from daita.hosting import home_upgrade
-from daita.hosting.embedded import _validate_agent_home_target
+from daita.hosting.agent_home import _validate_agent_home_target
 from daita.llm.models import FinishReason, ModelResponse
 from daita.storage.home_migrations.revision_0003 import PRE_REGISTRY_REVISION_3_CHECKSUM
 from tests.artifacts._public_surface_support import (

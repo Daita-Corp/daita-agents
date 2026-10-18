@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-import daita.hosting.embedded as embedded
+import daita.hosting.configuration as configuration
 from daita import Agent, SQLiteSource, cli
 from daita.adapters.models import SourceRegistration
 from daita.agent import AgentHomeError
@@ -174,7 +174,9 @@ async def test_detach_deletes_only_an_owned_postgresql_credential(
     )
     try:
         reference = SecretReference.keychain(
-            embedded._credential_account(agent.id, "postgresql", "credential-fixed")
+            configuration._credential_account(
+                agent.id, "postgresql", "credential-fixed"
+            )
         )
         keychain.values[reference.name] = "secret"
         registration = SourceRegistration.build(
@@ -249,7 +251,7 @@ async def test_agent_delete_accepts_incompatible_preproduction_source_state(
         "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
     )
     reference = SecretReference.keychain(
-        embedded._credential_account(agent.id, "postgresql", "credential-fixed")
+        configuration._credential_account(agent.id, "postgresql", "credential-fixed")
     )
     keychain.values[reference.name] = "secret"
     registration = SourceRegistration.build(

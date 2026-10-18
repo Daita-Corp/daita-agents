@@ -13,7 +13,7 @@ import openai
 import pytest
 from google import genai
 
-import daita.hosting.embedded as embedded_module
+import daita.hosting.configuration as configuration
 import daita.llm.factory as factory_module
 from daita import Agent, AgentConfig
 from daita.llm._lifecycle import closing_stream
@@ -379,7 +379,7 @@ async def test_host_closes_its_configured_provider_after_run_drain(
 
     monkeypatch.setattr(provider, "generate", generate)
     monkeypatch.setattr(
-        embedded_module,
+        configuration,
         "create_model_route_provider",
         lambda *_args, **_kwargs: provider,
     )
@@ -500,7 +500,7 @@ async def test_host_closes_separate_configured_primary_and_reviewer_routes(
     reviewer = _ManagedProvider()
     providers = iter((primary, reviewer))
     monkeypatch.setattr(
-        embedded_module,
+        configuration,
         "create_model_route_provider",
         lambda *_args, **_kwargs: next(providers),
     )
@@ -626,12 +626,12 @@ async def test_temporary_route_validation_closes_its_owned_provider(
         )
     )
     monkeypatch.setattr(
-        embedded_module,
+        configuration,
         "create_model_route_provider",
         lambda *_args, **_kwargs: provider,
     )
 
-    await embedded_module._validate_model_route(
+    await configuration._validate_model_route(
         _route(),
         secret_provider=EmptySecretProvider(),
         injected_provider=None,
@@ -655,7 +655,7 @@ async def test_route_validation_keeps_an_injected_provider_borrowed() -> None:
         )
     )
 
-    await embedded_module._validate_model_route(
+    await configuration._validate_model_route(
         _route(),
         secret_provider=EmptySecretProvider(),
         injected_provider=provider,

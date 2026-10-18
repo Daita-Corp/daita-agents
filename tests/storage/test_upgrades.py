@@ -20,7 +20,7 @@ import pytest
 from daita import Agent, AgentConfig, SQLiteSource, cli
 from daita.errors import StateCompatibilityCode, StateCompatibilityError
 from daita.hosting import home_upgrade as coordinator
-from daita.hosting.embedded import (
+from daita.hosting.configuration import (
     _encode_model_profile,
     _model_route,
     _write_model_configuration,

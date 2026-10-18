@@ -2,7 +2,7 @@ from unittest.mock import patch
 
 import pytest
 
-import daita.hosting.embedded as embedded
+import daita.hosting.configuration as configuration
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
@@ -80,11 +80,11 @@ async def test_model_validation_reserves_output_for_reasoning(
         return provider
 
     with patch.object(
-        embedded,
+        configuration,
         "create_model_route_provider",
         side_effect=create_provider,
     ):
-        await embedded._validate_model_route(
+        await configuration._validate_model_route(
             route,
             secret_provider=EmptySecretProvider(),
             injected_provider=None,
@@ -217,7 +217,7 @@ async def test_validation_keeps_original_deadline_and_one_attempt(
     monkeypatch.setattr(
         "daita.llm.factory.create_llm_provider", lambda *a, **kw: provider
     )
-    original = embedded._require_validated_model_provider
+    original = configuration._require_validated_model_provider
     observed = {}
 
     async def delayed_validation(model, *, call_policy, deadline):
@@ -229,13 +229,13 @@ async def test_validation_keeps_original_deadline_and_one_attempt(
         await original(model, call_policy=call_policy, deadline=deadline)
 
     monkeypatch.setattr(
-        embedded, "_require_validated_model_provider", delayed_validation
+        configuration, "_require_validated_model_provider", delayed_validation
     )
     start = asyncio.get_running_loop().time()
     try:
         if fails:
             with pytest.raises(ModelProviderError) as caught:
-                await embedded._validate_model_route(
+                await configuration._validate_model_route(
                     route,
                     secret_provider=EmptySecretProvider(),
                     injected_provider=provider if injected else None,
@@ -243,7 +243,7 @@ async def test_validation_keeps_original_deadline_and_one_attempt(
                 )
             assert caught.value.code is ProviderErrorCode.PROVIDER_UNAVAILABLE
         else:
-            await embedded._validate_model_route(
+            await configuration._validate_model_route(
                 route,
                 secret_provider=EmptySecretProvider(),
                 injected_provider=provider if injected else None,

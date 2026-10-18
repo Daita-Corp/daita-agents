@@ -127,7 +127,11 @@ receipts are stored in one SQLite database inside the agent home.
 ```text
 src/daita/
   agent.py                    # public Agent facade
-  hosting/embedded.py         # composition, agent-home admission, locks
+  hosting/embedded.py         # composition, lifecycle, locks, public operations
+  hosting/agent_home.py       # agent-home directory admission, manifest, writer lock
+  hosting/configuration.py    # persisted model configuration, credentials, model admission
+  hosting/sources.py          # source selection, edit previews, permission inspection
+  hosting/errors.py           # agent-home and composition errors
   hosting/resident.py         # headless host for the same composition
   loop/                       # direct transcript progression and run records
   llm/                        # canonical model records, routing, adapters

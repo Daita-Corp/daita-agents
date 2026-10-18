@@ -25,7 +25,7 @@ from daita.domains.data.capabilities import (
     relational_update_capability_declarations,
     relational_update_preview_capability_declarations,
 )
-from daita.hosting import embedded as embedded_module
+from daita.hosting import sources
 from daita.security import EmptySecretProvider, SecretReference
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
 from tests.support.workspace import workspace_for
@@ -129,7 +129,7 @@ async def test_default_read_scope_round_trips_through_agent_reopen(tmp_path):
     )
     try:
         assert await reopened.list_sources() == (registration,)
-        reconstructed = embedded_module._source_from_registration(
+        reconstructed = sources._source_from_registration(
             registration,
             secret_provider=EmptySecretProvider(),
         )

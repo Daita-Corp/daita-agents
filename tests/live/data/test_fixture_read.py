@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-import daita.hosting.embedded as embedded
+import daita.hosting.configuration as configuration
 from daita import Agent
 from daita._json import canonical_json
 from daita.llm.models import (
@@ -284,7 +284,7 @@ async def test_zero_argument_onboarding_through_grounded_postgresql_answer(
     )
     provider = _GroundedFixtureProvider()
     monkeypatch.setattr(
-        embedded,
+        configuration,
         "create_model_route_provider",
         lambda route, *, secret_provider=None: provider,
     )

@@ -142,7 +142,7 @@ def test_ratified_graph_target_has_one_execution_path_and_closed_model_origins()
     }
     host_origins = _files_with_method_call(PACKAGE, "generate") - provider_internals
     assert host_origins == {
-        "hosting/embedded.py",
+        "hosting/configuration.py",
         "learning_candidates.py",
         "loop/driver.py",
     }
@@ -355,8 +355,7 @@ def test_local_workspace_backend_is_explicit_and_conditionally_composed():
     assert "LocalDirectoryReadBackend" not in compose_text
     assert "local_file_declarations(workspace_backend)" in compose_text
     assert "if workspace_backend is None" in compose_text
-    assert "local_files.capabilities if local_files is not None else ()" in compose_text
-    assert "local_files.tool_views if local_files is not None else ()" in compose_text
+    assert "routine_precheck,\n            local_files,\n        )" in compose_text
     assert "local_files.executors if local_files is not None else ()" in compose_text
 
 

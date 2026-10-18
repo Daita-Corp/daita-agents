@@ -333,7 +333,7 @@ async def test_machine_calls_revalidate_retained_contracts_after_preparation(
     machine_origin: RunOrigin,
 ) -> None:
     from daita.capabilities import CapabilityInputError, ExecutionContractBindings
-    from daita.hosting.embedded import _model_execution_contracts
+    from daita.hosting.configuration import _model_execution_contracts
     from daita.llm import ModelCallPolicy
     from daita.llm.providers.mock import MockModelProvider
 

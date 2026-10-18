@@ -9,7 +9,7 @@ unreviewed-profile defaults have one owner:
 The consumers are deliberately separate:
 
 - `llm/factory.py` resolves configured credentials and builds routes;
-- `hosting/embedded.py` admits and persists model selections;
+- `hosting/configuration.py` admits and persists model selections;
 - `tui/` derives provider choices and authentication prompts; and
 - `llm/providers/` owns native requests, responses, streaming grammar, and SDK
   or official-client shutdown.
