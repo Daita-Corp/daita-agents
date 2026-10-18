@@ -943,3 +943,117 @@ async def test_routine_save_creates_with_narrow_defaults_and_replaces_one_exact_
         assert after.title == "Revised report"
     finally:
         await agent.close()
+
+
+async def test_routine_save_rejects_run_local_refs_in_the_instruction(tmp_path):
+    from daita.capabilities import ApprovalDecision
+    from daita.distribution import outcome_contract_projection
+    from daita.llm.models import ToolCall, ToolResultBlock
+    from tests.support.toolbox_model import ToolboxAwareMockModelProvider
+
+    database = tmp_path / "crm.sqlite"
+    connection = sqlite3.connect(database)
+    connection.execute("CREATE TABLE companies (name TEXT NOT NULL)")
+    connection.commit()
+    connection.close()
+
+    async def approve(request):
+        return ApprovalDecision.APPROVE
+
+    provider = ToolboxAwareMockModelProvider(
+        [ModelResponse(finish_reason=FinishReason.STOP, text="Ready.")]
+    )
+    agent = await Agent.create(
+        "routine-scope-refs",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=provider,
+        model_profile=provider.model_profile,
+        approval_handler=approve,
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database, name="CRM"))
+        resource = (await agent.list_catalog_resources(source_id=source.id))[0]
+        origin = await agent.run("Plan a weekly companies upsert.")
+        destinations = await agent.distribution_destinations(origin.conversation_id)
+        now = datetime.now(UTC)
+        arguments = {
+            "title": "Weekly companies upsert",
+            "schedule": {
+                "kind": "interval",
+                "interval_seconds": 7 * 86_400,
+                "anchor_at": (now + timedelta(days=7)).isoformat(),
+            },
+            "misfire_policy": "latest_only",
+            "reporting_mode": "always",
+            # Handles in id fields resolve at call time and stay correct.
+            "allowed_source_ids": ("s1",),
+            "allowed_resource_ids": ("t1",),
+            "allowed_connector_binding_ids": (),
+            "allowed_capability_ids": ("catalog.describe",),
+            "sensitivity_ceiling": "internal",
+            "outcome_contract": outcome_contract_projection(
+                no_artifact_outcome_contract()
+            ),
+            "distribution_destination_id": destinations[0].destination_id,
+            "eligible_model_routes": (provider.provider_id,),
+            "per_run_max_tokens": 100_000,
+            "per_run_max_cost_usd": "0.50",
+            "cumulative_max_tokens": 200_000,
+            "cumulative_max_cost_usd": "1.00",
+            "cumulative_max_attempts": 10,
+            "cumulative_max_occurrences": 10,
+            "maximum_consecutive_failures": 3,
+            "expires_at": (now + timedelta(days=30)).isoformat(),
+            "skill_names": (),
+            "run_immediately": False,
+        }
+        stale = {
+            **arguments,
+            "authorized_instruction": "Upsert this week's rows into t1.",
+        }
+        stable = {
+            **arguments,
+            "authorized_instruction": "Upsert this week's rows into companies.",
+        }
+        provider.replace_script(
+            [
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=(ToolCall("stale", "routine_save", stale),),
+                ),
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=(ToolCall("stable", "routine_save", stable),),
+                ),
+                ModelResponse(finish_reason=FinishReason.STOP, text="Saved."),
+            ]
+        )
+        result = await agent.run(
+            "Save the weekly companies upsert.",
+            conversation_id=origin.conversation_id,
+        )
+        assert result.kind.value == "completed"
+        provider.assert_consumed()
+        (rejected,) = [
+            block
+            for message in provider.logical_requests[-2].messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock) and block.call_id == "stale"
+        ]
+        error = rejected.output["error"]
+        assert isinstance(error, Mapping)
+        assert error["code"] == "routine_instruction_scope_ref"
+        assert isinstance(details := error["details"], Mapping)
+        assert isinstance(recovery := details["recovery"], Mapping)
+        assert recovery["kind"] == "correct_arguments"
+        assert f"t1 is {resource.id}" in recovery["constraint"]
+        (saved,) = await agent.list_routines()
+        inspection = await agent.inspect_routine(saved.routine_id)
+        assert inspection is not None
+        assert inspection.routine.authorized_instruction == (
+            stable["authorized_instruction"]
+        )
+        assert inspection.routine.allowed_resource_ids == (resource.id,)
+    finally:
+        await agent.close()
