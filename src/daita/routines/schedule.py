@@ -168,24 +168,31 @@ def select_due_slot(
 
     due_count = 1
     latest = materialized_due_at
-    cursor = materialized_due_at
-    while due_count <= MAX_ROUTINE_OCCURRENCES:
-        following = next_slot(schedule, after=cursor, expires_at=expires_at)
-        if following is None or following > now:
-            if due_count == 1:
-                selected = latest
-                skipped = 0
-            elif misfire_policy is MisfirePolicy.LATEST_ONLY:
-                selected = latest
-                skipped = due_count - 1
-            else:
-                selected = None
-                skipped = due_count
-            return DueSlotSelection(selected, following, skipped)
-        latest = following
-        cursor = following
-        due_count += 1
-    raise ValueError("missed schedule exceeds the occurrence bound")
+    if isinstance(schedule, IntervalSchedule):
+        # Interval backlogs are arithmetic, so no outage length is unselectable.
+        interval = timedelta(seconds=schedule.interval_seconds)
+        first = _next_slot(schedule, boundary=materialized_due_at, inclusive=False)
+        assert first is not None
+        limit = min(now, expires_at)
+        if first <= limit:
+            missed = (limit - first) // interval
+            latest = first + missed * interval
+            due_count += missed + 1
+        following = next_slot(schedule, after=now, expires_at=expires_at)
+    else:
+        while True:
+            following = next_slot(schedule, after=latest, expires_at=expires_at)
+            if following is None or following > now:
+                break
+            if due_count >= MAX_ROUTINE_OCCURRENCES:
+                raise ValueError("missed schedule exceeds the occurrence bound")
+            latest = following
+            due_count += 1
+    if due_count == 1:
+        return DueSlotSelection(latest, following, 0)
+    if misfire_policy is MisfirePolicy.LATEST_ONLY:
+        return DueSlotSelection(latest, following, due_count - 1)
+    return DueSlotSelection(None, following, due_count)
 
 
 def scheduled_slot_key(
