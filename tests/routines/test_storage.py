@@ -401,6 +401,7 @@ async def test_claim_fault_rolls_back_occurrence_and_budget(
         "subscription_no_tokens",
         "subscription_replayed_stall",
         "subscription_other_unknown",
+        "occurrence_exhausted",
     ),
 )
 async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
@@ -416,7 +417,13 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
             draft = replace(
                 draft, per_run_max_cost_usd=None, cumulative_max_cost_usd=None
             )
-        if usage_case not in {"normal", "subscription", "subscription_replayed_stall"}:
+        if usage_case == "occurrence_exhausted":
+            draft = replace(draft, cumulative_max_occurrences=1)
+        elif usage_case not in {
+            "normal",
+            "subscription",
+            "subscription_replayed_stall",
+        }:
             draft = replace(
                 draft,
                 cumulative_max_tokens=5_000,
@@ -558,6 +565,7 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
         completed = usage_case in {
             "normal",
             "once",
+            "occurrence_exhausted",
             "subscription",
             "subscription_replayed_stall",
         }
@@ -595,6 +603,23 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
             assert persisted.charged_tokens == 100
             assert persisted.charged_cost_usd == Decimal("0")
             assert persisted.reserved_cost_usd == Decimal("0")
+        elif usage_case == "occurrence_exhausted":
+            # A used-up allowance cannot stay ACTIVE with an unclaimable past due.
+            assert persisted.state is RoutineState.NEEDS_ATTENTION
+            assert persisted.next_due_at is None
+            assert await store.next_routine_deadline(routine.agent_id) is None
+            with pytest.raises(ValueError, match="routine_occurrence_budget_exhausted"):
+                await store.transition_scheduled_routine(
+                    routine.agent_id,
+                    routine.routine_id,
+                    expected_revision=persisted.revision,
+                    state=RoutineState.ACTIVE,
+                    transitioned_at=NOW + timedelta(hours=2),
+                )
+            assert (
+                await store.load_scheduled_routine(routine.agent_id, routine.routine_id)
+                == persisted
+            )
         elif usage_case == "once":
             assert persisted.next_due_at is None
             assert persisted.state is RoutineState.COMPLETED

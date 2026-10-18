@@ -1221,9 +1221,17 @@ def list_ready_tasks(
     )
     tasks = []
     for job_id, task_id in rows:
+        # List only what claim_task would accept, or the supervisor spins on it.
+        loaded_job = _load_job(connection, agent_id, str(job_id))
+        loaded_graph = _load_graph(connection, agent_id, str(job_id))
         loaded = _load_task(connection, agent_id, str(job_id), str(task_id))
-        if loaded is not None and _dependencies_satisfied(
-            connection, agent_id, str(job_id), str(task_id)
+        if (
+            loaded_job is not None
+            and loaded_graph is not None
+            and loaded is not None
+            and _task_claimable(
+                connection, loaded_job[0], loaded_graph[0], loaded[0], now
+            )
         ):
             tasks.append(loaded[0])
             if len(tasks) == limit:
@@ -1950,6 +1958,26 @@ def _finalizer_barrier_satisfied(
     return blocked is None and controls is None
 
 
+def _task_claimable(
+    connection: SQLConnection,
+    job: GraphJob,
+    graph: JobGraph,
+    task: GraphTask,
+    now: datetime,
+) -> bool:
+    return (
+        job.state in {GraphState.QUEUED, GraphState.ACTIVE}
+        and job.desired_state is GraphDesiredState.RUN
+        and job.deadline_at > now
+        and task.state is TaskState.READY
+        and (task.not_before is None or task.not_before <= now)
+        and task.attempt_count < job.specification.limits.max_attempts_per_task
+        and graph.active_attempt_count < job.specification.limits.max_parallelism
+        and _dependencies_satisfied(connection, job.agent_id, job.job_id, task.task_id)
+        and _finalizer_barrier_satisfied(connection, job, task)
+    )
+
+
 def _reserve_budgets(
     connection: SQLConnection,
     *,
@@ -2187,17 +2215,7 @@ def claim_task(
     job, job_data = loaded_job
     graph, graph_data = loaded_graph
     task, task_data = loaded_task
-    if (
-        job.state not in {GraphState.QUEUED, GraphState.ACTIVE}
-        or job.desired_state is not GraphDesiredState.RUN
-        or job.deadline_at <= claimed_at
-        or task.state is not TaskState.READY
-        or (task.not_before is not None and task.not_before > claimed_at)
-        or task.attempt_count >= job.specification.limits.max_attempts_per_task
-        or graph.active_attempt_count >= job.specification.limits.max_parallelism
-        or not _dependencies_satisfied(connection, agent_id, job_id, task_id)
-        or not _finalizer_barrier_satisfied(connection, job, task)
-    ):
+    if not _task_claimable(connection, job, graph, task, claimed_at):
         return None
     if not 1 <= lease_seconds <= 300:
         raise ValueError("task claim lease is outside its bound")
