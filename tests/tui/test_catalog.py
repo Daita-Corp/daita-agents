@@ -482,7 +482,14 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
                 composer = app.screen.query_one(Composer)
                 composer.load_text("/catalog")
                 composer.action_submit()
-                await settle_until(pilot, lambda: bool(app.screen.query("FooterKey")))
+                # The footer fills its keys after the screen switch.
+                for _ in range(200):
+                    await pilot.pause(0.05)
+                    current = app.screen
+                    if isinstance(current, CatalogScreen) and current.query(
+                        "FooterKey"
+                    ):
+                        break
                 assert isinstance(app.screen, CatalogScreen)
                 assert await pilot.click("FooterKey") is True
                 await pilot.pause()
