@@ -299,7 +299,11 @@ class OpenAICompatibleProvider:
             source = native_events(
                 lambda: self.client.chat.completions.create(
                     **arguments, timeout=transport_timeout(request)
-                )
+                ),
+                # The SDK drops SSE keepalives; raw bytes still prove liveness.
+                observe=lambda stream: attempt.track_liveness(
+                    getattr(stream, "response", None)
+                ),
             )
         except ModelProviderError:
             raise
