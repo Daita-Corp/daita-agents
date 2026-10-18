@@ -202,11 +202,15 @@ class RoutineSupervisor:
                             await self._claim_one_due()
                     timeout = self._poll_seconds
                     deadline = await self._store.next_routine_deadline(self._agent_id)
-                    if deadline is not None:
-                        timeout = min(
-                            timeout,
-                            max(0.05, (deadline - self._clock()).total_seconds()),
-                        )
+                    remaining = (
+                        None
+                        if deadline is None
+                        else (deadline - self._clock()).total_seconds()
+                    )
+                    # A deadline already past was unclaimable this pass (quota hold,
+                    # no model); keep the normal poll instead of hot-looping on it.
+                    if remaining is not None and remaining > 0:
+                        timeout = min(timeout, max(0.05, remaining))
                 except AdmissionClosedError:
                     self._stop_for_host_close()
                     break
