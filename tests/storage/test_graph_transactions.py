@@ -9,11 +9,13 @@ from pathlib import Path
 import pytest
 
 from daita.jobs.graph.models import (
+    MAX_GRAPH_JOBS_PER_AGENT,
     BudgetAmount,
     GraphMutationRequest,
     MutationDecision,
     TaskState,
 )
+from daita.jobs.graph.validation import GraphValidationError
 from daita.storage import sql_graph as sqlite_graph
 from daita.storage.sqlite import SQLiteStateStore
 from tests.support.graph import GRAPH_NOW, graph_admission
@@ -81,3 +83,23 @@ async def test_graph_inspection_uses_one_read_snapshot(
     assert current is not None
     assert current.graph.revision == 1
     assert current.graph.task_count == len(current.tasks) == 3
+
+
+async def test_graph_job_bound_is_enforced_at_admission_and_home_reopens(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.db"
+    store = await SQLiteStateStore.open(path)
+    try:
+        for ordinal in range(MAX_GRAPH_JOBS_PER_AGENT):
+            await store.admit_graph(graph_admission(job_id=f"job-{ordinal}"))
+        with pytest.raises(GraphValidationError) as refused:
+            await store.admit_graph(graph_admission(job_id="job-over-bound"))
+        assert refused.value.code == "graph_job_limit"
+    finally:
+        await store.close()
+    reopened = await SQLiteStateStore.open(path)
+    try:
+        assert await reopened.inspect_graph("agent-1", "job-over-bound") is None
+    finally:
+        await reopened.close()

@@ -656,6 +656,40 @@ async def test_finalizer_seal_releases_for_replan_and_mutation_replays(
                     fencing_epoch=planner_attempt.fencing_epoch + 1,
                 )
             )
+        listed_at = integration.clock() + timedelta(seconds=8)
+        ready = await integration.store.list_ready_graph_tasks(AGENT_ID, now=listed_at)
+        # The released finalizer stays unlisted until its barrier holds.
+        assert [item.task_id for item in ready] == [child.task_id]
+        child_attempt = await _claim_and_start(
+            integration.store,
+            agent_id=AGENT_ID,
+            job_id=admission.job.job_id,
+            task_id=child.task_id,
+            attempt_id="attempt-planned-child",
+            at=listed_at,
+        )
+        for task_id, attempt in (
+            (child.task_id, child_attempt),
+            (planner.task_id, planner_attempt),
+        ):
+            await integration.store.complete_graph_attempt(
+                task_result(
+                    agent_id=AGENT_ID,
+                    job_id=admission.job.job_id,
+                    task_id=task_id,
+                    attempt_id=attempt.attempt_id,
+                    run_id=attempt.run_id,
+                    result_id=f"result-{task_id}",
+                    completed_at=listed_at + timedelta(seconds=1),
+                ),
+                claim_token=attempt.claim_token,
+                fencing_epoch=attempt.fencing_epoch,
+                usage=(BudgetAmount("work_units", 1),),
+            )
+        ready = await integration.store.list_ready_graph_tasks(
+            AGENT_ID, now=listed_at + timedelta(seconds=2)
+        )
+        assert [item.task_id for item in ready] == [finalizer.task_id]
     finally:
         await integration.close()
 
