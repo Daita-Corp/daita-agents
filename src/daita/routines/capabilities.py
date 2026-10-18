@@ -467,7 +467,7 @@ class RoutineCapabilityDomain:
     ) -> CapabilityFailure | None:
         del call
         if isinstance(error, RoutineError):
-            return CapabilityFailure(error.code, str(error))
+            return CapabilityFailure(error.code, str(error), error.details)
         return None
 
 

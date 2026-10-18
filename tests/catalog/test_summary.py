@@ -682,6 +682,8 @@ async def test_embedded_exact_name_anchor_outranks_128_lookalikes_and_has_bounda
         assert isinstance(first, Mapping)
         assert first["resource_id"] == result.hits[0].resource_id
         assert first["match_reasons"] == ("resource_name_exact_mention",)
+        # Scoped SQL without a describe grant needs the source-qualified name.
+        assert first["native_identity"] == f"main.{first['name']}"
         assert context["total_matches"] == 129
         assert context["returned_count"] == 12
         assert context["truncated"] is True
