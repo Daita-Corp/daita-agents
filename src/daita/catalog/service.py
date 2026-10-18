@@ -2856,6 +2856,11 @@ class CatalogService:
                             "kind": hit.kind.value,
                             "match_reasons": hit.match_reasons,
                             "name": hit.name,
+                            # Source-qualified identity lets scoped SQL address
+                            # the resource without a separate describe grant.
+                            "native_identity": resources_by_id[
+                                hit.resource_id
+                            ].native_identity,
                             "resource_id": hit.resource_id,
                             "revision": hit.revision,
                             "sensitivity": hit.sensitivity.value,
