@@ -510,6 +510,8 @@ def transition_routine(
     if state is RoutineState.ACTIVE:
         if current.model_budget_exhausted:
             raise ValueError("routine_model_budget_exhausted")
+        if current.occurrence_allowance_exhausted:
+            raise ValueError("routine_occurrence_budget_exhausted")
         if current.capability_grants:
             _require_effects_unblocked(connection, agent_id, routine_id=routine_id)
         due = next_slot(
@@ -682,10 +684,7 @@ def _claim_routine_slot(
         _require_effects_unblocked(
             connection, current.agent_id, routine_id=current.routine_id
         )
-    if (
-        current.attempt_count >= current.cumulative_max_attempts
-        or current.occurrence_count >= current.cumulative_max_occurrences
-    ):
+    if current.occurrence_allowance_exhausted:
         raise ValueError("routine_occurrence_budget_exhausted")
     if current.model_budget_exhausted:
         raise ValueError("routine_model_budget_exhausted")
@@ -1292,7 +1291,10 @@ def finalize_occurrence(
         following = None
     else:
         next_state = RoutineState.ACTIVE
-    if next_state is RoutineState.ACTIVE and accounted_routine.model_budget_exhausted:
+    if next_state is RoutineState.ACTIVE and (
+        accounted_routine.model_budget_exhausted
+        or accounted_routine.occurrence_allowance_exhausted
+    ):
         next_state = RoutineState.NEEDS_ATTENTION
         following = None
     if uncertain_effect:
