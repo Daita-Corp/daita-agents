@@ -118,7 +118,10 @@ async def test_parser_cleanup_failure_blocks_success_and_recovers_terminal_run(
     async def fault(worker):
         candidate = worker.scratch / "candidate.bin"
         if candidate.exists():
-            getattr(os, "chflags")(candidate, stat.UF_IMMUTABLE)
+            # Cleanup clears user flags, so block deletion with a deny ACL instead.
+            subprocess.run(
+                ["chmod", "+a", "everyone deny delete", candidate], check=True
+            )
             parsers.append(worker)
         await original(worker)
 
@@ -145,7 +148,9 @@ async def test_parser_cleanup_failure_blocks_success_and_recovers_terminal_run(
             await Agent.open(
                 "recovery", root=tmp_path, workspace=workspace_for(tmp_path)
             )
-        getattr(os, "chflags")(parsers[0].scratch / "candidate.bin", 0)
+        subprocess.run(
+            ["chmod", "-N", parsers[0].scratch / "candidate.bin"], check=True
+        )
         agent = await Agent.open(
             "recovery", root=tmp_path, workspace=workspace_for(tmp_path)
         )
@@ -163,7 +168,9 @@ async def test_parser_cleanup_failure_blocks_success_and_recovers_terminal_run(
         await agent.close()
         for worker in parsers:
             if worker.scratch.exists():
-                getattr(os, "chflags")(worker.scratch / "candidate.bin", 0)
+                subprocess.run(
+                    ["chmod", "-N", worker.scratch / "candidate.bin"], check=True
+                )
                 from daita.adapters.analytical_workspace.cleanup import (
                     remove_owned_scratch,
                 )
@@ -932,3 +939,33 @@ async def test_uncertain_generation_blocks_open_before_run_finalization(tmp_path
         await agent.close()
         await worker.close()
         worker.dispose_closure_evidence()
+
+
+@pytest.mark.skipif(
+    not hasattr(stat, "UF_IMMUTABLE") or not hasattr(os, "chflags"),
+    reason="user file flags are BSD/macOS only",
+)
+def test_owned_scratch_cleanup_clears_user_flags_without_following_links(tmp_path):
+    from daita.adapters.analytical_workspace.cleanup import remove_owned_scratch
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep", encoding="utf-8")
+    scratch = tmp_path / "scratch"
+    locked = scratch / "locked"
+    locked.mkdir(parents=True)
+    (locked / "inner.txt").write_text("x", encoding="utf-8")
+    (scratch / "frozen.txt").write_text("x", encoding="utf-8")
+    (scratch / "link").symlink_to(outside)
+    os.chflags(scratch / "frozen.txt", stat.UF_IMMUTABLE)
+    os.chflags(locked, stat.UF_APPEND)
+    try:
+        identity = scratch.lstat()
+        remove_owned_scratch(scratch, identity.st_dev, identity.st_ino)
+    finally:
+        for path in (scratch / "frozen.txt", locked):
+            if path.exists():
+                os.chflags(path, 0)
+
+    assert not scratch.exists()
+    assert outside.read_text(encoding="utf-8") == "keep"
+    assert outside.lstat().st_flags == 0

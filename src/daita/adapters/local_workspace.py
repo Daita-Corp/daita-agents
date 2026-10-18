@@ -53,12 +53,9 @@ _LOCAL_QUERY_FORMATS = {
 }
 _SEARCH_NOISE_DIRECTORIES = frozenset(
     {
-        ".git",
-        ".hg",
         ".mypy_cache",
         ".pytest_cache",
         ".ruff_cache",
-        ".svn",
         ".tox",
         ".venv",
         "__pycache__",
@@ -67,14 +64,22 @@ _SEARCH_NOISE_DIRECTORIES = frozenset(
         "node_modules",
     }
 )
-_RESTRICTED_DIRECTORY_NAMES = frozenset({".aws", ".daita", ".gnupg", ".ssh"})
+_RESTRICTED_DIRECTORY_NAMES = frozenset(
+    {".aws", ".daita", ".docker", ".git", ".gnupg", ".hg", ".kube", ".ssh", ".svn"}
+)
 _RESTRICTED_FILE_NAMES = frozenset(
     {
+        ".git-credentials",
         ".netrc",
+        ".npmrc",
+        ".pgpass",
+        ".pypirc",
         "credentials",
         "id_dsa",
         "id_ecdsa",
+        "id_ecdsa_sk",
         "id_ed25519",
+        "id_ed25519_sk",
         "id_rsa",
     }
 )
