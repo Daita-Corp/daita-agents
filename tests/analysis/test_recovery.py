@@ -969,6 +969,9 @@ async def test_uncertain_generation_blocks_open_before_run_finalization(tmp_path
 def test_owned_scratch_cleanup_clears_user_flags_without_following_links(tmp_path):
     from daita.adapters.analytical_workspace.cleanup import remove_owned_scratch
 
+    if sys.platform != "darwin":  # Narrows os.chflags for type checking.
+        pytest.skip("user file flags are BSD/macOS only")
+
     outside = tmp_path / "outside.txt"
     outside.write_text("keep", encoding="utf-8")
     scratch = tmp_path / "scratch"

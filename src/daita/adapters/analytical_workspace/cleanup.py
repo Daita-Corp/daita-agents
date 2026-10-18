@@ -69,10 +69,10 @@ def _lstat(path: Path) -> os.stat_result:
 
 
 def _clear_flags(path: Path, facts: os.stat_result) -> None:
-    # st_flags and chflags exist only on BSD-derived platforms such as macOS.
-    if getattr(facts, "st_flags", 0):
-        os.chflags(path, 0, follow_symlinks=False)
+    # User flags and ACLs exist only on BSD-derived platforms such as macOS.
     if sys.platform == "darwin":
+        if facts.st_flags:
+            os.chflags(path, 0, follow_symlinks=False)
         libc = _libc()
         ctypes.set_errno(0)
         existing = libc.acl_get_link_np(os.fsencode(path), _ACL_TYPE_EXTENDED)
