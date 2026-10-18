@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import stat
 import subprocess
+import sys
 from datetime import UTC, datetime
 from importlib import import_module
 from pathlib import Path
@@ -15,6 +17,11 @@ import pytest
 
 from daita import Agent
 from daita._json import canonical_json
+from daita.adapters.analytical_workspace import (
+    cleanup as cleanup_module,
+    native as native_module,
+    recovery as recovery_module,
+)
 from daita.adapters.analytical_workspace.native import NativePythonWorker
 from daita.artifacts.models import ArtifactAuthorship, ArtifactDraft, ArtifactProvenance
 from daita.capabilities import ArtifactPolicy
@@ -114,16 +121,39 @@ async def test_parser_cleanup_failure_blocks_success_and_recovers_terminal_run(
 ):
     original = NativePythonWorker.start
     parsers = []
+    blocked = True
+    real_remove = cleanup_module.remove_owned_scratch
+
+    def remove(*args):
+        if blocked:
+            raise PermissionError("injected scratch cleanup failure")
+        return real_remove(*args)
+
+    # The guardian runs its sibling cleanup.py out of process; give the parser
+    # a guardian whose cleanup always fails, and fail host-side cleanup until
+    # the test clears the fault.
+    guardian_dir = tmp_path / "failing-guardian"
+    guardian_dir.mkdir()
+    for name in ("guardian.py", "worker.py"):
+        shutil.copy(Path(native_module.__file__).with_name(name), guardian_dir)
+    (guardian_dir / "cleanup.py").write_text(
+        "def remove_owned_scratch(root, device, inode):\n"
+        "    raise PermissionError('injected scratch cleanup failure')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(native_module, "remove_owned_scratch", remove)
+    monkeypatch.setattr(recovery_module, "remove_owned_scratch", remove)
 
     async def fault(worker):
-        candidate = worker.scratch / "candidate.bin"
-        if candidate.exists():
-            # Cleanup clears user flags, so block deletion with a deny ACL instead.
-            subprocess.run(
-                ["chmod", "+a", "everyone deny delete", candidate], check=True
-            )
+        if (worker.scratch / "candidate.bin").exists():
             parsers.append(worker)
-        await original(worker)
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    native_module, "__file__", str(guardian_dir / "native.py")
+                )
+                await original(worker)
+        else:
+            await original(worker)
 
     monkeypatch.setattr(NativePythonWorker, "start", fault)
     agent = await create(
@@ -148,9 +178,7 @@ async def test_parser_cleanup_failure_blocks_success_and_recovers_terminal_run(
             await Agent.open(
                 "recovery", root=tmp_path, workspace=workspace_for(tmp_path)
             )
-        subprocess.run(
-            ["chmod", "-N", parsers[0].scratch / "candidate.bin"], check=True
-        )
+        blocked = False
         agent = await Agent.open(
             "recovery", root=tmp_path, workspace=workspace_for(tmp_path)
         )
@@ -168,14 +196,7 @@ async def test_parser_cleanup_failure_blocks_success_and_recovers_terminal_run(
         await agent.close()
         for worker in parsers:
             if worker.scratch.exists():
-                subprocess.run(
-                    ["chmod", "-N", worker.scratch / "candidate.bin"], check=True
-                )
-                from daita.adapters.analytical_workspace.cleanup import (
-                    remove_owned_scratch,
-                )
-
-                remove_owned_scratch(
+                real_remove(
                     worker.scratch,
                     worker.identity["scratch_device"],
                     worker.identity["scratch_inode"],
@@ -969,3 +990,39 @@ def test_owned_scratch_cleanup_clears_user_flags_without_following_links(tmp_pat
     assert not scratch.exists()
     assert outside.read_text(encoding="utf-8") == "keep"
     assert outside.lstat().st_flags == 0
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS ACLs only")
+def test_owned_scratch_cleanup_removes_deny_acls_without_following_links(tmp_path):
+    from daita.adapters.analytical_workspace.cleanup import remove_owned_scratch
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep", encoding="utf-8")
+    scratch = tmp_path / "scratch"
+    (scratch / "dir").mkdir(parents=True)
+    (scratch / "dir" / "inner.txt").write_text("x", encoding="utf-8")
+    (scratch / "file.txt").write_text("x", encoding="utf-8")
+    (scratch / "link").symlink_to(outside)
+    identity = scratch.lstat()
+    deny = "everyone deny delete,delete_child,list,search,readsecurity,read,write"
+
+    def acl(*args):
+        subprocess.run(["chmod", *args], check=True)
+
+    acl("+a", "everyone deny delete", outside)
+    acl("-h", "+a", deny, scratch / "link")
+    for path in (scratch / "dir" / "inner.txt", scratch / "file.txt"):
+        acl("+a", deny, path)
+    acl("+a", deny, scratch / "dir")
+    acl("+a", deny, scratch)
+    try:
+        remove_owned_scratch(scratch, identity.st_dev, identity.st_ino)
+        assert not scratch.exists()
+        listed = subprocess.run(
+            ["ls", "-le", outside], check=True, capture_output=True, text=True
+        )
+        assert "deny delete" in listed.stdout
+    finally:
+        acl("-N", outside)
+        if os.path.lexists(scratch):
+            acl("-RN", scratch)
