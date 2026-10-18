@@ -1042,8 +1042,10 @@ async def test_routine_save_rejects_run_local_refs_in_the_instruction(tmp_path):
             if isinstance(block, ToolResultBlock) and block.call_id == "stale"
         ]
         error = rejected.output["error"]
+        assert isinstance(error, Mapping)
         assert error["code"] == "routine_instruction_scope_ref"
-        recovery = error["details"]["recovery"]
+        assert isinstance(details := error["details"], Mapping)
+        assert isinstance(recovery := details["recovery"], Mapping)
         assert recovery["kind"] == "correct_arguments"
         assert f"t1 is {resource.id}" in recovery["constraint"]
         (saved,) = await agent.list_routines()
