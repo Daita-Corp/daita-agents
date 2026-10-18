@@ -28,7 +28,6 @@ from ..jobs.graph.models import (
     CONTROL_BUDGET_ROLES,
     MAX_GRAPH_EVENTS,
     MAX_GRAPH_INSPECTION_EVENTS,
-    MAX_GRAPH_JOBS_PER_AGENT,
     TERMINAL_TASK_STATES,
     AttemptBudgetReservation,
     AttemptState,
@@ -741,14 +740,6 @@ def admit_graph(connection: SQLConnection, admission: GraphAdmission) -> GraphJo
     graph = admission.graph
     if _load_job(connection, job.agent_id, job.job_id) is not None:
         raise ValueError("graph job identity already exists")
-    # Rows are never deleted and home open retains every job's inspection.
-    count = connection.execute(
-        "SELECT COUNT(*) FROM job_runs WHERE agent_id = ?", (job.agent_id,)
-    ).fetchone()
-    if count is None or int(count[0]) >= MAX_GRAPH_JOBS_PER_AGENT:
-        raise GraphValidationError(
-            "graph_job_limit", "the agent has reached its graph job bound"
-        )
     origin = connection.execute(
         """SELECT job_id FROM job_runs
            WHERE agent_id = ? AND origin_run_id = ? AND origin_call_id = ?""",

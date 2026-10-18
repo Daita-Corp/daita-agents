@@ -14,7 +14,6 @@ from ..._json import FrozenJsonObject, canonical_json
 from ...llm.models import ModelSensitivity
 
 MAX_GRAPH_TASKS = 64
-MAX_GRAPH_JOBS_PER_AGENT = 256
 MAX_GRAPH_EDGES = 192
 MAX_GRAPH_DEPTH = 12
 MAX_DIRECT_PARENTS = 16
