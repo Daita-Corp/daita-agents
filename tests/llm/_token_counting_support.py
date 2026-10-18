@@ -30,6 +30,9 @@ async def provider_at(kind, transport, *, max_output=2048):
     provider: OpenAIResponsesProvider | AnthropicMessagesProvider | GeminiProvider
     if kind == "openai":
         sdk = openai.AsyncOpenAI(api_key="offline", http_client=client)
+        # The first access lazily imports openai.resources (~0.5s), which would
+        # otherwise eat the wall-clock budget of timeout tests.
+        sdk.responses.input_tokens
         provider = OpenAIResponsesProvider(
             "gpt-5.6-terra", client=cast(Any, sdk), max_output_tokens=max_output
         )
