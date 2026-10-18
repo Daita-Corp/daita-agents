@@ -537,6 +537,15 @@ async def test_read_rejects_traversal_symlink_special_secret_and_drift(
     outside.write_text("outside", encoding="utf-8")
     (root / "normal.txt").write_text("0123456789abcdef", encoding="utf-8")
     (root / ".env").write_text("secret", encoding="utf-8")
+    for secret in (
+        ".ssh/id_rsa",
+        ".git/config",
+        ".git-credentials",
+        ".pgpass",
+        ".npmrc",
+    ):
+        (root / secret).parent.mkdir(exist_ok=True)
+        (root / secret).write_text("secret", encoding="utf-8")
     (root / "link.txt").symlink_to(outside)
     fifo = root / "pipe"
     os.mkfifo(fifo)
@@ -546,6 +555,11 @@ async def test_read_rejects_traversal_symlink_special_secret_and_drift(
             ("link.txt", "symlink_not_allowed"),
             ("pipe", "not_regular_file"),
             (".env", "path_restricted"),
+            (".ssh/id_rsa", "path_restricted"),
+            (".git/config", "path_restricted"),
+            (".git-credentials", "path_restricted"),
+            (".pgpass", "path_restricted"),
+            (".npmrc", "path_restricted"),
         ):
             with pytest.raises(LocalWorkspaceError) as failure:
                 await backend.read(run_id="run-denied", path=path)
