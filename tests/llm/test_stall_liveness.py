@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
 from dataclasses import replace
 
 import httpx
@@ -30,7 +31,7 @@ POLICY = ModelCallPolicy(
 SHORT_ATTEMPT = replace(POLICY, max_request_seconds=8, max_attempt_seconds=4)
 
 
-def sse(event: dict[str, object], name: str | None = None) -> bytes:
+def sse(event: Mapping[str, object], name: str | None = None) -> bytes:
     prefix = "" if name is None else f"event: {name}\n"
     return (prefix + "data: " + json.dumps(event) + "\n\n").encode()
 
@@ -38,7 +39,9 @@ def sse(event: dict[str, object], name: str | None = None) -> bytes:
 def openai_reasoning(completes: bool):
     reasoning = {"type": "reasoning", "id": "rs_offline", "summary": []}
     terminal = _openai_text_response("done")
-    terminal["output"] = [reasoning, *terminal["output"]]
+    output = terminal["output"]
+    assert isinstance(output, list)
+    terminal["output"] = [reasoning, *output]
     terminal["usage"] = {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
 
     async def body():
@@ -141,7 +144,9 @@ async def run(kind: str, body, policy: ModelCallPolicy = POLICY):
             retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
         )
         try:
-            async with asyncio.timeout(30):  # Harness guard, never the production bound.
+            async with asyncio.timeout(
+                30
+            ):  # Harness guard, never the production bound.
                 events = [
                     event
                     async for event in router.stream(
@@ -154,7 +159,8 @@ async def run(kind: str, body, policy: ModelCallPolicy = POLICY):
 
 
 @pytest.mark.parametrize(
-    "kind,body", [("openai", openai_reasoning(True)), ("anthropic", anthropic_thinking())]
+    "kind,body",
+    [("openai", openai_reasoning(True)), ("anthropic", anthropic_thinking())],
 )
 async def test_silent_reasoning_with_live_stream_is_not_a_stall(kind, body):
     events, generations = await run(kind, body)
@@ -170,9 +176,11 @@ async def test_silent_stream_still_stalls_and_replays():
     with pytest.raises(ModelProviderError) as caught:
         await run("openai", silent())
 
+    diagnostic = caught.value.diagnostic
     assert caught.value.code is ProviderErrorCode.TIMEOUT
-    assert caught.value.diagnostic.code == "first_progress"
-    assert caught.value.diagnostic.attempt["total_attempt_number"] == 2
+    assert diagnostic is not None and diagnostic.attempt is not None
+    assert diagnostic.code == "first_progress"
+    assert diagnostic.attempt["total_attempt_number"] == 2
 
 
 async def test_endless_keepalives_are_bounded_by_the_attempt_deadline():
@@ -180,8 +188,10 @@ async def test_endless_keepalives_are_bounded_by_the_attempt_deadline():
     with pytest.raises(ModelProviderError) as caught:
         await run("openai", openai_reasoning(False), SHORT_ATTEMPT)
 
+    diagnostic = caught.value.diagnostic
     assert caught.value.code is ProviderErrorCode.TIMEOUT
-    assert caught.value.diagnostic.code == "attempt_deadline"
+    assert diagnostic is not None and diagnostic.attempt is not None
+    assert diagnostic.code == "attempt_deadline"
     # A deadline expiry may have generated output, so it is never replayed.
-    assert caught.value.diagnostic.attempt["total_attempt_number"] == 1
+    assert diagnostic.attempt["total_attempt_number"] == 1
     assert asyncio.get_running_loop().time() - started < 8
