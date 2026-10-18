@@ -135,6 +135,12 @@ async def test_actual_sdk_liveness_and_release(family, scenario):
                     assert elapsed < 1.5
                     if scenario == "text_trickle":
                         assert elapsed >= 0.75
+                    elif scenario in {"comments", "empty_events"}:
+                        # Keepalives prove liveness, not output: only the attempt
+                        # deadline bounds them, and it is never a replayable stall.
+                        assert elapsed >= 0.75
+                        assert diagnostic["first_substantive_progress_seconds"] is None
+                        assert diagnostic["timeout_reason"] == "attempt_deadline"
                     else:
                         assert diagnostic["first_substantive_progress_seconds"] is None
                         assert diagnostic["timeout_reason"] == "first_progress"

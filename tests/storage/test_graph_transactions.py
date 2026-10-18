@@ -81,3 +81,21 @@ async def test_graph_inspection_uses_one_read_snapshot(
     assert current is not None
     assert current.graph.revision == 1
     assert current.graph.task_count == len(current.tasks) == 3
+
+
+async def test_graph_job_count_is_unbounded_and_home_reopens(
+    tmp_path: Path,
+) -> None:
+    # 257 crossed the former fixed bound that made the home refuse to open.
+    path = tmp_path / "state.db"
+    store = await SQLiteStateStore.open(path)
+    try:
+        for ordinal in range(257):
+            await store.admit_graph(graph_admission(job_id=f"job-{ordinal}"))
+    finally:
+        await store.close()
+    reopened = await SQLiteStateStore.open(path)
+    try:
+        assert await reopened.inspect_graph("agent-1", "job-256") is not None
+    finally:
+        await reopened.close()

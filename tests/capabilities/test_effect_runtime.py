@@ -258,3 +258,80 @@ async def test_cancellation_during_committed_reservation_does_not_dispatch(
         assert not receipt.unresolved
     finally:
         await store.close()
+
+
+@pytest.mark.parametrize("failure", ("cancelled", "storage"))
+async def test_guard_failure_after_reservation_finishes_receipt_not_applied(
+    tmp_path, monkeypatch, failure
+):
+    import asyncio
+
+    import daita.capability_runtime as capability_runtime
+    from daita.storage.errors import StorageError
+
+    store, runtime, executor, run, _ = await _runtime_fixture(tmp_path)
+    original = capability_runtime._guard_attempt
+    failing = True
+
+    async def guard(guard, capability_id, point):
+        if failing and point == "after_effect_reservation_before_dispatch":
+            if failure == "cancelled":
+                raise asyncio.CancelledError()
+            raise StorageError("database is locked")
+        await original(guard, capability_id, point)
+
+    monkeypatch.setattr(capability_runtime, "_guard_attempt", guard)
+    try:
+        if failure == "cancelled":
+            batch = await execute_projected(runtime, run, (_call(),))
+            assert batch.ordered_results[0].is_error
+        else:
+            with pytest.raises(StorageError):
+                await execute_projected(runtime, run, (_call(),))
+        assert executor.calls == 0
+        receipt = await store.load_effect_receipt_for_call(
+            run.agent_id, run.id, "first"
+        )
+        assert receipt is not None and receipt.outcome is EffectOutcome.NOT_APPLIED
+        assert receipt.evidence_basis is EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
+        assert not receipt.unresolved
+        failing = False
+        following = (
+            await execute_projected(runtime, run, (_call("second", "other"),))
+        ).ordered_results[0]
+        assert not following.is_error and executor.calls == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "basis,expected",
+    (
+        (EffectEvidenceBasis.SERVER_REPORTED, EffectOutcome.UNCERTAIN),
+        (EffectEvidenceBasis.ADAPTER_VERIFIED, EffectOutcome.SUCCEEDED),
+    ),
+)
+async def test_storage_failure_after_dispatch_finishes_receipt_then_raises(
+    tmp_path, monkeypatch, basis, expected
+):
+    import daita.capability_runtime as capability_runtime
+    from daita.storage.errors import StorageError
+
+    store, runtime, executor, run, _ = await _runtime_fixture(tmp_path, basis=basis)
+
+    async def failed_finalize(*args, **kwargs):
+        raise StorageError("database is locked after the action")
+
+    monkeypatch.setattr(capability_runtime, "_domain_finalize_output", failed_finalize)
+    try:
+        with pytest.raises(StorageError):
+            await execute_projected(runtime, run, (_call(),))
+        assert executor.calls == 1
+        receipt = await store.load_effect_receipt_for_call(
+            run.agent_id, run.id, "first"
+        )
+        assert receipt is not None and receipt.outcome is expected
+        assert receipt.evidence_basis is basis or expected is EffectOutcome.UNCERTAIN
+        assert receipt.unresolved is (expected is EffectOutcome.UNCERTAIN)
+    finally:
+        await store.close()

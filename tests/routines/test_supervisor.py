@@ -415,6 +415,59 @@ async def test_quota_rejection_holds_the_route_without_counting_a_failure(
         await store.close()
 
 
+async def test_unclaimable_past_due_routine_waits_the_poll_interval(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    await _seed_conversation(store)
+    await store.admit_scheduled_routine(_routine())
+    distribution = DistributionOwner(agent_id="agent-1", store=store)
+    artifacts = await AgentHomeArtifactStore.open(
+        agent_id="agent-1",
+        agent_home=tmp_path,
+        registry=store,
+    )
+    claims = 0
+
+    async def refuse(*args: object, **kwargs: object) -> RoutineOccurrence | None:
+        del args, kwargs
+        nonlocal claims
+        claims += 1
+        raise ValueError("routine_occurrence_budget_exhausted")
+
+    monkeypatch.setattr(store, "claim_due_routine_occurrence", refuse)
+
+    async def execute(
+        occurrence: RoutineOccurrence,
+        run: RunInput,
+        observation: ResourceRevisionObservation | None,
+    ) -> LoopExit | None:
+        del occurrence, run, observation
+        raise AssertionError("an unclaimable routine cannot run")
+
+    supervisor = RoutineSupervisor(
+        agent_id="agent-1",
+        store=store,
+        owner=cast(RoutineOwner, _Owner()),
+        runtime=cast(CapabilityRuntime, _UnusedRuntime()),
+        distribution=distribution,
+        artifacts=artifacts,
+        execute_run=execute,
+        clock=lambda: NOW,
+        id_factory=_ids(),
+        poll_seconds=1,
+    )
+    try:
+        await supervisor.start()
+        await asyncio.sleep(0.5)
+        # The 0.05 s floor would retry ~10 times; the poll interval allows one.
+        assert claims == 1
+    finally:
+        await supervisor.close()
+        await store.close()
+
+
 async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

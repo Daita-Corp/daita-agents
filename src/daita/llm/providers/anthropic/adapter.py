@@ -296,9 +296,7 @@ class AnthropicMessagesProvider:
                     **arguments, timeout=transport_timeout(request)
                 ),
                 manager=True,
-                observe=lambda stream: self._observe_headers(
-                    attempt, "generation", _safe_field(stream, "response")
-                ),
+                observe=lambda stream: self._observe_stream(attempt, stream),
             )
             async with attempt.stream(source) as native_stream:
                 async for native_event in native_stream:
@@ -367,6 +365,13 @@ class AnthropicMessagesProvider:
                 ProviderErrorCode.INVALID_REQUEST,
                 "Anthropic cannot enforce the requested tool-call policy",
             )
+
+    @classmethod
+    def _observe_stream(cls, attempt: AttemptLifecycle, stream: object) -> None:
+        response = _safe_field(stream, "response")
+        # The SDK drops SSE keepalives; raw bytes still prove the provider is working.
+        attempt.track_liveness(response)
+        cls._observe_headers(attempt, "generation", response)
 
     @staticmethod
     def _observe_headers(

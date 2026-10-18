@@ -1027,6 +1027,13 @@ class ScheduledRoutine:
         object.__setattr__(self, "last_delivery_ids", last_delivery_ids)
 
     @property
+    def occurrence_allowance_exhausted(self) -> bool:
+        return (
+            self.attempt_count >= self.cumulative_max_attempts
+            or self.occurrence_count >= self.cumulative_max_occurrences
+        )
+
+    @property
     def model_budget_exhausted(self) -> bool:
         """Consumption is a fact; only a new reservation is capped by authority."""
         if (

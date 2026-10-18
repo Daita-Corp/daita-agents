@@ -68,7 +68,6 @@ from ..identity import AgentIdentity, AgentIdentityConflictError
 from ..jobs.graph.guard import GraphAttemptAuthority
 from ..jobs.graph.models import (
     ACTIVE_ATTEMPT_STATES,
-    MAX_GRAPH_JOBS_PER_AGENT,
     AttemptBudgetReservation,
     AttemptState,
     BudgetAmount,
@@ -5622,18 +5621,16 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
         if identity is not None and candidate.agent_id != identity.id:
             raise ValueError("stored learning candidate belongs to another agent")
 
-    graph_jobs: dict[tuple[str, str], GraphInspection] = {}
-    job_counts: dict[str, int] = {}
+    # Keep only job records: later checks need nothing else, so history size
+    # does not bound how many jobs an agent may have.
+    graph_jobs: dict[tuple[str, str], GraphJob] = {}
     for agent_id, job_id in connection.execute("SELECT agent_id, job_id FROM job_runs"):
         inspection = _graph_store.inspect_graph(connection, agent_id, job_id)
         if inspection is None:
             raise ValueError("stored graph job is unavailable")
         if identity is not None and inspection.job.agent_id != identity.id:
             raise ValueError("stored graph job belongs to another agent")
-        graph_jobs[(agent_id, job_id)] = inspection
-        job_counts[agent_id] = job_counts.get(agent_id, 0) + 1
-        if job_counts[agent_id] > MAX_GRAPH_JOBS_PER_AGENT:
-            raise ValueError("stored graph job count exceeds its fixed bound")
+        graph_jobs[(agent_id, job_id)] = inspection.job
 
     graph_attention_producers: dict[tuple[str, str], tuple[GraphJob, str, datetime]] = (
         {}
@@ -5657,8 +5654,8 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
                'task_review_changes_requested'
            )"""
     ):
-        inspection = graph_jobs.get((agent_id, job_id))
-        if inspection is None:
+        graph_job = graph_jobs.get((agent_id, job_id))
+        if graph_job is None:
             raise ValueError("stored graph attention event has no owned job")
         created_at = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(
             microseconds=int(created_at_us)
@@ -5707,7 +5704,7 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
         key = (event.agent_id, subject)
         if key in graph_attention_producers:
             raise ValueError("stored graph attention producer identity is duplicated")
-        graph_attention_producers[key] = (inspection.job, digest, created_at)
+        graph_attention_producers[key] = (graph_job, digest, created_at)
 
     routines: dict[tuple[str, str], ScheduledRoutine] = {}
     routine_counts: dict[str, int] = {}
