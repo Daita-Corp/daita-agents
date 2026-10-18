@@ -482,12 +482,16 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
                 composer = app.screen.query_one(Composer)
                 composer.load_text("/catalog")
                 composer.action_submit()
-                # The footer fills its keys after the screen switch.
+                # The footer mounts its keys after the screen switch and lays them
+                # out later; until then a click lands on another widget.
                 for _ in range(200):
                     await pilot.pause(0.05)
                     current = app.screen
-                    if isinstance(current, CatalogScreen) and current.query(
-                        "FooterKey"
+                    keys = current.query("FooterKey")
+                    if (
+                        isinstance(current, CatalogScreen)
+                        and keys
+                        and keys.first().region.area
                     ):
                         break
                 assert isinstance(app.screen, CatalogScreen)
