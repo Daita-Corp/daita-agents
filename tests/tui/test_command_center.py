@@ -31,6 +31,7 @@ from tests.tui._support import (
     _create_sqlite_source,
     _tui_inbox_item,
     _tui_job_summary,
+    settle_until,
 )
 
 pytestmark = pytest.mark.integration
@@ -55,7 +56,7 @@ async def test_tabs_show_one_view_preserve_draft_and_fit_terminal(tmp_path, size
             )
             composer = chat.composer()
             composer.load_text("unsent question")
-            await pilot.pause()
+            await settle_until(pilot, lambda: bool(chat.query("FooterKey")))
             navigation = chat.query_one(Tabs)
             identity = chat.query_one("#status-primary")
             context = chat.query_one("#context-window")
