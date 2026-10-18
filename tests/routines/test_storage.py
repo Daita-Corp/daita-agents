@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import daita.storage.sql as sqlite_module
+import daita.storage.sql_routines as routine_store_module
 from daita.distribution import DeliverySubjectKind, OutcomeState
 from daita.llm.models import (
     CanonicalMessage,
@@ -115,7 +116,7 @@ async def test_pre_run_escalation_finalization_rolls_back_as_one_transaction(
         raise RuntimeError("injected finalization failure")
 
     monkeypatch.setattr(
-        sqlite_module,
+        routine_store_module,
         "_replace_routine_occurrence_row",
         fail_occurrence_replacement,
     )
@@ -146,7 +147,7 @@ async def test_delivery_retention_limit_rolls_back_the_producer_transition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = await SQLiteStateStore.open(tmp_path / "state.db")
-    monkeypatch.setattr(sqlite_module, "MAX_DELIVERIES_PER_AGENT", 1)
+    monkeypatch.setattr(routine_store_module, "MAX_DELIVERIES_PER_AGENT", 1)
     try:
         first_routine = await store.admit_scheduled_routine(
             routine_record(routine_id="routine-retention-one")
@@ -211,7 +212,7 @@ async def test_acknowledged_delivery_is_reclaimed_for_next_atomic_finalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = await SQLiteStateStore.open(tmp_path / "state.db")
-    monkeypatch.setattr(sqlite_module, "MAX_DELIVERIES_PER_AGENT", 1)
+    monkeypatch.setattr(routine_store_module, "MAX_DELIVERIES_PER_AGENT", 1)
     try:
         first_routine = await store.admit_scheduled_routine(
             routine_record(routine_id="routine-reclaim-one")
@@ -370,7 +371,7 @@ async def test_claim_fault_rolls_back_occurrence_and_budget(
         raise RuntimeError("injected routine replacement failure")
 
     monkeypatch.setattr(
-        sqlite_module,
+        routine_store_module,
         "_replace_routine_row",
         fail_after_occurrence_insert,
     )
@@ -862,7 +863,6 @@ async def test_immediate_first_creation_claims_once_with_normal_budget_and_next_
 async def test_immediate_first_claim_failure_rolls_back_the_whole_creation(
     tmp_path, monkeypatch
 ):
-    import daita.storage.sql as sqlite_module
 
     store = await SQLiteStateStore.open(tmp_path / "state.db", clock=lambda: NOW)
     proposal = replace(routine_record(), run_immediately=True)
@@ -870,7 +870,7 @@ async def test_immediate_first_claim_failure_rolls_back_the_whole_creation(
     def fail_claim(*_args):
         raise OSError("cannot persist immediate occurrence")
 
-    monkeypatch.setattr(sqlite_module, "_insert_routine_occurrence", fail_claim)
+    monkeypatch.setattr(routine_store_module, "_insert_routine_occurrence", fail_claim)
     with pytest.raises(OSError, match="immediate occurrence"):
         await store.admit_scheduled_routine(proposal)
     assert (
@@ -890,7 +890,7 @@ async def test_cancelled_immediate_admission_settles_one_atomic_assignment(
     store = await SQLiteStateStore.open(tmp_path / "state.db", clock=lambda: NOW)
     proposal = replace(routine_record(), run_immediately=True)
     entered, release = threading.Event(), threading.Event()
-    original = sqlite_module._insert_routine_occurrence
+    original = routine_store_module._insert_routine_occurrence
 
     def hold_claim(*args):
         entered.set()
@@ -898,7 +898,7 @@ async def test_cancelled_immediate_admission_settles_one_atomic_assignment(
             raise TimeoutError("test did not release the atomic admission")
         return original(*args)
 
-    monkeypatch.setattr(sqlite_module, "_insert_routine_occurrence", hold_claim)
+    monkeypatch.setattr(routine_store_module, "_insert_routine_occurrence", hold_claim)
     admission = asyncio.create_task(store.admit_scheduled_routine(proposal))
     try:
         assert await asyncio.to_thread(entered.wait, 2)
