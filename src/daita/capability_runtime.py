@@ -4145,6 +4145,7 @@ class CapabilityRuntime:
         sensitivity: ModelSensitivity,
         session: RunSession | None,
     ) -> tuple[ToolResultBlock, ToolBatchInterruption | None, ToolBatchCertainty]:
+        from .storage.errors import StorageError
         from .storage.sqlite_records import EffectReceipt, effect_receipt_id
 
         store = self._effect_receipts
@@ -4220,28 +4221,46 @@ class CapabilityRuntime:
         observation: EffectObservation | None = None
         interruption: ToolBatchInterruption | None = None
         certainty = ToolBatchCertainty.DEFINITE
-        reservation_guard_error: CapabilityInputError | None = None
+        # Storage failures still reach the execution owner, but only after the
+        # reserved receipt is finished so it cannot stay STARTED in-process.
+        storage_error: StorageError | None = None
+        reservation_guard_error: BaseException | None = None
         try:
             await _guard_attempt(
                 execution.task_attempt_guard,
                 capability.id,
                 "after_effect_reservation_before_dispatch",
             )
-        except CapabilityInputError as error:
+        except BaseException as error:
             reservation_guard_error = error
-        if reservation_guard_error is not None:
+        if reservation_guard_error is not None and not isinstance(
+            reservation_guard_error, asyncio.CancelledError
+        ):
             observation = EffectObservation(
                 EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
             )
-            result = _with_execution_disposition(
-                self._exception_result(call, reservation_guard_error, domain),
-                "not_dispatched",
-            )
-        elif (
+            if isinstance(reservation_guard_error, StorageError):
+                storage_error = reservation_guard_error
+                result = _error(
+                    call,
+                    "effect_not_dispatched",
+                    "The effect attempt could not be revalidated before dispatch.",
+                    {"execution_disposition": "not_dispatched"},
+                )
+            else:
+                result = _with_execution_disposition(
+                    self._exception_result(call, reservation_guard_error, domain),
+                    "not_dispatched",
+                )
+        elif reservation_guard_error is not None or (
             active_task is not None
             and active_task.cancelling() > cancellations_before_reservation
         ):
-            interruption = ToolBatchInterruption.CANCELLED
+            interruption = (
+                _cancel_interruption(reservation_guard_error)
+                if isinstance(reservation_guard_error, asyncio.CancelledError)
+                else ToolBatchInterruption.CANCELLED
+            )
             observation = EffectObservation(
                 EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
             )
@@ -4314,7 +4333,15 @@ class CapabilityRuntime:
             except BaseException as error:
                 if isinstance(error, asyncio.CancelledError):
                     interruption = _cancel_interruption(error)
-                result = self._exception_result(call, error, domain)
+                try:
+                    result = self._exception_result(call, error, domain)
+                except StorageError as captured:
+                    storage_error = captured
+                    result = _error(
+                        call,
+                        "effect_receipt_unavailable",
+                        "Storage failed after the effect was dispatched.",
+                    )
         try:
             if observation is not None:
                 observation = self._registry.validate_effect_observation(
@@ -4374,6 +4401,8 @@ class CapabilityRuntime:
             terminal = await store.finish_effect_receipt(terminal)
         except BaseException as error:
             self._effect_receipts_unavailable = True
+            if storage_error is not None:
+                raise storage_error from error
             if isinstance(error, asyncio.CancelledError):
                 interruption = _cancel_interruption(error)
             result = _error(
@@ -4386,6 +4415,8 @@ class CapabilityRuntime:
                 interruption,
                 ToolBatchCertainty.OUTCOME_UNKNOWN,
             )
+        if storage_error is not None:
+            raise storage_error
         return _with_effect_reference(result, terminal), interruption, certainty
 
     async def _commit_artifact_output(
