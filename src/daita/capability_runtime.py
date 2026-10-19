@@ -7,7 +7,7 @@ import hmac
 import re
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -111,7 +111,7 @@ if TYPE_CHECKING:
 class AdmissionPermit(Protocol):
     async def __aenter__(self) -> object: ...
 
-    async def __aexit__(self, exc_type, exc, traceback) -> None: ...
+    async def __aexit__(self, exc_type, exc, traceback) -> bool | None: ...
 
 
 class CapabilityAdmissionCoordinator(Protocol):
@@ -1840,6 +1840,26 @@ class CapabilityRuntime:
             mode = tool_call_mode(entry.view, call.arguments)
             routed = entry.route(mode)
             if routed is None:
+                if mode in entry.view.presence_modes:
+                    return _ResolvedCall(
+                        outer,
+                        call,
+                        failure=_error(
+                            call,
+                            "invalid_argument_value",
+                            "This form of the tool is not available in this run.",
+                            recovery_details(
+                                ToolRecovery(
+                                    RecoveryKind.CORRECT_ARGUMENTS, f"Omit {mode}."
+                                ),
+                                {
+                                    "name": mode,
+                                    "constraint": "presence",
+                                    "execution_disposition": "not_dispatched",
+                                },
+                            ),
+                        ),
+                    )
                 if entry.view.mode_by_presence:
                     present = selector in call.arguments
                     return _ResolvedCall(
@@ -1866,6 +1886,11 @@ class CapabilityRuntime:
                             ),
                         ),
                     )
+                allowed = [
+                    name
+                    for name, _ in entry.routes
+                    if name not in entry.view.presence_modes
+                ]
                 return _ResolvedCall(
                     outer,
                     call,
@@ -1877,13 +1902,13 @@ class CapabilityRuntime:
                             ToolRecovery(
                                 RecoveryKind.CORRECT_ARGUMENTS,
                                 f"Set {selector} to one of: "
-                                + ", ".join(name for name, _ in entry.routes)
+                                + ", ".join(allowed)
                                 + ".",
                             ),
                             {
                                 "name": selector,
                                 "constraint": "enum",
-                                "allowed": [name for name, _ in entry.routes],
+                                "allowed": allowed,
                                 "execution_disposition": "not_dispatched",
                             },
                         ),
@@ -1899,6 +1924,8 @@ class CapabilityRuntime:
                         if selector in call.arguments
                         else f"without {selector}"
                     )
+                elif mode in entry.view.presence_modes:
+                    condition = f"with {mode}"
                 else:
                     condition = f"when {selector}={mode}"
                 return _ResolvedCall(
@@ -3634,6 +3661,30 @@ class CapabilityRuntime:
                 deadline=deadline,
                 cancellation=cancellation,
             )
+        inputs = arguments.get("inputs")
+        if isinstance(inputs, tuple) and inputs:
+            # Each distinct input source is held once, in sorted order, so two
+            # inputs on one capacity-one source and concurrent multi-source
+            # calls cannot deadlock.
+            permits = AsyncExitStack()
+            try:
+                for input_source_id in sorted(
+                    {
+                        cast(str, cast(Mapping[str, object], item)["source_id"])
+                        for item in inputs
+                    }
+                ):
+                    await permits.enter_async_context(
+                        await coordinator.source_resource_permit(
+                            f"source:{input_source_id}",
+                            deadline=deadline,
+                            cancellation=cancellation,
+                        )
+                    )
+            except BaseException:
+                await permits.aclose()
+                raise
+            return permits
         if (
             capability.access_mode is AccessMode.READ
             and run.execution_scope is not None

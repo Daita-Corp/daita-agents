@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from ..adapters.mcp import MCPServerBinding, MCPToolBinding
 
 from .._json import FrozenJsonObject
+from ..adapters.local_file_query import LocalFileQueryBackend, LocalFileQueryLimits
 from ..adapters.local_workspace import LocalWorkspaceBackend
 from ..adapters.mcp import (
     MCPAdmissionError,
@@ -118,6 +119,8 @@ from ..distribution import (
 from ..domains.analysis import AnalysisCapabilityDomain
 from ..domains.data import (
     ARTIFACT_DOMAIN_OWNER_ID,
+    DATA_QUERY_MAX_BYTES,
+    DATA_QUERY_MAX_ROWS,
     LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS,
     LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS,
     LOCAL_FILE_CAPABILITY_IDS,
@@ -634,6 +637,7 @@ class EmbeddedAgent:
         host_capacity: HostCapacityLimits,
         source_types: SourceTypeRegistry,
         source_backends: SourceBackends,
+        combined_query_engine: LocalFileQueryBackend | None,
         model_profile: ModelProfile | None,
         model_route: ModelRoute | None,
         owned_model_provider: ManagedModelProvider | None,
@@ -709,6 +713,7 @@ class EmbeddedAgent:
         self._host_capacity = host_capacity
         self._source_types = source_types
         self._source_backends = source_backends
+        self._combined_query_engine = combined_query_engine
         self._model_management_lock = asyncio.Lock()
         self._effect_resolution_lock = asyncio.Lock()
         self._routine_management_lock = asyncio.Lock()
@@ -1483,9 +1488,25 @@ class EmbeddedAgent:
             if artifact_store.available
             else None
         )
+        # Combined queries join their inputs in the same private DuckDB worker
+        # as file queries; it needs local scratch, so homeless hosts omit them.
+        combined_engine = (
+            None
+            if home is None
+            else LocalFileQueryBackend(
+                scratch_parent=home / "combined-query-scratch",
+                limits=LocalFileQueryLimits(
+                    max_result_rows=DATA_QUERY_MAX_ROWS,
+                    max_result_bytes=DATA_QUERY_MAX_BYTES,
+                ),
+            )
+        )
+        if combined_engine is not None and admission_cleanup is not None:
+            admission_cleanup.push_async_callback(combined_engine.close)
         relational_query = data_query_declarations(
             identity.id,
             source_backends[SourceOperation.SQL_READ],
+            combined_engine=combined_engine,
             file_outputs=(
                 exact_export_outputs(allow_arrow=export_arrow_bounds is not None)
                 if relational_export is not None
@@ -1700,6 +1721,7 @@ class EmbeddedAgent:
             learning_candidate_guard,
             registry,
             relational_export_available=relational_export is not None,
+            combined_query_available=combined_engine is not None,
             transcript_loader=store.load,
             upsert_readiness=lambda agent_id, constraints: (
                 _relational_upsert_readiness(
@@ -2259,6 +2281,7 @@ class EmbeddedAgent:
             host_capacity=host_capacity,
             source_types=registry,
             source_backends=source_backends,
+            combined_query_engine=combined_engine,
             model_profile=model_profile,
             model_route=model_route,
             owned_model_provider=owned_model_provider,
@@ -5297,7 +5320,14 @@ class EmbeddedAgent:
             if first_error is not None:
                 raise error from first_error
             raise
-        for backend in _backends_with(self._source_backends, "close"):
+        for backend in (
+            *_backends_with(self._source_backends, "close"),
+            *(
+                ()
+                if self._combined_query_engine is None
+                else (self._combined_query_engine,)
+            ),
+        ):
             try:
                 await backend.close()
             except BaseException as error:

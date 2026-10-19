@@ -216,8 +216,10 @@ and shutdown drain. Compatibility defaults are five executions, two provider
 requests, strict foreground reserves of one, one graph task, two PostgreSQL reads
 per source and four SQLite-pressure permits. Host capacity is runtime configuration,
 not execution authority. SQLite sources and MCP bindings remain capacity one;
-analysis retains one computation lane and an independent parser lane. Keyed
-permits do not replace the mutation lock.
+analysis retains one computation lane and an independent parser lane. A
+combined `data_query` holds each distinct input source's permit once, acquired
+in sorted source-ID order, so inputs sharing a capacity-one source cannot
+deadlock. Keyed permits do not replace the mutation lock.
 
 The loop depends on the small `ModelProvider`, `ContextBuilder`, `ToolRuntime`, and
 transcript-store protocols through those session boundaries. Provider payloads,
@@ -433,6 +435,21 @@ SQL validation belongs in `daita.domains.data.sql`; connector guardrails still
 apply during execution. Do not duplicate either mechanism in a generic policy
 layer.
 
+`data_query` with `inputs` routes to `data.query_combined`, a foreground-only
+read that joins two to four sources. Each input `{alias, source_id,
+resource_ids, sql}` takes the single-source path unchanged: run scope, catalog
+validation by the source type's `sql_dialect`, bound resource revisions and that
+type's registry backend. Inputs read at most an internal, model-invisible
+ceiling (`COMBINED_QUERY_INPUT_MAX_ROWS`/`_BYTES`); an input that reaches it
+refuses the whole call with `combined_input_truncated`, so no join ever sees
+incomplete input. The combining `sql` is one DuckDB SELECT validated before
+execution to reference each alias exactly once and nothing else: no table
+functions, file, HTTP or extension access. It runs in the same private DuckDB
+worker as `file_query`. The result carries the union of input resource
+revisions, the highest input sensitivity and per-input lineage (`source_id`,
+`source_revision`, `canonical_sql`, `sql_fingerprint`). Declared catalog links
+inform discovery and join paths only; they grant no read authority.
+
 Data capabilities are reads except for explicitly admitted `data_update_rows` and
 `data_upsert_rows`, initially backed by PostgreSQL. Their read-only counterparts are
 `data_preview_update_rows` and `data_preview_upsert_rows`. Execution requires an
@@ -473,7 +490,10 @@ searches.
 
 `file_search`, `file_read`, and `file_query` return bounded, revision-bound
 results. `file_query` uses a private one-call DuckDB worker over an exact input
-manifest and exposes only the relation `data` to validated SQL.
+manifest and exposes only the relation `data` to validated SQL. A combined
+`data_query` uses the same worker and validator, binding typed copies of its
+complete inputs in private scratch and exposing only their aliases; homes
+without local scratch (`Agent.from_storage`) do not offer it.
 
 An authenticated current-run `file_read` binding can feed
 `artifact_edit_text`. That capability commits a complete replacement artifact
@@ -514,7 +534,7 @@ visible `result_ref` values in `evidence_refs`. The runtime resolves each ref to
 its call, and the artifact domain authenticates each result against the immutable registry and
 persisted transcript, rejects failed, stale, reordered, cross-run, or tampered
 lineage, inherits the highest result sensitivity, and preserves current
-relational resource revisions where present. The artifact remains explicitly
+relational resource revisions where present, per input for a combined query. The artifact remains explicitly
 derived analysis rather than exact or complete source data. Exact complete
 relational export remains the separate `data.export_tabular` capability, reached
 through `data_query` with `output="csv"`, `"xlsx"` or `"arrow"`.

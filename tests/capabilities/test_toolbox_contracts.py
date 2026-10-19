@@ -271,6 +271,7 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
                 ("rows", "data.query"),
                 ("csv", "data.export_tabular"),
                 ("xlsx", "data.export_tabular"),
+                ("inputs", "data.query_combined"),
             ),
             "data_update_rows": (
                 ("preview", "data.preview_update_rows"),

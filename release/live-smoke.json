@@ -1,6 +1,6 @@
 {
-  "surface_digest": "sha256:fb2353b4c97a2c5be8a061aa51c82e7b54cc019ba5f4748776c5d447a0ddc110",
-  "recorded_on": "2026-10-18",
+  "surface_digest": "sha256:6f928f23074c7d3b9b9cd4e399b688b566cfb2ea51fb219ddd67c5ff0b68a053",
+  "recorded_on": "2026-10-19",
   "cases": {
     "tests/live/acceptance/test_result_refs.py::test_l8_graph_task_complete_cites_its_read[0]": "passed",
     "tests/live/analysis/test_public_journeys.py::test_real_model_dependent_cells_and_error_correction": "passed",
@@ -10,7 +10,7 @@
     "tests/live/data/test_model_write_acceptance.py::test_live_drift_during_approval_does_not_reapply[openai:gpt-5.6-terra-0]": "passed",
     "tests/live/data/test_model_write_acceptance.py::test_live_mixed_upsert_and_unchanged_repeat[openai:gpt-5.6-terra-0]": "passed",
     "tests/live/data_operations/test_workflows.py::test_live_analytical_correctness[openai:gpt-5.6-terra-0-join_grain-00]": "passed",
-    "tests/live/jobs/test_graph_planner.py::test_live_planner_uses_typed_replacement_without_production_cutover": "passed_on_rerun",
+    "tests/live/jobs/test_graph_planner.py::test_live_planner_uses_typed_replacement_without_production_cutover": "passed",
     "tests/live/mcp/test_actions.py::test_live_research_and_honest_action_evidence[openai:gpt-5.6-terra-0-success]": "passed",
     "tests/live/mcp/test_read_workflows.py::test_live_dependent_reads_discover_tools_and_bind_returned_account[0-2-2026-07-28-normal]": "passed",
     "tests/live/routines/test_contract_authoring.py::test_model_authors_scheduled_contract_without_dispatch[0-familiar]": "passed",

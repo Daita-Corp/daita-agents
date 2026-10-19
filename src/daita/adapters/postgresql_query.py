@@ -52,7 +52,7 @@ from .postgresql import (
 )
 from .protocols import SourceStore
 
-_MAX_QUERY_ROWS = 1_000
+_MAX_QUERY_ROWS = 10_000
 _MAX_QUERY_BYTES = 16 * 1_024 * 1_024
 _MAX_RESULT_COLUMNS = 512
 _MAX_VALUE_DEPTH = 32
@@ -667,7 +667,7 @@ class PostgreSQLQueryBackend:
             or isinstance(max_rows, bool)
             or not 1 <= max_rows <= _MAX_QUERY_ROWS
         ):
-            raise ValueError("max_rows must be from one through 1000")
+            raise ValueError("max_rows must be from one through 10000")
         if (
             not isinstance(max_bytes, int)
             or isinstance(max_bytes, bool)

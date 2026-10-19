@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from collections.abc import Mapping
+from decimal import Decimal
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from daita import Agent
+from daita import Agent, SQLiteSource
 from daita.adapters.postgresql_query import (
     PostgreSQLQueryBackend,
     PostgreSQLQueryError,
@@ -266,3 +268,99 @@ async def test_statement_deadline_cancels_the_server_query_and_cleans_up(
     finally:
         await admin.close()
         await agent.close()
+
+
+async def test_postgresql_input_joins_a_sqlite_input_in_one_combined_query(
+    tmp_path: Path,
+):
+    agent, source_id, by_name = await _agent(
+        tmp_path,
+        username="daita_large_reader",
+        password=os.environ.get(
+            "DAITA_LARGE_POSTGRES_PASSWORD", "daita_large_fixture_password"
+        ),
+        schemas=ATTACHED_SCHEMAS,
+    )
+    admin = await _admin()
+    try:
+        revenue = {
+            row["channel_code"]: row["revenue"]
+            for row in await admin.fetch(
+                "SELECT channel_code, SUM(subtotal) AS revenue "
+                "FROM sales.orders GROUP BY channel_code"
+            )
+        }
+        assert len(revenue) > 1
+        targets = tmp_path / "targets.sqlite"
+        with sqlite3.connect(targets) as connection:
+            connection.execute(
+                "CREATE TABLE targets (channel_code TEXT, target INTEGER)"
+            )
+            connection.executemany(
+                "INSERT INTO targets VALUES (?, ?)",
+                ((code, index) for index, code in enumerate(sorted(revenue))),
+            )
+        targets_source = await agent.attach(SQLiteSource(targets))
+        (targets_table,) = await agent.list_catalog_resources(
+            source_id=targets_source.id
+        )
+        loop = agent._embedded._loop
+        assert loop is not None
+        (result,) = await execute_projected(
+            cast(CapabilityRuntime, loop._tools),
+            RunInput(
+                id="combined-postgresql-run",
+                agent_id=agent.id,
+                message="join revenue with targets",
+                created_at=_OBSERVED_AT,
+                conversation_id="combined-postgresql-conversation",
+                source_scope_ids=(source_id, targets_source.id),
+            ),
+            (
+                ToolCall(
+                    id="combined",
+                    name="data_query",
+                    arguments={
+                        "inputs": (
+                            {
+                                "alias": "p",
+                                "source_id": source_id,
+                                "resource_ids": (by_name["sales.orders"],),
+                                "sql": "SELECT channel_code, SUM(subtotal) AS "
+                                "revenue FROM sales.orders "
+                                "GROUP BY channel_code",
+                            },
+                            {
+                                "alias": "t",
+                                "source_id": targets_source.id,
+                                "resource_ids": (targets_table.id,),
+                                "sql": "SELECT channel_code, target FROM targets",
+                            },
+                        ),
+                        "sql": "SELECT p.channel_code, p.revenue, t.target FROM p "
+                        "JOIN t ON t.channel_code = p.channel_code "
+                        "ORDER BY p.channel_code",
+                    },
+                ),
+            ),
+        )
+    finally:
+        await admin.close()
+        await agent.close()
+
+    output = cast(Mapping[str, object], result.output)
+    assert "error" not in output, output
+    data = cast(Mapping[str, object], output["data"])
+    rows = cast(tuple[Mapping[str, object], ...], data["rows"])
+    assert [
+        (
+            row["channel_code"],
+            Decimal(cast(Mapping[str, str], row["revenue"])["value"]),
+            row["target"],
+        )
+        for row in rows
+    ] == [(code, revenue[code], index) for index, code in enumerate(sorted(revenue))]
+    assert {
+        cast(Mapping[str, object], item)["source_id"]
+        for item in cast(tuple[object, ...], data["inputs"])
+    } == {source_id, targets_source.id}

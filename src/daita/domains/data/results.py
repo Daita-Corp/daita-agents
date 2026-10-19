@@ -92,13 +92,17 @@ def project_result_rows(
     row_candidates = frozen_rows[:max_rows]
     projected: list[FrozenJsonObject] = []
     byte_limited = False
+    # A canonical JSON array is "[" + rows joined by "," + "]", so its size
+    # grows by each row's own encoding plus one separator.
+    encoded_bytes = 2
     for row in row_candidates:
-        candidate = [thaw_json(item) for item in (*projected, row)]
-        candidate_bytes = len(canonical_json(candidate).encode("utf-8"))
+        row_bytes = len(canonical_json(thaw_json(row)).encode("utf-8"))
+        candidate_bytes = encoded_bytes + row_bytes + (1 if projected else 0)
         if candidate_bytes > max_bytes:
             byte_limited = True
             break
         projected.append(row)
+        encoded_bytes = candidate_bytes
 
     reasons: list[str] = []
     if total_rows > max_rows:

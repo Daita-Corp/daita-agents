@@ -175,11 +175,66 @@ def test_mode_routed_tool_exposes_one_merged_schema_over_existing_capabilities()
             "tool mode routes are invalid",
         ),
         ({"capability_id": "test.mode.other"}, "tool mode routes are invalid"),
+        ({"presence_modes": ("other",)}, "tool mode routes are invalid"),
+        (
+            {"default_mode": "preview", "presence_modes": ("preview",)},
+            "tool mode routes are invalid",
+        ),
+        ({"presence_modes": ("preview", "apply")}, "tool mode routes are invalid"),
+        (
+            {"mode_capability_ids": (), "presence_modes": ("apply",)},
+            "tool route selection requires mode routes",
+        ),
     ],
 )
 def test_mode_routes_reject_ambiguous_declarations(changes, message):
     with pytest.raises(ValueError, match=message):
         _view(**changes)
+
+
+def test_presence_route_selects_by_its_argument_and_owns_it():
+    preview, apply = _capabilities()
+    executors = (
+        _RecordingExecutor(preview.executor_id, preview.output_kind),
+        _RecordingExecutor(apply.executor_id, apply.output_kind),
+    )
+
+    def registry(apply_schema: dict[str, object]) -> CapabilityRegistry:
+        return CapabilityRegistry(
+            declarations=(
+                CapabilityDeclarations(
+                    domain_owner_id="test",
+                    capabilities=(preview, replace(apply, input_schema=apply_schema)),
+                    executor_ids=(preview.executor_id, apply.executor_id),
+                    tool_views=(
+                        _view(
+                            capability_id="test.mode.preview",
+                            mode_capability_ids=(
+                                ("preview", "test.mode.preview"),
+                                ("fingerprint", "test.mode.apply"),
+                            ),
+                            default_mode="preview",
+                            presence_modes=("fingerprint",),
+                        ),
+                    ),
+                ),
+            ),
+            executors=executors,
+        )
+
+    routed = registry(_schema("fingerprint"))
+    assert (
+        routed.call_capability("test_mode_rows", {"fingerprint": "f"}).id
+        == "test.mode.apply"
+    )
+    assert routed.call_capability("test_mode_rows", {}).id == "test.mode.preview"
+    properties = routed.tool_definition(
+        "test_mode_rows", lane=CallTargetLane.FOREGROUND
+    ).input_schema["properties"]
+    assert isinstance(properties, Mapping)
+    assert tuple(properties["mode"]["enum"]) == ("preview",)
+    with pytest.raises(ValueError, match="only a presence route declares"):
+        registry(_schema())
 
 
 def test_mode_routes_require_compatible_closed_route_schemas():

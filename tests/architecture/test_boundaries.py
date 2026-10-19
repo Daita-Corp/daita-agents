@@ -600,12 +600,22 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         query_schema = registry.tool_definition(
             "data_query", lane=CallTargetLane.FOREGROUND
         ).input_schema
-        query_required = query_schema.get("required")
-        assert isinstance(query_required, (tuple, list))
-        assert {"source_id", "resource_ids"} <= set(query_required)
+        # Each route keeps its own required arguments; the merged provider
+        # schema lists them all.
+        for capability_id, required in (
+            ("data.query", {"source_id", "resource_ids"}),
+            ("data.query_combined", {"inputs", "sql"}),
+        ):
+            route_required = registry.capability(capability_id).input_schema.get(
+                "required"
+            )
+            assert isinstance(route_required, (tuple, list))
+            assert required <= set(route_required)
         query_properties = query_schema.get("properties")
         assert isinstance(query_properties, Mapping)
-        assert {"sql", "statements"} <= set(query_properties)
+        assert {"source_id", "resource_ids", "sql", "statements", "inputs"} <= set(
+            query_properties
+        )
     finally:
         await agent.close()
 

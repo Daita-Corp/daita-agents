@@ -75,6 +75,8 @@ from .sql.relational_upsert import (
 DATA_DOMAIN_OWNER_ID = "data"
 DATA_QUERY_CAPABILITY_ID = "data.query"
 DATA_QUERY_EVIDENCE_KIND = "data.query_result"
+DATA_QUERY_COMBINED_CAPABILITY_ID = "data.query_combined"
+DATA_QUERY_COMBINED_EVIDENCE_KIND = "data.query_combined_result"
 DATA_EXPORT_TABULAR_CAPABILITY_ID = "data.export_tabular"
 RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID = "data.preview_update_rows"
 RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND = "data.preview_update_rows"
@@ -125,6 +127,7 @@ _RESOURCE_READ_DENIED_MESSAGE = (
 # The source operation a source's registered type must declare for each capability.
 _CAPABILITY_OPERATIONS = {
     DATA_QUERY_CAPABILITY_ID: SourceOperation.SQL_READ,
+    DATA_QUERY_COMBINED_CAPABILITY_ID: SourceOperation.SQL_READ,
     DATA_EXPORT_TABULAR_CAPABILITY_ID: SourceOperation.TABULAR_EXPORT,
     **{item: SourceOperation.RELATIONAL_UPDATE for item in _UPDATE_CAPABILITIES},
     **{item: SourceOperation.RELATIONAL_UPSERT for item in _UPSERT_CAPABILITIES},
@@ -346,6 +349,7 @@ class DataCapabilityDomain:
         source_types: SourceTypeRegistry,
         *,
         relational_export_available: bool = True,
+        combined_query_available: bool = False,
         transcript_loader: Callable[[str], Awaitable[Transcript]] | None = None,
         upsert_readiness: (
             Callable[[str, FrozenJsonObject], Awaitable[FrozenJsonObject]] | None
@@ -358,6 +362,8 @@ class DataCapabilityDomain:
         expected_ids = _SOURCE_CAPABILITIES
         if not relational_export_available:
             expected_ids -= {DATA_EXPORT_TABULAR_CAPABILITY_ID}
+        if not combined_query_available:
+            expected_ids -= {DATA_QUERY_COMBINED_CAPABILITY_ID}
         if local_file_sensitivity is not None:
             expected_ids |= LOCAL_FILE_CAPABILITY_IDS
         if declared_ids != expected_ids:
@@ -593,6 +599,8 @@ class DataCapabilityDomain:
                 )
         if capability.id == CATALOG_DESCRIBE_CAPABILITY_ID:
             _validate_describe_arguments(arguments)
+        if capability.id == DATA_QUERY_COMBINED_CAPABILITY_ID:
+            arguments = await self._prepare_combined_query(run, arguments)
         if capability.id in _RELATIONAL_READ_CAPABILITIES:
             arguments = await self._validate_sql(
                 run,
@@ -1348,6 +1356,64 @@ class DataCapabilityDomain:
             prepared["_resource_revisions"] = tuple(sorted(revisions.items()))
         return FrozenJsonObject.from_mapping(prepared)
 
+    async def _prepare_combined_query(
+        self, run: RunInput, arguments: Mapping[str, object]
+    ) -> FrozenJsonObject:
+        """Validate every input as one single-source read, then the combining SQL.
+
+        Each input takes the exact data_query scope, catalog, dialect and
+        revision path; declared catalog links grant no read authority here.
+        """
+
+        single = self._capabilities[DATA_QUERY_CAPABILITY_ID]
+        inputs = cast(tuple[Mapping[str, object], ...], arguments["inputs"])
+        aliases = tuple(cast(str, item["alias"]) for item in inputs)
+        if len(set(aliases)) != len(aliases):
+            raise CapabilityInputError(
+                "combined_query_invalid",
+                "Every input needs a distinct alias.",
+                {"aliases": aliases},
+                recovery=_CORRECT_SQL,
+            )
+        prepared: list[dict[str, object]] = []
+        for alias, item in zip(aliases, inputs, strict=True):
+            read = FrozenJsonObject.from_mapping(
+                {name: item[name] for name in ("source_id", "resource_ids", "sql")}
+            )
+            try:
+                await self._validate_source_scope(run, single, read)
+                self._validate_execution_resource_scope(run, single, read)
+                await self._validate_resource_read_scope(run, single, read)
+                validated = await self._validate_sql(
+                    run,
+                    read,
+                    operation=SourceOperation.SQL_READ,
+                    bind_revisions=True,
+                )
+            except CapabilityInputError as error:
+                raise CapabilityInputError(
+                    error.code,
+                    str(error),
+                    {**error.details.to_dict(), "input_alias": alias},
+                ) from error
+            prepared.append({**validated.to_dict(), "alias": alias})
+        try:
+            combining = validate_duckdb_read(cast(str, arguments["sql"]), aliases)
+        except DuckDBReadValidationError as error:
+            raise CapabilityInputError(
+                "combined_query_invalid",
+                error.message,
+                {"reason": error.reason, "aliases": aliases},
+                recovery=_CORRECT_SQL,
+            ) from error
+        return FrozenJsonObject.from_mapping(
+            {
+                "inputs": tuple(prepared),
+                "sql": combining.canonical_sql,
+                "_sql_fingerprint": combining.sql_fingerprint,
+            }
+        )
+
     def _validate_execution_resource_scope(
         self,
         run: RunInput,
@@ -1847,10 +1913,22 @@ class DataCapabilityDomain:
         run = replace(run, resolved_source_scope=scope)
         # Resolved arguments carry full IDs; the call keeps what the model sent.
         source_id = arguments.get("source_id")
+        inputs = arguments.get("inputs")
         source_ids = (
             (source_id,)
             if isinstance(source_id, str)
-            else tuple(sorted(scope.source_ids))
+            else (
+                tuple(
+                    sorted(
+                        {
+                            cast(str, cast(Mapping[str, object], item)["source_id"])
+                            for item in inputs
+                        }
+                    )
+                )
+                if isinstance(inputs, tuple)
+                else tuple(sorted(scope.source_ids))
+            )
         )
         sensitivity = await self._catalog.admitted_model_sensitivity(
             run.agent_id,
@@ -1917,6 +1995,8 @@ __all__ = [
     "DataCapabilityDomain",
     "DataDomainCatalog",
     "DATA_QUERY_CAPABILITY_ID",
+    "DATA_QUERY_COMBINED_CAPABILITY_ID",
+    "DATA_QUERY_COMBINED_EVIDENCE_KIND",
     "DATA_QUERY_EVIDENCE_KIND",
     "DATA_EXPORT_TABULAR_CAPABILITY_ID",
     "RELATIONAL_UPDATE_CAPABILITY_ID",

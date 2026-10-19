@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta
 from decimal import Decimal
@@ -115,6 +116,15 @@ class LocalFileQueryLimits:
 
 
 @dataclass(frozen=True, slots=True)
+class QueryRelation:
+    """One named in-memory input relation: its columns and bounded JSON rows."""
+
+    name: str
+    columns: tuple[str, ...]
+    rows: tuple[Mapping[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class LocalFileQueryResult:
     data: FrozenJsonObject
     sensitivity_provenance: FrozenJsonObject
@@ -150,6 +160,55 @@ class LocalFileQueryBackend:
         canonical_sql: str,
         sql_fingerprint: str,
     ) -> LocalFileQueryResult:
+        payload = await self._run(manifest, None, canonical_sql, sql_fingerprint)
+        manifest.revalidate()
+        data = {
+            **payload,
+            "path_pattern": manifest.qualified_path_pattern,
+            "format": manifest.format,
+            "input_file_count": len(manifest.bindings),
+            "input_bytes": manifest.input_bytes,
+            "manifest_bytes": manifest.encoded_bytes,
+            "manifest_sha256": manifest.manifest_sha256,
+            "input_bindings": tuple(
+                item.result_mapping() for item in manifest.bindings
+            ),
+        }
+        return LocalFileQueryResult(
+            data=FrozenJsonObject.from_mapping(data),
+            sensitivity_provenance=FrozenJsonObject.from_mapping(
+                manifest.provenance_mapping()
+            ),
+        )
+
+    async def query_relations(
+        self,
+        *,
+        relations: tuple[QueryRelation, ...],
+        canonical_sql: str,
+        sql_fingerprint: str,
+    ) -> FrozenJsonObject:
+        """Run one validated SELECT over named in-memory input relations.
+
+        Each relation is written to this call's private scratch and bound under
+        its name with column types derived from its values; the worker, its
+        locked security profile and its result bounds are those of file query.
+        """
+
+        if not relations or any(
+            not isinstance(item, QueryRelation) for item in relations
+        ):
+            raise TypeError("relations must be non-empty QueryRelation values")
+        payload = await self._run(None, relations, canonical_sql, sql_fingerprint)
+        return FrozenJsonObject.from_mapping(payload)
+
+    async def _run(
+        self,
+        manifest: LocalFileQueryManifest | None,
+        relations: tuple[QueryRelation, ...] | None,
+        canonical_sql: str,
+        sql_fingerprint: str,
+    ) -> dict[str, object]:
         if self._closed:
             raise LocalFileQueryError(
                 "workspace_unavailable", "The local file-query backend is closed."
@@ -178,6 +237,7 @@ class LocalFileQueryBackend:
             asyncio.to_thread(
                 _run_private_worker,
                 manifest,
+                relations,
                 canonical_sql,
                 sql_fingerprint,
                 self._scratch_parent,
@@ -188,30 +248,11 @@ class LocalFileQueryBackend:
         self._active[worker] = cancellation
         try:
             try:
-                payload = await asyncio.shield(worker)
+                return await asyncio.shield(worker)
             except asyncio.CancelledError:
                 cancellation.set()
                 await _settle_worker(worker)
                 raise
-            manifest.revalidate()
-            data = {
-                **payload,
-                "path_pattern": manifest.qualified_path_pattern,
-                "format": manifest.format,
-                "input_file_count": len(manifest.bindings),
-                "input_bytes": manifest.input_bytes,
-                "manifest_bytes": manifest.encoded_bytes,
-                "manifest_sha256": manifest.manifest_sha256,
-                "input_bindings": tuple(
-                    item.result_mapping() for item in manifest.bindings
-                ),
-            }
-            return LocalFileQueryResult(
-                data=FrozenJsonObject.from_mapping(data),
-                sensitivity_provenance=FrozenJsonObject.from_mapping(
-                    manifest.provenance_mapping()
-                ),
-            )
         finally:
             self._active.pop(worker, None)
             async with self._gate:
@@ -250,7 +291,8 @@ async def _settle_worker(worker: asyncio.Task[object]) -> None:
 
 
 def _run_private_worker(
-    manifest: LocalFileQueryManifest,
+    manifest: LocalFileQueryManifest | None,
+    relations: tuple[QueryRelation, ...] | None,
     canonical_sql: str,
     sql_fingerprint: str,
     scratch_parent: Path,
@@ -266,13 +308,24 @@ def _run_private_worker(
     peak_rss = 0
     final: dict[str, object] | None = None
     try:
-        manifest.revalidate()
+        if manifest is not None:
+            manifest.revalidate()
         if not (sys.platform == "darwin" or sys.platform.startswith("linux")):
             raise LocalFileQueryError(
                 "dependency_unavailable",
                 "This platform cannot monitor private file-query worker RSS.",
             )
-        request = _request_mapping(manifest, canonical_sql, sql_fingerprint, limits)
+        request = (
+            _request_mapping(manifest, canonical_sql, sql_fingerprint, limits)
+            if manifest is not None
+            else _relations_request_mapping(
+                cast(tuple[QueryRelation, ...], relations),
+                scratch,
+                canonical_sql,
+                sql_fingerprint,
+                limits,
+            )
+        )
         request_bytes = canonical_json(request).encode("utf-8")
         if len(request_bytes) > _MAX_REQUEST_BYTES:
             raise LocalFileQueryError(
@@ -294,7 +347,7 @@ def _run_private_worker(
         from multiprocessing.reduction import send_handle
 
         assert process.pid is not None
-        for binding in manifest.bindings:
+        for binding in () if manifest is None else manifest.bindings:
             send_handle(live_parent, binding.descriptor, process.pid)
         while process.is_alive():
             now = time.monotonic()
@@ -372,7 +425,8 @@ def _run_private_worker(
                 "file_query_invalid",
                 "The private file-query worker returned an invalid result.",
             )
-        manifest.revalidate()
+        if manifest is not None:
+            manifest.revalidate()
         return payload
     except _WorkerCancelled as error:
         raise asyncio.CancelledError from error
@@ -430,10 +484,12 @@ def _private_worker_entry(
         _revalidate_canonical_sql(request)
         from multiprocessing.reduction import recv_handle
 
-        for _binding in request["bindings"]:
+        relations = request.get("relations")
+        bindings = request["bindings"] if relations is None else []
+        for _binding in bindings:
             descriptors.append(int(recv_handle(cast(Any, connection))))
         descriptor_paths = tuple(_descriptor_path(item) for item in descriptors)
-        _revalidate_descriptors(descriptors, request["bindings"])
+        _revalidate_descriptors(descriptors, bindings)
         duckdb = _load_duckdb()
         duckdb_connection = duckdb.connect(":memory:")
         _apply_security_profile(
@@ -442,10 +498,14 @@ def _private_worker_entry(
             Path(scratch_text),
             request,
         )
-        schema = _bind_data(
-            duckdb_connection,
-            format_name=str(request["format"]),
-            descriptor_paths=descriptor_paths,
+        schema = (
+            _bind_data(
+                duckdb_connection,
+                format_name=str(request["format"]),
+                descriptor_paths=descriptor_paths,
+            )
+            if relations is None
+            else _bind_relations(duckdb_connection, relations, Path(scratch_text))
         )
         _send_message(
             connection,
@@ -463,7 +523,7 @@ def _private_worker_entry(
             max_bytes=int(request["max_result_bytes"]),
             max_columns=int(request["max_result_columns"]),
         )
-        _revalidate_descriptors(descriptors, request["bindings"])
+        _revalidate_descriptors(descriptors, bindings)
         final = {"kind": "final", "status": "success", "data": data}
     except ImportError as error:
         final = {
@@ -535,6 +595,200 @@ def _request_mapping(
     }
 
 
+_RELATION_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
+_RELATION_TYPES = frozenset({"BOOLEAN", "BIGINT", "DOUBLE", "VARCHAR", "JSON"})
+_DECIMAL_TYPE = re.compile(r"DECIMAL\(38,([0-9]|[12][0-9]|3[0-7])\)")
+_MAX_RELATIONS = 8
+_MAX_RELATION_COLUMNS = 512
+
+
+def _relations_request_mapping(
+    relations: tuple[QueryRelation, ...],
+    scratch: Path,
+    canonical_sql: str,
+    sql_fingerprint: str,
+    limits: LocalFileQueryLimits,
+) -> dict[str, object]:
+    """Write each relation as typed NDJSON in private scratch; describe it."""
+
+    described: list[dict[str, object]] = []
+    for index, relation in enumerate(relations):
+        types = tuple(
+            _relation_column_type(tuple(row.get(column) for row in relation.rows))
+            for column in relation.columns
+        )
+        with (scratch / f"input-{index}.ndjson").open("x", encoding="utf-8") as file:
+            for row in relation.rows:
+                file.write(
+                    canonical_json(
+                        {
+                            column: _relation_value(row.get(column), kind)
+                            for column, kind in zip(
+                                relation.columns, types, strict=True
+                            )
+                        }
+                    )
+                    + "\n"
+                )
+        described.append(
+            {
+                "name": relation.name,
+                "columns": [
+                    {"name": column, "type": kind}
+                    for column, kind in zip(relation.columns, types, strict=True)
+                ],
+            }
+        )
+    return {
+        "protocol": _PROTOCOL,
+        "duckdb_version": _DUCKDB_VERSION,
+        "relations": described,
+        "canonical_sql": canonical_sql,
+        "sql_fingerprint": sql_fingerprint,
+        "query_seconds": float(limits.max_query_seconds),
+        "max_result_rows": limits.max_result_rows,
+        "max_result_bytes": limits.max_result_bytes,
+        "max_result_columns": limits.max_result_columns,
+        "memory_bytes": limits.duckdb_memory_bytes,
+        "spill_bytes": limits.max_spill_bytes,
+        "rss_bytes": limits.max_worker_rss_bytes,
+        "threads": limits.duckdb_threads,
+    }
+
+
+def _decimal_text(value: object) -> str | None:
+    """The exact text of a source's tagged decimal value, if it is one."""
+
+    if (
+        isinstance(value, Mapping)
+        and set(value) == {"type", "value"}
+        and value["type"] == "decimal"
+        and isinstance(value["value"], str)
+    ):
+        return value["value"]
+    return None
+
+
+def _relation_column_type(values: tuple[object, ...]) -> str:
+    """One deterministic DuckDB type for a column, from its JSON values."""
+
+    present = tuple(item for item in values if item is not None)
+    if all(isinstance(item, bool) for item in present):
+        return "BOOLEAN" if present else "VARCHAR"
+    if all(isinstance(item, int) and not isinstance(item, bool) for item in present):
+        if all(-(2**63) <= cast(int, item) < 2**63 for item in present):
+            return "BIGINT"
+        return "VARCHAR"
+    if all(
+        isinstance(item, (int, float)) and not isinstance(item, bool)
+        for item in present
+    ):
+        return "DOUBLE"
+    if all(
+        (isinstance(item, int) and not isinstance(item, bool))
+        or _decimal_text(item) is not None
+        for item in present
+    ):
+        digits = [
+            Decimal(
+                str(item) if isinstance(item, int) else cast(str, _decimal_text(item))
+            ).as_tuple()
+            for item in present
+        ]
+        scale = max(max(0, -cast(int, item.exponent)) for item in digits)
+        whole = max(len(item.digits) + cast(int, item.exponent) for item in digits)
+        # Exact text is kept when DECIMAL(38, scale) cannot hold every value.
+        return (
+            f"DECIMAL(38,{scale})" if scale <= 37 and whole <= 38 - scale else "VARCHAR"
+        )
+    if all(isinstance(item, str) for item in present):
+        return "VARCHAR"
+    return "JSON"
+
+
+def _relation_value(value: object, kind: str) -> object:
+    if value is None:
+        return None
+    if kind.startswith("DECIMAL") or (kind == "VARCHAR" and not isinstance(value, str)):
+        return _decimal_text(value) or str(value)
+    return value
+
+
+def _validate_relations(value: object) -> None:
+    if not isinstance(value, list) or not 1 <= len(value) <= _MAX_RELATIONS:
+        raise _WorkerFailure(
+            "file_query_invalid", "The query input relations are invalid."
+        )
+    names: set[str] = set()
+    for relation in value:
+        if (
+            not isinstance(relation, dict)
+            or set(relation) != {"name", "columns"}
+            or not isinstance(relation["name"], str)
+            or _RELATION_NAME.fullmatch(relation["name"]) is None
+            or relation["name"] in names
+            or not isinstance(relation["columns"], list)
+            or not 1 <= len(relation["columns"]) <= _MAX_RELATION_COLUMNS
+        ):
+            raise _WorkerFailure(
+                "file_query_invalid", "The query input relations are invalid."
+            )
+        names.add(relation["name"])
+        columns: set[str] = set()
+        for column in relation["columns"]:
+            if (
+                not isinstance(column, dict)
+                or set(column) != {"name", "type"}
+                or not isinstance(column["name"], str)
+                or not column["name"]
+                or len(column["name"].encode("utf-8")) > _MAX_COLUMN_NAME_BYTES
+                or column["name"] in columns
+                or not isinstance(column["type"], str)
+                or (
+                    column["type"] not in _RELATION_TYPES
+                    and _DECIMAL_TYPE.fullmatch(column["type"]) is None
+                )
+            ):
+                raise _WorkerFailure(
+                    "file_query_invalid", "The query input relations are invalid."
+                )
+            columns.add(column["name"])
+
+
+def _bind_relations(
+    connection: Any, relations: list[dict[str, Any]], scratch: Path
+) -> tuple[dict[str, str], ...]:
+    schema: list[dict[str, str]] = []
+    for index, relation in enumerate(relations):
+        columns = (
+            "{"
+            + ",".join(
+                f"{_sql_string(item['name'])}:{_sql_string(item['type'])}"
+                for item in relation["columns"]
+            )
+            + "}"
+        )
+        reader = (
+            f"read_json({_sql_string(os.fspath(scratch / f'input-{index}.ndjson'))}, "
+            f"format='newline_delimited', columns={columns})"
+        )
+        try:
+            connection.execute(
+                f'CREATE TEMP VIEW "{relation["name"]}" AS SELECT * FROM {reader}'
+            )
+        except BaseException as error:
+            raise _WorkerFailure(
+                "file_query_invalid",
+                "A query input relation could not be bound safely.",
+                {"stage": "binding", "relation": relation["name"]},
+            ) from error
+        schema.extend(
+            {"name": f"{relation['name']}.{item['name']}", "type": item["type"]}
+            for item in relation["columns"]
+        )
+    return tuple(schema)
+
+
 def _validate_request(raw: bytes) -> dict[str, Any]:
     try:
         value = json.loads(raw)
@@ -542,17 +796,11 @@ def _validate_request(raw: bytes) -> dict[str, Any]:
         raise _WorkerFailure(
             "file_query_invalid", "The private file-query request is malformed."
         ) from error
-    expected = {
+    common = {
         "protocol",
         "duckdb_version",
-        "format",
-        "workspace_id",
-        "path_pattern",
         "canonical_sql",
         "sql_fingerprint",
-        "manifest_sha256",
-        "manifest_bytes",
-        "bindings",
         "query_seconds",
         "max_result_rows",
         "max_result_bytes",
@@ -562,7 +810,18 @@ def _validate_request(raw: bytes) -> dict[str, Any]:
         "rss_bytes",
         "threads",
     }
-    if not isinstance(value, dict) or set(value) != expected:
+    file_fields = {
+        "format",
+        "workspace_id",
+        "path_pattern",
+        "manifest_sha256",
+        "manifest_bytes",
+        "bindings",
+    }
+    if not isinstance(value, dict) or set(value) not in (
+        common | file_fields,
+        common | {"relations"},
+    ):
         raise _WorkerFailure(
             "file_query_invalid", "The private file-query request is invalid."
         )
@@ -571,74 +830,78 @@ def _validate_request(raw: bytes) -> dict[str, Any]:
             "dependency_unavailable",
             "The local structured-file query protocol is incompatible.",
         )
-    if value["format"] not in {
-        "csv",
-        "tsv",
-        "json_records",
-        "ndjson",
-        "parquet",
-    }:
-        raise _WorkerFailure(
-            "format_unsupported", "The structured-file format is unsupported."
-        )
-    if (
-        not isinstance(value["workspace_id"], str)
-        or not value["workspace_id"].startswith("workspace:sha256:")
-        or not isinstance(value["path_pattern"], str)
-        or not value["path_pattern"]
-        or value["path_pattern"].startswith("/")
-        or "\\" in value["path_pattern"]
-        or "\x00" in value["path_pattern"]
-    ):
-        raise _WorkerFailure(
-            "file_query_invalid", "The bound file-query manifest is invalid."
-        )
-    bindings = value["bindings"]
-    if not isinstance(bindings, list) or not 1 <= len(bindings) <= 1_000:
-        raise _WorkerFailure(
-            "file_pattern_too_broad", "The bound file-query manifest is invalid."
-        )
-    required_binding = {
-        "path",
-        "format",
-        "physical_revision",
-        "device",
-        "inode",
-        "mode",
-        "uid",
-        "gid",
-        "link_count",
-        "size_bytes",
-        "modified_ns",
-        "changed_ns",
-        "observed_at",
-    }
-    if any(
-        not isinstance(item, dict)
-        or set(item) != required_binding
-        or item.get("format") != value["format"]
-        for item in bindings
-    ):
-        raise _WorkerFailure(
-            "file_query_invalid", "The bound file-query manifest is invalid."
-        )
-    manifest_material = {
-        "protocol": "daita.local_file_query_manifest.v1",
-        "workspace_id": value["workspace_id"],
-        "path_pattern": value["path_pattern"],
-        "format": value["format"],
-        "bindings": bindings,
-    }
-    encoded_manifest = canonical_json(manifest_material).encode("utf-8")
-    if (
-        not isinstance(value["manifest_bytes"], int)
-        or isinstance(value["manifest_bytes"], bool)
-        or value["manifest_bytes"] != len(encoded_manifest)
-        or value["manifest_sha256"] != "sha256:" + sha256(encoded_manifest).hexdigest()
-    ):
-        raise _WorkerFailure(
-            "file_query_invalid", "The bound file-query manifest changed."
-        )
+    if "relations" in value:
+        _validate_relations(value["relations"])
+    else:
+        if value["format"] not in {
+            "csv",
+            "tsv",
+            "json_records",
+            "ndjson",
+            "parquet",
+        }:
+            raise _WorkerFailure(
+                "format_unsupported", "The structured-file format is unsupported."
+            )
+        if (
+            not isinstance(value["workspace_id"], str)
+            or not value["workspace_id"].startswith("workspace:sha256:")
+            or not isinstance(value["path_pattern"], str)
+            or not value["path_pattern"]
+            or value["path_pattern"].startswith("/")
+            or "\\" in value["path_pattern"]
+            or "\x00" in value["path_pattern"]
+        ):
+            raise _WorkerFailure(
+                "file_query_invalid", "The bound file-query manifest is invalid."
+            )
+        bindings = value["bindings"]
+        if not isinstance(bindings, list) or not 1 <= len(bindings) <= 1_000:
+            raise _WorkerFailure(
+                "file_pattern_too_broad", "The bound file-query manifest is invalid."
+            )
+        required_binding = {
+            "path",
+            "format",
+            "physical_revision",
+            "device",
+            "inode",
+            "mode",
+            "uid",
+            "gid",
+            "link_count",
+            "size_bytes",
+            "modified_ns",
+            "changed_ns",
+            "observed_at",
+        }
+        if any(
+            not isinstance(item, dict)
+            or set(item) != required_binding
+            or item.get("format") != value["format"]
+            for item in bindings
+        ):
+            raise _WorkerFailure(
+                "file_query_invalid", "The bound file-query manifest is invalid."
+            )
+        manifest_material = {
+            "protocol": "daita.local_file_query_manifest.v1",
+            "workspace_id": value["workspace_id"],
+            "path_pattern": value["path_pattern"],
+            "format": value["format"],
+            "bindings": bindings,
+        }
+        encoded_manifest = canonical_json(manifest_material).encode("utf-8")
+        if (
+            not isinstance(value["manifest_bytes"], int)
+            or isinstance(value["manifest_bytes"], bool)
+            or value["manifest_bytes"] != len(encoded_manifest)
+            or value["manifest_sha256"]
+            != "sha256:" + sha256(encoded_manifest).hexdigest()
+        ):
+            raise _WorkerFailure(
+                "file_query_invalid", "The bound file-query manifest changed."
+            )
     integer_names = (
         "max_result_rows",
         "max_result_bytes",
@@ -708,8 +971,12 @@ def _revalidate_canonical_sql(request: dict[str, Any]) -> None:
         validate_duckdb_read,
     )
 
+    relations = request.get("relations")
+    names = (
+        ("data",) if relations is None else tuple(item["name"] for item in relations)
+    )
     try:
-        validated = validate_duckdb_read(str(request["canonical_sql"]))
+        validated = validate_duckdb_read(str(request["canonical_sql"]), names)
     except DuckDBReadValidationError as error:
         raise _WorkerFailure(
             "file_query_invalid",

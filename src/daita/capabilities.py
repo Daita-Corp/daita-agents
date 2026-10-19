@@ -1875,6 +1875,10 @@ class ToolView:
     # value: the first route without it, the second route (which declares and
     # receives it) with it.
     mode_by_presence: bool = False
+    # Routes chosen by an argument of the same name rather than by a selector
+    # value: a call that supplies it, with the selector omitted or at its
+    # default, takes that route. They never appear among the selector values.
+    presence_modes: tuple[str, ...] = ()
     # Optional arguments whose full rules stay in the capability contract
     # (read with toolbox_inspect) and are summarized in the provider schema.
     # Validation always uses the capability's complete schema.
@@ -1904,6 +1908,11 @@ class ToolView:
                 or not isinstance(self.mode_argument, str)
                 or re.fullmatch(r"[a-z][a-z_]{0,31}", self.mode_argument) is None
                 or (self.default_mode is not None and self.default_mode not in modes)
+                or not set(self.presence_modes) <= set(modes)
+                or len(set(self.presence_modes)) != len(self.presence_modes)
+                or self.default_mode in self.presence_modes
+                or (self.presence_modes and self.mode_by_presence)
+                or not set(modes) - set(self.presence_modes)
                 or not isinstance(self.mode_by_presence, bool)
                 or (
                     self.mode_by_presence
@@ -1923,9 +1932,11 @@ class ToolView:
             self.mode_argument != TOOL_MODE_ARGUMENT
             or self.default_mode is not None
             or self.mode_by_presence
+            or self.presence_modes
         ):
             raise ValueError("tool route selection requires mode routes")
         object.__setattr__(self, "mode_capability_ids", routes)
+        object.__setattr__(self, "presence_modes", tuple(self.presence_modes))
         summarized = tuple(self.summarized_arguments)
         if len(set(summarized)) != len(summarized) or any(
             not isinstance(item, str)
@@ -2225,6 +2236,16 @@ class CapabilityRegistry:
                             raise ValueError(
                                 f"routed selector values are undeclared: {view.name}"
                             )
+                routes = dict(view.mode_capability_ids)
+                if any(
+                    _declares(self._capabilities[capability_id], mode)
+                    != (capability_id == routes[mode])
+                    for mode in view.presence_modes
+                    for capability_id in routed_ids
+                ):
+                    raise ValueError(
+                        f"only a presence route declares its argument: {view.name}"
+                    )
                 mode_input_schemas[view.name] = _mode_input_schema(
                     view,
                     tuple(
@@ -2357,6 +2378,15 @@ class CapabilityRegistry:
                                                 "default_mode": view.default_mode,
                                                 "mode_by_presence": (
                                                     view.mode_by_presence
+                                                ),
+                                                **(
+                                                    {
+                                                        "presence_modes": list(
+                                                            view.presence_modes
+                                                        )
+                                                    }
+                                                    if view.presence_modes
+                                                    else {}
                                                 ),
                                             }
                                             if view.mode_capability_ids
@@ -2910,9 +2940,12 @@ def tool_call_mode(view: ToolView, arguments: Mapping[str, object]) -> object:
     if view.mode_by_presence:
         present = view.mode_argument in arguments
         return view.mode_capability_ids[1 if present else 0][0]
-    if view.mode_argument not in arguments:
-        return view.default_mode
-    return arguments.get(view.mode_argument)
+    selected = arguments.get(view.mode_argument, view.default_mode)
+    if selected == view.default_mode:
+        for mode in view.presence_modes:
+            if mode in arguments:
+                return mode
+    return selected
 
 
 def _declares(capability: Capability, name: str) -> bool:
@@ -3052,7 +3085,7 @@ def _mode_input_schema(
     if not view.mode_by_presence:
         properties[selector] = {
             "type": "string",
-            "enum": [mode for mode, _ in routes],
+            "enum": [mode for mode, _ in routes if mode not in view.presence_modes],
         }
     required: set[str] | None = None
     for index, (_mode, schema) in enumerate(routes):

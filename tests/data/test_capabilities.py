@@ -9,7 +9,7 @@ from typing import cast
 
 import pytest
 
-from daita._json import FrozenJsonObject, thaw_json
+from daita._json import FrozenJsonObject, canonical_json, thaw_json
 from daita.adapters.registry import SourceOperation, SourceTypeRegistry
 from daita.capabilities import (
     CallTargetLane,
@@ -690,3 +690,17 @@ async def test_data_export_routes_each_catalog_binding_to_exactly_one_backend() 
 
     assert sqlite.calls == 1
     assert postgresql.calls == 1
+
+
+@pytest.mark.parametrize("slack", [0, -1])
+def test_result_projection_keeps_only_whole_rows_within_the_byte_limit(slack: int):
+    rows = tuple({"id": index, "label": "x" * (index * 7)} for index in range(6))
+    # Three rows encode as '[r0,r1,r2]': brackets, rows and two separators.
+    three_rows = 2 + sum(len(canonical_json(row)) for row in rows[:3]) + 2
+
+    projection = project_result_rows(rows, max_rows=5, max_bytes=three_rows + slack)
+
+    kept = 3 if slack == 0 else 2
+    assert projection.returned_rows == kept
+    assert projection.utf8_bytes == len(canonical_json(list(rows[:kept])))
+    assert projection.truncation_reasons == ("row_limit", "byte_limit")

@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol, TypeVar, cast
 
 from ..._json import FrozenJsonObject, canonical_json
+from ...adapters.local_file_query import LocalFileQueryError, QueryRelation
 from ...artifacts.renderers import MAX_CSV_ROWS, MAX_CSV_SECONDS
 from ...capabilities import (
     AccessMode,
@@ -39,6 +40,8 @@ from ...errors import DaitaError
 from .controller import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
     DATA_QUERY_CAPABILITY_ID,
+    DATA_QUERY_COMBINED_CAPABILITY_ID,
+    DATA_QUERY_COMBINED_EVIDENCE_KIND,
     DATA_QUERY_EVIDENCE_KIND,
     RELATIONAL_UPDATE_CAPABILITY_ID,
     RELATIONAL_UPDATE_EVIDENCE_KIND,
@@ -58,6 +61,7 @@ from .sql import (
 from .sql.relational_upsert import RelationalUpsertIntent
 
 DATA_QUERY_EXECUTOR_ID = "data.query.executor"
+DATA_QUERY_COMBINED_EXECUTOR_ID = "data.query_combined.executor"
 DATA_QUERY_TOOL_NAME = "data_query"
 RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID = "data.preview_update_rows.executor"
 RELATIONAL_UPDATE_EXECUTOR_ID = "data.update_rows.executor"
@@ -89,7 +93,24 @@ _DATA_QUERY_USAGE = (
 )
 
 
-def _data_query_description(file_outputs: tuple[str, ...]) -> str:
+_DATA_QUERY_COMBINED_CAPABILITY_DESCRIPTION = (
+    "Join or aggregate data from several sources in one bounded read. Each of "
+    "2 to 4 inputs runs read-only SQL in its own source's dialect on exact "
+    "catalog resources; sql is one DuckDB SELECT that references each input "
+    "alias exactly once and nothing else. Returns columns, rows, truncation, "
+    "per-input lineage and timing. Limits: 5s per input, 15s for all inputs, "
+    "100 rows and 16 KB in the result; an input too large to join completely "
+    "refuses the whole call, so aggregate or filter inside each input."
+)
+_DATA_QUERY_COMBINED_USAGE = (
+    " To join sources, send inputs (2-4 {alias, source_id, resource_ids, sql}, "
+    "each in its source's dialect) and sql as one DuckDB SELECT over only "
+    "those aliases; aggregate or filter in each input, since an input too "
+    "large to join completely refuses the call."
+)
+
+
+def _data_query_description(file_outputs: tuple[str, ...], combined: bool) -> str:
     file_output = (
         f" output={'|'.join(file_outputs)} exports one sql in full as a file "
         f"({MAX_CSV_ROWS:,} rows, {MAX_CSV_SECONDS:.0f}s), no rows; to save "
@@ -97,7 +118,12 @@ def _data_query_description(file_outputs: tuple[str, ...]) -> str:
         if file_outputs
         else ""
     )
-    return DATA_QUERY_DESCRIPTION + file_output + _DATA_QUERY_USAGE
+    return (
+        DATA_QUERY_DESCRIPTION
+        + file_output
+        + (_DATA_QUERY_COMBINED_USAGE if combined else "")
+        + _DATA_QUERY_USAGE
+    )
 
 
 RELATIONAL_UPDATE_DESCRIPTION = (
@@ -733,6 +759,187 @@ def data_query_statements(
     return tuple(statements)
 
 
+COMBINED_QUERY_MAX_INPUTS = 4
+# Internal per-input ceilings the model never sees. An input that reaches
+# either refuses the whole call: a join over incomplete input is never returned.
+COMBINED_QUERY_INPUT_MAX_ROWS = 10_000
+COMBINED_QUERY_INPUT_MAX_BYTES = 4 * 1_024 * 1_024
+
+
+class CombinedQueryEngine(Protocol):
+    async def query_relations(
+        self,
+        *,
+        relations: tuple[QueryRelation, ...],
+        canonical_sql: str,
+        sql_fingerprint: str,
+    ) -> FrozenJsonObject: ...
+
+
+_ENGINE_ERRORS = {
+    "file_query_timeout": (
+        "combined_query_timeout",
+        "The combining query exceeded its bounded wall time.",
+    ),
+    "file_query_limited": (
+        "combined_query_limited",
+        "The combining query exceeded a bounded worker limit.",
+    ),
+}
+
+
+class DataQueryCombinedExecutor:
+    """Join complete bounded per-source reads in the private DuckDB worker.
+
+    Each input runs through its source's registry backend under the catalog
+    revisions validated before dispatch, within one shared input deadline.
+    """
+
+    executor_id = DATA_QUERY_COMBINED_EXECUTOR_ID
+
+    def __init__(
+        self,
+        agent_id: str,
+        backends: Mapping[str, SqlReadBackend],
+        engine: CombinedQueryEngine,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._agent_id = agent_id
+        self._backends = dict(backends)
+        self._engine = engine
+        self._clock = clock
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        inputs = cast(tuple[Mapping[str, object], ...], request.arguments["inputs"])
+        started = self._clock()
+        deadline = started + DATA_QUERY_TOTAL_TIMEOUT_SECONDS
+        reads: list[tuple[str, SqlReadResult]] = []
+        for item in inputs:
+            alias = cast(str, item["alias"])
+            source_id = cast(str, item["source_id"])
+            backend = self._backends.get(cast(str, item["_adapter_id"]))
+            if backend is None:
+                raise ValueError("relational query adapter binding is unsupported")
+            remaining_seconds = deadline - self._clock()
+            if remaining_seconds <= 0:
+                raise DataQueryError(
+                    "query_time_limit",
+                    "The inputs exceeded the total read deadline of "
+                    f"{DATA_QUERY_TOTAL_TIMEOUT_SECONDS:g} seconds.",
+                )
+            result = await backend.execute_read(
+                agent_id=self._agent_id,
+                source_id=source_id,
+                sql=cast(str, item["sql"]),
+                parameters=(),
+                max_rows=COMBINED_QUERY_INPUT_MAX_ROWS,
+                max_bytes=COMBINED_QUERY_INPUT_MAX_BYTES,
+                expected_resource_revisions=_expected_resource_revisions(item),
+                timeout_seconds=min(
+                    DATA_QUERY_STATEMENT_TIMEOUT_SECONDS, remaining_seconds
+                ),
+            )
+            if (
+                not isinstance(result, SqlReadResult)
+                or result.source_id != source_id
+                or frozenset(result.resource_ids)
+                != frozenset(cast(tuple[str, ...], item["resource_ids"]))
+            ):
+                raise ValueError("SQL backend returned different catalog binding facts")
+            if result.projection.truncated:
+                raise CapabilityInputError(
+                    "combined_input_truncated",
+                    f"Input {alias} returned more rows or bytes than can be "
+                    "joined completely, so no result was returned.",
+                    {
+                        "alias": alias,
+                        "source_id": source_id,
+                        "truncation_reasons": result.projection.truncation_reasons,
+                    },
+                    recovery=ToolRecovery(
+                        RecoveryKind.CORRECT_ARGUMENTS,
+                        f"Aggregate or filter inside input {alias}'s own SQL so "
+                        "it returns fewer rows, then retry the combined query.",
+                    ),
+                )
+            reads.append((alias, result))
+        try:
+            payload = await self._engine.query_relations(
+                relations=tuple(
+                    QueryRelation(alias, result.columns, result.projection.rows)
+                    for alias, result in reads
+                ),
+                canonical_sql=cast(str, request.arguments["sql"]),
+                sql_fingerprint=cast(str, request.arguments["_sql_fingerprint"]),
+            )
+        except LocalFileQueryError as error:
+            code, message = _ENGINE_ERRORS.get(
+                error.code,
+                (
+                    "combined_query_failed",
+                    "The combining query could not run over the inputs; check "
+                    "each alias's column names and types.",
+                ),
+            )
+            raise DataQueryError(code, message) from error
+        projection = BoundedResultProjection(
+            rows=tuple(
+                FrozenJsonObject.from_mapping(row)
+                for row in cast(tuple[Mapping[str, object], ...], payload["rows"])
+            ),
+            total_rows=cast(int, payload["observed_rows"]),
+            returned_rows=cast(int, payload["returned_rows"]),
+            utf8_bytes=cast(int, payload["utf8_bytes"]),
+            row_limit=cast(int, payload["row_limit"]),
+            byte_limit=cast(int, payload["byte_limit"]),
+            truncated=cast(bool, payload["truncated"]),
+            truncation_reasons=cast(tuple[str, ...], payload["truncation_reasons"]),
+        )
+        revisions = dict(
+            revision for _, result in reads for revision in result.resource_revisions
+        )
+        names = dict(name for _, result in reads for name in result.resource_names)
+        data = projection.to_payload().to_dict()
+        data.update(
+            {
+                "canonical_sql": payload["canonical_sql"],
+                "columns": payload["columns"],
+                "inputs": tuple(
+                    {
+                        "alias": alias,
+                        "source_id": result.source_id,
+                        "source_revision": result.source_revision,
+                        "canonical_sql": result.canonical_sql,
+                        "sql_fingerprint": result.sql_fingerprint,
+                        "resource_ids": result.resource_ids,
+                        "resource_revisions": tuple(
+                            {"resource_id": resource_id, "revision": revision}
+                            for resource_id, revision in result.resource_revisions
+                        ),
+                        "rows": result.projection.returned_rows,
+                    }
+                    for alias, result in reads
+                ),
+                "resource_ids": tuple(sorted(revisions)),
+                "resource_revisions": tuple(
+                    {"resource_id": resource_id, "revision": revision}
+                    for resource_id, revision in sorted(revisions.items())
+                ),
+                "sql_fingerprint": payload["sql_fingerprint"],
+                "tables_touched": tables_touched(names.items()),
+                "timing": {
+                    "elapsed_ms": _elapsed_ms(started, self._clock()),
+                    "statement_timeout_ms": int(
+                        DATA_QUERY_STATEMENT_TIMEOUT_SECONDS * 1_000
+                    ),
+                    "total_timeout_ms": int(DATA_QUERY_TOTAL_TIMEOUT_SECONDS * 1_000),
+                },
+            }
+        )
+        return ToolOutput(kind=DATA_QUERY_COMBINED_EVIDENCE_KIND, data=data)
+
+
 def _expected_resource_revisions(
     arguments: Mapping[str, object],
 ) -> tuple[tuple[str, str], ...] | None:
@@ -951,14 +1158,18 @@ def data_query_declarations(
     backends: Mapping[str, SqlReadBackend],
     *,
     file_outputs: tuple[str, ...] = (),
+    combined_engine: CombinedQueryEngine | None = None,
 ) -> DataQueryDeclarations:
-    executor = DataQueryExecutor(agent_id, backends)
+    executors: tuple[Executor, ...] = (DataQueryExecutor(agent_id, backends),)
+    if combined_engine is not None:
+        executors += (DataQueryCombinedExecutor(agent_id, backends, combined_engine),)
     declarations = data_query_capability_declarations(
         file_outputs=file_outputs,
         file_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID if file_outputs else None,
+        combined=combined_engine is not None,
     )
     return DataQueryDeclarations(
-        declarations.capabilities, (executor,), declarations.tool_views
+        declarations.capabilities, executors, declarations.tool_views
     )
 
 
@@ -994,8 +1205,12 @@ def data_query_capability_declarations(
     *,
     file_outputs: tuple[str, ...] = (),
     file_capability_id: str | None = None,
+    combined: bool = False,
 ) -> CapabilityDeclarations:
-    """Declare data_query; file outputs route to the exact export capability."""
+    """Declare data_query; file outputs route to the exact export capability.
+
+    A call that supplies ``inputs`` routes to the combined multi-source read.
+    """
 
     return _query_declarations(
         ToolPresentation(
@@ -1023,6 +1238,7 @@ def data_query_capability_declarations(
                 "relational",
                 "sql",
                 "profile",
+                *(("join", "combine") if combined else ()),
                 *(
                     (
                         "export",
@@ -1039,6 +1255,7 @@ def data_query_capability_declarations(
         ),
         file_outputs=file_outputs,
         file_capability_id=file_capability_id,
+        combined=combined,
     )
 
 
@@ -1261,6 +1478,7 @@ def _query_declarations(
     *,
     file_outputs: tuple[str, ...] = (),
     file_capability_id: str | None = None,
+    combined: bool = False,
 ) -> CapabilityDeclarations:
     if bool(file_outputs) != (file_capability_id is not None):
         raise ValueError("data_query file outputs require their export capability")
@@ -1319,28 +1537,110 @@ def _query_declarations(
             graph_max_targets=16,
         ),
     )
+    resource_ids_rule = {
+        "type": "array",
+        "items": resource_id_schema(),
+        "minItems": 1,
+        "maxItems": DATA_QUERY_MAX_RESOURCES,
+        "uniqueItems": True,
+    }
+    combined_capability = Capability(
+        id=DATA_QUERY_COMBINED_CAPABILITY_ID,
+        description=_DATA_QUERY_COMBINED_CAPABILITY_DESCRIPTION,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "inputs": {
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": COMBINED_QUERY_MAX_INPUTS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "alias": {
+                                "type": "string",
+                                "pattern": r"^[a-z][a-z0-9_]{0,31}$",
+                            },
+                            "source_id": source_id_schema(),
+                            "resource_ids": resource_ids_rule,
+                            "sql": sql_rule,
+                        },
+                        "required": ["alias", "source_id", "resource_ids", "sql"],
+                        "additionalProperties": False,
+                    },
+                    "description": (
+                        "Use with sql as one DuckDB SELECT over these aliases "
+                        "to join sources; each input sql uses its own source's "
+                        "dialect."
+                    ),
+                },
+                "sql": sql_rule,
+            },
+            "required": ["inputs", "sql"],
+            "additionalProperties": False,
+        },
+        output_kind=DATA_QUERY_COMBINED_EVIDENCE_KIND,
+        output_schema=_combined_query_output_schema(),
+        executor_id=DATA_QUERY_COMBINED_EXECUTOR_ID,
+        access_mode=AccessMode.READ,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+    )
+    routes: tuple[tuple[str, str], ...] = (
+        ("rows", capability.id),
+        *((output, cast(str, file_capability_id)) for output in file_outputs),
+        *((("inputs", combined_capability.id),) if combined else ()),
+    )
+    routed = len(routes) > 1
     view = ToolView(
         name=DATA_QUERY_TOOL_NAME,
         capability_id=capability.id,
-        description=_data_query_description(file_outputs),
+        description=_data_query_description(file_outputs, combined),
         presentation=presentation,
-        mode_capability_ids=(
-            (
-                ("rows", capability.id),
-                *((output, cast(str, file_capability_id)) for output in file_outputs),
-            )
-            if file_outputs
-            else ()
-        ),
-        mode_argument="output" if file_outputs else "mode",
-        default_mode="rows" if file_outputs else None,
+        mode_capability_ids=routes if routed else (),
+        mode_argument="output" if routed else "mode",
+        default_mode="rows" if routed else None,
+        presence_modes=("inputs",) if combined else (),
+        # The description states the input shape; the full item rules stay in
+        # the capability contract.
+        summarized_arguments=("inputs",) if combined else (),
     )
     return CapabilityDeclarations(
         domain_owner_id="data",
-        capabilities=(capability,),
-        executor_ids=(DATA_QUERY_EXECUTOR_ID,),
+        capabilities=(capability, *((combined_capability,) if combined else ())),
+        executor_ids=(
+            DATA_QUERY_EXECUTOR_ID,
+            *((DATA_QUERY_COMBINED_EXECUTOR_ID,) if combined else ()),
+        ),
         tool_views=(view,),
     )
+
+
+def _combined_query_output_schema() -> dict[str, object]:
+    types = {
+        "byte_limit": "integer",
+        "canonical_sql": "string",
+        "columns": "array",
+        "inputs": "array",
+        "resource_ids": "array",
+        "resource_revisions": "array",
+        "returned_rows": "integer",
+        "row_limit": "integer",
+        "rows": "array",
+        "sql_fingerprint": "string",
+        "tables_touched": "array",
+        "timing": "object",
+        "total_rows": "integer",
+        "truncated": "boolean",
+        "truncation_reasons": "array",
+        "trust_classification": "string",
+        "utf8_bytes": "integer",
+    }
+    return {
+        "type": "object",
+        "properties": {name: {"type": kind} for name, kind in sorted(types.items())},
+        "required": sorted(types),
+        "additionalProperties": False,
+    }
 
 
 def _query_output_schema() -> dict[str, object]:
