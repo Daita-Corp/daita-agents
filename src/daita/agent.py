@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
@@ -119,6 +119,7 @@ from .storage.sqlite_records import (
     SourcePermissionsPreview,
     SourceReadMode,
 )
+from .work_board import DEFAULT_DONE_WINDOW, WorkBoard
 from .workspace import LocalWorkspace
 
 
@@ -538,6 +539,18 @@ class Agent:
 
         return await self._embedded.acknowledge_delivery(
             delivery_id, caller_principal_id=caller_principal_id
+        )
+
+    async def work_board(
+        self,
+        *,
+        done_window: timedelta = DEFAULT_DONE_WINDOW,
+        caller_principal_id: str | None = None,
+    ) -> WorkBoard:
+        """Show live and recent work as Scheduled, Running, Needs you and Done."""
+
+        return await self._embedded.work_board(
+            done_window=done_window, caller_principal_id=caller_principal_id
         )
 
     def background_status(self) -> tuple[SupervisorStatus, ...]:

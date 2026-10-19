@@ -39,8 +39,9 @@ Capacity changes require drain and reopen and are not persisted as grants.
 Use `/jobs` in the terminal app to list jobs, inspect tasks and blockers,
 review controls, read results, or cancel a job. The Python API provides
 `list_jobs`, `inspect_job`, `job_board`, `job_timeline`,
-`read_job_result`, and `cancel_job`. The headless CLI can inspect the same
-agent-owned records:
+`read_job_result`, and `cancel_job`. `work_board` shows queued, running,
+blocked and recently finished jobs beside scheduled routines and their results.
+The headless CLI can inspect the same agent-owned records:
 
 ```bash
 daita jobs list atlas

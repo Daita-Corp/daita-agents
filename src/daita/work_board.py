@@ -26,6 +26,7 @@ MAX_WORK_CARDS_PER_COLUMN = 25
 MAX_WORK_CARD_TITLE_CHARACTERS = 120
 MAX_WORK_CARD_SUMMARY_CHARACTERS = 240
 DEFAULT_DONE_WINDOW = timedelta(hours=24)
+MAX_DONE_WINDOW = timedelta(days=7)
 # shortcut: failed jobs have no dismissable record yet; replace when one exists.
 FAILED_JOB_WINDOW = timedelta(days=7)
 
@@ -374,6 +375,7 @@ def work_board_projection(board: WorkBoard) -> dict[str, object]:
 __all__ = [
     "DEFAULT_DONE_WINDOW",
     "FAILED_JOB_WINDOW",
+    "MAX_DONE_WINDOW",
     "MAX_WORK_CARDS_PER_COLUMN",
     "WorkBoard",
     "WorkCard",

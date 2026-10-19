@@ -382,12 +382,18 @@ daita inbox inspect atlas <delivery-id>
 daita inbox acknowledge atlas <delivery-id>
 ```
 
-Acknowledgment is idempotent. Unacknowledged available or blocked Deliveries
-are never evicted. When the fixed per-agent Delivery bound is full, producer
-finalization remains atomic and pending rather than losing the outcome. Once a
-Delivery is acknowledged, its oldest retained history entry can be reclaimed
-inside a later producer finalization transaction; acknowledgment wakes both
-producer drivers so pending work can converge immediately.
+From Python, `Agent.list_deliveries`, `Agent.inspect_delivery` and
+`Agent.acknowledge_delivery` read and dismiss the same records.
+`Agent.work_board()` shows them beside jobs and routines in Scheduled, Running,
+Needs you and Done columns; it is not yet available to hosted callers.
+
+Acknowledgment is idempotent. Unacknowledged routine results are never evicted.
+When the fixed per-agent Delivery bound is full, a producer's finalization
+transaction reclaims the oldest acknowledged Delivery first, then the oldest job
+result (the job record keeps the result), then the oldest job notice whose job no
+longer waits on the user. If nothing is reclaimable, finalization remains atomic
+and pending rather than losing the outcome; acknowledgment wakes both producer
+drivers so pending work can converge immediately.
 
 A Delivery stores a bounded immutable artifact reference rather than another
 copy of the full artifact manifest. Finalization verifies it against the artifact

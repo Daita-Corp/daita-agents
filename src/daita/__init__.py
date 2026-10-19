@@ -132,6 +132,7 @@ from .storage.sqlite_records import (
     EffectResolutionDecision,
     RelationalWriteScope,
 )
+from .work_board import WorkBoard, WorkCard, WorkColumn, WorkKind
 from .workspace import LocalFileAccess, LocalWorkspace
 
 __all__ = [
@@ -250,6 +251,10 @@ __all__ = [
     "ScheduledRoutineSummary",
     "ScheduledRoutine",
     "Transcript",
+    "WorkBoard",
+    "WorkCard",
+    "WorkColumn",
+    "WorkKind",
     "__version__",
     "create_llm_provider",
     "run_resident_host",

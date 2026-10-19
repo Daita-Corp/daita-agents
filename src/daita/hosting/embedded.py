@@ -10,7 +10,7 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, Self, TypedDict, TypeVar, cast
@@ -100,6 +100,7 @@ from ..context import AgentContextBuilder, _project_completed_history
 from ..distribution import (
     DISTRIBUTION_DOMAIN_OWNER_ID,
     DeliveryInspection,
+    DeliverySubjectKind,
     DeliveryView,
     DistributionCapabilityDomain,
     DistributionDestination,
@@ -160,6 +161,7 @@ from ..jobs.graph.capabilities import (
 )
 from ..jobs.graph.models import (
     MAX_MODEL_REQUESTS_PER_ATTEMPT,
+    TERMINAL_GRAPH_STATES,
     GraphAdmission,
     GraphInspection,
     GraphJob,
@@ -238,6 +240,7 @@ from ..routines.capabilities import (
     routine_capability_declarations,
 )
 from ..routines.models import (
+    MAX_ROUTINE_LIST_PAGE_SIZE,
     MisfirePolicy,
     ReportingMode,
     RequestedCapabilityGrant,
@@ -292,6 +295,12 @@ from ..storage.sqlite_records import (
     SourcePermissionsPreview,
     SourceReadMode,
     validate_effect_receipt_id,
+)
+from ..work_board import (
+    DEFAULT_DONE_WINDOW,
+    MAX_DONE_WINDOW,
+    WorkBoard,
+    project_work_board,
 )
 from ..workspace import LocalWorkspace
 from .agent_home import (
@@ -424,6 +433,7 @@ def _routine_draft_values(draft: ScheduledRoutineDraft) -> _RoutineDraftValues:
 
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_DISCOVERED_AGENTS = 100
+_LIVE_JOB_STATES = frozenset(GraphState) - TERMINAL_GRAPH_STATES
 _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
 _RUN_ADMISSION_DRAIN_SECONDS = 30.0
 _T = TypeVar("_T")
@@ -2749,6 +2759,49 @@ class EmbeddedAgent:
         if acknowledged is not None:
             self._routine_supervisor.wake()
         return acknowledged
+
+    async def work_board(
+        self,
+        *,
+        done_window: timedelta = DEFAULT_DONE_WINDOW,
+        caller_principal_id: str | None = None,
+    ) -> WorkBoard:
+        """Project this agent's live and recent jobs, routines and results."""
+
+        self._require_open()
+        self._resolve_caller_principal(caller_principal_id)
+        if self._hosted:
+            raise ValueError("hosted work board is not available yet")
+        if not isinstance(done_window, timedelta) or not (
+            timedelta(0) < done_window <= MAX_DONE_WINDOW
+        ):
+            raise ValueError("done window must be positive and at most seven days")
+        now = self._clock()
+        live_jobs = await self._job_owner.list(states=_LIVE_JOB_STATES, limit=100)
+        finished_jobs = await self._job_owner.list(
+            states=TERMINAL_GRAPH_STATES, limit=100
+        )
+        routines = await self._routine_owner.list(limit=MAX_ROUTINE_LIST_PAGE_SIZE)
+        active = await self._routine_owner.list_active_occurrences(limit=100)
+        deliveries = await self._distribution_owner.list()
+        results = await self._routine_owner.load_occurrences(
+            tuple(
+                dict.fromkeys(
+                    item.subject_id
+                    for item in deliveries
+                    if item.subject_kind is DeliverySubjectKind.ROUTINE_OCCURRENCE
+                )
+            )
+        )
+        return project_work_board(
+            jobs=(*live_jobs, *finished_jobs),
+            routines=routines,
+            active_occurrences=active,
+            result_occurrences=results,
+            deliveries=deliveries,
+            now=now,
+            done_window=done_window,
+        )
 
     def background_status(self) -> tuple[SupervisorStatus, ...]:
         """Return payload-free health of background job and routine execution."""
