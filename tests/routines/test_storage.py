@@ -810,12 +810,12 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
         )
         assert duplicate_delivery.delivery_id == "delivery-routine-1"
         assert duplicate_delivery.subject_kind is DeliverySubjectKind.ROUTINE_OCCURRENCE
-        inbox = await store.list_deliveries(routine.agent_id)
-        assert len(inbox) == 1
+        deliveries = await store.list_deliveries(routine.agent_id)
+        assert len(deliveries) == 1
         if completed:
-            assert inbox[0].outcome.conclusion_preview == final_text
+            assert deliveries[0].outcome.conclusion_preview == final_text
         else:
-            assert "routine_run_" in inbox[0].outcome.conclusion_preview
+            assert "routine_run_" in deliveries[0].outcome.conclusion_preview
         persisted = await store.load_scheduled_routine(
             routine.agent_id,
             routine.routine_id,

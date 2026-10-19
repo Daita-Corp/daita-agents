@@ -41,7 +41,7 @@ def response() -> ModelResponse:
     )
 
 
-def inbox_count(state_path: Path) -> int:
+def delivery_count(state_path: Path) -> int:
     connection = sqlite3.connect(f"file:{state_path}?mode=ro", uri=True)
     try:
         row = connection.execute("SELECT COUNT(*) FROM deliveries").fetchone()
@@ -131,10 +131,10 @@ async def main(root: Path) -> None:
     )
     await ready.wait()
     for _ in range(5_000):
-        if inbox_count(state_path) == 1:
+        if delivery_count(state_path) == 1:
             break
         await asyncio.sleep(0)
-    assert inbox_count(state_path) == 1
+    assert delivery_count(state_path) == 1
     stop.set()
     await hosted
 
@@ -162,8 +162,8 @@ async def main(root: Path) -> None:
         await asyncio.sleep(0)
     restarted_stop.set()
     await restarted
-    assert inbox_count(state_path) == 1
-    print(json.dumps({"inbox_count": 1, "restart_model_calls": 0}))
+    assert delivery_count(state_path) == 1
+    print(json.dumps({"delivery_count": 1, "restart_model_calls": 0}))
 
 
 if __name__ == "__main__":

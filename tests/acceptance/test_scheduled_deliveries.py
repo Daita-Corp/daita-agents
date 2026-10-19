@@ -187,9 +187,9 @@ async def _run_routine(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 15.0
     while loop.time() < deadline:
-        inbox = await agent.list_deliveries(conversation_id=conversation_id)
-        if inbox:
-            return inbox[0]
+        deliveries = await agent.list_deliveries(conversation_id=conversation_id)
+        if deliveries:
+            return deliveries[0]
         await asyncio.sleep(0.01)
     inspection = await agent.inspect_routine(created.routine_id)
     raise AssertionError(inspection)
@@ -569,11 +569,11 @@ async def test_restart_after_artifact_and_terminal_commit_does_not_repeat_work(
     )
     try:
         for _ in range(500):
-            inbox = await reopened.list_deliveries(conversation_id=conversation_id)
-            if inbox:
+            deliveries = await reopened.list_deliveries(conversation_id=conversation_id)
+            if deliveries:
                 break
             await asyncio.sleep(0)
-        (delivery,) = inbox
+        (delivery,) = deliveries
         assert delivery.artifact_references[0].artifact_id == artifact.artifact_id
         assert (await reopened.read_artifact(artifact.artifact_id)).content == (
             b'"value"\r\n11\r\n'
@@ -1282,9 +1282,11 @@ async def test_corrupt_committed_artifact_is_one_failed_delivery(
         )
         delivery = None
         for _ in range(500):
-            inbox = await agent.list_deliveries(conversation_id=origin.conversation_id)
-            if inbox:
-                delivery = inbox[0]
+            deliveries = await agent.list_deliveries(
+                conversation_id=origin.conversation_id
+            )
+            if deliveries:
+                delivery = deliveries[0]
                 break
             await asyncio.sleep(0)
         assert delivery is not None

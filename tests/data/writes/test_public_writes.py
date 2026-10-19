@@ -450,9 +450,9 @@ def script(
 
 async def wait_delivery(agent, conversation_id, count):
     for _ in range(1000):
-        inbox = await agent.list_deliveries(conversation_id=conversation_id)
-        if len(inbox) >= count:
-            return await agent.inspect_delivery(inbox[0].delivery_id)
+        deliveries = await agent.list_deliveries(conversation_id=conversation_id)
+        if len(deliveries) >= count:
+            return await agent.inspect_delivery(deliveries[0].delivery_id)
         await asyncio.sleep(0.005)
     inspection = await agent.list_routines()
     pytest.fail(f"Native routine did not deliver: {inspection}")

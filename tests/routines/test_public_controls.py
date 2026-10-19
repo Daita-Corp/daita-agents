@@ -414,13 +414,15 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
             expected_revision=resumed.revision,
         )
         for _ in range(1_000):
-            inbox = await agent.list_deliveries(conversation_id=origin.conversation_id)
-            if inbox:
+            deliveries = await agent.list_deliveries(
+                conversation_id=origin.conversation_id
+            )
+            if deliveries:
                 break
             await asyncio.sleep(0.005)
         inspection = await agent.inspect_routine(running.routine_id)
         assert inspection is not None
-        assert len(inbox) == 1, (
+        assert len(deliveries) == 1, (
             tuple(
                 (
                     item.disposition,
@@ -432,7 +434,7 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
             ),
             len(provider.requests),
         )
-        delivery = await agent.inspect_delivery(inbox[0].delivery_id)
+        delivery = await agent.inspect_delivery(deliveries[0].delivery_id)
         assert delivery is not None
         scheduled_request = provider.requests[-1]
         assert scheduled_request.sensitivity is ModelSensitivity.INTERNAL
@@ -443,7 +445,7 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
         assert "later-procedure" not in scheduled_text
         assert "Private later meaning" not in scheduled_text
         assert delivery.delivery.outcome.conclusion_digest == (
-            inbox[0].conclusion_digest
+            deliveries[0].conclusion_digest
         )
         disabled = await agent.disable_routine(
             running.routine_id,
@@ -574,18 +576,23 @@ async def test_public_source_free_once_routine_commits_required_document(
         await agent.set_memory("", sensitivity=ModelSensitivity.PUBLIC)
         created = await agent.create_routine(await agent.propose_routine(draft))
         for _ in range(1000):
-            inbox = await agent.list_deliveries(conversation_id=origin.conversation_id)
-            if inbox:
+            deliveries = await agent.list_deliveries(
+                conversation_id=origin.conversation_id
+            )
+            if deliveries:
                 break
             await asyncio.sleep(0.005)
-        assert len(inbox) == 1
-        assert inbox[0].conclusion_state is OutcomeState.SUCCEEDED, tuple(
+        assert len(deliveries) == 1
+        assert deliveries[0].conclusion_state is OutcomeState.SUCCEEDED, tuple(
             item.result
             for item in await agent.conversation_runs(origin.conversation_id)
         )
-        assert len(inbox[0].artifact_references) == 1
+        assert len(deliveries[0].artifact_references) == 1
         assert provider.requests[-1].sensitivity is classification
-        assert inbox[0].artifact_references[0].sensitivity.value == classification.value
+        assert (
+            deliveries[0].artifact_references[0].sensitivity.value
+            == classification.value
+        )
         inspection = await agent.inspect_routine(created.routine_id)
         assert (
             inspection is not None

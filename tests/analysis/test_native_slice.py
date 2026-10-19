@@ -261,20 +261,20 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
         )
         async with asyncio.timeout(30):
             while not (
-                inbox := await agent.list_deliveries(
+                deliveries := await agent.list_deliveries(
                     conversation_id=origin.conversation_id
                 )
             ):
                 await asyncio.sleep(0.01)
-        assert len(inbox) == 1
-        assert inbox[0].conclusion_state is OutcomeState.SUCCEEDED, (
-            inbox[0].failure_code,
+        assert len(deliveries) == 1
+        assert deliveries[0].conclusion_state is OutcomeState.SUCCEEDED, (
+            deliveries[0].failure_code,
             [
                 (run.result, run.transcript.tool_pairs)
                 for run in await agent.conversation_runs(origin.conversation_id)
             ],
         )
-        run_id = inbox[0].resulting_run_id
+        run_id = deliveries[0].resulting_run_id
         assert run_id is not None
         transcript = await agent.transcript(run_id)
         assert transcript.run.origin is RunOrigin.SCHEDULED_ROUTINE
@@ -304,10 +304,10 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
         ]
         ref = next(
             ref
-            for ref in inbox[0].artifact_references
+            for ref in deliveries[0].artifact_references
             if ref.media_type == "application/json"
         )
-        assert len(inbox[0].artifact_references) == (2 if batch else 1)
+        assert len(deliveries[0].artifact_references) == (2 if batch else 1)
         assert json.loads((await agent.read_artifact(ref.artifact_id)).content) == {
             "n": 42
         }

@@ -235,9 +235,9 @@ async def _wait_for_deliveries(agent: Agent, conversation_id: str, count: int):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 15.0
     while loop.time() < deadline:
-        inbox = await agent.list_deliveries(conversation_id=conversation_id)
-        if len(inbox) >= count:
-            return inbox
+        deliveries = await agent.list_deliveries(conversation_id=conversation_id)
+        if len(deliveries) >= count:
+            return deliveries
         await asyncio.sleep(0.01)
     raise AssertionError(f"expected {count} routine deliveries")
 
@@ -313,7 +313,7 @@ async def _routine(tmp_path: Path) -> tuple[MockModelProvider, tuple[object, ...
         await _wait_for_deliveries(agent, origin.conversation_id, 1)
         now[0] = NOW + timedelta(hours=1, seconds=1)
         agent._embedded._routine_supervisor.wake()
-        inbox = await _wait_for_deliveries(agent, origin.conversation_id, 2)
+        deliveries = await _wait_for_deliveries(agent, origin.conversation_id, 2)
         inspection = await agent.inspect_routine(created.routine_id)
         assert inspection is not None
         transcripts = []
@@ -326,7 +326,7 @@ async def _routine(tmp_path: Path) -> tuple[MockModelProvider, tuple[object, ...
         provider.assert_consumed()
         return provider, (
             inspection.routine.consecutive_failures,
-            tuple(sorted(item.failure_code or "" for item in inbox)),
+            tuple(sorted(item.failure_code or "" for item in deliveries)),
             tuple(transcripts),
         )
     finally:
