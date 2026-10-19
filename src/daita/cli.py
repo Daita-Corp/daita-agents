@@ -68,8 +68,8 @@ from .distribution import (
     ArtifactRequirement,
     OutcomeContract,
     delivery_inspection_projection,
+    delivery_view_projection,
     distribution_destination_projection,
-    inbox_view_projection,
 )
 from .errors import StateCompatibilityError
 from .jobs.graph.models import GraphInspection, GraphState, TaskState
@@ -2235,8 +2235,8 @@ async def _execute(args: argparse.Namespace) -> object:
                 ]
             if args.inbox_command == "list":
                 return [
-                    inbox_view_projection(item)
-                    for item in await agent.inbox(
+                    delivery_view_projection(item)
+                    for item in await agent.list_deliveries(
                         conversation_id=args.conversation_id,
                         include_acknowledged=args.include_acknowledged,
                         limit=args.limit,
@@ -2247,10 +2247,10 @@ async def _execute(args: argparse.Namespace) -> object:
                 if delivery_inspection is None:
                     raise ValueError("delivery not found")
                 return delivery_inspection_projection(delivery_inspection)
-            acknowledged = await agent.acknowledge_inbox(args.delivery_id)
+            acknowledged = await agent.acknowledge_delivery(args.delivery_id)
             if acknowledged is None:
                 raise ValueError("delivery not found")
-            return inbox_view_projection(acknowledged)
+            return delivery_view_projection(acknowledged)
         if args.command == "routines":
             print(
                 "Host open for this command only. Saved assignments progress while a host is open; "

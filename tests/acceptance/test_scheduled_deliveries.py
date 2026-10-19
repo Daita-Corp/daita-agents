@@ -187,7 +187,7 @@ async def _run_routine(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 15.0
     while loop.time() < deadline:
-        inbox = await agent.inbox(conversation_id=conversation_id)
+        inbox = await agent.list_deliveries(conversation_id=conversation_id)
         if inbox:
             return inbox[0]
         await asyncio.sleep(0.01)
@@ -318,14 +318,14 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
         clock=lambda: NOW,
     )
     try:
-        (delivery,) = await reopened.inbox()
+        (delivery,) = await reopened.list_deliveries()
         assert delivery.delivery_id == delivery_id
         assert delivery.artifact_references[0].artifact_id == artifact_id
         assert (await reopened.read_artifact(artifact_id)).content == payload.content
         scheduled_run_id = delivery.resulting_run_id
         assert scheduled_run_id is not None
         assert await reopened.clear_conversations() == 2
-        retained = await reopened.inbox(include_acknowledged=True)
+        retained = await reopened.list_deliveries(include_acknowledged=True)
         assert retained[0].delivery_id == delivery_id
         with pytest.raises(KeyError):
             await reopened.transcript(scheduled_run_id)
@@ -355,7 +355,7 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
             current.found_revision == current.current_revision == CURRENT_HOME_REVISION
         )
         assert (await migrated.read_artifact(artifact_id)).content == payload.content
-        assert (await migrated.inbox())[0].delivery_id == delivery_id
+        assert (await migrated.list_deliveries())[0].delivery_id == delivery_id
     finally:
         await migrated.close()
 
@@ -545,7 +545,7 @@ async def test_restart_after_artifact_and_terminal_commit_does_not_repeat_work(
         )
         assert terminal_result is not None
         (artifact,) = terminal_result.artifacts
-        assert await agent.inbox(conversation_id=origin.conversation_id) == ()
+        assert await agent.list_deliveries(conversation_id=origin.conversation_id) == ()
         assert source_io == 1
         request_count = len(provider.requests)
         conversation_id = origin.conversation_id
@@ -569,7 +569,7 @@ async def test_restart_after_artifact_and_terminal_commit_does_not_repeat_work(
     )
     try:
         for _ in range(500):
-            inbox = await reopened.inbox(conversation_id=conversation_id)
+            inbox = await reopened.list_deliveries(conversation_id=conversation_id)
             if inbox:
                 break
             await asyncio.sleep(0)
@@ -586,7 +586,7 @@ async def test_restart_after_artifact_and_terminal_commit_does_not_repeat_work(
         assert recovery.requests == ()
         assert len(provider.requests) == request_count
         assert source_io == 1
-        assert len(await reopened.inbox(conversation_id=conversation_id)) == 1
+        assert len(await reopened.list_deliveries(conversation_id=conversation_id)) == 1
         duplicate = await reopened._embedded._store.finalize_routine_occurrence(
             reopened.id,
             occurrence_id,
@@ -596,7 +596,7 @@ async def test_restart_after_artifact_and_terminal_commit_does_not_repeat_work(
         assert duplicate is not None
         assert duplicate[1] is not None
         assert duplicate[1].delivery_id == delivery.delivery_id
-        assert len(await reopened.inbox(conversation_id=conversation_id)) == 1
+        assert len(await reopened.list_deliveries(conversation_id=conversation_id)) == 1
     finally:
         await reopened.close()
 
@@ -1282,7 +1282,7 @@ async def test_corrupt_committed_artifact_is_one_failed_delivery(
         )
         delivery = None
         for _ in range(500):
-            inbox = await agent.inbox(conversation_id=origin.conversation_id)
+            inbox = await agent.list_deliveries(conversation_id=origin.conversation_id)
             if inbox:
                 delivery = inbox[0]
                 break

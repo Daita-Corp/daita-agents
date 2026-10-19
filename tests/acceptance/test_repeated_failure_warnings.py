@@ -235,7 +235,7 @@ async def _wait_for_deliveries(agent: Agent, conversation_id: str, count: int):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 15.0
     while loop.time() < deadline:
-        inbox = await agent.inbox(conversation_id=conversation_id)
+        inbox = await agent.list_deliveries(conversation_id=conversation_id)
         if len(inbox) >= count:
             return inbox
         await asyncio.sleep(0.01)

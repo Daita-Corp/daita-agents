@@ -663,6 +663,7 @@ def test_public_surface_is_focused():
         "DeliveryInspection",
         "DeliverySubjectKind",
         "DeliveryState",
+        "DeliveryView",
         "DistributionDestination",
         "DistributionPlan",
         "DistributionTargetBinding",
@@ -678,7 +679,6 @@ def test_public_surface_is_focused():
         "GraphInspection",
         "GraphJob",
         "GraphState",
-        "InboxView",
         "IntervalSchedule",
         "LocalFileAccess",
         "LocalWorkspace",
@@ -868,8 +868,8 @@ def test_graph_finalization_and_distribution_have_single_current_owners():
     )
     tui_controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
     tui_app = (PACKAGE / "tui" / "app.py").read_text(encoding="utf-8")
-    assert "require_agent().inbox(" in tui_controller
-    assert "require_agent().acknowledge_inbox(" in tui_controller
+    assert "require_agent().list_deliveries(" in tui_controller
+    assert "require_agent().acknowledge_delivery(" in tui_controller
     assert "event.run_origin" in tui_app
     assert "Agent.run" not in inbox_screen
     assert "_embedded" not in inbox_screen

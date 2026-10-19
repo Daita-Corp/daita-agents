@@ -65,7 +65,7 @@ async def test_live_owner_admitted_routine_runs_immediate_and_weekly(
             assert result.usage.total_tokens > 0
         assert scenario.approvals == []  # exact typed owner authorization is standing
         assert scenario.conversation_id is not None
-        for item in await scenario.agent.inbox(
+        for item in await scenario.agent.list_deliveries(
             conversation_id=scenario.conversation_id
         ):
             delivery = await scenario.agent.inspect_delivery(item.delivery_id)

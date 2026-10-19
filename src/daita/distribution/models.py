@@ -899,7 +899,7 @@ class GraphJobDelivery:
 
 
 @dataclass(frozen=True, slots=True)
-class InboxView:
+class DeliveryView:
     """Bounded user-facing projection over one logical delivery."""
 
     delivery_id: str
@@ -1149,11 +1149,11 @@ def outcome_artifact_reference_projection(
     return _outcome_artifact_reference_mapping(value)
 
 
-def inbox_view_projection(value: InboxView) -> dict[str, object]:
+def delivery_view_projection(value: DeliveryView) -> dict[str, object]:
     """Return the bounded public/model projection of one logical delivery."""
 
-    if not isinstance(value, InboxView):
-        raise TypeError("inbox projection requires InboxView")
+    if not isinstance(value, DeliveryView):
+        raise TypeError("delivery projection requires DeliveryView")
     return {
         "delivery_id": value.delivery_id,
         "conversation_id": value.conversation_id,

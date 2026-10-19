@@ -488,7 +488,7 @@ async def routine_delivery(evaluation, origin, *, python: bool):
         )
         deadline = asyncio.get_running_loop().time() + 300
         while asyncio.get_running_loop().time() < deadline:
-            items = await evaluation.agent.inbox(
+            items = await evaluation.agent.list_deliveries(
                 conversation_id=origin.result.conversation_id
             )
             matches = [item for item in items if item.resulting_run_id is not None]

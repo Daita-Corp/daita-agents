@@ -48,7 +48,7 @@ from .catalog.models import (
     CatalogSummary,
 )
 from .config import AgentConfig
-from .distribution import DeliveryInspection, DistributionDestination, InboxView
+from .distribution import DeliveryInspection, DeliveryView, DistributionDestination
 from .hosting.embedded import (
     AgentAlreadyExistsError,
     AgentHomeError,
@@ -487,17 +487,17 @@ class Agent:
             run_id, caller_principal_id=caller_principal_id
         )
 
-    async def inbox(
+    async def list_deliveries(
         self,
         *,
         conversation_id: str | None = None,
         include_acknowledged: bool = False,
         limit: int = 50,
         caller_principal_id: str | None = None,
-    ) -> tuple[InboxView, ...]:
+    ) -> tuple[DeliveryView, ...]:
         """Inspect bounded durable autonomous results for this agent."""
 
-        return await self._embedded.inbox(
+        return await self._embedded.list_deliveries(
             conversation_id=conversation_id,
             include_acknowledged=include_acknowledged,
             limit=limit,
@@ -531,12 +531,12 @@ class Agent:
             delivery_id, caller_principal_id=caller_principal_id
         )
 
-    async def acknowledge_inbox(
+    async def acknowledge_delivery(
         self, delivery_id: str, *, caller_principal_id: str | None = None
-    ) -> InboxView | None:
-        """Idempotently acknowledge one exact inbox result."""
+    ) -> DeliveryView | None:
+        """Idempotently acknowledge one exact delivery."""
 
-        return await self._embedded.acknowledge_inbox(
+        return await self._embedded.acknowledge_delivery(
             delivery_id, caller_principal_id=caller_principal_id
         )
 
@@ -1641,11 +1641,11 @@ __all__ = [
     "AgentNotConfiguredError",
     "AgentNotFoundError",
     "CatalogSummary",
+    "DeliveryView",
     "GraphInspection",
     "GraphJob",
     "GraphState",
     "HostActiveError",
-    "InboxView",
     "PostgreSQLProbeResult",
     "PostgreSQLSourceError",
     "SourceRefreshError",

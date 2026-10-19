@@ -16,10 +16,10 @@ from tests.tui._support import (
     DaitaApp,
     DeliveryState,
     DeliverySubjectKind,
+    DeliveryView,
     FrozenJsonObject,
     GraphState,
     InboxScreen,
-    InboxView,
     Input,
     JobsScreen,
     ModelSensitivity,
@@ -87,10 +87,10 @@ async def test_inbox_screen_inspects_sanitizes_and_acknowledges(monkeypatch):
     items = [item]
     acknowledgments: list[str] = []
 
-    async def list_inbox() -> tuple[InboxView, ...]:
+    async def list_inbox() -> tuple[DeliveryView, ...]:
         return tuple(items)
 
-    async def acknowledge_inbox(delivery_id: str) -> InboxView | None:
+    async def acknowledge_delivery(delivery_id: str) -> DeliveryView | None:
         acknowledgments.append(delivery_id)
         items.clear()
         return item
@@ -111,7 +111,7 @@ async def test_inbox_screen_inspects_sanitizes_and_acknowledges(monkeypatch):
         )
 
     monkeypatch.setattr(app.controller, "list_inbox", list_inbox)
-    monkeypatch.setattr(app.controller, "acknowledge_inbox", acknowledge_inbox)
+    monkeypatch.setattr(app.controller, "acknowledge_delivery", acknowledge_delivery)
     monkeypatch.setattr(
         app.controller,
         "list_distribution_destinations",
@@ -202,13 +202,13 @@ async def test_background_status_notifies_once_and_remains_outside_transcript(
     running = _tui_job_summary(
         "job-running-status", GraphState.ACTIVE, result_available=False
     )
-    current_inbox: list[InboxView] = []
+    current_inbox: list[DeliveryView] = []
     notifications: list[tuple[str, str | None]] = []
 
     async def list_jobs() -> tuple[object, ...]:
         return (running,)
 
-    async def list_inbox() -> tuple[InboxView, ...]:
+    async def list_inbox() -> tuple[DeliveryView, ...]:
         return tuple(current_inbox)
 
     def notify(message: str, *, title: str | None = None, **_kwargs: object) -> None:

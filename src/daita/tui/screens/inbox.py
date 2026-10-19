@@ -10,7 +10,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
-from daita import DeliveryState, DeliverySubjectKind, InboxView
+from daita import DeliveryState, DeliverySubjectKind, DeliveryView
 
 from ..sanitization import safe_display, sanitize_terminal_text
 
@@ -26,7 +26,7 @@ class InboxScreen(ModalScreen[None]):
 
     def __init__(self, *, delivery_id: str | None = None) -> None:
         super().__init__()
-        self._items: tuple[InboxView, ...] = ()
+        self._items: tuple[DeliveryView, ...] = ()
         self._target_delivery_id = delivery_id
         self._busy = False
 
@@ -136,7 +136,7 @@ class InboxScreen(ModalScreen[None]):
             item = self._selected_item()
             if item is None:
                 raise ValueError("Select an inbox result first.")
-            acknowledged = await self.app.controller.acknowledge_inbox(  # type: ignore[attr-defined]
+            acknowledged = await self.app.controller.acknowledge_delivery(  # type: ignore[attr-defined]
                 item.delivery_id
             )
             if acknowledged is None:
@@ -204,7 +204,7 @@ class InboxScreen(ModalScreen[None]):
         option = listing.get_option_at_index(listing.highlighted)
         return str(option.id) if option.id is not None else None
 
-    def _selected_item(self) -> InboxView | None:
+    def _selected_item(self) -> DeliveryView | None:
         selected = self._selected_delivery_id()
         if selected is None:
             return None
@@ -212,7 +212,7 @@ class InboxScreen(ModalScreen[None]):
             (item for item in self._items if item.delivery_id == selected), None
         )
 
-    def _render_item(self, item: InboxView) -> None:
+    def _render_item(self, item: DeliveryView) -> None:
         self.query_one("#inbox-detail", Static).update(render_inbox_item(item))
         self.run_worker(
             self._render_destination_discovery(item),
@@ -221,7 +221,7 @@ class InboxScreen(ModalScreen[None]):
             exclusive=True,
         )
 
-    async def _render_destination_discovery(self, item: InboxView) -> None:
+    async def _render_destination_discovery(self, item: DeliveryView) -> None:
         try:
             destinations = await self.app.controller.list_distribution_destinations(  # type: ignore[attr-defined]
                 item.conversation_id,
@@ -255,7 +255,7 @@ class InboxScreen(ModalScreen[None]):
                 )
 
     @staticmethod
-    def _list_label(item: InboxView) -> str:
+    def _list_label(item: DeliveryView) -> str:
         outcome = item.conclusion_state.value.upper()
         subject = item.subject_kind.value.replace("_", " ")
         short_id = (
@@ -296,7 +296,7 @@ class InboxScreen(ModalScreen[None]):
         )
 
 
-def render_inbox_item(item: InboxView) -> str:
+def render_inbox_item(item: DeliveryView) -> str:
     """Render one bounded delivery without treating report text as markup."""
 
     outcome = item.conclusion_state.value

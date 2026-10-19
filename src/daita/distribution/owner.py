@@ -15,11 +15,11 @@ from .models import (
     DeliveryInspection,
     DeliveryState,
     DeliverySubjectKind,
+    DeliveryView,
     DistributionDestination,
     DistributionDestinationState,
     DistributionPlan,
     GraphJobDelivery,
-    InboxView,
     OutcomeArtifactReference,
     OutcomeConclusionKind,
     OutcomeContract,
@@ -372,14 +372,14 @@ class DistributionOwner:
         conversation_id: str | None = None,
         include_acknowledged: bool = False,
         limit: int = MAX_DELIVERY_LIST_PAGE_SIZE,
-    ) -> tuple[InboxView, ...]:
+    ) -> tuple[DeliveryView, ...]:
         deliveries = await self._store.list_deliveries(
             self._agent_id,
             conversation_id=conversation_id,
             include_acknowledged=include_acknowledged,
             limit=limit,
         )
-        return tuple(_inbox_view(value) for value in deliveries)
+        return tuple(_delivery_view(value) for value in deliveries)
 
     async def validate_outcome_artifacts(
         self,
@@ -414,19 +414,19 @@ class DistributionOwner:
         delivery_id: str,
         *,
         acknowledged_at: datetime,
-    ) -> InboxView | None:
+    ) -> DeliveryView | None:
         delivery = await self._store.acknowledge_delivery(
             self._agent_id,
             delivery_id,
             acknowledged_at=acknowledged_at,
         )
-        return None if delivery is None else _inbox_view(delivery)
+        return None if delivery is None else _delivery_view(delivery)
 
 
-def _inbox_view(value: Delivery) -> InboxView:
+def _delivery_view(value: Delivery) -> DeliveryView:
     outcome = value.outcome
     blocked = value.blocked_reason_code is not None
-    return InboxView(
+    return DeliveryView(
         delivery_id=value.delivery_id,
         conversation_id=value.conversation_id,
         subject_kind=value.subject_kind,

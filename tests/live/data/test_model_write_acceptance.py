@@ -674,7 +674,9 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
             assert len(scenario.approvals) == 1 and scenario.approvals[0]["approved"]
         else:
             assert scenario.approvals == []
-        inbox = await scenario.agent.inbox(conversation_id=scenario.conversation_id)
+        inbox = await scenario.agent.list_deliveries(
+            conversation_id=scenario.conversation_id
+        )
         assert len(inbox) == 2
         for item in inbox:
             delivery = await scenario.agent.inspect_delivery(item.delivery_id)

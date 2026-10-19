@@ -100,10 +100,10 @@ from ..context import AgentContextBuilder, _project_completed_history
 from ..distribution import (
     DISTRIBUTION_DOMAIN_OWNER_ID,
     DeliveryInspection,
+    DeliveryView,
     DistributionCapabilityDomain,
     DistributionDestination,
     DistributionOwner,
-    InboxView,
     OutcomeContract,
     distribution_capability_declarations,
 )
@@ -2664,15 +2664,15 @@ class EmbeddedAgent:
             raise ValueError("conversation is unavailable to this caller")
         return exists
 
-    async def inbox(
+    async def list_deliveries(
         self,
         *,
         conversation_id: str | None = None,
         include_acknowledged: bool = False,
         limit: int = 50,
         caller_principal_id: str | None = None,
-    ) -> tuple[InboxView, ...]:
-        """Inspect a bounded agent-owned durable conversation inbox."""
+    ) -> tuple[DeliveryView, ...]:
+        """List bounded agent-owned durable deliveries."""
 
         self._require_open()
         principal_id = self._resolve_caller_principal(caller_principal_id)
@@ -2680,7 +2680,7 @@ class EmbeddedAgent:
             _validate_conversation_id(conversation_id)
             await self._require_conversation_caller(conversation_id, principal_id)
         elif self._hosted:
-            raise ValueError("hosted inbox requires an owned conversation")
+            raise ValueError("hosted delivery listing requires an owned conversation")
         items = await self._distribution_owner.list(
             conversation_id=conversation_id,
             include_acknowledged=include_acknowledged,
@@ -2728,10 +2728,10 @@ class EmbeddedAgent:
             )
         return result
 
-    async def acknowledge_inbox(
+    async def acknowledge_delivery(
         self, delivery_id: str, *, caller_principal_id: str | None = None
-    ) -> InboxView | None:
-        """Idempotently acknowledge one exact agent-owned inbox result."""
+    ) -> DeliveryView | None:
+        """Idempotently acknowledge one exact agent-owned delivery."""
 
         self._require_open()
         if not isinstance(delivery_id, str) or not delivery_id.strip():

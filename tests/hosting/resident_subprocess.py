@@ -107,7 +107,7 @@ async def main(root: Path) -> None:
     )
     await agent.create_routine(await agent.propose_routine(draft))
     state_path = agent.home / "state.db"
-    assert await agent.inbox() == ()
+    assert await agent.list_deliveries() == ()
     await agent.close()
 
     resident_model = MockModelProvider(

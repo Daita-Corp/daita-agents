@@ -29,7 +29,7 @@ from daita import (
     Agent,
     DeliveryState,
     DeliverySubjectKind,
-    InboxView,
+    DeliveryView,
     IntervalSchedule,
     LoopExit,
     LoopLimits,
@@ -215,7 +215,7 @@ class _LiveScenario:
 @dataclass(frozen=True, slots=True)
 class _CompletedRoutine:
     routine: ScheduledRoutine
-    item: InboxView
+    item: DeliveryView
     transcript: Transcript
     result: LoopExit
     conversation_id: str
@@ -376,10 +376,10 @@ async def _wait_for_routine_delivery(
     conversation_id: str,
     routine_id: str,
     timeout: float = 180.0,
-) -> tuple[InboxView, ...]:
+) -> tuple[DeliveryView, ...]:
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
-        items = await agent.inbox(conversation_id=conversation_id)
+        items = await agent.list_deliveries(conversation_id=conversation_id)
         matching = tuple(
             item
             for item in items
@@ -583,7 +583,12 @@ async def _assert_occurrence_and_disable(
     )
     assert disabled.state is RoutineState.DISABLED
     assert (
-        len(await scenario.agent.inbox(conversation_id=completed.conversation_id)) == 1
+        len(
+            await scenario.agent.list_deliveries(
+                conversation_id=completed.conversation_id
+            )
+        )
+        == 1
     )
 
 

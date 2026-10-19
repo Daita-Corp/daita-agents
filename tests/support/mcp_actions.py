@@ -363,7 +363,9 @@ class ActionFixture:
 
     async def delivery(self, count=1):
         for _ in range(1000):
-            inbox = await self.agent.inbox(conversation_id=self.origin.conversation_id)
+            inbox = await self.agent.list_deliveries(
+                conversation_id=self.origin.conversation_id
+            )
             if len(inbox) >= count:
                 return await self.agent.inspect_delivery(inbox[0].delivery_id)
             await asyncio.sleep(0.005)

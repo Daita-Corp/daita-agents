@@ -414,7 +414,7 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
             expected_revision=resumed.revision,
         )
         for _ in range(1_000):
-            inbox = await agent.inbox(conversation_id=origin.conversation_id)
+            inbox = await agent.list_deliveries(conversation_id=origin.conversation_id)
             if inbox:
                 break
             await asyncio.sleep(0.005)
@@ -574,7 +574,7 @@ async def test_public_source_free_once_routine_commits_required_document(
         await agent.set_memory("", sensitivity=ModelSensitivity.PUBLIC)
         created = await agent.create_routine(await agent.propose_routine(draft))
         for _ in range(1000):
-            inbox = await agent.inbox(conversation_id=origin.conversation_id)
+            inbox = await agent.list_deliveries(conversation_id=origin.conversation_id)
             if inbox:
                 break
             await asyncio.sleep(0.005)

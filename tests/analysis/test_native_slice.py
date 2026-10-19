@@ -261,7 +261,9 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
         )
         async with asyncio.timeout(30):
             while not (
-                inbox := await agent.inbox(conversation_id=origin.conversation_id)
+                inbox := await agent.list_deliveries(
+                    conversation_id=origin.conversation_id
+                )
             ):
                 await asyncio.sleep(0.01)
         assert len(inbox) == 1

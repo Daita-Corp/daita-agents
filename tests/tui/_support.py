@@ -34,11 +34,11 @@ __all__ = (
     "DaitaApp",
     "DeliveryState",
     "DeliverySubjectKind",
+    "DeliveryView",
     "FinishReason",
     "Footer",
     "FrozenJsonObject",
     "InboxScreen",
-    "InboxView",
     "Input",
     "Iterator",
     "GraphState",
@@ -149,8 +149,8 @@ from daita import (
     ApprovalRequest,
     DeliveryState,
     DeliverySubjectKind,
+    DeliveryView,
     GraphState,
-    InboxView,
     LoopExit,
     LoopExitKind,
     OutcomeConclusionKind,
@@ -239,9 +239,9 @@ def _tui_inbox_item(
     delivery_id: str = "delivery-stage-c",
     *,
     report: str = "The durable profile completed successfully.",
-) -> InboxView:
+) -> DeliveryView:
     observed = datetime(2026, 8, 23, 14, 5, tzinfo=UTC)
-    return InboxView(
+    return DeliveryView(
         delivery_id=delivery_id,
         conversation_id="conversation-inbox",
         subject_kind=DeliverySubjectKind.ROUTINE_OCCURRENCE,

@@ -339,7 +339,9 @@ async def run() -> None:
 
             async def wait_for_deliveries(count):
                 for _ in range(1000):
-                    items = await agent.inbox(conversation_id=origin.conversation_id)
+                    items = await agent.list_deliveries(
+                        conversation_id=origin.conversation_id
+                    )
                     if len(items) >= count:
                         return items
                     await asyncio.sleep(0.01)

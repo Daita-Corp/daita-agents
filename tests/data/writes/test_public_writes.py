@@ -450,7 +450,7 @@ def script(
 
 async def wait_delivery(agent, conversation_id, count):
     for _ in range(1000):
-        inbox = await agent.inbox(conversation_id=conversation_id)
+        inbox = await agent.list_deliveries(conversation_id=conversation_id)
         if len(inbox) >= count:
             return await agent.inspect_delivery(inbox[0].delivery_id)
         await asyncio.sleep(0.005)

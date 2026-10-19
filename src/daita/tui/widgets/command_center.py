@@ -13,7 +13,7 @@ from textual.widgets.option_list import Option
 
 from daita import GraphState, RoutineState, ScheduledRoutineSummary
 from daita.artifacts import ArtifactRef
-from daita.distribution import InboxView
+from daita.distribution import DeliveryView
 from daita.jobs import GraphJob
 
 from ..sanitization import safe_display
@@ -178,7 +178,7 @@ class CommandSections(ContentSwitcher):
             )
         )
 
-    def update_inbox(self, items: tuple[InboxView, ...]) -> None:
+    def update_inbox(self, items: tuple[DeliveryView, ...]) -> None:
         # The existing inbox read returns only unacknowledged deliveries.
         self.query_one("#command-inbox", ProjectionList).update_rows(
             tuple(
