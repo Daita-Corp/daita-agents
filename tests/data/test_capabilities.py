@@ -10,7 +10,7 @@ from typing import cast
 import pytest
 
 from daita._json import FrozenJsonObject, thaw_json
-from daita.adapters.registry import SourceTypeRegistry
+from daita.adapters.registry import SourceOperation, SourceTypeRegistry
 from daita.capabilities import (
     CallTargetLane,
     CapabilityDeclarations,
@@ -448,7 +448,8 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
 
     sqlite = await domain._validate_sql(
         _run(),
-        {
+        operation=SourceOperation.SQL_READ,
+        arguments={
             "source_id": "source-sqlite",
             "resource_ids": ("resource-sqlite",),
             "sql": "SELECT id FROM items",
@@ -456,7 +457,8 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     )
     postgresql = await domain._validate_sql(
         _run(),
-        {
+        operation=SourceOperation.SQL_READ,
+        arguments={
             "source_id": "source-postgresql",
             "resource_ids": ("resource-postgresql",),
             "sql": "SELECT id FROM public.items",
@@ -468,7 +470,8 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     with pytest.raises(CapabilityInputError, match="belong to the selected source"):
         await domain._validate_sql(
             _run(),
-            {
+            operation=SourceOperation.SQL_READ,
+            arguments={
                 "source_id": "source-sqlite",
                 "resource_ids": ("resource-postgresql",),
                 "sql": "SELECT id FROM items",
@@ -477,7 +480,8 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     with pytest.raises(CapabilityInputError, match="does not support relational"):
         await domain._validate_sql(
             _run(),
-            {
+            operation=SourceOperation.SQL_READ,
+            arguments={
                 "source_id": "source-unsupported",
                 "resource_ids": ("resource-sqlite",),
                 "sql": "SELECT id FROM items",
@@ -486,7 +490,8 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     with pytest.raises(CapabilityInputError) as unknown_source:
         await domain._validate_sql(
             _run(),
-            {
+            operation=SourceOperation.SQL_READ,
+            arguments={
                 "source_id": "source-missing",
                 "resource_ids": ("resource-sqlite",),
                 "sql": "SELECT id FROM items",
@@ -496,7 +501,8 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     with pytest.raises(CapabilityInputError) as unknown_resource:
         await domain._validate_sql(
             _run(),
-            {
+            operation=SourceOperation.SQL_READ,
+            arguments={
                 "source_id": "source-sqlite",
                 "resource_ids": ("resource-missing",),
                 "sql": "SELECT id FROM items",
@@ -506,7 +512,8 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     with pytest.raises(CapabilityInputError) as target_mismatch:
         await domain._validate_sql(
             _run(),
-            {
+            operation=SourceOperation.SQL_READ,
+            arguments={
                 "source_id": "source-sqlite",
                 "resource_ids": ("resource-sqlite",),
                 "sql": "SELECT id FROM other_items",

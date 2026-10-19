@@ -1217,7 +1217,7 @@ class DataCapabilityDomain:
         run: RunInput,
         arguments: Mapping[str, object],
         *,
-        operation: SourceOperation = SourceOperation.SQL_READ,
+        operation: SourceOperation,
         bind_revisions: bool = False,
     ) -> FrozenJsonObject:
         source_id = arguments.get("source_id")

@@ -49,6 +49,7 @@ from . import (
     ResourceRevisionPrecheck,
     RoutineState,
     ScheduledRoutineDraft,
+    SourceTypeRegistry,
     SQLiteSource,
     __version__,
     create_llm_provider,
@@ -402,7 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     attach.add_argument("name")
     attach.add_argument(
         "kind",
-        choices=tuple(item.adapter_id for item in Agent.registered_source_types()),
+        choices=tuple(item.adapter_id for item in SourceTypeRegistry().types()),
     )
     attach.add_argument("path", type=Path, nargs="?")
     attach.add_argument("--host")

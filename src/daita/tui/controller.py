@@ -33,6 +33,8 @@ from daita import (
     ScheduledRoutine,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
+    SourceType,
+    SourceTypeRegistry,
     Transcript,
     WorkBoard,
 )
@@ -670,8 +672,9 @@ class PresentationController:
     async def list_sources(self) -> tuple[Any, ...]:
         return await self.require_agent().list_sources()
 
-    def source_types(self) -> tuple[Any, ...]:
-        return Agent.registered_source_types(AgentConfig())
+    def source_types(self) -> tuple[SourceType, ...]:
+        # Matches this controller's AgentConfig(): built-in types only.
+        return SourceTypeRegistry().types()
 
     async def list_jobs(self) -> tuple[GraphJob, ...]:
         return await self.require_agent().list_jobs(limit=50)

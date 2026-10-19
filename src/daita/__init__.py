@@ -19,6 +19,12 @@ from .adapters import (
     SQLiteSource,
 )
 from .adapters.postgresql_write import RelationalUpdateReadiness
+from .adapters.registry import (
+    SourceBackendContext,
+    SourceOperation,
+    SourceType,
+    SourceTypeRegistry,
+)
 from .agent import Agent
 from .artifacts import (
     ArtifactDeliveryReceipt,
@@ -143,6 +149,10 @@ __all__ = [
     "EffectEvidenceBasis",
     "Agent",
     "AgentConfig",
+    "SourceBackendContext",
+    "SourceOperation",
+    "SourceType",
+    "SourceTypeRegistry",
     "HostCapacityLimits",
     "PostgreSQLReadLimits",
     "AgentEvent",

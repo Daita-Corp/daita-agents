@@ -10,6 +10,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Button, Footer, Input, Label, Static
 
+from daita import SourceOperation
 from daita.capabilities import render_approval_arguments
 
 from ..models import PickerOption
@@ -175,8 +176,8 @@ class PermissionsScreen(Screen[bool]):
     async def _preview_write(self, controller: Any) -> None:
         inspection = await controller.inspect_source_permissions(self._source_id)
         if not any(
-            {operation.value for operation in source_type.operations}
-            & {"relational_update", "relational_upsert"}
+            source_type.operations
+            & {SourceOperation.RELATIONAL_UPDATE, SourceOperation.RELATIONAL_UPSERT}
             for source_type in controller.source_types()
             if source_type.adapter_id == inspection.adapter_id
         ):
