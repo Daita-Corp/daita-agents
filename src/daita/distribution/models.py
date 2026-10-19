@@ -925,52 +925,52 @@ class DeliveryView:
 
     def __post_init__(self) -> None:
         for value, name in (
-            (self.delivery_id, "inbox view delivery_id"),
-            (self.conversation_id, "inbox view conversation_id"),
-            (self.subject_id, "inbox view subject_id"),
-            (self.destination_id, "inbox view destination_id"),
+            (self.delivery_id, "delivery view delivery_id"),
+            (self.conversation_id, "delivery view conversation_id"),
+            (self.subject_id, "delivery view subject_id"),
+            (self.destination_id, "delivery view destination_id"),
         ):
             _text(value, name)
         if not isinstance(self.subject_kind, DeliverySubjectKind):
-            raise TypeError("inbox view subject kind is invalid")
+            raise TypeError("delivery view subject kind is invalid")
         if not isinstance(self.conclusion_kind, OutcomeConclusionKind):
-            raise TypeError("inbox view conclusion kind is invalid")
+            raise TypeError("delivery view conclusion kind is invalid")
         if not isinstance(self.conclusion_state, OutcomeState):
-            raise TypeError("inbox view conclusion state is invalid")
-        _digest(self.conclusion_digest, "inbox view conclusion_digest")
+            raise TypeError("delivery view conclusion state is invalid")
+        _digest(self.conclusion_digest, "delivery view conclusion_digest")
         if (
             not isinstance(self.conclusion_preview, str)
             or len(self.conclusion_preview.encode("utf-8"))
             > MAX_OUTCOME_CONCLUSION_PREVIEW_BYTES
         ):
-            raise ValueError("inbox view conclusion preview is invalid")
+            raise ValueError("delivery view conclusion preview is invalid")
         if not isinstance(self.conclusion_preview_truncated, bool):
-            raise TypeError("inbox view truncated flag must be a boolean")
+            raise TypeError("delivery view truncated flag must be a boolean")
         if self.resulting_run_id is not None:
-            _text(self.resulting_run_id, "inbox view resulting_run_id")
+            _text(self.resulting_run_id, "delivery view resulting_run_id")
         references = tuple(self.artifact_references)
         if len(references) > MAX_OUTCOME_ARTIFACT_REFERENCES or any(
             not isinstance(value, OutcomeArtifactReference) for value in references
         ):
-            raise ValueError("inbox view artifact references exceed their bound")
+            raise ValueError("delivery view artifact references exceed their bound")
         if not isinstance(self.effective_sensitivity, ModelSensitivity):
-            raise TypeError("inbox view sensitivity is invalid")
-        _digest(self.provenance_digest, "inbox view provenance_digest")
+            raise TypeError("delivery view sensitivity is invalid")
+        _digest(self.provenance_digest, "delivery view provenance_digest")
         if not isinstance(self.state, DeliveryState):
-            raise TypeError("inbox view state is invalid")
-        _utc(self.created_at, "inbox view created_at")
-        _utc(self.updated_at, "inbox view updated_at")
-        _optional_utc(self.acknowledged_at, "inbox view acknowledged_at")
+            raise TypeError("delivery view state is invalid")
+        _utc(self.created_at, "delivery view created_at")
+        _utc(self.updated_at, "delivery view updated_at")
+        _optional_utc(self.acknowledged_at, "delivery view acknowledged_at")
         if (
             self.blocked_reason_code is not None
             and _FAILURE_CODE.fullmatch(self.blocked_reason_code) is None
         ):
-            raise ValueError("inbox view blocked reason code is invalid")
+            raise ValueError("delivery view blocked reason code is invalid")
         if (
             self.failure_code is not None
             and _FAILURE_CODE.fullmatch(self.failure_code) is None
         ):
-            raise ValueError("inbox view failure code is invalid")
+            raise ValueError("delivery view failure code is invalid")
         object.__setattr__(self, "artifact_references", references)
 
 
