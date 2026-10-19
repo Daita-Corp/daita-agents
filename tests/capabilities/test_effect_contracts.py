@@ -216,7 +216,7 @@ def test_observation_validation_preserves_evidence_basis_and_schema():
 
 
 def test_model_execution_bindings_cover_declared_routes_profiles_and_retry_configuration():
-    from daita.hosting.embedded import _model_execution_contracts
+    from daita.hosting.configuration import _model_execution_contracts
     from daita.llm.models import ModelProfile
     from daita.llm.providers.mock import MockModelProvider
     from daita.llm.routing import ModelRoute, ModelRouteCandidate, RetryPolicy

@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 
 from daita.config import AgentConfig
-from daita.hosting.embedded import (
+from daita.hosting.configuration import (
     _decode_call_policy,
     _encode_call_policy,
     _model_execution_contracts,

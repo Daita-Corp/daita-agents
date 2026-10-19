@@ -223,12 +223,13 @@ def _skill_grammar_literals(path: Path) -> list[str]:
 
 
 def _home_file_contract() -> dict[str, object]:
-    embedded = ROOT / "src" / "daita" / "hosting" / "embedded.py"
+    agent_home = ROOT / "src" / "daita" / "hosting" / "agent_home.py"
+    configuration = ROOT / "src" / "daita" / "hosting" / "configuration.py"
     delivery = ROOT / "src" / "daita" / "artifacts" / "delivery.py"
     skills = ROOT / "src" / "daita" / "skills" / "store.py"
     return {
         "agent_manifest": {
-            "fields": _literal_string_sets(embedded, "_read_manifest"),
+            "fields": _literal_string_sets(agent_home, "_read_manifest"),
             "path": "agent.toml",
         },
         "artifact_layout": {
@@ -245,7 +246,7 @@ def _home_file_contract() -> dict[str, object]:
         },
         "model_configuration": {
             "field_sets": _dictionary_field_sets(
-                embedded,
+                configuration,
                 ("_encode_agent_config", "_persisted_profile_limits"),
             ),
             "model_call_policy_fields": sorted(

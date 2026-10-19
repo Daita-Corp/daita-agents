@@ -14,6 +14,7 @@ from ...capabilities import (
     Executor,
     ToolExecution,
     ToolOutput,
+    ToolView,
 )
 from ...llm.models import ModelSensitivity
 
@@ -81,6 +82,7 @@ class ResourceRevisionObservationExecutor:
 class ResourceRevisionObservationDeclarations:
     capabilities: tuple[Capability, ...]
     executors: tuple[Executor, ...]
+    tool_views: tuple[ToolView, ...] = ()
 
 
 def resource_revision_observation_declarations(

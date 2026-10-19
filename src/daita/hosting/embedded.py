@@ -3,30 +3,23 @@
 from __future__ import annotations
 
 import asyncio
-import errno
-import hashlib
 import hmac
-import json
-import os
 import re
 import secrets
-import shutil
 import sqlite3
-import stat
-import tomllib
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass, replace
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Self, TypedDict, TypeVar, cast
+from typing import TYPE_CHECKING, Protocol, Self, TypedDict, TypeVar, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
     from ..adapters.mcp import MCPServerBinding, MCPToolBinding
 
-from .._json import FrozenJsonObject, canonical_json
+from .._json import FrozenJsonObject
 from ..adapters.local_workspace import LocalWorkspaceBackend
 from ..adapters.mcp import (
     MCPAdmissionError,
@@ -63,7 +56,6 @@ from ..artifacts.bytes import ArtifactByteStorage
 from ..artifacts.delivery import (
     ArtifactDestinationGrant,
     LocalArtifactDelivery,
-    validate_delivery_configuration,
 )
 from ..artifacts.models import (
     ArtifactDeliveryReceipt,
@@ -72,23 +64,21 @@ from ..artifacts.models import (
     ArtifactRef,
     ArtifactState,
 )
-from ..artifacts.store import AgentHomeArtifactStore, validate_artifact_home
+from ..artifacts.store import AgentHomeArtifactStore
 from ..capabilities import (
-    AccessMode,
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
+    Capability,
     CapabilityDeclarations,
-    CapabilityInputError,
     CapabilityRegistry,
     EffectOutcome,
     ExecutionContractBindings,
     ExecutionContractReader,
-    OperationalEffect,
+    ToolView,
 )
 from ..capability_runtime import CapabilityRuntime
 from ..catalog.capabilities import (
-    CATALOG_DESCRIBE_CAPABILITY_ID,
     catalog_declarations,
 )
 from ..catalog.models import (
@@ -98,8 +88,6 @@ from ..catalog.models import (
     CatalogSummary,
     CatalogSync,
     CatalogSyncStatus,
-    ResourceKind,
-    SourceCatalogSnapshot,
 )
 from ..catalog.service import CatalogService
 from ..config import (
@@ -122,7 +110,6 @@ from ..distribution import (
 from ..domains.analysis import AnalysisCapabilityDomain
 from ..domains.data import (
     ARTIFACT_DOMAIN_OWNER_ID,
-    DATA_QUERY_CAPABILITY_ID,
     LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS,
     LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS,
     LOCAL_FILE_CAPABILITY_IDS,
@@ -147,9 +134,6 @@ from ..domains.data.profile_jobs import (
     DataProfileCapabilityDomain,
     data_profile_declarations,
 )
-from ..domains.data.sql import (
-    validate_relational_write_scope,
-)
 from ..domains.learning import LearningCandidateGuard
 from ..domains.mcp import (
     MCP_DOMAIN_OWNER_ID,
@@ -157,12 +141,9 @@ from ..domains.mcp import (
     activate_mcp_domain,
     validate_mcp_model_compatibility,
 )
-from ..errors import AgentError, StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity
 from ..jobs.capabilities import (
     JOB_DOMAIN_OWNER_ID,
-    JOB_INSPECT_CAPABILITY_ID,
-    JOB_READ_RESULTS_CAPABILITY_ID,
     JobCapabilityDomain,
     job_capability_declarations,
 )
@@ -196,7 +177,6 @@ from ..jobs.owner import GraphBlockerProjection, JobOwner
 from ..jobs.projections import GraphBoardProjection, GraphTimelinePage
 from ..jobs.supervisor import JobSupervisor
 from ..learning_candidates import (
-    LEARNING_REVIEW_MAX_TOTAL_TOKENS,
     LearningCandidate,
     LearningCandidateContent,
     LearningCandidateRejectionReason,
@@ -205,20 +185,12 @@ from ..learning_candidates import (
     LearningReviewResult,
     OneShotCandidateReviewer,
 )
-from ..llm.errors import ModelProviderError, ProviderErrorCode
-from ..llm.factory import create_model_route_provider
 from ..llm.models import (
-    _DEFAULT_CALL_POLICY,
     CanonicalMessage,
-    FinishReason,
-    MessageRole,
     ModelCallPolicy,
     ModelProfile,
-    ModelRequest,
     ModelSensitivity,
-    TextBlock,
     ToolCall,
-    ToolDefinition,
     ToolResultBlock,
 )
 from ..llm.profiles import reviewed_model_profile
@@ -230,11 +202,7 @@ from ..llm.provider_definitions import (
     tool_schema_incompatibility,
 )
 from ..llm.routing import (
-    ModelProviderRegistration,
     ModelRoute,
-    ModelRouteCandidate,
-    ModelRouter,
-    RetryPolicy,
 )
 from ..llm.subscription_auth import CodexDevicePrompt, login_codex_subscription
 from ..loop.driver import (
@@ -257,7 +225,6 @@ from ..memory.capabilities import (
     MemoryCapabilityDomain,
     memory_set_declarations,
 )
-from ..memory.store import validate_memory_documents
 from ..observation import (
     AgentObserver,
     PrivateDiagnosticSink,
@@ -312,30 +279,72 @@ from ..skills.capabilities import (
     SkillCapabilityDomain,
     skill_declarations,
 )
-from ..skills.store import validate_skill_documents
 from ..storage.advisory import AdvisoryStorage
 from ..storage.protocols import StateStore
 from ..storage.sqlite import (
     SQLiteStateStore,
-    load_current_artifact_inventory,
-    validate_current_state_database,
 )
 from ..storage.sqlite_records import (
     EffectReceipt,
     EffectResolution,
     EffectResolutionDecision,
-    RelationalWriteScope,
-    SourcePermissionResource,
     SourcePermissionsInspection,
     SourcePermissionsPreview,
-    SourcePermissionState,
-    SourcePermissionSummary,
     SourceReadMode,
-    SourceReadScope,
-    relational_write_authorization_fingerprint,
     validate_effect_receipt_id,
 )
 from ..workspace import LocalWorkspace
+from .agent_home import (
+    _AGENT_NAME,
+    _admit_agent_home,
+    _candidate_agent_homes,
+    _cleanup_failed_create,
+    _delete_agent_home,
+    _open_workspace_backend,
+    _read_manifest,
+    _reject_legacy_state_root,
+    _require_unaliased_path,
+    _resolve_state_root,
+    _validate_agent_home_target,
+    _validate_workspace_composition,
+    _write_manifest,
+    _WriterLock,
+)
+from .configuration import (
+    _ONE_ATTEMPT_RETRY_POLICY,
+    _admit_host_model,
+    _candidate_reviewer_from_route,
+    _configuration_was_injected,
+    _credential_account,
+    _credential_account_prefix,
+    _credential_reference_is_owned,
+    _diagnostic_sink,
+    _injected_concurrency_key,
+    _keychain_references,
+    _model_execution_contracts,
+    _model_route,
+    _owned_agent_credential_references,
+    _owned_source_credential_reference,
+    _read_model_configuration,
+    _read_model_configuration_document,
+    _resolve_candidate_reviewer_profile,
+    _resolve_configuration,
+    _resolve_credential_session,
+    _stage_c_model_routes,
+    _validate_custom_loop,
+    _validate_model_route,
+    _write_model_configuration,
+)
+from .errors import (
+    AgentAlreadyExistsError,
+    AgentHomeError,
+    AgentIdentityMismatchError,
+    AgentModelConfigurationError,
+    AgentNameError,
+    AgentNotConfiguredError,
+    AgentNotFoundError,
+    HostActiveError,
+)
 from .execution_governor import (
     AdmissionClosedError,
     CoordinatorDiagnostics,
@@ -343,6 +352,16 @@ from .execution_governor import (
     WorkloadClass,
 )
 from .home_upgrade import AgentHomeStatus, inspect_agent_home, upgrade_agent_home
+from .sources import (
+    SourceEditConfirmationHandler,
+    SourceEditPreview,
+    SourceEditResult,
+    _build_source_permissions_preview,
+    _inspect_source_permissions,
+    _resolve_source_selector,
+    _source_edit_read_scope,
+    _source_from_registration,
+)
 
 
 class _RoutineDraftValues(TypedDict):
@@ -403,37 +422,11 @@ def _routine_draft_values(draft: ScheduledRoutineDraft) -> _RoutineDraftValues:
     }
 
 
-_AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
-_MAX_AGENT_HOME_CANDIDATES = 256
 _MAX_DISCOVERED_AGENTS = 100
-_LEGACY_STATE_ROOT_MARKERS = (
-    "catalog.json",
-    "graph",
-    "memory",
-    "sessions",
-)
-_MODEL_CONFIG_NAME = "config.json"
-_MAX_MODEL_CONFIG_BYTES = 64 * 1_024
 _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
 _RUN_ADMISSION_DRAIN_SECONDS = 30.0
-# One-shot validation and candidate review never retry or fall back.
-_ONE_ATTEMPT_RETRY_POLICY = RetryPolicy(
-    max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
-)
-_MODEL_VALIDATION_TOOL_NAME = "daita_validate_tool_support"
-_MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 16
-_REASONING_MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 25_000
-_CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS = LEARNING_REVIEW_MAX_TOTAL_TOKENS // 4
-_SOURCE_ALIAS_SEPARATOR = re.compile(r"[^a-z0-9]+")
 _T = TypeVar("_T")
-_STAGE_C_ALLOWED_CAPABILITY_IDS = (
-    CATALOG_DESCRIBE_CAPABILITY_ID,
-    DATA_QUERY_CAPABILITY_ID,
-    JOB_INSPECT_CAPABILITY_ID,
-    JOB_READ_RESULTS_CAPABILITY_ID,
-)
-_STAGE_C_SAFETY_WAKE_SECONDS = 5.0
 
 
 def _utc_now() -> datetime:
@@ -442,112 +435,6 @@ def _utc_now() -> datetime:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
-
-
-def _stage_c_capability_ids(registry: CapabilityRegistry) -> tuple[str, ...]:
-    return registry.validate_execution_scope_grant(
-        _STAGE_C_ALLOWED_CAPABILITY_IDS,
-        allowed_access_modes=frozenset({AccessMode.NONE, AccessMode.READ}),
-        allowed_operational_effects=frozenset({OperationalEffect.NONE}),
-    )
-
-
-def _stage_c_model_routes(
-    model: ModelProvider | None,
-    model_route: ModelRoute | None,
-) -> tuple[str, ...]:
-    if model_route is not None:
-        return tuple(candidate.provider_id for candidate in model_route.candidates)
-    if isinstance(model, ModelRouter):
-        return tuple(
-            registration.provider.provider_id for registration in model.candidates
-        )
-    if model is None:
-        return ()
-    return (model.provider_id,)
-
-
-def _model_execution_contracts(
-    model: ModelProvider | None,
-    profile: ModelProfile | None,
-    route: ModelRoute | None,
-    call_policy: ModelCallPolicy = _DEFAULT_CALL_POLICY,
-) -> dict[str, str]:
-    """Digest declared non-secret execution configuration, never SDK state."""
-
-    if route is not None:
-        material = _encode_model_route_contract(route)
-        route_ids = tuple(candidate.provider_id for candidate in route.candidates)
-    elif isinstance(model, ModelRouter):
-        material = {
-            "candidates": [
-                {
-                    "provider_id": candidate.provider.provider_id,
-                    "profile": _encode_model_profile(candidate.profile),
-                    "allowed_sensitivities": sorted(
-                        item.value for item in candidate.allowed_sensitivities
-                    ),
-                }
-                for candidate in model.candidates
-            ],
-            "retry_policy": {
-                "max_attempts_per_candidate": model.retry_policy.max_attempts_per_candidate,
-                "max_total_attempts": model.retry_policy.max_total_attempts,
-                "backoff_seconds": model.retry_policy.backoff_seconds,
-            },
-        }
-        route_ids = tuple(
-            candidate.provider.provider_id for candidate in model.candidates
-        )
-    elif model is not None and profile is not None:
-        material = {
-            "provider_id": model.provider_id,
-            "profile": _encode_model_profile(profile),
-        }
-        route_ids = (model.provider_id,)
-    else:
-        return {}
-    return {
-        route_id: "sha256:"
-        + hashlib.sha256(
-            canonical_json(
-                {
-                    "route_id": route_id,
-                    "execution_configuration": material,
-                    "model_call_policy": _encode_call_policy(call_policy),
-                }
-            ).encode("utf-8")
-        ).hexdigest()
-        for route_id in route_ids
-    }
-
-
-def _encode_model_route_contract(route: ModelRoute) -> dict[str, object]:
-    """Encode exact runtime facts used to authorize frozen model execution."""
-
-    return {
-        "candidates": [
-            {
-                "allowed_sensitivities": sorted(
-                    sensitivity.value for sensitivity in candidate.allowed_sensitivities
-                ),
-                "base_url": candidate.base_url,
-                "profile": _encode_model_profile(candidate.profile),
-                "provider_id": candidate.provider_id,
-                "secret_reference": (
-                    None
-                    if candidate.secret_reference is None
-                    else candidate.secret_reference.to_uri()
-                ),
-            }
-            for candidate in route.candidates
-        ],
-        "retry_policy": {
-            "max_attempts_per_candidate": route.retry_policy.max_attempts_per_candidate,
-            "max_total_attempts": route.retry_policy.max_total_attempts,
-            "backoff_seconds": route.retry_policy.backoff_seconds,
-        },
-    }
 
 
 async def _current_execution_contracts(
@@ -628,151 +515,28 @@ def _validate_conversation_id(value: str) -> None:
         raise ValueError("conversation_id must match [A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 
-def _source_alias(value: str) -> str:
-    return _SOURCE_ALIAS_SEPARATOR.sub("-", value.casefold()).strip("-")
-
-
-def _resolve_source_selector(
-    selector: str,
-    sources: tuple[SourceRegistration, ...],
-) -> SourceRegistration:
-    if not isinstance(selector, str) or not (candidate := selector.strip()):
-        raise ValueError("Source selector must be non-empty terminal text.")
-    try:
-        encoded_length = len(candidate.encode("utf-8"))
-    except UnicodeEncodeError:
-        raise ValueError("Source selector must be non-empty terminal text.") from None
-    if encoded_length > 1_024 or any(
-        ord(character) < 32 or ord(character) == 127 for character in candidate
-    ):
-        raise ValueError("Source selector must be non-empty terminal text.")
-    exact_id = tuple(source for source in sources if source.id == candidate)
-    if exact_id:
-        return exact_id[0]
-    folded = candidate.casefold()
-    matches = {
-        source.id: source
-        for source in sources
-        if source.display_name.casefold() == folded
-        or _source_alias(source.display_name) == folded
-    }
-    if not matches:
-        raise ValueError(
-            "No active source matches that name. Use /sources to list choices."
-        )
-    if len(matches) > 1:
-        raise ValueError("That source name is ambiguous. Use /source to choose one.")
-    return next(iter(matches.values()))
-
-
-class AgentHomeError(AgentError):
-    """Base failure for isolated local agent-home admission."""
-
-
-class AgentNameError(AgentHomeError, ValueError):
-    pass
-
-
-class AgentAlreadyExistsError(AgentHomeError):
-    pass
-
-
-class AgentNotFoundError(AgentHomeError):
-    pass
-
-
-class AgentIdentityMismatchError(AgentHomeError):
-    pass
-
-
-class AgentModelConfigurationError(AgentHomeError):
-    """A saved model route whose profile facts can no longer be admitted."""
-
-
-class HostActiveError(AgentHomeError):
-    code = "host_active"
-
-
-class AgentNotConfiguredError(AgentHomeError):
-    pass
-
-
-@dataclass(frozen=True, slots=True)
-class SourceEditPreview:
-    """Safe bounded facts shown immediately before a source connection edit."""
-
-    current_source_id: str
-    replacement_source_id: str
-    display_name: str
-    adapter_id: str
-    resource_count: int
-    relationship_count: int
-    read_mode: SourceReadMode
-    preserved_read_resource_count: int
-    omitted_read_resources: tuple[str, ...]
+class _DeclarationSet(Protocol):
+    @property
+    def capabilities(self) -> tuple[Capability, ...]: ...
 
     @property
-    def identity_changed(self) -> bool:
-        return self.current_source_id != self.replacement_source_id
+    def tool_views(self) -> tuple[ToolView, ...]: ...
 
 
-@dataclass(frozen=True, slots=True)
-class SourceEditResult:
-    """Committed source connection edit plus best-effort credential cleanup."""
-
-    source: SourceRegistration
-    identity_changed: bool
-    previous_credential_deleted: bool
-
-
-SourceEditConfirmationHandler = Callable[[SourceEditPreview], Awaitable[bool]]
-
-
-class _WriterLock:
-    def __init__(self, path: Path, descriptor: int) -> None:
-        self.path = path
-        self._descriptor = descriptor
-
-    @classmethod
-    def acquire(cls, path: Path) -> _WriterLock:
-        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-        flags |= getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(path, flags, 0o600)
-        except OSError as error:
-            raise AgentHomeError(f"cannot open agent writer lock: {path}") from error
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise AgentHomeError("agent writer lock must be a regular file")
-            import fcntl
-
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError as error:
-                if error.errno in {errno.EACCES, errno.EAGAIN}:
-                    raise HostActiveError(
-                        f"host_active: another writer owns {path.parent.parent}"
-                    ) from error
-                raise
-            os.ftruncate(descriptor, 0)
-            os.write(descriptor, f"pid={os.getpid()}\n".encode("ascii"))
-            os.fsync(descriptor)
-            return cls(path, descriptor)
-        except BaseException:
-            os.close(descriptor)
-            raise
-
-    def release(self) -> None:
-        descriptor = self._descriptor
-        if descriptor < 0:
-            return
-        self._descriptor = -1
-        import fcntl
-
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
+def _domain_declarations(
+    domain_owner_id: str, *sets: _DeclarationSet | None
+) -> CapabilityDeclarations:
+    """Bundle one domain's capabilities and views from its optional declaration sets."""
+    present = [item for item in sets if item is not None]
+    capabilities = tuple(
+        capability for item in present for capability in item.capabilities
+    )
+    return CapabilityDeclarations(
+        domain_owner_id=domain_owner_id,
+        capabilities=capabilities,
+        executor_ids=tuple(capability.executor_id for capability in capabilities),
+        tool_views=tuple(view for item in present for view in item.tool_views),
+    )
 
 
 class EmbeddedAgent:
@@ -1340,63 +1104,9 @@ class EmbeddedAgent:
                     "agent.toml does not match state.db identity"
                 )
             await store.list_sources(identity.id)
-            from ..adapters.analytical_workspace.recovery import (
-                dispose_generation_proof,
-                recover_generation,
+            recovery_task = asyncio.create_task(
+                _recover_analysis_evidence(store, identity.id)
             )
-            from ..loop.analysis import AnalysisEvidence
-
-            async def recover_analysis() -> None:
-                assert store is not None
-                after = ("", "")
-                while page := await store.pending_analysis_evidence(
-                    identity.id, after=after
-                ):
-                    for pending in page:
-                        facts = pending.facts
-                        if pending.kind == "generation":
-                            if facts.get("proof_disposed") is True:
-                                continue
-                            recovered = facts.get("recovery")
-                            if recovered is None and facts["status"] in {
-                                "admitted",
-                                "running",
-                                "cleanup_failed",
-                            }:
-                                recovery = await recover_generation(facts)
-                                pending = await store.recover_analysis_evidence(
-                                    identity.id, pending, recovery
-                                )
-                            elif recovered is None and facts["status"] != "closed":
-                                continue
-                            # Closure facts are durable before proof disposal. A
-                            # crash on either side of unlink can repeat this step.
-                            dispose_generation_proof(pending.facts)
-                            await store.recover_analysis_evidence(
-                                identity.id, pending, proof_disposed=True
-                            )
-                        elif (
-                            facts["status"] in {"admitted", "running"}
-                            and await store.result(pending.run_id) is None
-                        ):
-                            await store.record_analysis_evidence(
-                                identity.id,
-                                AnalysisEvidence(
-                                    pending.run_id,
-                                    pending.evidence_id,
-                                    pending.kind,
-                                    {
-                                        **facts,
-                                        "status": "interrupted",
-                                        "interruption": "host_crash",
-                                        "completion_observed": False,
-                                    },
-                                ),
-                            )
-                    last = page[-1]
-                    after = (last.run_id, last.evidence_id)
-
-            recovery_task = asyncio.create_task(recover_analysis())
             try:
                 await asyncio.shield(recovery_task)
             except asyncio.CancelledError:
@@ -1874,102 +1584,35 @@ class EmbeddedAgent:
             id_factory=id_factory,
         )
         learning_candidate_guard = LearningCandidateGuard()
-        data_declarations = CapabilityDeclarations(
-            domain_owner_id=DATA_DOMAIN_OWNER_ID,
-            capabilities=(
-                *catalog.capabilities,
-                *relational_query.capabilities,
-                *(
-                    relational_export.capabilities
-                    if relational_export is not None
-                    else ()
-                ),
-                *postgresql_preview.capabilities,
-                *relational_update.capabilities,
-                *relational_upsert.capabilities,
-                *routine_precheck.capabilities,
-                *(local_files.capabilities if local_files is not None else ()),
-            ),
-            executor_ids=tuple(
-                item.executor_id
-                for item in (
-                    *catalog.capabilities,
-                    *relational_query.capabilities,
-                    *(
-                        relational_export.capabilities
-                        if relational_export is not None
-                        else ()
-                    ),
-                    *postgresql_preview.capabilities,
-                    *relational_update.capabilities,
-                    *relational_upsert.capabilities,
-                    *routine_precheck.capabilities,
-                    *(local_files.capabilities if local_files is not None else ()),
-                )
-            ),
-            tool_views=(
-                *catalog.tool_views,
-                *relational_query.tool_views,
-                *(
-                    relational_export.tool_views
-                    if relational_export is not None
-                    else ()
-                ),
-                *postgresql_preview.tool_views,
-                *relational_update.tool_views,
-                *relational_upsert.tool_views,
-                *(local_files.tool_views if local_files is not None else ()),
-            ),
+        data_declarations = _domain_declarations(
+            DATA_DOMAIN_OWNER_ID,
+            catalog,
+            relational_query,
+            relational_export,
+            postgresql_preview,
+            relational_update,
+            relational_upsert,
+            routine_precheck,
+            local_files,
         )
-        memory_declarations = CapabilityDeclarations(
-            domain_owner_id=MEMORY_DOMAIN_OWNER_ID,
-            capabilities=memory.capabilities,
-            executor_ids=tuple(item.executor_id for item in memory.capabilities),
-            tool_views=memory.tool_views,
-        )
-        skill_declaration_bundle = CapabilityDeclarations(
-            domain_owner_id=SKILL_DOMAIN_OWNER_ID,
-            capabilities=skills.capabilities,
-            executor_ids=tuple(item.executor_id for item in skills.capabilities),
-            tool_views=skills.tool_views,
-        )
-        semantic_declaration_bundle = CapabilityDeclarations(
-            domain_owner_id=SEMANTIC_DOMAIN_OWNER_ID,
-            capabilities=semantics.capabilities,
-            executor_ids=tuple(item.executor_id for item in semantics.capabilities),
-            tool_views=semantics.tool_views,
+        memory_declarations = _domain_declarations(MEMORY_DOMAIN_OWNER_ID, memory)
+        skill_declaration_bundle = _domain_declarations(SKILL_DOMAIN_OWNER_ID, skills)
+        semantic_declaration_bundle = _domain_declarations(
+            SEMANTIC_DOMAIN_OWNER_ID, semantics
         )
         artifact_declaration_bundle = (
             None
             if artifacts is None
-            else CapabilityDeclarations(
-                domain_owner_id=ARTIFACT_DOMAIN_OWNER_ID,
-                capabilities=artifacts.capabilities,
-                executor_ids=tuple(item.executor_id for item in artifacts.capabilities),
-                tool_views=artifacts.tool_views,
-            )
+            else _domain_declarations(ARTIFACT_DOMAIN_OWNER_ID, artifacts)
         )
-        job_declaration_bundle = CapabilityDeclarations(
-            domain_owner_id=JOB_DOMAIN_OWNER_ID,
-            capabilities=job_lifecycle.capabilities,
-            executor_ids=tuple(item.executor_id for item in job_lifecycle.capabilities),
-            tool_views=job_lifecycle.tool_views,
+        job_declaration_bundle = _domain_declarations(
+            JOB_DOMAIN_OWNER_ID, job_lifecycle
         )
-        graph_task_declaration_bundle = CapabilityDeclarations(
-            domain_owner_id=GRAPH_TASK_DOMAIN_OWNER_ID,
-            capabilities=graph_task_lifecycle.capabilities,
-            executor_ids=tuple(
-                item.executor_id for item in graph_task_lifecycle.capabilities
-            ),
-            tool_views=graph_task_lifecycle.tool_views,
+        graph_task_declaration_bundle = _domain_declarations(
+            GRAPH_TASK_DOMAIN_OWNER_ID, graph_task_lifecycle
         )
-        data_profile_declaration_bundle = CapabilityDeclarations(
-            domain_owner_id=DATA_PROFILE_DOMAIN_OWNER_ID,
-            capabilities=data_profile_jobs.capabilities,
-            executor_ids=tuple(
-                item.executor_id for item in data_profile_jobs.capabilities
-            ),
-            tool_views=data_profile_jobs.tool_views,
+        data_profile_declaration_bundle = _domain_declarations(
+            DATA_PROFILE_DOMAIN_OWNER_ID, data_profile_jobs
         )
         data_domain = DataCapabilityDomain(
             data_declarations,
@@ -2026,6 +1669,11 @@ class EmbeddedAgent:
                 raise AgentNotConfiguredError(
                     "the data agent requires a tool-capable model profile"
                 )
+        mcp_model_ids = (
+            tuple(candidate.provider_id for candidate in model_route.candidates)
+            if model_route is not None
+            else (() if model_profile is None else (model_profile.id,))
+        )
         resolved_mcp_client_factory: MCPClientFactory
         if mcp_client_factory is None:
             resolved_mcp_client_factory = SDKMCPClientFactory()
@@ -2040,14 +1688,7 @@ class EmbeddedAgent:
                     secrets=secret_provider,
                     connection_provider=mcp_connection_provider,
                     clock=clock,
-                    model_ids=(
-                        tuple(
-                            candidate.provider_id
-                            for candidate in model_route.candidates
-                        )
-                        if model_route is not None
-                        else (() if model_profile is None else (model_profile.id,))
-                    ),
+                    model_ids=mcp_model_ids,
                 )
             )
         except MCPAdmissionError as error:
@@ -2105,13 +1746,8 @@ class EmbeddedAgent:
         distribution_lifecycle = distribution_capability_declarations(
             distribution_owner
         )
-        distribution_declaration_bundle = CapabilityDeclarations(
-            domain_owner_id=DISTRIBUTION_DOMAIN_OWNER_ID,
-            capabilities=distribution_lifecycle.capabilities,
-            executor_ids=tuple(
-                item.executor_id for item in distribution_lifecycle.capabilities
-            ),
-            tool_views=distribution_lifecycle.tool_views,
+        distribution_declaration_bundle = _domain_declarations(
+            DISTRIBUTION_DOMAIN_OWNER_ID, distribution_lifecycle
         )
         distribution_domain = DistributionCapabilityDomain(
             distribution_declaration_bundle,
@@ -2144,6 +1780,7 @@ class EmbeddedAgent:
                 model_route_ids=model_route_ids,
             )
 
+        graph_routes = _stage_c_model_routes(declared_model, model_route)
         routine_owner = RoutineOwner(
             execution_contract_reader=read_execution_contracts,
             agent_id=identity.id,
@@ -2151,19 +1788,14 @@ class EmbeddedAgent:
             catalog=data_view,
             distribution=distribution_owner,
             skills=skill_store,
-            eligible_model_routes=_stage_c_model_routes(declared_model, model_route),
+            eligible_model_routes=graph_routes,
             maximum_per_run_tokens=limits.max_total_tokens,
             maximum_per_run_cost_usd=limits.max_estimated_cost_usd,
             clock=clock,
         )
         routine_lifecycle = routine_capability_declarations(routine_owner)
-        routine_declaration_bundle = CapabilityDeclarations(
-            domain_owner_id=ROUTINE_DOMAIN_OWNER_ID,
-            capabilities=routine_lifecycle.capabilities,
-            executor_ids=tuple(
-                item.executor_id for item in routine_lifecycle.capabilities
-            ),
-            tool_views=routine_lifecycle.tool_views,
+        routine_declaration_bundle = _domain_declarations(
+            ROUTINE_DOMAIN_OWNER_ID, routine_lifecycle
         )
         routine_domain = RoutineCapabilityDomain(
             routine_declaration_bundle,
@@ -2175,7 +1807,6 @@ class EmbeddedAgent:
             *distribution_lifecycle.executors,
             *routine_lifecycle.executors,
         )
-        graph_routes = _stage_c_model_routes(declared_model, model_route)
         graph_builder: GraphAdmissionBuilder | None = None
         graph_resolver: RegistryInitialTaskProposalResolver | None = None
         if graph_routes:
@@ -2305,11 +1936,7 @@ class EmbeddedAgent:
                 clock=clock,
                 bindings=bindings,
                 existing=existing,
-                model_ids=(
-                    tuple(candidate.provider_id for candidate in model_route.candidates)
-                    if model_route is not None
-                    else (() if model_profile is None else (model_profile.id,))
-                ),
+                model_ids=mcp_model_ids,
             )
             next_domains = (
                 *native_domains,
@@ -5245,128 +4872,8 @@ class EmbeddedAgent:
         self,
         source_id: str,
     ) -> SourcePermissionsInspection:
-        registration = await self._store.load_source(self.identity.id, source_id)
-        if (
-            registration is None
-            or registration.agent_id != self.identity.id
-            or registration.id != source_id
-            or not registration.active
-        ):
-            raise ValueError("unknown active source for this agent")
-        read_scope = await self._store.load_source_read_scope(
-            self.identity.id,
-            source_id,
-        )
-        if read_scope is None:
-            raise ValueError("active source is missing its read scope")
-        update_scopes = await self._store.list_relational_write_scopes(
-            self.identity.id,
-            source_id,
-        )
-        refs = await self._store.list_current_snapshot_refs(
-            self.identity.id,
-            (source_id,),
-        )
-        if len(refs) > 1:
-            raise ValueError("source has multiple current catalog generations")
-        catalog_generation = None if not refs else refs[0].sync_id
-        resources = tuple(
-            resource
-            for resource in await self._store.list_resources(
-                self.identity.id,
-                source_id,
-            )
-            if resource.agent_id == self.identity.id and resource.source_id == source_id
-        )
-        schemas = (
-            await self._data_view.resource_schemas(self.identity.id, source_id)
-            if registration.adapter_id == "postgresql"
-            else ()
-        )
-        schemas_by_resource_id = {schema.resource_id: schema for schema in schemas}
-        choices: list[SourcePermissionResource] = []
-        from ..domains.data.sql.relational_upsert import (
-            validate_relational_upsert_scope,
-        )
-
-        for resource in resources:
-            eligible_columns: tuple[str, ...] = ()
-            insert_columns: tuple[str, ...] = ()
-            upsert_keys: list[tuple[str, ...]] = []
-            schema = schemas_by_resource_id.get(resource.id)
-            if schema is not None and resource.kind is ResourceKind.TABLE:
-                eligible_columns = tuple(
-                    column
-                    for column in schema.columns
-                    if validate_relational_write_scope(
-                        source_id,
-                        resource.id,
-                        (column,),
-                        resources=(schema,),
-                    ).valid
-                )
-                insert_columns = tuple(
-                    column
-                    for column in schema.columns
-                    if column not in schema.identity_columns
-                )
-                for keys in schema.conflict_keys:
-                    try:
-                        validate_relational_upsert_scope(
-                            schema,
-                            key_columns=keys,
-                            insert_columns=insert_columns,
-                            update_columns=tuple(
-                                column
-                                for column in schema.updatable_columns
-                                if column
-                                not in (
-                                    *keys,
-                                    *schema.primary_key_columns,
-                                    *schema.identity_columns,
-                                )
-                            ),
-                            generated_identity_columns=schema.identity_columns,
-                        )
-                    except CapabilityInputError:
-                        continue
-                    upsert_keys.append(keys)
-            choices.append(
-                SourcePermissionResource(
-                    resource_id=resource.id,
-                    display_name=resource.native_identity,
-                    resource_kind=resource.kind.value,
-                    eligible_assignment_columns=eligible_columns,
-                    key_columns=() if schema is None else schema.primary_key_columns,
-                    upsert_conflict_keys=tuple(upsert_keys),
-                    eligible_insert_columns=insert_columns if upsert_keys else (),
-                    eligible_upsert_update_columns=(
-                        ()
-                        if schema is None or not upsert_keys
-                        else tuple(
-                            column
-                            for column in schema.updatable_columns
-                            if column
-                            not in (
-                                *schema.primary_key_columns,
-                                *schema.identity_columns,
-                            )
-                        )
-                    ),
-                    generated_identity_columns=(
-                        ()
-                        if schema is None or not upsert_keys
-                        else schema.identity_columns
-                    ),
-                )
-            )
-        return SourcePermissionsInspection(
-            source_id=source_id,
-            source_display_name=registration.display_name,
-            adapter_id=registration.adapter_id,
-            catalog_generation=catalog_generation,
-            state=SourcePermissionState(read_scope, update_scopes),
-            resources=tuple(choices),
+        return await _inspect_source_permissions(
+            self._store, self._data_view, self.identity.id, source_id
         )
 
     async def _build_source_permissions_preview(
@@ -5377,234 +4884,16 @@ class EmbeddedAgent:
         read_resource_ids: tuple[str, ...],
         relational_write_scopes: Mapping[str, Mapping[str, object]],
     ) -> SourcePermissionsPreview:
-        if not isinstance(read_mode, SourceReadMode):
-            raise TypeError("read_mode must be SourceReadMode")
-        if not isinstance(read_resource_ids, tuple):
-            raise TypeError("read_resource_ids must be a tuple")
-        if not isinstance(relational_write_scopes, Mapping):
-            raise TypeError("relational_write_scopes must be a mapping")
-        current_resources = {
-            resource.resource_id: resource for resource in inspection.resources
-        }
-        requested_read = SourceReadScope(
-            agent_id=self.identity.id,
-            source_id=inspection.source_id,
-            mode=read_mode,
-            resource_ids=read_resource_ids,
-        )
-        if requested_read.mode is SourceReadMode.SELECTED:
-            unknown_read_ids = set(requested_read.resource_ids) - set(current_resources)
-            if unknown_read_ids:
-                raise ValueError(
-                    "selected read resources are not current resources of this source"
-                )
-        if relational_write_scopes and inspection.adapter_id != "postgresql":
-            raise ValueError(
-                "PostgreSQL update scopes require an active PostgreSQL source"
-            )
-
-        registration = await self._store.load_source(
+        return await _build_source_permissions_preview(
+            self._store,
+            self._catalog_service,
+            self._data_view,
             self.identity.id,
-            inspection.source_id,
-        )
-        if (
-            registration is None
-            or not registration.active
-            or registration.adapter_id != inspection.adapter_id
-        ):
-            raise ValueError("source identity changed during permission preview")
-        tabular_by_resource_id = {
-            item.resource.id: item
-            for item in await self._catalog_service.tabular_resources(
-                self.identity.id,
-                inspection.source_id,
-            )
-        }
-        update_scopes: list[RelationalWriteScope] = []
-        requested_update_ids: set[str] = set()
-        schemas = {
-            item.resource_id: item
-            for item in await self._data_view.resource_schemas(
-                self.identity.id, inspection.source_id
-            )
-        }
-        from ..domains.data.sql.relational_upsert import (
-            validate_relational_upsert_scope,
-        )
-
-        for resource_id, constraints in relational_write_scopes.items():
-            if not isinstance(constraints, Mapping) or set(constraints) != {
-                "allowed_operations",
-                "allowed_insert_columns",
-                "allowed_update_columns",
-                "key_columns",
-                "generated_identity_columns",
-                "max_rows",
-            }:
-                raise ValueError(
-                    "write scopes require explicit operations, keys, insert/update columns, identities and row limit"
-                )
-            tabular = tabular_by_resource_id.get(resource_id)
-            schema = schemas.get(resource_id)
-            if (
-                tabular is None
-                or schema is None
-                or tabular.resource.kind is not ResourceKind.TABLE
-            ):
-                raise ValueError("write scope requires an exact current table")
-            scope = RelationalWriteScope(
-                agent_id=self.identity.id,
-                source_id=inspection.source_id,
-                resource_id=resource_id,
-                resource_revision=tabular.resource.current_revision,
-                allowed_operations=cast(
-                    tuple[str, ...], constraints["allowed_operations"]
-                ),
-                allowed_insert_columns=cast(
-                    tuple[str, ...], constraints["allowed_insert_columns"]
-                ),
-                allowed_update_columns=cast(
-                    tuple[str, ...], constraints["allowed_update_columns"]
-                ),
-                key_columns=cast(tuple[str, ...], constraints["key_columns"]),
-                generated_identity_columns=cast(
-                    tuple[str, ...], constraints["generated_identity_columns"]
-                ),
-                max_rows=cast(int, constraints["max_rows"]),
-                authorization_fingerprint="sha256:" + "0" * 64,
-            )
-            if "update" in scope.allowed_operations:
-                if (
-                    set(scope.key_columns) != set(schema.primary_key_columns)
-                    or not validate_relational_write_scope(
-                        inspection.source_id,
-                        resource_id,
-                        scope.allowed_update_columns,
-                        resources=(schema,),
-                    ).valid
-                ):
-                    raise ValueError(
-                        "update scope requires eligible columns and the exact primary key"
-                    )
-            if "upsert" in scope.allowed_operations:
-                validate_relational_upsert_scope(
-                    schema,
-                    key_columns=scope.key_columns,
-                    insert_columns=scope.allowed_insert_columns,
-                    update_columns=scope.allowed_update_columns,
-                    generated_identity_columns=scope.generated_identity_columns,
-                )
-                if scope.max_rows > 1000:
-                    raise ValueError("upsert scope cannot exceed 1000 rows")
-            scope = replace(
-                scope,
-                authorization_fingerprint=relational_write_authorization_fingerprint(
-                    source=registration,
-                    resource=tabular.resource,
-                    facet=tabular.facet,
-                    scope=scope,
-                ),
-            )
-            update_scopes.append(scope)
-            requested_update_ids.add(resource_id)
-
-        automatic_read_additions: set[str] = set()
-        if requested_read.mode is SourceReadMode.ALL:
-            final_read_scope = requested_read
-        else:
-            requested_ids = set(requested_read.resource_ids)
-            automatic_read_additions = requested_update_ids - requested_ids
-            final_ids = requested_ids | requested_update_ids
-            final_read_scope = (
-                SourceReadScope(
-                    agent_id=self.identity.id,
-                    source_id=inspection.source_id,
-                    mode=SourceReadMode.SELECTED,
-                    resource_ids=tuple(final_ids),
-                )
-                if final_ids
-                else SourceReadScope(
-                    agent_id=self.identity.id,
-                    source_id=inspection.source_id,
-                    mode=SourceReadMode.NONE,
-                )
-            )
-        effective_read_ids = (
-            set(current_resources)
-            if final_read_scope.mode is SourceReadMode.ALL
-            else set(final_read_scope.resource_ids)
-        )
-        dependent_revocations = tuple(
-            scope.resource_id
-            for scope in inspection.state.relational_write_scopes
-            if scope.resource_id not in effective_read_ids
-        )
-
-        after = SourcePermissionState(
-            final_read_scope,
-            tuple(update_scopes),
-        )
-        names = {
-            resource.resource_id: resource.display_name
-            for resource in inspection.resources
-        }
-        summary = SourcePermissionSummary(
-            source_display_name=inspection.source_display_name,
-            read_mode=final_read_scope.mode,
-            selected_read_resource_count=(
-                len(current_resources)
-                if final_read_scope.mode is SourceReadMode.ALL
-                else len(final_read_scope.resource_ids)
-            ),
-            relational_write_table_count=len(update_scopes),
-            relational_write_table_examples=tuple(
-                names.get(scope.resource_id, scope.resource_id)
-                for scope in sorted(
-                    update_scopes,
-                    key=lambda item: names.get(item.resource_id, item.resource_id),
-                )[:5]
-            ),
-            automatic_read_addition_examples=tuple(
-                names.get(resource_id, resource_id)
-                for resource_id in sorted(
-                    automatic_read_additions,
-                    key=lambda item: names.get(item, item),
-                )[:5]
-            ),
-            dependent_update_revocation_examples=tuple(
-                names.get(resource_id, resource_id)
-                for resource_id in sorted(
-                    dependent_revocations,
-                    key=lambda item: names.get(item, item),
-                )[:5]
-            ),
-        )
-        material = {
-            "source_id": inspection.source_id,
-            "adapter_id": inspection.adapter_id,
-            "catalog_generation": inspection.catalog_generation,
-            "before": _source_permission_state_payload(inspection.state),
-            "after": _source_permission_state_payload(after),
-            "automatic_read_additions": tuple(sorted(automatic_read_additions)),
-            "dependent_write_revocations": tuple(sorted(dependent_revocations)),
-        }
-        confirmation_fingerprint = (
-            "sha256:"
-            + hmac.new(
-                self._source_permission_confirmation_key,
-                canonical_json(material).encode("utf-8"),
-                hashlib.sha256,
-            ).hexdigest()
-        )
-        return SourcePermissionsPreview(
-            source_id=inspection.source_id,
-            catalog_generation=inspection.catalog_generation,
-            before=inspection.state,
-            after=after,
-            automatic_read_additions=tuple(automatic_read_additions),
-            dependent_write_revocations=dependent_revocations,
-            summary=summary,
-            confirmation_fingerprint=confirmation_fingerprint,
+            self._source_permission_confirmation_key,
+            inspection,
+            read_mode=read_mode,
+            read_resource_ids=read_resource_ids,
+            relational_write_scopes=relational_write_scopes,
         )
 
     async def relational_upsert_readiness(
@@ -5897,1141 +5186,6 @@ class EmbeddedAgent:
             raise AgentHomeError("embedded agent is closed")
 
 
-def _admit_host_model(
-    model: ModelProvider | None,
-    coordinator: RunAdmissionCoordinator,
-    *,
-    identity: str,
-    home: Path | None,
-    profile: ModelProfile | None = None,
-    retry_policy: RetryPolicy = RetryPolicy(),
-    owned: bool = False,
-) -> ModelProvider | None:
-    """Route one host model through the shared router retry and permit boundary.
-
-    A caller-supplied router keeps its own candidates and policy. Any other
-    provider becomes the sole candidate of a host router so injected and
-    configured routes share the same retry, admission and attempt diagnostics.
-    A caller-injected provider stays caller-owned and the router never closes
-    it; a host-owned provider closes with its router. Either keeps serving every
-    request sensitivity the host sends it.
-    """
-
-    if model is None:
-        return None
-
-    async def admit(key: str, deadline: float | None):
-        return await coordinator.provider_permit(key, deadline=deadline)
-
-    if isinstance(model, ModelRouter):
-        if not model.provider_admission_bound:
-            model.bind_provider_admission(admit)
-        return model
-    if profile is None:
-        raise AgentNotConfiguredError("a configured model requires its ModelProfile")
-    if model.provider_id != profile.id:
-        raise AgentNotConfiguredError("model and profile identities differ")
-    router = ModelRouter(
-        (
-            ModelProviderRegistration(
-                provider=model,
-                profile=profile,
-                allowed_sensitivities=frozenset(ModelSensitivity),
-                close_with_router=owned,
-                concurrency_key=_injected_concurrency_key(
-                    model.provider_id, identity=identity, home=home
-                ),
-            ),
-        ),
-        retry_policy=retry_policy,
-    )
-    router.bind_provider_admission(admit)
-    return router
-
-
-def _injected_concurrency_key(
-    provider_id: str, *, identity: str, home: Path | None
-) -> str:
-    return f"injected:{provider_id}:{home.resolve() if home is not None else identity}"
-
-
-def _source_permission_state_payload(
-    state: SourcePermissionState,
-) -> dict[str, object]:
-    return {
-        "read": {
-            "mode": state.read_scope.mode.value,
-            "resource_ids": state.read_scope.resource_ids,
-        },
-        "relational_writes": tuple(
-            {
-                "resource_id": scope.resource_id,
-                **scope.constraints(),
-                "authorization_fingerprint": scope.authorization_fingerprint,
-            }
-            for scope in state.relational_write_scopes
-        ),
-    }
-
-
-def _source_from_registration(
-    registration: SourceRegistration,
-    *,
-    secret_provider: SecretProvider,
-) -> ResourceSource:
-    """Reconstruct one admitted source only at the composition boundary."""
-
-    configuration = registration.configuration
-    adapter_id = registration.adapter_id
-    if adapter_id == "sqlite":
-        _require_configuration_fields(configuration, {"path"})
-        return SQLiteSource(
-            path=_configuration_text(configuration, "path"),
-            name=registration.display_name,
-        )
-    if adapter_id == "postgresql":
-        required = {
-            "database",
-            "host",
-            "port",
-            "schemas",
-            "ssl_mode",
-            "username",
-        }
-        allowed = required | {"credential_ref", "public_network_only"}
-        fields = set(configuration)
-        if not required <= fields or not fields <= allowed:
-            raise AgentHomeError("PostgreSQL source configuration is invalid")
-        raw_schemas = configuration["schemas"]
-        if not isinstance(raw_schemas, tuple) or any(
-            not isinstance(schema, str) for schema in raw_schemas
-        ):
-            raise AgentHomeError("PostgreSQL source configuration is invalid")
-        raw_reference = configuration.get("credential_ref")
-        if raw_reference is not None and not isinstance(raw_reference, str):
-            raise AgentHomeError("PostgreSQL source configuration is invalid")
-        try:
-            reference = (
-                None if raw_reference is None else SecretReference.parse(raw_reference)
-            )
-            return PostgreSQLSource(
-                host=_configuration_text(configuration, "host"),
-                port=_configuration_integer(configuration, "port"),
-                database=_configuration_text(configuration, "database"),
-                username=_configuration_text(configuration, "username"),
-                credential=reference,
-                schemas=cast(tuple[str, ...], raw_schemas),
-                ssl_mode=_configuration_text(configuration, "ssl_mode"),
-                public_network_only=_configuration_boolean(
-                    configuration, "public_network_only", default=False
-                ),
-                name=registration.display_name,
-                secret_provider=secret_provider,
-            )
-        except (TypeError, ValueError) as error:
-            raise AgentHomeError(
-                "PostgreSQL source configuration is invalid"
-            ) from error
-    raise AgentHomeError("registered source adapter cannot be refreshed")
-
-
-def _resolve_candidate_reviewer_profile(
-    model: ModelProvider | None,
-    profile: ModelProfile | None,
-) -> ModelProfile | None:
-    """Admit one direct provider profile without retry or fallback."""
-
-    if model is None:
-        if profile is not None:
-            raise ValueError("reviewer_profile requires reviewer_model")
-        return None
-    if isinstance(model, ModelRouter) and (
-        len(model.candidates) != 1
-        or model.retry_policy.max_attempts_per_candidate != 1
-        or model.retry_policy.max_total_attempts != 1
-    ):
-        raise ValueError("candidate reviewer requires one attempt without fallback")
-    resolved = profile
-    if resolved is None:
-        candidate = getattr(model, "model_profile", None)
-        if isinstance(candidate, ModelProfile):
-            resolved = candidate
-    if not isinstance(resolved, ModelProfile):
-        raise ValueError("candidate reviewer requires an explicit bounded ModelProfile")
-    if resolved.max_output_tokens >= LEARNING_REVIEW_MAX_TOTAL_TOKENS:
-        raise ValueError(
-            "candidate reviewer profile output limit exceeds review token budget"
-        )
-    return resolved
-
-
-def _candidate_reviewer_from_route(
-    route: ModelRoute,
-    *,
-    secret_provider: SecretProvider | None,
-) -> tuple[ManagedModelProvider, ModelProfile]:
-    """Derive one bounded, direct reviewer from the persisted primary route."""
-
-    primary = route.candidates[0]
-    profile = replace(
-        primary.profile,
-        max_output_tokens=min(
-            primary.profile.max_output_tokens,
-            _CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS,
-        ),
-    )
-    direct_route = ModelRoute(
-        (
-            ModelRouteCandidate(
-                provider_id=primary.provider_id,
-                profile=profile,
-                base_url=primary.base_url,
-                secret_reference=primary.secret_reference,
-                allowed_sensitivities=primary.allowed_sensitivities,
-            ),
-        ),
-        retry_policy=_ONE_ATTEMPT_RETRY_POLICY,
-    )
-    return (
-        create_model_route_provider(
-            direct_route,
-            secret_provider=secret_provider,
-        ),
-        profile,
-    )
-
-
-def _require_configuration_fields(
-    configuration: Mapping[str, object],
-    expected: set[str],
-) -> None:
-    if set(configuration) != expected:
-        raise AgentHomeError("source configuration fields are invalid")
-
-
-def _configuration_text(
-    configuration: Mapping[str, object],
-    name: str,
-) -> str:
-    value = configuration[name]
-    if not isinstance(value, str) or not value:
-        raise AgentHomeError("source configuration text is invalid")
-    return value
-
-
-def _configuration_integer(
-    configuration: Mapping[str, object],
-    name: str,
-) -> int:
-    value = configuration[name]
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise AgentHomeError("source configuration integer is invalid")
-    return value
-
-
-def _configuration_boolean(
-    configuration: Mapping[str, object],
-    name: str,
-    *,
-    default: bool,
-) -> bool:
-    value = configuration.get(name, default)
-    if not isinstance(value, bool):
-        raise AgentHomeError("source configuration boolean is invalid")
-    return value
-
-
-def _resolve_configuration(
-    config: AgentConfig | None,
-    *,
-    model: ModelProvider | None,
-    model_profile: ModelProfile | None,
-    limits: LoopLimits | None,
-    secret_provider: SecretProvider | None,
-) -> tuple[
-    ModelProvider | None,
-    ModelProfile | None,
-    ModelRoute | None,
-    LoopLimits,
-    ModelCallPolicy,
-]:
-    if config is not None and not isinstance(config, AgentConfig):
-        raise TypeError("config must be AgentConfig or None")
-    route = None if config is None else config.model_route
-    if route is not None:
-        if model is not None:
-            raise AgentNotConfiguredError(
-                "model_route and injected model cannot be combined"
-            )
-        model = create_model_route_provider(route, secret_provider=secret_provider)
-        model_profile = route.model_profile
-    resolved_limits = limits or (LoopLimits() if config is None else config.limits)
-    if model is not None and model_profile is None:
-        raise AgentNotConfiguredError("a configured model requires its ModelProfile")
-    if model is not None:
-        assert model_profile is not None
-        if model.provider_id != model_profile.id:
-            raise AgentNotConfiguredError("model and profile identities differ")
-    return (
-        model,
-        model_profile,
-        route,
-        resolved_limits,
-        (ModelCallPolicy() if config is None else config.model_call_policy),
-    )
-
-
-def _resolve_credential_session(
-    keychain: KeychainStore | None,
-) -> tuple[CredentialSession, bool]:
-    if isinstance(keychain, CredentialSession):
-        return keychain, False
-    return CredentialSession(keychain or KeychainSecretProvider()), True
-
-
-def _diagnostic_sink(path: Path | None) -> PrivateDiagnosticSink | None:
-    if path is None:
-        return None
-    if not isinstance(path, Path):
-        raise TypeError("diagnostics_path must be pathlib.Path or None")
-    return PrivateDiagnosticSink(path)
-
-
-def _configuration_was_injected(
-    config: AgentConfig | None,
-    *,
-    model: ModelProvider | None,
-    model_profile: ModelProfile | None,
-    context_builder: ContextBuilder | None,
-    tools: ToolRuntime | None,
-) -> bool:
-    return any(
-        value is not None
-        for value in (
-            config,
-            model,
-            model_profile,
-            context_builder,
-            tools,
-        )
-    )
-
-
-def _model_profile(
-    provider: str,
-    model: str,
-    *,
-    context_window_tokens: int | None,
-    max_output_tokens: int | None,
-) -> ModelProfile:
-    provider_id = f"{provider}:{model}"
-    reviewed = reviewed_model_profile(provider_id)
-    if reviewed is not None:
-        if context_window_tokens is not None or max_output_tokens is not None:
-            raise ValueError("reviewed models use their canonical profile limits")
-        return reviewed
-    if context_window_tokens is None or max_output_tokens is None:
-        raise ValueError(
-            "unreviewed models require explicit context and output token limits"
-        )
-    definition = provider_definition(provider)
-    return ModelProfile(
-        id=provider_id,
-        context_window_tokens=context_window_tokens,
-        max_output_tokens=max_output_tokens,
-        supports_tools=True,
-        supports_parallel_tools=(
-            False if definition is None else definition.profile_supports_parallel_tools
-        ),
-        supports_structured_output=(
-            False
-            if definition is None
-            else definition.profile_supports_structured_output
-        ),
-        supports_streaming=(
-            False if definition is None else definition.profile_supports_streaming
-        ),
-        supports_reasoning=(
-            False if definition is None else definition.profile_supports_reasoning
-        ),
-    )
-
-
-def _model_route(
-    provider: str,
-    model: str,
-    *,
-    base_url: str | None,
-    secret_reference: SecretReference | None,
-    context_window_tokens: int | None,
-    max_output_tokens: int | None,
-) -> ModelRoute:
-    profile = _model_profile(
-        provider,
-        model,
-        context_window_tokens=context_window_tokens,
-        max_output_tokens=max_output_tokens,
-    )
-    return ModelRoute(
-        (
-            ModelRouteCandidate(
-                provider_id=profile.id,
-                profile=profile,
-                base_url=base_url,
-                secret_reference=secret_reference,
-            ),
-        )
-    )
-
-
-def _credential_account(agent_id: str, provider: str, nonce: str) -> str:
-    digest = hashlib.sha256(
-        f"{agent_id}\x00{provider}\x00{nonce}".encode("utf-8")
-    ).hexdigest()[:24]
-    return _credential_account_prefix(agent_id, provider) + digest
-
-
-def _credential_account_prefix(agent_id: str, provider: str) -> str:
-    prefix = f"{agent_id}:{provider}:"
-    if len(prefix) + 24 > 256:
-        agent_digest = hashlib.sha256(agent_id.encode("utf-8")).hexdigest()[:24]
-        prefix = f"agent-{agent_digest}:{provider}:"
-    return prefix
-
-
-def _credential_reference_is_owned(
-    reference: SecretReference,
-    *,
-    agent_id: str,
-    provider: str,
-) -> bool:
-    if reference.scheme != "keychain":
-        return False
-    prefix = _credential_account_prefix(agent_id, provider)
-    if not reference.name.startswith(prefix):
-        return False
-    suffix = reference.name[len(prefix) :]
-    return len(suffix) == 24 and all(
-        character in "0123456789abcdef" for character in suffix
-    )
-
-
-def _source_edit_read_scope(
-    *,
-    current_read_scope: SourceReadScope,
-    current_resources: tuple[CatalogResource, ...],
-    replacement: SourceCatalogSnapshot,
-) -> tuple[SourceReadScope, tuple[str, ...]]:
-    """Carry read intent only across exact kind/native-identity matches."""
-
-    if current_read_scope.mode is SourceReadMode.ALL:
-        return (
-            SourceReadScope.allow_all(
-                agent_id=replacement.sync.agent_id,
-                source_id=replacement.sync.source_id,
-            ),
-            (),
-        )
-    if current_read_scope.mode is SourceReadMode.NONE:
-        return (
-            SourceReadScope(
-                agent_id=replacement.sync.agent_id,
-                source_id=replacement.sync.source_id,
-                mode=SourceReadMode.NONE,
-            ),
-            (),
-        )
-
-    current_by_id = {resource.id: resource for resource in current_resources}
-    replacement_by_identity: dict[tuple[ResourceKind, str], list[CatalogResource]] = {}
-    for resource in replacement.resources:
-        replacement_by_identity.setdefault(
-            (resource.kind, resource.native_identity),
-            [],
-        ).append(resource)
-    preserved: list[str] = []
-    omitted: list[str] = []
-    for resource_id in current_read_scope.resource_ids:
-        current = current_by_id.get(resource_id)
-        if current is None:
-            omitted.append(resource_id)
-            continue
-        matches = replacement_by_identity.get(
-            (current.kind, current.native_identity),
-            [],
-        )
-        if len(matches) != 1:
-            omitted.append(current.native_identity)
-            continue
-        preserved.append(matches[0].id)
-    if not preserved:
-        return (
-            SourceReadScope(
-                agent_id=replacement.sync.agent_id,
-                source_id=replacement.sync.source_id,
-                mode=SourceReadMode.NONE,
-            ),
-            tuple(sorted(omitted)),
-        )
-    return (
-        SourceReadScope(
-            agent_id=replacement.sync.agent_id,
-            source_id=replacement.sync.source_id,
-            mode=SourceReadMode.SELECTED,
-            resource_ids=tuple(preserved),
-        ),
-        tuple(sorted(omitted)),
-    )
-
-
-def _owned_source_credential_reference(
-    registration: SourceRegistration,
-    *,
-    agent_id: str,
-) -> SecretReference | None:
-    if registration.agent_id != agent_id or registration.adapter_id != "postgresql":
-        return None
-    value = registration.configuration.get("credential_ref")
-    if not isinstance(value, str):
-        return None
-    try:
-        reference = SecretReference.parse(value)
-    except ValueError:
-        return None
-    return (
-        reference
-        if _credential_reference_is_owned(
-            reference,
-            agent_id=agent_id,
-            provider="postgresql",
-        )
-        else None
-    )
-
-
-def _owned_agent_credential_references(
-    agent_id: str,
-    *,
-    model_document: object | None,
-    source_reference_values: tuple[str, ...],
-    mcp_reference_values: tuple[str, ...] = (),
-) -> tuple[SecretReference, ...]:
-    references: dict[str, SecretReference] = {}
-    if model_document is not None:
-        if not isinstance(model_document, dict):
-            raise AgentHomeError(
-                "model configuration is invalid; the agent home was preserved"
-            )
-        route = model_document.get("model_route")
-        candidates = route.get("candidates") if isinstance(route, dict) else None
-        if not isinstance(candidates, list):
-            raise AgentHomeError(
-                "model configuration is invalid; the agent home was preserved"
-            )
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                raise AgentHomeError(
-                    "model configuration is invalid; the agent home was preserved"
-                )
-            provider_id = candidate.get("provider_id")
-            reference_value = candidate.get("secret_reference")
-            if not isinstance(provider_id, str) or (
-                reference_value is not None and not isinstance(reference_value, str)
-            ):
-                raise AgentHomeError(
-                    "model configuration is invalid; the agent home was preserved"
-                )
-            provider, separator, _model = provider_id.partition(":")
-            if not separator or reference_value is None:
-                continue
-            try:
-                reference = SecretReference.parse(reference_value)
-            except ValueError:
-                continue
-            if _credential_reference_is_owned(
-                reference,
-                agent_id=agent_id,
-                provider=provider,
-            ):
-                references[reference.to_uri()] = reference
-    for reference_value in source_reference_values:
-        try:
-            reference = SecretReference.parse(reference_value)
-        except ValueError:
-            continue
-        if _credential_reference_is_owned(
-            reference,
-            agent_id=agent_id,
-            provider="postgresql",
-        ):
-            references[reference.to_uri()] = reference
-    for reference_value in mcp_reference_values:
-        reference = SecretReference.parse(reference_value)
-        if _credential_reference_is_owned(reference, agent_id=agent_id, provider="mcp"):
-            references[reference.to_uri()] = reference
-    return tuple(references[key] for key in sorted(references))
-
-
-async def _validate_model_route(
-    route: ModelRoute,
-    *,
-    secret_provider: SecretProvider,
-    injected_provider: ModelProvider | None,
-    injected_concurrency_key: str | None = None,
-    call_policy: ModelCallPolicy = _DEFAULT_CALL_POLICY,
-    provider_admission: (
-        Callable[
-            [str, float | None],
-            Awaitable[AbstractAsyncContextManager[object]],
-        ]
-        | None
-    ) = None,
-) -> None:
-    validation_candidates = tuple(
-        replace(
-            candidate,
-            profile=replace(
-                candidate.profile,
-                max_output_tokens=min(
-                    (
-                        _REASONING_MODEL_VALIDATION_MAX_OUTPUT_TOKENS
-                        if candidate.profile.supports_reasoning
-                        else _MODEL_VALIDATION_MAX_OUTPUT_TOKENS
-                    ),
-                    candidate.profile.max_output_tokens,
-                    candidate.profile.context_window_tokens - 1,
-                ),
-            ),
-        )
-        for candidate in route.candidates
-    )
-    validation_route = ModelRoute(validation_candidates, _ONE_ATTEMPT_RETRY_POLICY)
-    owns_provider = injected_provider is None
-    if owns_provider:
-        provider = create_model_route_provider(
-            validation_route,
-            secret_provider=secret_provider,
-        )
-        if provider_admission is not None:
-            assert isinstance(provider, ModelRouter)
-            provider.bind_provider_admission(provider_admission)
-    else:
-        assert injected_provider is not None
-        if len(validation_candidates) != 1:
-            raise AgentNotConfiguredError(
-                "an injected validation provider requires one route candidate"
-            )
-        candidate = validation_candidates[0]
-        if injected_provider.provider_id != candidate.profile.id:
-            raise AgentNotConfiguredError(
-                "validation provider and configured model identities differ"
-            )
-        provider = ModelRouter(
-            (
-                ModelProviderRegistration(
-                    provider=injected_provider,
-                    profile=candidate.profile,
-                    allowed_sensitivities=candidate.allowed_sensitivities,
-                    concurrency_key=injected_concurrency_key,
-                ),
-            ),
-            retry_policy=validation_route.retry_policy,
-        )
-        if provider_admission is not None:
-            provider.bind_provider_admission(provider_admission)
-    try:
-        await _require_validated_model_provider(
-            provider,
-            call_policy=call_policy,
-            deadline=asyncio.get_running_loop().time()
-            + call_policy.max_request_seconds,
-        )
-    except BaseException:
-        if owns_provider:
-            assert isinstance(provider, ManagedModelProvider)
-            try:
-                await provider.close(
-                    deadline=asyncio.get_running_loop().time()
-                    + call_policy.cleanup_timeout_seconds
-                )
-            except BaseException:  # noqa: BLE001
-                # Retain the original validation failure.
-                pass  # Cleanup's once-only outcome stays on the provider owner.
-        raise
-    else:
-        if owns_provider:
-            assert isinstance(provider, ManagedModelProvider)
-            await provider.close(
-                deadline=asyncio.get_running_loop().time()
-                + call_policy.cleanup_timeout_seconds
-            )
-
-
-async def _require_validated_model_provider(
-    provider: ModelProvider,
-    *,
-    call_policy: ModelCallPolicy = _DEFAULT_CALL_POLICY,
-    deadline: float | None = None,
-) -> None:
-    response = await provider.generate(
-        ModelRequest(
-            call_policy=call_policy,
-            deadline=deadline,
-            messages=(
-                CanonicalMessage(
-                    role=MessageRole.USER,
-                    content=(TextBlock("Call the validation tool once."),),
-                ),
-            ),
-            tools=(
-                ToolDefinition(
-                    name=_MODEL_VALIDATION_TOOL_NAME,
-                    description="Prove provider tool-call compatibility.",
-                    input_schema={
-                        "type": "object",
-                        "properties": {},
-                        "additionalProperties": False,
-                    },
-                ),
-            ),
-            sensitivity=ModelSensitivity.PUBLIC,
-            allow_parallel_tool_calls=False,
-        )
-    )
-    if response.finish_reason is FinishReason.LENGTH:
-        raise ModelProviderError(
-            ProviderErrorCode.OUTPUT_LIMIT,
-            "model exhausted the validation output budget",
-        )
-    if (
-        response.finish_reason is not FinishReason.TOOL_CALLS
-        or len(response.tool_calls) != 1
-        or response.tool_calls[0].name != _MODEL_VALIDATION_TOOL_NAME
-        or response.tool_calls[0].arguments
-    ):
-        raise ValueError("model validation did not prove native tool-call support")
-
-
-def _keychain_references(
-    config: AgentConfig | None,
-) -> tuple[tuple[str, SecretReference], ...]:
-    if config is None or config.model_route is None:
-        return ()
-    return tuple(
-        (candidate.provider_id.partition(":")[0], reference)
-        for candidate in config.model_route.candidates
-        if (reference := candidate.secret_reference) is not None
-        and reference.scheme == "keychain"
-    )
-
-
-def _read_model_configuration_document(home: Path) -> object | None:
-    path = home / _MODEL_CONFIG_NAME
-    if path.is_symlink():
-        raise AgentHomeError("model configuration cannot be a symlink")
-    if not path.exists():
-        return None
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise ValueError("configuration is not a regular file")
-            chunks: list[bytes] = []
-            size = 0
-            while size <= _MAX_MODEL_CONFIG_BYTES:
-                chunk = os.read(
-                    descriptor, min(8_192, _MAX_MODEL_CONFIG_BYTES + 1 - size)
-                )
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                size += len(chunk)
-            if size > _MAX_MODEL_CONFIG_BYTES:
-                raise ValueError("configuration exceeds its byte bound")
-        finally:
-            os.close(descriptor)
-        value = json.loads(
-            b"".join(chunks).decode("utf-8"),
-            parse_constant=lambda value: (_ for _ in ()).throw(
-                ValueError(f"invalid JSON constant: {value}")
-            ),
-        )
-        return value
-    except AgentHomeError:
-        raise
-    except Exception:
-        raise AgentHomeError("model configuration is invalid") from None
-
-
-def _read_model_configuration(home: Path, agent_id: str) -> AgentConfig | None:
-    value = _read_model_configuration_document(home)
-    if value is None:
-        return None
-    try:
-        return _decode_agent_config(value, agent_id=agent_id)
-    except AgentHomeError:
-        raise
-    except Exception:
-        raise AgentModelConfigurationError(
-            "saved model configuration must be replaced"
-        ) from None
-
-
-def _write_model_configuration(home: Path, config: AgentConfig) -> None:
-    if not isinstance(config, AgentConfig) or config.model_route is None:
-        raise ValueError("persisted model configuration requires a model route")
-    path = home / _MODEL_CONFIG_NAME
-    if path.is_symlink() or (path.exists() and not path.is_file()):
-        raise AgentHomeError("model configuration path is invalid")
-    data = json.dumps(
-        _encode_agent_config(config),
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    if len(data) > _MAX_MODEL_CONFIG_BYTES:
-        raise AgentHomeError("model configuration exceeds its byte bound")
-    temporary = home / f".{_MODEL_CONFIG_NAME}.{uuid4().hex}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(temporary, flags, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb") as file:
-            file.write(data)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temporary, path)
-        directory = os.open(home, os.O_RDONLY)
-        try:
-            try:
-                os.fsync(directory)
-            except OSError:
-                pass
-        finally:
-            os.close(directory)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-
-
-def _encode_call_policy(policy: ModelCallPolicy) -> dict[str, object]:
-    from dataclasses import asdict
-
-    return asdict(policy)
-
-
-def _decode_call_policy(value: object) -> ModelCallPolicy:
-    from dataclasses import fields
-
-    values = _strict_mapping(value, {item.name for item in fields(ModelCallPolicy)})
-    return ModelCallPolicy(**cast(Mapping[str, float], values))
-
-
-def _encode_agent_config(config: AgentConfig) -> dict[str, object]:
-    route = config.model_route
-    assert route is not None
-    return {
-        "model_call_policy": _encode_call_policy(config.model_call_policy),
-        "limits": {
-            "max_estimated_cost_usd": (
-                None
-                if config.limits.max_estimated_cost_usd is None
-                else str(config.limits.max_estimated_cost_usd)
-            ),
-            "max_steps": config.limits.max_steps,
-            "max_total_tokens": config.limits.max_total_tokens,
-            "max_wall_time_seconds": config.limits.max_wall_time_seconds,
-        },
-        "model_route": {
-            "candidates": [
-                {
-                    "allowed_sensitivities": sorted(
-                        sensitivity.value
-                        for sensitivity in candidate.allowed_sensitivities
-                    ),
-                    "base_url": candidate.base_url,
-                    "profile_limits": _persisted_profile_limits(candidate),
-                    "provider_id": candidate.provider_id,
-                    "secret_reference": (
-                        None
-                        if candidate.secret_reference is None
-                        else candidate.secret_reference.to_uri()
-                    ),
-                }
-                for candidate in route.candidates
-            ],
-            "retry_policy": {
-                "max_attempts_per_candidate": route.retry_policy.max_attempts_per_candidate,
-                "max_total_attempts": route.retry_policy.max_total_attempts,
-                "backoff_seconds": route.retry_policy.backoff_seconds,
-            },
-        },
-    }
-
-
-def _persisted_profile_limits(candidate: ModelRouteCandidate) -> dict[str, int] | None:
-    reviewed = reviewed_model_profile(candidate.provider_id)
-    if reviewed is not None:
-        if candidate.profile != reviewed:
-            raise ValueError(
-                "reviewed model route contains non-canonical profile facts"
-            )
-        return None
-    provider_name, separator, model_name = candidate.provider_id.partition(":")
-    if not separator:
-        raise ValueError("provider ID is incomplete")
-    expected = _model_profile(
-        provider_name,
-        model_name,
-        context_window_tokens=candidate.profile.context_window_tokens,
-        max_output_tokens=candidate.profile.max_output_tokens,
-    )
-    if candidate.profile != expected:
-        raise ValueError("custom model route contains non-canonical profile facts")
-    return {
-        "context_window_tokens": candidate.profile.context_window_tokens,
-        "max_output_tokens": candidate.profile.max_output_tokens,
-    }
-
-
-def _encode_model_profile(profile: ModelProfile) -> dict[str, object]:
-    return {
-        "available": profile.available,
-        "context_window_tokens": profile.context_window_tokens,
-        "data_routing_classification": profile.data_routing_classification,
-        "healthy": profile.healthy,
-        "id": profile.id,
-        "input_cost_per_million_usd": None,
-        "max_output_tokens": profile.max_output_tokens,
-        "output_cost_per_million_usd": None,
-        "supports_documents": profile.supports_documents,
-        "supports_native_continuation": profile.supports_native_continuation,
-        "supports_parallel_tools": profile.supports_parallel_tools,
-        "supports_prompt_caching": profile.supports_prompt_caching,
-        "supports_reasoning": profile.supports_reasoning,
-        "supports_streaming": profile.supports_streaming,
-        "supports_structured_output": profile.supports_structured_output,
-        "supports_tools": profile.supports_tools,
-        "supports_vision": profile.supports_vision,
-    }
-
-
-def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
-    document = _strict_mapping(value, {"limits", "model_route", "model_call_policy"})
-    route_value = _strict_mapping(
-        document["model_route"],
-        {"candidates", "retry_policy"},
-    )
-    raw_candidates = route_value["candidates"]
-    if not isinstance(raw_candidates, list) or not 1 <= len(raw_candidates) <= 5:
-        raise ValueError("model route candidates are invalid")
-    candidates: list[ModelRouteCandidate] = []
-    for raw_candidate in raw_candidates:
-        candidate = _strict_mapping(
-            raw_candidate,
-            {
-                "allowed_sensitivities",
-                "base_url",
-                "profile_limits",
-                "provider_id",
-                "secret_reference",
-            },
-        )
-        raw_allowed = candidate["allowed_sensitivities"]
-        if not isinstance(raw_allowed, list) or not raw_allowed:
-            raise ValueError("allowed sensitivities are invalid")
-        reference_value = candidate["secret_reference"]
-        if reference_value is not None and not isinstance(reference_value, str):
-            raise TypeError("secret reference must be text or null")
-        base_url = candidate["base_url"]
-        if base_url is not None and not isinstance(base_url, str):
-            raise TypeError("base URL must be text or null")
-        provider_id = candidate["provider_id"]
-        if not isinstance(provider_id, str):
-            raise TypeError("provider ID must be text")
-        provider_name, separator, model_name = provider_id.partition(":")
-        if not separator:
-            raise ValueError("provider ID is incomplete")
-        _, _, admitted_url, requires_credential = admit_model_selection(
-            provider_name,
-            model_name,
-            base_url,
-        )
-        reviewed_profile = reviewed_model_profile(provider_id)
-        limits_value = candidate["profile_limits"]
-        if limits_value is None:
-            if reviewed_profile is None:
-                raise AgentModelConfigurationError(
-                    "saved model configuration must be replaced"
-                )
-            profile = reviewed_profile
-        else:
-            profile_limits = _strict_mapping(
-                limits_value,
-                {"context_window_tokens", "max_output_tokens"},
-            )
-            context_window_tokens = profile_limits["context_window_tokens"]
-            max_output_tokens = profile_limits["max_output_tokens"]
-            if (
-                not isinstance(context_window_tokens, int)
-                or isinstance(context_window_tokens, bool)
-                or not isinstance(max_output_tokens, int)
-                or isinstance(max_output_tokens, bool)
-            ):
-                raise ValueError("saved custom model limits are invalid")
-            profile = _model_profile(
-                provider_name,
-                model_name,
-                context_window_tokens=context_window_tokens,
-                max_output_tokens=max_output_tokens,
-            )
-        reference = (
-            None if reference_value is None else SecretReference.parse(reference_value)
-        )
-        if requires_credential and (
-            reference is None or reference.scheme != "keychain"
-        ):
-            raise ValueError("persisted provider credential reference is incomplete")
-        if requires_credential and (
-            reference is None
-            or not _credential_reference_is_owned(
-                reference,
-                agent_id=agent_id,
-                provider=provider_name,
-            )
-        ):
-            raise ValueError(
-                "persisted provider credential reference belongs to another agent"
-            )
-        if not requires_credential and reference is not None:
-            raise ValueError(
-                "local or client-owned subscription configuration cannot contain "
-                "a credential"
-            )
-        allowed = tuple(ModelSensitivity(cast(str, item)) for item in raw_allowed)
-        if len(allowed) != len(set(allowed)):
-            raise ValueError("allowed sensitivities cannot repeat")
-        candidates.append(
-            ModelRouteCandidate(
-                provider_id=provider_id,
-                profile=profile,
-                base_url=admitted_url,
-                secret_reference=reference,
-                allowed_sensitivities=frozenset(allowed),
-            )
-        )
-    raw_retry = _strict_mapping(
-        route_value["retry_policy"],
-        {"max_attempts_per_candidate", "max_total_attempts", "backoff_seconds"},
-    )
-    route = ModelRoute(
-        tuple(candidates),
-        RetryPolicy(
-            max_attempts_per_candidate=cast(
-                int, raw_retry["max_attempts_per_candidate"]
-            ),
-            max_total_attempts=cast(int, raw_retry["max_total_attempts"]),
-            backoff_seconds=cast(float, raw_retry["backoff_seconds"]),
-        ),
-    )
-    raw_limits = _strict_mapping(
-        document["limits"],
-        {
-            "max_estimated_cost_usd",
-            "max_steps",
-            "max_total_tokens",
-            "max_wall_time_seconds",
-        },
-    )
-    cost = raw_limits["max_estimated_cost_usd"]
-    if cost is not None and not isinstance(cost, str):
-        raise TypeError("estimated cost must be text or null")
-    return AgentConfig(
-        model_route=route,
-        model_call_policy=_decode_call_policy(document["model_call_policy"]),
-        limits=LoopLimits(
-            max_steps=cast(int, raw_limits["max_steps"]),
-            max_total_tokens=cast(int, raw_limits["max_total_tokens"]),
-            max_wall_time_seconds=cast(float, raw_limits["max_wall_time_seconds"]),
-            max_estimated_cost_usd=None if cost is None else Decimal(cost),
-        ),
-    )
-
-
-def _decode_model_profile(value: object) -> ModelProfile:
-    fields = {
-        "available",
-        "context_window_tokens",
-        "data_routing_classification",
-        "healthy",
-        "id",
-        "input_cost_per_million_usd",
-        "max_output_tokens",
-        "output_cost_per_million_usd",
-        "supports_documents",
-        "supports_native_continuation",
-        "supports_parallel_tools",
-        "supports_prompt_caching",
-        "supports_reasoning",
-        "supports_streaming",
-        "supports_structured_output",
-        "supports_tools",
-        "supports_vision",
-    }
-    profile = _strict_mapping(value, fields)
-    if (
-        profile["input_cost_per_million_usd"] is not None
-        or profile["output_cost_per_million_usd"] is not None
-    ):
-        raise ValueError("model profile cannot contain pricing")
-    return ModelProfile(
-        id=cast(str, profile["id"]),
-        context_window_tokens=cast(int, profile["context_window_tokens"]),
-        max_output_tokens=cast(int, profile["max_output_tokens"]),
-        supports_tools=cast(bool, profile["supports_tools"]),
-        supports_parallel_tools=cast(bool, profile["supports_parallel_tools"]),
-        supports_structured_output=cast(bool, profile["supports_structured_output"]),
-        supports_streaming=cast(bool, profile["supports_streaming"]),
-        supports_reasoning=cast(bool, profile["supports_reasoning"]),
-        supports_vision=cast(bool, profile["supports_vision"]),
-        supports_documents=cast(bool, profile["supports_documents"]),
-        supports_prompt_caching=cast(bool, profile["supports_prompt_caching"]),
-        supports_native_continuation=cast(
-            bool, profile["supports_native_continuation"]
-        ),
-        data_routing_classification=cast(str, profile["data_routing_classification"]),
-        available=cast(bool, profile["available"]),
-        healthy=cast(bool, profile["healthy"]),
-    )
-
-
-def _strict_mapping(value: object, fields: set[str]) -> Mapping[str, object]:
-    if not isinstance(value, dict) or set(value) != fields:
-        raise ValueError("configuration object fields are invalid")
-    if any(not isinstance(key, str) for key in value):
-        raise TypeError("configuration object keys must be text")
-    return cast(Mapping[str, object], value)
-
-
-def _validate_custom_loop(
-    model: ModelProvider | None,
-    profile: ModelProfile | None,
-    context: ContextBuilder | None,
-    tools: ToolRuntime | None,
-) -> None:
-    del profile
-    if (context is None) != (tools is None):
-        raise AgentNotConfiguredError(
-            "custom context_builder and tools must be configured together"
-        )
-    if model is None and context is not None:
-        raise AgentNotConfiguredError("custom loop components require a model")
-
-
 def _require_value(value: _T | None) -> _T:
     if value is None:
         raise AgentNotConfiguredError("agent loop is incomplete")
@@ -7048,6 +5202,61 @@ async def _await_sync_completion(callback: Callable[[], _T]) -> tuple[_T, bool]:
             cancelled = True
             continue
     return worker.result(), cancelled
+
+
+async def _recover_analysis_evidence(store: StateStore, agent_id: str) -> None:
+    """Settle analysis evidence that a crashed host left admitted or running."""
+    from ..adapters.analytical_workspace.recovery import (
+        dispose_generation_proof,
+        recover_generation,
+    )
+    from ..loop.analysis import AnalysisEvidence
+
+    after = ("", "")
+    while page := await store.pending_analysis_evidence(agent_id, after=after):
+        for pending in page:
+            facts = pending.facts
+            if pending.kind == "generation":
+                if facts.get("proof_disposed") is True:
+                    continue
+                recovered = facts.get("recovery")
+                if recovered is None and facts["status"] in {
+                    "admitted",
+                    "running",
+                    "cleanup_failed",
+                }:
+                    recovery = await recover_generation(facts)
+                    pending = await store.recover_analysis_evidence(
+                        agent_id, pending, recovery
+                    )
+                elif recovered is None and facts["status"] != "closed":
+                    continue
+                # Closure facts are durable before proof disposal. A
+                # crash on either side of unlink can repeat this step.
+                dispose_generation_proof(pending.facts)
+                await store.recover_analysis_evidence(
+                    agent_id, pending, proof_disposed=True
+                )
+            elif (
+                facts["status"] in {"admitted", "running"}
+                and await store.result(pending.run_id) is None
+            ):
+                await store.record_analysis_evidence(
+                    agent_id,
+                    AnalysisEvidence(
+                        pending.run_id,
+                        pending.evidence_id,
+                        pending.kind,
+                        {
+                            **facts,
+                            "status": "interrupted",
+                            "interruption": "host_crash",
+                            "completion_observed": False,
+                        },
+                    ),
+                )
+        last = page[-1]
+        after = (last.run_id, last.evidence_id)
 
 
 async def _recover_agent_state(
@@ -7077,270 +5286,6 @@ async def _await_async_completion(
             cancelled = True
             continue
     return worker.result(), cancelled
-
-
-def _admit_agent_home(
-    name: str,
-    root: str | Path | None,
-    create: bool,
-) -> tuple[Path, _WriterLock]:
-    if not isinstance(name, str) or _AGENT_NAME.fullmatch(name) is None:
-        raise AgentNameError(
-            "agent name must contain 1-64 ASCII letters, digits, '_' or '-'"
-        )
-    state_root = _resolve_state_root(root)
-    _reject_legacy_state_root(state_root)
-    state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    agents_root = state_root / "agents"
-    agents_root.mkdir(mode=0o700, exist_ok=True)
-    home = agents_root / name
-    if not create and not home.is_dir():
-        raise AgentNotFoundError(f"agent does not exist: {name}")
-    home.mkdir(mode=0o700, exist_ok=True)
-    run = home / "run"
-    run.mkdir(mode=0o700, exist_ok=True)
-    for path, label in (
-        (state_root, "agent state root"),
-        (agents_root, "agents directory"),
-        (home, "agent home"),
-        (run, "agent run directory"),
-    ):
-        _require_unaliased_path(path, label)
-        os.chmod(path, 0o700)
-    return home, _WriterLock.acquire(run / "host.lock")
-
-
-def _candidate_agent_homes(root: str | Path | None) -> tuple[Path, ...]:
-    state_root = _resolve_state_root(root)
-    if not state_root.exists():
-        return ()
-    if not state_root.is_dir():
-        raise AgentHomeError("agent state root must be a directory")
-    _reject_legacy_state_root(state_root)
-    agents_root = state_root / "agents"
-    if not agents_root.exists():
-        return ()
-    agents_root = _require_unaliased_path(agents_root, "agents directory")
-    if not agents_root.is_dir():
-        raise AgentHomeError("agents directory must be a directory")
-    try:
-        with os.scandir(agents_root) as iterator:
-            entries = sorted(iterator, key=lambda entry: entry.name)
-    except OSError as error:
-        raise AgentHomeError("cannot inspect agents directory") from error
-    candidates: list[Path] = []
-    for entry in entries[:_MAX_AGENT_HOME_CANDIDATES]:
-        if _AGENT_NAME.fullmatch(entry.name) is None:
-            continue
-        try:
-            if not entry.is_dir(follow_symlinks=False):
-                continue
-            home = _require_unaliased_path(
-                agents_root / entry.name,
-                "agent home",
-            )
-        except (AgentHomeError, OSError):
-            continue
-        candidates.append(home)
-    return tuple(candidates)
-
-
-def _reject_legacy_state_root(state_root: Path) -> None:
-    if (state_root / "agents").exists() or not state_root.exists():
-        return
-    if not any((state_root / marker).exists() for marker in _LEGACY_STATE_ROOT_MARKERS):
-        return
-    raise StateCompatibilityError(
-        StateCompatibilityCode.LEGACY,
-        state_root,
-        (
-            "This local data directory belongs to the unsupported pre-1.0 Daita "
-            "framework. It was left unchanged. Use a separate current root "
-            "and keep this directory intact for a deliberate legacy export/import."
-        ),
-        current_revision=SQLiteStateStore.current_revision,
-        found_revision="pre-1.0-framework",
-    )
-
-
-def _validate_workspace_composition(
-    workspace: LocalWorkspace | None,
-    *,
-    hosted: bool,
-) -> None:
-    if not isinstance(hosted, bool):
-        raise TypeError("hosted must be bool")
-    if hosted:
-        if workspace is not None:
-            raise ValueError("hosted composition cannot admit local file access")
-        return
-    if not isinstance(workspace, LocalWorkspace):
-        raise TypeError("local agent composition requires LocalWorkspace")
-
-
-async def _open_workspace_backend(
-    workspace: LocalWorkspace | None,
-    *,
-    hosted: bool,
-    home: Path,
-    clock: Callable[[], datetime],
-) -> LocalWorkspaceBackend | None:
-    if hosted:
-        return None
-    assert workspace is not None
-    return await LocalWorkspaceBackend.open(
-        workspace,
-        agent_root=home.parent.parent,
-        agent_home=home,
-        clock=clock,
-    )
-
-
-def _resolve_state_root(root: str | Path | None) -> Path:
-    state_root = Path.home() / ".daita" if root is None else Path(root)
-    if ".." in state_root.parts:
-        raise AgentHomeError("agent state root cannot contain parent aliases")
-    state_root = Path(os.path.abspath(os.fspath(state_root)))
-    return _require_unaliased_path(state_root, "agent state root")
-
-
-def _require_unaliased_path(path: Path, label: str) -> Path:
-    lexical = Path(os.path.abspath(os.fspath(path)))
-    resolved = lexical.resolve(strict=False)
-    if lexical != resolved or lexical.is_symlink():
-        raise AgentHomeError(f"{label} cannot contain a symlink or path alias")
-    return resolved
-
-
-def _write_manifest(home: Path, identity: AgentIdentity) -> None:
-    temporary = home / f".agent.toml.{uuid4().hex}.tmp"
-    text = (
-        f'agent_id = "{identity.id}"\n'
-        f'display_name = "{identity.display_name}"\n'
-        f'created_at = "{identity.created_at.isoformat()}"\n'
-    )
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(temporary, flags, 0o600)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-            file.write(text)
-            file.flush()
-            os.fsync(file.fileno())
-        os.replace(temporary, home / "agent.toml")
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-
-
-def _validate_agent_home_target(
-    manifest: AgentIdentity,
-    source_home: Path,
-    candidate_home: Path,
-    affected_paths: frozenset[str],
-) -> None:
-    """Validate one complete home view assembled by the upgrade coordinator."""
-
-    state_home = (
-        candidate_home
-        if candidate_home == source_home or "state.db" in affected_paths
-        else source_home
-    )
-    identity = validate_current_state_database(state_home / "state.db")
-    if identity is None or identity != manifest:
-        raise AgentIdentityMismatchError(
-            "agent.toml does not match the upgraded state identity"
-        )
-
-    config_home = (
-        candidate_home
-        if candidate_home == source_home or _MODEL_CONFIG_NAME in affected_paths
-        else source_home
-    )
-    _read_model_configuration_document(config_home)
-    if candidate_home != source_home:
-        _read_model_configuration(config_home, manifest.id)
-    memory_home = (
-        candidate_home
-        if candidate_home == source_home
-        or {"MEMORY.md", "USER.md"}.intersection(affected_paths)
-        else source_home
-    )
-    validate_memory_documents(memory_home)
-    validate_skill_documents(source_home)
-    records = load_current_artifact_inventory(state_home / "state.db", manifest.id)
-    validate_artifact_home(
-        agent_id=manifest.id, agent_home=source_home, records=records
-    )
-    validate_delivery_configuration(source_home)
-
-
-def _read_manifest(home: Path, expected_name: str) -> AgentIdentity:
-    path = home / "agent.toml"
-    state_path = home / "state.db"
-    if path.is_symlink() or state_path.is_symlink():
-        raise AgentIdentityMismatchError("agent files cannot be symlinks")
-    if not path.is_file() or not state_path.is_file():
-        raise AgentNotFoundError("agent home is incomplete")
-    try:
-        values = tomllib.loads(path.read_text(encoding="utf-8"))
-        if set(values) != {"agent_id", "display_name", "created_at"}:
-            raise ValueError("unexpected manifest fields")
-        if values["display_name"] != expected_name:
-            raise ValueError("manifest name differs from its home")
-        return AgentIdentity(
-            id=values["agent_id"],
-            display_name=values["display_name"],
-            created_at=datetime.fromisoformat(values["created_at"]),
-        )
-    except (OSError, ValueError, TypeError, tomllib.TOMLDecodeError) as error:
-        raise AgentIdentityMismatchError("agent.toml is invalid") from error
-
-
-def _cleanup_failed_create(home: Path) -> None:
-    for name in (
-        "agent.toml",
-        "state.db",
-        "state.db-wal",
-        "state.db-shm",
-        "state.db-journal",
-    ):
-        try:
-            os.unlink(home / name)
-        except FileNotFoundError:
-            pass
-
-
-def _delete_agent_home(home: Path) -> None:
-    """Atomically retire one admitted home, then remove only that exact tree."""
-
-    try:
-        state = os.lstat(home)
-    except OSError as error:
-        raise AgentHomeError("agent home is unavailable for deletion") from error
-    if not stat.S_ISDIR(state.st_mode) or stat.S_ISLNK(state.st_mode):
-        raise AgentHomeError("agent home must be a non-symlink directory")
-    if home.resolve(strict=True) != home:
-        raise AgentHomeError("agent home cannot contain a symlink or path alias")
-    tombstone = home.parent / f".{home.name}.deleting-{uuid4().hex}"
-    try:
-        os.replace(home, tombstone)
-        directory = os.open(home.parent, os.O_RDONLY)
-        try:
-            try:
-                os.fsync(directory)
-            except OSError:
-                pass
-        finally:
-            os.close(directory)
-        shutil.rmtree(tombstone)
-    except OSError as error:
-        if tombstone.exists():
-            raise AgentHomeError(
-                "agent was retired but its temporary deletion tree remains"
-            ) from error
-        raise AgentHomeError("agent home could not be deleted") from error
 
 
 __all__ = [
