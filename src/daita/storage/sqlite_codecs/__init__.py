@@ -1,8 +1,10 @@
 """Collect serializers for the one current canonical SQLite record shape."""
 
 from .catalog import (
+    decode_catalog_link,
     decode_catalog_snapshot,
     decode_catalog_sync,
+    encode_catalog_link,
     encode_catalog_snapshot,
     encode_catalog_sync,
 )
@@ -60,6 +62,7 @@ from .transcripts import (
 )
 
 __all__ = [
+    "decode_catalog_link",
     "decode_catalog_snapshot",
     "decode_catalog_sync",
     "decode_identifier",
@@ -83,6 +86,7 @@ __all__ = [
     "decode_source_configuration_for_deletion",
     "decode_source_read_scope",
     "decode_scheduled_routine",
+    "encode_catalog_link",
     "encode_catalog_snapshot",
     "encode_catalog_sync",
     "encode_identifier",

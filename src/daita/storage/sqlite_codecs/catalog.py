@@ -1,9 +1,10 @@
-"""Encode and decode catalog synchronizations, snapshots, facets, and revisions."""
+"""Encode and decode catalog synchronizations, snapshots, facets, revisions and links."""
 
 from __future__ import annotations
 
 from ...catalog.models import (
     CatalogFacet,
+    CatalogLink,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
@@ -58,6 +59,70 @@ def encode_catalog_snapshot(value: SourceCatalogSnapshot) -> str:
 
 def decode_catalog_snapshot(value: str) -> SourceCatalogSnapshot:
     return _decode_catalog_snapshot(load_payload(value))
+
+
+def encode_catalog_link(value: CatalogLink) -> str:
+    if not isinstance(value, CatalogLink):
+        raise TypeError("catalog link codec requires CatalogLink")
+    return dump_payload(
+        record(
+            "CatalogLink",
+            {
+                "id": value.id,
+                "agent_id": value.agent_id,
+                "from_source_id": value.from_source_id,
+                "from_resource_id": value.from_resource_id,
+                "to_source_id": value.to_source_id,
+                "to_resource_id": value.to_resource_id,
+                "field_pairs": [_encode_field_pair(item) for item in value.field_pairs],
+                "declared_at": datetime_encode(value.declared_at),
+                "declared_revisions": list(value.declared_revisions),
+                "note": value.note,
+            },
+        )
+    )
+
+
+def decode_catalog_link(value: str) -> CatalogLink:
+    fields = record_fields(
+        load_payload(value),
+        "CatalogLink",
+        (
+            "id",
+            "agent_id",
+            "from_source_id",
+            "from_resource_id",
+            "to_source_id",
+            "to_resource_id",
+            "field_pairs",
+            "declared_at",
+            "declared_revisions",
+            "note",
+        ),
+    )
+    revisions = sequence(fields["declared_revisions"], "catalog link revisions")
+    if len(revisions) != 2:
+        raise ValueError("stored catalog link revisions are invalid")
+    return CatalogLink(
+        id=text(fields["id"], "catalog link id"),
+        agent_id=text(fields["agent_id"], "catalog link agent_id"),
+        from_source_id=text(fields["from_source_id"], "catalog link from_source_id"),
+        from_resource_id=text(
+            fields["from_resource_id"], "catalog link from_resource_id"
+        ),
+        to_source_id=text(fields["to_source_id"], "catalog link to_source_id"),
+        to_resource_id=text(fields["to_resource_id"], "catalog link to_resource_id"),
+        field_pairs=tuple(
+            _decode_field_pair(item)
+            for item in sequence(fields["field_pairs"], "catalog link field_pairs")
+        ),
+        declared_at=datetime_decode(fields["declared_at"]),
+        declared_revisions=(
+            text(revisions[0], "catalog link revision"),
+            text(revisions[1], "catalog link revision"),
+        ),
+        note=optional_text(fields["note"], "catalog link note"),
+    )
 
 
 def _encode_catalog_facet(value: CatalogFacet) -> dict[str, JsonValue]:

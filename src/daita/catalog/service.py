@@ -9,7 +9,7 @@ import secrets
 import unicodedata
 from bisect import bisect_left
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
@@ -29,6 +29,9 @@ from .models import (
     CatalogDescribeDetail,
     CatalogDescribeRequest,
     CatalogFacet,
+    CatalogLink,
+    CatalogLinkStaleReason,
+    CatalogLinkStatus,
     CatalogMatchOutcome,
     CatalogPath,
     CatalogPathStep,
@@ -48,12 +51,14 @@ from .models import (
     CatalogTraversalTruncationReason,
     FacetKind,
     RelationshipDirection,
+    RelationshipFieldPair,
     RelationshipKind,
     RelationshipProvenance,
     ResourceKind,
     SourceCatalogSnapshot,
     TabularFacet,
     catalog_facet_revision,
+    catalog_link_id,
 )
 from .protocols import CatalogResourceNotFoundError, CatalogStore, CatalogStoreError
 
@@ -125,6 +130,17 @@ class _ParentStep:
     parent_resource_id: str
     relationship_id: str
     direction: RelationshipDirection
+
+
+@dataclass(frozen=True, slots=True)
+class _LinkGraph:
+    """Current, readable declared links as edges over the projected indexes."""
+
+    links_by_id: Mapping[str, CatalogLink]
+    adjacency_by_resource_id: Mapping[str, tuple[_IndexedEdge, ...]]
+
+
+_NO_LINKS = _LinkGraph(MappingProxyType({}), MappingProxyType({}))
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +265,8 @@ class _SchemaJoinSelection:
     truncation_reason: str | None
     visited_nodes: int
     visited_edges: int
+    # Each source's join group: sources joined by current links share one.
+    source_groups: Mapping[str, str]
 
 
 class _CatalogGenerationChanged(RuntimeError):
@@ -335,6 +353,108 @@ class CatalogService:
         return tuple(
             sorted(resources, key=lambda resource: (resource.name, resource.id))[:limit]
         )
+
+    async def declare_link(
+        self,
+        agent_id: str,
+        from_resource_id: str,
+        to_resource_id: str,
+        field_pairs: tuple[RelationshipFieldPair, ...],
+        *,
+        declared_at: datetime,
+        note: str | None = None,
+    ) -> CatalogLink:
+        """Validate both endpoints and fields against current truth, then persist."""
+
+        _, indexes = await self._current_indexes(agent_id)
+        endpoints: list[tuple[CatalogResource, frozenset[str]]] = []
+        for resource_id in (from_resource_id, to_resource_id):
+            index = next(
+                (item for item in indexes if resource_id in item.resources_by_id),
+                None,
+            )
+            if index is None:
+                raise CatalogResourceNotFoundError(agent_id, resource_id)
+            endpoints.append(
+                (
+                    index.resources_by_id[resource_id],
+                    _tabular_field_names(
+                        index.facets_by_resource_id.get(resource_id, ())
+                    ),
+                )
+            )
+        (from_resource, from_fields), (to_resource, to_fields) = endpoints
+        for pair in field_pairs:
+            for field_name, resource, fields in (
+                (pair.source_field, from_resource, from_fields),
+                (pair.target_field, to_resource, to_fields),
+            ):
+                if field_name not in fields:
+                    raise ValueError(
+                        f"catalog link field {field_name!r} is not a current "
+                        f"column of {resource.native_identity}"
+                    )
+        link = CatalogLink(
+            id=catalog_link_id(
+                from_resource_id=from_resource_id,
+                to_resource_id=to_resource_id,
+                field_pairs=field_pairs,
+            ),
+            agent_id=agent_id,
+            from_source_id=from_resource.source_id,
+            from_resource_id=from_resource_id,
+            to_source_id=to_resource.source_id,
+            to_resource_id=to_resource_id,
+            field_pairs=field_pairs,
+            declared_at=declared_at,
+            declared_revisions=(
+                from_resource.current_revision,
+                to_resource.current_revision,
+            ),
+            note=note,
+        )
+        await self._store.save_catalog_link(link)
+        return link
+
+    async def remove_link(self, agent_id: str, link_id: str) -> bool:
+        return await self._store.delete_catalog_link(agent_id, link_id)
+
+    async def link_statuses(self, agent_id: str) -> tuple[CatalogLinkStatus, ...]:
+        """Return every declared link, current or stale with its reason."""
+
+        links = await self._store.list_catalog_links(agent_id)
+        active_source_ids, indexes = await self._current_indexes(agent_id)
+        index_by_source_id = {index.source_id: index for index in indexes}
+        return tuple(
+            CatalogLinkStatus(
+                link,
+                _link_stale_reason(link, active_source_ids, index_by_source_id),
+            )
+            for link in links
+        )
+
+    async def _current_indexes(
+        self,
+        agent_id: str,
+    ) -> tuple[tuple[str, ...], tuple[_SourceCatalogIndex, ...]]:
+        for _ in range(2):
+            active_source_ids = await self._active_source_ids(agent_id)
+            refs = (
+                ()
+                if not active_source_ids
+                else await self._store.list_current_snapshot_refs(
+                    agent_id,
+                    active_source_ids,
+                )
+            )
+            await self._evict_stale_indexes(agent_id, active_source_ids, refs)
+            try:
+                return active_source_ids, tuple(
+                    [await self._index_for_ref(ref) for ref in refs]
+                )
+            except _CatalogGenerationChanged:
+                continue
+        raise CatalogStoreError("catalog snapshot generation changed repeatedly")
 
     async def tabular_resources(
         self,
@@ -501,6 +621,11 @@ class CatalogService:
                     request.agent_id,
                     frozenset(scoped_source_ids),
                 ),
+                link_graph=_current_link_graph(
+                    await self._store.list_catalog_links(request.agent_id),
+                    indexes,
+                    readable_resource_ids,
+                ),
             )
             current_active_source_ids = await self._active_source_ids(request.agent_id)
             current_refs = (
@@ -592,12 +717,14 @@ class CatalogService:
         readable_resource_ids: frozenset[str] | None = None,
         include_fallback: bool = True,
         source_hints: tuple[Mapping[str, object], ...] = (),
+        link_graph: _LinkGraph = _NO_LINKS,
     ) -> CatalogSearchResult:
         selection = self._select_index_hits(
             request,
             indexes,
             readable_resource_ids=readable_resource_ids,
             source_hints=source_hints,
+            link_graph=link_graph,
         )
         matched_hits = selection.ordered_hits
         matched_ids = {hit.resource_id for hit in matched_hits}
@@ -690,6 +817,7 @@ class CatalogService:
         *,
         readable_resource_ids: frozenset[str] | None = None,
         source_hints: tuple[Mapping[str, object], ...] = (),
+        link_graph: _LinkGraph = _NO_LINKS,
     ) -> _CatalogHitSelection:
         for index in indexes:
             if index.agent_id != request.agent_id or (
@@ -839,13 +967,31 @@ class CatalogService:
             str,
             tuple[tuple[int, str, str, str], CatalogSearchHit],
         ] = {}
+        linked_resources = (
+            {
+                resource.id: resource
+                for index in indexes
+                for resource in index.resources_by_id.values()
+            }
+            if link_graph.links_by_id
+            else {}
+        )
         for direct_position, candidate in enumerate(candidates):
             index = index_by_source_id[candidate.hit.source_id]
-            for edge in index.adjacency_by_resource_id.get(
-                candidate.hit.resource_id,
-                (),
+            for edge, neighbor in (
+                *(
+                    (edge, index.resources_by_id.get(edge.neighbor_resource_id))
+                    for edge in index.adjacency_by_resource_id.get(
+                        candidate.hit.resource_id, ()
+                    )
+                ),
+                *(
+                    (edge, linked_resources.get(edge.neighbor_resource_id))
+                    for edge in link_graph.adjacency_by_resource_id.get(
+                        candidate.hit.resource_id, ()
+                    )
+                ),
             ):
-                neighbor = index.resources_by_id.get(edge.neighbor_resource_id)
                 if (
                     neighbor is None
                     or (
@@ -871,7 +1017,19 @@ class CatalogService:
                     sensitivity=neighbor.sensitivity,
                     score=0.0,
                     matched_fields=(f"relationship:{edge.relationship_id}",),
-                    match_reasons=("relationship_neighbor",),
+                    match_reasons=(
+                        ("relationship_neighbor",)
+                        if edge.relationship_id not in link_graph.links_by_id
+                        else (
+                            "relationship_neighbor",
+                            "declared_link",
+                            *(
+                                ("cross_source",)
+                                if neighbor.source_id != candidate.hit.source_id
+                                else ()
+                            ),
+                        )
+                    ),
                 )
                 existing = neighbor_by_id.get(neighbor.id)
                 if existing is None or order < existing[0]:
@@ -972,11 +1130,12 @@ class CatalogService:
         return await self._project_current(
             request.agent_id,
             request.source_id,
-            lambda active_source_ids, indexes: self._schema_slice_from_indexes(
+            lambda active_source_ids, indexes, links: self._schema_slice_from_indexes(
                 request,
                 active_source_ids,
                 indexes,
                 readable_resource_ids=readable_resource_ids,
+                links=links,
             ),
         )
 
@@ -999,7 +1158,7 @@ class CatalogService:
             return await self._project_current(
                 request.agent_id,
                 request.source_id,
-                lambda active_source_ids, indexes: self._identity_from_indexes(
+                lambda active_source_ids, indexes, _links: self._identity_from_indexes(
                     request,
                     active_source_ids,
                     indexes,
@@ -1024,12 +1183,13 @@ class CatalogService:
         projection = await self._project_current(
             request.agent_id,
             request.source_id,
-            lambda active_source_ids, indexes: self._schema_slice_from_indexes(
+            lambda active_source_ids, indexes, links: self._schema_slice_from_indexes(
                 schema_request,
                 active_source_ids,
                 indexes,
                 readable_resource_ids=readable_resource_ids,
                 include_describe_facts=True,
+                links=links,
             ),
         )
         if relationships_only:
@@ -1050,7 +1210,8 @@ class CatalogService:
         agent_id: str,
         source_id: str | None,
         project: Callable[
-            [tuple[str, ...], tuple[_SourceCatalogIndex, ...]], FrozenJsonObject
+            [tuple[str, ...], tuple[_SourceCatalogIndex, ...], tuple[CatalogLink, ...]],
+            FrozenJsonObject,
         ],
     ) -> FrozenJsonObject:
         """Project one consistent current generation, retrying one change."""
@@ -1082,8 +1243,9 @@ class CatalogService:
                 if attempt == 0:
                     continue
                 break
+            links = await self._store.list_catalog_links(agent_id)
             try:
-                projection = project(active_source_ids, tuple(indexes))
+                projection = project(active_source_ids, tuple(indexes), links)
             except _CatalogGenerationChanged:
                 if attempt == 0:
                     continue
@@ -1313,6 +1475,7 @@ class CatalogService:
         *,
         readable_resource_ids: frozenset[str] | None = None,
         include_describe_facts: bool = False,
+        links: tuple[CatalogLink, ...] = (),
     ) -> FrozenJsonObject:
         resources_by_id: dict[str, CatalogResource] = {}
         revisions_by_resource_id: dict[str, CatalogResourceRevision] = {}
@@ -1362,6 +1525,15 @@ class CatalogService:
                 if relationship.id in relationships_by_id:
                     raise CatalogStoreError("catalog index set repeats a relationship")
                 relationships_by_id[relationship.id] = relationship
+        link_graph = _current_link_graph(
+            links,
+            tuple(
+                index
+                for index in indexes
+                if request.source_id in (None, index.source_id)
+            ),
+            readable_resource_ids,
+        )
 
         match_by_resource_id: dict[str, CatalogSearchHit] = {}
         normalized_query = _normalize_search_text(request.query or "")
@@ -1482,13 +1654,14 @@ class CatalogService:
             term for term in significant_terms if term not in covered_terms
         )
 
-        join_selection = _SchemaJoinSelection((), (), (), (), None, 0, 0)
+        join_selection = _SchemaJoinSelection((), (), (), (), None, 0, 0, {})
         if request.include_relationships and len(seeds) >= 2:
             join_selection = self._select_schema_joins(
                 request,
                 seeds,
                 index_by_source_id,
                 readable_resource_ids=readable_resource_ids,
+                link_graph=link_graph,
             )
 
         included_ids = set(seed_ids)
@@ -1503,8 +1676,14 @@ class CatalogService:
             )
             neighbor_candidates = tuple(
                 edge.neighbor_resource_id
-                for edge in index.adjacency_by_resource_id.get(seed.id, ())
-                if edge.relationship_id in eligible_ids
+                for edge in (
+                    *index.adjacency_by_resource_id.get(seed.id, ()),
+                    *link_graph.adjacency_by_resource_id.get(seed.id, ()),
+                )
+                if (
+                    edge.relationship_id in eligible_ids
+                    or edge.relationship_id in link_graph.links_by_id
+                )
                 and (
                     readable_resource_ids is None
                     or edge.neighbor_resource_id in readable_resource_ids
@@ -1613,8 +1792,14 @@ class CatalogService:
                 index = index_by_resource_id[resource.id]
                 selected_relationship_ids.update(
                     edge.relationship_id
-                    for edge in index.adjacency_by_resource_id.get(resource.id, ())
-                    if edge.relationship_id in relationships_by_id
+                    for edge in (
+                        *index.adjacency_by_resource_id.get(resource.id, ()),
+                        *link_graph.adjacency_by_resource_id.get(resource.id, ()),
+                    )
+                    if (
+                        edge.relationship_id in relationships_by_id
+                        or edge.relationship_id in link_graph.links_by_id
+                    )
                     and (
                         len(seeds) == 1
                         or edge.neighbor_resource_id in selected_resources
@@ -1631,18 +1816,23 @@ class CatalogService:
                 len(required_ids),
                 min(request.relationship_limit, _SCHEMA_RELATIONSHIP_LIMIT),
             )
-            relationships = tuple(
-                relationships_by_id[relationship_id] for relationship_id in ordered_ids
-            )
-            if len(relationships) > relationship_limit:
+            if len(ordered_ids) > relationship_limit:
                 relationships_truncated = True
             selected_ids = set(selected_resources)
-            for relationship in relationships[:relationship_limit]:
-                from_resource, to_resource = self._snapshot_relationship_endpoints(
-                    relationship,
-                    resources_by_id,
-                    revisions_by_resource_id,
-                )
+            for relationship_id in ordered_ids[:relationship_limit]:
+                link = link_graph.links_by_id.get(relationship_id)
+                edge: CatalogRelationship | CatalogLink
+                if link is None:
+                    edge = relationships_by_id[relationship_id]
+                    from_resource, to_resource = self._snapshot_relationship_endpoints(
+                        edge,
+                        resources_by_id,
+                        revisions_by_resource_id,
+                    )
+                else:
+                    edge = link
+                    from_resource = resources_by_id[link.from_resource_id]
+                    to_resource = resources_by_id[link.to_resource_id]
                 unselected_endpoints = tuple(
                     _schema_endpoint_payload(endpoint)
                     for endpoint in (from_resource, to_resource)
@@ -1655,16 +1845,24 @@ class CatalogService:
                                 "source_field": pair.source_field,
                                 "target_field": pair.target_field,
                             }
-                            for pair in relationship.field_pairs
+                            for pair in edge.field_pairs
                         ),
-                        "from_resource_id": relationship.from_resource_id,
+                        "from_resource_id": edge.from_resource_id,
                         "from_resource_revision": from_resource.current_revision,
-                        "kind": relationship.kind.value,
-                        "provenance": relationship.provenance.value,
-                        "relationship_id": relationship.id,
-                        "to_resource_id": relationship.to_resource_id,
+                        "kind": edge.kind.value,
+                        "provenance": edge.provenance.value,
+                        "relationship_id": edge.id,
+                        "to_resource_id": edge.to_resource_id,
                         "to_resource_revision": to_resource.current_revision,
                         "unselected_endpoints": unselected_endpoints,
+                        **(
+                            {}
+                            if link is None
+                            else {
+                                "cross_source": from_resource.source_id
+                                != to_resource.source_id
+                            }
+                        ),
                     }
                 )
 
@@ -1703,12 +1901,15 @@ class CatalogService:
                 )
             )
             if len(path_seed_ids) == 1:
+                groups = join_selection.source_groups
                 terminal_source_id = resources_by_id[path_seed_ids[0]].source_id
+                terminal_group = groups.get(terminal_source_id, terminal_source_id)
                 root_seed_id = next(
                     (
                         resource.id
                         for resource in seeds
-                        if resource.source_id == terminal_source_id
+                        if groups.get(resource.source_id, resource.source_id)
+                        == terminal_group
                         and resource.id != path_seed_ids[0]
                     ),
                     None,
@@ -1873,10 +2074,26 @@ class CatalogService:
         index_by_source_id: Mapping[str, _SourceCatalogIndex],
         *,
         readable_resource_ids: frozenset[str] | None = None,
+        link_graph: _LinkGraph = _NO_LINKS,
     ) -> _SchemaJoinSelection:
+        # Sources joined by a current link form one join group; seeds in
+        # different groups have no path between them.
+        source_groups = {source_id: source_id for source_id in index_by_source_id}
+
+        def group_of(source_id: str) -> str:
+            while source_groups[source_id] != source_id:
+                source_id = source_groups[source_id]
+            return source_id
+
+        for link in link_graph.links_by_id.values():
+            first, second = sorted(
+                (group_of(link.from_source_id), group_of(link.to_source_id))
+            )
+            source_groups[second] = first
+        source_groups = {source_id: group_of(source_id) for source_id in source_groups}
         groups: dict[str, list[CatalogResource]] = {}
         for seed in seeds:
-            groups.setdefault(seed.source_id, []).append(seed)
+            groups.setdefault(source_groups[seed.source_id], []).append(seed)
 
         unresolved_reasons: set[str] = set()
         if len(groups) > 1:
@@ -1890,22 +2107,42 @@ class CatalogService:
         seed_ids = {seed.id for seed in seeds}
         seed_rank = {seed.id: rank for rank, seed in enumerate(seeds)}
 
-        for source_id in sorted(groups):
-            index = index_by_source_id[source_id]
-            source_seeds = tuple(groups[source_id])
+        for group_id in sorted(groups):
+            group_indexes = tuple(
+                index_by_source_id[source_id]
+                for source_id in sorted(index_by_source_id)
+                if source_groups[source_id] == group_id
+            )
+            group_resources = {
+                resource_id: resource
+                for index in group_indexes
+                for resource_id, resource in index.resources_by_id.items()
+            }
+            source_seeds = tuple(groups[group_id])
             joinable_seeds = tuple(
                 seed
                 for seed in source_seeds
-                if self._is_tabular_resource(index, seed.id)
+                if self._is_tabular_resource(
+                    index_by_source_id[seed.source_id], seed.id
+                )
             )
             if len(joinable_seeds) != len(source_seeds):
                 unresolved_reasons.add("non_tabular_seed")
             if len(joinable_seeds) < 2:
                 continue
 
-            eligible_relationship_ids = self._sql_join_relationship_ids(
-                index,
-                readable_resource_ids=readable_resource_ids,
+            eligible_relationship_ids = frozenset(
+                link.id
+                for link in link_graph.links_by_id.values()
+                if source_groups[link.from_source_id] == group_id
+            ).union(
+                *(
+                    self._sql_join_relationship_ids(
+                        index,
+                        readable_resource_ids=readable_resource_ids,
+                    )
+                    for index in group_indexes
+                )
             )
             tree_resource_ids = {joinable_seeds[0].id}
             remaining = list(joinable_seeds[1:])
@@ -1923,7 +2160,7 @@ class CatalogService:
                     sorted(
                         tree_resource_ids,
                         key=lambda resource_id: _resource_join_key(
-                            index.resources_by_id[resource_id]
+                            group_resources[resource_id]
                         ),
                     )
                 )
@@ -1952,7 +2189,8 @@ class CatalogService:
                                 max_nodes=remaining_nodes,
                                 max_edges=remaining_edges,
                             ),
-                            (index,),
+                            group_indexes,
+                            link_graph=link_graph,
                             eligible_relationship_ids=eligible_relationship_ids,
                             stop_at_shortest_target=True,
                             readable_resource_ids=readable_resource_ids,
@@ -1995,7 +2233,7 @@ class CatalogService:
                                         ),
                                         tuple(
                                             _normalize_search_text(
-                                                index.resources_by_id[
+                                                group_resources[
                                                     resource_id
                                                 ].native_identity
                                             ).complete
@@ -2065,6 +2303,7 @@ class CatalogService:
             truncation_reason=truncation_reason,
             visited_nodes=visited_nodes,
             visited_edges=visited_edges,
+            source_groups=source_groups,
         )
 
     async def _active_source_ids(self, agent_id: str) -> tuple[str, ...]:
@@ -2214,12 +2453,20 @@ class CatalogService:
                     continue
                 break
             resolved_indexes = tuple(indexes)
+            link_graph = _current_link_graph(
+                await self._store.list_catalog_links(request.agent_id),
+                resolved_indexes,
+                readable_resource_ids,
+            )
             result = self._traverse_indexes(
                 request,
                 resolved_indexes,
+                link_graph=link_graph,
                 readable_resource_ids=readable_resource_ids,
             )
-            projection = self._traversal_projection(result, resolved_indexes)
+            projection = self._traversal_projection(
+                result, resolved_indexes, link_graph
+            )
             current_active_source_ids = await self._active_source_ids(request.agent_id)
             current_refs = (
                 ()
@@ -2240,12 +2487,14 @@ class CatalogService:
         request: CatalogTraversalRequest,
         indexes: tuple[_SourceCatalogIndex, ...],
         *,
+        link_graph: _LinkGraph = _NO_LINKS,
         eligible_relationship_ids: frozenset[str] | None = None,
         stop_at_shortest_target: bool = False,
         readable_resource_ids: frozenset[str] | None = None,
     ) -> CatalogTraversalResult:
         resources_by_id: dict[str, CatalogResource] = {}
-        relationships_by_id: dict[str, CatalogRelationship] = {}
+        # Source-owned relationships and current declared links are one edge set.
+        relationships_by_id: dict[str, CatalogRelationship | CatalogLink] = {}
         index_by_resource_id: dict[str, _SourceCatalogIndex] = {}
         for index in indexes:
             if index.agent_id != request.agent_id:
@@ -2277,6 +2526,12 @@ class CatalogService:
             index_by_resource_id.update(
                 (resource_id, index) for resource_id in admitted_resources
             )
+        relationships_by_id.update(
+            (link.id, link)
+            for link in link_graph.links_by_id.values()
+            if link.from_resource_id in resources_by_id
+            and link.to_resource_id in resources_by_id
+        )
 
         for resource_id in (*request.from_resource_ids, *request.to_resource_ids):
             if resource_id not in resources_by_id:
@@ -2319,7 +2574,10 @@ class CatalogService:
             if current_resource_id in target_ids and current_distance > 0:
                 continue
             index = index_by_resource_id[current_resource_id]
-            for edge in index.adjacency_by_resource_id.get(current_resource_id, ()):
+            for edge in (
+                *index.adjacency_by_resource_id.get(current_resource_id, ()),
+                *link_graph.adjacency_by_resource_id.get(current_resource_id, ()),
+            ):
                 if edge.relationship_id not in relationships_by_id:
                     continue
                 relationship = relationships_by_id[edge.relationship_id]
@@ -2467,6 +2725,7 @@ class CatalogService:
         self,
         result: CatalogTraversalResult,
         indexes: tuple[_SourceCatalogIndex, ...],
+        link_graph: _LinkGraph,
     ) -> FrozenJsonObject:
         request = result.request
         resources_by_id = {
@@ -2489,15 +2748,25 @@ class CatalogService:
         for path in result.paths:
             steps_payload: list[dict[str, object]] = []
             for step in path.steps:
-                relationship = relationships_by_id.get(step.relationship_id)
+                link = link_graph.links_by_id.get(step.relationship_id)
+                relationship: CatalogRelationship | CatalogLink | None = (
+                    link or relationships_by_id.get(step.relationship_id)
+                )
                 if relationship is None:
                     raise CatalogStoreError(
                         "catalog traversal references a non-current relationship"
                     )
-                endpoints = self._snapshot_relationship_endpoints(
-                    relationship,
-                    resources_by_id,
-                    revisions_by_resource_id,
+                endpoints = (
+                    self._snapshot_relationship_endpoints(
+                        relationship,
+                        resources_by_id,
+                        revisions_by_resource_id,
+                    )
+                    if isinstance(relationship, CatalogRelationship)
+                    else (
+                        resources_by_id[relationship.from_resource_id],
+                        resources_by_id[relationship.to_resource_id],
+                    )
                 )
                 if step.direction is RelationshipDirection.FORWARD:
                     expected = (
@@ -2513,11 +2782,20 @@ class CatalogService:
                     raise CatalogStoreError(
                         "catalog traversal step disagrees with its relationship"
                     )
-                payload = _relationship_payload(
-                    relationship,
-                    endpoints[0],
-                    endpoints[1],
-                    direction=step.direction,
+                payload = (
+                    _relationship_payload(
+                        relationship,
+                        endpoints[0],
+                        endpoints[1],
+                        direction=step.direction,
+                    )
+                    if isinstance(relationship, CatalogRelationship)
+                    else _link_payload(
+                        relationship,
+                        endpoints[0],
+                        endpoints[1],
+                        direction=step.direction,
+                    )
                 )
                 payload["path_from_resource_id"] = step.from_resource_id
                 payload["path_to_resource_id"] = step.to_resource_id
@@ -2809,11 +3087,17 @@ class CatalogService:
                 )
                 prior_outcome = None
             else:
+                link_graph = _current_link_graph(
+                    await self._store.list_catalog_links(agent_id),
+                    indexed,
+                    readable_resource_ids,
+                )
                 current_selection = self._select_index_hits(
                     current_request,
                     indexed,
                     readable_resource_ids=readable_resource_ids,
                     source_hints=source_hints,
+                    link_graph=link_graph,
                 )
                 prior_selection = (
                     None
@@ -2823,6 +3107,7 @@ class CatalogService:
                         indexed,
                         readable_resource_ids=readable_resource_ids,
                         source_hints=source_hints,
+                        link_graph=link_graph,
                     )
                 )
                 all_hits = _merge_context_selections(
@@ -3702,6 +3987,96 @@ def _relationship_payload(
         "to_resource_id": relationship.to_resource_id,
         "to_resource_revision": to_resource.current_revision,
     }
+
+
+def _link_payload(
+    link: CatalogLink,
+    from_resource: CatalogResource,
+    to_resource: CatalogResource,
+    *,
+    direction: RelationshipDirection,
+) -> dict[str, object]:
+    return {
+        "confidence": link.confidence,
+        "cross_source": from_resource.source_id != to_resource.source_id,
+        "declared_at": link.declared_at.isoformat(),
+        "direction": direction.value,
+        "field_pairs": tuple(pair.to_payload() for pair in link.field_pairs),
+        "from_resource_id": link.from_resource_id,
+        "from_resource_revision": from_resource.current_revision,
+        "kind": link.kind.value,
+        "note": link.note,
+        "provenance": link.provenance.value,
+        "relationship_id": link.id,
+        "to_resource_id": link.to_resource_id,
+        "to_resource_revision": to_resource.current_revision,
+    }
+
+
+def _link_stale_reason(
+    link: CatalogLink,
+    active_source_ids: Collection[str],
+    index_by_source_id: Mapping[str, _SourceCatalogIndex],
+) -> CatalogLinkStaleReason | None:
+    """Compute currency from fields, never from whole-resource revisions."""
+
+    endpoints = (
+        (
+            link.from_source_id,
+            link.from_resource_id,
+            {pair.source_field for pair in link.field_pairs},
+        ),
+        (
+            link.to_source_id,
+            link.to_resource_id,
+            {pair.target_field for pair in link.field_pairs},
+        ),
+    )
+    if any(source_id not in active_source_ids for source_id, _, _ in endpoints):
+        return CatalogLinkStaleReason.SOURCE_INACTIVE
+    for source_id, resource_id, _ in endpoints:
+        index = index_by_source_id.get(source_id)
+        if index is None or resource_id not in index.resources_by_id:
+            return CatalogLinkStaleReason.RESOURCE_MISSING
+    for source_id, resource_id, fields in endpoints:
+        facets = index_by_source_id[source_id].facets_by_resource_id.get(
+            resource_id, ()
+        )
+        if not fields <= _tabular_field_names(facets):
+            return CatalogLinkStaleReason.FIELD_MISSING
+    return None
+
+
+def _current_link_graph(
+    links: Iterable[CatalogLink],
+    indexes: Iterable[_SourceCatalogIndex],
+    readable_resource_ids: frozenset[str] | None,
+) -> _LinkGraph:
+    """Keep links current over these indexes whose endpoints are both readable."""
+
+    index_by_source_id = {index.source_id: index for index in indexes}
+    links_by_id: dict[str, CatalogLink] = {}
+    adjacency: dict[str, list[_IndexedEdge]] = {}
+    for link in links:
+        if (
+            readable_resource_ids is not None
+            and (
+                link.from_resource_id not in readable_resource_ids
+                or link.to_resource_id not in readable_resource_ids
+            )
+        ) or _link_stale_reason(link, index_by_source_id, index_by_source_id):
+            continue
+        links_by_id[link.id] = link
+        adjacency.setdefault(link.from_resource_id, []).append(
+            _IndexedEdge(link.to_resource_id, link.id, RelationshipDirection.FORWARD)
+        )
+        adjacency.setdefault(link.to_resource_id, []).append(
+            _IndexedEdge(link.from_resource_id, link.id, RelationshipDirection.REVERSE)
+        )
+    return _LinkGraph(
+        MappingProxyType(links_by_id),
+        MappingProxyType({key: tuple(edges) for key, edges in adjacency.items()}),
+    )
 
 
 def _selection_facts(

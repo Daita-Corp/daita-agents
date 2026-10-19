@@ -42,6 +42,8 @@ from .artifacts.models import (
 )
 from .capabilities import ApprovalHandler
 from .catalog.models import (
+    CatalogLink,
+    CatalogLinkStatus,
     CatalogResource,
     CatalogSearchRequest,
     CatalogSearchResult,
@@ -1616,6 +1618,48 @@ class Agent:
 
     async def inspect_catalog_resource(self, resource_id: str) -> FrozenJsonObject:
         return await self._embedded.inspect_catalog_resource(resource_id)
+
+    async def declare_catalog_link(
+        self,
+        from_resource_id: str,
+        to_resource_id: str,
+        field_pairs: tuple[tuple[str, str], ...],
+        *,
+        note: str | None = None,
+    ) -> CatalogLink:
+        """Declare that fields of one resource reference fields of another.
+
+        Each pair is ``(from_field, to_field)``. The resources may be in
+        different sources. Both endpoints and every field must exist in the
+        current catalog; catalog traversal and join selection then follow
+        the link while it stays current.
+        """
+
+        if (
+            not isinstance(field_pairs, tuple)
+            or not field_pairs
+            or any(
+                not isinstance(pair, tuple)
+                or len(pair) != 2
+                or not all(isinstance(name, str) for name in pair)
+                for pair in field_pairs
+            )
+        ):
+            raise TypeError("field_pairs must be a non-empty tuple of (from, to) names")
+        return await self._embedded.declare_catalog_link(
+            from_resource_id,
+            to_resource_id,
+            field_pairs,
+            note=note,
+        )
+
+    async def remove_catalog_link(self, link_id: str) -> bool:
+        return await self._embedded.remove_catalog_link(link_id)
+
+    async def list_catalog_links(self) -> tuple[CatalogLinkStatus, ...]:
+        """Return every declared link, current or stale with its reason."""
+
+        return await self._embedded.list_catalog_links()
 
     async def close(self) -> None:
         await self._embedded.close()

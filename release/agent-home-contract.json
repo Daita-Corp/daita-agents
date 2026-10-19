@@ -132,8 +132,8 @@
         "affected_paths": [
           "state.db"
         ],
-        "checksum": "696dc7820bd744aabd5214a71a1ae6bfb7517f405dc6887eefb9e41c414499f5",
-        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs.",
+        "checksum": "8023aec3e4bd55a1222bc078197a11c117abbabb2726866f95e18b1c9ddd63c8",
+        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored.",
         "migration_id": "0004_foreground_analysis_evidence",
         "revision": 4
       }
@@ -291,6 +291,18 @@
         "revision",
         "payload",
         "observed_at"
+      ],
+      "CatalogLink": [
+        "id",
+        "agent_id",
+        "from_source_id",
+        "from_resource_id",
+        "to_source_id",
+        "to_resource_id",
+        "field_pairs",
+        "declared_at",
+        "declared_revisions",
+        "note"
       ],
       "CatalogRelationship": [
         "id",
@@ -2270,6 +2282,29 @@
             0
           ]
         ],
+        "catalog_links": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
         "deliveries": [
           [
             "agent_id",
@@ -4087,7 +4122,7 @@
       }
     }
   },
-  "contract_sha256": "99f3d28dbf9fb61d324f5da29d130ef01419e397aaaea0978464393b2c5d7a13",
+  "contract_sha256": "1486caea30076987ae2c035344879ee3c94c331eabadffbf885493df7c52d4e6",
   "home_revision": 4,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1

@@ -339,6 +339,7 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
     # its full registry record from the owned manifest before upgrading to current.
     with sqlite3.connect(reopened.home / "state.db") as connection:
         connection.execute("DROP TABLE analysis_evidence")
+        connection.execute("DROP TABLE catalog_links")
         connection.execute("DROP TABLE artifacts")
         connection.execute("DELETE FROM agent_home_migrations WHERE revision >= 3")
     legacy = await Agent.inspect_home("d2-sqlite-csv", root=tmp_path)

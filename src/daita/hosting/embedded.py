@@ -86,12 +86,15 @@ from ..catalog.capabilities import (
     catalog_declarations,
 )
 from ..catalog.models import (
+    CatalogLink,
+    CatalogLinkStatus,
     CatalogResource,
     CatalogSearchRequest,
     CatalogSearchResult,
     CatalogSummary,
     CatalogSync,
     CatalogSyncStatus,
+    RelationshipFieldPair,
 )
 from ..catalog.service import CatalogService
 from ..config import (
@@ -5188,6 +5191,39 @@ class EmbeddedAgent:
         return await self._catalog_service.inspect_resource(
             self.identity.id, resource_id
         )
+
+    async def declare_catalog_link(
+        self,
+        from_resource_id: str,
+        to_resource_id: str,
+        field_pairs: tuple[tuple[str, str], ...],
+        *,
+        note: str | None = None,
+    ) -> CatalogLink:
+        pairs = tuple(
+            RelationshipFieldPair(source_field, target_field, ordinal)
+            for ordinal, (source_field, target_field) in enumerate(field_pairs)
+        )
+        async with self._source_commit_lock:
+            self._require_open()
+            return await self._catalog_service.declare_link(
+                self.identity.id,
+                from_resource_id,
+                to_resource_id,
+                pairs,
+                declared_at=self._clock(),
+                note=note,
+            )
+
+    async def remove_catalog_link(self, link_id: str) -> bool:
+        async with self._source_commit_lock:
+            self._require_open()
+            return await self._catalog_service.remove_link(self.identity.id, link_id)
+
+    async def list_catalog_links(self) -> tuple[CatalogLinkStatus, ...]:
+        async with self._source_commit_lock:
+            self._require_open()
+            return await self._catalog_service.link_statuses(self.identity.id)
 
     @asynccontextmanager
     async def _admit_system_work(self, label: str):

@@ -7,7 +7,7 @@ CREATE TABLE agent_home_migrations (
 INSERT INTO "agent_home_migrations" VALUES(1,'agent_home_revision_1','a08bdc56e3cb7c3dbe77dc0d8b8ed9aac1299a6a701902dba8e11a5ebe70f25e');
 INSERT INTO "agent_home_migrations" VALUES(2,'0002_durable_adaptive_task_graph','cb98e978fcb6db71cc1cb3ee5532d92ce99117db7359a008a98a4651df1c20e2');
 INSERT INTO "agent_home_migrations" VALUES(3,'0003_framework_caller_authority','3357ee7ad8153e5160d06133082be89dca1e868f1529029f5b63988fae5dca42');
-INSERT INTO "agent_home_migrations" VALUES(4,'0004_foreground_analysis_evidence','696dc7820bd744aabd5214a71a1ae6bfb7517f405dc6887eefb9e41c414499f5');
+INSERT INTO "agent_home_migrations" VALUES(4,'0004_foreground_analysis_evidence','8023aec3e4bd55a1222bc078197a11c117abbabb2726866f95e18b1c9ddd63c8');
 CREATE TABLE analysis_evidence (
     agent_id TEXT NOT NULL,
     run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -29,6 +29,13 @@ CREATE TABLE artifacts (
     data TEXT NOT NULL
 );
 INSERT INTO "artifacts" VALUES('artifact-00000000000000000000000000000001','agent-golden-revision-1','run-00000000000000000000000000000001','conversation-00000000000000000000000000000001','agent-golden-revision-1','ready',18,1790960058476070,'{"__record__":"ArtifactRecord","fields":{"agent_id":"agent-golden-revision-1","caller_principal_id":"agent-golden-revision-1","computation_evidence":{},"ref":{"__record__":"ArtifactRef","fields":{"artifact_id":"artifact-00000000000000000000000000000001","byte_size":18,"call_id":"create-0","capability_id":"artifact.create_document","conversation_id":"conversation-00000000000000000000000000000001","created_at":{"__datetime__":"2026-10-02T16:54:18.476070Z"},"filename":"golden-0.txt","media_type":"text/plain","provenance":{"__record__":"ArtifactProvenance","fields":{"authorship":{"__enum__":"ArtifactAuthorship","value":"model_authored_analysis"},"columns":[],"derived_from_artifact_id":null,"evidence_call_ids":[],"local_file_binding":null,"parameters_sha256":null,"resource_bindings":[],"result_binding":null,"row_count":null,"sql_fingerprint":null}},"run_id":"run-00000000000000000000000000000001","sensitivity":{"__enum__":"Sensitivity","value":"restricted"},"sha256":"sha256:641fc61003c7639d83d76af5fe200ee094fc7faeeb48a276131efc79a0e53fee"}},"state":{"__enum__":"ArtifactState","value":"ready"}}}');
+CREATE TABLE catalog_links (
+    agent_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY(agent_id, id)
+);
+INSERT INTO "catalog_links" VALUES('agent-golden-revision-1','catalog-link:sha256:335e62baace965f276aae9a82ff9c8ffbdde2734afb86e1e713dd30a22888a1a','{"__record__":"CatalogLink","fields":{"agent_id":"agent-golden-revision-1","declared_at":{"__datetime__":"2026-01-02T03:04:05Z"},"declared_revisions":["sha256:1111111111111111111111111111111111111111111111111111111111111111","sha256:2222222222222222222222222222222222222222222222222222222222222222"],"field_pairs":[{"__record__":"RelationshipFieldPair","fields":{"ordinal":0,"source_field":"customer_id","target_field":"id"}}],"from_resource_id":"catalog-resource:sha256:9d6ad160aca152ad7831ea2f5077fc4e85e2aa99c7bdc7f1ec19706ccaf9bf39","from_source_id":"source-golden-orders","id":"catalog-link:sha256:335e62baace965f276aae9a82ff9c8ffbdde2734afb86e1e713dd30a22888a1a","note":"Golden declared link.","to_resource_id":"catalog-resource:sha256:5c75cf1bc66f85b76a03f57a7e20e1288c4c0b2708304a0a157a1e7f80fdbca2","to_source_id":"source-golden-customers"}}');
 CREATE TABLE deliveries (
     agent_id TEXT NOT NULL,
     delivery_id TEXT NOT NULL,

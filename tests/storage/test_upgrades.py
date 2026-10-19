@@ -432,6 +432,7 @@ async def test_populated_prior_mcp_home_preserves_binding_grant_and_receipt(
                 (PRE_REGISTRY_REVISION_3_CHECKSUM,),
             )
         connection.execute("DROP TABLE analysis_evidence")
+        connection.execute("DROP TABLE catalog_links")
         connection.execute("DELETE FROM agent_home_migrations WHERE revision > 3")
         connection.execute("DROP TABLE artifacts")
     connection.close()

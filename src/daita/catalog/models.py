@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
-from typing import TypeVar, cast
+from typing import ClassVar, TypeVar, cast
 
 from .._json import FrozenJsonObject, canonical_json
 
@@ -19,6 +19,7 @@ _RELATIONSHIP_ID = re.compile(r"catalog-relationship:sha256:[0-9a-f]{64}\Z")
 
 CATALOG_CONTEXT_DEFAULT_LIMIT = 12
 CATALOG_MAX_LIMIT = 50
+CATALOG_MAX_LINKS = 1_000
 CATALOG_MATCH_CANDIDATE_BINDING_LIMIT = 12
 CATALOG_RESOURCE_ID_MAX_CHARACTERS = 256
 CATALOG_SEARCH_REQUEST_DEFAULT_LIMIT = 20
@@ -759,6 +760,23 @@ class RelationshipFieldPair:
         }
 
 
+def _ordered_field_pairs(
+    values: Iterable[RelationshipFieldPair],
+    owner: str,
+) -> tuple[RelationshipFieldPair, ...]:
+    pairs = _record_tuple(values, RelationshipFieldPair, f"{owner} field_pairs")
+    pairs = tuple(sorted(pairs, key=lambda pair: pair.ordinal))
+    if len(pairs) > 64:
+        raise ValueError(f"{owner} field_pairs exceed 64 items")
+    if len({pair.ordinal for pair in pairs}) != len(pairs):
+        raise ValueError(f"{owner} field-pair ordinals cannot repeat")
+    if len({(pair.source_field, pair.target_field) for pair in pairs}) != len(pairs):
+        raise ValueError(f"{owner} field pairs cannot repeat")
+    if pairs and [pair.ordinal for pair in pairs] != list(range(len(pairs))):
+        raise ValueError(f"{owner} field-pair ordinals must be contiguous")
+    return pairs
+
+
 def catalog_relationship_id(
     *,
     source_id: str,
@@ -849,22 +867,7 @@ class CatalogRelationship:
         _required_text(self.sync_id, "relationship sync_id")
         _aware(self.observed_at, "relationship observed_at")
 
-        pairs = _record_tuple(
-            self.field_pairs,
-            RelationshipFieldPair,
-            "relationship field_pairs",
-        )
-        pairs = tuple(sorted(pairs, key=lambda pair: pair.ordinal))
-        if len(pairs) > 64:
-            raise ValueError("relationship field_pairs exceed 64 items")
-        if len({pair.ordinal for pair in pairs}) != len(pairs):
-            raise ValueError("relationship field-pair ordinals cannot repeat")
-        if len({(pair.source_field, pair.target_field) for pair in pairs}) != len(
-            pairs
-        ):
-            raise ValueError("relationship field pairs cannot repeat")
-        if pairs and [pair.ordinal for pair in pairs] != list(range(len(pairs))):
-            raise ValueError("relationship field-pair ordinals must be contiguous")
+        pairs = _ordered_field_pairs(self.field_pairs, "relationship")
         if self.kind is RelationshipKind.REFERENCES and not pairs:
             raise ValueError("reference relationships require field pairs")
         if self.kind is not RelationshipKind.REFERENCES and pairs:
@@ -935,6 +938,100 @@ class CatalogRelationship:
             field_pairs=pairs,
             attributes=attributes,
         )
+
+
+def catalog_link_id(
+    *,
+    from_resource_id: str,
+    to_resource_id: str,
+    field_pairs: Iterable[RelationshipFieldPair],
+) -> str:
+    pairs = _ordered_field_pairs(field_pairs, "catalog link")
+    digest = _hash(
+        {
+            "field_pairs": tuple(pair.to_payload() for pair in pairs),
+            "from_resource_id": from_resource_id,
+            "to_resource_id": to_resource_id,
+        }
+    ).removeprefix("sha256:")
+    return f"catalog-link:sha256:{digest}"
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogLink:
+    """One agent-owned declared reference between fields of two resources.
+
+    Unlike a ``CatalogRelationship``, a link is owned by the agent rather than
+    one source snapshot, so its endpoints may live in different sources.
+    Whether it is current is computed from the catalog, never stored.
+    """
+
+    kind: ClassVar[RelationshipKind] = RelationshipKind.REFERENCES
+    provenance: ClassVar[RelationshipProvenance] = RelationshipProvenance.DECLARED
+    confidence: ClassVar[float] = 1.0
+
+    id: str
+    agent_id: str
+    from_source_id: str
+    from_resource_id: str
+    to_source_id: str
+    to_resource_id: str
+    field_pairs: tuple[RelationshipFieldPair, ...]
+    declared_at: datetime
+    # Both endpoint revisions when declared, for audit only; currency is
+    # computed from fields so unrelated column changes keep a link current.
+    declared_revisions: tuple[str, str]
+    note: str | None = None
+
+    def __post_init__(self) -> None:
+        _required_text(self.agent_id, "catalog link agent_id")
+        _required_text(self.from_source_id, "catalog link from_source_id")
+        _required_text(self.to_source_id, "catalog link to_source_id")
+        for value, name in (
+            (self.from_resource_id, "from_resource_id"),
+            (self.to_resource_id, "to_resource_id"),
+        ):
+            if not isinstance(value, str) or _RESOURCE_ID.fullmatch(value) is None:
+                raise ValueError(f"catalog link {name} must be a catalog resource id")
+        if self.from_resource_id == self.to_resource_id:
+            raise ValueError("catalog link endpoints must be distinct resources")
+        pairs = _ordered_field_pairs(self.field_pairs, "catalog link")
+        if not pairs:
+            raise ValueError("catalog link requires field pairs")
+        _aware(self.declared_at, "catalog link declared_at")
+        revisions = tuple(self.declared_revisions)
+        if len(revisions) != 2:
+            raise ValueError("catalog link declared_revisions must have two items")
+        for revision in revisions:
+            _require_hash(revision, "catalog link declared revision")
+        _optional_text(self.note, "catalog link note", maximum=1_024)
+        expected_id = catalog_link_id(
+            from_resource_id=self.from_resource_id,
+            to_resource_id=self.to_resource_id,
+            field_pairs=pairs,
+        )
+        if self.id != expected_id:
+            raise ValueError("catalog link id does not match its stable identity")
+        object.__setattr__(self, "field_pairs", pairs)
+        object.__setattr__(self, "declared_revisions", revisions)
+
+
+class CatalogLinkStaleReason(str, Enum):
+    SOURCE_INACTIVE = "source_inactive"
+    RESOURCE_MISSING = "resource_missing"
+    FIELD_MISSING = "field_missing"
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogLinkStatus:
+    """One declared link and whether the current catalog still supports it."""
+
+    link: CatalogLink
+    stale_reason: CatalogLinkStaleReason | None
+
+    @property
+    def current(self) -> bool:
+        return self.stale_reason is None
 
 
 def catalog_resource_revision(
@@ -1878,6 +1975,9 @@ class CatalogTraversalResult:
 
 __all__ = [
     "CatalogFacet",
+    "CatalogLink",
+    "CatalogLinkStaleReason",
+    "CatalogLinkStatus",
     "CatalogMatchOutcome",
     "CatalogPath",
     "CatalogPathStep",
@@ -1907,6 +2007,7 @@ __all__ = [
     "TabularFacet",
     "TabularIndex",
     "catalog_facet_revision",
+    "catalog_link_id",
     "catalog_relationship_id",
     "catalog_resource_id",
     "catalog_resource_revision",

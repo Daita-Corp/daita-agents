@@ -42,7 +42,9 @@ from ..capabilities import (
     TaskAttemptGuard,
 )
 from ..catalog.models import (
+    CATALOG_MAX_LINKS,
     CatalogFacet,
+    CatalogLink,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
@@ -159,6 +161,7 @@ from .sql_routines import (
     _require_effects_unblocked,
 )
 from .sqlite_codecs import (
+    decode_catalog_link,
     decode_catalog_snapshot,
     decode_catalog_sync,
     decode_delivery,
@@ -177,6 +180,7 @@ from .sqlite_codecs import (
     decode_source,
     decode_source_configuration_for_deletion,
     decode_source_read_scope,
+    encode_catalog_link,
     encode_catalog_snapshot,
     encode_catalog_sync,
     encode_delivery,
@@ -3184,6 +3188,59 @@ class SQLStateStore:
         ]
         return tuple(sorted(relationships, key=lambda item: item.id)[:limit])
 
+    async def save_catalog_link(self, link: CatalogLink) -> None:
+        """Create or replace one declared link within the per-agent bound."""
+
+        if not isinstance(link, CatalogLink):
+            raise TypeError("link must be a CatalogLink")
+
+        def write(connection: SQLConnection) -> None:
+            exists = connection.execute(
+                "SELECT 1 FROM catalog_links WHERE agent_id = ? AND id = ?",
+                (link.agent_id, link.id),
+            ).fetchone()
+            count = required_row(
+                connection.execute(
+                    "SELECT COUNT(*) FROM catalog_links WHERE agent_id = ?",
+                    (link.agent_id,),
+                )
+            )[0]
+            if exists is None and count >= CATALOG_MAX_LINKS:
+                raise CatalogStoreError(
+                    f"an agent can declare at most {CATALOG_MAX_LINKS} catalog links"
+                )
+            connection.execute(
+                f"""INSERT INTO catalog_links(agent_id, id, data)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT({connection.conflict('agent_id, id')}) DO UPDATE SET data = excluded.data""",
+                (link.agent_id, link.id, encode_catalog_link(link)),
+            )
+
+        await run_sql_transaction(self._database, write)
+
+    async def delete_catalog_link(self, agent_id: str, link_id: str) -> bool:
+        def write(connection: SQLConnection) -> bool:
+            cursor = connection.execute(
+                "DELETE FROM catalog_links WHERE agent_id = ? AND id = ?",
+                (agent_id, link_id),
+            )
+            return cursor.rowcount == 1
+
+        return await run_sql_transaction(self._database, write)
+
+    async def list_catalog_links(self, agent_id: str) -> tuple[CatalogLink, ...]:
+        def read() -> tuple[CatalogLink, ...]:
+            with _connect_read_only(self._database) as connection:
+                rows = connection.execute(
+                    "SELECT data FROM catalog_links WHERE agent_id = ? ORDER BY id",
+                    (agent_id,),
+                ).fetchall()
+            if len(rows) > CATALOG_MAX_LINKS:
+                raise CatalogStoreError("stored catalog link collection exceeds bound")
+            return tuple(decode_catalog_link(data) for (data,) in rows)
+
+        return await settled_thread(read)
+
     async def list_semantic_annotations(
         self,
         agent_id: str,
@@ -5644,6 +5701,14 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
             raise ValueError("stored semantic annotation ownership is invalid")
         if identity is not None and annotation.agent_id != identity.id:
             raise ValueError("stored semantic annotation belongs to another agent")
+    for agent_id, link_id, data in connection.execute(
+        "SELECT agent_id, id, data FROM catalog_links"
+    ):
+        link = decode_catalog_link(data)
+        if link.agent_id != agent_id or link.id != link_id:
+            raise ValueError("stored catalog link ownership is invalid")
+        if identity is not None and link.agent_id != identity.id:
+            raise ValueError("stored catalog link belongs to another agent")
     for agent_id, candidate_id, data in connection.execute(
         "SELECT agent_id, id, data FROM learning_candidates"
     ):

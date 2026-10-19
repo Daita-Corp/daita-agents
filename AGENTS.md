@@ -43,8 +43,8 @@ memory/skill owners' validation, bounds and canonical bytes.
 ## Architecture status: current revision 4
 
 The current agent-home format is **revision 4**, extending released revision 3
-with bounded foreground analytical evidence and retained artifact computation
-provenance. Released revisions 1 through 3 and their migrations remain immutable. Revision 4 is the
+with bounded foreground analytical evidence, retained artifact computation
+provenance and agent-owned declared catalog links. Released revisions 1 through 3 and their migrations remain immutable. Revision 4 is the
 sole current runnable format; legacy decoders remain migration-only.
 
 The current revision-2 graph has these non-negotiable boundaries:
@@ -118,9 +118,10 @@ validated against the current catalog before source I/O. Local file reads are
 descriptor-contained and revision-bound. MCP calls
 revalidate the exact binding revision, remote identity, and schemas.
 
-Agent identity, source registrations, current catalog snapshots, exact run
-transcripts, terminal results, jobs, routines, deliveries, permissions, and
-receipts are stored in one SQLite database inside the agent home.
+Agent identity, source registrations, current catalog snapshots, declared
+catalog links, exact run transcripts, terminal results, jobs, routines,
+deliveries, permissions, and receipts are stored in one SQLite database inside
+the agent home.
 
 ## Directory layout
 
@@ -399,6 +400,24 @@ eligibility from a tool name when capability metadata defines them.
 search, inspection, and traversal. Data code consumes catalog contracts rather
 than building another schema graph or querying source clients for planning
 facts.
+
+A `CatalogRelationship` belongs to one source snapshot. A `CatalogLink` is an
+agent-owned declared reference between fields of two resources, possibly in
+different sources, managed only through `Agent.declare_catalog_link`,
+`remove_catalog_link` and `list_catalog_links`; no model tool declares links.
+Declaration requires both resources and every paired field in the current
+catalog. Links survive detach and reattach because source and resource IDs are
+stable. Currency is computed, never stored: a link is current while both
+sources are active and every paired field exists in a current tabular facet;
+otherwise it is stale as `source_inactive`, `resource_missing` or
+`field_missing`. Unrelated column changes keep a link current. Search
+neighbours, traversal and schema join selection merge current links with
+source relationships in one edge set, labelled `provenance: "declared"` with
+`cross_source`; sources joined by current links form one join group, so
+`cross_source_unsupported` remains only for seeds with no linking group. Links
+are read fresh for each projection, outside the per-source index cache. Readable
+and run-scope filters apply to both link endpoints, so traversal never crosses
+a resource outside scope.
 
 `daita.adapters` implements source admission, containment, discovery,
 freshness checks, and I/O. One composed `SourceTypeRegistry` per agent maps each

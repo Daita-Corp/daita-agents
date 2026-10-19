@@ -6,6 +6,7 @@ from typing import Protocol, runtime_checkable
 
 from .models import (
     CatalogFacet,
+    CatalogLink,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
@@ -123,6 +124,12 @@ class CatalogStore(Protocol):
         relationship_kinds: tuple[RelationshipKind, ...] = (),
         limit: int = 50,
     ) -> tuple[CatalogRelationship, ...]: ...
+
+    async def save_catalog_link(self, link: CatalogLink) -> None: ...
+
+    async def delete_catalog_link(self, agent_id: str, link_id: str) -> bool: ...
+
+    async def list_catalog_links(self, agent_id: str) -> tuple[CatalogLink, ...]: ...
 
 
 __all__ = [
