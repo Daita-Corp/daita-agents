@@ -35,6 +35,14 @@ from ..widgets.transcript import TranscriptView
 if TYPE_CHECKING:
     from ..app import DaitaApp
 
+# Four-row Daita "D", one row per line of the empty-chat welcome text.
+_WELCOME_LOGO = (
+    "⣿⣿⣿⠿⠿⠿⣷⣦⡀   ",
+    "⣿⣿⣿    ⢹⣿   ",
+    "⣿⣿⣿    ⣸⣿   ",
+    "⣿⣿⣿⣶⣶⣶⡿⠟⠁   ",
+)
+
 
 class ChatScreen(Screen[None]):
     AUTO_FOCUS = "#composer"
@@ -79,15 +87,24 @@ class ChatScreen(Screen[None]):
             with Vertical(id="main-view"):
                 with Vertical(id="conversation-pane"):
                     with Vertical(id="welcome-region"):
-                        welcome = Text("What would you like to know?", style="bold")
-                        welcome.append(
-                            "\n\nAsk about your data or local files.\n",
-                            style="not bold",
-                        )
-                        welcome.append(
-                            "Type / for commands or @ to choose a source.",
-                            style="not bold",
-                        )
+                        welcome = Text()
+                        for index, (logo, line, style) in enumerate(
+                            zip(
+                                _WELCOME_LOGO,
+                                (
+                                    "What would you like to know?",
+                                    "",
+                                    "Ask about your data or local files.",
+                                    "Type / for commands or @ to choose a source.",
+                                ),
+                                ("bold", "", "", ""),
+                                strict=True,
+                            )
+                        ):
+                            if index:
+                                welcome.append("\n")
+                            welcome.append(logo, style="bold")
+                            welcome.append(line, style=style)
                         yield Static(welcome, id="welcome", markup=False)
                     yield TranscriptView()
                     yield ApprovalPanel()

@@ -400,6 +400,8 @@ class DaitaApp(App[int]):
     async def _show_chat(self) -> None:
         self.invalidate_completion_cache()
         await self._load_completion_cache()
+        for boot in self.query("#boot").results(WelcomeView):
+            await boot.intro_finished()
         await self.push_screen(ChatScreen())
         await self._replace_conversation_transcript()
         await self._refresh_status()
