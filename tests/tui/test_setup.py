@@ -522,6 +522,19 @@ async def test_terminal_defaults_preserve_markdown_and_focus_without_rgb_paint(
             app.exit(0)
 
 
+async def test_wide_boot_swirls_dots_into_the_braille_logo():
+    boot = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    async with boot.run_test(size=(140, 28)) as pilot:
+        welcome = boot.query_one("#boot", WelcomeView)
+        await pilot.pause()
+        assert "⣿⣿⣿⣿⣿⣿⡿⠛⠛⠛⠛⠛⠛⢿⣿⣿⣿⣿⣿⣿" not in str(welcome.content)
+        await asyncio.wait_for(welcome.intro_finished(), timeout=5)
+        await pilot.pause()
+        assert "⣿⣿⣿⣿⣿⣿⡿⠛⠛⠛⠛⠛⠛⢿⣿⣿⣿⣿⣿⣿" in str(welcome.content)
+        assert "Starting your workspace" in str(welcome.content)
+        boot.exit(0)
+
+
 async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: Path):
     boot = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with boot.run_test(size=(80, 24)):
