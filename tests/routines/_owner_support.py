@@ -255,6 +255,18 @@ class _Store:
         del agent_id, routine_id, limit
         return ()
 
+    async def list_active_routine_occurrences(
+        self, agent_id: str, *, limit: int = 100
+    ) -> tuple[RoutineOccurrence, ...]:
+        del agent_id, limit
+        return ()
+
+    async def load_routine_occurrences(
+        self, agent_id: str, occurrence_ids: tuple[str, ...]
+    ) -> tuple[RoutineOccurrence, ...]:
+        del agent_id, occurrence_ids
+        return ()
+
     async def revise_scheduled_routine(
         self,
         routine: ScheduledRoutine,

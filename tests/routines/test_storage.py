@@ -1183,3 +1183,105 @@ async def test_cancelled_immediate_admission_settles_one_atomic_assignment(
     finally:
         release.set()
         await store.close()
+
+
+async def _seed_occurrences(
+    store: SQLiteStateStore, *occurrences: RoutineOccurrence
+) -> None:
+    def write(connection) -> None:
+        for occurrence in occurrences:
+            routine_store_module._insert_routine_occurrence(connection, occurrence)
+
+    await sqlite_module.run_sql_transaction(store._database, write)
+
+
+def _occurrence_in(
+    disposition: RoutineOccurrenceDisposition,
+    *,
+    hour: int,
+    agent_id: str = "agent-1",
+) -> RoutineOccurrence:
+    return replace(
+        occurrence_record(
+            routine=routine_record(agent_id=agent_id),
+            scheduled_for=NOW + timedelta(hours=hour),
+        ),
+        disposition=disposition,
+    )
+
+
+async def test_active_occurrence_reads_return_only_queued_or_running_work(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    try:
+        await store.admit_scheduled_routine(routine_record())
+        await store.admit_scheduled_routine(routine_record(agent_id="agent-2"))
+        seeded = tuple(
+            _occurrence_in(disposition, hour=hour)
+            for hour, disposition in enumerate(RoutineOccurrenceDisposition)
+        )
+        other_agent = _occurrence_in(
+            RoutineOccurrenceDisposition.RUNNING, hour=0, agent_id="agent-2"
+        )
+        await _seed_occurrences(store, *seeded, other_agent)
+
+        active = await store.list_active_routine_occurrences("agent-1")
+        assert {item.disposition for item in active} == {
+            RoutineOccurrenceDisposition.CLAIMED,
+            RoutineOccurrenceDisposition.PRECHECKING,
+            RoutineOccurrenceDisposition.RUNNING,
+            RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION,
+            RoutineOccurrenceDisposition.RETRYABLE,
+        }
+        assert all(item.agent_id == "agent-1" for item in active)
+        ids = [item.occurrence_id for item in active]
+        assert ids == sorted(ids, reverse=True)
+        assert await store.list_active_routine_occurrences("agent-1", limit=2) == (
+            active[:2]
+        )
+        assert await store.list_active_routine_occurrences("agent-3") == ()
+        for limit in (0, 101, True):
+            with pytest.raises(ValueError, match="active occurrence limit"):
+                await store.list_active_routine_occurrences("agent-1", limit=limit)
+    finally:
+        await store.close()
+
+
+async def test_occurrence_lookup_returns_only_known_owned_identities(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    try:
+        await store.admit_scheduled_routine(routine_record())
+        await store.admit_scheduled_routine(routine_record(agent_id="agent-2"))
+        first = _occurrence_in(RoutineOccurrenceDisposition.COMPLETED, hour=1)
+        second = _occurrence_in(RoutineOccurrenceDisposition.TERMINAL_FAILED, hour=2)
+        foreign = _occurrence_in(
+            RoutineOccurrenceDisposition.COMPLETED, hour=3, agent_id="agent-2"
+        )
+        await _seed_occurrences(store, first, second, foreign)
+
+        loaded = await store.load_routine_occurrences(
+            "agent-1",
+            (second.occurrence_id, "occurrence-unknown", foreign.occurrence_id)
+            + (first.occurrence_id,),
+        )
+        assert loaded == tuple(
+            sorted((first, second), key=lambda item: item.occurrence_id)
+        )
+        assert await store.load_routine_occurrences("agent-1", ()) == ()
+        assert (
+            await store.load_routine_occurrences(
+                "agent-1", tuple(f"occurrence-{index}" for index in range(50))
+            )
+            == ()
+        )
+        for invalid in (
+            tuple(f"occurrence-{index}" for index in range(51)),
+            ("",),
+        ):
+            with pytest.raises(ValueError, match="occurrence identities"):
+                await store.load_routine_occurrences("agent-1", invalid)
+    finally:
+        await store.close()

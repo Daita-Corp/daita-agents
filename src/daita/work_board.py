@@ -16,8 +16,8 @@ from .distribution.models import (
 )
 from .jobs.graph.models import GraphJob, GraphState
 from .routines.models import (
+    ACTIVE_OCCURRENCE_DISPOSITIONS,
     RoutineOccurrence,
-    RoutineOccurrenceDisposition,
     RoutineState,
     ScheduledRoutineSummary,
 )
@@ -30,15 +30,6 @@ DEFAULT_DONE_WINDOW = timedelta(hours=24)
 FAILED_JOB_WINDOW = timedelta(days=7)
 
 _ROUTINE_RUN_FALLBACK_TITLE = "Routine run"
-_ACTIVE_DISPOSITIONS = frozenset(
-    {
-        RoutineOccurrenceDisposition.CLAIMED,
-        RoutineOccurrenceDisposition.PRECHECKING,
-        RoutineOccurrenceDisposition.RUNNING,
-        RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION,
-        RoutineOccurrenceDisposition.RETRYABLE,
-    }
-)
 
 
 class WorkColumn(str, Enum):
@@ -292,7 +283,7 @@ def project_work_board(
     carded_occurrences: set[str] = set()
     for occurrence in active_occurrences:
         if (
-            occurrence.disposition not in _ACTIVE_DISPOSITIONS
+            occurrence.disposition not in ACTIVE_OCCURRENCE_DISPOSITIONS
             or occurrence.occurrence_id in carded_occurrences
         ):
             continue

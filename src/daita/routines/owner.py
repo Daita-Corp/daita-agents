@@ -122,6 +122,17 @@ class RoutineStore(Protocol):
         limit: int = MAX_ROUTINE_HISTORY_PAGE_SIZE,
     ) -> tuple[RoutineOccurrence, ...]: ...
 
+    async def list_active_routine_occurrences(
+        self,
+        agent_id: str,
+        *,
+        limit: int = MAX_ROUTINE_HISTORY_PAGE_SIZE,
+    ) -> tuple[RoutineOccurrence, ...]: ...
+
+    async def load_routine_occurrences(
+        self, agent_id: str, occurrence_ids: tuple[str, ...]
+    ) -> tuple[RoutineOccurrence, ...]: ...
+
     async def revise_scheduled_routine(
         self,
         routine: ScheduledRoutine,
@@ -845,6 +856,22 @@ class RoutineOwner:
             limit=MAX_ROUTINE_HISTORY_PAGE_SIZE,
         )
         return ScheduledRoutineInspection(routine, tuple(occurrences))
+
+    async def list_active_occurrences(
+        self, *, limit: int = MAX_ROUTINE_HISTORY_PAGE_SIZE
+    ) -> tuple[RoutineOccurrence, ...]:
+        """Return this agent's queued or running occurrences, newest identity first."""
+
+        return await self._store.list_active_routine_occurrences(
+            self.agent_id, limit=limit
+        )
+
+    async def load_occurrences(
+        self, occurrence_ids: tuple[str, ...]
+    ) -> tuple[RoutineOccurrence, ...]:
+        """Return the known occurrences among bounded exact identities."""
+
+        return await self._store.load_routine_occurrences(self.agent_id, occurrence_ids)
 
     async def control(
         self,
