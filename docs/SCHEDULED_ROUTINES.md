@@ -298,7 +298,11 @@ daita routines promote atlas --spec /absolute/path/routine.json \
   --basis-run-id <completed-run-id>
 daita routines update atlas <routine-id> <revision> \
   --spec /absolute/path/routine.json
+daita routines destinations atlas <conversation-id>
 ```
+
+`routines destinations` lists the destinations a routine in that conversation
+can deliver to.
 
 The JSON specification contains the foreground origin run and complete frozen
 definition. For example:
@@ -376,14 +380,18 @@ cap third-party service fees.
 `/inbox` opens the bounded product projection. The headless equivalents are:
 
 ```bash
-daita inbox destinations atlas <conversation-id>
-daita inbox list atlas
-daita inbox inspect atlas <delivery-id>
-daita inbox acknowledge atlas <delivery-id>
+daita work show atlas [--done-hours 24]
+daita work inspect atlas <delivery-id>
+daita work dismiss atlas <delivery-id>
 ```
+
+`work show` prints the work board as JSON. Finished results stay in Done for
+`--done-hours` (1 to 168, default 24). `work dismiss` acknowledges one result.
 
 From Python, `Agent.list_deliveries`, `Agent.inspect_delivery` and
 `Agent.acknowledge_delivery` read and dismiss the same records.
+`Agent.list_deliveries` also covers what the board leaves out: one
+conversation's results and already acknowledged history.
 `Agent.work_board()` shows them beside jobs and routines in Scheduled, Running,
 Needs you and Done columns; it is not yet available to hosted callers.
 

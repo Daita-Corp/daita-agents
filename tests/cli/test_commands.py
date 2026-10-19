@@ -27,17 +27,31 @@ from daita import (
     cli,
 )
 from daita._json import FrozenJsonObject
+from daita.distribution import (
+    DeliveryInspection,
+    DeliverySubjectKind,
+    DistributionDestination,
+    DistributionDestinationState,
+    OutcomeConclusionKind,
+    OutcomeState,
+    delivery_inspection_projection,
+    delivery_view_projection,
+    distribution_destination_projection,
+)
+from daita.distribution.owner import _delivery_view, construct_logical_delivery
 from daita.llm.models import (
     FinishReason,
     MessageRole,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     ModelUsage,
     TextBlock,
     ToolCall,
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import SecretReference
+from tests.support.distribution import inbox_distribution_plan
 from tests.support.workspace import workspace_for
 
 
@@ -985,7 +999,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "skills",
         "routines",
         "effects",
-        "inbox",
+        "work",
         "jobs",
         "diagnostics",
     }
@@ -1083,6 +1097,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "resume",
         "run-now",
         "disable",
+        "destinations",
     }
     assert _surface(routines["list"]) == (
         ("name",),
@@ -1092,26 +1107,18 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         ("name", "routine_id"),
         frozenset({"-h", "--help"}),
     )
-    inbox = _subcommands(commands["inbox"])
-    assert set(inbox) == {"destinations", "list", "inspect", "acknowledge"}
-    assert _surface(inbox["destinations"]) == (
+    assert _surface(routines["destinations"]) == (
         ("name", "conversation_id"),
         frozenset({"-h", "--help", "--sensitivity-ceiling"}),
     )
-    assert _surface(inbox["list"]) == (
+    work = _subcommands(commands["work"])
+    assert set(work) == {"show", "inspect", "dismiss"}
+    assert _surface(work["show"]) == (
         ("name",),
-        frozenset(
-            {
-                "-h",
-                "--help",
-                "--conversation-id",
-                "--include-acknowledged",
-                "--limit",
-            }
-        ),
+        frozenset({"-h", "--help", "--done-hours"}),
     )
-    for command in ("inspect", "acknowledge"):
-        assert _surface(inbox[command]) == (
+    for command in ("inspect", "dismiss"):
+        assert _surface(work[command]) == (
             ("name", "delivery_id"),
             frozenset({"-h", "--help"}),
         )
@@ -1854,3 +1861,140 @@ def test_cli_stopped_run_retains_committed_routine_without_dumping_contract():
     assert record["tool_results"][0]["is_error"] is False
     assert "create committed" in record["tool_results"][0]["summary"]
     assert "PRIVATE INSTRUCTION" not in json.dumps(record)
+
+
+def _routine_result_delivery() -> DeliveryInspection:
+    (target,) = inbox_distribution_plan("conversation-1").targets
+    return DeliveryInspection(
+        delivery=construct_logical_delivery(
+            delivery_id="delivery-1",
+            agent_id="agent-1",
+            conversation_id="conversation-1",
+            subject_kind=DeliverySubjectKind.ROUTINE_OCCURRENCE,
+            subject_id="occurrence-1",
+            target=target,
+            conclusion_kind=OutcomeConclusionKind.TERMINAL_RUN,
+            conclusion_state=OutcomeState.SUCCEEDED,
+            conclusion_id="run-1",
+            conclusion_digest="sha256:" + "1" * 64,
+            conclusion_preview="The current value is 7.",
+            conclusion_preview_truncated=False,
+            resulting_run_id="run-1",
+            artifact_references=(),
+            effective_sensitivity=ModelSensitivity.INTERNAL,
+            provenance_digest="sha256:" + "2" * 64,
+            failure_code=None,
+            observed_at=datetime(2026, 9, 1, 12, tzinfo=UTC),
+        )
+    )
+
+
+def test_work_show_prints_every_board_column_for_a_local_agent(
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_create_agent(tmp_path, "atlas"))
+    code, stdout, stderr = _invoke(
+        ["--root", str(tmp_path), "work", "show", "atlas", "--done-hours", "168"]
+    )
+    assert code == 0, stderr
+    board = json.loads(stdout)
+    assert set(board) == {"generated_at", "columns", "truncated"}
+    columns = ("scheduled", "running", "needs_you", "done")
+    assert board["columns"] == {column: [] for column in columns}
+    assert board["truncated"] == {column: 0 for column in columns}
+    assert "Host open for this command only" in stderr
+
+
+@pytest.mark.parametrize("hours", ["0", "169", "-1"])
+def test_work_show_rejects_done_hours_outside_one_week(
+    tmp_path: Path, hours: str
+) -> None:
+    asyncio.run(_create_agent(tmp_path, "atlas"))
+    code, stdout, stderr = _invoke(
+        ["--root", str(tmp_path), "work", "show", "atlas", "--done-hours", hours]
+    )
+    assert (code, stdout) == (1, "")
+    assert "done window must be positive and at most seven days" in stderr
+
+
+@pytest.mark.parametrize("command", ["inspect", "dismiss"])
+def test_work_inspect_and_dismiss_project_one_exact_delivery(
+    tmp_path: Path, command: str
+) -> None:
+    inspection = _routine_result_delivery()
+    view = _delivery_view(inspection.delivery)
+    fake = SimpleNamespace(
+        inspect_delivery=AsyncMock(return_value=inspection),
+        acknowledge_delivery=AsyncMock(return_value=view),
+        close=AsyncMock(),
+    )
+    args = cli.build_parser().parse_args(
+        ["--root", str(tmp_path), "work", command, "atlas", "delivery-1"]
+    )
+    with patch.object(Agent, "open", new=AsyncMock(return_value=fake)):
+        result = asyncio.run(cli._execute(args))
+    if command == "inspect":
+        assert result == delivery_inspection_projection(inspection)
+        fake.inspect_delivery.assert_awaited_once_with("delivery-1")
+        fake.acknowledge_delivery.assert_not_awaited()
+    else:
+        assert result == delivery_view_projection(view)
+        fake.acknowledge_delivery.assert_awaited_once_with("delivery-1")
+        fake.inspect_delivery.assert_not_awaited()
+    fake.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("command", ["inspect", "dismiss"])
+def test_work_inspect_and_dismiss_report_an_unknown_delivery(
+    tmp_path: Path, command: str
+) -> None:
+    fake = SimpleNamespace(
+        inspect_delivery=AsyncMock(return_value=None),
+        acknowledge_delivery=AsyncMock(return_value=None),
+        close=AsyncMock(),
+    )
+    args = cli.build_parser().parse_args(
+        ["--root", str(tmp_path), "work", command, "atlas", "delivery-missing"]
+    )
+    with patch.object(Agent, "open", new=AsyncMock(return_value=fake)):
+        with pytest.raises(ValueError, match="delivery not found"):
+            asyncio.run(cli._execute(args))
+    fake.close.assert_awaited_once()
+
+
+def test_routines_destinations_lists_one_conversation_destination(
+    tmp_path: Path,
+) -> None:
+    destination = DistributionDestination(
+        destination_id="conversation_inbox:conversation-1",
+        kind="conversation_inbox",
+        label="Conversation Inbox",
+        state=DistributionDestinationState.AVAILABLE,
+        revision=1,
+        sensitivity_ceiling=ModelSensitivity.INTERNAL,
+        supported_outcome_media=("text/csv",),
+        selectable=True,
+    )
+    fake = SimpleNamespace(
+        distribution_destinations=AsyncMock(return_value=(destination,)),
+        close=AsyncMock(),
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "--root",
+            str(tmp_path),
+            "routines",
+            "destinations",
+            "atlas",
+            "conversation-1",
+            "--sensitivity-ceiling",
+            "internal",
+        ]
+    )
+    with patch.object(Agent, "open", new=AsyncMock(return_value=fake)):
+        result = asyncio.run(cli._execute(args))
+    assert result == [distribution_destination_projection(destination)]
+    fake.distribution_destinations.assert_awaited_once_with(
+        "conversation-1", sensitivity_ceiling=ModelSensitivity.INTERNAL
+    )
+    fake.close.assert_awaited_once()
