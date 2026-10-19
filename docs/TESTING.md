@@ -394,7 +394,7 @@ Configure the exact read contract and an independently known result marker:
 ```bash
 export MCP_HOST=https://mcp.firecrawl.dev/v2/mcp
 export MCP_TOOL=firecrawl_scrape
-export MCP_ARGUMENTS='{"url":"https://example.com","formats":["markdown"]}'
+export MCP_ARGUMENTS='{"url":"https://example.com","formats":["markdown"],"objective":"Read the page title and main text"}'
 export MCP_EXPECT_TEXT='Example Domain'
 # Set MCP_TOKEN privately to an existing Firecrawl API key for authenticated access.
 # Omitting MCP_TOKEN selects no authentication; it does not start OAuth sign-in.
