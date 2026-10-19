@@ -21,26 +21,12 @@ from .common import (
     text,
 )
 
-_CURRENT_SOURCE_ADAPTER_IDS = frozenset({"sqlite", "postgresql"})
-
-
-class CurrentSourceAdapterError(ValueError):
-    """Reject a source adapter outside the one canonical runtime shape."""
-
-
-def _require_current_adapter(adapter_id: str) -> None:
-    if adapter_id not in _CURRENT_SOURCE_ADAPTER_IDS:
-        raise CurrentSourceAdapterError(
-            "stored source registration uses an unsupported current adapter"
-        )
-
 
 def _require_current_source(value: SourceRegistration) -> SourceRegistration:
     if not isinstance(value, SourceRegistration):
         raise TypeError("source codec requires SourceRegistration")
-    _require_current_adapter(value.adapter_id)
-    if value.adapter_id == "postgresql" and "write_access" in value.configuration:
-        raise ValueError("PostgreSQL source contains embedded write admission")
+    if "write_access" in value.configuration:
+        raise ValueError("source contains embedded write admission")
     return value
 
 
@@ -49,18 +35,15 @@ def encode_source(value: SourceRegistration) -> str:
 
 
 def decode_source(value: str) -> SourceRegistration:
-    decoded = _decode_source(load_payload(value))
-    if decoded.adapter_id == "postgresql" and "write_access" in decoded.configuration:
-        raise ValueError("stored PostgreSQL source contains embedded write admission")
-    return decoded
+    return _decode_source(load_payload(value))
 
 
-def decode_source_credential_reference_for_deletion(
+def decode_source_configuration_for_deletion(
     value: str,
     *,
     agent_id: str,
     source_id: str,
-) -> str | None:
+) -> tuple[str, dict[str, JsonValue]]:
     """Read only deletion-critical fields across pre-production source shapes."""
 
     decoded = load_payload(value)
@@ -75,10 +58,7 @@ def decode_source_credential_reference_for_deletion(
         raise ValueError("stored source row identity is invalid")
     adapter_id = text(fields.get("adapter_id"), "source adapter_id")
     configuration = mapping(fields.get("configuration"), "source configuration")
-    if adapter_id != "postgresql":
-        return None
-    reference = configuration.get("credential_ref")
-    return None if reference is None else text(reference, "source credential_ref")
+    return adapter_id, dict(configuration)
 
 
 def _encode_source(value: SourceRegistration) -> dict[str, JsonValue]:
@@ -125,9 +105,8 @@ def _decode_source(value: JsonValue) -> SourceRegistration:
     if not isinstance(configuration, dict):
         raise ValueError("stored source configuration is invalid")
     adapter_id = text(fields["adapter_id"], "source adapter_id")
-    _require_current_adapter(adapter_id)
-    if adapter_id == "postgresql" and "write_access" in configuration:
-        raise ValueError("stored PostgreSQL source contains embedded write admission")
+    if "write_access" in configuration:
+        raise ValueError("stored source contains embedded write admission")
     return SourceRegistration(
         id=text(fields["id"], "source id"),
         agent_id=text(fields["agent_id"], "source agent_id"),
@@ -150,8 +129,7 @@ def _decode_source(value: JsonValue) -> SourceRegistration:
 
 
 __all__ = [
-    "CurrentSourceAdapterError",
     "decode_source",
-    "decode_source_credential_reference_for_deletion",
+    "decode_source_configuration_for_deletion",
     "encode_source",
 ]

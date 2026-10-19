@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
-from typing import Protocol, cast
+from typing import Protocol, TypeVar, cast
 
 from ..._json import FrozenJsonObject, canonical_json
 from ...artifacts.renderers import MAX_CSV_ROWS, MAX_CSV_SECONDS
@@ -512,12 +512,23 @@ class SqlReadBackend(Protocol):
     ) -> SqlReadResult: ...
 
 
-class SQLiteReadBackend(SqlReadBackend, Protocol):
-    pass
+SourceAdapterLookup = Callable[[str, str], Awaitable[str | None]]
+_Backend = TypeVar("_Backend")
 
 
-class PostgreSQLReadBackend(SqlReadBackend, Protocol):
-    pass
+async def _source_backend(
+    backends: Mapping[str, _Backend],
+    source_adapter_id: SourceAdapterLookup,
+    agent_id: str,
+    source_id: str,
+) -> _Backend:
+    """Route one write to the backend of the source's registered type."""
+
+    adapter_id = await source_adapter_id(agent_id, source_id)
+    backend = None if adapter_id is None else backends.get(adapter_id)
+    if backend is None:
+        raise ValueError("relational write adapter binding is unsupported")
+    return backend
 
 
 class RelationalUpdatePreviewBackend(Protocol):
@@ -590,8 +601,7 @@ class DataQueryExecutor:
     def __init__(
         self,
         agent_id: str,
-        sqlite_backend: SQLiteReadBackend,
-        postgresql_backend: PostgreSQLReadBackend,
+        backends: Mapping[str, SqlReadBackend],
         *,
         max_rows: int = DATA_QUERY_MAX_ROWS,
         max_bytes: int = DATA_QUERY_MAX_BYTES,
@@ -602,10 +612,7 @@ class DataQueryExecutor:
         if not 0 < statement_timeout_seconds <= total_timeout_seconds:
             raise ValueError("statement timeout must be positive and within total")
         self._agent_id = agent_id
-        self._backends: dict[str, SqlReadBackend] = {
-            "sqlite": sqlite_backend,
-            "postgresql": postgresql_backend,
-        }
+        self._backends = dict(backends)
         self._max_rows = max_rows
         self._max_bytes = max_bytes
         self._statement_timeout_seconds = float(statement_timeout_seconds)
@@ -624,9 +631,6 @@ class DataQueryExecutor:
         backend = self._backends.get(adapter_id)
         if backend is None:
             raise ValueError("relational query adapter binding is unsupported")
-        expected_type = (
-            PostgreSQLReadResult if adapter_id == "postgresql" else SQLiteReadResult
-        )
         started = self._clock()
         deadline = started + self._total_timeout_seconds
         remaining_rows = self._max_rows
@@ -658,7 +662,7 @@ class DataQueryExecutor:
             )
             elapsed_ms = _elapsed_ms(statement_started, self._clock())
             if (
-                not isinstance(result, expected_type)
+                not isinstance(result, SqlReadResult)
                 or result.source_id != source_id
                 or not frozenset(result.resource_ids) <= frozenset(resource_ids)
             ):
@@ -818,18 +822,26 @@ class RelationalUpdatePreviewExecutor:
     def __init__(
         self,
         agent_id: str,
-        backend: RelationalUpdatePreviewBackend,
+        backends: Mapping[str, RelationalUpdatePreviewBackend],
+        source_adapter_id: SourceAdapterLookup,
     ) -> None:
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("preview executor agent_id must be non-empty text")
-        if not callable(getattr(backend, "preview_update", None)):
+        if any(
+            not callable(getattr(backend, "preview_update", None))
+            for backend in backends.values()
+        ):
             raise TypeError("preview backend must provide preview_update")
         self._agent_id = agent_id
-        self._backend = backend
+        self._backends = dict(backends)
+        self._source_adapter_id = source_adapter_id
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         intent = RelationalUpdateIntent.from_mapping(request.arguments)
-        result = await self._backend.preview_update(
+        backend = await _source_backend(
+            self._backends, self._source_adapter_id, self._agent_id, intent.source_id
+        )
+        result = await backend.preview_update(
             agent_id=self._agent_id,
             intent=intent,
         )
@@ -848,21 +860,35 @@ class RelationalUpdatePreviewExecutor:
 class RelationalUpdateExecutor:
     executor_id = RELATIONAL_UPDATE_EXECUTOR_ID
 
-    def __init__(self, agent_id: str, backend: RelationalUpdateBackend) -> None:
+    def __init__(
+        self,
+        agent_id: str,
+        backends: Mapping[str, RelationalUpdateBackend],
+        source_adapter_id: SourceAdapterLookup,
+    ) -> None:
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("update executor agent_id must be non-empty text")
-        if not callable(getattr(backend, "preview_update", None)) or not callable(
-            getattr(backend, "execute_update", None)
+        if any(
+            not callable(getattr(backend, "preview_update", None))
+            or not callable(getattr(backend, "execute_update", None))
+            for backend in backends.values()
         ):
             raise TypeError(
                 "update backend must provide preview_update and execute_update"
             )
         self._agent_id = agent_id
-        self._backend = backend
+        self._backends = dict(backends)
+        self._source_adapter_id = source_adapter_id
+
+    async def _backend(self, source_id: str) -> RelationalUpdateBackend:
+        return await _source_backend(
+            self._backends, self._source_adapter_id, self._agent_id, source_id
+        )
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
         command = RelationalUpdateCommand.from_mapping(request.arguments)
-        preview = await self._backend.preview_update(
+        backend = await self._backend(command.intent.source_id)
+        preview = await backend.preview_update(
             agent_id=self._agent_id,
             intent=command.intent,
         )
@@ -901,7 +927,8 @@ class RelationalUpdateExecutor:
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         command = RelationalUpdateCommand.from_mapping(request.arguments)
-        result = await self._backend.execute_update(
+        backend = await self._backend(command.intent.source_id)
+        result = await backend.execute_update(
             agent_id=self._agent_id,
             execution=request,
             command=command,
@@ -921,12 +948,11 @@ class RelationalUpdateExecutor:
 
 def data_query_declarations(
     agent_id: str,
-    sqlite_backend: SQLiteReadBackend,
-    postgresql_backend: PostgreSQLReadBackend,
+    backends: Mapping[str, SqlReadBackend],
     *,
     file_outputs: tuple[str, ...] = (),
 ) -> DataQueryDeclarations:
-    executor = DataQueryExecutor(agent_id, sqlite_backend, postgresql_backend)
+    executor = DataQueryExecutor(agent_id, backends)
     declarations = data_query_capability_declarations(
         file_outputs=file_outputs,
         file_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID if file_outputs else None,
@@ -938,9 +964,10 @@ def data_query_declarations(
 
 def relational_update_preview_declarations(
     agent_id: str,
-    backend: RelationalUpdatePreviewBackend,
+    backends: Mapping[str, RelationalUpdatePreviewBackend],
+    source_adapter_id: SourceAdapterLookup,
 ) -> RelationalUpdatePreviewDeclarations:
-    executor = RelationalUpdatePreviewExecutor(agent_id, backend)
+    executor = RelationalUpdatePreviewExecutor(agent_id, backends, source_adapter_id)
     declarations = relational_update_preview_capability_declarations()
     return RelationalUpdatePreviewDeclarations(
         declarations.capabilities,
@@ -951,9 +978,10 @@ def relational_update_preview_declarations(
 
 def relational_update_declarations(
     agent_id: str,
-    backend: RelationalUpdateBackend,
+    backends: Mapping[str, RelationalUpdateBackend],
+    source_adapter_id: SourceAdapterLookup,
 ) -> RelationalUpdateDeclarations:
-    executor = RelationalUpdateExecutor(agent_id, backend)
+    executor = RelationalUpdateExecutor(agent_id, backends, source_adapter_id)
     declarations = relational_update_capability_declarations()
     return RelationalUpdateDeclarations(
         declarations.capabilities,
@@ -1470,7 +1498,6 @@ __all__ = [
     "RELATIONAL_UPDATE_EXECUTOR_ID",
     "RELATIONAL_UPDATE_TOOL_NAME",
     "RELATIONAL_UPSERT_TOOL_NAME",
-    "PostgreSQLReadBackend",
     "PostgreSQLReadResult",
     "RelationalPreviewFingerprint",
     "RelationalUpdatePreview",
@@ -1483,7 +1510,6 @@ __all__ = [
     "RelationalUpdateExecutor",
     "RelationalUpdateResult",
     "RelationalUpdateSample",
-    "SQLiteReadBackend",
     "SQLiteReadResult",
     "data_query_declarations",
     "data_query_capability_declarations",
@@ -1577,33 +1603,42 @@ def _upsert_intent(request: ToolExecution) -> RelationalUpsertIntent:
     )
 
 
-class RelationalUpsertPreviewExecutor:
-    executor_id = "data.preview_upsert_rows.executor"
+class _RelationalUpsertRouting:
+    def __init__(
+        self,
+        agent_id: str,
+        backends: Mapping[str, RelationalUpsertBackend],
+        source_adapter_id: SourceAdapterLookup,
+    ) -> None:
+        self._agent_id = agent_id
+        self._backends = dict(backends)
+        self._source_adapter_id = source_adapter_id
 
-    def __init__(self, agent_id: str, backend: RelationalUpsertBackend) -> None:
-        self._agent_id, self._backend = agent_id, backend
+    async def _backend(self, intent: RelationalUpsertIntent) -> RelationalUpsertBackend:
+        return await _source_backend(
+            self._backends, self._source_adapter_id, self._agent_id, intent.source_id
+        )
+
+
+class RelationalUpsertPreviewExecutor(_RelationalUpsertRouting):
+    executor_id = "data.preview_upsert_rows.executor"
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         intent = _upsert_intent(request)
+        backend = await self._backend(intent)
         return ToolOutput(
             kind="data.preview_upsert_rows",
-            data=await self._backend.preview_upsert(
-                agent_id=self._agent_id, intent=intent
-            ),
+            data=await backend.preview_upsert(agent_id=self._agent_id, intent=intent),
         )
 
 
-class RelationalUpsertExecutor:
+class RelationalUpsertExecutor(_RelationalUpsertRouting):
     executor_id = "data.upsert_rows.executor"
-
-    def __init__(self, agent_id: str, backend: RelationalUpsertBackend) -> None:
-        self._agent_id, self._backend = agent_id, backend
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
         intent = _upsert_intent(request)
-        preview = await self._backend.preview_upsert(
-            agent_id=self._agent_id, intent=intent
-        )
+        backend = await self._backend(intent)
+        preview = await backend.preview_upsert(agent_id=self._agent_id, intent=intent)
         if preview["preview_fingerprint"] != request.arguments["preview_fingerprint"]:
             raise CapabilityInputError(
                 "write_preview_stale",
@@ -1641,10 +1676,12 @@ class RelationalUpsertExecutor:
         )
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
-        result = await self._backend.execute_upsert(
+        intent = _upsert_intent(request)
+        backend = await self._backend(intent)
+        result = await backend.execute_upsert(
             agent_id=self._agent_id,
             execution=request,
-            intent=_upsert_intent(request),
+            intent=intent,
             preview_fingerprint=cast(str, request.arguments["preview_fingerprint"]),
         )
         return ToolOutput(
@@ -1879,14 +1916,16 @@ def _upsert_output_schema(*, preview: bool) -> dict[str, object]:
 
 
 def relational_upsert_declarations(
-    agent_id: str, backend: RelationalUpsertBackend
+    agent_id: str,
+    backends: Mapping[str, RelationalUpsertBackend],
+    source_adapter_id: SourceAdapterLookup,
 ) -> DataQueryDeclarations:
     declarations = relational_upsert_capability_declarations()
     return DataQueryDeclarations(
         declarations.capabilities,
         (
-            RelationalUpsertPreviewExecutor(agent_id, backend),
-            RelationalUpsertExecutor(agent_id, backend),
+            RelationalUpsertPreviewExecutor(agent_id, backends, source_adapter_id),
+            RelationalUpsertExecutor(agent_id, backends, source_adapter_id),
         ),
         declarations.tool_views,
     )

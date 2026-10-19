@@ -174,7 +174,12 @@ class PermissionsScreen(Screen[bool]):
 
     async def _preview_write(self, controller: Any) -> None:
         inspection = await controller.inspect_source_permissions(self._source_id)
-        if inspection.adapter_id != "postgresql":
+        if not any(
+            {operation.value for operation in source_type.operations}
+            & {"relational_update", "relational_upsert"}
+            for source_type in controller.source_types()
+            if source_type.adapter_id == inspection.adapter_id
+        ):
             raise ValueError(
                 "Native write access is available only for PostgreSQL sources."
             )

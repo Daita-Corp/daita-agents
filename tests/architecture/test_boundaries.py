@@ -955,6 +955,64 @@ def test_deleted_lifecycle_systems_remain_absent():
         assert not (PACKAGE / module_name).exists()
 
 
+# Files that may name a built-in source type literally. Everywhere else dispatches
+# through the composed SourceTypeRegistry.
+_SOURCE_TYPE_LITERAL_FILES = frozenset(
+    {
+        "adapters/sqlite.py",  # SQLite adapter owns its adapter id
+        "adapters/sqlite_query.py",  # SQLite read/export backend checks its own type
+        "adapters/postgresql.py",  # PostgreSQL adapter owns its adapter id
+        "adapters/postgresql_query.py",  # PostgreSQL read backend checks its own type
+        "adapters/postgresql_write.py",  # PostgreSQL write backend checks its own type
+        "adapters/registry.py",  # built-in SourceType registrations
+        "domains/data/sql/analysis.py",  # SQL dialect parsing
+        "domains/data/sql/contracts.py",  # SQL dialect identifier rules
+        "domains/data/sql/read_validation.py",  # SQL dialect validators and quoting
+        "cli.py",  # per-type `daita attach` flow and its PostgreSQL flags
+        "tui/controller.py",  # per-type source edit and probe flows
+        "tui/screens/onboarding.py",  # per-type onboarding form
+        "tui/screens/source_edit.py",  # per-type source edit form
+        "tui/commands.py",  # postgresql:// connection-URL scheme parsing
+    }
+)
+
+
+def test_source_type_dispatch_goes_through_the_registry():
+    offenders: list[str] = []
+    for path in sorted(PACKAGE.rglob("*.py")):
+        relative = path.relative_to(PACKAGE).as_posix()
+        if relative in _SOURCE_TYPE_LITERAL_FILES:
+            continue
+        tree = _tree(path)
+        # Discovery keywords are tool presentation vocabulary, not dispatch.
+        vocabulary = {
+            id(node)
+            for call in ast.walk(tree)
+            if isinstance(call, ast.Call)
+            for keyword in call.keywords
+            if keyword.arg == "keywords"
+            for node in ast.walk(keyword.value)
+        }
+        offenders.extend(
+            f"{relative}:{node.lineno}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and node.value in {"sqlite", "postgresql"}
+            and id(node) not in vocabulary
+        )
+    assert offenders == []
+
+    package_text = _python_text(PACKAGE)
+    for deleted in (
+        "_CURRENT_SOURCE_ADAPTER_IDS",
+        "_RELATIONAL_ADAPTER_IDS",
+        "_ADAPTER_CAPABILITIES",
+        "_postgresql_backend",
+        "SOURCE_TYPE_LABELS",
+    ):
+        assert deleted not in package_text
+
+
 def test_memory_keeps_storage_separate_from_one_fixed_write_identity():
     memory = PACKAGE / "memory"
     assert {path.name for path in memory.glob("*.py")} == {
@@ -2351,7 +2409,9 @@ def test_exact_tabular_tool_arguments_contain_query_selection_but_never_rows_or_
         exact_export_capability_declarations,
     )
 
-    declarations = exact_export_capability_declarations()
+    declarations = exact_export_capability_declarations(
+        adapter_ids=("sqlite", "postgresql")
+    )
     for capability in declarations.capabilities:
         if capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID:
             continue

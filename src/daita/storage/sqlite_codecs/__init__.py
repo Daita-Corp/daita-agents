@@ -46,9 +46,8 @@ from .source_permissions import (
     encode_source_read_scope,
 )
 from .sources import (
-    CurrentSourceAdapterError,
     decode_source,
-    decode_source_credential_reference_for_deletion,
+    decode_source_configuration_for_deletion,
     encode_source,
 )
 from .transcripts import (
@@ -61,7 +60,6 @@ from .transcripts import (
 )
 
 __all__ = [
-    "CurrentSourceAdapterError",
     "decode_catalog_snapshot",
     "decode_catalog_sync",
     "decode_identifier",
@@ -82,7 +80,7 @@ __all__ = [
     "decode_run_input",
     "decode_semantic_annotation",
     "decode_source",
-    "decode_source_credential_reference_for_deletion",
+    "decode_source_configuration_for_deletion",
     "decode_source_read_scope",
     "decode_scheduled_routine",
     "encode_catalog_snapshot",

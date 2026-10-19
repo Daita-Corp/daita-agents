@@ -311,7 +311,9 @@ async def test_update_preflight_retains_bounded_review_without_another_read(
         },
     )
     fingerprint = await RelationalUpdateExecutor(
-        "agent-preview", cast(RelationalUpdateBackend, backend)
+        "agent-preview",
+        {"postgresql": cast(RelationalUpdateBackend, backend)},
+        AsyncMock(return_value="postgresql"),
     ).preflight(execution)
     review = fingerprint["review"]
     assert isinstance(review, FrozenJsonObject)

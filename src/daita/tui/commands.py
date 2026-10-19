@@ -7,9 +7,9 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 
 from .models import (
     MAX_POSTGRESQL_CONNECTION_URL_BYTES,
-    SOURCE_TYPE_LABELS,
     SSL_MODES,
     UserInputError,
+    source_type_label,
 )
 from .sanitization import safe_display
 
@@ -181,6 +181,7 @@ def quoted_source_override(selector: str) -> str:
 
 def source_override_completions(
     sources: tuple[Any, ...],
+    source_types: tuple[Any, ...],
 ) -> tuple[tuple[str, str, str], ...]:
     active_sources = tuple(source for source in sources if source.active)
     folded_name_counts: dict[str, int] = {}
@@ -202,7 +203,7 @@ def source_override_completions(
         )
         selector = source.display_name if use_display_name else source.id
         adapter_id = getattr(source, "adapter_id", "source")
-        source_type = SOURCE_TYPE_LABELS.get(adapter_id, adapter_id)
+        source_type = source_type_label(source_types, adapter_id)
         description = f"Ask one question using {source_type}"
         if not use_display_name:
             description += f" · {source.id[-8:]}"

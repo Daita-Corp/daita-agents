@@ -10,6 +10,7 @@ from typing import Protocol, cast
 from ..._json import FrozenJsonObject, canonical_json
 from ...adapters.local_file_query import LocalFileQueryError
 from ...adapters.local_workspace import LocalWorkspaceError
+from ...adapters.registry import SourceOperation, SourceTypeRegistry
 from ...artifacts.models import (
     ArtifactAuthorship,
     ArtifactDraft,
@@ -61,10 +62,9 @@ from .sql import (
     RelationalUpdateCommand,
     RelationalUpdateIntent,
     ResourceSchema,
+    read_validator,
     validate_duckdb_read,
-    validate_postgresql_read,
     validate_relational_update_intent,
-    validate_sqlite_read,
 )
 from .sql.relational_upsert import (
     RelationalUpsertIntent,
@@ -118,24 +118,20 @@ _RESOURCE_ARGUMENT_CAPABILITIES = frozenset(
     }
 )
 _RESOURCE_LIST_ARGUMENT_CAPABILITIES = _RELATIONAL_READ_CAPABILITIES
-_RELATIONAL_ADAPTER_IDS = frozenset({"sqlite", "postgresql"})
 _RESOURCE_READ_DENIED_MESSAGE = (
     "The requested resource is not available for reading in this run. Copy exact "
     "current catalog IDs without shortening them; do not guess or substitute another resource."
 )
-_ADAPTER_CAPABILITIES = {
-    "postgresql": frozenset(
-        {
-            *_UPSERT_CAPABILITIES,
-            RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
-            RELATIONAL_UPDATE_CAPABILITY_ID,
-        }
-    ),
+# The source operation a source's registered type must declare for each capability.
+_CAPABILITY_OPERATIONS = {
+    DATA_QUERY_CAPABILITY_ID: SourceOperation.SQL_READ,
+    DATA_EXPORT_TABULAR_CAPABILITY_ID: SourceOperation.TABULAR_EXPORT,
+    **{item: SourceOperation.RELATIONAL_UPDATE for item in _UPDATE_CAPABILITIES},
+    **{item: SourceOperation.RELATIONAL_UPSERT for item in _UPSERT_CAPABILITIES},
 }
 _SOURCE_CAPABILITIES = frozenset().union(
     _CATALOG_CAPABILITIES,
-    _RELATIONAL_READ_CAPABILITIES,
-    *_ADAPTER_CAPABILITIES.values(),
+    _CAPABILITY_OPERATIONS,
 )
 
 
@@ -347,6 +343,7 @@ class DataCapabilityDomain:
         declarations: CapabilityDeclarations,
         catalog: DataDomainCatalog,
         learning: LearningCandidateGuard,
+        source_types: SourceTypeRegistry,
         *,
         relational_export_available: bool = True,
         transcript_loader: Callable[[str], Awaitable[Transcript]] | None = None,
@@ -371,11 +368,8 @@ class DataCapabilityDomain:
             local_file_sensitivity, ModelSensitivity
         ):
             raise TypeError("local_file_sensitivity must be ModelSensitivity")
-        for adapter_id, capability_ids in _ADAPTER_CAPABILITIES.items():
-            if not capability_ids <= declared_ids:
-                raise ValueError(
-                    f"data adapter capability admission is incomplete: {adapter_id}"
-                )
+        if not isinstance(source_types, SourceTypeRegistry):
+            raise TypeError("source_types must be a SourceTypeRegistry")
         for method_name in (
             "source_routing_facts",
             "resource_schemas",
@@ -392,6 +386,7 @@ class DataCapabilityDomain:
         self._declarations = declarations
         self._catalog = catalog
         self._learning = learning
+        self._source_types = source_types
         self._local_file_sensitivity = local_file_sensitivity
         self._views = {item.name: item for item in declarations.tool_views}
         self._capabilities = {item.id: item for item in declarations.capabilities}
@@ -489,19 +484,11 @@ class DataCapabilityDomain:
                 ):
                     names.append(name)
                 continue
-            if capability.id in _RELATIONAL_READ_CAPABILITIES:
-                if active_adapter_ids & _RELATIONAL_ADAPTER_IDS:
-                    names.append(name)
-                continue
-            required_adapter = next(
-                (
-                    adapter_id
-                    for adapter_id, capability_ids in _ADAPTER_CAPABILITIES.items()
-                    if capability.id in capability_ids
-                ),
-                None,
-            )
-            if required_adapter not in active_adapter_ids:
+            operation = _CAPABILITY_OPERATIONS.get(capability.id)
+            if operation is None or not any(
+                self._source_types.supports(adapter_id, operation)
+                for adapter_id in active_adapter_ids
+            ):
                 continue
             if capability.id in _UPDATE_CAPABILITIES and not update_source_ids:
                 continue
@@ -610,6 +597,7 @@ class DataCapabilityDomain:
             arguments = await self._validate_sql(
                 run,
                 arguments,
+                operation=_CAPABILITY_OPERATIONS[capability.id],
                 bind_revisions=capability.id == DATA_QUERY_CAPABILITY_ID,
             )
         if capability.id in _UPDATE_CAPABILITIES | _UPSERT_CAPABILITIES:
@@ -963,8 +951,7 @@ class DataCapabilityDomain:
 
     finalize_session_output = finalize_output
 
-    @staticmethod
-    def _validate_export_summary(output: ToolOutput) -> None:
+    def _validate_export_summary(self, output: ToolOutput) -> None:
         draft = output.artifact
         if (
             draft is None
@@ -975,7 +962,8 @@ class DataCapabilityDomain:
             )
         valid = (
             bool(draft.provenance.resource_bindings)
-            and output.data.get("adapter_id") in _RELATIONAL_ADAPTER_IDS
+            and isinstance(adapter_id := output.data.get("adapter_id"), str)
+            and self._source_types.supports(adapter_id, SourceOperation.TABULAR_EXPORT)
             and output.data.get("format") in {"csv", "xlsx", "arrow"}
             and output.data.get("filename") == draft.suggested_filename
             and output.data.get("source_id")
@@ -1021,7 +1009,10 @@ class DataCapabilityDomain:
             or any(not isinstance(item, str) for item in resource_ids)
             or not isinstance(sql, str)
             or not isinstance(parameters, tuple)
-            or adapter_id not in _RELATIONAL_ADAPTER_IDS
+            or not isinstance(adapter_id, str)
+            or not self._source_types.supports(
+                adapter_id, SourceOperation.TABULAR_EXPORT
+            )
         ):
             raise ToolOutputValidationError(
                 "relational export execution arguments are unavailable"
@@ -1040,11 +1031,9 @@ class DataCapabilityDomain:
             readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
-        validator = (
-            validate_postgresql_read
-            if adapter_id == "postgresql"
-            else validate_sqlite_read
-        )
+        validator = read_validator(self._source_types.require(adapter_id).sql_dialect)
+        if validator is None:
+            raise _incomplete_export(draft, "catalog_changed")
         validation = validator(
             sql,
             source_id=source_id,
@@ -1228,6 +1217,7 @@ class DataCapabilityDomain:
         run: RunInput,
         arguments: Mapping[str, object],
         *,
+        operation: SourceOperation = SourceOperation.SQL_READ,
         bind_revisions: bool = False,
     ) -> FrozenJsonObject:
         source_id = arguments.get("source_id")
@@ -1257,7 +1247,11 @@ class DataCapabilityDomain:
                 "The selected source is not active for this agent.",
                 {"source_id": source_id},
             )
-        if adapter_id not in _RELATIONAL_ADAPTER_IDS:
+        source_type = self._source_types.get(adapter_id)
+        validator = (
+            None if source_type is None else read_validator(source_type.sql_dialect)
+        )
+        if validator is None or not self._source_types.supports(adapter_id, operation):
             raise CapabilityInputError(
                 "sql_source_adapter_unsupported",
                 "The selected source does not support relational SQL reads.",
@@ -1293,11 +1287,6 @@ class DataCapabilityDomain:
             readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
-        validator = (
-            validate_postgresql_read
-            if adapter_id == "postgresql"
-            else validate_sqlite_read
-        )
         referenced: set[str] = set()
         revisions: dict[str, str] = {}
         for index, (sql, parameters) in enumerate(statements):
@@ -1410,9 +1399,9 @@ class DataCapabilityDomain:
                 "write_source_not_available",
                 "PostgreSQL update requires an exact current source.",
             )
-        if (
-            await self._catalog.source_adapter_id(run.agent_id, source_id)
-            != "postgresql"
+        adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
+        if adapter_id is None or not self._source_types.supports(
+            adapter_id, SourceOperation.RELATIONAL_UPDATE
         ):
             raise CapabilityInputError(
                 "write_source_not_available",

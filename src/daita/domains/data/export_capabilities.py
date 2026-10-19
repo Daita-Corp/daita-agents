@@ -210,9 +210,8 @@ class ExactTabularExportResult:
     def __post_init__(self) -> None:
         if self.format not in {"csv", "xlsx", "arrow"}:
             raise ValueError("exact tabular format is invalid")
-        if self.adapter_id not in {"sqlite", "postgresql"}:
-            raise ValueError("exact tabular adapter_id is invalid")
         for value, name in (
+            (self.adapter_id, "adapter_id"),
             (self.source_id, "source_id"),
             (self.source_revision, "source_revision"),
             (self.sql_fingerprint, "sql_fingerprint"),
@@ -459,18 +458,14 @@ class DataExportTabularExecutor:
     def __init__(
         self,
         agent_id: str,
-        sqlite_backend: ExactTabularExportBackend,
-        postgresql_backend: ExactTabularExportBackend,
+        backends: Mapping[str, ExactTabularExportBackend],
         *,
         clock: Callable[[], datetime],
         max_seconds: float = MAX_CSV_SECONDS,
         arrow_bounds: tuple[int, int, int] | None = None,
     ) -> None:
         self._agent_id = agent_id
-        self._backends = {
-            "sqlite": sqlite_backend,
-            "postgresql": postgresql_backend,
-        }
+        self._backends = dict(backends)
         self._clock = clock
         self._max_seconds = max_seconds
         self._arrow_bounds = arrow_bounds
@@ -992,22 +987,21 @@ class ArtifactSetExportLocationExecutor:
 
 def exact_export_declarations(
     agent_id: str,
-    sqlite_backend: ExactTabularExportBackend,
-    postgresql_backend: ExactTabularExportBackend,
+    backends: Mapping[str, ExactTabularExportBackend],
     clock: Callable[[], datetime],
     *,
     arrow_bounds: tuple[int, int, int] | None = None,
 ) -> DataExportTabularDeclarations:
     declarations = exact_export_capability_declarations(
-        allow_arrow=arrow_bounds is not None
+        adapter_ids=tuple(backends),
+        allow_arrow=arrow_bounds is not None,
     )
     return DataExportTabularDeclarations(
         capabilities=declarations.capabilities,
         executors=(
             DataExportTabularExecutor(
                 agent_id,
-                sqlite_backend,
-                postgresql_backend,
+                backends,
                 clock=clock,
                 arrow_bounds=arrow_bounds,
             ),
@@ -1051,11 +1045,13 @@ def artifact_declarations(
 
 
 def exact_export_capability_declarations(
-    *, allow_arrow: bool = False
+    *, adapter_ids: tuple[str, ...], allow_arrow: bool = False
 ) -> CapabilityDeclarations:
     """Declare the exact export; data_query's file outputs are its only view."""
 
-    capability = _tabular_export_capability(allow_arrow=allow_arrow)
+    capability = _tabular_export_capability(
+        adapter_ids=adapter_ids, allow_arrow=allow_arrow
+    )
     return CapabilityDeclarations(
         domain_owner_id="data",
         capabilities=(capability,),
@@ -3024,7 +3020,11 @@ def _sha256_json(value: object) -> str:
     return "sha256:" + sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _tabular_export_capability(*, allow_arrow: bool = False) -> Capability:
+def _tabular_export_capability(
+    *, adapter_ids: tuple[str, ...], allow_arrow: bool = False
+) -> Capability:
+    if not adapter_ids:
+        raise ValueError("exact export requires at least one source type")
     formats = ["csv", "xlsx", *(["arrow"] if allow_arrow else [])]
     return Capability(
         id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
@@ -3095,10 +3095,7 @@ def _tabular_export_capability(*, allow_arrow: bool = False) -> Capability:
                     else {}
                 ),
                 "format": {"type": "string", "enum": formats},
-                "adapter_id": {
-                    "type": "string",
-                    "enum": ["sqlite", "postgresql"],
-                },
+                "adapter_id": {"type": "string", "enum": list(adapter_ids)},
                 "filename": {"type": "string"},
                 "source_id": {"type": "string"},
                 "source_revision": {"type": "string"},

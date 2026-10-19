@@ -159,7 +159,6 @@ from .sql_routines import (
     _require_effects_unblocked,
 )
 from .sqlite_codecs import (
-    CurrentSourceAdapterError,
     decode_catalog_snapshot,
     decode_catalog_sync,
     decode_delivery,
@@ -176,7 +175,7 @@ from .sqlite_codecs import (
     decode_scheduled_routine,
     decode_semantic_annotation,
     decode_source,
-    decode_source_credential_reference_for_deletion,
+    decode_source_configuration_for_deletion,
     decode_source_read_scope,
     encode_catalog_snapshot,
     encode_catalog_sync,
@@ -337,8 +336,6 @@ def _decode_source_state(
         raise SourcePermissionStateError("stored source permission state is invalid")
     try:
         registration = decode_source(source_data)
-    except CurrentSourceAdapterError as error:
-        raise SourcePermissionStateError(str(error)) from None
     except (TypeError, ValueError):
         raise SourcePermissionStateError(
             "stored source registration is invalid"
@@ -346,9 +343,7 @@ def _decode_source_state(
     if registration.agent_id != row_agent_id or registration.id != row_source_id:
         raise SourcePermissionStateError("stored source ownership is invalid")
     _decode_owned_read_scope(connection, registration, read_scope_data)
-    if update_scope_count and (
-        not registration.active or registration.adapter_id != "postgresql"
-    ):
+    if update_scope_count and not registration.active:
         raise SourcePermissionStateError("stored PostgreSQL update scope is foreign")
     return registration
 
@@ -1038,13 +1033,21 @@ class SQLStateStore:
     async def load_deletion_credential_inventory(
         self,
         agent_id: str,
-    ) -> tuple[AgentIdentity | None, tuple[str, ...], tuple[str, ...]]:
-        """Read identity and credential reference candidates without admission."""
+    ) -> tuple[
+        AgentIdentity | None,
+        tuple[tuple[str, Mapping[str, object]], ...],
+        tuple[str, ...],
+    ]:
+        """Read identity, source configurations and MCP credential candidates."""
 
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("agent_id must be non-empty text")
 
-        def read() -> tuple[AgentIdentity | None, tuple[str, ...], tuple[str, ...]]:
+        def read() -> tuple[
+            AgentIdentity | None,
+            tuple[tuple[str, Mapping[str, object]], ...],
+            tuple[str, ...],
+        ]:
             with _connect_read_only(self._database) as connection:
                 identity_row = connection.execute(
                     "SELECT data FROM metadata WHERE key = 'identity'"
@@ -1065,25 +1068,25 @@ class SQLStateStore:
             identity = (
                 None if identity_row is None else decode_identity(identity_row[0])
             )
-            references: list[str] = []
+            sources: list[tuple[str, Mapping[str, object]]] = []
             for row_agent_id, source_id, data in rows:
                 if not all(
                     isinstance(item, str) for item in (row_agent_id, source_id, data)
                 ):
                     raise ValueError("stored source deletion inventory is invalid")
-                reference = decode_source_credential_reference_for_deletion(
-                    data,
-                    agent_id=agent_id,
-                    source_id=source_id,
+                sources.append(
+                    decode_source_configuration_for_deletion(
+                        data,
+                        agent_id=agent_id,
+                        source_id=source_id,
+                    )
                 )
-                if reference is not None:
-                    references.append(reference)
             mcp_references: list[str] = []
             for (data,) in mcp_rows:
                 reference = decode_mcp_credential_reference_for_deletion(data)
                 if reference is not None:
                     mcp_references.append(reference)
-            return identity, tuple(references), tuple(mcp_references)
+            return identity, tuple(sources), tuple(mcp_references)
 
         return await settled_thread(read)
 
@@ -1924,12 +1927,6 @@ class SQLStateStore:
                 )
                 if not registration.active:
                     return ()
-                if registration.adapter_id != "postgresql":
-                    if source_row[4]:
-                        raise SourcePermissionStateError(
-                            "non-PostgreSQL source retains update scopes"
-                        )
-                    return ()
                 rows = connection.execute(
                     """SELECT resource_id, authorization_fingerprint, data
                        FROM relational_write_scopes
@@ -2004,8 +2001,6 @@ class SQLStateStore:
                 and not update_resource_ids <= set(read_scope.resource_ids)
             ):
                 raise ValueError("PostgreSQL update scope must be a read subset")
-            if update_scopes and registration.adapter_id != "postgresql":
-                raise ValueError("PostgreSQL update scopes require a PostgreSQL source")
             snapshot = _current_source_snapshot(
                 connection,
                 read_scope.agent_id,
@@ -5512,11 +5507,7 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
            FROM relational_write_scopes"""
     ):
         scope_registration = sources.get((agent_id, source_id))
-        if (
-            scope_registration is None
-            or scope_registration.adapter_id != "postgresql"
-            or not scope_registration.active
-        ):
+        if scope_registration is None or not scope_registration.active:
             raise ValueError("stored PostgreSQL update scope is foreign")
         decode_relational_write_scope(
             data,

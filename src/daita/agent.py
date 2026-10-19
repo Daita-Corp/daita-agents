@@ -32,6 +32,7 @@ from .adapters.protocols import (
     ResourceAdapterError as SourceRefreshError,
     ResourceSource,
 )
+from .adapters.registry import SourceType, SourceTypeRegistry
 from .artifacts.bytes import ArtifactByteStorage
 from .artifacts.models import (
     MAX_ARTIFACTS_PER_AGENT,
@@ -1584,6 +1585,22 @@ class Agent:
 
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
         return await self._embedded.list_sources()
+
+    @staticmethod
+    def registered_source_types(
+        config: AgentConfig | None = None,
+    ) -> tuple[SourceType, ...]:
+        """Source types an agent composed with ``config`` registers.
+
+        These are the built-in types followed by ``config.source_types``.
+        """
+
+        return SourceTypeRegistry(() if config is None else config.source_types).types()
+
+    async def unavailable_sources(self) -> tuple[SourceRegistration, ...]:
+        """Active sources whose type is not registered; they get no tools."""
+
+        return await self._embedded.unavailable_sources()
 
     async def list_catalog_resources(
         self, *, source_id: str | None = None

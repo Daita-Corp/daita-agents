@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import asdict
 from datetime import UTC, datetime
 
 import pytest
 
-from daita import Agent
+from daita import Agent, SQLiteSource
 from daita.adapters.models import SourceRegistration
 from daita.catalog.models import (
     CatalogFacet,
@@ -20,7 +21,9 @@ from daita.catalog.models import (
     TabularFacet,
     catalog_resource_id,
 )
-from daita.storage.sqlite_records import SourceReadMode
+from daita.hosting.errors import AgentHomeError
+from daita.storage.sqlite_codecs import encode_relational_write_scope
+from daita.storage.sqlite_records import RelationalWriteScope, SourceReadMode
 from tests.support.relational_writes import update_constraints
 from tests.support.workspace import workspace_for
 
@@ -357,3 +360,67 @@ async def test_unknown_or_wrong_confirmation_never_changes_state(tmp_path):
         ).state == preview.before
     finally:
         await agent.close()
+
+
+async def test_hosting_rejects_write_scopes_for_a_type_without_native_writes(
+    tmp_path,
+):
+    database = tmp_path / "customers.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)")
+    root = tmp_path / "state"
+    agent = await Agent.create(
+        "sqlite-write-scope",
+        root=root,
+        clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        home = agent.home
+        source = await agent.attach(SQLiteSource(database))
+        (table,) = await agent.list_catalog_resources(source_id=source.id)
+        with pytest.raises(ValueError, match="require an active PostgreSQL source"):
+            await agent.preview_source_permissions(
+                source_id=source.id,
+                read_mode="all",
+                read_resource_ids=(),
+                relational_write_scopes={table.id: update_constraints(("name",))},
+            )
+    finally:
+        await agent.close()
+
+    # Storage keeps no source-type knowledge, so forge a stored scope directly.
+    forged = RelationalWriteScope(
+        agent_id=source.agent_id,
+        source_id=source.id,
+        resource_id=table.id,
+        resource_revision=table.current_revision,
+        allowed_operations=("update",),
+        allowed_insert_columns=(),
+        allowed_update_columns=("name",),
+        key_columns=("id",),
+        generated_identity_columns=(),
+        max_rows=10,
+        authorization_fingerprint="sha256:" + "1" * 64,
+    )
+    with sqlite3.connect(home / "state.db") as connection:
+        connection.execute(
+            """INSERT INTO relational_write_scopes(
+                   agent_id, source_id, resource_id, authorization_fingerprint, data
+               ) VALUES (?, ?, ?, ?, ?)""",
+            (
+                forged.agent_id,
+                forged.source_id,
+                forged.resource_id,
+                forged.authorization_fingerprint,
+                encode_relational_write_scope(forged),
+            ),
+        )
+
+    with pytest.raises(AgentHomeError, match="foreign to its source type"):
+        await Agent.open(
+            "sqlite-write-scope",
+            root=root,
+            clock=lambda: NOW,
+            workspace=workspace_for(tmp_path),
+        )

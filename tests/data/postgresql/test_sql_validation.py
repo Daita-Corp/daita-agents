@@ -478,7 +478,9 @@ def test_model_facing_sql_capabilities_publish_the_same_input_bounds() -> None:
     query_capability = data_query_capability_declarations().capabilities[0]
     export_capability = next(
         item
-        for item in exact_export_capability_declarations().capabilities
+        for item in exact_export_capability_declarations(
+            adapter_ids=("sqlite", "postgresql")
+        ).capabilities
         if item.id == DATA_EXPORT_TABULAR_CAPABILITY_ID
     )
 

@@ -616,7 +616,9 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
 
 
 def test_semantic_csv_tool_schema_cannot_accept_rows_bytes_or_provenance() -> None:
-    extension = exact_export_capability_declarations()
+    extension = exact_export_capability_declarations(
+        adapter_ids=("sqlite", "postgresql")
+    )
     assert extension.tool_views == ()
     for capability in extension.capabilities:
         if capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID:

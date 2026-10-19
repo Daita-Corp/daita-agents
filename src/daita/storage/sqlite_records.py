@@ -505,8 +505,7 @@ def relational_write_authorization_fingerprint(
 ) -> str:
     """Bind exact current structural and permission facts, excluding freshness."""
     if (
-        source.adapter_id != "postgresql"
-        or not source.active
+        not source.active
         or resource.agent_id != source.agent_id
         or resource.source_id != source.id
         or resource.kind is not ResourceKind.TABLE

@@ -441,7 +441,9 @@ def test_exact_xlsx_source_failure_never_returns_a_partial_workbook() -> None:
 def test_tabular_tool_schemas_add_xlsx_without_accepting_rows_bytes_or_workbook_control() -> (
     None
 ):
-    declarations = exact_export_capability_declarations()
+    declarations = exact_export_capability_declarations(
+        adapter_ids=("sqlite", "postgresql")
+    )
     assert declarations.tool_views == ()
     for capability in declarations.capabilities:
         if capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID:

@@ -529,7 +529,8 @@ class DaitaApp(App[int]):
                 skill_matches = ()
             try:
                 source_matches = source_override_completions(
-                    await self.controller.list_sources()
+                    await self.controller.list_sources(),
+                    self.controller.source_types(),
                 )
             except Exception:
                 source_matches = ()

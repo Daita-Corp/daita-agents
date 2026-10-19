@@ -14,7 +14,7 @@ from textual.containers import Horizontal, ItemGrid, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Label, Static, Tree
 
-from ..models import SOURCE_TYPE_LABELS
+from ..models import source_type_label
 from ..sanitization import safe_display, sanitize_terminal_text
 
 
@@ -712,7 +712,10 @@ class CatalogScreen(ModalScreen[SourceManagerAction | None]):
             safe_display(source.display_name, fallback="source", maximum=512),
             style="bold",
         )
-        source_type = SOURCE_TYPE_LABELS.get(source.adapter_id, source.adapter_id)
+        source_type = source_type_label(
+            self.app.controller.source_types(),  # type: ignore[attr-defined]
+            source.adapter_id,
+        )
         noun = "resource" if resource_count == 1 else "resources"
         label.append(f"  {source_type} · {resource_count} {noun}", style="dim")
         return label

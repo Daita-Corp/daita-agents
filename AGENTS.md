@@ -143,6 +143,7 @@ src/daita/
   domains/data/               # data validation, SQL, files, artifacts
   catalog/                    # normalized source and resource truth
   adapters/                   # source admission, discovery, and bounded I/O
+  adapters/registry.py        # source types: identity, factory, declared operations
   artifacts/                  # artifact records, renderers, storage, delivery
   jobs/                       # durable job records, lifecycle, supervisor
   routines/                   # scheduled routines and occurrence supervisor
@@ -400,7 +401,10 @@ than building another schema graph or querying source clients for planning
 facts.
 
 `daita.adapters` implements source admission, containment, discovery,
-freshness checks, and I/O. SQLite paths must be absolute and bounded. Local
+freshness checks, and I/O. One composed `SourceTypeRegistry` per agent maps each
+`adapter_id` to its factory, credential fields, read capacity, SQL dialect and
+operation backends. A stored source whose type is not registered stays listed
+but unavailable: it gets no tools or source capacity, and refresh or edit fails. SQLite paths must be absolute and bounded. Local
 workspace access uses only admitted relative logical paths and rejects
 symlink, traversal, secret-file, and special-file access. PostgreSQL and MCP
 credentials remain secret references and are resolved only at the integration
@@ -1055,13 +1059,17 @@ special cases.
 
 When adding a source or data capability:
 
-1. extend the existing adapter, catalog, and concrete domain;
-2. declare stable `Capability`, `Executor`, and optional `ToolView` identities;
-3. compose them in `EmbeddedAgent` through `CapabilityRegistry`;
-4. keep discovery in the catalog and source I/O in the adapter;
-5. validate current facts before I/O and retain connector guardrails;
-6. return bounded schema-validated `ToolOutput`; and
-7. add focused contract tests and one public end-to-end test.
+1. register a `SourceType` (built-in in `adapters/registry.py`, or passed at agent
+   composition through `AgentConfig.source_types`) and never add adapter-id
+   dispatch outside the type's own modules; run `tests/support/source_contract.py`
+   against it;
+2. extend the existing adapter, catalog, and concrete domain;
+3. declare stable `Capability`, `Executor`, and optional `ToolView` identities;
+4. compose them in `EmbeddedAgent` through `CapabilityRegistry`;
+5. keep discovery in the catalog and source I/O in the adapter;
+6. validate current facts before I/O and retain connector guardrails;
+7. return bounded schema-validated `ToolOutput`; and
+8. add focused contract tests and one public end-to-end test.
 
 Do not commit changes unless the task explicitly requests a commit.
 
@@ -1076,6 +1084,7 @@ Do not commit changes unless the task explicitly requests a commit.
 | `src/daita/loop/models.py` | run, transcript, limits, and exit records |
 | `src/daita/capabilities.py` | declarations and registry |
 | `src/daita/capability_runtime.py` | common execution mechanics |
+| `src/daita/adapters/registry.py` | source type registry and built-in source types |
 | `src/daita/context.py` | model-request construction |
 | `src/daita/domains/data/sql/` | catalog-scoped SQL validation |
 | `src/daita/domains/mcp.py` | MCP projection and call-time rechecks |

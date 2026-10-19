@@ -6,7 +6,9 @@ from hashlib import sha256
 from typing import Protocol
 
 from ..._json import FrozenJsonObject
+from ...adapters.models import SourceRegistration
 from ...adapters.protocols import SourceStore
+from ...adapters.registry import SourceOperation, SourceTypeRegistry
 from ...catalog.models import (
     CatalogDescribeRequest,
     CatalogResource,
@@ -46,6 +48,13 @@ class CatalogPermissionStore(SourceStore, Protocol):
     ) -> tuple[RelationalWriteScope, ...]: ...
 
 
+# The source operation each relational write-scope operation requires.
+RELATIONAL_WRITE_OPERATIONS = {
+    "update": SourceOperation.RELATIONAL_UPDATE,
+    "upsert": SourceOperation.RELATIONAL_UPSERT,
+}
+
+
 class CatalogDataView:
     """Translate catalog records without creating a second catalog owner."""
 
@@ -54,6 +63,7 @@ class CatalogDataView:
         store: CatalogStore,
         service: CatalogService,
         sources: CatalogPermissionStore,
+        source_types: SourceTypeRegistry,
     ) -> None:
         if not isinstance(store, CatalogStore):
             raise TypeError("store must implement CatalogStore")
@@ -69,9 +79,21 @@ class CatalogDataView:
         ):
             if not callable(getattr(sources, method_name, None)):
                 raise TypeError(f"sources must provide {method_name}")
+        if not isinstance(source_types, SourceTypeRegistry):
+            raise TypeError("source_types must be a SourceTypeRegistry")
         self._store = store
         self._service = service
         self._sources = sources
+        self._source_types = source_types
+
+    def _available(self, registration: SourceRegistration, agent_id: str) -> bool:
+        """An active owned source whose type is registered in this composition."""
+
+        return (
+            registration.agent_id == agent_id
+            and registration.active
+            and self._source_types.get(registration.adapter_id) is not None
+        )
 
     async def source_routing_facts(
         self,
@@ -84,7 +106,7 @@ class CatalogDataView:
         registrations = await self._sources.list_sources(agent_id)
         readable_sources: set[str] = set()
         for registration in registrations:
-            if registration.agent_id != agent_id or not registration.active:
+            if not self._available(registration, agent_id):
                 continue
             if selected_source_ids and registration.id not in selected_source_ids:
                 continue
@@ -114,8 +136,7 @@ class CatalogDataView:
                 registrations,
                 key=lambda item: (item.id, item.adapter_id),
             )
-            if registration.agent_id == agent_id
-            and registration.active
+            if self._available(registration, agent_id)
             and registration.id in readable_sources
             and (not selected_source_ids or registration.id in selected_source_ids)
         )
@@ -177,8 +198,7 @@ class CatalogDataView:
         registrations = tuple(
             registration
             for registration in await self._sources.list_sources(agent_id)
-            if registration.agent_id == agent_id
-            and registration.active
+            if self._available(registration, agent_id)
             and (not selected_source_ids or registration.id in selected_source_ids)
         )
         if selected_source_ids and selected_source_ids != {
@@ -427,9 +447,8 @@ class CatalogDataView:
         registration = await self._sources.load_source(agent_id, source_id)
         if (
             registration is None
-            or registration.agent_id != agent_id
             or registration.id != source_id
-            or not registration.active
+            or not self._available(registration, agent_id)
         ):
             return None
         return registration.adapter_id
@@ -607,7 +626,10 @@ class CatalogDataView:
             or registration.agent_id != agent_id
             or registration.id != source_id
             or not registration.active
-            or registration.adapter_id != "postgresql"
+            or operation not in RELATIONAL_WRITE_OPERATIONS
+            or not self._source_types.supports(
+                registration.adapter_id, RELATIONAL_WRITE_OPERATIONS[operation]
+            )
         ):
             return (
                 "resource_update_not_allowed",
@@ -724,7 +746,10 @@ class CatalogDataView:
             if (
                 registration.agent_id != agent_id
                 or not registration.active
-                or registration.adapter_id != "postgresql"
+                or operation not in RELATIONAL_WRITE_OPERATIONS
+                or not self._source_types.supports(
+                    registration.adapter_id, RELATIONAL_WRITE_OPERATIONS[operation]
+                )
                 or (selected and registration.id not in selected)
             ):
                 continue
@@ -745,4 +770,4 @@ class CatalogDataView:
         return frozenset(applicable)
 
 
-__all__ = ["CatalogDataView"]
+__all__ = ["RELATIONAL_WRITE_OPERATIONS", "CatalogDataView"]

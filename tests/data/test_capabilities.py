@@ -10,6 +10,7 @@ from typing import cast
 import pytest
 
 from daita._json import FrozenJsonObject, thaw_json
+from daita.adapters.registry import SourceTypeRegistry
 from daita.capabilities import (
     CallTargetLane,
     CapabilityDeclarations,
@@ -79,7 +80,9 @@ def test_data_query_is_one_backend_neutral_model_tool() -> None:
 
 
 def test_data_export_is_one_backend_neutral_model_tool() -> None:
-    declarations = exact_export_capability_declarations()
+    declarations = exact_export_capability_declarations(
+        adapter_ids=("sqlite", "postgresql")
+    )
 
     assert tuple(item.id for item in declarations.capabilities) == (
         DATA_EXPORT_TABULAR_CAPABILITY_ID,
@@ -108,7 +111,7 @@ def test_data_export_is_one_backend_neutral_model_tool() -> None:
 
 
 def test_data_query_file_outputs_route_to_exact_export_with_one_limits_clause() -> None:
-    exports = exact_export_capability_declarations()
+    exports = exact_export_capability_declarations(adapter_ids=("sqlite", "postgresql"))
     query = data_query_capability_declarations(
         file_outputs=exact_export_outputs(allow_arrow=False),
         file_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
@@ -283,7 +286,9 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
         file_outputs=exact_export_outputs(allow_arrow=False),
         file_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
     )
-    export_bundle = exact_export_capability_declarations()
+    export_bundle = exact_export_capability_declarations(
+        adapter_ids=("sqlite", "postgresql")
+    )
     preview_bundle = relational_update_preview_capability_declarations()
     update_bundle = relational_update_capability_declarations()
     upsert_bundle = relational_upsert_capability_declarations()
@@ -320,6 +325,7 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
         ),
         cast(DataDomainCatalog, catalog),
         LearningCandidateGuard(),
+        SourceTypeRegistry(),
         local_file_sensitivity=ModelSensitivity.RESTRICTED if local_files else None,
     )
 
@@ -438,6 +444,7 @@ async def test_exact_relational_projection_rechecks_current_source_admission():
 async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     domain = object.__new__(DataCapabilityDomain)
     domain._catalog = cast(DataDomainCatalog, _Catalog())
+    domain._source_types = SourceTypeRegistry()
 
     sqlite = await domain._validate_sql(
         _run(),
@@ -551,7 +558,9 @@ class _ReadBackend:
 async def test_data_query_routes_each_catalog_binding_to_exactly_one_backend() -> None:
     sqlite = _ReadBackend("sqlite")
     postgresql = _ReadBackend("postgresql")
-    executor = DataQueryExecutor("agent-relational", sqlite, postgresql)
+    executor = DataQueryExecutor(
+        "agent-relational", {"sqlite": sqlite, "postgresql": postgresql}
+    )
 
     for adapter_id in ("sqlite", "postgresql"):
         output = await executor.execute(
@@ -582,7 +591,9 @@ async def test_data_query_inline_byte_limit_reports_truncation() -> None:
         {"id": index, "detail": "x" * 1_000} for index in range(100)
     )
     sqlite = _ReadBackend("sqlite", rows)
-    executor = DataQueryExecutor("agent-relational", sqlite, _ReadBackend("postgresql"))
+    executor = DataQueryExecutor(
+        "agent-relational", {"sqlite": sqlite, "postgresql": _ReadBackend("postgresql")}
+    )
 
     output = await executor.execute(
         ToolExecution(
@@ -640,8 +651,7 @@ async def test_data_export_routes_each_catalog_binding_to_exactly_one_backend() 
     postgresql = _ExportBackend("postgresql")
     executor = DataExportTabularExecutor(
         "agent-relational",
-        sqlite,
-        postgresql,
+        {"sqlite": sqlite, "postgresql": postgresql},
         clock=lambda: datetime(2026, 9, 3, tzinfo=UTC),
     )
 

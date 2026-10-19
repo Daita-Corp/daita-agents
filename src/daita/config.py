@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .llm.models import ModelCallPolicy
 from .llm.routing import ModelRoute
 from .loop.models import LoopLimits
+
+if TYPE_CHECKING:
+    from .adapters.registry import SourceType
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,8 +194,12 @@ class AgentConfig:
     host_capacity: HostCapacityLimits = field(default_factory=HostCapacityLimits)
     postgresql_reads: PostgreSQLReadLimits = field(default_factory=PostgreSQLReadLimits)
     admission_observations: bool = False
+    # Additional source types; the built-in types are always registered.
+    source_types: tuple[SourceType, ...] = ()
 
     def __post_init__(self) -> None:
+        from .adapters.registry import SourceType
+
         if self.model_route is not None and not isinstance(
             self.model_route, ModelRoute
         ):
@@ -208,6 +216,10 @@ class AgentConfig:
             raise TypeError("postgresql_reads must be PostgreSQLReadLimits")
         if type(self.admission_observations) is not bool:
             raise TypeError("admission_observations must be bool")
+        if not isinstance(self.source_types, tuple) or any(
+            not isinstance(item, SourceType) for item in self.source_types
+        ):
+            raise TypeError("source_types must be a tuple of SourceType")
 
 
 __all__ = [

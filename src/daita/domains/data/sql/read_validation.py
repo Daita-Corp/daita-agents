@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import Literal
 
 from .analysis import (
@@ -491,6 +491,40 @@ def validate_postgresql_read(
         allowed_resource_ids=allowed_resource_ids,
         dialect="postgresql",
     )
+
+
+_READ_VALIDATORS: dict[str, Callable[..., SqlValidationResult]] = {
+    "sqlite": validate_sqlite_read,
+    "postgresql": validate_postgresql_read,
+}
+
+
+def read_validator(dialect: str | None) -> Callable[..., SqlValidationResult] | None:
+    """Return the catalog-scoped read validator for one SQL dialect, if known."""
+
+    return None if dialect is None else _READ_VALIDATORS.get(dialect)
+
+
+def qualified_relation(schema: ResourceSchema, dialect: str | None) -> str | None:
+    """Quote one catalog relation in a dialect, or None without an exact name."""
+
+    def quote(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
+
+    if dialect == "sqlite":
+        return quote(schema.name)
+    if dialect != "postgresql":
+        return None
+    identity = next(
+        (
+            (alias[: -len(suffix)], schema.name)
+            for alias in schema.aliases
+            for suffix in ("." + schema.name,)
+            if alias.endswith(suffix) and len(alias) > len(suffix)
+        ),
+        None,
+    )
+    return None if identity is None else ".".join(quote(part) for part in identity)
 
 
 def _validate_sql_read(

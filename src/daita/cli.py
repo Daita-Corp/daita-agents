@@ -400,7 +400,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     attach = commands.add_parser("attach", help="attach a read-only source")
     attach.add_argument("name")
-    attach.add_argument("kind", choices=("sqlite", "postgresql"))
+    attach.add_argument(
+        "kind",
+        choices=tuple(item.adapter_id for item in Agent.registered_source_types()),
+    )
     attach.add_argument("path", type=Path, nargs="?")
     attach.add_argument("--host")
     attach.add_argument("--port", type=int, default=5432)

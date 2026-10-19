@@ -11,6 +11,7 @@ from typing import cast
 import pytest
 
 from daita.adapters.postgresql_query import PostgreSQLQueryError
+from daita.adapters.registry import SourceTypeRegistry
 from daita.capabilities import CapabilityInputError
 from daita.cli import _graph_inspection_mapping
 from daita.domains.data.profile_jobs import DataProfileExecutor, ProfileResourceBinding
@@ -50,8 +51,8 @@ async def test_postgresql_profile_read_uses_exact_qualified_catalog_identity() -
     executor = DataProfileExecutor(
         agent_id=AGENT_ID,
         catalog=catalog,
-        sqlite_backend=backend,
-        postgresql_backend=backend,
+        backends={"sqlite": backend, "postgresql": backend},
+        source_types=SourceTypeRegistry(),
     )
     assert schema.revision is not None
     assert schema.source_revision is not None

@@ -613,7 +613,9 @@ async def test_dataset_guidance_requires_exact_loaded_export_metadata(
 
     monkeypatch.setattr("daita.domains.analysis.domain.available", lambda: True)
     analysis = AnalysisCapabilityDomain(RunAdmissionCoordinator())
-    exports = exact_export_capability_declarations(allow_arrow=arrow)
+    exports = exact_export_capability_declarations(
+        adapter_ids=("sqlite", "postgresql"), allow_arrow=arrow
+    )
     query = data_query_capability_declarations(
         file_outputs=exact_export_outputs(allow_arrow=arrow),
         file_capability_id=exports.capabilities[0].id,
