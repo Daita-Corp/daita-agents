@@ -12,10 +12,8 @@ from typing import cast
 from ..capabilities import EffectOutcome
 from ..distribution.models import (
     CONVERSATION_INBOX_DESTINATION_REVISION,
-    MAX_DELIVERIES_PER_AGENT,
     ConversationInboxTarget,
     Delivery,
-    DeliveryState,
     GraphJobDelivery,
     conversation_inbox_destination_id,
     distribution_plan_digest,
@@ -75,6 +73,7 @@ from .errors import (
     GraphStoreConflictError as GraphStoreConflictError,
 )
 from .sql_connection import SQLConnection
+from .sql_deliveries import reserve_delivery_slot
 from .sqlite_codecs.distribution import decode_delivery, encode_delivery
 from .sqlite_codecs.graph import (
     decode_graph_event,
@@ -648,35 +647,11 @@ def _insert_graph_attention(
         if decoded != delivery:
             raise GraphStoreConflictError("attention delivery key changed content")
         return decoded
-    count = connection.execute(
-        "SELECT COUNT(*) FROM deliveries WHERE agent_id = ?",
-        (delivery.agent_id,),
-    ).fetchone()
-    if count is None:
-        raise GraphStoreConflictError("attention delivery count is unavailable")
-    if int(count[0]) >= MAX_DELIVERIES_PER_AGENT:
-        acknowledged = connection.execute(
-            """SELECT delivery_id FROM deliveries
-               WHERE agent_id = ? AND state = ?
-               ORDER BY created_at_us, delivery_id LIMIT 1""",
-            (delivery.agent_id, DeliveryState.ACKNOWLEDGED.value),
-        ).fetchone()
-        if acknowledged is None:
-            raise GraphValidationError(
-                "delivery_retention_limit",
-                "the inbox has no reclaimable acknowledged delivery",
-            )
-        deleted = connection.execute(
-            """DELETE FROM deliveries
-               WHERE agent_id = ? AND delivery_id = ? AND state = ?""",
-            (
-                delivery.agent_id,
-                acknowledged[0],
-                DeliveryState.ACKNOWLEDGED.value,
-            ),
+    if not reserve_delivery_slot(connection, delivery.agent_id):
+        raise GraphValidationError(
+            "delivery_retention_limit",
+            "the agent has no reclaimable delivery",
         )
-        if deleted.rowcount != 1:
-            raise GraphStoreConflictError("acknowledged delivery changed")
     connection.execute(
         """INSERT INTO deliveries(
                agent_id, delivery_id, conversation_id, subject_kind, subject_id,
@@ -979,6 +954,11 @@ def _insert_graph_delivery(
     connection: SQLConnection,
     delivery: GraphJobDelivery,
 ) -> None:
+    if not reserve_delivery_slot(connection, delivery.agent_id):
+        raise GraphValidationError(
+            "delivery_retention_limit",
+            "the agent has no reclaimable delivery",
+        )
     connection.execute(
         """INSERT INTO deliveries(
                agent_id, delivery_id, conversation_id, subject_kind, subject_id,

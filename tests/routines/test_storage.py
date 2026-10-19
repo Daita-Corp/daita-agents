@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
@@ -11,11 +11,28 @@ from pathlib import Path
 import pytest
 
 import daita.storage.sql as sqlite_module
+import daita.storage.sql_deliveries as delivery_store_module
 import daita.storage.sql_routines as routine_store_module
 from daita.distribution import DeliverySubjectKind, OutcomeState
+from daita.distribution.models import (
+    CONVERSATION_INBOX_DESTINATION_REVISION,
+    ConversationInboxTarget,
+    conversation_inbox_destination_id,
+    target_fingerprint,
+)
+from daita.distribution.owner import construct_graph_job_delivery
+from daita.jobs.graph.models import (
+    BudgetAmount,
+    ControlKind,
+    ControlState,
+    TaskAttempt,
+    TaskControl,
+    canonical_digest,
+)
 from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
+    ModelSensitivity,
     ModelUsage,
     TextBlock,
 )
@@ -30,6 +47,7 @@ from daita.loop.models import (
 )
 from daita.routines.models import (
     OnceSchedule,
+    RoutineOccurrence,
     RoutineOccurrenceDisposition,
     RoutineSlotKind,
     RoutineState,
@@ -47,6 +65,7 @@ from tests.routines._storage_support import (
     occurrence_record,
     routine_record,
 )
+from tests.support.graph import GRAPH_NOW, graph_admission, task_result
 
 
 def test_routine_codec_v1_round_trip_is_exact() -> None:
@@ -147,7 +166,7 @@ async def test_delivery_retention_limit_rolls_back_the_producer_transition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = await SQLiteStateStore.open(tmp_path / "state.db")
-    monkeypatch.setattr(routine_store_module, "MAX_DELIVERIES_PER_AGENT", 1)
+    monkeypatch.setattr(delivery_store_module, "MAX_DELIVERIES_PER_AGENT", 1)
     try:
         first_routine = await store.admit_scheduled_routine(
             routine_record(routine_id="routine-retention-one")
@@ -212,7 +231,7 @@ async def test_acknowledged_delivery_is_reclaimed_for_next_atomic_finalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = await SQLiteStateStore.open(tmp_path / "state.db")
-    monkeypatch.setattr(routine_store_module, "MAX_DELIVERIES_PER_AGENT", 1)
+    monkeypatch.setattr(delivery_store_module, "MAX_DELIVERIES_PER_AGENT", 1)
     try:
         first_routine = await store.admit_scheduled_routine(
             routine_record(routine_id="routine-reclaim-one")
@@ -273,6 +292,221 @@ async def test_acknowledged_delivery_is_reclaimed_for_next_atomic_finalization(
             )
             is None
         )
+    finally:
+        await store.close()
+
+
+async def _start_graph_task(
+    store: SQLiteStateStore, job_id: str, task_id: str, budget: int
+) -> TaskAttempt:
+    attempt_id = f"{job_id}:{task_id}"
+    attempt = await store.claim_graph_task(
+        "agent-1",
+        job_id,
+        task_id,
+        attempt_id=attempt_id,
+        claim_token=f"{attempt_id}:claim",
+        run_id=f"{attempt_id}:run",
+        executor_id="executor-1",
+        claimed_at=GRAPH_NOW,
+        lease_seconds=30,
+        absolute_deadline_at=GRAPH_NOW + timedelta(minutes=2),
+        budget_reservations=(BudgetAmount("work_units", budget),),
+    )
+    assert attempt is not None
+    started = await store.start_graph_attempt(
+        "agent-1",
+        job_id,
+        task_id,
+        attempt_id,
+        claim_token=f"{attempt_id}:claim",
+        fencing_epoch=attempt.fencing_epoch,
+        started_at=GRAPH_NOW + timedelta(seconds=1),
+    )
+    assert started is not None and started.claim_token is not None
+    return started
+
+
+async def _finish_graph_job_with_delivery(
+    store: SQLiteStateStore, job_id: str, completed_at: datetime
+) -> None:
+    await store.admit_graph(graph_admission(job_id=job_id))
+    for task_id, budget in (("worker", 2), ("finalizer", 1)):
+        attempt = await _start_graph_task(store, job_id, task_id, budget)
+        assert attempt.claim_token is not None
+        result = task_result(
+            job_id=job_id,
+            task_id=task_id,
+            attempt_id=attempt.attempt_id,
+            run_id=attempt.run_id,
+            result_id=f"{attempt.attempt_id}:result",
+            completed_at=completed_at,
+        )
+        if task_id == "worker":
+            await store.complete_graph_attempt(
+                result,
+                claim_token=attempt.claim_token,
+                fencing_epoch=attempt.fencing_epoch,
+                usage=None,
+            )
+            continue
+        destination_id = conversation_inbox_destination_id("conversation-1")
+        target = ConversationInboxTarget(
+            conversation_id="conversation-1",
+            destination_id=destination_id,
+            destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
+            sensitivity_ceiling=ModelSensitivity.RESTRICTED,
+            target_fingerprint=target_fingerprint(
+                conversation_id="conversation-1",
+                destination_id=destination_id,
+                destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
+                sensitivity_ceiling=ModelSensitivity.RESTRICTED,
+            ),
+        )
+        await store.finalize_graph_attempt(
+            result,
+            construct_graph_job_delivery(
+                delivery_id=f"delivery-{job_id}",
+                agent_id="agent-1",
+                conversation_id="conversation-1",
+                job_id=job_id,
+                target=target,
+                result_id=result.result_id,
+                result_digest=result.result_digest,
+                result_summary=result.summary,
+                artifact_references=(),
+                effective_sensitivity=ModelSensitivity.RESTRICTED,
+                provenance_digest=result.result_digest,
+                observed_at=completed_at,
+            ),
+            claim_token=attempt.claim_token,
+            fencing_epoch=attempt.fencing_epoch,
+            usage=None,
+        )
+
+
+async def _block_graph_job_on_input(store: SQLiteStateStore, job_id: str) -> None:
+    await store.admit_graph(graph_admission(job_id=job_id))
+    attempt = await _start_graph_task(store, job_id, "worker", 2)
+    assert attempt.claim_token is not None
+    payload = {"question": "Select the bounded source."}
+    await store.open_graph_control(
+        TaskControl(
+            agent_id="agent-1",
+            job_id=job_id,
+            task_id="worker",
+            control_id=f"{job_id}:control",
+            kind=ControlKind.NEEDS_INPUT,
+            state=ControlState.OPEN,
+            requesting_attempt_id=attempt.attempt_id,
+            payload=payload,
+            created_at=GRAPH_NOW + timedelta(seconds=2),
+            payload_digest=canonical_digest(payload),
+        ),
+        claim_token=attempt.claim_token,
+        fencing_epoch=attempt.fencing_epoch,
+    )
+
+
+async def _finalize_failed_routine(
+    store: SQLiteStateStore, routine_id: str
+) -> RoutineOccurrence:
+    routine = await store.admit_scheduled_routine(routine_record(routine_id=routine_id))
+    claimed = await store.claim_due_routine_occurrence(
+        routine.agent_id,
+        routine.routine_id,
+        expected_revision=routine.revision,
+        expected_due_at=NOW,
+        claimed_at=NOW,
+        claim_token=f"{routine_id}:claim",
+    )
+    assert claimed is not None
+    finalized = await store.finalize_routine_occurrence(
+        routine.agent_id,
+        claimed.occurrence_id,
+        delivery_id=f"delivery-{routine_id}",
+        finalized_at=NOW + timedelta(seconds=1),
+        failure_code="routine_test_failure",
+    )
+    assert finalized is not None and finalized[1] is not None
+    return claimed
+
+
+async def test_job_result_deliveries_yield_their_slots_to_routine_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Job results are never acknowledged; the job record stays authoritative.
+    for module in (sqlite_module, delivery_store_module):
+        monkeypatch.setattr(module, "MAX_DELIVERIES_PER_AGENT", 2)
+    path = tmp_path / "state.db"
+    store = await SQLiteStateStore.open(path)
+    try:
+        for ordinal in range(2):
+            await _finish_graph_job_with_delivery(
+                store, f"job-{ordinal}", GRAPH_NOW + timedelta(seconds=ordinal + 2)
+            )
+        await _finalize_failed_routine(store, "routine-after-jobs")
+        await _finish_graph_job_with_delivery(
+            store, "job-2", GRAPH_NOW + timedelta(seconds=4)
+        )
+        assert tuple(
+            item.job_id for item in await store.list_graph_deliveries("agent-1")
+        ) == ("job-2",)
+    finally:
+        await store.close()
+
+    reopened = await SQLiteStateStore.open(path)
+    try:
+        assert tuple(
+            item.delivery_id for item in await reopened.list_deliveries("agent-1")
+        ) == ("delivery-routine-after-jobs",)
+        assert await reopened.inspect_graph("agent-1", "job-0") is not None
+    finally:
+        await reopened.close()
+
+
+async def test_attention_on_a_job_still_waiting_for_the_user_is_never_reclaimed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(delivery_store_module, "MAX_DELIVERIES_PER_AGENT", 2)
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    try:
+        # "job-1" is a prefix of "job-10"; only the exact job's state may protect.
+        await _block_graph_job_on_input(store, "job-1")
+        await _block_graph_job_on_input(store, "job-10")
+        assert await store.resolve_graph_control(
+            "agent-1",
+            "job-10",
+            "worker",
+            "job-10:control",
+            state=ControlState.RESOLVED,
+            resolved_at=GRAPH_NOW + timedelta(seconds=3),
+            resolved_by_kind="user",
+            resolved_by_id="user-1",
+            resolution={"source_id": "source-1"},
+            make_ready=True,
+        )
+        attention = await store.list_deliveries("agent-1")
+        assert {item.subject_id.split("/")[0] for item in attention} == {
+            "job-1",
+            "job-10",
+        }
+
+        await _finalize_failed_routine(store, "routine-after-attention")
+        assert {
+            item.delivery_id for item in await store.list_deliveries("agent-1")
+        } == {
+            "delivery-routine-after-attention",
+            *(
+                item.delivery_id
+                for item in attention
+                if item.subject_id.startswith("job-1/")
+            ),
+        }
+        with pytest.raises(ValueError, match="delivery_retention_limit_exceeded"):
+            await _finalize_failed_routine(store, "routine-without-room")
     finally:
         await store.close()
 

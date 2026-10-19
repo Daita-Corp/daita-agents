@@ -16,9 +16,7 @@ from hashlib import sha256
 from .._json import FrozenJsonObject, canonical_json
 from ..capabilities import ExecutionScope
 from ..distribution.models import (
-    MAX_DELIVERIES_PER_AGENT,
     Delivery,
-    DeliveryState,
     DeliverySubjectKind,
     OutcomeArtifactReference,
     OutcomeConclusionKind,
@@ -53,6 +51,7 @@ from ..routines.schedule import (
     select_due_slot,
 )
 from .sql_connection import SQLConnection
+from .sql_deliveries import reserve_delivery_slot
 from .sqlite_codecs import (
     decode_delivery,
     decode_loop_exit,
@@ -73,31 +72,8 @@ from .sqlite_records import (
 
 
 def _insert_delivery(connection: SQLConnection, delivery: Delivery) -> None:
-    count = connection.execute(
-        "SELECT COUNT(*) FROM deliveries WHERE agent_id = ?",
-        (delivery.agent_id,),
-    ).fetchone()
-    assert count is not None
-    if int(count[0]) >= MAX_DELIVERIES_PER_AGENT:
-        acknowledged = connection.execute(
-            "SELECT delivery_id FROM deliveries "
-            "WHERE agent_id = ? AND state = ? "
-            "ORDER BY created_at_us, delivery_id LIMIT 1",
-            (delivery.agent_id, DeliveryState.ACKNOWLEDGED.value),
-        ).fetchone()
-        if acknowledged is None:
-            raise ValueError("delivery_retention_limit_exceeded")
-        deleted = connection.execute(
-            "DELETE FROM deliveries "
-            "WHERE agent_id = ? AND delivery_id = ? AND state = ?",
-            (
-                delivery.agent_id,
-                acknowledged[0],
-                DeliveryState.ACKNOWLEDGED.value,
-            ),
-        )
-        if deleted.rowcount != 1:
-            raise RuntimeError("acknowledged delivery changed during reclamation")
+    if not reserve_delivery_slot(connection, delivery.agent_id):
+        raise ValueError("delivery_retention_limit_exceeded")
     connection.execute(
         """INSERT INTO deliveries(
                agent_id, delivery_id, conversation_id, subject_kind, subject_id,
