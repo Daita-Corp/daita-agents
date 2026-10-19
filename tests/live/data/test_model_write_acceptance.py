@@ -674,9 +674,11 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
             assert len(scenario.approvals) == 1 and scenario.approvals[0]["approved"]
         else:
             assert scenario.approvals == []
-        inbox = await scenario.agent.inbox(conversation_id=scenario.conversation_id)
-        assert len(inbox) == 2
-        for item in inbox:
+        deliveries = await scenario.agent.list_deliveries(
+            conversation_id=scenario.conversation_id
+        )
+        assert len(deliveries) == 2
+        for item in deliveries:
             delivery = await scenario.agent.inspect_delivery(item.delivery_id)
             assert delivery.delivery.outcome.conclusion_state is OutcomeState.SUCCEEDED
         scenario.stages.append("two_exact_receipts_and_inbox_deliveries_verified")

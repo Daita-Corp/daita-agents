@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
@@ -48,7 +48,7 @@ from .catalog.models import (
     CatalogSummary,
 )
 from .config import AgentConfig
-from .distribution import DeliveryInspection, DistributionDestination, InboxView
+from .distribution import DeliveryInspection, DeliveryView, DistributionDestination
 from .hosting.embedded import (
     AgentAlreadyExistsError,
     AgentHomeError,
@@ -119,6 +119,7 @@ from .storage.sqlite_records import (
     SourcePermissionsPreview,
     SourceReadMode,
 )
+from .work_board import DEFAULT_DONE_WINDOW, WorkBoard
 from .workspace import LocalWorkspace
 
 
@@ -487,17 +488,17 @@ class Agent:
             run_id, caller_principal_id=caller_principal_id
         )
 
-    async def inbox(
+    async def list_deliveries(
         self,
         *,
         conversation_id: str | None = None,
         include_acknowledged: bool = False,
         limit: int = 50,
         caller_principal_id: str | None = None,
-    ) -> tuple[InboxView, ...]:
+    ) -> tuple[DeliveryView, ...]:
         """Inspect bounded durable autonomous results for this agent."""
 
-        return await self._embedded.inbox(
+        return await self._embedded.list_deliveries(
             conversation_id=conversation_id,
             include_acknowledged=include_acknowledged,
             limit=limit,
@@ -531,13 +532,25 @@ class Agent:
             delivery_id, caller_principal_id=caller_principal_id
         )
 
-    async def acknowledge_inbox(
+    async def acknowledge_delivery(
         self, delivery_id: str, *, caller_principal_id: str | None = None
-    ) -> InboxView | None:
-        """Idempotently acknowledge one exact inbox result."""
+    ) -> DeliveryView | None:
+        """Idempotently acknowledge one exact delivery."""
 
-        return await self._embedded.acknowledge_inbox(
+        return await self._embedded.acknowledge_delivery(
             delivery_id, caller_principal_id=caller_principal_id
+        )
+
+    async def work_board(
+        self,
+        *,
+        done_window: timedelta = DEFAULT_DONE_WINDOW,
+        caller_principal_id: str | None = None,
+    ) -> WorkBoard:
+        """Show live and recent work as Scheduled, Running, Needs you and Done."""
+
+        return await self._embedded.work_board(
+            done_window=done_window, caller_principal_id=caller_principal_id
         )
 
     def background_status(self) -> tuple[SupervisorStatus, ...]:
@@ -1641,11 +1654,11 @@ __all__ = [
     "AgentNotConfiguredError",
     "AgentNotFoundError",
     "CatalogSummary",
+    "DeliveryView",
     "GraphInspection",
     "GraphJob",
     "GraphState",
     "HostActiveError",
-    "InboxView",
     "PostgreSQLProbeResult",
     "PostgreSQLSourceError",
     "SourceRefreshError",

@@ -69,6 +69,6 @@ def test_resident_subprocess_runs_due_slot_and_restart_does_not_duplicate(
     )
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout) == {
-        "inbox_count": 1,
+        "delivery_count": 1,
         "restart_model_calls": 0,
     }

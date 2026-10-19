@@ -663,6 +663,7 @@ def test_public_surface_is_focused():
         "DeliveryInspection",
         "DeliverySubjectKind",
         "DeliveryState",
+        "DeliveryView",
         "DistributionDestination",
         "DistributionPlan",
         "DistributionTargetBinding",
@@ -678,7 +679,6 @@ def test_public_surface_is_focused():
         "GraphInspection",
         "GraphJob",
         "GraphState",
-        "InboxView",
         "IntervalSchedule",
         "LocalFileAccess",
         "LocalWorkspace",
@@ -746,6 +746,10 @@ def test_public_surface_is_focused():
         "ScheduledRoutineSummary",
         "ScheduledRoutine",
         "Transcript",
+        "WorkBoard",
+        "WorkCard",
+        "WorkColumn",
+        "WorkKind",
         "__version__",
         "create_llm_provider",
         "run_resident_host",
@@ -826,7 +830,8 @@ def test_graph_finalization_and_distribution_have_single_current_owners():
     assert _class_owners("Delivery") == {"distribution/models.py"}
     assert _class_owners("DistributionOwner") == {"distribution/owner.py"}
     assert _class_owners("RunStartEnvelope") == {"loop/models.py"}
-    assert _class_owners("InboxScreen") == {"tui/screens/inbox.py"}
+    assert _class_owners("ResultScreen") == {"tui/screens/result.py"}
+    assert _class_owners("WorkBoardView") == {"tui/widgets/command_center.py"}
     assert "autonomous_followups" not in CURRENT_SCHEMA.tables
     assert "deliveries" in CURRENT_SCHEMA.tables
     production = _python_text(PACKAGE)
@@ -863,16 +868,20 @@ def test_graph_finalization_and_distribution_have_single_current_owners():
     assert "executor.execute(" not in supervisor
     assert "execute_read(" not in supervisor
 
-    inbox_screen = (PACKAGE / "tui" / "screens" / "inbox.py").read_text(
+    result_screen = (PACKAGE / "tui" / "screens" / "result.py").read_text(
+        encoding="utf-8"
+    )
+    work_board_view = (PACKAGE / "tui" / "widgets" / "command_center.py").read_text(
         encoding="utf-8"
     )
     tui_controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
     tui_app = (PACKAGE / "tui" / "app.py").read_text(encoding="utf-8")
-    assert "require_agent().inbox(" in tui_controller
-    assert "require_agent().acknowledge_inbox(" in tui_controller
+    assert "require_agent().work_board(" in tui_controller
+    assert "require_agent().acknowledge_delivery(" in tui_controller
     assert "event.run_origin" in tui_app
-    assert "Agent.run" not in inbox_screen
-    assert "_embedded" not in inbox_screen
+    for presentation in (result_screen, work_board_view):
+        assert "Agent.run" not in presentation
+        assert "_embedded" not in presentation
 
     production = _python_text(PACKAGE)
     for forbidden in (

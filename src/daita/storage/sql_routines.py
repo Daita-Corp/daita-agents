@@ -16,9 +16,7 @@ from hashlib import sha256
 from .._json import FrozenJsonObject, canonical_json
 from ..capabilities import ExecutionScope
 from ..distribution.models import (
-    MAX_DELIVERIES_PER_AGENT,
     Delivery,
-    DeliveryState,
     DeliverySubjectKind,
     OutcomeArtifactReference,
     OutcomeConclusionKind,
@@ -33,6 +31,7 @@ from ..llm.models import MessageRole, ToolResultBlock
 from ..llm.pricing import STALL_USAGE_UNREPORTED, CostEstimateStatus
 from ..loop.models import LoopExitKind, RunOrigin, Transcript
 from ..routines.models import (
+    ACTIVE_OCCURRENCE_DISPOSITIONS,
     MAX_ACTIVE_ROUTINES_PER_AGENT,
     MAX_ROUTINE_ATTEMPTS,
     MAX_SCHEDULED_ROUTINES_PER_AGENT,
@@ -53,6 +52,7 @@ from ..routines.schedule import (
     select_due_slot,
 )
 from .sql_connection import SQLConnection
+from .sql_deliveries import reserve_delivery_slot
 from .sqlite_codecs import (
     decode_delivery,
     decode_loop_exit,
@@ -73,31 +73,8 @@ from .sqlite_records import (
 
 
 def _insert_delivery(connection: SQLConnection, delivery: Delivery) -> None:
-    count = connection.execute(
-        "SELECT COUNT(*) FROM deliveries WHERE agent_id = ?",
-        (delivery.agent_id,),
-    ).fetchone()
-    assert count is not None
-    if int(count[0]) >= MAX_DELIVERIES_PER_AGENT:
-        acknowledged = connection.execute(
-            "SELECT delivery_id FROM deliveries "
-            "WHERE agent_id = ? AND state = ? "
-            "ORDER BY created_at_us, delivery_id LIMIT 1",
-            (delivery.agent_id, DeliveryState.ACKNOWLEDGED.value),
-        ).fetchone()
-        if acknowledged is None:
-            raise ValueError("delivery_retention_limit_exceeded")
-        deleted = connection.execute(
-            "DELETE FROM deliveries "
-            "WHERE agent_id = ? AND delivery_id = ? AND state = ?",
-            (
-                delivery.agent_id,
-                acknowledged[0],
-                DeliveryState.ACKNOWLEDGED.value,
-            ),
-        )
-        if deleted.rowcount != 1:
-            raise RuntimeError("acknowledged delivery changed during reclamation")
+    if not reserve_delivery_slot(connection, delivery.agent_id):
+        raise ValueError("delivery_retention_limit_exceeded")
     connection.execute(
         """INSERT INTO deliveries(
                agent_id, delivery_id, conversation_id, subject_kind, subject_id,
@@ -398,6 +375,48 @@ def list_occurrences(
                WHERE agent_id = ? AND routine_id = ?
                ORDER BY occurrence_id DESC LIMIT ?""",
             (agent_id, routine_id, limit),
+        )
+    )
+    return tuple(
+        decode_routine_occurrence(data, agent_id=agent_id, occurrence_id=occurrence_id)
+        for occurrence_id, data in rows
+    )
+
+
+def list_active_occurrences(
+    connection: SQLConnection,
+    agent_id: str,
+    *,
+    limit: int,
+) -> tuple[RoutineOccurrence, ...]:
+    states = sorted(item.value for item in ACTIVE_OCCURRENCE_DISPOSITIONS)
+    rows = tuple(
+        connection.execute(
+            "SELECT occurrence_id, data FROM routine_occurrences "
+            f"WHERE agent_id = ? AND state IN ({', '.join('?' for _ in states)}) "
+            "ORDER BY occurrence_id DESC LIMIT ?",
+            (agent_id, *states, limit),
+        )
+    )
+    return tuple(
+        decode_routine_occurrence(data, agent_id=agent_id, occurrence_id=occurrence_id)
+        for occurrence_id, data in rows
+    )
+
+
+def load_occurrences(
+    connection: SQLConnection,
+    agent_id: str,
+    occurrence_ids: tuple[str, ...],
+) -> tuple[RoutineOccurrence, ...]:
+    if not occurrence_ids:
+        return ()
+    rows = tuple(
+        connection.execute(
+            "SELECT occurrence_id, data FROM routine_occurrences "
+            "WHERE agent_id = ? AND occurrence_id IN "
+            f"({', '.join('?' for _ in occurrence_ids)}) ORDER BY occurrence_id",
+            (agent_id, *occurrence_ids),
         )
     )
     return tuple(

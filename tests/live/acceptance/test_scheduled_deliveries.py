@@ -20,7 +20,7 @@ import pytest
 from daita import (
     Agent,
     ArtifactRequirement,
-    InboxView,
+    DeliveryView,
     IntervalSchedule,
     LoopLimits,
     MisfirePolicy,
@@ -215,14 +215,16 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
             expected_revision=created.revision,
         )
         deadline = asyncio.get_running_loop().time() + 180
-        inbox: tuple[InboxView, ...] = ()
+        deliveries: tuple[DeliveryView, ...] = ()
         while asyncio.get_running_loop().time() < deadline:
-            inbox = await agent.inbox(conversation_id=origin.conversation_id)
-            if inbox:
+            deliveries = await agent.list_deliveries(
+                conversation_id=origin.conversation_id
+            )
+            if deliveries:
                 break
             await asyncio.sleep(0.05)
-        assert len(inbox) == 1
-        delivery = inbox[0]
+        assert len(deliveries) == 1
+        delivery = deliveries[0]
         assert delivery.failure_code is None
         (reference,) = delivery.artifact_references
         assert reference.producer_capability_id == (DATA_EXPORT_TABULAR_CAPABILITY_ID)

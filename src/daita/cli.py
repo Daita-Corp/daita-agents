@@ -13,7 +13,7 @@ import sys
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -68,8 +68,8 @@ from .distribution import (
     ArtifactRequirement,
     OutcomeContract,
     delivery_inspection_projection,
+    delivery_view_projection,
     distribution_destination_projection,
-    inbox_view_projection,
 )
 from .errors import StateCompatibilityError
 from .jobs.graph.models import GraphInspection, GraphState, TaskState
@@ -92,8 +92,14 @@ from .tui.models import (
     validate_candidate_review_cost_limit as _validate_candidate_review_cost_limit,
 )
 from .tui.projection import run_failure_notice, tool_outcome_summary
+from .work_board import work_board_projection
 
 _CANDIDATE_REVIEW_COST_LIMIT_ENV = "DAITA_CANDIDATE_REVIEW_MAX_COST_USD"
+_HOST_NOTICE = (
+    "Host open for this command only. Saved assignments progress while a host is open; "
+    "this command closes its host on exit. For continued execution, run "
+    "daita host --agent <name>. Stop that host before reopening the same agent in the TUI."
+)
 
 
 def _graph_inspection_mapping(inspection: GraphInspection) -> dict[str, object]:
@@ -863,30 +869,32 @@ def build_parser() -> argparse.ArgumentParser:
         action.add_argument("routine_id")
         action.add_argument("expected_revision", type=int)
 
-    inbox = commands.add_parser(
-        "inbox",
-        help="discover destinations and inspect logical deliveries",
-    )
-    inbox_commands = inbox.add_subparsers(dest="inbox_command", required=True)
-    inbox_destinations = inbox_commands.add_parser("destinations")
-    inbox_destinations.add_argument("name")
-    inbox_destinations.add_argument("conversation_id")
-    inbox_destinations.add_argument(
+    routine_destinations = routine_commands.add_parser("destinations")
+    routine_destinations.add_argument("name")
+    routine_destinations.add_argument("conversation_id")
+    routine_destinations.add_argument(
         "--sensitivity-ceiling",
         choices=tuple(item.value for item in ModelSensitivity),
         default=ModelSensitivity.RESTRICTED.value,
     )
-    inbox_list = inbox_commands.add_parser("list")
-    inbox_list.add_argument("name")
-    inbox_list.add_argument("--conversation-id")
-    inbox_list.add_argument("--include-acknowledged", action="store_true")
-    inbox_list.add_argument("--limit", type=int, default=50)
-    inbox_inspect = inbox_commands.add_parser("inspect")
-    inbox_inspect.add_argument("name")
-    inbox_inspect.add_argument("delivery_id")
-    inbox_acknowledge = inbox_commands.add_parser("acknowledge")
-    inbox_acknowledge.add_argument("name")
-    inbox_acknowledge.add_argument("delivery_id")
+
+    work = commands.add_parser(
+        "work",
+        help="show the work board and inspect or dismiss results",
+    )
+    work_commands = work.add_subparsers(dest="work_command", required=True)
+    work_show = work_commands.add_parser("show")
+    work_show.add_argument("name")
+    work_show.add_argument(
+        "--done-hours",
+        type=int,
+        default=24,
+        help="hours finished work stays in Done (1 to 168)",
+    )
+    for command in ("inspect", "dismiss"):
+        action = work_commands.add_parser(command)
+        action.add_argument("name")
+        action.add_argument("delivery_id")
     return parser
 
 
@@ -2224,8 +2232,24 @@ async def _execute(args: argparse.Namespace) -> object:
                 return {"name": args.skill_name, "changed": changed}
             deleted = await agent.delete_skill(args.skill_name)
             return {"name": args.skill_name, "deleted": deleted}
-        if args.command == "inbox":
-            if args.inbox_command == "destinations":
+        if args.command == "work":
+            print(_HOST_NOTICE, file=sys.stderr)
+            if args.work_command == "show":
+                return work_board_projection(
+                    await agent.work_board(done_window=timedelta(hours=args.done_hours))
+                )
+            if args.work_command == "inspect":
+                delivery_inspection = await agent.inspect_delivery(args.delivery_id)
+                if delivery_inspection is None:
+                    raise ValueError("delivery not found")
+                return delivery_inspection_projection(delivery_inspection)
+            dismissed = await agent.acknowledge_delivery(args.delivery_id)
+            if dismissed is None:
+                raise ValueError("delivery not found")
+            return delivery_view_projection(dismissed)
+        if args.command == "routines":
+            print(_HOST_NOTICE, file=sys.stderr)
+            if args.routines_command == "destinations":
                 return [
                     distribution_destination_projection(item)
                     for item in await agent.distribution_destinations(
@@ -2233,31 +2257,6 @@ async def _execute(args: argparse.Namespace) -> object:
                         sensitivity_ceiling=ModelSensitivity(args.sensitivity_ceiling),
                     )
                 ]
-            if args.inbox_command == "list":
-                return [
-                    inbox_view_projection(item)
-                    for item in await agent.inbox(
-                        conversation_id=args.conversation_id,
-                        include_acknowledged=args.include_acknowledged,
-                        limit=args.limit,
-                    )
-                ]
-            if args.inbox_command == "inspect":
-                delivery_inspection = await agent.inspect_delivery(args.delivery_id)
-                if delivery_inspection is None:
-                    raise ValueError("delivery not found")
-                return delivery_inspection_projection(delivery_inspection)
-            acknowledged = await agent.acknowledge_inbox(args.delivery_id)
-            if acknowledged is None:
-                raise ValueError("delivery not found")
-            return inbox_view_projection(acknowledged)
-        if args.command == "routines":
-            print(
-                "Host open for this command only. Saved assignments progress while a host is open; "
-                "this command closes its host on exit. For continued execution, run "
-                "daita host --agent <name>. Stop that host before reopening the same agent in the TUI.",
-                file=sys.stderr,
-            )
             if args.routines_command == "list":
                 states = frozenset(RoutineState(item) for item in (args.state or ()))
                 return [

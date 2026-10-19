@@ -70,10 +70,10 @@ class StatusBar(Horizontal):
         state: str,
         context_used: int | None = None,
         context_total: int | None = None,
-        active_jobs: int = 0,
-        saved_routines: int = 0,
+        scheduled: int = 0,
+        running: int = 0,
+        needs_you: int = 0,
         active_reports: int = 0,
-        inbox_items: int = 0,
         source_count: int = 0,
         too_small: bool = False,
     ) -> None:
@@ -91,9 +91,8 @@ class StatusBar(Horizontal):
             source, maximum=48, preserve_lines=False, fallback="none"
         )
         self.tooltip = (
-            f"{source_count} sources · {active_jobs} active jobs · "
-            f"{saved_routines}{'+' if saved_routines == 50 else ''} saved routines · "
-            f"{inbox_items} unread results. Sources: {safe_source}"
+            f"{source_count} sources · {scheduled} scheduled · {running} running · "
+            f"{needs_you} need you. Sources: {safe_source}"
         )
         safe_agent = sanitize_terminal_text(
             agent, maximum=32, preserve_lines=False, fallback="agent"

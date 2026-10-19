@@ -378,7 +378,7 @@ async def test_routine_run_reaches_the_host_sink_without_an_observer(tmp_path):
             created.routine_id, expected_revision=created.revision
         )
         deadline = asyncio.get_running_loop().time() + 15
-        while not await agent.inbox(conversation_id=origin.conversation_id):
+        while not await agent.list_deliveries(conversation_id=origin.conversation_id):
             assert asyncio.get_running_loop().time() < deadline
             await asyncio.sleep(0.01)
     finally:

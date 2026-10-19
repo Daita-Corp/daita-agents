@@ -238,7 +238,7 @@ async def test_live_model_authors_grant_and_runs_immediate_and_weekly_occurrence
             len(scenario.approvals) == 1 and scenario.approvals[0]["approved"] is True
         )
         assert scenario.conversation_id is not None
-        for item in await scenario.agent.inbox(
+        for item in await scenario.agent.list_deliveries(
             conversation_id=scenario.conversation_id
         ):
             delivery = await scenario.agent.inspect_delivery(item.delivery_id)

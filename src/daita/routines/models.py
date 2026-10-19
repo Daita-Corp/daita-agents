@@ -213,6 +213,17 @@ class RoutineOccurrenceDisposition(str, Enum):
     TERMINAL_FAILED = "terminal_failed"
 
 
+ACTIVE_OCCURRENCE_DISPOSITIONS = frozenset(
+    {
+        RoutineOccurrenceDisposition.CLAIMED,
+        RoutineOccurrenceDisposition.PRECHECKING,
+        RoutineOccurrenceDisposition.RUNNING,
+        RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION,
+        RoutineOccurrenceDisposition.RETRYABLE,
+    }
+)
+
+
 class RoutineControlAction(str, Enum):
     PAUSE = "pause"
     RESUME = "resume"

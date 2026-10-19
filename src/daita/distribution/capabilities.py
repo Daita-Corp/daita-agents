@@ -28,8 +28,8 @@ from ..loop.models import RunInput, RunOrigin
 from .models import (
     MAX_DELIVERY_LIST_PAGE_SIZE,
     delivery_inspection_projection,
+    delivery_view_projection,
     distribution_destination_projection,
-    inbox_view_projection,
 )
 from .owner import DistributionOwner
 
@@ -116,7 +116,7 @@ class DeliveryListExecutor:
         return ToolOutput(
             kind="distribution.delivery_list",
             data={
-                "deliveries": [inbox_view_projection(item) for item in values],
+                "deliveries": [delivery_view_projection(item) for item in values],
                 "count": len(values),
             },
             sensitivity=sensitivity,

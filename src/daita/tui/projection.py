@@ -580,7 +580,7 @@ def tool_outcome_summary(result: ToolResultBlock) -> str | None:
         return sanitize_terminal_text(
             f"Routine {data.get('action')} committed: {routine.get('routine_id')} "
             f"(revision {routine.get('revision')}, {routine.get('state')}). "
-            "Scheduled execution is reported separately in the Inbox.",
+            "Scheduled execution is reported separately on the work board.",
             maximum=1600,
             preserve_lines=False,
             fallback="Routine mutation recorded.",

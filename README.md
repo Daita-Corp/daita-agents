@@ -18,7 +18,8 @@ access, budgets, and actions you authorize.
 - **Answer across systems.** Query admitted databases, local CSV, TSV, JSON,
   NDJSON, and Parquet files, and remote MCP tools using current source evidence.
 - **Carry work forward.** Run durable task graphs or set assignments to run
-  once or regularly. Review their results in the inbox while a Daita host is open.
+  once or regularly. Follow them and review results on the Work tab while a Daita
+  host is open.
 - **Improve with use.** Keep conversations, approved business knowledge,
   meanings tied to specific sources, and reusable Markdown procedures. An
   optional, explicit review can propose lessons from completed runs for you to accept.
@@ -53,20 +54,24 @@ Try asking:
 How do our customers, orders, and payments tables relate?
 Profile the orders and payments tables without changing them.
 Compare paid revenue by region across our admitted sources.
-Every Monday, summarize last week's revenue and put the result in my inbox.
+Every Monday, summarize last week's revenue and send me the result.
 ```
 
 Use `/learn <material>` to teach Daita a business definition or procedure with
-approval. `/jobs` shows durable work, `/routines` manages saved assignments, and
-`/inbox` shows their results. `/artifacts` previews, saves, and deletes stored
-files. `/sources` explores connections and relationships;
+approval. `/work` shows the work board, `/jobs` manages durable work, and
+`/routines` manages saved assignments. `/artifacts` previews, saves, and deletes
+stored files. `/sources` explores connections and relationships;
 `@` narrows a question to one source. Type `/help` for the full command list.
 
-The header has five tabs on the same row as the agent and model: Chat, Sources,
-Work, Inbox, and Artifacts. Work combines active jobs and upcoming routines.
-Click a tab, use `F6` and the arrow
-keys, or press `Ctrl+1` through `Ctrl+5`. Select a row to open its existing detail
-screen; closing it returns to your chat draft. `F1` shows the full controls.
+The header has four tabs on the same row as the agent and model: Chat, Sources,
+Work, and Artifacts. Click a tab, use `F6` and the arrow keys, or press `Ctrl+1`
+through `Ctrl+4`. Work is a board of everything long-running, in four columns:
+Scheduled (routines with a next run and queued jobs), Running, Needs you
+(approvals, input, failures and withheld results) and Done (finished results from
+the last 24 hours). Its tab counts the items that need you. On the board, the
+arrow keys move between and within columns, `Enter` opens a card, and `d` dismisses
+a result. Opening a card shows its existing detail screen; closing it returns to
+your chat draft. `F1` shows the full controls.
 Approvals bring Chat into focus and stay above the composer until resolved.
 
 Scheduled work progresses only while the terminal or `daita host --agent <name>`

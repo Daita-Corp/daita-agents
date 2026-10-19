@@ -20,6 +20,7 @@ from ..widgets.approval import ApprovalPanel
 from ..widgets.command_center import (
     CommandCenterNavigate,
     CommandSections,
+    WorkBoardView,
 )
 from ..widgets.composer import (
     CompletionPopup,
@@ -42,8 +43,7 @@ class ChatScreen(Screen[None]):
         Binding("ctrl+1", "section('chat')", show=False, priority=True),
         Binding("ctrl+2", "section('sources')", show=False, priority=True),
         Binding("ctrl+3", "section('work')", show=False, priority=True),
-        Binding("ctrl+4", "section('inbox')", show=False, priority=True),
-        Binding("ctrl+5", "section('artifacts')", show=False, priority=True),
+        Binding("ctrl+4", "section('artifacts')", show=False, priority=True),
         Binding("f6", "focus_tabs", "Tabs", priority=True),
         Binding("f1", "help", "Help", priority=True),
         Binding("escape", "focus_conversation", "Chat", show=False),
@@ -69,7 +69,6 @@ class ChatScreen(Screen[None]):
                         ("chat", "Chat"),
                         ("sources", "Sources"),
                         ("work", "Work"),
-                        ("inbox", "Inbox"),
                         ("artifacts", "Artifacts"),
                     )
                 ),
@@ -110,7 +109,11 @@ class ChatScreen(Screen[None]):
             else (
                 ("enter", "f6", "f1")
                 if self.section == "chat"
-                else ("enter", "escape", "f1")
+                else (
+                    ("enter", "d", "escape", "f1")
+                    if self.section == "work"
+                    else ("enter", "escape", "f1")
+                )
             )
         )
         return {
@@ -174,9 +177,10 @@ class ChatScreen(Screen[None]):
     def focus_section(self) -> None:
         if self.section == "chat":
             self.query_one(Composer).focus()
+        elif self.section == "work":
+            self.query_one(WorkBoardView).focus_board()
         else:
-            section = "jobs" if self.section == "work" else self.section
-            self.query_one(f"#command-{section}", OptionList).focus()
+            self.query_one(f"#command-{self.section}", OptionList).focus()
 
     def action_focus_tabs(self) -> None:
         if self.query_one(ApprovalPanel).active:
@@ -214,6 +218,20 @@ class ChatScreen(Screen[None]):
         self.run_worker(
             self.daita_app.open_command_center_item(event.section, event.item_id),
             name="command-center-navigation",
+            group="foreground-interaction",
+            exclusive=True,
+        )
+
+    def on_work_board_view_dismiss_requested(
+        self, event: WorkBoardView.DismissRequested
+    ) -> None:
+        event.stop()
+        if self.query_one(ApprovalPanel).active:
+            self.action_focus_conversation()
+            return
+        self.run_worker(
+            self.daita_app.dismiss_work_result(event.delivery_id),
+            name="work-dismiss",
             group="foreground-interaction",
             exclusive=True,
         )
@@ -315,10 +333,10 @@ class ChatScreen(Screen[None]):
         state: str,
         context_used: int | None = None,
         context_total: int | None = None,
-        active_jobs: int = 0,
-        saved_routines: int = 0,
+        scheduled: int = 0,
+        running: int = 0,
+        needs_you: int = 0,
         active_reports: int = 0,
-        inbox_items: int = 0,
         source_count: int = 0,
         too_small: bool = False,
     ) -> None:
@@ -329,23 +347,22 @@ class ChatScreen(Screen[None]):
             state=state,
             context_used=context_used,
             context_total=context_total,
-            active_jobs=active_jobs,
-            saved_routines=saved_routines,
+            scheduled=scheduled,
+            running=running,
+            needs_you=needs_you,
             active_reports=active_reports,
-            inbox_items=inbox_items,
             source_count=source_count,
             too_small=too_small,
         )
         for section, label, count in (
             ("sources", "Sources", source_count),
-            ("work", "Work", active_jobs),
-            ("inbox", "Inbox", inbox_items),
+            ("work", "Work", needs_you),
         ):
             self.query_one(f"#tab-{section}", Tab).label = (
                 f"{label} {count}" if count else label
             )
         self.query_one("#tab-work").tooltip = (
-            f"{active_jobs} active jobs · {saved_routines}{'+' if saved_routines == 50 else ''} saved routines"
+            f"{running} running · {scheduled} scheduled · {needs_you} need you"
         )
         self._apply_layout()
 

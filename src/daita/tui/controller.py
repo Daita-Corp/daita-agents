@@ -18,8 +18,7 @@ from daita import (
     ApprovalHandler,
     ConversationRun,
     DeliveryInspection,
-    DistributionDestination,
-    InboxView,
+    DeliveryView,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningReviewStatus,
@@ -35,6 +34,7 @@ from daita import (
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
     Transcript,
+    WorkBoard,
 )
 from daita.agent import (
     AgentAlreadyExistsError,
@@ -673,8 +673,8 @@ class PresentationController:
     async def list_jobs(self) -> tuple[GraphJob, ...]:
         return await self.require_agent().list_jobs(limit=50)
 
-    async def list_inbox(self) -> tuple[InboxView, ...]:
-        return await self.require_agent().inbox(limit=50)
+    async def work_board(self) -> WorkBoard:
+        return await self.require_agent().work_board()
 
     async def list_artifacts(
         self, *, limit: int, offset: int, newest_first: bool = False
@@ -695,25 +695,14 @@ class PresentationController:
     async def delete_artifact(self, artifact_id: str) -> bool:
         return await self.require_agent().delete_artifact(artifact_id)
 
-    async def list_distribution_destinations(
-        self,
-        conversation_id: str,
-        *,
-        sensitivity_ceiling: ModelSensitivity,
-    ) -> tuple[DistributionDestination, ...]:
-        return await self.require_agent().distribution_destinations(
-            conversation_id,
-            sensitivity_ceiling=sensitivity_ceiling,
-        )
-
     async def inspect_delivery(
         self,
         delivery_id: str,
     ) -> DeliveryInspection | None:
         return await self.require_agent().inspect_delivery(delivery_id)
 
-    async def acknowledge_inbox(self, delivery_id: str) -> InboxView | None:
-        return await self.require_agent().acknowledge_inbox(delivery_id)
+    async def acknowledge_delivery(self, delivery_id: str) -> DeliveryView | None:
+        return await self.require_agent().acknowledge_delivery(delivery_id)
 
     async def inspect_job(self, job_id: str) -> GraphInspection | None:
         return await self.require_agent().inspect_job(job_id)
@@ -1006,16 +995,16 @@ class PresentationController:
             return await self._jobs_command(parts)
         if name == "/routines":
             return await self._routines_command(parts, command)
-        if name == "/inbox":
+        if name == "/work":
             if len(parts) == 1:
                 return CommandOutcome(
                     "screen",
-                    screen="inbox",
+                    screen="work",
                     conversation_id=conversation_id,
                 )
             return CommandOutcome(
                 "notice",
-                "Usage: /inbox",
+                "Usage: /work",
                 conversation_id=conversation_id,
             )
         if name == "/artifacts":

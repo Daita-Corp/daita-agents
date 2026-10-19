@@ -1435,6 +1435,47 @@ class SQLStateStore:
 
         return await settled_thread(read)
 
+    async def list_active_routine_occurrences(
+        self,
+        agent_id: str,
+        *,
+        limit: int = MAX_ROUTINE_HISTORY_PAGE_SIZE,
+    ) -> tuple[RoutineOccurrence, ...]:
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= MAX_ROUTINE_HISTORY_PAGE_SIZE
+        ):
+            raise ValueError("active occurrence limit is outside its bound")
+
+        def read() -> tuple[RoutineOccurrence, ...]:
+            with _connect_read_only(self._database) as connection:
+                return _routine_store.list_active_occurrences(
+                    connection, agent_id, limit=limit
+                )
+
+        return await settled_thread(read)
+
+    async def load_routine_occurrences(
+        self,
+        agent_id: str,
+        occurrence_ids: tuple[str, ...],
+    ) -> tuple[RoutineOccurrence, ...]:
+        if (
+            not isinstance(occurrence_ids, tuple)
+            or len(occurrence_ids) > MAX_DELIVERY_LIST_PAGE_SIZE
+            or any(not isinstance(item, str) or not item for item in occurrence_ids)
+        ):
+            raise ValueError("occurrence identities are outside their bound")
+
+        def read() -> tuple[RoutineOccurrence, ...]:
+            with _connect_read_only(self._database) as connection:
+                return _routine_store.load_occurrences(
+                    connection, agent_id, occurrence_ids
+                )
+
+        return await settled_thread(read)
+
     async def revise_scheduled_routine(
         self,
         routine: ScheduledRoutine,

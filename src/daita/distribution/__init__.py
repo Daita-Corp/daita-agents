@@ -18,12 +18,12 @@ from .models import (
     DeliveryInspection,
     DeliveryState,
     DeliverySubjectKind,
+    DeliveryView,
     DistributionDestination,
     DistributionDestinationState,
     DistributionPlan,
     DistributionTargetBinding,
     EffectRequirement,
-    InboxView,
     OutcomeArtifactReference,
     OutcomeConclusionKind,
     OutcomeContract,
@@ -32,10 +32,10 @@ from .models import (
     conclusion_preview_projection,
     conversation_inbox_destination_id,
     delivery_inspection_projection,
+    delivery_view_projection,
     distribution_destination_projection,
     distribution_plan_digest,
     distribution_plan_projection,
-    inbox_view_projection,
     is_distribution_destination_id,
     logical_delivery_key,
     outcome_artifact_reference,
@@ -45,7 +45,7 @@ from .models import (
     target_fingerprint,
     validate_outcome_artifact_references,
 )
-from .owner import DistributionOwner
+from .owner import DistributionOwner, delivery_view
 
 __all__ = [
     "ArtifactRequirement",
@@ -67,7 +67,7 @@ __all__ = [
     "DELIVERY_LIST_TOOL_NAME",
     "DELIVERY_INSPECT_CAPABILITY_ID",
     "DELIVERY_INSPECT_TOOL_NAME",
-    "InboxView",
+    "DeliveryView",
     "OutcomeArtifactReference",
     "OutcomeConclusionKind",
     "OutcomeContract",
@@ -82,7 +82,8 @@ __all__ = [
     "distribution_destination_projection",
     "distribution_capability_declarations",
     "delivery_inspection_projection",
-    "inbox_view_projection",
+    "delivery_view",
+    "delivery_view_projection",
     "logical_delivery_key",
     "outcome_contract_digest",
     "outcome_contract_projection",

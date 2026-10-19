@@ -219,4 +219,5 @@ __marimo__/
 *.zip
 
 #Claude Code
-*.claude
+.claude/*
+!.claude/settings.json

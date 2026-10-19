@@ -507,7 +507,9 @@ class Evaluation:
         async with asyncio.timeout(self.limits.max_wall_time_seconds + 30):
             while True:
                 assert self.conversation_id is not None
-                items = await self.agent.inbox(conversation_id=self.conversation_id)
+                items = await self.agent.list_deliveries(
+                    conversation_id=self.conversation_id
+                )
                 if len(items) >= count:
                     routines = await self.agent.list_routines()
                     assert len(routines) == 1

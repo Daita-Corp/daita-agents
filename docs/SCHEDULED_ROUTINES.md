@@ -234,7 +234,7 @@ substitute for a required action.
 The finalizer loads authoritative receipts for the exact run, occurrence, grant
 and capability contract and authenticates their successful tool results. It keeps
 valid partial artifacts if another action or artifact minimum fails. An uncertain
-or started effect forces failure even on an optional path. The inbox then shows a
+or started effect forces failure even on an optional path. The work board then shows a
 code-authored failure notice with receipt and artifact references, rather than
 presenting the model's completion claim as success.
 
@@ -262,7 +262,7 @@ recorded receipt facts alongside the stopped-run notice. Headless `daita run` ou
 includes bounded tool-result summaries and call IDs without repeating tool arguments
 or full authorization records. The public `Transcript.tool_pairs` projection exposes
 the original ordered call/result evidence; a missing result remains unknown.
-Scheduled execution outcomes continue to appear separately in the Inbox.
+Scheduled execution outcomes appear separately on the work board.
 
 ## Terminal use
 
@@ -298,7 +298,11 @@ daita routines promote atlas --spec /absolute/path/routine.json \
   --basis-run-id <completed-run-id>
 daita routines update atlas <routine-id> <revision> \
   --spec /absolute/path/routine.json
+daita routines destinations atlas <conversation-id>
 ```
+
+`routines destinations` lists the destinations a routine in that conversation
+can deliver to.
 
 The JSON specification contains the foreground origin run and complete frozen
 definition. For example:
@@ -371,23 +375,39 @@ arguments and report delivery are shown as separate lines. An approval cannot ad
 stronger evidence than the selected producer supports. Model cost ceilings do not
 cap third-party service fees.
 
-## Inbox lifecycle and retention
+## Results on the work board
 
-`/inbox` opens the bounded product projection. The headless equivalents are:
+The TUI's Work tab (`Ctrl+3` or `/work`) is a board over jobs, routines and their
+results. A routine's successful or skipped result sits in Done for 24 hours, then
+ages off the board. A failed or withheld result stays in Needs you until you
+dismiss it. Press `Enter` on a result to read it, and `d` (or the result's
+Dismiss button) to dismiss it. Dismissing acknowledges the delivery; it never
+reruns the work. Notices about jobs are not listed separately: the job's own card
+moves to Needs you while it waits on you. The headless equivalents are:
 
 ```bash
-daita inbox destinations atlas <conversation-id>
-daita inbox list atlas
-daita inbox inspect atlas <delivery-id>
-daita inbox acknowledge atlas <delivery-id>
+daita work show atlas [--done-hours 24]
+daita work inspect atlas <delivery-id>
+daita work dismiss atlas <delivery-id>
 ```
 
-Acknowledgment is idempotent. Unacknowledged available or blocked Deliveries
-are never evicted. When the fixed per-agent Delivery bound is full, producer
-finalization remains atomic and pending rather than losing the outcome. Once a
-Delivery is acknowledged, its oldest retained history entry can be reclaimed
-inside a later producer finalization transaction; acknowledgment wakes both
-producer drivers so pending work can converge immediately.
+`work show` prints the work board as JSON. Finished results stay in Done for
+`--done-hours` (1 to 168, default 24). `work dismiss` acknowledges one result.
+
+From Python, `Agent.list_deliveries`, `Agent.inspect_delivery` and
+`Agent.acknowledge_delivery` read and dismiss the same records.
+`Agent.list_deliveries` also covers what the board leaves out: one
+conversation's results and already acknowledged history.
+`Agent.work_board()` shows them beside jobs and routines in Scheduled, Running,
+Needs you and Done columns; it is not yet available to hosted callers.
+
+Acknowledgment is idempotent. Unacknowledged routine results are never evicted.
+When the fixed per-agent Delivery bound is full, a producer's finalization
+transaction reclaims the oldest acknowledged Delivery first, then the oldest job
+result (the job record keeps the result), then the oldest job notice whose job no
+longer waits on the user. If nothing is reclaimable, finalization remains atomic
+and pending rather than losing the outcome; acknowledgment wakes both producer
+drivers so pending work can converge immediately.
 
 A Delivery stores a bounded immutable artifact reference rather than another
 copy of the full artifact manifest. Finalization verifies it against the artifact

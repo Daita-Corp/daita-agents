@@ -18,6 +18,8 @@ from daita import (
     LocalWorkspace,
     LoopExit,
     LoopExitKind,
+    WorkColumn,
+    WorkKind,
 )
 from daita.observation import AgentEventKind
 from daita.security import KeychainStore
@@ -49,7 +51,6 @@ from .screens.catalog import CatalogScreen, SourceManagerAction
 from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
-from .screens.inbox import InboxScreen
 from .screens.jobs import JobsScreen
 from .screens.mcp import MCPManagementScreen, MCPSetupScreen
 from .screens.onboarding import (
@@ -58,11 +59,12 @@ from .screens.onboarding import (
     SourceSetupScreen,
 )
 from .screens.permissions import PermissionsScreen
+from .screens.result import ResultScreen
 from .screens.routines import RoutinesScreen
 from .screens.selection import SelectionScreen
 from .screens.source_edit import SourceEditScreen
 from .widgets.approval import ApprovalPanel
-from .widgets.command_center import ACTIVE_JOB_STATES, CommandSections
+from .widgets.command_center import CommandSections
 from .widgets.composer import (
     ComposerExitRequested,
     ComposerLimitReached,
@@ -162,13 +164,12 @@ class DaitaApp(App[int]):
         self._modal_future: asyncio.Future[Any] | None = None
         self._start_bootstrap = start_bootstrap
         self._startup_error: Exception | None = None
-        self._active_job_count = 0
-        self._routine_count = 0
+        self._work_counts: dict[WorkColumn, int] = {}
         self._foreground_state = "ready"
-        self._inbox_item_count = 0
         self._source_count = 0
         self._autonomous_run_ids: set[str] = set()
-        self._known_inbox_ids: set[str] | None = None
+        # Needs-you and Done card keys from the last refresh, for notifications.
+        self._known_work: dict[WorkColumn, set[tuple[WorkKind, str]]] | None = None
         self._background_refresh_lock = asyncio.Lock()
         self._completion_cache: (
             tuple[
@@ -405,12 +406,10 @@ class DaitaApp(App[int]):
         await self.refresh_background_status(notify_new=False)
 
     def _reset_background_status(self) -> None:
-        self._active_job_count = 0
-        self._routine_count = 0
-        self._inbox_item_count = 0
+        self._work_counts = {}
         self._source_count = 0
         self._autonomous_run_ids.clear()
-        self._known_inbox_ids = None
+        self._known_work = None
 
     async def _poll_background_status(self) -> None:
         await self.refresh_background_status(notify_new=True)
@@ -426,46 +425,31 @@ class DaitaApp(App[int]):
             return
         async with self._background_refresh_lock:
             screen = self.chat()
-            jobs = None
-            inbox = None
+            board = None
             try:
-                routines = await self.controller.list_routines()
-                self._routine_count = len(routines)
-                if screen is not None:
-                    screen.query_one(CommandSections).update_routines(routines)
+                board = await self.controller.work_board()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 pass
-            try:
-                jobs = await self.controller.list_jobs()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-            try:
-                inbox = await self.controller.list_inbox()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
-            if jobs is not None:
-                self._active_job_count = sum(
-                    item.state in ACTIVE_JOB_STATES for item in jobs
-                )
+            new_work: dict[WorkColumn, int] = {}
+            if board is not None:
+                self._work_counts = {
+                    column: len(board.columns[column]) + board.truncated[column]
+                    for column in WorkColumn
+                }
                 if screen is not None:
-                    screen.query_one(CommandSections).update_jobs(jobs)
-            new_delivery_ids: set[str] = set()
-            if inbox is not None:
-                if screen is not None:
-                    screen.query_one(CommandSections).update_inbox(inbox)
-                current_ids = {item.delivery_id for item in inbox}
-                self._inbox_item_count = len(current_ids)
-                if self._known_inbox_ids is None:
-                    self._known_inbox_ids = set(current_ids)
-                else:
-                    new_delivery_ids = current_ids - self._known_inbox_ids
-                    self._known_inbox_ids.update(current_ids)
+                    screen.query_one(CommandSections).update_work(board)
+                current = {
+                    column: {(card.kind, card.id) for card in board.columns[column]}
+                    for column in (WorkColumn.NEEDS_YOU, WorkColumn.DONE)
+                }
+                if self._known_work is not None:
+                    new_work = {
+                        column: len(keys - self._known_work[column])
+                        for column, keys in current.items()
+                    }
+                self._known_work = current
             if screen is not None:
                 try:
                     sources = await self.controller.list_sources()
@@ -488,13 +472,17 @@ class DaitaApp(App[int]):
                     except Exception:
                         pass
             await self._refresh_status()
-            if notify_new and new_delivery_ids:
-                count = len(new_delivery_ids)
-                noun = "report is" if count == 1 else "reports are"
+            needs_you = new_work.get(WorkColumn.NEEDS_YOU, 0)
+            finished = new_work.get(WorkColumn.DONE, 0)
+            if notify_new and needs_you:
+                noun = "item needs" if needs_you == 1 else "items need"
                 self.notify(
-                    f"{count} background {noun} ready. Open /inbox to review.",
-                    title="Inbox",
-                    timeout=8,
+                    f"{needs_you} {noun} you. Open /work.", title="Work", timeout=8
+                )
+            elif notify_new and finished:
+                noun = "item" if finished == 1 else "items"
+                self.notify(
+                    f"{finished} {noun} finished. Open /work.", title="Work", timeout=8
                 )
 
     async def _replace_conversation_transcript(self) -> None:
@@ -595,10 +583,10 @@ class DaitaApp(App[int]):
             context_total=(
                 profile.context_window_tokens if profile is not None else None
             ),
-            active_jobs=self._active_job_count,
-            saved_routines=self._routine_count,
+            scheduled=self._work_counts.get(WorkColumn.SCHEDULED, 0),
+            running=self._work_counts.get(WorkColumn.RUNNING, 0),
+            needs_you=self._work_counts.get(WorkColumn.NEEDS_YOU, 0),
             active_reports=len(self._autonomous_run_ids),
-            inbox_items=self._inbox_item_count,
             source_count=self._source_count,
             too_small=too_small,
         )
@@ -628,8 +616,8 @@ class DaitaApp(App[int]):
                 await self._await_modal(JobsScreen(job_id=item_id))
             elif section == "routines":
                 await self._await_modal(RoutinesScreen(routine_id=item_id))
-            elif section == "inbox":
-                await self._await_modal(InboxScreen(delivery_id=item_id))
+            elif section == "result" and item_id is not None:
+                await self._await_modal(ResultScreen(delivery_id=item_id))
             elif section == "artifacts":
                 await self._await_modal(ArtifactsScreen(artifact_id=item_id))
             await self.refresh_background_status(notify_new=False)
@@ -638,6 +626,23 @@ class DaitaApp(App[int]):
         finally:
             if self.chat() is chat:
                 chat.action_focus_conversation()
+
+    async def dismiss_work_result(self, delivery_id: str) -> None:
+        """Acknowledge one result from the work board, then refresh it."""
+
+        chat = self.chat()
+        if (
+            chat is None
+            or self.controller.agent is None
+            or chat.query_one(ApprovalPanel).active
+        ):
+            return
+        try:
+            if await self.controller.acknowledge_delivery(delivery_id) is None:
+                chat.show_notice("That result no longer exists.")
+            await self.refresh_background_status(notify_new=False)
+        except (ValueError, RuntimeError, OSError) as error:
+            chat.show_notice(safe_display(str(error), maximum=512))
 
     def on_composer_submitted(self, event: ComposerSubmitted) -> None:
         # A command may await a modal result. Keep that wait out of the App's
@@ -836,9 +841,10 @@ class DaitaApp(App[int]):
             await self._await_modal(RoutinesScreen())
             await self.refresh_background_status(notify_new=False)
             return
-        if screen_name == "inbox":
-            await self._await_modal(InboxScreen())
-            await self.refresh_background_status(notify_new=False)
+        if screen_name == "work":
+            chat = self.chat()
+            if chat is not None:
+                chat.action_section("work")
             return
         if screen_name == "artifacts":
             await self._await_modal(ArtifactsScreen())

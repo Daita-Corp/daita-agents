@@ -14,30 +14,20 @@ from tests.tui._support import (
     Button,
     ConfirmScreen,
     DaitaApp,
-    DeliveryState,
-    DeliverySubjectKind,
     FrozenJsonObject,
     GraphState,
-    InboxScreen,
-    InboxView,
     Input,
     JobsScreen,
-    ModelSensitivity,
     ObserverEvent,
     OptionList,
-    OutcomeConclusionKind,
-    OutcomeState,
     Path,
     SimpleNamespace,
     Static,
     Text,
     TranscriptView,
-    _tui_inbox_item,
     _tui_job_inspection,
     _tui_job_summary,
     datetime,
-    render_inbox_item,
-    replace,
     workspace_for,
 )
 
@@ -63,182 +53,6 @@ async def test_jobs_command_opens_interactive_manager_without_model_calls():
         outcome = await app.controller.dispatch_command(removed_command)
         assert outcome.kind == "notice"
         assert outcome.message == "Usage: /jobs"
-
-
-async def test_inbox_command_routes_without_a_model_call():
-    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
-
-    assert (
-        "/inbox",
-        "/inbox",
-        "Inspect and acknowledge completed background reports",
-    ) in SLASH_COMMAND_COMPLETIONS
-    outcome = await app.controller.dispatch_command("/inbox")
-    assert outcome.kind == "screen"
-    assert outcome.screen == "inbox"
-    malformed = await app.controller.dispatch_command("/inbox extra")
-    assert malformed.kind == "notice"
-    assert malformed.message == "Usage: /inbox"
-
-
-async def test_inbox_screen_inspects_sanitizes_and_acknowledges(monkeypatch):
-    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
-    item = _tui_inbox_item(report="Ready\x1b[31m @everyone")
-    items = [item]
-    acknowledgments: list[str] = []
-
-    async def list_inbox() -> tuple[InboxView, ...]:
-        return tuple(items)
-
-    async def acknowledge_inbox(delivery_id: str) -> InboxView | None:
-        acknowledgments.append(delivery_id)
-        items.clear()
-        return item
-
-    async def list_distribution_destinations(
-        conversation_id: str,
-        *,
-        sensitivity_ceiling: ModelSensitivity,
-    ) -> tuple[SimpleNamespace, ...]:
-        assert conversation_id == item.conversation_id
-        assert sensitivity_ceiling is ModelSensitivity.INTERNAL
-        return (
-            SimpleNamespace(
-                label="Current conversation Inbox",
-                state=SimpleNamespace(value="available"),
-                revision=1,
-            ),
-        )
-
-    monkeypatch.setattr(app.controller, "list_inbox", list_inbox)
-    monkeypatch.setattr(app.controller, "acknowledge_inbox", acknowledge_inbox)
-    monkeypatch.setattr(
-        app.controller,
-        "list_distribution_destinations",
-        list_distribution_destinations,
-    )
-
-    async with app.run_test(size=(110, 36)) as pilot:
-        await app.push_screen(InboxScreen())
-        for _ in range(200):
-            await pilot.pause(0.05)
-            if "1 unacknowledged result" in str(
-                app.screen.query_one("#inbox-summary", Static).content
-            ):
-                break
-        manager = app.screen
-        assert isinstance(manager, InboxScreen)
-        listing = manager.query_one("#inbox-list", OptionList)
-        assert listing.option_count == 1
-        assert listing.has_focus is True
-        detail = str(manager.query_one("#inbox-detail", Static).content)
-        assert "Ready?[31m @everyone" in detail
-        assert "\x1b" not in detail
-        assert "Result run: run-routine" in detail
-        assert manager.query_one("#inbox-acknowledge", Button).disabled is False
-
-        assert await pilot.click("#inbox-acknowledge") is True
-        for _ in range(200):
-            await pilot.pause(0.05)
-            if "0 unacknowledged results" in str(
-                manager.query_one("#inbox-summary", Static).content
-            ):
-                break
-        assert acknowledgments == [item.delivery_id]
-        assert listing.option_count == 0
-        assert "never reruns reasoning" in str(
-            manager.query_one("#inbox-help", Static).content
-        )
-        app.exit(0)
-
-
-def test_inbox_rendering_withholds_blocked_reports_and_marks_bounded_previews():
-    available = _tui_inbox_item(report="bounded preview")
-    truncated = replace(
-        available,
-        conclusion_preview_truncated=True,
-    )
-    assert "Preview truncated" in render_inbox_item(truncated)
-
-    blocked = replace(
-        available,
-        state=DeliveryState.BLOCKED,
-        conclusion_preview="",
-        blocked_reason_code="sensitivity_exceeds_destination",
-    )
-    rendered = render_inbox_item(blocked)
-    assert "bounded preview" not in rendered
-    assert "Preview withheld" in rendered
-    assert "sensitivity_exceeds_destination" in rendered
-
-    routine_escalation = replace(
-        available,
-        subject_kind=DeliverySubjectKind.ROUTINE_OCCURRENCE,
-        subject_id="occurrence-pre-run-failure",
-        conclusion_kind=OutcomeConclusionKind.NO_MODEL_OCCURRENCE,
-        conclusion_state=OutcomeState.FAILED,
-        resulting_run_id=None,
-        conclusion_preview="",
-        failure_code="routine_precheck_unavailable",
-    )
-    escalation = render_inbox_item(routine_escalation)
-    assert "Routine: occurrence-pre-run-failure" in escalation
-    assert "Result run: No model run started" in escalation
-    assert "Escalation" in escalation
-    assert "failed before a model run could start" in escalation
-
-
-async def test_background_status_notifies_once_and_remains_outside_transcript(
-    tmp_path: Path,
-    monkeypatch,
-):
-    opened = await Agent.create(
-        "inbox-status-agent", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
-    app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
-    )
-    app.controller.agent = opened
-    running = _tui_job_summary(
-        "job-running-status", GraphState.ACTIVE, result_available=False
-    )
-    current_inbox: list[InboxView] = []
-    notifications: list[tuple[str, str | None]] = []
-
-    async def list_jobs() -> tuple[object, ...]:
-        return (running,)
-
-    async def list_inbox() -> tuple[InboxView, ...]:
-        return tuple(current_inbox)
-
-    def notify(message: str, *, title: str | None = None, **_kwargs: object) -> None:
-        notifications.append((message, title))
-
-    monkeypatch.setattr(app.controller, "list_jobs", list_jobs)
-    monkeypatch.setattr(app.controller, "list_inbox", list_inbox)
-    monkeypatch.setattr(app, "notify", notify)
-    try:
-        async with app.run_test(size=(110, 32)) as pilot:
-            await app._show_chat()
-            await pilot.pause()
-            status = app.screen.query_one("#status-bar")
-            assert "1 active jobs" in str(status.tooltip)
-            assert status.display is True
-
-            current_inbox.append(_tui_inbox_item())
-            await app.refresh_background_status(notify_new=True)
-            await pilot.pause()
-            assert "1 active jobs" in str(status.tooltip)
-            assert "1 unread results" in str(status.tooltip)
-            assert notifications == [
-                ("1 background report is ready. Open /inbox to review.", "Inbox")
-            ]
-            await app.refresh_background_status(notify_new=True)
-            assert len(notifications) == 1
-            assert app.screen.query_one(TranscriptView).is_empty
-            app.exit(0)
-    finally:
-        await opened.close()
 
 
 async def test_machine_origin_observations_do_not_project_into_foreground_chat(
