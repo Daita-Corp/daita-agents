@@ -24,7 +24,7 @@ SLASH_COMMAND_COMPLETIONS = (
         "Manage sources and explore the catalog relationship tree",
     ),
     ("/jobs", "/jobs", "Manage durable jobs"),
-    ("/inbox", "/inbox", "Inspect and acknowledge completed background reports"),
+    ("/work", "/work", "Show scheduled, running, waiting and finished work"),
     ("/artifacts", "/artifacts", "View, save and delete stored artifacts"),
     ("/routines", "/routines", "Inspect and control saved assignments"),
     (
@@ -99,11 +99,12 @@ HELP_TEXT = (
     "Type / to browse commands and their descriptions.\n"
     "Ask across admitted connections without selecting a source.\n"
     'Use @"source name" <question> to narrow one request.\n'
-    "Saved assignments: /routines · results: /inbox\n"
+    "Saved assignments: /routines · work board: /work\n"
     "Stored files: /artifacts\n"
     "MCP servers and tool access: /mcp\n"
     "Execution requires an open host; stop this TUI before starting daita host --agent <name>.\n"
-    "F6 focus tabs · Ctrl-1…5 switch Chat, Sources, Work, Inbox, Artifacts · F1 help\n"
+    "F6 focus tabs · Ctrl-1…4 switch Chat, Sources, Work, Artifacts · F1 help\n"
+    "Work board: arrows move · Enter opens · d dismisses a result\n"
     "Enter submit · Ctrl-J newline · Esc Esc clear input · Ctrl-D exit\n"
     "Wheel or Page Up/Page Down review · Ctrl-Home start · Ctrl-End latest\n"
     "Ctrl-O show/hide tool results · Ctrl-C copy selection or cancel the run\n"

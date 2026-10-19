@@ -81,7 +81,7 @@ def test_tool_projection_and_approval_document():
 
 
 @pytest.mark.parametrize(
-    "size,section", [((80, 24), "chat"), ((80, 24), "inbox"), ((140, 32), "work")]
+    "size,section", [((80, 24), "chat"), ((80, 24), "artifacts"), ((140, 32), "work")]
 )
 async def test_approval_approve_deny_cancel_and_unreviewable(size, section):
     request = ApprovalRequest(

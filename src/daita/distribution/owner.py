@@ -379,7 +379,7 @@ class DistributionOwner:
             include_acknowledged=include_acknowledged,
             limit=limit,
         )
-        return tuple(_delivery_view(value) for value in deliveries)
+        return tuple(delivery_view(value) for value in deliveries)
 
     async def validate_outcome_artifacts(
         self,
@@ -420,10 +420,12 @@ class DistributionOwner:
             delivery_id,
             acknowledged_at=acknowledged_at,
         )
-        return None if delivery is None else _delivery_view(delivery)
+        return None if delivery is None else delivery_view(delivery)
 
 
-def _delivery_view(value: Delivery) -> DeliveryView:
+def delivery_view(value: Delivery) -> DeliveryView:
+    """Project one delivery for people, withholding a blocked preview."""
+
     outcome = value.outcome
     blocked = value.blocked_reason_code is not None
     return DeliveryView(
@@ -457,4 +459,5 @@ __all__ = [
     "construct_graph_attention_delivery",
     "construct_graph_job_delivery",
     "construct_logical_delivery",
+    "delivery_view",
 ]

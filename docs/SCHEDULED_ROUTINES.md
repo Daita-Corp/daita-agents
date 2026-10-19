@@ -234,7 +234,7 @@ substitute for a required action.
 The finalizer loads authoritative receipts for the exact run, occurrence, grant
 and capability contract and authenticates their successful tool results. It keeps
 valid partial artifacts if another action or artifact minimum fails. An uncertain
-or started effect forces failure even on an optional path. The inbox then shows a
+or started effect forces failure even on an optional path. The work board then shows a
 code-authored failure notice with receipt and artifact references, rather than
 presenting the model's completion claim as success.
 
@@ -262,7 +262,7 @@ recorded receipt facts alongside the stopped-run notice. Headless `daita run` ou
 includes bounded tool-result summaries and call IDs without repeating tool arguments
 or full authorization records. The public `Transcript.tool_pairs` projection exposes
 the original ordered call/result evidence; a missing result remains unknown.
-Scheduled execution outcomes continue to appear separately in the Inbox.
+Scheduled execution outcomes appear separately on the work board.
 
 ## Terminal use
 
@@ -375,9 +375,15 @@ arguments and report delivery are shown as separate lines. An approval cannot ad
 stronger evidence than the selected producer supports. Model cost ceilings do not
 cap third-party service fees.
 
-## Inbox lifecycle and retention
+## Results on the work board
 
-`/inbox` opens the bounded product projection. The headless equivalents are:
+The TUI's Work tab (`Ctrl+3` or `/work`) is a board over jobs, routines and their
+results. A routine's successful or skipped result sits in Done for 24 hours, then
+ages off the board. A failed or withheld result stays in Needs you until you
+dismiss it. Press `Enter` on a result to read it, and `d` (or the result's
+Dismiss button) to dismiss it. Dismissing acknowledges the delivery; it never
+reruns the work. Notices about jobs are not listed separately: the job's own card
+moves to Needs you while it waits on you. The headless equivalents are:
 
 ```bash
 daita work show atlas [--done-hours 24]

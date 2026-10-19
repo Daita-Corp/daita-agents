@@ -35,10 +35,11 @@ from daita.distribution import (
     OutcomeConclusionKind,
     OutcomeState,
     delivery_inspection_projection,
+    delivery_view,
     delivery_view_projection,
     distribution_destination_projection,
 )
-from daita.distribution.owner import _delivery_view, construct_logical_delivery
+from daita.distribution.owner import construct_logical_delivery
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -1922,7 +1923,7 @@ def test_work_inspect_and_dismiss_project_one_exact_delivery(
     tmp_path: Path, command: str
 ) -> None:
     inspection = _routine_result_delivery()
-    view = _delivery_view(inspection.delivery)
+    view = delivery_view(inspection.delivery)
     fake = SimpleNamespace(
         inspect_delivery=AsyncMock(return_value=inspection),
         acknowledge_delivery=AsyncMock(return_value=view),

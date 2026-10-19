@@ -38,7 +38,6 @@ __all__ = (
     "FinishReason",
     "Footer",
     "FrozenJsonObject",
-    "InboxScreen",
     "Input",
     "Iterator",
     "GraphState",
@@ -59,6 +58,7 @@ __all__ = (
     "PickerOption",
     "ReviewCostScreen",
     "RoutineState",
+    "ResultScreen",
     "RoutinesScreen",
     "SQLiteSource",
     "ScheduleKind",
@@ -86,7 +86,7 @@ __all__ = (
     "WelcomeView",
     "_create_sqlite_source",
     "_mock_profile",
-    "_tui_inbox_item",
+    "_tui_delivery_view",
     "_tui_job_inspection",
     "_tui_job_summary",
     "approval_review_document",
@@ -105,7 +105,7 @@ __all__ = (
     "project_tool_details",
     "pytest",
     "redact_presentation_value",
-    "render_inbox_item",
+    "render_result",
     "replace",
     "run_failure_notice",
     "sanitize_terminal_text",
@@ -211,7 +211,6 @@ from daita.tui.screens.catalog import CatalogScreen
 from daita.tui.screens.chat import ChatScreen
 from daita.tui.screens.confirm import ConfirmScreen
 from daita.tui.screens.editing import ReviewCostScreen
-from daita.tui.screens.inbox import InboxScreen, render_inbox_item
 from daita.tui.screens.jobs import JobsScreen
 from daita.tui.screens.onboarding import (
     AgentCreateScreen,
@@ -219,6 +218,7 @@ from daita.tui.screens.onboarding import (
     SourceSetupScreen,
 )
 from daita.tui.screens.permissions import PermissionsScreen
+from daita.tui.screens.result import ResultScreen, render_result
 from daita.tui.screens.routines import RoutinesScreen
 from daita.tui.screens.selection import SelectionScreen
 from daita.tui.screens.source_edit import SourceEditScreen
@@ -235,7 +235,7 @@ from daita.tui.widgets.welcome import WelcomeView
 from tests.support.workspace import workspace_for
 
 
-def _tui_inbox_item(
+def _tui_delivery_view(
     delivery_id: str = "delivery-stage-c",
     *,
     report: str = "The durable profile completed successfully.",
@@ -243,9 +243,9 @@ def _tui_inbox_item(
     observed = datetime(2026, 8, 23, 14, 5, tzinfo=UTC)
     return DeliveryView(
         delivery_id=delivery_id,
-        conversation_id="conversation-inbox",
+        conversation_id="conversation-results",
         subject_kind=DeliverySubjectKind.ROUTINE_OCCURRENCE,
-        subject_id="occurrence-inbox",
+        subject_id="occurrence-results",
         conclusion_kind=OutcomeConclusionKind.TERMINAL_RUN,
         conclusion_state=OutcomeState.SUCCEEDED,
         conclusion_digest="sha256:" + "2" * 64,
@@ -255,7 +255,7 @@ def _tui_inbox_item(
         artifact_references=(),
         effective_sensitivity=ModelSensitivity.INTERNAL,
         provenance_digest="sha256:" + "3" * 64,
-        destination_id="conversation_inbox:conversation-inbox",
+        destination_id="conversation_inbox:conversation-results",
         state=DeliveryState.AVAILABLE,
         created_at=observed,
         updated_at=observed,
