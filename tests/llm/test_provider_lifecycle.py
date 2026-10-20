@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import AsyncGenerator
 from contextvars import ContextVar
 from dataclasses import replace
-from decimal import Decimal
 from typing import Any, cast
 
 import anthropic
@@ -491,31 +490,6 @@ async def test_host_does_not_close_an_injected_shared_provider(tmp_path) -> None
     await agent.close()
 
     assert provider.close_calls == 0
-
-
-async def test_host_closes_separate_configured_primary_and_reviewer_routes(
-    tmp_path, monkeypatch
-) -> None:
-    primary = _ManagedProvider()
-    reviewer = _ManagedProvider()
-    providers = iter((primary, reviewer))
-    monkeypatch.setattr(
-        configuration,
-        "create_model_route_provider",
-        lambda *_args, **_kwargs: next(providers),
-    )
-    agent = await Agent.create(
-        "owns-configured-reviewer",
-        root=tmp_path,
-        hosted=True,
-        config=AgentConfig(model_route=_route()),
-        reviewer_max_estimated_cost_usd=Decimal("1"),
-    )
-
-    await agent.close()
-
-    assert primary.close_calls == 1
-    assert reviewer.close_calls == 1
 
 
 def _request() -> ModelRequest:

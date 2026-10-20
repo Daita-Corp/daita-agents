@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
+
+from daita.capabilities import CapabilityInputError
+from daita.llm.models import ToolCall
+from daita.memory.capabilities import apply_memory_edit
 from tests.support.approval_learning import (
     EAGER_LIMITS,
     Agent,
@@ -107,5 +112,68 @@ async def test_weak_learning_signal_stays_in_transcript_without_a_write(tmp_path
         assert "Never learn raw results" in prompt
         assert "Approval card alone confirms" in prompt
         assert "never ask typed approval" in prompt
+    finally:
+        await agent.close()
+
+
+def test_memory_edits_change_one_entry_and_reject_unclear_targets():
+    assert apply_memory_edit("", "add", content=" FY starts in February. ") == (
+        "FY starts in February."
+    )
+    assert apply_memory_edit("A\n", "add", content="B") == "A\nB"
+    assert apply_memory_edit("A\nB\nC", "replace", old_text="B", content="D") == (
+        "A\nD\nC"
+    )
+    assert apply_memory_edit("A\nB\nC", "remove", old_text="B") == "A\nC"
+    assert apply_memory_edit("A\nB", "remove", old_text="B") == "A\n"
+    assert apply_memory_edit("Keep A B", "remove", old_text=" B") == "Keep A"
+    for current, action, arguments, code in (
+        ("FY\nOther", "add", {"content": "FY"}, "memory_entry_exists"),
+        ("A", "replace", {"old_text": "Z", "content": "B"}, "memory_text_not_found"),
+        ("A A", "remove", {"old_text": "A"}, "memory_text_ambiguous"),
+        ("A", "replace", {"old_text": "A", "content": " "}, "memory_invalid_content"),
+    ):
+        with pytest.raises(CapabilityInputError) as raised:
+            apply_memory_edit(current, action, **arguments)
+        assert raised.value.code == code
+
+
+async def test_memory_replace_approves_only_the_edit_and_keeps_other_entries(
+    tmp_path,
+):
+    approvals: list[ApprovalRequest] = []
+
+    async def approve(request):
+        approvals.append(request)
+        return ApprovalDecision.APPROVE
+
+    edit = ToolCall(
+        id="edit",
+        name="memory_set",
+        arguments={
+            "target": "memory",
+            "action": "replace",
+            "old_text": "Revenue excludes voids.",
+            "content": "Revenue excludes voids and refunds.",
+        },
+    )
+    provider = MockModelProvider((_call(edit), _stop("Updated.")))
+    agent = await Agent.create(
+        "edit-one-entry",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        limits=EAGER_LIMITS,
+        approval_handler=approve,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        await agent.set_memory("FY starts in February.\nRevenue excludes voids.")
+        await agent.run("Correction: revenue also excludes refunds.")
+        assert await agent.read_memory() == (
+            "FY starts in February.\nRevenue excludes voids and refunds."
+        )
+        assert len(approvals) == 1
+        assert "FY starts in February." not in str(approvals[0].arguments)
     finally:
         await agent.close()

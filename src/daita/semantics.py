@@ -35,7 +35,6 @@ from .capabilities import (
 )
 from .capability_runtime import CapabilityFailure, SideEffectPlan
 from .catalog.models import CATALOG_CONTEXT_DEFAULT_LIMIT
-from .domains.learning import LearningCandidateGuard
 from .llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
 from .loop.models import RunInput, Transcript
 from .loop.session import RunSession
@@ -1642,7 +1641,6 @@ class SemanticCapabilityDomain:
         declarations: CapabilityDeclarations,
         catalog: SemanticDomainCatalog,
         store: SemanticStore,
-        learning: LearningCandidateGuard,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("semantic declarations have the wrong domain owner")
@@ -1653,12 +1651,9 @@ class SemanticCapabilityDomain:
             SEMANTIC_DELETE_CAPABILITY_ID,
         }:
             raise ValueError("semantic domain requires its exact capabilities")
-        if not isinstance(learning, LearningCandidateGuard):
-            raise TypeError("learning must be LearningCandidateGuard")
         self._declarations = declarations
         self._catalog = catalog
         self._store = store
-        self._learning = learning
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
 
@@ -1734,20 +1729,7 @@ class SemanticCapabilityDomain:
         requested = session is not None and session.options.explicit_learning
         if not requested:
             requested = await self._maintenance_requested(run)
-        selected_tool = self._learning.selected_mutation_tool(session)
-        return tuple(
-            view.name
-            for view in self._views
-            if (requested or view.name == selected_tool)
-            and self._learning.allows(
-                session,
-                view.name,
-                effectful=(
-                    self._capabilities[view.capability_id].operational_effect
-                    is not OperationalEffect.NONE
-                ),
-            )
-        )
+        return tuple(view.name for view in self._views) if requested else ()
 
     project_session = project
 
@@ -1787,8 +1769,6 @@ class SemanticCapabilityDomain:
         session: RunSession | None = None,
     ) -> FrozenJsonObject:
         del request_sensitivity
-        if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.validate_effect(session, call, arguments)
         await self._validate_source_scope(run, capability, arguments)
         await self._validate_read_scope(run, capability, arguments)
         if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
@@ -1842,8 +1822,6 @@ class SemanticCapabilityDomain:
             output = await self._decorate_view(run, arguments, output)
         elif capability.id == SEMANTIC_LIST_CAPABILITY_ID:
             output = await self._filter_list(run, arguments, output)
-        if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.mark_effect_succeeded(session, call.id)
         if output.sensitivity is not None:
             return output
         scope = await resolve_effective_source_scope(run, self._catalog)

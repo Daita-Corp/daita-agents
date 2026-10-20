@@ -12,7 +12,7 @@ from threading import Lock
 
 from .._json import canonical_json
 from ..capabilities import ExecutionPreference, GraphTaskBinding, RecoveryKind
-from ..llm.models import ModelSensitivity, ToolCall, ToolResultBlock
+from ..llm.models import ToolCall, ToolResultBlock
 from .models import RunInput, RunOrigin
 from .transcripts import ConversationPredecessor, RunSessionWriter
 
@@ -75,7 +75,6 @@ class RunSessionEvidence:
     """Current-run, once-set evidence; never an ambient run registry."""
 
     __slots__ = (
-        "_learning_mutation_call_id",
         "_lock",
         "tool_calls_attempted",
         "tool_budget_exhausted",
@@ -89,7 +88,6 @@ class RunSessionEvidence:
     )
 
     def __init__(self) -> None:
-        self._learning_mutation_call_id: str | None = None
         self._lock = Lock()
         self.tool_calls_attempted = 0
         self.tool_budget_exhausted = False
@@ -186,24 +184,6 @@ class RunSessionEvidence:
                 ),
                 "unsettled": len(self._outer_dispatched - self._outer_results.keys()),
             }
-
-    @property
-    def learning_mutation_succeeded(self) -> bool:
-        with self._lock:
-            return self._learning_mutation_call_id is not None
-
-    @property
-    def learning_mutation_call_id(self) -> str | None:
-        with self._lock:
-            return self._learning_mutation_call_id
-
-    def record_learning_mutation(self, call_id: str) -> None:
-        if not isinstance(call_id, str) or not call_id:
-            raise ValueError("learning mutation call_id must be non-empty")
-        with self._lock:
-            if self._learning_mutation_call_id not in {None, call_id}:
-                raise RuntimeError("session recorded more than one learning mutation")
-            self._learning_mutation_call_id = call_id
 
 
 def _progress_failure(
@@ -330,10 +310,6 @@ class RunSessionOptions:
 
     files_only: bool = False
     explicit_learning: bool = False
-    learning_candidate: object | None = None
-    learning_candidate_id: str | None = None
-    learning_candidate_text: str | None = None
-    learning_candidate_sensitivity: ModelSensitivity | None = None
     retained_skill_bindings: tuple[tuple[str, str], ...] = ()
     one_time_artifact_destinations: tuple[object, ...] = ()
     task_context: object | None = None
@@ -347,36 +323,6 @@ class RunSessionOptions:
             raise TypeError("session boolean options must be bool")
         if not isinstance(self.execution_preference, ExecutionPreference):
             raise TypeError("session execution preference is invalid")
-        selected = (
-            self.learning_candidate,
-            self.learning_candidate_id,
-            self.learning_candidate_text,
-            self.learning_candidate_sensitivity,
-        )
-        if any(item is not None for item in selected) and not all(
-            item is not None for item in selected
-        ):
-            raise ValueError("learning candidate session values must be set together")
-        if self.learning_candidate_id is not None and (
-            not isinstance(self.learning_candidate_id, str)
-            or not self.learning_candidate_id
-        ):
-            raise ValueError("learning candidate id must be non-empty text")
-        if self.learning_candidate_text is not None and (
-            not isinstance(self.learning_candidate_text, str)
-            or not self.learning_candidate_text
-        ):
-            raise ValueError("learning candidate text must be non-empty text")
-        if self.learning_candidate_sensitivity is not None and not isinstance(
-            self.learning_candidate_sensitivity, ModelSensitivity
-        ):
-            raise TypeError("learning candidate sensitivity is invalid")
-        if self.learning_candidate is not None and (
-            getattr(self.learning_candidate, "id", None) != self.learning_candidate_id
-            or getattr(self.learning_candidate, "sensitivity", None)
-            is not self.learning_candidate_sensitivity
-        ):
-            raise ValueError("learning candidate session binding is inconsistent")
         bindings = tuple(self.retained_skill_bindings)
         if any(
             not isinstance(item, tuple)

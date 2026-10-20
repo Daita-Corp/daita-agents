@@ -489,9 +489,9 @@ async def test_chat_accumulates_and_resumes_the_full_conversation_transcript(
             prompt = await app.controller.dispatch_command("/schedule")
             assert prompt.screen == "schedule_prompt"
             assert prompt.payload == {"question": "Second question"}
-            taught = await app.controller.dispatch_command("/teach")
+            taught = await app.controller.dispatch_command("/learn")
             assert taught.kind == "run" and taught.run_message is not None
-            assert "explicit teaching request" in taught.run_message
+            assert taught.run_message.startswith("/learn ")
             assert last_run[1] in taught.run_message
             saved = await app.controller.dispatch_command("/save")
             assert saved.kind == "run"

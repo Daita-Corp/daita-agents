@@ -1,4 +1,4 @@
-"""Declare and execute approval-gated replacement of agent memory documents."""
+"""Declare and execute approval-gated entry edits to agent memory documents."""
 
 from __future__ import annotations
 
@@ -25,7 +25,6 @@ from ..capabilities import (
     ToolView,
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
-from ..domains.learning import LearningCandidateGuard
 from ..llm.models import ModelSensitivity, ToolCall
 from ..loop.models import RunInput
 from ..loop.session import RunSession
@@ -59,10 +58,10 @@ class MemorySetExecutor:
         self._store = store
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        target, content = _replacement_arguments(request)
+        target, edit = _edit_arguments(request)
         try:
-            exists, digest, state_digest = await self._store.preflight_replacement(
-                target, content
+            _, exists, digest, state_digest = await self._store.preflight_edit(
+                target, edit
             )
         except MemoryValidationError as error:
             raise CapabilityInputError(
@@ -86,7 +85,10 @@ class MemorySetExecutor:
         )
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
-        target, content = _replacement_arguments(request)
+        # The runtime rechecked the preflight state under the mutation lock, so
+        # this applies the approved edit to exactly the document it validated.
+        target, edit = _edit_arguments(request)
+        content, _, _, _ = await self._store.preflight_edit(target, edit)
         await self._store.replace_from_tool(
             target, content, sensitivity=request.request_sensitivity
         )
@@ -101,12 +103,14 @@ def memory_set_declarations(store: MemoryStore) -> MemoryDeclarations:
     capability = Capability(
         id=MEMORY_SET_CAPABILITY_ID,
         description=(
-            "Replace complete bounded MEMORY.md or USER.md via the sole approval card. "
-            "USER.md(target=user)=durable preferences; "
-            "MEMORY.md(target=memory)=schema-independent definitions/conventions; "
-            "SKILL.md=procedures. Text ends run: call first. Preserve unrelated content; "
-            "replace duplicates. Exclude results, schema/transient values, secrets, "
-            "permissions, and assumptions."
+            "Edit one entry of MEMORY.md or USER.md via the sole approval card; "
+            "never resend the whole document. USER.md(target=user)=durable "
+            "preferences; MEMORY.md(target=memory)=schema-independent "
+            "definitions/conventions; SKILL.md=procedures. action=add appends "
+            "content; replace swaps old_text for content; remove deletes old_text. "
+            "old_text must match exactly one current passage. Text ends run: call "
+            "first. Replace instead of duplicating. Exclude results, "
+            "schema/transient values, secrets, permissions, and assumptions."
         ),
         input_schema={
             "type": "object",
@@ -117,12 +121,22 @@ def memory_set_declarations(store: MemoryStore) -> MemoryDeclarations:
                     "minLength": 4,
                     "maxLength": 6,
                 },
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "replace", "remove"],
+                    "minLength": 3,
+                    "maxLength": 7,
+                },
                 "content": {
                     "type": "string",
                     "maxLength": MEMORY_MAX_CHARACTERS,
                 },
+                "old_text": {
+                    "type": "string",
+                    "maxLength": MEMORY_MAX_CHARACTERS,
+                },
             },
-            "required": ["target", "content"],
+            "required": ["target", "action"],
             "additionalProperties": False,
         },
         output_kind=MEMORY_SET_OUTPUT_KIND,
@@ -152,7 +166,7 @@ def memory_set_declarations(store: MemoryStore) -> MemoryDeclarations:
                     toolbox_id=ToolboxId.KNOWLEDGE,
                     load_mode=ToolLoadMode.ON_DEMAND,
                     text_trust=ToolTextTrust.CODE,
-                    summary="Replace one bounded advisory memory or user-profile document.",
+                    summary="Add, replace or remove one memory or user-profile entry.",
                     when_to_use="Use only for explicit durable definitions or preferences.",
                     keywords=("memory", "user", "preference", "remember"),
                 ),
@@ -169,7 +183,6 @@ class MemoryCapabilityDomain:
     def __init__(
         self,
         declarations: CapabilityDeclarations,
-        learning: LearningCandidateGuard,
         *,
         validate_schema_independent: (
             Callable[[RunInput, str], Awaitable[None]] | None
@@ -182,7 +195,6 @@ class MemoryCapabilityDomain:
         }:
             raise ValueError("memory domain requires its exact capability")
         self._declarations = declarations
-        self._learning = learning
         self._validate_schema_independent = validate_schema_independent
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
@@ -196,18 +208,7 @@ class MemoryCapabilityDomain:
         run: RunInput,
         session: RunSession | None = None,
     ) -> tuple[str, ...]:
-        return tuple(
-            view.name
-            for view in self._views
-            if self._learning.allows(
-                session,
-                view.name,
-                effectful=(
-                    self._capabilities[view.capability_id].operational_effect
-                    is not OperationalEffect.NONE
-                ),
-            )
-        )
+        return tuple(view.name for view in self._views)
 
     project_session = project
 
@@ -229,12 +230,13 @@ class MemoryCapabilityDomain:
         session: RunSession | None = None,
     ) -> FrozenJsonObject:
         del request_sensitivity
-        self._learning.validate_effect(session, call, arguments)
         if (
             arguments["target"] == "memory"
             and self._validate_schema_independent is not None
         ):
-            await self._validate_schema_independent(run, str(arguments["content"]))
+            await self._validate_schema_independent(
+                run, str(arguments.get("content", ""))
+            )
         return arguments
 
     prepare_session_call = prepare_call
@@ -272,7 +274,6 @@ class MemoryCapabilityDomain:
         request_sensitivity: ModelSensitivity,
         session: RunSession | None = None,
     ) -> ToolOutput:
-        self._learning.mark_effect_succeeded(session, call.id)
         if output.sensitivity is not None:
             return output
         return replace(
@@ -299,17 +300,77 @@ class MemoryCapabilityDomain:
         return None
 
 
-def _replacement_arguments(request: ToolExecution) -> tuple[str, str]:
+def _edit_arguments(request: ToolExecution) -> tuple[str, Callable[[str], str]]:
     if request.capability_id != MEMORY_SET_CAPABILITY_ID:
         raise ValueError("memory executor received another capability")
-    target = request.arguments["target"]
-    content = request.arguments["content"]
-    if not isinstance(target, str) or not isinstance(content, str):
-        raise TypeError("memory replacement arguments must be text")
-    return target, content
+    arguments = request.arguments
+    target = arguments["target"]
+    action = arguments["action"]
+    content = arguments.get("content")
+    old_text = arguments.get("old_text")
+    if not isinstance(target, str) or not isinstance(action, str):
+        raise TypeError("memory edit arguments must be text")
+    if (content is None) != (action == "remove") or (old_text is None) != (
+        action == "add"
+    ):
+        raise CapabilityInputError(
+            "memory_invalid_arguments",
+            "add takes content; replace takes old_text and content; "
+            "remove takes old_text.",
+            {"target": target, "action": action},
+        )
+    return target, lambda current: apply_memory_edit(
+        current, action, content=content, old_text=old_text
+    )
+
+
+def apply_memory_edit(
+    current: str,
+    action: str,
+    *,
+    content: object = None,
+    old_text: object = None,
+) -> str:
+    """Return ``current`` with one entry added, replaced or removed."""
+
+    if content is not None and (not isinstance(content, str) or not content.strip()):
+        raise CapabilityInputError(
+            "memory_invalid_content", "content must be non-empty text."
+        )
+    if action == "add":
+        assert isinstance(content, str)
+        entry = content.strip()
+        if entry in (line.strip() for line in current.splitlines()):
+            raise CapabilityInputError(
+                "memory_entry_exists",
+                "This entry is already saved; use replace to change it.",
+            )
+        head = current.rstrip("\n")
+        return f"{head}\n{entry}" if head else entry
+    if not isinstance(old_text, str) or not old_text:
+        raise CapabilityInputError(
+            "memory_invalid_arguments", "old_text must be non-empty text."
+        )
+    matches = current.count(old_text)
+    if matches != 1:
+        raise CapabilityInputError(
+            "memory_text_not_found" if matches == 0 else "memory_text_ambiguous",
+            "old_text must match exactly one passage of the current document.",
+            {"matches": matches},
+        )
+    start = current.index(old_text)
+    end = start + len(old_text)
+    if action == "replace":
+        assert isinstance(content, str)
+        return current[:start] + content.strip() + current[end:]
+    # Removing a whole line also removes its line break.
+    if (start == 0 or current[start - 1] == "\n") and current[end : end + 1] == "\n":
+        end += 1
+    return current[:start] + current[end:]
 
 
 __all__ = [
+    "apply_memory_edit",
     "MEMORY_SET_CAPABILITY_ID",
     "MEMORY_SET_EXECUTOR_ID",
     "MEMORY_SET_OUTPUT_KIND",

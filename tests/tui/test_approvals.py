@@ -14,8 +14,6 @@ from tests.tui._support import (
     ConfirmScreen,
     DaitaApp,
     FrozenJsonObject,
-    Input,
-    ReviewCostScreen,
     Static,
     ToolCall,
     ToolResultBlock,
@@ -197,32 +195,3 @@ async def test_destructive_confirm_requires_explicit_yes():
         await pilot.press("y")
         await pilot.pause()
     assert accepted.return_value is True
-
-
-async def test_review_cost_modal_validates_before_dismissal():
-    class Harness(App[str | None]):
-        def compose(self) -> ComposeResult:
-            yield Static("host")
-
-        def on_mount(self) -> None:
-            self.run_worker(self._present(), exclusive=True)
-
-        async def _present(self) -> None:
-            self.exit(await self.push_screen_wait(ReviewCostScreen()))
-
-    app = Harness()
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        field = app.screen.query_one("#review-cost-value", Input)
-        field.value = "not-money"
-        screen_after = app.screen
-        assert isinstance(screen_after, ReviewCostScreen)
-        screen_after._submit()
-        await pilot.pause()
-        assert isinstance(app.screen, ReviewCostScreen)
-        field.value = "0.15"
-        screen = app.screen
-        assert isinstance(screen, ReviewCostScreen)
-        screen._submit()
-        await pilot.pause()
-    assert app.return_value == "0.15"

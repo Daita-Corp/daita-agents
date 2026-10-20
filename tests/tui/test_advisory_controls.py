@@ -35,7 +35,7 @@ def test_external_editor_runs_only_inside_textual_suspend():
     assert events == ["suspend", "edit:memory", "resume"]
 
 
-async def test_skill_memory_and_candidate_editor_flows_use_public_controller(
+async def test_skill_and_memory_editor_flows_use_public_controller(
     tmp_path: Path,
 ):
     opened = await Agent.create(
@@ -58,20 +58,5 @@ async def test_skill_memory_and_candidate_editor_flows_use_public_controller(
         app._edit_document = lambda seed: seed + "Remember fiscal calendars.\n"  # type: ignore[method-assign]
         await app._edit_memory_target("memory")
         assert "Remember fiscal calendars." in await opened.read_memory()
-
-        documents: list[tuple[str, str]] = []
-
-        async def candidate_document(candidate_id: str) -> str:
-            assert candidate_id == "candidate-1"
-            return '{"statement": "old"}\n'
-
-        async def save_candidate(candidate_id: str, text: str) -> None:
-            documents.append((candidate_id, text))
-
-        app.controller.candidate_editor_document = candidate_document  # type: ignore[method-assign]
-        app.controller.save_candidate_document = save_candidate  # type: ignore[method-assign]
-        app._edit_document = lambda seed: '{"statement": "new"}\n'  # type: ignore[method-assign]
-        await app._edit_candidate("candidate-1")
-        assert documents == [("candidate-1", '{"statement": "new"}\n')]
     finally:
         await opened.close()

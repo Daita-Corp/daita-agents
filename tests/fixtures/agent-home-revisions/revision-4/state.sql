@@ -7,7 +7,7 @@ CREATE TABLE agent_home_migrations (
 INSERT INTO "agent_home_migrations" VALUES(1,'agent_home_revision_1','a08bdc56e3cb7c3dbe77dc0d8b8ed9aac1299a6a701902dba8e11a5ebe70f25e');
 INSERT INTO "agent_home_migrations" VALUES(2,'0002_durable_adaptive_task_graph','cb98e978fcb6db71cc1cb3ee5532d92ce99117db7359a008a98a4651df1c20e2');
 INSERT INTO "agent_home_migrations" VALUES(3,'0003_framework_caller_authority','3357ee7ad8153e5160d06133082be89dca1e868f1529029f5b63988fae5dca42');
-INSERT INTO "agent_home_migrations" VALUES(4,'0004_foreground_analysis_evidence','fb675270be548207199b3737d0c3f6c75e9b41e2ddc906ac674ec42f9d98b528');
+INSERT INTO "agent_home_migrations" VALUES(4,'0004_foreground_analysis_evidence','0b0775dd1335a7333cb5b449e70a3de707ad28ecc7a17b14c3cb2ed6473283f7');
 CREATE TABLE analysis_evidence (
     agent_id TEXT NOT NULL,
     run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -379,12 +379,6 @@ CREATE TABLE job_tasks (
         REFERENCES job_tasks(agent_id, job_id, task_id) ON DELETE RESTRICT,
     FOREIGN KEY(agent_id, job_id, superseded_by_task_id)
         REFERENCES job_tasks(agent_id, job_id, task_id) ON DELETE RESTRICT
-);
-CREATE TABLE learning_candidates (
-    agent_id TEXT NOT NULL,
-    id TEXT NOT NULL,
-    data TEXT NOT NULL,
-    PRIMARY KEY(agent_id, id)
 );
 CREATE TABLE mcp_server_bindings (
     agent_id TEXT NOT NULL,

@@ -28,7 +28,6 @@ COMMAND_GROUPS = (
                 "/schedule [when]",
                 "Run the latest question again on a schedule",
             ),
-            ("/teach ", "/teach [note]", "Remember what worked in the latest answer"),
         ),
     ),
     (
@@ -66,17 +65,17 @@ COMMAND_GROUPS = (
     (
         "Learn",
         (
-            ("/learn ", "/learn <material>", "Teach a fact, preference or procedure"),
             (
-                "/review",
-                "/review [cost-usd]",
-                "Suggest memories and skills from recent runs",
+                "/learn ",
+                "/learn [material]",
+                "Teach a fact, preference or procedure; alone, remember what "
+                "worked in the latest answer",
             ),
             (
                 "/memory",
                 "/memory",
-                "What Daita remembers, and suggestions to review (duplicate, "
-                "stale, conflicting, and superseded)",
+                "What Daita remembers, including duplicate, stale, conflicting, and "
+                "superseded definitions",
             ),
             ("/user", "/user", "Your profile and preferences"),
             ("/skills", "/skills", "List reusable procedures"),
@@ -121,7 +120,7 @@ _COMMAND_GROUP_BY_DISPLAY = {
 NEXT_STEPS = (
     ("/save", "Save as document"),
     ("/schedule", "Run on a schedule"),
-    ("/teach", "Teach this"),
+    ("/learn", "Teach this"),
 )
 
 
@@ -217,18 +216,8 @@ def learning_invocation_message(message: str) -> str | None:
         return None
     if len(parts) == 1 or not parts[1].strip():
         raise ValueError("usage: /learn <material>")
-    material = parts[1].strip()
-    return LearningInvocation(
-        "Treat the following as an explicit teaching request. Determine whether it "
-        "belongs in stable user preferences, agent-wide business memory, a current "
-        "resource/field-scoped semantic annotation, or a reusable procedural skill. "
-        "Apply the normal foreground-learning safety rules and inspect current catalog "
-        "scope and existing memory, semantics, or skills when needed. Call the smallest "
-        "fitting learning tool immediately; its approval card is the only confirmation, "
-        "so never ask the user for a typed approval phrase. Do not claim that a workflow "
-        "is verified unless it was executed successfully or the user explicitly "
-        "confirmed it.\n\nTeaching material:\n" + material
-    )
+    # The explicit-learning run supplies the routing instructions.
+    return LearningInvocation("/learn " + parts[1].strip())
 
 
 def quoted_source_override(selector: str) -> str:

@@ -23,7 +23,7 @@ async def test_memory_roundtrip_labels_bounds_and_revision(advisory_storage):
     memory = MemoryStore(None, asyncio.Lock(), storage=advisory_storage)
     try:
         assert await memory.read_context() == ("", "", ModelSensitivity.PUBLIC)
-        before = await memory.preflight_replacement("memory", "naïve 🧭")
+        before = await memory.preflight_edit("memory", lambda _: "naïve 🧭")
         await memory.set_memory("naïve 🧭", sensitivity=ModelSensitivity.INTERNAL)
         await memory.set_user_profile(
             "Concise", sensitivity=ModelSensitivity.RESTRICTED
@@ -33,12 +33,13 @@ async def test_memory_roundtrip_labels_bounds_and_revision(advisory_storage):
             "Concise",
             ModelSensitivity.RESTRICTED,
         )
-        first = await memory.preflight_replacement("memory", "new")
+        first = await memory.preflight_edit("memory", lambda current: current + " new")
         await memory.set_memory("temporary")
         await memory.set_memory("naïve 🧭", sensitivity=ModelSensitivity.INTERNAL)
-        again = await memory.preflight_replacement("memory", "new")
-        assert not before[0] and first[0]
-        assert first[1] == again[1] and first[2] != again[2]
+        again = await memory.preflight_edit("memory", lambda current: current + " new")
+        assert not before[1] and first[1]
+        assert first[0] == again[0] == "naïve 🧭 new"
+        assert first[2] == again[2] and first[3] != again[3]
         with pytest.raises(MemoryValidationError):
             await memory.set_memory("x" * 2201)
         assert await memory.read_memory() == "naïve 🧭"
@@ -270,7 +271,7 @@ async def test_cancelled_preflight_waits_for_its_storage_snapshot(
     memory = MemoryStore(None, asyncio.Lock(), storage=BlockingRead())
     skills = SkillStore(None, asyncio.Lock(), storage=BlockingRead())
     reading = asyncio.create_task(
-        memory.preflight_replacement("memory", "replacement")
+        memory.preflight_edit("memory", lambda _: "replacement")
         if owner == "memory"
         else skills.preflight_save("report", "Report", "Instructions.")
     )

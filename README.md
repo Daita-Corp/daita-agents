@@ -21,8 +21,8 @@ access, budgets, and actions you authorize.
   once or regularly. Follow them and review results on the Work tab while a Daita
   host is open.
 - **Improve with use.** Keep conversations, approved business knowledge,
-  meanings tied to specific sources, and reusable Markdown procedures. An
-  optional, explicit review can propose lessons from completed runs for you to accept.
+  meanings tied to specific sources, and reusable Markdown procedures. Teach
+  them with `/learn`; every change waits for your approval.
 - **Deliver useful output.** Create reports backed by evidence and CSV or XLSX
   exports, including exact relational snapshots.
 - **Take controlled action.** Preview and approve scoped PostgreSQL updates or

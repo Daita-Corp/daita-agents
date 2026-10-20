@@ -50,7 +50,6 @@ from ...loop.models import RunInput, RunOrigin, Transcript
 from ...loop.session import RunSession
 from ...scope import EffectiveSourceScope, resolve_effective_source_scope
 from ...storage.sqlite_records import RelationalWriteScope, SourcePermissionStateError
-from ..learning import LearningCandidateGuard
 from .routine_precheck import RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID
 from .sql import (
     DuckDBReadValidationError,
@@ -350,7 +349,6 @@ class DataCapabilityDomain:
         self,
         declarations: CapabilityDeclarations,
         catalog: DataDomainCatalog,
-        learning: LearningCandidateGuard,
         source_types: SourceTypeRegistry,
         *,
         relational_export_available: bool = True,
@@ -388,14 +386,11 @@ class DataCapabilityDomain:
         ):
             if not callable(getattr(catalog, method_name, None)):
                 raise TypeError(f"data catalog must provide {method_name}")
-        if not isinstance(learning, LearningCandidateGuard):
-            raise TypeError("learning must be LearningCandidateGuard")
         self._upsert_readiness = upsert_readiness
         self._transcript_loader = transcript_loader
         self._registry: CapabilityRegistry | None = None
         self._declarations = declarations
         self._catalog = catalog
-        self._learning = learning
         self._source_types = source_types
         self._views = {item.name: item for item in declarations.tool_views}
         self._capabilities = {item.id: item for item in declarations.capabilities}
@@ -484,19 +479,6 @@ class DataCapabilityDomain:
         for name in sorted(views):
             view = views[name]
             capability = self._capabilities[view.capability_id]
-            routed = tuple(
-                self._capabilities[capability_id]
-                for _mode, capability_id in view.mode_capability_ids
-            ) or (capability,)
-            if not self._learning.allows(
-                session,
-                name,
-                effectful=all(
-                    item.operational_effect is not OperationalEffect.NONE
-                    for item in routed
-                ),
-            ):
-                continue
             if capability.id in _CATALOG_CAPABILITIES:
                 # The live session folder source has no catalog to discover.
                 if any(
@@ -554,8 +536,6 @@ class DataCapabilityDomain:
     ) -> FrozenJsonObject:
         scope = await resolve_effective_source_scope(run, self._catalog)
         run = replace(run, resolved_source_scope=scope)
-        if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.validate_effect(session, call, arguments)
         await self._validate_source_scope(run, capability, arguments)
         self._validate_execution_resource_scope(run, capability, arguments)
         await self._validate_resource_read_scope(run, capability, arguments)
@@ -933,8 +913,6 @@ class DataCapabilityDomain:
                     output.artifact,
                 ),
             )
-        if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.mark_effect_succeeded(session, call.id)
         return await self._classify(run, capability, arguments, output)
 
     finalize_session_output = finalize_output

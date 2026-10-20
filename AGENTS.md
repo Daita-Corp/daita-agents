@@ -358,9 +358,8 @@ The statically composed domains are `DataCapabilityDomain`,
 `MemoryCapabilityDomain`, `SkillCapabilityDomain`,
 `SemanticCapabilityDomain`, `ArtifactCapabilityDomain`,
 `RoutineCapabilityDomain`, `DistributionCapabilityDomain`, and the admitted
-MCP domain. `LearningCandidateGuard` supplies the bounded transient learning
-selection and mutation-success state shared by relevant domains. Applicability
-and current-state checks remain in the concrete domain.
+MCP domain. Applicability and current-state checks remain in the concrete
+domain.
 
 `CapabilityRuntime.execute_internal` is the typed code-owned path used by the
 job and routine supervisors. It resolves the same immutable registry contract
@@ -745,11 +744,7 @@ session runtime or resumable loop.
 text. They are not catalog truth, evidence, policy, authorization, executors,
 or plugins. Semantic annotations are also advisory and must remain grounded in
 current resource identity and evidence. Learning uses the ordinary foreground
-loop and explicit capabilities. Candidate review is disabled by default. When
-explicitly requested, it uses one tool-free model request outside `AgentLoop`
-and places proposals in an inactive inbox. `/memory accept <id>` handles exactly
-one candidate through a fresh foreground run; there is no bulk acceptance or
-background learning agent.
+loop and explicit capabilities; there is no background learning agent.
 
 Operational effects use the fixed governance branch immediately before the
 effect in `CapabilityRuntime`. Approval is once-only, in-process, and bound to
@@ -872,7 +867,7 @@ prices remain in `profiles.py` and `pricing.py`.
 
 One immutable `ModelCallPolicy` in `AgentConfig` and `ModelRequest` governs
 configured and conforming injected providers, both delivery modes, foreground,
-routines, graph tasks, validation and candidate review. Defaults are 180 seconds
+routines, graph tasks and validation. Defaults are 180 seconds
 per logical request, 120 per attempt, 60 to first substantive progress, 30 idle,
 15 counting, 5 connect, 120 read, 30 write, 5 pool and 5 cleanup. Every logical
 request intersects its caller/run deadline before setup; retries retain that
@@ -914,10 +909,10 @@ eligibility. Completed usage remains authoritative during shutdown. Valid HTTP
 retry delays are honored without shortening; waits exceeding 60 seconds or the
 remaining deadline stop recovery. Local exponential backoff uses bounded jitter.
 `RetryPolicy` defaults to `max_attempts_per_candidate=2` and
-`max_total_attempts=3`. Both limits are one for one-shot validation/review.
+`max_total_attempts=3`. Both limits are one for one-shot validation.
 Every host route uses `ModelRouter`, including a one-candidate route. The host
 places an injected non-router provider in a one-candidate router with the
-default `RetryPolicy` (one attempt for validation and review) under its
+default `RetryPolicy` (one attempt for validation) under its
 `injected:` provider permit key, so every route shares retry, admission and
 attempt diagnostics. Injected providers retain caller ownership, must honor the
 canonical policy and are never closed by that router; their frozen model
@@ -927,8 +922,8 @@ Provider lifecycle follows explicit ownership. Providers constructed from an
 agent's persisted model route are closed by `EmbeddedAgent` after runs and
 supervisors drain. Providers injected by a caller remain caller-owned and may
 be reused across agent instances. Each provider closes only SDK clients it
-created; injected SDK clients remain borrowed. Temporary validation and
-candidate-review providers are closed by the component that creates them.
+created; injected SDK clients remain borrowed. Temporary validation providers
+are closed by the component that creates them.
 
 Owners stop new work and drain active calls before closing a provider. Close
 callers share one absolute cleanup deadline and a retained once-only outcome;

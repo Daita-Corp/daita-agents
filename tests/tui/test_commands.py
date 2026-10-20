@@ -103,7 +103,7 @@ async def test_typed_command_palette_navigates_and_inserts_without_submitting(
                 assert popup.selected_insertion() == "/save"
 
                 # Answer actions lead the menu; /sources opens the Data group.
-                await pilot.press("down", "down", "down", "enter")
+                await pilot.press("down", "down", "enter")
                 await pilot.pause()
                 assert composer.text == "/sources"
                 assert popup.display is False

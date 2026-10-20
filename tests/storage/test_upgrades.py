@@ -13,7 +13,6 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -47,14 +46,10 @@ from daita.storage.home_migrations.revision_0004 import REVISION_4
 from daita.storage.schema_contract import require_healthy, require_schema
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_schema import CURRENT_SCHEMA
+from tests.support.home_revisions import undo_revision_4_schema
 from tests.support.mcp_actions import ActionFixture
 from tests.support.paths import REPO_ROOT
 from tests.support.workspace import workspace_for
-
-
-class _TTYBuffer(io.StringIO):
-    def isatty(self) -> bool:
-        return True
 
 
 def _sha256(path: Path) -> str:
@@ -431,8 +426,7 @@ async def test_populated_prior_mcp_home_preserves_binding_grant_and_receipt(
                 "UPDATE agent_home_migrations SET checksum = ? WHERE revision = 3",
                 (PRE_REGISTRY_REVISION_3_CHECKSUM,),
             )
-        connection.execute("DROP TABLE analysis_evidence")
-        connection.execute("DROP TABLE catalog_links")
+        undo_revision_4_schema(connection)
         connection.execute("DELETE FROM agent_home_migrations WHERE revision > 3")
         connection.execute("DROP TABLE artifacts")
     connection.close()
@@ -909,42 +903,50 @@ def test_headless_cli_reports_revision_status_and_safe_failures(tmp_path: Path) 
     assert error["state_path"] == str(path)
 
 
-def test_interactive_tui_renders_human_safe_upgrade_diagnostic(tmp_path: Path) -> None:
-    async def prepare() -> Path:
-        created = await Agent.create(
-            "unsupported", root=tmp_path, workspace=workspace_for(tmp_path)
-        )
-        try:
-            return created.home / "state.db"
-        finally:
-            await created.close()
+async def test_interactive_tui_lists_unopenable_home_with_human_safe_diagnostic(
+    tmp_path: Path,
+) -> None:
+    from daita.tui.app import DaitaApp
+    from daita.tui.screens.selection import SelectionScreen
 
-    path = asyncio.run(prepare())
+    created = await Agent.create(
+        "unsupported", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    path = created.home / "state.db"
+    await created.close()
     with sqlite3.connect(path) as connection:
         connection.execute(
             "UPDATE agent_home_migrations SET migration_id = 'unknown' "
             "WHERE revision = 1"
         )
-    stdin = _TTYBuffer()
-    stdout = _TTYBuffer()
-    stderr = _TTYBuffer()
+    before = path.read_bytes()
+    app = DaitaApp(
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        agent_name="unsupported",
+        start_bootstrap=False,
+    )
+    shown: list[SelectionScreen] = []
 
-    with (
-        patch.object(sys, "stdin", stdin),
-        patch.object(sys, "stdout", stdout),
-        patch.object(sys, "stderr", stderr),
-        redirect_stdout(stdout),
-        redirect_stderr(stderr),
-    ):
-        code = cli.main(["--root", str(tmp_path), "--agent", "unsupported"])
+    async def await_modal(screen: SelectionScreen) -> None:
+        shown.append(screen)
+        return None
 
-    rendered = stderr.getvalue()
-    assert code == 1
-    assert stdout.getvalue() == ""
-    assert rendered.startswith("Daita could not open this local agent state.\n")
-    assert f"State: {path}" in rendered
-    assert "Local data changed: no" in rendered
-    assert "current_revision" not in rendered
+    app._await_modal = await_modal  # type: ignore[method-assign]
+    try:
+        await app._bootstrap_inner()
+    finally:
+        await app.controller.close()
+
+    (picker,) = shown
+    assert [(item.identity, item.description) for item in picker._options] == [
+        ("unsupported", "cannot open with this release")
+    ]
+    assert picker._initial_error.startswith("unsupported: ")
+    for internal in ("current_revision", "found_revision", "Traceback"):
+        assert internal not in picker._initial_error
+    assert app._startup_error is None
+    assert path.read_bytes() == before
 
 
 def test_released_home_migration_checksum_binds_its_exact_definition() -> None:

@@ -191,8 +191,8 @@ The same typed keyword is available on `set_user_profile`. Local Markdown
 classification uses the first line `<!-- daita-sensitivity: restricted -->`
 (or another `ModelSensitivity` value). Classification is a local information
 handling decision; content that claims permission or describes itself as public
-does not override it. Semantic annotations and inactive learning candidates
-retain their classification in their existing SQLite records.
+does not override it. Semantic annotations retain their classification in
+their existing SQLite records.
 
 Scheduled instructions must be self-contained and retain the originating request's
 sensitivity. A scheduled run does not import unrelated conversation history,

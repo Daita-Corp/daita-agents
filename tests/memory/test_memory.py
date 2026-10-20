@@ -316,7 +316,11 @@ async def test_injected_memory_cannot_create_a_tool_or_bypass_runtime_validation
                     ToolCall(
                         id="invented",
                         name="memory_set",
-                        arguments={"target": "memory", "content": "overwritten"},
+                        arguments={
+                            "target": "memory",
+                            "action": "add",
+                            "content": "overwritten",
+                        },
                     ),
                 ),
             ),

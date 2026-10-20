@@ -303,7 +303,7 @@ async def test_same_conversation_turns_bind_predecessor_and_include_prior_result
 
 @pytest.mark.parametrize(
     "operation",
-    ("detach", "refresh", "apply_permissions", "candidate_review"),
+    ("detach", "refresh", "apply_permissions"),
 )
 async def test_foreground_run_does_not_hold_a_broad_host_mutation_lock(
     tmp_path,
@@ -340,7 +340,7 @@ async def test_foreground_run_does_not_hold_a_broad_host_mutation_lock(
         mutation = asyncio.create_task(agent.detach(source.id))
     elif operation == "refresh":
         mutation = asyncio.create_task(agent.refresh_source(source.id))
-    elif operation == "apply_permissions":
+    else:
         assert permission_preview is not None
         mutation = asyncio.create_task(
             agent.apply_source_permissions(
@@ -348,8 +348,6 @@ async def test_foreground_run_does_not_hold_a_broad_host_mutation_lock(
                 confirmation_fingerprint=(permission_preview.confirmation_fingerprint),
             )
         )
-    else:
-        mutation = asyncio.create_task(agent.review_learning_candidates())
     mutation_result = await asyncio.wait_for(mutation, timeout=1)
     listed_sources = await asyncio.wait_for(agent.list_sources(), timeout=1)
     if operation == "detach":

@@ -27,7 +27,6 @@ from ..distribution.owner import DistributionStore
 from ..domains.data.catalog import CatalogPermissionStore
 from ..domains.mcp import MCPBindingStore
 from ..jobs.owner import GraphJobStore, GraphSupervisorStore
-from ..learning_candidates import LearningCandidateStore
 from ..loop.driver import TranscriptStore
 from ..routines.owner import RoutineStore, RoutineSupervisorStore
 from ..semantics import SemanticStore
@@ -68,7 +67,6 @@ class StateStore(
     CatalogPermissionStore,
     MCPBindingStore,
     GraphJobStore,
-    LearningCandidateStore,
     TranscriptStore,
     RoutineStore,
     SemanticStore,
@@ -77,6 +75,8 @@ class StateStore(
     Protocol,
 ):
     """Composition of domain contracts; consumers accept their narrow views."""
+
+    async def clear_conversations(self, agent_id: str) -> int: ...
 
     async def load_analysis_evidence(
         self, agent_id: str, run_id: str

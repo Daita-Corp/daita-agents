@@ -13,15 +13,18 @@ The catalog and current tool results remain the source of truth for live data.
 | Markdown skills | Reusable procedures that Daita can read when relevant. |
 
 In the terminal app, use `/learn <material>` to teach a definition or
-procedure. Daita chooses the fitting form, checks current context when needed,
+procedure, or `/learn` alone right after an answer to keep what worked. Daita
+chooses the fitting form, checks current context when needed,
 and presents the exact change for approval. Use `/memory` to inspect saved
 knowledge and semantic annotations, `/user` for your profile, and `/skills`
 to manage procedures. A skill can guide work but cannot connect to a source
 or grant an action.
 
-The model reaches this knowledge through a few tools. `skill_view` reads one
-skill, and `skill_save` creates or replaces one; with `action: "delete"` it
-removes one named skill instead. `semantic_view` lists annotations when no `id`
+The model reaches this knowledge through a few tools. `memory_set` adds,
+replaces or removes one entry of agent memory or the user profile; replace and
+remove name the exact current text they change, so the approval card shows only
+that edit. `skill_view` reads one skill, and `skill_save` creates or replaces
+one; with `action: "delete"` it removes one named skill instead. `semantic_view` lists annotations when no `id`
 is given (filtered by source, resource, kind and limit) and loads one
 annotation with its `current_sha256` when an `id` is given. `semantic_save`
 creates, replaces or supersedes an annotation; with `action: "delete"` it
@@ -29,14 +32,9 @@ deletes one. Each save and delete keeps its own exact approval card, and
 replacement, supersession and deletion all require the `expected_sha256` from
 the latest view.
 
-## Suggestions from completed work
-
-`/review` can inspect completed runs and suggest reusable lessons. This review
-is off by default and needs an explicit cost limit when authorized. Suggestions
-enter an inactive candidate inbox. Inspect, edit, accept, or reject them through
-`/memory`; accepting one candidate starts a fresh foreground run with the
-ordinary checks and approval. Daita does not silently promote a model's
-inference into durable knowledge.
+Daita does not silently promote a model's inference into durable knowledge:
+it learns only when you teach it with `/learn`, or ask it to
+remember something, and every change waits for your approval.
 
 Semantic annotations remain tied to current catalog identities and evidence.
 Metrics referencing a database table or column belong in semantic annotations,

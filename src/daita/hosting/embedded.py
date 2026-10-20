@@ -148,7 +148,6 @@ from ..domains.data.profile_jobs import (
     DataProfileCapabilityDomain,
     data_profile_declarations,
 )
-from ..domains.learning import LearningCandidateGuard
 from ..domains.mcp import (
     MCP_DOMAIN_OWNER_ID,
     MCPActivatedBinding,
@@ -191,15 +190,6 @@ from ..jobs.graph.models import (
 from ..jobs.owner import GraphBlockerProjection, JobOwner
 from ..jobs.projections import GraphBoardProjection, GraphTimelinePage
 from ..jobs.supervisor import JobSupervisor
-from ..learning_candidates import (
-    LearningCandidate,
-    LearningCandidateContent,
-    LearningCandidateRejectionReason,
-    LearningCandidateStatus,
-    LearningCandidateView,
-    LearningReviewResult,
-    OneShotCandidateReviewer,
-)
 from ..llm.models import (
     CanonicalMessage,
     ModelCallPolicy,
@@ -333,9 +323,7 @@ from .agent_home import (
     _WriterLock,
 )
 from .configuration import (
-    _ONE_ATTEMPT_RETRY_POLICY,
     _admit_host_model,
-    _candidate_reviewer_from_route,
     _configuration_was_injected,
     _credential_account,
     _credential_account_prefix,
@@ -349,7 +337,6 @@ from .configuration import (
     _owned_source_credential_references,
     _read_model_configuration,
     _read_model_configuration_document,
-    _resolve_candidate_reviewer_profile,
     _resolve_configuration,
     _resolve_credential_session,
     _stage_c_model_routes,
@@ -626,15 +613,12 @@ class EmbeddedAgent:
         data_profile_admission: DataProfileAdmission,
         execution_contract_reader: ExecutionContractReader,
         data_profile_job_domain: DataProfileCapabilityDomain,
-        learning_candidate_guard: LearningCandidateGuard,
         semantic_domain: SemanticCapabilityDomain,
         memory_store: MemoryStore,
         skill_store: SkillStore,
-        candidate_reviewer: OneShotCandidateReviewer,
         context_builder: AgentContextBuilder | None,
         artifact_store: AgentHomeArtifactStore,
         artifact_delivery: LocalArtifactDelivery | None,
-        candidate_acceptance_supported: bool,
         admission_coordinator: RunAdmissionCoordinator,
         host_capacity: HostCapacityLimits,
         source_types: SourceTypeRegistry,
@@ -700,15 +684,12 @@ class EmbeddedAgent:
         self._data_profile_admission = data_profile_admission
         self._execution_contract_reader = execution_contract_reader
         self._data_profile_job_domain = data_profile_job_domain
-        self._learning_candidate_guard = learning_candidate_guard
         self._semantic_domain = semantic_domain
         self._memory_store = memory_store
         self._skill_store = skill_store
-        self._candidate_reviewer = candidate_reviewer
         self._context_builder = context_builder
         self._artifact_store = artifact_store
         self._artifact_delivery = artifact_delivery
-        self._candidate_acceptance_supported = candidate_acceptance_supported
         self._clock = clock
         self._id_factory = id_factory
         self._admission_coordinator = admission_coordinator
@@ -926,9 +907,6 @@ class EmbeddedAgent:
         mcp_connection_provider: MCPConnectionProvider | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
-        reviewer_model: ModelProvider | None = None,
-        reviewer_profile: ModelProfile | None = None,
-        reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
@@ -1036,9 +1014,6 @@ class EmbeddedAgent:
                 keychain=credential_session,
                 owns_credential_session=owns_credential_session,
                 model_validator=model_validator,
-                reviewer_model=reviewer_model,
-                reviewer_profile=reviewer_profile,
-                reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
                 diagnostics=diagnostics,
                 approval_handler=approval_handler,
@@ -1088,9 +1063,6 @@ class EmbeddedAgent:
         mcp_connection_provider: MCPConnectionProvider | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
-        reviewer_model: ModelProvider | None = None,
-        reviewer_profile: ModelProfile | None = None,
-        reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
@@ -1254,9 +1226,6 @@ class EmbeddedAgent:
                 keychain=credential_session,
                 owns_credential_session=owns_credential_session,
                 model_validator=model_validator,
-                reviewer_model=reviewer_model,
-                reviewer_profile=reviewer_profile,
-                reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
                 diagnostics=diagnostics,
                 approval_handler=approval_handler,
@@ -1293,9 +1262,6 @@ class EmbeddedAgent:
         mcp_client_factory: MCPClientFactory | None = None,
         mcp_connection_provider: MCPConnectionProvider | None = None,
         keychain: KeychainStore | None = None,
-        reviewer_model: ModelProvider | None = None,
-        reviewer_profile: ModelProfile | None = None,
-        reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         diagnostics_path: Path | None = None,
@@ -1379,9 +1345,6 @@ class EmbeddedAgent:
                     keychain=credential_session,
                     owns_credential_session=owns_credentials,
                     model_validator=None,
-                    reviewer_model=reviewer_model,
-                    reviewer_profile=reviewer_profile,
-                    reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                     observer=observer,
                     diagnostics=diagnostics,
                     approval_handler=approval_handler,
@@ -1429,9 +1392,6 @@ class EmbeddedAgent:
         keychain: CredentialSession,
         owns_credential_session: bool,
         model_validator: ModelProvider | None,
-        reviewer_model: ModelProvider | None,
-        reviewer_profile: ModelProfile | None,
-        reviewer_max_estimated_cost_usd: Decimal | None,
         observer: AgentObserver | None,
         approval_handler: ApprovalHandler | None,
         artifact_store: AgentHomeArtifactStore,
@@ -1631,56 +1591,6 @@ class EmbeddedAgent:
         if advisory_storage is not None:
             await memory_store.read_context()
             await skill_store.list_skills()
-        resolved_reviewer_model = reviewer_model
-        resolved_reviewer_profile = reviewer_profile
-        owned_reviewer_model: ManagedModelProvider | None = None
-        if (
-            resolved_reviewer_model is None
-            and resolved_reviewer_profile is None
-            and reviewer_max_estimated_cost_usd is not None
-            and model_route is not None
-        ):
-            (
-                resolved_reviewer_model,
-                resolved_reviewer_profile,
-            ) = _candidate_reviewer_from_route(
-                model_route,
-                secret_provider=secret_provider or keychain,
-            )
-            owned_reviewer_model = resolved_reviewer_model
-            if admission_cleanup is not None:
-                admission_cleanup.push_async_callback(owned_reviewer_model.close)
-        resolved_reviewer_profile = _resolve_candidate_reviewer_profile(
-            resolved_reviewer_model,
-            resolved_reviewer_profile,
-        )
-        resolved_reviewer_model = _admit_host_model(
-            resolved_reviewer_model,
-            admission_coordinator,
-            identity=identity.id,
-            home=home,
-            profile=resolved_reviewer_profile,
-            retry_policy=_ONE_ATTEMPT_RETRY_POLICY,
-            owned=owned_reviewer_model is not None,
-        )
-        if owned_reviewer_model is not None:
-            owned_reviewer_model = cast(
-                ManagedModelProvider,
-                resolved_reviewer_model,
-            )
-        candidate_reviewer = OneShotCandidateReviewer(
-            agent_id=identity.id,
-            store=store,
-            memory=memory_store,
-            skills=skill_store,
-            catalog=data_view,
-            model=resolved_reviewer_model,
-            owned_model=owned_reviewer_model,
-            profile=resolved_reviewer_profile,
-            max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
-            clock=clock,
-            call_policy=model_call_policy,
-        )
         memory = memory_set_declarations(memory_store)
         skills = skill_declarations(skill_store)
         semantics = semantic_declarations(identity.id, store)
@@ -1719,7 +1629,6 @@ class EmbeddedAgent:
             clock=clock,
             id_factory=id_factory,
         )
-        learning_candidate_guard = LearningCandidateGuard()
         data_declarations = _domain_declarations(
             DATA_DOMAIN_OWNER_ID,
             catalog,
@@ -1753,7 +1662,6 @@ class EmbeddedAgent:
         data_domain = DataCapabilityDomain(
             data_declarations,
             data_view,
-            learning_candidate_guard,
             registry,
             relational_export_available=relational_export is not None,
             combined_query_available=combined_engine is not None,
@@ -1769,19 +1677,14 @@ class EmbeddedAgent:
                 for capability in relational_query.capabilities
             ),
         )
-        skill_domain = SkillCapabilityDomain(
-            skill_declaration_bundle,
-            learning_candidate_guard,
-        )
+        skill_domain = SkillCapabilityDomain(skill_declaration_bundle)
         semantic_domain = SemanticCapabilityDomain(
             semantic_declaration_bundle,
             data_view,
             store,
-            learning_candidate_guard,
         )
         memory_domain = MemoryCapabilityDomain(
             memory_declarations,
-            learning_candidate_guard,
             validate_schema_independent=semantic_domain.validate_schema_independent_memory,
         )
         artifact_domain = (
@@ -1794,7 +1697,6 @@ class EmbeddedAgent:
                 artifact_store,
                 artifact_delivery,
                 workspace_backend,
-                learning_candidate_guard,
                 clock=clock,
             )
         )
@@ -2023,7 +1925,6 @@ class EmbeddedAgent:
         data_domain.bind_capability_registry(capabilities)
         routine_owner.bind_capability_registry(capabilities)
         graph_task_lifecycle.bind_capability_registry(capabilities)
-        candidate_reviewer.bind_capability_registry(capabilities)
 
         async def resolve_run_sources(run: RunInput):
             return await resolve_effective_source_scope(run, data_view)
@@ -2304,11 +2205,9 @@ class EmbeddedAgent:
             data_profile_admission=data_profile_admission,
             execution_contract_reader=read_execution_contracts,
             data_profile_job_domain=data_profile_job_domain,
-            learning_candidate_guard=learning_candidate_guard,
             semantic_domain=semantic_domain,
             memory_store=memory_store,
             skill_store=skill_store,
-            candidate_reviewer=candidate_reviewer,
             context_builder=(
                 resolved_context
                 if isinstance(resolved_context, AgentContextBuilder)
@@ -2316,10 +2215,6 @@ class EmbeddedAgent:
             ),
             artifact_store=artifact_store,
             artifact_delivery=artifact_delivery,
-            candidate_acceptance_supported=(
-                isinstance(resolved_context, AgentContextBuilder)
-                and resolved_tools is capability_runtime
-            ),
             admission_coordinator=admission_coordinator,
             host_capacity=host_capacity,
             source_types=registry,
@@ -2593,9 +2488,6 @@ class EmbeddedAgent:
         *,
         conversation_id: str | None = None,
         source_scope_ids: tuple[str, ...] = (),
-        learning_candidate_id: str | None = None,
-        learning_candidate_text: str | None = None,
-        learning_candidate: LearningCandidate | None = None,
         explicit_learning: bool = False,
         files_only: bool = False,
         run_id: str | None = None,
@@ -2614,19 +2506,6 @@ class EmbeddedAgent:
             raise TypeError("files_only must be bool")
         if files_only and source_scope_ids:
             raise ValueError("files_only and source_scope_ids are mutually exclusive")
-        if learning_candidate_id is not None and (
-            not isinstance(learning_candidate_id, str)
-            or not learning_candidate_id.strip()
-        ):
-            raise ValueError("learning_candidate_id must be a non-empty string or None")
-        if not (
-            (learning_candidate_id is None)
-            == (learning_candidate_text is None)
-            == (learning_candidate is None)
-        ):
-            raise ValueError(
-                "learning candidate guard, id, and rendered content must be set together"
-            )
         if self._model_reopen_required:
             raise AgentNotConfiguredError(
                 "model configuration changed; close and reopen required"
@@ -2734,14 +2613,6 @@ class EmbeddedAgent:
             options = RunSessionOptions(
                 files_only=files_only,
                 explicit_learning=explicit_learning,
-                learning_candidate=learning_candidate,
-                learning_candidate_id=learning_candidate_id,
-                learning_candidate_text=learning_candidate_text,
-                learning_candidate_sensitivity=(
-                    None
-                    if learning_candidate is None
-                    else learning_candidate.sensitivity
-                ),
                 one_time_artifact_destinations=one_time_artifact_destinations,
             )
             session = RunSession(
@@ -3686,7 +3557,7 @@ class EmbeddedAgent:
             )
 
     async def clear_conversations(self) -> int:
-        """Delete transcripts and candidate records, not approved knowledge."""
+        """Delete transcripts, not approved knowledge."""
 
         if self._hosted:
             raise ValueError(
@@ -3703,8 +3574,7 @@ class EmbeddedAgent:
         )
         async with lease:
             self._require_open()
-            cleared = await self._candidate_reviewer.clear_conversations()
-            return cleared
+            return await self._store.clear_conversations(self.identity.id)
 
     async def list_artifacts(
         self,
@@ -3835,175 +3705,6 @@ class EmbeddedAgent:
     ) -> None:
         self._require_open()
         await self._memory_store.set_user_profile(text, sensitivity=sensitivity)
-
-    async def review_learning_candidates(
-        self,
-        *,
-        max_estimated_cost_usd: Decimal | None = None,
-    ) -> LearningReviewResult:
-        """Explicitly trigger one bounded auxiliary review request."""
-
-        deadline = (
-            asyncio.get_running_loop().time() + self._limits.max_wall_time_seconds
-        )
-        lease = await self._admission_coordinator.admit_execution(
-            WorkloadClass.SYSTEM,
-            self._id_factory("learning-review"),
-            absolute_deadline=deadline,
-        )
-        async with lease:
-            self._require_open()
-            if max_estimated_cost_usd is None or self._candidate_reviewer.enabled:
-                return await self._candidate_reviewer.review(
-                    max_estimated_cost_usd=max_estimated_cost_usd,
-                )
-            if self.model_route is None:
-                return await self._candidate_reviewer.review()
-            model, profile = _candidate_reviewer_from_route(
-                self.model_route,
-                secret_provider=self._secret_provider or self._keychain,
-            )
-            admitted_model = _admit_host_model(
-                model,
-                self._admission_coordinator,
-                identity=self.identity.id,
-                home=self._home,
-            )
-            assert admitted_model is not None
-            try:
-                result = await self._candidate_reviewer.review_with_model(
-                    model=admitted_model,
-                    profile=profile,
-                    max_estimated_cost_usd=max_estimated_cost_usd,
-                )
-            except BaseException:
-                try:
-                    await model.close()
-                except BaseException:
-                    pass
-                raise
-            else:
-                await model.close()
-                return result
-
-    async def list_learning_candidates(
-        self,
-        *,
-        status: LearningCandidateStatus | None = None,
-    ) -> tuple[LearningCandidateView, ...]:
-        self._require_open()
-        return await self._candidate_reviewer.list_candidates(status=status)
-
-    async def read_learning_candidate(
-        self,
-        candidate_id: str,
-    ) -> LearningCandidateView | None:
-        self._require_open()
-        return await self._candidate_reviewer.read_candidate(candidate_id)
-
-    async def edit_learning_candidate(
-        self,
-        candidate_id: str,
-        content: LearningCandidateContent,
-    ) -> LearningCandidateView:
-        async with self._admit_system_work("learning-edit"):
-            self._require_open()
-            return await self._candidate_reviewer.edit_candidate(candidate_id, content)
-
-    async def reject_learning_candidate(
-        self,
-        candidate_id: str,
-        reason: LearningCandidateRejectionReason,
-    ) -> LearningCandidateView:
-        async with self._admit_system_work("learning-reject"):
-            self._require_open()
-            return await self._candidate_reviewer.reject_candidate(candidate_id, reason)
-
-    async def clear_rejected_learning_candidates(self) -> int:
-        async with self._admit_system_work("learning-clear-rejected"):
-            self._require_open()
-            return await self._candidate_reviewer.clear_rejected()
-
-    async def accept_learning_candidate(
-        self,
-        candidate_id: str,
-        *,
-        conversation_id: str | None = None,
-        source_id: str | None = None,
-        caller_principal_id: str | None = None,
-    ) -> LoopExit:
-        """Start a fresh ordinary foreground run for one selected candidate."""
-
-        self._require_open()
-        principal_id = self._resolve_caller_principal(caller_principal_id)
-        if not self._candidate_acceptance_supported:
-            raise AgentHomeError(
-                "learning candidate acceptance requires the built-in data "
-                "context and tool runtime"
-            )
-        view = await self._candidate_reviewer.read_candidate(candidate_id)
-        if view is None:
-            raise ValueError(f"learning candidate not found: {candidate_id}")
-        if view.status is not LearningCandidateStatus.AWAITING_REVIEW:
-            raise ValueError(
-                f"learning candidate is not awaiting review: {view.status.value}"
-            )
-        candidate = view.candidate
-        effective_source_id = source_id
-        if candidate.source_ids:
-            bound_source_id = candidate.source_ids[0]
-            if source_id is not None and source_id != bound_source_id:
-                raise ValueError(
-                    "learning candidate acceptance must use its bound source"
-                )
-            effective_source_id = bound_source_id
-        candidate_text = await self._candidate_reviewer.acceptance_context(
-            self.identity.id,
-            candidate.id,
-            effective_source_id,
-        )
-        run_id = self._id_factory("run")
-        evidence = RunSessionEvidence()
-        result: LoopExit | None = None
-        run_error: BaseException | None = None
-        try:
-            result = await self._run(
-                (
-                    "Review the explicitly selected inactive learning candidate "
-                    "against current catalog and active knowledge. If it remains "
-                    "correct, durable, grounded, scoped, and non-duplicate, "
-                    "propose the exact matching existing mutation before "
-                    "returning text. Otherwise do not mutate active knowledge."
-                ),
-                conversation_id=conversation_id,
-                source_scope_ids=(
-                    () if effective_source_id is None else (effective_source_id,)
-                ),
-                learning_candidate_id=candidate.id,
-                learning_candidate_text=candidate_text,
-                learning_candidate=candidate,
-                run_id=run_id,
-                evidence=evidence,
-                caller_principal_id=caller_principal_id,
-            )
-        except BaseException as error:
-            run_error = error
-
-        finalization_cancelled = False
-        if evidence.learning_mutation_succeeded:
-            _, finalization_cancelled = await _await_async_completion(
-                lambda: self._candidate_reviewer.mark_accepted(
-                    candidate.id,
-                    expected_fingerprint=candidate.candidate_fingerprint,
-                )
-            )
-
-        if run_error is not None:
-            raise run_error.with_traceback(run_error.__traceback__)
-        if finalization_cancelled:
-            raise asyncio.CancelledError
-        assert result is not None
-        return result
 
     async def list_semantic_annotations(
         self,
@@ -5392,9 +5093,6 @@ class EmbeddedAgent:
             asyncio.get_running_loop().time()
             + self._model_call_policy.cleanup_timeout_seconds
         )
-        reviewer_close = asyncio.create_task(
-            self._candidate_reviewer.close(deadline=model_shutdown_deadline)
-        )
         if owned_model_provider is not None:
             try:
                 await owned_model_provider.close(deadline=model_shutdown_deadline)
@@ -5402,11 +5100,6 @@ class EmbeddedAgent:
             except BaseException as error:
                 if first_error is None:
                     first_error = error
-        try:
-            await reviewer_close
-        except BaseException as error:
-            if first_error is None:
-                first_error = error
         activated_bindings = (
             *self._mcp_activated_bindings.values(),
             *self._retired_mcp_bindings,

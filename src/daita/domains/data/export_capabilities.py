@@ -108,7 +108,6 @@ from ...scope import (
     SourceScopeCatalog,
     resolve_effective_source_scope,
 )
-from ..learning import LearningCandidateGuard
 from .controller import DATA_EXPORT_TABULAR_CAPABILITY_ID
 from .sql import (
     MAX_SQL_CHARACTERS,
@@ -1860,7 +1859,6 @@ class ArtifactCapabilityDomain:
         artifacts: AgentHomeArtifactStore,
         delivery: LocalArtifactDelivery | None,
         workspace: LocalWorkspaceBackend | None,
-        learning: LearningCandidateGuard,
         *,
         clock: Callable[[], datetime],
     ) -> None:
@@ -1886,7 +1884,6 @@ class ArtifactCapabilityDomain:
         self._artifacts = artifacts
         self._delivery = delivery
         self._workspace = workspace
-        self._learning = learning
         self._clock = clock
         self._registry: CapabilityRegistry | None = None
         self._views = tuple(declarations.tool_views)
@@ -1916,16 +1913,7 @@ class ArtifactCapabilityDomain:
         )
         has_current = any(item.run_id == run.id for item in refs)
         has_prior = any(item.run_id != run.id for item in refs)
-        candidates: list[ToolView] = []
-        for view in self._views:
-            capability = self._capabilities[view.capability_id]
-            if not self._learning.allows(
-                session,
-                view.name,
-                effectful=capability.operational_effect is not OperationalEffect.NONE,
-            ):
-                continue
-            candidates.append(view)
+        candidates = list(self._views)
         may_have_current_artifact = (
             has_current
             or has_prior
@@ -2027,8 +2015,6 @@ class ArtifactCapabilityDomain:
                     error.code, error.message, error.details
                 ) from error
             return arguments
-        if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.validate_effect(session, call, arguments)
         scope = await resolve_effective_source_scope(run, self._catalog)
         supplied_source_id = arguments.get("source_id")
         if (
@@ -2655,11 +2641,6 @@ class ArtifactCapabilityDomain:
                     output.sensitivity.routing_rank < artifact_sensitivity.routing_rank
                 ):
                     output = replace(output, sensitivity=artifact_sensitivity)
-        if capability.operational_effect is not OperationalEffect.NONE and not (
-            capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID
-            and output.data.get("outcome") == "failed"
-        ):
-            self._learning.mark_effect_succeeded(session, call.id)
         if output.sensitivity is not None:
             return output
         # Remaining outputs describe local management state and reflect the

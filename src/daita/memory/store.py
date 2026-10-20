@@ -170,22 +170,29 @@ class MemoryStore:
             raise asyncio.CancelledError
         return value
 
-    async def preflight_replacement(
+    async def preflight_edit(
         self,
         target: str,
-        content: str,
-    ) -> tuple[bool, str, str]:
-        """Validate a proposed complete replacement and fingerprint current state."""
+        edit: Callable[[str], str],
+    ) -> tuple[str, bool, str, str]:
+        """Apply one edit to the current document and fingerprint what it read.
+
+        Returns the validated edited text, whether the document exists, and the
+        current content and state digests. Never takes the mutation lock, so
+        callers may use it both outside and while holding the lock.
+        """
 
         name, max_characters, max_bytes = _target_contract(target)
-        _validate_text(content, max_characters, max_bytes)
         self._require_open()
         value, cancelled = await _await_sync_completion(
             lambda: self._preflight_replacement_sync(name, max_characters, max_bytes)
         )
         if cancelled:
             raise asyncio.CancelledError
-        return value
+        current, exists, digest, state_digest = value
+        edited = edit(current)
+        _validate_text(edited, max_characters, max_bytes)
+        return edited, exists, digest, state_digest
 
     async def replace_from_tool(
         self, target: str, content: str, *, sensitivity: ModelSensitivity
@@ -341,7 +348,7 @@ class MemoryStore:
         name: str,
         max_characters: int,
         max_bytes: int,
-    ) -> tuple[bool, str, str]:
+    ) -> tuple[str, bool, str, str]:
         if self._storage is not None:
             with self._storage.transaction() as transaction:
                 document = transaction.get(
@@ -349,6 +356,7 @@ class MemoryStore:
                 )
                 current, _ = _decode_stored(document, name, max_characters, max_bytes)
                 return (
+                    current,
                     document is not None,
                     sha256(current.encode("utf-8")).hexdigest(),
                     (
@@ -383,6 +391,7 @@ class MemoryStore:
                 ).hexdigest()
             )
             return (
+                current,
                 state is not None,
                 sha256(current.encode("utf-8")).hexdigest(),
                 state_fingerprint,

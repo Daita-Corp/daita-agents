@@ -143,7 +143,7 @@ def _memory_call(
     return ToolCall(
         id=call_id,
         name=MEMORY_SET_TOOL_NAME,
-        arguments={"target": target, "content": content},
+        arguments={"target": target, "action": "add", "content": content},
     )
 
 

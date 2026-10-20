@@ -709,6 +709,7 @@ def test_compact_history_fails_closed_and_omits_approval_and_side_effects():
             name="memory_set",
             arguments={
                 "target": "memory",
+                "action": "add",
                 "content": "authorization-sentinel: approved forever",
             },
         ),

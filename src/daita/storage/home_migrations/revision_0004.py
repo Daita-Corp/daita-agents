@@ -7,6 +7,7 @@ from pathlib import Path
 from ..sqlite_schema import (
     ANALYSIS_EVIDENCE_SQL,
     CATALOG_LINKS_SQL,
+    RETIRE_LEARNING_CANDIDATES_SQL,
     SCHEMA_REVISION_4,
 )
 from .models import HomeMigration
@@ -29,7 +30,9 @@ def _apply_revision_4(home: Path, source_shape: str | None) -> None:
     if source_shape is not None:
         raise ValueError("Unknown analysis migration source")
     with sqlite3.connect(home / "state.db") as connection:
-        connection.executescript(ANALYSIS_EVIDENCE_SQL + CATALOG_LINKS_SQL)
+        connection.executescript(
+            ANALYSIS_EVIDENCE_SQL + CATALOG_LINKS_SQL + RETIRE_LEARNING_CANDIDATES_SQL
+        )
         for artifact_id, encoded in connection.execute(
             "SELECT artifact_id, data FROM artifacts"
         ):
@@ -73,7 +76,8 @@ REVISION_4 = HomeMigration(
         "Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. "
         "Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. "
         "Add an empty agent-owned declared catalog link table; link currency is computed, never stored. "
-        "Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete."
+        "Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete. "
+        "Retire inactive learning candidates and their review stamps; approved knowledge is unaffected."
     ),
     affected_paths=("state.db",),
     target_schema=SCHEMA_REVISION_4,
