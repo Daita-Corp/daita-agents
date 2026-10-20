@@ -12,10 +12,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from ..config import HostCapacityLimits, PostgreSQLReadLimits
 from ..security import SecretProvider
+from .models import SourceRegistration
 from .protocols import ResourceSource, SourceStore
 
 if TYPE_CHECKING:
@@ -35,6 +36,8 @@ class SourceOperation(str, Enum):
     TABULAR_READ = "tabular_read"
     FILE_SEARCH = "file_search"
     TEXT_READ = "text_read"
+    # SQL over files a live folder matches by path pattern, not by catalog.
+    PATH_QUERY = "path_query"
 
 
 # Operations whose validation and execution depend on the type's SQL dialect.
@@ -63,6 +66,14 @@ class SourceBackendContext:
     session_source_id: str | None = None
 
 
+class SourceReconstructor(Protocol):
+    """Rebuild one source from its stored registration, validating its config."""
+
+    def __call__(
+        self, registration: SourceRegistration, *, secret_provider: SecretProvider
+    ) -> ResourceSource: ...
+
+
 def _one_read(_: HostCapacityLimits) -> int:
     return 1
 
@@ -77,7 +88,7 @@ class SourceType:
 
     adapter_id: str
     label: str
-    from_registration: Callable[..., ResourceSource]
+    from_registration: SourceReconstructor
     credential_fields: tuple[str, ...] = ()
     read_capacity: Callable[[HostCapacityLimits], int] = _one_read
     sql_dialect: str | None = None
@@ -152,6 +163,17 @@ class SourceTypeRegistry:
             raise ValueError(
                 f"source type {source_type.adapter_id} is already registered"
             )
+        from ..domains.data.sql import read_validator
+
+        # An SQL type the validators cannot check would be offered SQL and refused.
+        if (
+            source_type.sql_dialect is not None
+            and read_validator(source_type.sql_dialect) is None
+        ):
+            raise ValueError(
+                f"source type {source_type.adapter_id} uses unsupported SQL "
+                f"dialect {source_type.sql_dialect}"
+            )
         self._types[source_type.adapter_id] = source_type
 
     def get(self, adapter_id: str) -> SourceType | None:
@@ -187,7 +209,6 @@ def _sqlite_operations(
         SourceOperation.SQL_READ: backend,
         SourceOperation.TABULAR_EXPORT: backend,
         SourceOperation.PROFILE: backend,
-        SourceOperation.TABULAR_READ: backend,
     }
 
 
@@ -216,7 +237,6 @@ def _postgresql_operations(
         SourceOperation.SQL_READ: reads,
         SourceOperation.TABULAR_EXPORT: reads,
         SourceOperation.PROFILE: reads,
-        SourceOperation.TABULAR_READ: reads,
         SourceOperation.RELATIONAL_UPDATE: writes,
         SourceOperation.RELATIONAL_UPSERT: writes,
     }
@@ -230,7 +250,7 @@ def _folder_operations(
     backend = FolderBackend(context)
     return {
         SourceOperation.SQL_READ: backend,
-        SourceOperation.TABULAR_READ: backend,
+        SourceOperation.PATH_QUERY: backend,
         SourceOperation.FILE_SEARCH: backend,
         SourceOperation.TEXT_READ: backend,
     }
@@ -263,7 +283,6 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
                     SourceOperation.SQL_READ,
                     SourceOperation.TABULAR_EXPORT,
                     SourceOperation.PROFILE,
-                    SourceOperation.TABULAR_READ,
                 }
             ),
             create_backends=_sqlite_operations,
@@ -275,8 +294,15 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
             credential_fields=("credential_ref",),
             read_capacity=_postgresql_read_capacity,
             sql_dialect="postgresql",
-            operations=frozenset(SourceOperation)
-            - {SourceOperation.FILE_SEARCH, SourceOperation.TEXT_READ},
+            operations=frozenset(
+                {
+                    SourceOperation.SQL_READ,
+                    SourceOperation.TABULAR_EXPORT,
+                    SourceOperation.PROFILE,
+                    SourceOperation.RELATIONAL_UPDATE,
+                    SourceOperation.RELATIONAL_UPSERT,
+                }
+            ),
             create_backends=_postgresql_operations,
         ),
         *(
@@ -290,7 +316,7 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
                     operations=frozenset(
                         {
                             SourceOperation.SQL_READ,
-                            SourceOperation.TABULAR_READ,
+                            SourceOperation.PATH_QUERY,
                             SourceOperation.FILE_SEARCH,
                             SourceOperation.TEXT_READ,
                         }
@@ -307,6 +333,7 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
 __all__ = [
     "SourceBackendContext",
     "SourceOperation",
+    "SourceReconstructor",
     "SourceType",
     "SourceTypeRegistry",
     "UnknownSourceTypeError",

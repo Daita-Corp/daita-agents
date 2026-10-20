@@ -9,7 +9,6 @@ import shutil
 import stat
 import subprocess
 import sys
-from dataclasses import replace
 from datetime import UTC, datetime
 from importlib import import_module
 from pathlib import Path
@@ -60,8 +59,7 @@ async def create(root, *turns):
         root=root,
         workspace=workspace_for(root),
         model=model,
-        # Multi-cell transcripts beside the pinned tool surface need headroom.
-        model_profile=replace(_profile(model), context_window_tokens=48_000),
+        model_profile=_profile(model),
     )
 
 

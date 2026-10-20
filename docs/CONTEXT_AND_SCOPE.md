@@ -139,8 +139,8 @@ Connections or permissions added later cannot enlarge that prepared run;
 revocation can narrow it immediately. Source filters apply to catalog access.
 The explicit `files_only=True` option scopes the run to exactly the live session
 folder source, which excludes catalog and MCP operations. The session folder
-source is never stored; include `Agent.session_source_id` in explicit
-`source_scope_ids` to keep local files in a narrowed run.
+source is never stored, and a narrowed foreground run keeps local files: explicit
+`source_scope_ids` narrow catalog sources only.
 Machine runs use their frozen authorization ceilings; an empty machine source
 ceiling means no sources.
 

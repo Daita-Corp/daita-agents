@@ -147,6 +147,19 @@ def test_registry_rejects_a_duplicate_adapter_id() -> None:
         SourceTypeRegistry((registry.require("sqlite"),))
 
 
+def test_registry_rejects_a_type_with_an_unsupported_sql_dialect() -> None:
+    mysql = SourceType(
+        adapter_id="mysql",
+        label="MySQL",
+        from_registration=memory_from_registration,
+        sql_dialect="mysql",
+        operations=frozenset({SourceOperation.SQL_READ}),
+        create_backends=lambda context: {SourceOperation.SQL_READ: object()},
+    )
+    with pytest.raises(ValueError, match="unsupported SQL dialect mysql"):
+        SourceTypeRegistry((mysql,))
+
+
 @pytest.mark.contract
 async def test_in_memory_source_type_satisfies_the_source_contract() -> None:
     await assert_source_type_contract(
@@ -296,14 +309,12 @@ async def test_registered_type_without_sql_attaches_catalogs_reopens_and_detache
                 _tool("describe", "catalog_describe", {"resource_ids": [resource.id]}),
                 _stop("The regions table has region and revenue."),
             ),
-            # Only the SQL-less source: the live session folder answers SQL.
             source_scope_ids=(source.id,),
         )
         assert not results["search"].is_error
         assert resource.id in repr(results["search"].output)
         assert not results["describe"].is_error
         assert "revenue" in repr(results["describe"].output)
-        assert "data_query" not in {tool.name for tool in provider.requests[0].tools}
     finally:
         await agent.close()
 

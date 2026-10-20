@@ -239,15 +239,30 @@ async def test_files_only_scopes_the_run_to_the_session_folder_source(
         first = await agent.attach(SQLiteSource(first_database))
         second = await agent.attach(SQLiteSource(second_database))
 
+        view = agent._embedded._data_view
+        session_source_id = agent.session_source_id
+
         async def unexpected_source_read(*_args, **_kwargs):
             raise AssertionError("files-only context must not read catalog state")
 
+        def session_only(method_name: str):
+            original = getattr(view, method_name)
+
+            async def read(agent_id, source_ids=(), *args, **kwargs):
+                # Projection may consult only the live session folder source.
+                assert source_ids and set(source_ids) <= {session_source_id}
+                return await original(agent_id, source_ids, *args, **kwargs)
+
+            return read
+
         for method_name in ("catalog_context", "semantic_resource_facts"):
-            monkeypatch.setattr(
-                agent._embedded._data_view,
-                method_name,
-                unexpected_source_read,
-            )
+            monkeypatch.setattr(view, method_name, unexpected_source_read)
+        for method_name in (
+            "source_routing_facts",
+            "relational_write_applicable_source_ids",
+            "admitted_model_sensitivity",
+        ):
+            monkeypatch.setattr(view, method_name, session_only(method_name))
         await agent.run("Use files only", files_only=True)
         names = {tool.name for tool in provider.requests[0].tools}
         assert {"file_search", "file_read"} <= names
@@ -540,8 +555,8 @@ async def test_data_query_offers_only_routes_a_source_in_scope_can_serve(
         assert "path_pattern" in local_only
         assert not {"csv", "xlsx"} & local_only
         source = await agent.attach(SQLiteSource(database))
-        sqlite_only = await routes(source.id)
-        assert {"csv", "xlsx"} <= sqlite_only
-        assert "path_pattern" not in sqlite_only
+        # A source filter narrows catalog sources; the session folder stays.
+        narrowed = await routes(source.id)
+        assert {"csv", "xlsx", "path_pattern"} <= narrowed
     finally:
         await agent.close()

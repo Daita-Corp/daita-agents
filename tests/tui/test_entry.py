@@ -7,8 +7,10 @@ from pathlib import Path
 import pytest
 
 from daita import Agent
+from daita.errors import StateCompatibilityCode, StateCompatibilityError
 from daita.tui.app import DaitaApp, run_daita_app
 from daita.tui.screens.onboarding import AgentCreateScreen
+from daita.tui.screens.selection import SelectionScreen
 from tests.support.workspace import workspace_for
 
 
@@ -172,3 +174,46 @@ async def test_unknown_requested_conversation_fails_startup(
         await app.controller.close()
 
     assert app.controller.conversation_id is None
+
+
+async def test_incompatible_agent_state_returns_to_agent_picker(
+    tmp_path: Path, monkeypatch
+):
+    opened = await Agent.create(
+        "atlas", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    await opened.close()
+    app = DaitaApp(
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        agent_name="atlas",
+        start_bootstrap=False,
+    )
+
+    async def incompatible(name: str, **_kwargs: object) -> None:
+        raise StateCompatibilityError(
+            StateCompatibilityCode.REVISION_UNSUPPORTED,
+            tmp_path / name / "state.db",
+            "unknown migration history",
+            current_revision="4",
+        )
+
+    shown: list[SelectionScreen] = []
+
+    async def await_modal(screen: SelectionScreen) -> None:
+        shown.append(screen)
+        return None
+
+    monkeypatch.setattr(app.controller, "open_agent", incompatible)
+    monkeypatch.setattr(app, "_await_modal", await_modal)
+    try:
+        await app._bootstrap_inner()
+    finally:
+        await app.controller.close()
+
+    (picker,) = shown
+    assert picker._initial_error == "atlas: unknown migration history"
+    assert [(o.identity, o.description) for o in picker._options] == [
+        ("atlas", "cannot open with this release")
+    ]
+    assert app._startup_error is None

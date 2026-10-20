@@ -6,12 +6,14 @@ import os
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import duckdb
 import pytest
 
 from daita import Agent, FolderSource, LocalFileAccess, LocalWorkspace
+from daita.adapters import folder as folder_module
 from daita.adapters.folder import FolderSourceError
 from daita.adapters.local_workspace import LocalWorkspaceError
 from daita.adapters.models import DiscoveryRequest
@@ -29,7 +31,6 @@ from daita.security import EmptySecretProvider
 from tests.support.source_contract import (
     assert_live_source_contract,
     assert_source_type_contract,
-    assert_tabular_read_contract,
 )
 from tests.support.workspace import workspace_for
 
@@ -124,7 +125,6 @@ async def test_attached_folder_catalogs_folders_files_and_tabular_schemas(
         }
         assert {path: item.kind for path, item in resources.items()} == {
             ".": ResourceKind.FOLDER,
-            "notes.md": ResourceKind.FILE,
             "sales": ResourceKind.FOLDER,
             "sales/2026": ResourceKind.FOLDER,
             "sales/2026/orders.csv": ResourceKind.FILE,
@@ -171,9 +171,12 @@ async def test_attached_folder_catalogs_folders_files_and_tabular_schemas(
         regions = facets("sales/regions.parquet")
         assert regions[FacetKind.FILE]["format"] == "parquet"
         assert FacetKind.TABULAR in regions
-        notes = facets("notes.md")
-        assert notes[FacetKind.FILE]["format"] == "text"
-        assert FacetKind.TABULAR not in notes
+        # notes.md is not a data file: an attached folder neither catalogs nor
+        # reads it; the live session folder still can.
+        assert "notes.md" not in resources
+        with pytest.raises(FolderSourceError) as refused:
+            await _read(agent, source.id, "notes.md")
+        assert refused.value.error_code == "resource_read_not_allowed"
 
         search = await agent._embedded._data_view.search(
             CatalogSearchRequest(agent_id=agent.id, query="region_code")
@@ -200,36 +203,6 @@ async def test_attached_folder_type_satisfies_the_source_contract(
             FolderSource(folder, name="Contract"),
             secret_provider=EmptySecretProvider(),
             agent_home=agent.home,
-        )
-    finally:
-        await agent.close()
-
-
-@pytest.mark.contract
-async def test_attached_folder_tabular_reads_satisfy_the_tabular_read_contract(
-    tmp_path: Path,
-) -> None:
-    folder = tmp_path / "data"
-    folder.mkdir()
-    (folder / "sales.csv").write_text(
-        'region,"unit price"\nnorth,4.5\nsouth,10.0\nnorth,7.25\neast,1.0\n',
-        encoding="utf-8",
-    )
-    agent = await _agent(tmp_path, "folder-tabular-contract")
-    try:
-        source = await agent.attach(FolderSource(folder, name="Sales"))
-        (sales,) = [
-            item
-            for item in await agent.list_catalog_resources(source_id=source.id)
-            if item.kind is ResourceKind.FILE
-        ]
-        await assert_tabular_read_contract(
-            agent,
-            source_id=source.id,
-            resource_id=sales.id,
-            columns=("region", "unit price"),
-            key_column="region",
-            range_column="unit price",
         )
     finally:
         await agent.close()
@@ -266,23 +239,23 @@ def _contained_case(folder: Path, case: str) -> str:
     """Create one unsafe entry; return the root-relative path it would have."""
 
     if case == "symlink":
-        outside = folder.parent / "outside.txt"
-        outside.write_text("outside sentinel", encoding="utf-8")
-        (folder / "link.txt").symlink_to(outside)
-        return "link.txt"
+        outside = folder.parent / "outside.csv"
+        outside.write_text("id,note\n1,outside sentinel\n", encoding="utf-8")
+        (folder / "link.csv").symlink_to(outside)
+        return "link.csv"
     if case == "parent_traversal":
-        (folder.parent / "outside.txt").write_text("outside sentinel")
-        return "../outside.txt"
+        (folder.parent / "outside.csv").write_text("id,note\n1,outside sentinel\n")
+        return "../outside.csv"
     if case == "secret_pattern":
         (folder / "server.pem").write_text("outside sentinel")
         return "server.pem"
     if case == "special_file":
-        os.mkfifo(folder / "pipe.txt")
-        return "pipe.txt"
+        os.mkfifo(folder / "pipe.csv")
+        return "pipe.csv"
     assert case == "private_daita_state"
     (folder / ".daita").mkdir()
-    (folder / ".daita" / "MEMORY.md").write_text("outside sentinel")
-    return ".daita/MEMORY.md"
+    (folder / ".daita" / "memory.csv").write_text("id,note\n1,outside sentinel\n")
+    return ".daita/memory.csv"
 
 
 @pytest.mark.parametrize(
@@ -300,7 +273,7 @@ async def test_unsafe_entries_are_never_cataloged_searched_or_read(
 ) -> None:
     folder = tmp_path / "data"
     folder.mkdir()
-    (folder / "safe.txt").write_text("safe sentinel", encoding="utf-8")
+    (folder / "safe.csv").write_text("id,note\n1,safe sentinel\n", encoding="utf-8")
     unsafe = _contained_case(folder, case)
     agent = await _agent(tmp_path, f"folder-{case.replace('_', '-')}")
     try:
@@ -309,29 +282,82 @@ async def test_unsafe_entries_are_never_cataloged_searched_or_read(
             item.native_identity
             for item in await agent.list_catalog_resources(source_id=source.id)
         }
-        assert cataloged == {".", "safe.txt"}
+        assert cataloged == {".", "safe.csv"}
         for mode in ("paths", "content"):
             matches = await _search(agent, source.id, "sentinel", mode=mode)
-            assert {item["path"] for item in matches} <= {"safe.txt"}
+            assert {item["path"] for item in matches} <= {"safe.csv"}
         # Only readable cataloged files are reachable, before any file I/O.
         with pytest.raises(FolderSourceError) as refused:
             await _read(agent, source.id, unsafe)
         assert refused.value.error_code == "resource_read_not_allowed"
-        assert (await _read(agent, source.id, "safe.txt"))["content"] == (
-            "safe sentinel"
+        assert (await _read(agent, source.id, "safe.csv"))["content"] == (
+            "id,note\n1,safe sentinel\n"
         )
     finally:
         await agent.close()
 
 
-async def test_folder_containing_private_agent_state_cannot_be_attached(
+async def test_attached_file_changed_since_refresh_is_never_searched_or_read(
     tmp_path: Path,
+) -> None:
+    folder = tmp_path / "data"
+    folder.mkdir()
+    orders = folder / "orders.csv"
+    # Larger than one read chunk, so the first read returns a cursor.
+    orders.write_text(
+        "id,note\n" + "".join(f"{index},needle {index}\n" for index in range(6_000)),
+        encoding="utf-8",
+    )
+    agent = await _agent(tmp_path, "folder-changed")
+    try:
+        source = await agent.attach(FolderSource(folder))
+        first = await _read(agent, source.id, "orders.csv")
+        cursor = first["cursor"]
+        assert isinstance(cursor, str)
+        assert await _search(agent, source.id, "needle", mode="content")
+
+        orders.write_text("id,note\n1,needle changed\n", encoding="utf-8")
+        for mode in ("paths", "content"):
+            assert await _search(agent, source.id, "needle", mode=mode) == ()
+        with pytest.raises(FolderSourceError) as by_path:
+            await _read(agent, source.id, "orders.csv")
+        assert by_path.value.error_code == "query_binding_stale"
+        backend = cast(
+            TextReadBackend,
+            agent._embedded._source_backends[SourceOperation.TEXT_READ]["folder"],
+        )
+        with pytest.raises(FolderSourceError) as by_cursor:
+            await backend.read_text(
+                TextReadRequest(
+                    agent_id=agent.id,
+                    run_id="folder-test",
+                    source_id=source.id,
+                    path=None,
+                    cursor=cursor,
+                    position=None,
+                    resource_ids=await agent._embedded._data_view.readable_resource_ids(
+                        agent.id, (source.id,)
+                    ),
+                )
+            )
+        assert by_cursor.value.error_code == "query_binding_stale"
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize("root", ["state_parent", "agent_home"])
+async def test_folder_overlapping_private_agent_state_cannot_be_attached(
+    tmp_path: Path, root: str
 ) -> None:
     agent = await _agent(tmp_path, "folder-state-overlap")
     try:
+        folder = tmp_path if root == "state_parent" else agent.home
         with pytest.raises(ResourceAdapterError) as refused:
-            await agent.attach(FolderSource(tmp_path))
+            await agent.attach(FolderSource(folder))
         assert refused.value.code == "workspace_state_overlap"
+        # The filesystem root is refused before any folder is opened.
+        with pytest.raises(ValueError, match="filesystem root"):
+            await agent.attach(FolderSource(Path("/")))
         assert await agent.list_sources() == ()
     finally:
         await agent.close()
@@ -343,7 +369,7 @@ async def test_discovery_beyond_max_resources_is_bounded_and_marked_truncated(
     folder = tmp_path / "data"
     folder.mkdir()
     for index in range(12):
-        (folder / f"log-{index:02}.txt").write_text(f"entry {index}")
+        (folder / f"part-{index:02}.csv").write_text(f"id\n{index}\n")
     agent = await _agent(tmp_path, "folder-truncation")
     try:
         adapter = await FolderSource(folder).open(
@@ -370,11 +396,48 @@ async def test_discovery_beyond_max_resources_is_bounded_and_marked_truncated(
     assert len(snapshot.resources) == 5
     assert [item.native_identity for item in snapshot.resources] == [
         ".",
-        "log-00.txt",
-        "log-01.txt",
-        "log-02.txt",
-        "log-03.txt",
+        "part-00.csv",
+        "part-01.csv",
+        "part-02.csv",
+        "part-03.csv",
     ]
+
+
+async def test_discovery_out_of_schema_budget_is_marked_truncated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "data"
+    folder.mkdir()
+    (folder / "orders.csv").write_text("id\n1\n")
+    clock = iter((0.0, 1_000.0))
+    # The schema budget is spent before the first batch is described.
+    monkeypatch.setattr(
+        folder_module, "time", SimpleNamespace(monotonic=lambda: next(clock))
+    )
+    agent = await _agent(tmp_path, "folder-schema-budget")
+    try:
+        adapter = await FolderSource(folder).open(
+            agent_id=agent.id, attached_at=_NOW, clock=lambda: _NOW
+        )
+        try:
+            result = await adapter.discover(
+                DiscoveryRequest(
+                    agent_id=agent.id,
+                    source_id=adapter.registration.id,
+                    sync_id="sync-schema-budget",
+                    requested_at=_NOW,
+                    agent_root=agent.home.parent.parent,
+                    agent_home=agent.home,
+                )
+            )
+        finally:
+            await adapter.close()
+    finally:
+        await agent.close()
+    snapshot = result.snapshot
+    assert snapshot.sync.truncated is True
+    assert {item.native_identity for item in snapshot.resources} == {".", "orders.csv"}
+    assert {facet.kind for facet in snapshot.facets} == {FacetKind.FILE}
 
 
 async def _session_search(

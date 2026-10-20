@@ -429,9 +429,14 @@ freshness checks, and I/O. One composed `SourceTypeRegistry` per agent maps each
 `adapter_id` to its factory, credential fields, read capacity, SQL dialect and
 operation backends. `SourceOperation` names those backends: `SQL_READ`,
 `TABULAR_READ`, `TABULAR_EXPORT`, `PROFILE`, `RELATIONAL_UPDATE`,
-`RELATIONAL_UPSERT`, `FILE_SEARCH` and `TEXT_READ`; every operation except
-`TABULAR_READ`, `FILE_SEARCH` and `TEXT_READ` requires an SQL dialect. A stored source whose type is not registered stays listed
-but unavailable: it gets no tools or source capacity, and refresh or edit fails. SQLite paths must be absolute and bounded. Local
+`RELATIONAL_UPSERT`, `FILE_SEARCH`, `TEXT_READ` and `PATH_QUERY`; every
+operation except `TABULAR_READ`, `FILE_SEARCH` and `TEXT_READ` requires an SQL
+dialect the validators in `domains/data/sql` support, checked at registration.
+A stored source whose type is not registered stays listed
+but unavailable: it gets no tools or source capacity, and refresh or edit fails.
+Pass the composing `AgentConfig` to `Agent.delete` so credentials of its source
+types are removed too. PostgreSQL read diagnostics, update readiness and
+keychain password storage remain PostgreSQL-only public conveniences. SQLite paths must be absolute and bounded. Local
 workspace access uses only admitted relative logical paths and rejects
 symlink, traversal, secret-file, and special-file access. PostgreSQL and MCP
 credentials remain secret references and are resolved only at the integration
@@ -452,19 +457,22 @@ current catalog schema, and filters are only AND-combined `eq`, `in`, `lt`,
 `lte`, `gt` and `gte` on scalar values. Its backend receives one
 `ReadTabularRequest` bound to the validated resource revision, refuses a stale
 revision with `query_binding_stale`, and returns a `BoundedResultProjection`.
-SQLite and PostgreSQL implement it by rendering parameterized SQL through their
-own validated read path. A type with `TABULAR_READ` but no `SQL_READ` is usable
+It serves types without SQL; the built-in types read through SQL inputs instead,
+which can aggregate before the join. A type with `TABULAR_READ` but no `SQL_READ` is usable
 only as a combined-query input; single-source `data_query` is refused for it,
 and `data_query` is offered only while a source with `SQL_READ` is in scope.
 A run withholds the `data_query` routes no in-scope source can serve: export
 needs a `TABULAR_EXPORT` source and `path_pattern` needs the session folder.
+A tool definition describes only the routes its run admits, so scheduled and
+graph runs never read about combined or live-folder queries.
 Inputs read at most an internal, model-invisible
 ceiling (`COMBINED_QUERY_INPUT_MAX_ROWS`/`_BYTES`); an input that reaches it
 refuses the whole call with `combined_input_truncated`, so no join ever sees
-incomplete input. The combining `sql` is one DuckDB SELECT validated before
-execution to reference each alias exactly once and nothing else: no table
-functions, file, HTTP or extension access. It runs in the same private DuckDB
-worker as folder-source SQL. The result carries the union of input resource
+incomplete input; an input with no rows still joins and aggregates. The
+combining `sql` is one DuckDB SELECT or UNION validated before execution to
+read every alias and nothing else: no table functions, file, HTTP or extension
+access. It runs in the same private DuckDB worker as folder-source SQL, one
+query at a time; a concurrent call waits for the worker. The result carries the union of input resource
 revisions, the highest input sensitivity and per-input lineage (`source_id`,
 `source_revision`, and `canonical_sql`/`sql_fingerprint` for SQL inputs or
 `columns`/`filters` for tabular inputs). Declared catalog links
@@ -503,13 +511,16 @@ Local files reach the agent only through the `folder` source type
 folder source:
 
 - An **attached folder** (`Agent.attach(FolderSource(root, subpaths=...))`) is a
-  durable, cataloged source like any other. Discovery catalogs FOLDER and FILE
-  resources with `CONTAINS` edges, a `FileFacet` (format, media type, size,
-  stat-based physical revision) for every file, and a `TabularFacet` read
-  through the worker for csv, tsv, json-records, ndjson and parquet files. It is
-  bounded by `max_resources`; a truncated discovery commits a bounded snapshot
-  with `CatalogSync.truncated`. Attached folders are always contained to their
-  root; hosted compositions do not register the folder type.
+  durable, cataloged source like any other. Discovery catalogs only its data
+  files (csv, tsv, json-records, ndjson and parquet) as FILE resources, the
+  FOLDER resources that hold them with `CONTAINS` edges, a `FileFacet` (format,
+  media type, size, stat-based physical revision) and a `TabularFacet` read
+  through the worker. Other files stay reachable only live, through the session
+  folder. Discovery is bounded by `max_resources` and a fixed walk and schema
+  budget; a discovery that reaches either commits a bounded snapshot with
+  `CatalogSync.truncated`. Attached folders are always contained to their root;
+  hosted compositions do not register the folder type. Like any source, they
+  can be granted to scheduled routines and graph jobs.
 - The **session folder source** is built by the composition root from the
   session's `LocalWorkspace`. Its `source:workspace:sha256:` ID is stable for the agent
   and workspace, sorts after every stored source, and is never written to the
@@ -520,8 +531,7 @@ folder source:
   contained by default unless they explicitly select computer access. Only a
   foreground user run receives it: hosted compositions have none, and scope
   resolution drops it for machine-originated runs even when a frozen scope names
-  it. Explicit `source_scope_ids` keep it only when they include
-  `Agent.session_source_id`.
+  it. Explicit `source_scope_ids` narrow catalog sources and never drop it.
 
 Private Daita state is rejected when targeted, pruned from broader searches and
 refused as an attached root. `file_search` and `file_read` take a folder
@@ -530,11 +540,11 @@ shared budget, qualified matches, and per-root coverage, and `file_read` returns
 bounded chunks, `position=end` tail windows and opaque cursors. `data_query` with
 `source_id`, `path_pattern` and `sql` queries one homogeneous dataset matched
 live in the session folder and exposes only the relation `data`. An attached
-folder answers only for its readable cataloged files: search and read are
-limited to them before any file content is read, `data_query` takes their
-`resource_ids` as the one relation `data`, combined queries accept them as SQL
-or tabular inputs, and a file whose physical revision no longer matches its
-catalog revision is refused with `query_binding_stale`. Every result carries the
+folder answers only for its readable cataloged files at their cataloged
+physical revision: search skips any other file and read refuses it before any
+file content is read, `data_query` takes their `resource_ids` as the one
+relation `data`, combined queries accept them as SQL inputs, and a changed
+file is refused with `query_binding_stale` until the source is refreshed. Every result carries the
 source's sensitivity and its binding provenance. A combined `data_query` uses
 the same worker and validator, binding typed copies of its complete inputs in
 private scratch and exposing only their aliases; homes without local scratch

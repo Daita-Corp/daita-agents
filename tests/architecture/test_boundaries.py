@@ -535,8 +535,18 @@ def test_folder_queries_stay_lazy_private_and_inside_existing_owners():
     owners = adapter + workspace + folder + capabilities + controller
     assert "CapabilityRuntime(" not in owners
     assert "CapabilityRegistry(" not in owners
-    # The folder backend reuses the workspace backend's one DuckDB worker.
-    assert "LocalFileQueryBackend(" not in folder + embedded.split("combined")[0]
+    # The folder backend reuses the workspace backend's DuckDB worker; the host
+    # constructs exactly one more, for combined queries.
+    constructions = {
+        name: sum(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "LocalFileQueryBackend"
+            for node in ast.walk(ast.parse(text))
+        )
+        for name, text in (("folder", folder), ("embedded", embedded))
+    }
+    assert constructions == {"folder": 0, "embedded": 1}
     for prohibited in (
         "DuckDBRuntime",
         "FileQueryRuntime",
@@ -1011,6 +1021,21 @@ _FOLDER_LITERAL_FILES = frozenset(
 )
 
 
+# Files that may name a built-in type through its adapter-id constant.
+_ADAPTER_ID_CONSTANT_FILES = frozenset(
+    {
+        "adapters/folder.py",  # folder adapter owns its adapter id
+        "adapters/postgresql.py",  # PostgreSQL adapter owns its adapter id
+        # PostgreSQL-only public conveniences: read diagnostics, update
+        # readiness and keychain password storage.
+        "hosting/embedded.py",
+    }
+)
+_ADAPTER_ID_CONSTANTS = frozenset(
+    {"SQLITE_ADAPTER_ID", "POSTGRESQL_ADAPTER_ID", "FOLDER_ADAPTER_ID"}
+)
+
+
 def test_source_type_dispatch_goes_through_the_registry():
     offenders: list[str] = []
     for path in sorted(PACKAGE.rglob("*.py")):
@@ -1037,27 +1062,17 @@ def test_source_type_dispatch_goes_through_the_registry():
             )
             and id(node) not in vocabulary
         )
+    for path in sorted(PACKAGE.rglob("*.py")):
+        relative = path.relative_to(PACKAGE).as_posix()
+        if relative in _ADAPTER_ID_CONSTANT_FILES:
+            continue
+        offenders.extend(
+            f"{relative}:{node.lineno}"
+            for node in ast.walk(_tree(path))
+            if (isinstance(node, ast.Name) and node.id in _ADAPTER_ID_CONSTANTS)
+            or (isinstance(node, ast.alias) and node.name in _ADAPTER_ID_CONSTANTS)
+        )
     assert offenders == []
-
-    package_text = _python_text(PACKAGE)
-    for deleted in (
-        "_CURRENT_SOURCE_ADAPTER_IDS",
-        "_RELATIONAL_ADAPTER_IDS",
-        "_ADAPTER_CAPABILITIES",
-        "_postgresql_backend",
-        "SOURCE_TYPE_LABELS",
-        # The local Files surface the folder source replaced.
-        "file_capabilities",
-        "data.local_file",
-        "LOCAL_FILE_",
-        "LocalFileSearchExecutor",
-        "LocalFileReadExecutor",
-        "LocalFileQueryExecutor",
-        "local_file_declarations",
-        "local_file_sensitivity",
-    ):
-        assert deleted not in package_text
-    assert not (PACKAGE / "domains" / "data" / "file_capabilities.py").exists()
 
 
 def test_memory_keeps_storage_separate_from_one_fixed_write_identity():

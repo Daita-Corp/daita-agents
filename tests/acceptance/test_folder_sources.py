@@ -14,7 +14,6 @@ from daita.adapters.folder import FolderSourceError
 from daita.adapters.registry import SourceOperation, UnknownSourceTypeError
 from daita.catalog import CatalogTraversalRequest
 from daita.catalog.models import ResourceKind
-from daita.domains.data import ReadTabularRequest, TabularReadBackend
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -129,8 +128,8 @@ async def test_customer_file_links_to_database_orders_and_joins_in_one_query(
                 {
                     "alias": "c",
                     "source_id": files.id,
-                    "resource_id": customers.id,
-                    "columns": ["id", "region"],
+                    "resource_ids": [customers.id],
+                    "sql": "SELECT id, region FROM data",
                 },
             ],
             "sql": "SELECT c.region, SUM(o.revenue) AS revenue FROM o "
@@ -169,22 +168,18 @@ async def test_customer_file_links_to_database_orders_and_joins_in_one_query(
             if item.kind is ResourceKind.FILE
         ]
         assert refreshed.current_revision != customers.current_revision
-        backend = cast(
-            TabularReadBackend,
-            agent._embedded._source_backends[SourceOperation.TABULAR_READ]["folder"],
-        )
+        backend = agent._embedded._source_backends[SourceOperation.SQL_READ]["folder"]
         with pytest.raises(FolderSourceError) as pinned:
-            await backend.read_tabular(
-                ReadTabularRequest(
-                    agent_id=agent.id,
-                    source_id=files.id,
-                    resource_id=customers.id,
-                    expected_revision=customers.current_revision,
-                    columns=("id", "region"),
-                    filters=(),
-                    limit=100,
-                    max_bytes=16_384,
-                )
+            await backend.execute_read(
+                agent_id=agent.id,
+                source_id=files.id,
+                sql="SELECT id, region FROM data",
+                parameters=(),
+                max_rows=100,
+                max_bytes=16_384,
+                expected_resource_revisions=(
+                    (customers.id, customers.current_revision),
+                ),
             )
         assert pinned.value.error_code == "query_binding_stale"
     finally:

@@ -123,6 +123,14 @@ async def resolve_effective_source_scope(
     if ceiling is not None:
         allowed = frozenset(ceiling.allowed_source_ids)
         requested = allowed if requested is None else requested & allowed
+    elif (
+        requested is not None
+        and run.origin is RunOrigin.USER
+        and catalog.session_source_id is not None
+    ):
+        # The live session folder is not a catalog source; a source filter
+        # narrows catalog sources and never drops local files.
+        requested |= {catalog.session_source_id}
     if prepared is not None:
         requested = (
             prepared.source_ids

@@ -217,7 +217,7 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
         assert "Local text edits are artifact-backed" not in texts[0]
         assert "Available user-authorized procedural skill index" not in texts[0]
         # The code-owned run-start clock is part of the fixed setup context.
-        assert len(texts[0].encode()) < 7300
+        assert len(texts[0].encode()) < 7200
         assert '"match_outcomes":' in texts[0]
         assert '"kind":"toolbox"' not in texts[0]
         assert "For scheduled work" not in texts[0]

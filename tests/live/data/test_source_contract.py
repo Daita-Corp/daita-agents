@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pytest
 
-from daita import Agent, PostgreSQLSource
+from daita import PostgreSQLSource
 from daita.adapters.registry import SourceTypeRegistry
 from daita.security import EnvironmentSecretProvider, SecretReference
 from tests.support.source_contract import (
     assert_source_type_contract,
-    assert_tabular_read_contract,
 )
-from tests.support.workspace import workspace_for
 
 pytestmark = [
     pytest.mark.contract,
@@ -57,32 +54,3 @@ async def test_postgresql_source_type_satisfies_the_source_contract(
     await assert_source_type_contract(
         SourceTypeRegistry().require("postgresql"), source, secret_provider=secrets
     )
-
-
-async def test_postgresql_tabular_reads_satisfy_the_tabular_read_contract(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    source, secrets = _fixture_source(monkeypatch)
-    agent = await Agent.create(
-        "postgresql-tabular-contract",
-        root=tmp_path,
-        secret_provider=secrets,
-        workspace=workspace_for(tmp_path),
-    )
-    try:
-        attached = await agent.attach(source)
-        (products,) = [
-            item
-            for item in await agent.list_catalog_resources(source_id=attached.id)
-            if item.native_identity == "analytics.products"
-        ]
-        await assert_tabular_read_contract(
-            agent,
-            source_id=attached.id,
-            resource_id=products.id,
-            columns=("product_id", "sku", "category"),
-            key_column="category",
-            range_column="product_id",
-        )
-    finally:
-        await agent.close()

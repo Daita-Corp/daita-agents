@@ -274,8 +274,9 @@ async def assert_live_source_contract(
     backends = agent._embedded._source_backends
     search = cast(FileSearchBackend, backends[SourceOperation.FILE_SEARCH][adapter_id])
     read = cast(TextReadBackend, backends[SourceOperation.TEXT_READ][adapter_id])
-    query = backends[SourceOperation.SQL_READ][adapter_id]
-    assert isinstance(query, PathPatternReadBackend)
+    query = cast(
+        PathPatternReadBackend, backends[SourceOperation.PATH_QUERY][adapter_id]
+    )
     assert source_id not in {item.id for item in await agent.list_sources()}
 
     found = await search.search_files(

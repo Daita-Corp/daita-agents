@@ -244,8 +244,9 @@ async def test_one_run_filter_narrows_sources_and_preserves_classified_history(
         override_run = (await agent.transcript(override.run_id)).run
         assert override_run.source_scope_ids == (second_source.id,)
         assert override_run.resolved_source_scope is not None
+        # The filter narrows catalog sources; the live session folder stays.
         assert override_run.resolved_source_scope.source_ids == frozenset(
-            {second_source.id}
+            {second_source.id, agent.session_source_id}
         )
         assert _user_texts(provider.requests[0]) == ("Question about first_records",)
         assert _user_texts(provider.requests[1]) == (
@@ -351,16 +352,14 @@ async def test_runtime_binds_catalog_scope_without_injection_and_rejects_outside
         await agent.close()
 
 
-async def test_source_filter_keeps_local_files_only_with_the_session_source(
+async def test_source_filter_still_projects_source_independent_file_tools(
     tmp_path: Path,
 ):
     first_database = tmp_path / "first.sqlite"
     second_database = tmp_path / "second.sqlite"
     _database(first_database, "first_records")
     _database(second_database, "second_records")
-    provider = MockModelProvider(
-        (_stop("second source selected"), _stop("files included"))
-    )
+    provider = MockModelProvider((_stop("second source selected"),))
     agent = await Agent.create(
         "source-tool-projection",
         root=tmp_path,
@@ -374,20 +373,11 @@ async def test_source_filter_keeps_local_files_only_with_the_session_source(
 
         second = await agent.resolve_source("second-source")
         await agent.run(
-            "What data is available?",
+            "What data and workspace files are available?",
             source_scope_ids=(second.id,),
         )
-        narrowed = {tool.name for tool in provider.requests[0].tools}
-        assert "data_query" in narrowed
-        assert not {"file_search", "file_read"} & narrowed
 
-        session_source_id = agent.session_source_id
-        assert session_source_id is not None
-        await agent.run(
-            "What data and workspace files are available?",
-            source_scope_ids=(second.id, session_source_id),
-        )
-        tool_names = {tool.name for tool in provider.requests[1].tools}
+        tool_names = {tool.name for tool in provider.requests[0].tools}
         assert {"file_search", "file_read", "data_query"} <= tool_names
     finally:
         await agent.close()

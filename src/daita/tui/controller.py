@@ -53,6 +53,7 @@ from daita.artifacts import (
     ArtifactPayload,
     ArtifactRef,
 )
+from daita.errors import StateCompatibilityError
 from daita.jobs import (
     GraphBoardProjection,
     GraphInspection,
@@ -347,7 +348,7 @@ class PresentationController:
             raise UserInputError(
                 "That agent is active in another Daita process. Close it, then retry."
             ) from error
-        except AgentHomeError as error:
+        except (AgentHomeError, StateCompatibilityError) as error:
             raise UserInputError(str(error)) from error
 
     async def reopen_agent(

@@ -30,7 +30,6 @@ from ..storage.sqlite_records import (
     SourceReadScope,
     relational_write_authorization_fingerprint,
 )
-from .errors import AgentHomeError
 
 _SOURCE_ALIAS_SEPARATOR = re.compile(r"[^a-z0-9]+")
 
@@ -239,11 +238,8 @@ async def _inspect_source_permissions(
         )
         if resource.agent_id == agent_id and resource.source_id == source_id
     )
-    schemas = (
-        await data_view.resource_schemas(agent_id, source_id)
-        if _supports_relational_writes(source_types, registration.adapter_id)
-        else ()
-    )
+    writable = _supports_relational_writes(source_types, registration.adapter_id)
+    schemas = await data_view.resource_schemas(agent_id, source_id) if writable else ()
     schemas_by_resource_id = {schema.resource_id: schema for schema in schemas}
     choices: list[SourcePermissionResource] = []
     from ..domains.data.sql.relational_upsert import (
@@ -326,6 +322,7 @@ async def _inspect_source_permissions(
         catalog_generation=catalog_generation,
         state=SourcePermissionState(read_scope, update_scopes),
         resources=tuple(choices),
+        supports_relational_writes=writable,
     )
 
 
@@ -363,10 +360,11 @@ async def _build_source_permissions_preview(
             raise ValueError(
                 "selected read resources are not current resources of this source"
             )
-    if relational_write_scopes and not _supports_relational_writes(
-        source_types, inspection.adapter_id
-    ):
-        raise ValueError("PostgreSQL update scopes require an active PostgreSQL source")
+    if relational_write_scopes and not inspection.supports_relational_writes:
+        raise ValueError(
+            "Relational write scopes require an active source whose type "
+            "supports native writes"
+        )
 
     registration = await store.load_source(
         agent_id,

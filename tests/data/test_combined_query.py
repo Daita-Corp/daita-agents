@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -45,12 +45,13 @@ from daita.domains.data import (
     DATA_QUERY_COMBINED_EVIDENCE_KIND,
 )
 from daita.domains.data.capabilities import ReadTabularRequest, SqlReadResult
-from daita.domains.data.results import BoundedResultProjection, project_result_rows
+from daita.domains.data.results import project_result_rows
 from daita.llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
 from daita.scope import EffectiveSourceScope, scope_refs
 from tests.support.capability_runtime import execute_projected
+from tests.support.memory_source import MEMORY_ADAPTER_ID, MEMORY_TYPE, MemorySource
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.contract
@@ -60,6 +61,12 @@ REVENUE_BY_REGION = (
     "SELECT c.region, SUM(o.revenue) AS revenue FROM o "
     "JOIN c ON c.id = o.customer_id GROUP BY c.region ORDER BY c.region"
 )
+REGION_CUSTOMERS = (
+    "SELECT r.region, r.revenue, COUNT(c.id) AS customers FROM r "
+    "JOIN c ON c.region = r.region GROUP BY r.region, r.revenue ORDER BY r.region"
+)
+# Tabular inputs need a type that declares TABULAR_READ: the in-memory one.
+_MEMORY = AgentConfig(source_types=(MEMORY_TYPE,))
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +85,7 @@ async def _agent(tmp_path: Path, config: AgentConfig | None = None) -> Agent:
         "combined-query",
         root=tmp_path,
         config=config,
+        clock=lambda: NOW,
         model=provider,
         model_profile=ModelProfile(
             id=provider.provider_id,
@@ -144,16 +152,29 @@ def _inputs(shop: _Shop) -> tuple[dict[str, object], ...]:
     )
 
 
-def _tabular_customers(shop: _Shop, **changes: object) -> dict[str, object]:
-    """The customers input read as catalog columns instead of SQL."""
+async def _regions(shop: _Shop) -> tuple[str, str]:
+    """Attach the in-memory regions table, whose type has only tabular reads."""
 
+    source = await shop.agent.attach(MemorySource("Regions"))
+    (table,) = await shop.agent.list_catalog_resources(source_id=source.id)
+    return source.id, table.id
+
+
+def _tabular_regions(
+    source_id: str, resource_id: str, **changes: object
+) -> dict[str, object]:
     return {
-        "alias": "c",
-        "source_id": shop.customers_source,
-        "resource_id": shop.customers,
-        "columns": ("id", "region"),
+        "alias": "r",
+        "source_id": source_id,
+        "resource_id": resource_id,
+        "columns": ("region", "revenue"),
         **changes,
     }
+
+
+def _tabular_requests(agent: Agent) -> list[ReadTabularRequest]:
+    backends = agent._embedded._source_backends[SourceOperation.TABULAR_READ]
+    return backends[MEMORY_ADAPTER_ID].requests  # type: ignore[no-any-return]
 
 
 def _runtime(agent: Agent) -> CapabilityRuntime:
@@ -219,14 +240,6 @@ class _CountingBackend:
             self.before(request)
         return await self.delegate.execute_read(**request)  # type: ignore[attr-defined]
 
-    async def read_tabular(
-        self, request: ReadTabularRequest
-    ) -> BoundedResultProjection:
-        self.reads.append(request.source_id)
-        if self.before is not None:
-            self.before({"source_id": request.source_id})
-        return await self.delegate.read_tabular(request)  # type: ignore[attr-defined]
-
 
 def _wrap_sqlite_reads(
     agent: Agent, before: Callable[[Mapping[str, object]], None] | None = None
@@ -238,39 +251,16 @@ def _wrap_sqlite_reads(
     backends = executor._backends  # type: ignore[attr-defined]
     counting = _CountingBackend(backends["sqlite"], before)
     backends["sqlite"] = counting
-    executor._tabular_backends["sqlite"] = counting  # type: ignore[attr-defined]
     return counting
 
 
-@pytest.mark.parametrize("customers_form", ["sql", "tabular"])
 async def test_combined_query_totals_revenue_by_region_across_two_sqlite_sources(
-    tmp_path: Path, customers_form: str
+    tmp_path: Path,
 ):
     shop = await _shop(tmp_path)
     try:
-        inputs = _inputs(shop)
-        if customers_form == "tabular":
-            # The model may name the tabular input's identities by run handles.
-            refs = scope_refs(
-                EffectiveSourceScope(
-                    frozenset({shop.orders_source, shop.customers_source}),
-                    frozenset({shop.orders, shop.customers}),
-                )
-            )
-            inputs = (
-                inputs[0],
-                _tabular_customers(
-                    shop,
-                    source_id=refs.handles[shop.customers_source],
-                    resource_id=refs.handles[shop.customers],
-                ),
-            )
-        result = await _call(shop, {"inputs": inputs, "sql": REVENUE_BY_REGION})
+        result = await _call(shop, {"inputs": _inputs(shop), "sql": REVENUE_BY_REGION})
         data = _data(result)
-        # A SQL read of the same source reports the revision it read.
-        sql_inputs = _data(
-            await _call(shop, {"inputs": _inputs(shop), "sql": REVENUE_BY_REGION})
-        )["inputs"]
         catalog = {
             item.id: item
             for source_id in (shop.orders_source, shop.customers_source)
@@ -290,27 +280,148 @@ async def test_combined_query_totals_revenue_by_region_across_two_sqlite_sources
         item["resource_id"]: item["revision"]
         for item in cast(tuple[Mapping[str, object], ...], data["resource_revisions"])
     } == {resource_id: item.current_revision for resource_id, item in catalog.items()}
-    inputs = cast(tuple[Mapping[str, object], ...], data["inputs"])  # type: ignore[assignment]
+    inputs = cast(tuple[Mapping[str, object], ...], data["inputs"])
     assert [(item["alias"], item["source_id"], item["rows"]) for item in inputs] == [
         ("o", shop.orders_source, 3),
         ("c", shop.customers_source, 3),
     ]
-    for item in inputs if customers_form == "sql" else inputs[:1]:
+    for item in inputs:
         assert str(item["canonical_sql"]).upper().startswith("SELECT")
         assert str(item["sql_fingerprint"]).startswith("sha256:")
-    if customers_form == "tabular":
-        assert inputs[1]["columns"] == ("id", "region")
-        assert inputs[1]["filters"] == ()
-        assert (
-            inputs[1]["source_revision"]
-            == cast(tuple[Mapping[str, object], ...], sql_inputs)[1]["source_revision"]
-        )
     assert str(data["sql_fingerprint"]).startswith("sha256:")
     assert result.capability_id == DATA_QUERY_COMBINED_CAPABILITY_ID
     assert result.sensitivity_provenance is not None
     assert result.sensitivity_provenance["source_ids"] == tuple(
         sorted((shop.orders_source, shop.customers_source))
     )
+
+
+async def test_tabular_input_named_by_run_handles_joins_a_sqlite_input(
+    tmp_path: Path,
+):
+    shop = await _shop(tmp_path, _MEMORY)
+    try:
+        regions_source, regions = await _regions(shop)
+        # The model may name the tabular input's identities by run handles.
+        refs = scope_refs(
+            EffectiveSourceScope(
+                frozenset({shop.customers_source, regions_source}),
+                frozenset({shop.customers, regions}),
+            )
+        )
+        result = await _call(
+            shop,
+            {
+                "inputs": (
+                    _inputs(shop)[1],
+                    _tabular_regions(
+                        refs.handles[regions_source],
+                        refs.handles[regions],
+                        filters=({"column": "revenue", "operator": "gte", "value": 5},),
+                    ),
+                ),
+                "sql": REGION_CUSTOMERS,
+            },
+            scope=(shop.customers_source, regions_source),
+        )
+        (table,) = await shop.agent.list_catalog_resources(source_id=regions_source)
+    finally:
+        await shop.agent.close()
+
+    data = _data(result)
+    assert tuple(dict(row) for row in data["rows"]) == (  # type: ignore[attr-defined]
+        {"region": "north", "revenue": 15, "customers": 2},
+        {"region": "south", "revenue": 7, "customers": 1},
+    )
+    tabular = cast(tuple[Mapping[str, object], ...], data["inputs"])[1]
+    assert tabular["source_id"] == regions_source
+    assert tabular["columns"] == ("region", "revenue")
+    assert [dict(item) for item in tabular["filters"]] == [  # type: ignore[attr-defined]
+        {"column": "revenue", "operator": "gte", "value": 5}
+    ]
+    assert "canonical_sql" not in tabular
+    assert [dict(item) for item in tabular["resource_revisions"]] == [  # type: ignore[attr-defined]
+        {"resource_id": regions, "revision": table.current_revision}
+    ]
+
+
+async def test_an_input_with_no_rows_still_aggregates(tmp_path: Path):
+    shop = await _shop(tmp_path)
+    try:
+        orders, customers = _inputs(shop)
+        result = await _call(
+            shop,
+            {
+                "inputs": (
+                    {**orders, "sql": f"{orders['sql']} HAVING SUM(total) > 1000"},
+                    customers,
+                ),
+                "sql": "SELECT c.region, SUM(o.revenue) AS revenue FROM c "
+                "LEFT JOIN o ON o.customer_id = c.id GROUP BY c.region "
+                "ORDER BY c.region",
+            },
+        )
+    finally:
+        await shop.agent.close()
+
+    assert tuple(dict(row) for row in _data(result)["rows"]) == (  # type: ignore[attr-defined]
+        {"region": "north", "revenue": None},
+        {"region": "south", "revenue": None},
+    )
+
+
+async def test_sql_input_without_catalog_revisions_is_refused_before_any_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    shop = await _shop(tmp_path)
+    view = shop.agent._embedded._data_view
+    schemas = view.resource_schemas
+
+    async def without_revisions(agent_id: str, source_id: str, *args, **kwargs):
+        found = await schemas(agent_id, source_id, *args, **kwargs)
+        if source_id != shop.customers_source:
+            return found
+        return tuple(replace(item, revision=None) for item in found)
+
+    monkeypatch.setattr(view, "resource_schemas", without_revisions)
+    try:
+        reads = _wrap_sqlite_reads(shop.agent)
+        result = await _call(shop, {"inputs": _inputs(shop), "sql": REVENUE_BY_REGION})
+    finally:
+        await shop.agent.close()
+
+    error = _error(result)
+    assert error["code"] == "catalog_provenance_missing"
+    assert cast(Mapping[str, object], error["details"])["input_alias"] == "c"
+    assert reads.reads == []
+
+
+async def test_combining_sql_may_self_join_and_stack_inputs(tmp_path: Path):
+    shop = await _shop(tmp_path)
+    try:
+        stacked = await _call(
+            shop,
+            {
+                "inputs": _inputs(shop),
+                "sql": "SELECT COUNT(*) AS n FROM (SELECT customer_id AS id FROM o "
+                "UNION ALL SELECT id FROM c) AS ids",
+            },
+        )
+        paired = await _call(
+            shop,
+            {
+                "inputs": _inputs(shop),
+                "sql": "SELECT COUNT(*) AS n FROM c JOIN c AS twin "
+                "ON twin.region = c.region AND twin.id <> c.id "
+                "JOIN o ON o.customer_id = c.id",
+            },
+        )
+    finally:
+        await shop.agent.close()
+
+    assert tuple(dict(row) for row in _data(stacked)["rows"]) == ({"n": 6},)  # type: ignore[attr-defined]
+    # Customers 1 and 3 share north; both have orders.
+    assert tuple(dict(row) for row in _data(paired)["rows"]) == ({"n": 2},)  # type: ignore[attr-defined]
 
 
 async def test_inputs_route_only_with_the_default_output(tmp_path: Path):
@@ -346,6 +457,28 @@ async def test_inputs_route_only_with_the_default_output(tmp_path: Path):
     error = _error(exported)
     assert error["code"] == "invalid_argument_for_mode"
     assert error["message"] == "inputs do not apply when output=csv."
+
+
+async def test_definition_describes_only_the_routes_a_run_admits(tmp_path: Path):
+    shop = await _shop(tmp_path)
+    try:
+        registry: CapabilityRegistry = shop.agent._embedded._capabilities
+        full = registry.tool_definition("data_query", lane=CallTargetLane.FOREGROUND)
+        # A machine run admits no combined or live-folder route.
+        narrowed = registry.tool_definition(
+            "data_query", lane=None, routes=("rows", "csv", "xlsx", "arrow")
+        )
+    finally:
+        await shop.agent.close()
+
+    full_properties = cast(Mapping[str, object], full.input_schema["properties"])
+    assert "Join sources" in full.description and "Folder files" in full.description
+    assert {"inputs", "path_pattern"} <= set(full_properties)
+    properties = cast(Mapping[str, object], narrowed.input_schema["properties"])
+    assert "Join sources" not in narrowed.description
+    assert "Folder files" not in narrowed.description
+    assert not {"inputs", "path_pattern"} & set(properties)
+    assert {"source_id", "resource_ids", "sql", "output"} <= set(properties)
 
 
 async def test_two_inputs_on_one_sqlite_source_share_its_single_permit(tmp_path: Path):
@@ -439,50 +572,65 @@ async def test_input_permits_are_taken_once_each_in_sorted_source_order(
     assert recorder.events[2:] == ["release source:source:b", "release source:source:a"]
 
 
+async def test_input_exactly_at_its_row_ceiling_joins_and_past_its_bytes_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Both inputs return exactly three rows.
+    monkeypatch.setattr(data_capabilities, "COMBINED_QUERY_INPUT_MAX_ROWS", 3)
+    shop = await _shop(tmp_path)
+    try:
+        at_ceiling = await _call(
+            shop, {"inputs": _inputs(shop), "sql": REVENUE_BY_REGION}
+        )
+        monkeypatch.setattr(data_capabilities, "COMBINED_QUERY_INPUT_MAX_BYTES", 16)
+        past_bytes = await _call(
+            shop, {"inputs": _inputs(shop), "sql": REVENUE_BY_REGION}
+        )
+    finally:
+        await shop.agent.close()
+
+    assert _data(at_ceiling)["truncated"] is False
+    error = _error(past_bytes)
+    assert error["code"] == "combined_input_truncated"
+    details = cast(Mapping[str, object], error["details"])
+    assert details["truncation_reasons"] == ("byte_limit",)
+
+
 @pytest.mark.parametrize("orders_form", ["sql", "tabular"])
 async def test_input_past_its_internal_ceiling_refuses_the_whole_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, orders_form: str
 ):
     monkeypatch.setattr(data_capabilities, "COMBINED_QUERY_INPUT_MAX_ROWS", 2)
-    shop = await _shop(tmp_path)
+    shop = await _shop(tmp_path, _MEMORY)
     try:
         arguments: dict[str, object] = {
             "inputs": _inputs(shop),
             "sql": REVENUE_BY_REGION,
         }
+        scope = None
         if orders_form == "tabular":
+            regions_source, regions = await _regions(shop)
             arguments = {
-                "inputs": (
-                    {
-                        "alias": "o",
-                        "source_id": shop.orders_source,
-                        "resource_id": shop.orders,
-                        "columns": ("customer_id", "total"),
-                    },
-                    _inputs(shop)[1],
-                ),
-                "sql": "SELECT c.region, SUM(o.total) AS revenue FROM o "
-                "JOIN c ON c.id = o.customer_id GROUP BY c.region",
+                "inputs": (_tabular_regions(regions_source, regions), _inputs(shop)[1]),
+                "sql": REGION_CUSTOMERS,
             }
-        result = await _call(shop, arguments)
+            scope = (shop.customers_source, regions_source)
+        result = await _call(shop, arguments, scope=scope)
     finally:
         await shop.agent.close()
 
     error = _error(result)
     assert error["code"] == "combined_input_truncated"
     details = cast(Mapping[str, object], error["details"])
-    assert details["alias"] == "o"
+    assert details["alias"] == ("r" if orders_form == "tabular" else "o")
     assert details["truncation_reasons"] == ("row_limit",)
 
 
-@pytest.mark.parametrize("customers_form", ["sql", "tabular"])
 async def test_schema_change_after_validation_fails_the_whole_call_as_stale(
-    tmp_path: Path, customers_form: str
+    tmp_path: Path,
 ):
     shop = await _shop(tmp_path)
     inputs = _inputs(shop)
-    if customers_form == "tabular":
-        inputs = (inputs[0], _tabular_customers(shop))
 
     def alter_customers(request: Mapping[str, object]) -> None:
         if request["source_id"] == shop.customers_source:
@@ -504,12 +652,12 @@ async def test_schema_change_after_validation_fails_the_whole_call_as_stale(
 async def test_input_outside_the_run_scope_is_refused_before_any_source_read(
     tmp_path: Path, foreign: str, customers_form: str
 ):
-    shop = await _shop(tmp_path)
+    shop = await _shop(tmp_path, _MEMORY)
     try:
         reads = _wrap_sqlite_reads(shop.agent)
         inputs = list(_inputs(shop))
         if customers_form == "tabular":
-            inputs[1] = _tabular_customers(shop)
+            inputs[1] = _tabular_regions(*await _regions(shop), alias="c")
         if foreign == "resource":
             # The input names an in-scope source but reads a table of another.
             inputs[1] = {**inputs[1], "source_id": shop.orders_source}
@@ -518,6 +666,7 @@ async def test_input_outside_the_run_scope_is_refused_before_any_source_read(
             {"inputs": tuple(inputs), "sql": REVENUE_BY_REGION},
             scope=(shop.orders_source,),
         )
+        tabular_reads = _tabular_requests(shop.agent)
     finally:
         await shop.agent.close()
 
@@ -527,6 +676,7 @@ async def test_input_outside_the_run_scope_is_refused_before_any_source_read(
     )
     assert cast(Mapping[str, object], error["details"])["input_alias"] == "c"
     assert reads.reads == []
+    assert tabular_reads == []
 
 
 @pytest.mark.parametrize(
@@ -598,18 +748,18 @@ async def test_combining_sql_outside_the_input_aliases_is_rejected_before_execut
             "tabular_filter_invalid",
         ),
         (
-            {"filters": ({"column": "id", "operator": "eq", "value": (1, 2)},)},
+            {"filters": ({"column": "revenue", "operator": "eq", "value": (1, 2)},)},
             "tabular_filter_invalid",
         ),
         (
-            {"filters": ({"column": "id", "operator": "gte", "value": None},)},
+            {"filters": ({"column": "revenue", "operator": "gte", "value": None},)},
             "tabular_filter_invalid",
         ),
         (
-            {"filters": ({"column": "id", "operator": "lt", "value": {"n": 2}},)},
+            {"filters": ({"column": "revenue", "operator": "lt", "value": {"n": 2}},)},
             "tabular_filter_invalid",
         ),
-        ({"columns": ("id", "country")}, "tabular_column_unknown"),
+        ({"columns": ("region", "country")}, "tabular_column_unknown"),
         (
             {"filters": ({"column": "tier", "operator": "eq", "value": "gold"},)},
             "tabular_column_unknown",
@@ -632,21 +782,28 @@ async def test_combining_sql_outside_the_input_aliases_is_rejected_before_execut
 async def test_tabular_input_outside_equality_in_and_range_on_catalog_columns_is_refused(
     tmp_path: Path, changes: Mapping[str, object], code: str
 ):
-    shop = await _shop(tmp_path)
+    shop = await _shop(tmp_path, _MEMORY)
     try:
+        regions_source, regions = await _regions(shop)
         reads = _wrap_sqlite_reads(shop.agent)
         result = await _call(
             shop,
             {
-                "inputs": (_inputs(shop)[0], _tabular_customers(shop, **changes)),
-                "sql": REVENUE_BY_REGION,
+                "inputs": (
+                    _inputs(shop)[1],
+                    _tabular_regions(regions_source, regions, **changes),
+                ),
+                "sql": REGION_CUSTOMERS,
             },
+            scope=(shop.customers_source, regions_source),
         )
+        tabular_reads = _tabular_requests(shop.agent)
     finally:
         await shop.agent.close()
 
     assert _error(result)["code"] == code
     assert reads.reads == []
+    assert tabular_reads == []
 
 
 CONFIDENTIAL_ADAPTER_ID = "confidential-targets"

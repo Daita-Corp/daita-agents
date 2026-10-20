@@ -5,12 +5,13 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 import daita.storage.sql as sql_storage
-from daita import Agent, SQLiteSource
+from daita import Agent, FolderSource, SQLiteSource
 from daita.adapters.models import SourceRegistration
 from daita.catalog import (
     CatalogDescribeDetail,
@@ -22,12 +23,17 @@ from daita.catalog import (
     CatalogStoreError,
     CatalogTraversalRequest,
 )
+from daita.catalog.models import ResourceKind
+from daita.llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
+from daita.llm.providers.mock import MockModelProvider
+from daita.loop.models import RunInput
 from tests.catalog._schema_support import (
     _mapping,
     _mapping_sequence,
     _object_sequence,
     _schema,
 )
+from tests.support.capability_runtime import execute_projected
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.integration
@@ -188,6 +194,14 @@ async def test_link_staleness_follows_paired_fields_not_resource_revisions(
         assert (await _traverse(agent, sources.orders, sources.customers))[
             "reachable"
         ] is False
+
+        # The endpoint table itself is gone while its source stays active.
+        with sqlite3.connect(sources.customers_database) as connection:
+            connection.execute("DROP TABLE customers")
+            connection.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY)")
+        await agent.refresh_source(sources.customers_source.id)
+        (status,) = await agent.list_catalog_links()
+        assert status.stale_reason is CatalogLinkStaleReason.RESOURCE_MISSING
     finally:
         await agent.close()
 
@@ -346,6 +360,79 @@ async def test_source_narrowed_describe_lists_declared_links_leaving_that_source
         assert scoped["relationships"] == ()
     finally:
         await agent.close()
+
+
+async def test_source_narrowed_describe_takes_the_sensitivity_of_listed_link_endpoints(
+    tmp_path: Path,
+):
+    orders_database = tmp_path / "orders.sqlite"
+    with sqlite3.connect(orders_database) as connection:
+        connection.execute(
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER)"
+        )
+    restricted = tmp_path / "restricted"
+    restricted.mkdir()
+    (restricted / "customers.csv").write_text("id,region\n1,north\n", "utf-8")
+    provider = MockModelProvider(())
+    agent = await Agent.create(
+        "describe-sensitivity",
+        root=tmp_path / "home",
+        model=provider,
+        model_profile=ModelProfile(
+            id=provider.provider_id,
+            context_window_tokens=80_000,
+            max_output_tokens=2_000,
+            supports_tools=True,
+        ),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        orders_source = await agent.attach(SQLiteSource(orders_database, name="Orders"))
+        folder = await agent.attach(
+            FolderSource(
+                restricted, name="Restricted", sensitivity=ModelSensitivity.RESTRICTED
+            )
+        )
+        (orders,) = await agent.list_catalog_resources(source_id=orders_source.id)
+        (customers,) = [
+            item
+            for item in await agent.list_catalog_resources(source_id=folder.id)
+            if item.kind is ResourceKind.FILE
+        ]
+        await agent.declare_catalog_link(
+            orders.id, customers.id, (("customer_id", "id"),)
+        )
+        loop = agent._embedded._loop
+        assert loop is not None
+        (result,) = await execute_projected(
+            loop._tools,
+            RunInput(
+                id="describe-sensitivity-run",
+                agent_id=agent.id,
+                message="describe orders",
+                created_at=datetime(2026, 10, 19, 12, 0, tzinfo=UTC),
+                conversation_id="describe-sensitivity-conversation",
+            ),
+            (
+                ToolCall(
+                    id="describe",
+                    name="catalog_describe",
+                    arguments={
+                        "source_id": orders_source.id,
+                        "resource_ids": [orders.id],
+                    },
+                ),
+            ),
+        )
+    finally:
+        await agent.close()
+
+    assert isinstance(result, ToolResultBlock)
+    assert "error" not in result.output, result.output
+    # The far endpoint's metadata is restricted, so the whole result is.
+    assert result.sensitivity is ModelSensitivity.RESTRICTED
+    assert result.sensitivity_provenance is not None
+    assert folder.id in result.sensitivity_provenance["source_ids"]
 
 
 async def test_invalid_link_declarations_are_rejected_before_persistence(

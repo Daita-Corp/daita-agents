@@ -32,7 +32,6 @@ def test_tool_projection_and_approval_document():
     assert CAPABILITY_LABELS["toolbox_load"] == "Load selected tools"
     assert CAPABILITY_LABELS["file_search"] == "Search folder files"
     assert CAPABILITY_LABELS["file_read"] == "Read folder file"
-    assert "file_query" not in CAPABILITY_LABELS
     assert CAPABILITY_LABELS["artifact_edit_text"] == "Prepare local file edit"
     assert CAPABILITY_LABELS["artifact_save_local"] == "Save artifact locally"
     details = project_tool_details(

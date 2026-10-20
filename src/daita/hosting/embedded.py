@@ -825,6 +825,7 @@ class EmbeddedAgent:
         *,
         root: str | Path | None = None,
         keychain: KeychainStore | None = None,
+        config: AgentConfig | None = None,
     ) -> None:
         """Delete one inactive agent home after removing its owned credentials."""
 
@@ -833,6 +834,9 @@ class EmbeddedAgent:
                 name,
                 root=root,
                 keychain=keychain or KeychainSecretProvider(),
+                source_types=SourceTypeRegistry(
+                    () if config is None else config.source_types
+                ),
             )
         )
         if cancelled:
@@ -845,6 +849,7 @@ class EmbeddedAgent:
         *,
         root: str | Path | None,
         keychain: KeychainStore,
+        source_types: SourceTypeRegistry,
     ) -> None:
         del cls
         (home, writer_lock), _cancelled = await _await_sync_completion(
@@ -878,8 +883,7 @@ class EmbeddedAgent:
                 identity.id,
                 model_document=model_document,
                 source_configurations=source_configurations,
-                # Deletion has no composition input; only built-in types own credentials.
-                source_types=SourceTypeRegistry(),
+                source_types=source_types,
                 mcp_reference_values=mcp_reference_values,
             )
             failures = 0
@@ -1529,6 +1533,7 @@ class EmbeddedAgent:
             source_backends[SourceOperation.SQL_READ],
             combined_engine=combined_engine,
             tabular_backends=source_backends[SourceOperation.TABULAR_READ],
+            path_backends=source_backends[SourceOperation.PATH_QUERY],
             file_outputs=(
                 exact_export_outputs(allow_arrow=export_arrow_bounds is not None)
                 if relational_export is not None

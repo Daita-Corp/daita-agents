@@ -10,7 +10,6 @@ descriptor-contained ``LocalWorkspaceBackend`` and its private DuckDB worker.
 from __future__ import annotations
 
 import asyncio
-import mimetypes
 import os
 import stat
 import time
@@ -68,7 +67,7 @@ from .protocols import (
 )
 
 if TYPE_CHECKING:
-    from ..domains.data.capabilities import ReadTabularRequest, SqlReadResult
+    from ..domains.data.capabilities import SqlReadResult
     from ..domains.data.results import BoundedResultProjection
     from ..domains.data.source_files import (
         FileSearchRequest,
@@ -81,9 +80,9 @@ if TYPE_CHECKING:
 
 FOLDER_ADAPTER_ID = "folder"
 _DESCRIBE_BATCH_FILES = 32
-# shortcut: schema discovery stops describing files after this budget and
-# catalogs the rest without a tabular facet; upgrade when large folders need it.
-_DESCRIBE_SECONDS = 60.0
+# The walk and the schema reads each get this budget; a discovery that runs
+# out of either commits a snapshot marked truncated.
+_DISCOVERY_SECONDS = 60.0
 _RUN_ID = "folder-source"
 
 
@@ -157,6 +156,14 @@ class FolderSource:
     name: str | None = None
     sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.subpaths, tuple) or any(
+            not isinstance(item, str) or not item for item in self.subpaths
+        ):
+            raise ValueError("folder subpaths must be a tuple of relative paths")
+        if self.name is not None and (not isinstance(self.name, str) or not self.name):
+            raise ValueError("folder name must be non-empty text or None")
+
     def workspace(self) -> LocalWorkspace:
         return LocalWorkspace(
             Path(self.root),
@@ -171,12 +178,6 @@ class FolderSource:
         attached_at: datetime,
         clock: Callable[[], datetime],
     ) -> FolderResourceAdapter:
-        if not isinstance(self.subpaths, tuple) or any(
-            not isinstance(item, str) or not item for item in self.subpaths
-        ):
-            raise ValueError("folder subpaths must be a tuple of relative paths")
-        if self.name is not None and (not isinstance(self.name, str) or not self.name):
-            raise ValueError("folder name must be non-empty text or None")
         workspace = self.workspace()
         registration = SourceRegistration.build(
             agent_id=agent_id,
@@ -210,17 +211,11 @@ def folder_source_from_registration(
     if set(configuration) != {"root", "subpaths"}:
         raise ValueError("source configuration fields are invalid")
     root = configuration["root"]
-    subpaths = configuration["subpaths"]
-    if (
-        not isinstance(root, str)
-        or not root
-        or not isinstance(subpaths, tuple)
-        or any(not isinstance(item, str) or not item for item in subpaths)
-    ):
+    if not isinstance(root, str) or not root:
         raise ValueError("source configuration text is invalid")
     return FolderSource(
         root=root,
-        subpaths=cast(tuple[str, ...], subpaths),
+        subpaths=cast(tuple[str, ...], configuration["subpaths"]),
         name=registration.display_name,
         sensitivity=registration.presentation_sensitivity,
     )
@@ -273,7 +268,8 @@ class FolderResourceAdapter:
                     agent_root=request.agent_root,
                     agent_home=request.agent_home,
                     limits=LocalWorkspaceLimits(
-                        max_search_results=min(request.max_resources, 1_000)
+                        max_search_results=request.max_resources,
+                        max_search_seconds=_DISCOVERY_SECONDS,
                     ),
                     clock=self._clock,
                 )
@@ -383,55 +379,14 @@ def _root_revision(root: Path) -> str | None:
     return physical_revision_for_facts(facts) if stat.S_ISDIR(facts.st_mode) else None
 
 
-# Common text suffixes the platform MIME table may not know.
-_TEXT_MEDIA_TYPES = {
-    ".log": "text/plain",
-    ".markdown": "text/markdown",
-    ".md": "text/markdown",
-    ".toml": "application/toml",
-    ".yaml": "application/yaml",
-    ".yml": "application/yaml",
+# Attached folders catalog only data files, one media type per query format.
+_DATA_MEDIA_TYPES = {
+    "csv": "text/csv",
+    "tsv": "text/tab-separated-values",
+    "json_records": "application/json",
+    "ndjson": "application/x-ndjson",
+    "parquet": "application/vnd.apache.parquet",
 }
-
-
-def _guess_media_type(relative_path: str) -> str | None:
-    guessed, _encoding = mimetypes.guess_type(relative_path, strict=False)
-    return guessed or _TEXT_MEDIA_TYPES.get(
-        PurePosixPath(relative_path).suffix.casefold()
-    )
-
-
-def _file_format(relative_path: str) -> tuple[str, str | None]:
-    structured = structured_file_format(relative_path)
-    if structured == "parquet":
-        return structured, None
-    if structured is not None:
-        return structured, "utf-8"
-    guessed = _guess_media_type(relative_path)
-    if guessed is not None and (
-        guessed.startswith("text/")
-        or guessed
-        in {
-            "application/json",
-            "application/toml",
-            "application/xml",
-            "application/yaml",
-        }
-    ):
-        return "text", "utf-8"
-    return "binary", None
-
-
-def _media_type(relative_path: str, format_name: str) -> str:
-    guessed = _guess_media_type(relative_path)
-    if guessed is not None:
-        return guessed
-    return {
-        "tsv": "text/tab-separated-values",
-        "ndjson": "application/x-ndjson",
-        "parquet": "application/vnd.apache.parquet",
-        "text": "text/plain",
-    }.get(format_name, "application/octet-stream")
 
 
 async def _discover(
@@ -440,7 +395,8 @@ async def _discover(
     subpaths: tuple[str, ...],
     request: DiscoveryRequest,
 ) -> SourceCatalogSnapshot:
-    """Catalog folders and files, bounded by the request, through the scanner."""
+    """Catalog the data files and the folders that hold them, bounded by the
+    request, through the scanner. Other files stay reachable live."""
 
     root_revision = _root_revision(backend.working_directory)
     if root_revision is None:
@@ -453,9 +409,11 @@ async def _discover(
         mode="paths",
         glob="*",
         order_by="path",
+        structured_only=True,
     )
     truncated = result.truncated
     folders: list[str] = ["."]
+    seen_folders = {"."}
     files: list[tuple[str, str, int, datetime]] = []
     for match in result.matches:
         parents = [
@@ -463,13 +421,14 @@ async def _discover(
             for parent in reversed(PurePosixPath(match.path).parents)
             if parent.as_posix() != "."
         ]
-        missing = [item for item in parents if item not in folders]
+        missing = [item for item in parents if item not in seen_folders]
         # One resource per file and missing folder; one CONTAINS edge each.
         needed = len(folders) + len(files) + len(missing) + 1
         if needed > request.max_resources or needed - 1 > request.max_relationships:
             truncated = True
             break
         folders.extend(missing)
+        seen_folders.update(missing)
         files.append(
             (
                 match.path,
@@ -478,7 +437,9 @@ async def _discover(
                 datetime.fromisoformat(match.modified_at),
             )
         )
-    schemas = await _describe(backend, tuple(path for path, *_ in files))
+    schemas, described_all = await _describe(backend, tuple(path for path, *_ in files))
+    # A data file left without its schema is an incomplete catalog.
+    truncated = truncated or not described_all
 
     sync_id = request.sync_id
     observed_at = request.requested_at
@@ -513,15 +474,15 @@ async def _discover(
         entries.append((ResourceKind.FOLDER, path, (), None))
     for path, physical_revision, size_bytes, modified_at in files:
         identifier = resource_id(ResourceKind.FILE, path)
-        format_name, encoding = _file_format(path)
+        format_name = cast(str, structured_file_format(path))
         file_facet = CatalogFacet.from_file(
             resource_id=identifier,
             sync_id=sync_id,
             observed_at=observed_at,
             facet=FileFacet(
                 format=format_name,
-                media_type=_media_type(path, format_name),
-                encoding=encoding,
+                media_type=_DATA_MEDIA_TYPES[format_name],
+                encoding=None if format_name == "parquet" else "utf-8",
                 size_bytes=size_bytes,
                 physical_revision=physical_revision,
                 modified_at=modified_at,
@@ -557,6 +518,10 @@ async def _discover(
                 physical_revision,
             )
         )
+    relationship_revisions: dict[str, list[str]] = {}
+    for item in relationships:
+        for endpoint in (item.from_resource_id, item.to_resource_id):
+            relationship_revisions.setdefault(endpoint, []).append(item.revision)
     resources: list[CatalogResource] = []
     revisions: list[CatalogResourceRevision] = []
     for kind, path, facet_revisions, revision_source in entries:
@@ -566,11 +531,7 @@ async def _discover(
             sync_id=sync_id,
             observed_at=observed_at,
             facet_revisions=facet_revisions,
-            relationship_revisions=tuple(
-                item.revision
-                for item in relationships
-                if identifier in {item.from_resource_id, item.to_resource_id}
-            ),
+            relationship_revisions=tuple(relationship_revisions.get(identifier, ())),
             source_revision=revision_source or root_revision,
         )
         revisions.append(revision)
@@ -618,15 +579,18 @@ def _complete(
 
 async def _describe(
     backend: LocalWorkspaceBackend, paths: tuple[str, ...]
-) -> dict[str, tuple[tuple[str, str], ...]]:
-    """Read each structured file's schema, one worker per format batch."""
+) -> tuple[dict[str, tuple[tuple[str, str], ...]], bool]:
+    """Read each structured file's schema, one worker per format batch.
+
+    Also returns whether every batch was attempted within the budget.
+    """
 
     by_format: dict[str, list[str]] = {}
     for path in paths:
         format_name = structured_file_format(path)
         if format_name is not None:
             by_format.setdefault(format_name, []).append(path)
-    deadline = time.monotonic() + _DESCRIBE_SECONDS
+    deadline = time.monotonic() + _DISCOVERY_SECONDS
     described: dict[str, tuple[tuple[str, str], ...]] = {}
     pending = [
         tuple(group[index : index + _DESCRIBE_BATCH_FILES])
@@ -645,7 +609,7 @@ async def _describe(
         for path, schema in zip(batch, schemas, strict=True):
             if schema:
                 described[path] = schema
-    return described
+    return described, not pending
 
 
 class FolderBackend:
@@ -706,20 +670,33 @@ class FolderBackend:
     async def _cataloged_files(
         self, agent_id: str, source_id: str, resource_ids: frozenset[str]
     ) -> dict[str, str]:
-        """Map each readable cataloged file's path to its physical revision."""
+        """Map each readable cataloged file's path to its physical revision.
 
+        One cached snapshot load per call, not one lookup per resource.
+        """
+
+        refs = await self._store.list_current_snapshot_refs(agent_id, (source_id,))
+        snapshot = await self._store.load_current_snapshot(refs[0]) if refs else None
+        if snapshot is None:
+            return {}
+        revisions = {
+            facet.resource_id: cast(str, facet.payload["physical_revision"])
+            for facet in snapshot.facets
+            if facet.kind is FacetKind.FILE
+        }
         files: dict[str, str] = {}
-        for resource_id in resource_ids:
-            resource = await self._store.load_resource(agent_id, resource_id)
+        for resource in snapshot.resources:
             if (
-                resource is None
-                or resource.source_id != source_id
-                or resource.kind is not ResourceKind.FILE
+                resource.kind is not ResourceKind.FILE
+                or resource.id not in resource_ids
             ):
                 continue
-            files[resource.native_identity] = await self._physical_revision(
-                agent_id, resource
-            )
+            if resource.id not in revisions:
+                raise FolderSourceError(
+                    "catalog_provenance_missing",
+                    "The file has no current catalog facts; refresh the source.",
+                )
+            files[resource.native_identity] = revisions[resource.id]
         return files
 
     async def _physical_revision(self, agent_id: str, resource: CatalogResource) -> str:
@@ -788,7 +765,7 @@ class FolderBackend:
             mode=request.mode,
             glob=request.glob,
             order_by=request.order_by,
-            allowed_paths=frozenset(files),
+            allowed_revisions=files,
         )
         return self._result(
             request.source_id,
@@ -820,16 +797,20 @@ class FolderBackend:
         )
         if request.path is not None and request.path not in files:
             raise _not_readable()
-        result = await backend.read(
-            run_id=request.run_id,
-            path=request.path,
-            cursor=request.cursor,
-            position=request.position,
-        )
-        if result.path not in files:
-            raise _not_readable()
-        if result.physical_revision != files[result.path]:
-            raise _stale()
+        try:
+            result = await backend.read(
+                run_id=request.run_id,
+                path=request.path,
+                cursor=request.cursor,
+                position=request.position,
+                allowed_revisions=files,
+            )
+        except LocalWorkspaceError as error:
+            if error.code == "path_not_allowed":
+                raise _not_readable() from error
+            if error.code == "file_changed":
+                raise _stale() from error
+            raise
         # Cataloged folders are read-only sources: no edit binding.
         return self._result(
             request.source_id,
@@ -908,39 +889,6 @@ class FolderBackend:
             projection=projection,
             resource_names=tuple((item.resource_id, item.name) for item in schemas),
         )
-
-    async def read_tabular(
-        self, request: ReadTabularRequest
-    ) -> BoundedResultProjection:
-        from ..domains.data.sql import (
-            DuckDBReadValidationError,
-            tabular_read_sql,
-            validate_duckdb_read,
-        )
-
-        schemas, files = await self._bound_files(
-            request.agent_id,
-            request.source_id,
-            {request.resource_id: request.expected_revision},
-        )
-        sql, _parameters = tabular_read_sql(
-            schemas[0], "duckdb", request.columns, request.filters
-        )
-        try:
-            validated = validate_duckdb_read(sql)
-        except DuckDBReadValidationError as error:
-            raise FolderSourceError("tabular_filter_invalid", error.message) from error
-        projection, _columns = await self._query(
-            request.agent_id,
-            request.source_id,
-            files,
-            validated.canonical_sql,
-            validated.sql_fingerprint,
-            max_rows=request.limit,
-            max_bytes=request.max_bytes,
-            timeout_seconds=request.timeout_seconds,
-        )
-        return projection
 
     async def _bound_files(
         self, agent_id: str, source_id: str, expected: Mapping[str, str]

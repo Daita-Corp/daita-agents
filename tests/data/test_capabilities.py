@@ -450,7 +450,7 @@ async def test_folder_file_tools_project_only_with_a_folder_source_in_scope(
                 "path_pattern": "x.csv",
                 "sql": "DELETE FROM data",
             },
-            "file_query_invalid",
+            "folder_query_invalid",
         ),
     ),
 )

@@ -379,7 +379,7 @@ async def test_hosting_rejects_write_scopes_for_a_type_without_native_writes(
         home = agent.home
         source = await agent.attach(SQLiteSource(database))
         (table,) = await agent.list_catalog_resources(source_id=source.id)
-        with pytest.raises(ValueError, match="require an active PostgreSQL source"):
+        with pytest.raises(ValueError, match="supports native writes"):
             await agent.preview_source_permissions(
                 source_id=source.id,
                 read_mode="all",

@@ -1886,6 +1886,9 @@ class ToolView:
     # value: a call that supplies it, with the selector omitted or at its
     # default, takes that route. They never appear among the selector values.
     presence_modes: tuple[str, ...] = ()
+    # (route capability_id, sentence) pairs appended to the description only
+    # while that route is admitted, so a run never reads about routes it lacks.
+    route_notes: tuple[tuple[str, str], ...] = ()
     # Optional arguments whose full rules stay in the capability contract
     # (read with toolbox_inspect) and are summarized in the provider schema.
     # Validation always uses the capability's complete schema.
@@ -1944,6 +1947,15 @@ class ToolView:
             raise ValueError("tool route selection requires mode routes")
         object.__setattr__(self, "mode_capability_ids", routes)
         object.__setattr__(self, "presence_modes", tuple(self.presence_modes))
+        notes = tuple(self.route_notes)
+        if len({item[0] for item in notes}) != len(notes) or any(
+            capability_id not in {item for _mode, item in routes}
+            for capability_id, _text_value in notes
+        ):
+            raise ValueError("tool route notes must name distinct routed capabilities")
+        for _capability_id, note in notes:
+            _text(note, "tool route note")
+        object.__setattr__(self, "route_notes", notes)
         summarized = tuple(self.summarized_arguments)
         if len(set(summarized)) != len(summarized) or any(
             not isinstance(item, str)
@@ -2261,6 +2273,10 @@ class CapabilityRegistry:
                     ),
                 )
         self._mode_input_schemas = MappingProxyType(mode_input_schemas)
+        # Schemas narrowed to one admitted route set, built once per set.
+        self._narrowed_input_schemas: dict[
+            tuple[str, tuple[str, ...]], dict[str, object]
+        ] = {}
         for declaration in declared.values():
             for view in declaration.tool_views:
                 if view.summarized_arguments:
@@ -2704,18 +2720,49 @@ class CapabilityRegistry:
         return view, capability, self.resolve_domain_owner(capability.id)
 
     def tool_definition(
-        self, name: str, *, lane: CallTargetLane | None
+        self,
+        name: str,
+        *,
+        lane: CallTargetLane | None,
+        routes: tuple[str, ...] | None = None,
     ) -> ToolDefinition:
-        """Project one provider definition with the target bound ``lane`` enforces."""
+        """Project one provider definition with the target bound ``lane`` enforces.
+
+        ``routes`` names the modes a run admits; the schema and route notes then
+        cover only those. Without it every declared route is described.
+        """
 
         view, capability = self.resolve_tool(name)
+        admitted = tuple(
+            (mode, capability_id)
+            for mode, capability_id in view.mode_capability_ids
+            if routes is None or mode in routes
+        )
         if not view.mode_capability_ids:
             input_schema: Mapping[str, object] = capability.input_schema
-        else:
+        elif routes is None:
             input_schema = self._mode_input_schemas[name]
+        else:
+            key = (name, tuple(mode for mode, _ in admitted))
+            if key not in self._narrowed_input_schemas:
+                self._narrowed_input_schemas[key] = _mode_input_schema(
+                    view,
+                    tuple(
+                        (mode, self._capabilities[capability_id].input_schema)
+                        for mode, capability_id in admitted
+                    ),
+                )
+            input_schema = self._narrowed_input_schemas[key]
         if view.summarized_arguments:
-            input_schema = _summarized_input_schema(view, input_schema)
-        description = _provider_description(view)
+            input_schema = _summarized_input_schema(
+                view, input_schema, require_declared=routes is None
+            )
+        admitted_ids = {capability_id for _mode, capability_id in admitted}
+        description = _provider_description(view) + "".join(
+            note
+            for capability_id, note in view.route_notes
+            if capability_id in admitted_ids
+        )
         policy = capability.execution_admission_policy
         sentence = None if policy is None else policy.limits_sentence(lane)
         if sentence is not None:
@@ -3089,11 +3136,10 @@ def _mode_input_schema(
 
     selector = view.mode_argument
     properties: dict[str, object] = {}
-    if not view.mode_by_presence:
-        properties[selector] = {
-            "type": "string",
-            "enum": [mode for mode, _ in routes if mode not in view.presence_modes],
-        }
+    selectable = [mode for mode, _ in routes if mode not in view.presence_modes]
+    # Routes narrowed to presence modes alone leave nothing to select.
+    if not view.mode_by_presence and selectable:
+        properties[selector] = {"type": "string", "enum": selectable}
     required: set[str] | None = None
     for index, (_mode, schema) in enumerate(routes):
         if (
@@ -3126,7 +3172,9 @@ def _mode_input_schema(
         "required": [
             *(
                 [selector]
-                if view.default_mode is None and not view.mode_by_presence
+                if view.default_mode is None
+                and not view.mode_by_presence
+                and selectable
                 else []
             ),
             *sorted(required),
@@ -3141,16 +3189,19 @@ SUMMARIZED_ARGUMENT_DESCRIPTION = "Optional; full rule via toolbox_inspect."
 
 
 def _summarized_input_schema(
-    view: ToolView, schema: Mapping[str, object]
+    view: ToolView, schema: Mapping[str, object], *, require_declared: bool = True
 ) -> dict[str, object]:
-    """Replace optional argument rules with a pointer to the full contract."""
+    """Replace optional argument rules with a pointer to the full contract.
+
+    A schema narrowed to admitted routes may lack a summarized argument.
+    """
 
     properties = schema.get("properties")
     required = schema.get("required", ())
     if not isinstance(properties, Mapping) or not isinstance(required, (tuple, list)):
         raise ValueError(f"summarized tool schema is malformed: {view.name}")
     for name in view.summarized_arguments:
-        if name not in properties or name in required:
+        if (require_declared and name not in properties) or name in required:
             raise ValueError(
                 f"summarized argument must be optional and declared: {view.name}.{name}"
             )

@@ -414,7 +414,7 @@ async def test_live_model_recovers_from_incompatible_pattern(
     )
     assert broad, "the live model skipped the requested incompatible-pattern check"
     assert broad[0][1].is_error
-    assert _query_error(broad[0][1])["code"] == "file_query_invalid"
+    assert _query_error(broad[0][1])["code"] == "folder_query_invalid"
 
     recovered = tuple(
         (call, block)
@@ -473,7 +473,7 @@ async def test_live_model_handles_unsafe_sql_without_host_data(
     )
     assert all(block.is_error for _call, block in unsafe)
     assert all(
-        _query_error(block)["code"] == "file_query_invalid" for _call, block in unsafe
+        _query_error(block)["code"] == "folder_query_invalid" for _call, block in unsafe
     )
 
     safe = tuple(

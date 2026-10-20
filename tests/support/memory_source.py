@@ -153,6 +153,8 @@ class _MemoryAdapter:
 @dataclass(frozen=True, slots=True)
 class MemorySource:
     name: str
+    # A stored secret reference, for types that declare credential fields.
+    credential_ref: str | None = None
 
     async def open(
         self,
@@ -168,7 +170,14 @@ class MemorySource:
                 adapter_id=MEMORY_ADAPTER_ID,
                 native_identity=f"memory:{self.name}",
                 display_name=self.name,
-                configuration={"name": self.name},
+                configuration={
+                    "name": self.name,
+                    **(
+                        {}
+                        if self.credential_ref is None
+                        else {"credential_ref": self.credential_ref}
+                    ),
+                },
                 attached_at=attached_at,
             )
         )
@@ -178,7 +187,11 @@ def memory_from_registration(
     registration: SourceRegistration, *, secret_provider: object
 ) -> MemorySource:
     del secret_provider
-    return MemorySource(str(registration.configuration["name"]))
+    credential = registration.configuration.get("credential_ref")
+    return MemorySource(
+        str(registration.configuration["name"]),
+        None if credential is None else str(credential),
+    )
 
 
 REGION_ROWS = (

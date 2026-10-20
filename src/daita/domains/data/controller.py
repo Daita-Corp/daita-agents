@@ -135,7 +135,7 @@ _CAPABILITY_OPERATIONS = {
     DATA_EXPORT_TABULAR_CAPABILITY_ID: SourceOperation.TABULAR_EXPORT,
     FILE_SEARCH_CAPABILITY_ID: SourceOperation.FILE_SEARCH,
     TEXT_READ_CAPABILITY_ID: SourceOperation.TEXT_READ,
-    PATH_QUERY_CAPABILITY_ID: SourceOperation.SQL_READ,
+    PATH_QUERY_CAPABILITY_ID: SourceOperation.PATH_QUERY,
     **{item: SourceOperation.RELATIONAL_UPDATE for item in _UPDATE_CAPABILITIES},
     **{item: SourceOperation.RELATIONAL_UPSERT for item in _UPSERT_CAPABILITIES},
 }
@@ -415,6 +415,29 @@ class DataCapabilityDomain:
         *,
         tool_names: frozenset[str] | None = None,
     ) -> tuple[str, ...]:
+        return (await self._projection(run, session, tool_names))[0]
+
+    project_session = project
+
+    async def project_routes(
+        self, run: RunInput, session: RunSession | None = None
+    ) -> tuple[tuple[str, ...], frozenset[str]]:
+        """Project the tool names and the routed capabilities no source in this
+        run's scope can serve, from one scope resolution.
+
+        ``data_query`` is offered for any SQL source, but its export route needs
+        a ``TABULAR_EXPORT`` source and its ``path_pattern`` route the live
+        session folder; offering them otherwise only invites refused calls.
+        """
+
+        return await self._projection(run, session, None)
+
+    async def _projection(
+        self,
+        run: RunInput,
+        session: RunSession | None,
+        tool_names: frozenset[str] | None,
+    ) -> tuple[tuple[str, ...], frozenset[str]]:
         views = {
             name: view
             for name, view in self._views.items()
@@ -493,46 +516,18 @@ class DataCapabilityDomain:
             if capability.id in _UPSERT_CAPABILITIES and not upsert_source_ids:
                 continue
             names.append(name)
-        return tuple(names)
-
-    project_session = project
-
-    async def withheld_routes(
-        self, run: RunInput, session: RunSession | None = None
-    ) -> frozenset[str]:
-        """Routed capabilities that no source in this run's scope can serve.
-
-        ``data_query`` is offered for any SQL source, but its export route needs
-        a ``TABULAR_EXPORT`` source and its ``path_pattern`` route the live
-        session folder; offering them otherwise only invites refused calls.
-        """
-
-        del session
-        scope = await resolve_effective_source_scope(run, self._catalog)
-        facts = (
-            await self._catalog.source_routing_facts(
-                run.agent_id, tuple(sorted(scope.source_ids))
-            )
-            if scope.source_ids
-            else ()
-        )
-        adapter_ids = {
-            adapter_id
-            for fact in facts
-            if isinstance(adapter_id := fact.get("adapter_id"), str)
-        }
         withheld = {
             capability_id
             for capability_id, operation in _CAPABILITY_OPERATIONS.items()
             if capability_id in self._capabilities
             and not any(
                 self._source_types.supports(adapter_id, operation)
-                for adapter_id in adapter_ids
+                for adapter_id in active_adapter_ids
             )
         }
         if self._catalog.session_source_id not in scope.source_ids:
             withheld.add(PATH_QUERY_CAPABILITY_ID)
-        return frozenset(withheld)
+        return tuple(names), frozenset(withheld)
 
     async def project_call(
         self, run: RunInput, call: ToolCall, session: RunSession | None
@@ -1127,6 +1122,23 @@ class DataCapabilityDomain:
 
         source_id = cast(str, arguments["source_id"])
         adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
+        live = source_id == self._catalog.session_source_id
+        if (
+            capability.id == PATH_QUERY_CAPABILITY_ID
+            and adapter_id is not None
+            and not live
+        ):
+            # Any cataloged source answers by catalog resources instead.
+            raise CapabilityInputError(
+                "path_pattern_unsupported",
+                "A cataloged source is queried by its catalog resources, "
+                "not by path_pattern.",
+                {"source_id": source_id},
+                recovery=ToolRecovery(
+                    RecoveryKind.CORRECT_ARGUMENTS,
+                    "Query this source with resource_ids from its catalog.",
+                ),
+            )
         if adapter_id is None or not self._source_types.supports(
             adapter_id, _CAPABILITY_OPERATIONS[capability.id]
         ):
@@ -1135,7 +1147,6 @@ class DataCapabilityDomain:
                 "The selected source does not support this file operation.",
                 {"source_id": source_id},
             )
-        live = source_id == self._catalog.session_source_id
         if live and (
             run.origin is not RunOrigin.USER or run.execution_scope is not None
         ):
@@ -1159,22 +1170,11 @@ class DataCapabilityDomain:
                     "A file cursor cannot be combined with a position.",
                 )
         if capability.id == PATH_QUERY_CAPABILITY_ID:
-            if not live:
-                raise CapabilityInputError(
-                    "path_pattern_unsupported",
-                    "A cataloged source is queried by its catalog resources, "
-                    "not by path_pattern.",
-                    {"source_id": source_id},
-                    recovery=ToolRecovery(
-                        RecoveryKind.CORRECT_ARGUMENTS,
-                        "Query this source with resource_ids from its catalog.",
-                    ),
-                )
             try:
                 validated = validate_duckdb_read(cast(str, arguments["sql"]))
             except DuckDBReadValidationError as error:
                 raise CapabilityInputError(
-                    "file_query_invalid",
+                    "folder_query_invalid",
                     error.message,
                     {"reason": error.reason},
                 ) from error
@@ -1471,6 +1471,14 @@ class DataCapabilityDomain:
                         bind_revisions=True,
                     )
                 )
+                if "_resource_revisions" not in validated:
+                    # A join never reads an input it cannot recheck for staleness.
+                    raise CapabilityInputError(
+                        "catalog_provenance_missing",
+                        "A resource has no current catalog revision; refresh "
+                        "the source.",
+                        {"resource_ids": read["resource_ids"]},
+                    )
             except CapabilityInputError as error:
                 raise CapabilityInputError(
                     error.code,
@@ -2081,7 +2089,8 @@ class DataCapabilityDomain:
         source_id = arguments.get("source_id")
         inputs = arguments.get("inputs")
         source_ids = (
-            (source_id,)
+            # A narrowed describe still lists link endpoints in other sources.
+            tuple(sorted({source_id, *_endpoint_source_ids(output.data)}))
             if isinstance(source_id, str)
             else (
                 tuple(
@@ -2128,6 +2137,22 @@ class DataCapabilityDomain:
                 "resource_ids": tuple(sorted(readable)),
             },
         )
+
+
+def _endpoint_source_ids(data: Mapping[str, object]) -> set[str]:
+    """Sources of the relationship endpoints a result returns outside its seeds."""
+
+    relationships = data.get("relationships")
+    return {
+        cast(str, endpoint["source_id"])
+        for relationship in (
+            relationships if isinstance(relationships, (tuple, list)) else ()
+        )
+        for endpoint in cast(
+            tuple[Mapping[str, object], ...],
+            cast(Mapping[str, object], relationship).get("unselected_endpoints", ()),
+        )
+    }
 
 
 def _incomplete_export(draft: ArtifactDraft, reason: str) -> ArtifactError:

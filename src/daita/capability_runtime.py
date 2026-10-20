@@ -1186,12 +1186,14 @@ class CapabilityRuntime:
         projected: dict[str, RunToolCatalogEntry] = {}
         for owner_id in sorted(self._domains):
             domain = self._domains[owner_id]
-            # A domain may withhold mode routes no current source can serve.
-            withhold = getattr(domain, "withheld_routes", None)
-            withheld: frozenset[str] = (
-                await withhold(run, session) if callable(withhold) else frozenset()
+            # A domain may also withhold mode routes no current source can serve.
+            project_routes = getattr(domain, "project_routes", None)
+            names, withheld = (
+                await project_routes(run, session)
+                if callable(project_routes)
+                else (await _domain_project(domain, run, session), frozenset())
             )
-            for name in await _domain_project(domain, run, session):
+            for name in names:
                 if name in projected:
                     raise ValueError(f"tool projected by multiple domains: {name}")
                 view = self._registry.resolve_tool(name)[0]
@@ -1276,7 +1278,7 @@ class CapabilityRuntime:
         pinned_definitions = tuple(
             sorted(
                 (
-                    self._registry.tool_definition(entry.view.name, lane=lane)
+                    _entry_definition(self._registry, entry, lane)
                     for entry in pinned_entries
                 ),
                 key=lambda item: item.name,
@@ -1391,8 +1393,8 @@ class CapabilityRuntime:
             sorted(
                 (
                     *(
-                        self._registry.tool_definition(
-                            entry.view.name, lane=catalog.call_target_lane
+                        _entry_definition(
+                            self._registry, entry, catalog.call_target_lane
                         )
                         for entry in callable_entries
                     ),
@@ -1404,9 +1406,7 @@ class CapabilityRuntime:
         _validate_step_surface(provider_definitions, self._limits)
         loaded_definition_bytes = _definition_bytes(
             tuple(
-                self._registry.tool_definition(
-                    entry.view.name, lane=catalog.call_target_lane
-                )
+                _entry_definition(self._registry, entry, catalog.call_target_lane)
                 for entry in loaded
             )
         )
@@ -2504,9 +2504,7 @@ class CapabilityRuntime:
             )
         loaded = tuple(sorted(requested, key=lambda item: item.view.name))
         definitions = tuple(
-            self._registry.tool_definition(
-                entry.view.name, lane=projection.call_target_lane
-            )
+            _entry_definition(self._registry, entry, projection.call_target_lane)
             for entry in loaded
         )
         definition_bytes = _definition_bytes(definitions)
@@ -2529,8 +2527,8 @@ class CapabilityRuntime:
             sorted(
                 (
                     *(
-                        self._registry.tool_definition(
-                            item.view.name, lane=projection.call_target_lane
+                        _entry_definition(
+                            self._registry, item, projection.call_target_lane
                         )
                         for item in pinned
                     ),
@@ -5417,9 +5415,7 @@ def _verified_loaded_entries(
         for entry in entries
     ):
         return None
-    definitions = tuple(
-        registry.tool_definition(entry.view.name, lane=lane) for entry in entries
-    )
+    definitions = tuple(_entry_definition(registry, entry, lane) for entry in entries)
     definition_bytes = _definition_bytes(definitions)
     expected_activation = _activation_digest(run_id, catalog_digest, entries)
     expected_data: dict[str, object] = dict(data)
@@ -5594,7 +5590,7 @@ def _validate_step_projection(
     if projection.callable_entries != expected_callable:
         raise ValueError("step projection callable set is invalid")
     loaded_definitions = tuple(
-        registry.tool_definition(entry.view.name, lane=projection.call_target_lane)
+        _entry_definition(registry, entry, projection.call_target_lane)
         for entry in loaded
     )
     if (
@@ -5612,9 +5608,7 @@ def _validate_step_projection(
         sorted(
             (
                 *(
-                    registry.tool_definition(
-                        entry.view.name, lane=projection.call_target_lane
-                    )
+                    _entry_definition(registry, entry, projection.call_target_lane)
                     for entry in expected_callable
                 ),
                 *controls,
@@ -6105,6 +6099,20 @@ def _with_execution_disposition(
     return replace(
         result,
         output={**result.output, "error": {**error, "details": current}},
+    )
+
+
+def _entry_definition(
+    registry: CapabilityRegistry,
+    entry: RunToolCatalogEntry,
+    lane: CallTargetLane | None,
+) -> ToolDefinition:
+    """One provider definition describing only the routes this entry admits."""
+
+    return registry.tool_definition(
+        entry.view.name,
+        lane=lane,
+        routes=tuple(mode for mode, _ in entry.routes) if entry.routes else None,
     )
 
 

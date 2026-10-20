@@ -2354,6 +2354,8 @@ def _source_from_attach_args(
         if args.path is None:
             raise ValueError("attach folder requires a path")
         return FolderSource(args.path, name=args.source_name)
+    if args.kind != "postgresql":
+        raise ValueError(f"attach {args.kind} has no command-line form")
     if args.path is not None:
         raise ValueError("attach postgresql does not accept a path")
     required = {

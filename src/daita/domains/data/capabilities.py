@@ -103,34 +103,27 @@ _DATA_QUERY_USAGE = (
 
 
 _DATA_QUERY_COMBINED_CAPABILITY_DESCRIPTION = (
-    "Join or aggregate data from several sources in one bounded read. Each of "
-    "2 to 4 inputs runs read-only SQL in its own source's dialect on exact "
-    "catalog resources, or reads exact catalog columns of one resource with "
-    "optional equality, in and range filters; sql is one DuckDB SELECT that "
-    "references each input alias exactly once and nothing else. Returns "
-    "columns, rows, truncation, per-input lineage and timing. Limits: 5s per "
-    "input, 15s for all inputs, 100 rows and 16 KB in the result; an input too "
-    "large to join completely refuses the whole call, so aggregate or filter "
-    "inside each input."
+    "Join or aggregate data from 2 to 4 sources in one bounded read. Each input "
+    "runs read-only SQL in its own source's dialect on exact catalog resources, "
+    "or reads exact catalog columns of one resource with optional eq, in and "
+    "range filters; sql is one DuckDB SELECT or UNION, at most 8 KiB, that "
+    "reads every input alias and nothing else. Limits: 5s per input, 15s for "
+    "all inputs, 100 rows and 16 KB in the result. An input too large to join "
+    "completely refuses the call, so aggregate or filter inside each input."
 )
 _DATA_QUERY_COMBINED_USAGE = (
-    " To join sources, send inputs (2-4 {alias, source_id, resource_ids, sql}, "
-    "each in its source's dialect, or {alias, source_id, resource_id, columns, "
-    "filters} for a source without SQL) and sql as one DuckDB SELECT over only "
-    "those aliases; aggregate or filter in each input, since an input too "
-    "large to join completely refuses the call."
+    " Join sources: inputs is 2-4 {alias, source_id, resource_ids, sql} in each "
+    "source's dialect, or {alias, source_id, resource_id, columns, filters} for "
+    "a source without SQL; sql is one DuckDB SELECT or UNION over the aliases "
+    "(8 KiB). Aggregate or filter in each input: one too large refuses the call."
 )
-
-
 _DATA_QUERY_PATH_USAGE = (
-    " Folder files: sql reads relation data, from path_pattern in a live folder "
-    "or resource_ids in an attached one."
+    " Folder files: query relation data by path_pattern (live folder) or "
+    "resource_ids (attached folder)."
 )
 
 
-def _data_query_description(
-    file_outputs: tuple[str, ...], combined: bool, path_query: bool = False
-) -> str:
+def _data_query_description(file_outputs: tuple[str, ...]) -> str:
     file_output = (
         f" output={'|'.join(file_outputs)} exports one sql in full as a file "
         f"({MAX_CSV_ROWS:,} rows, {MAX_CSV_SECONDS:.0f}s), no rows; to save "
@@ -138,13 +131,7 @@ def _data_query_description(
         if file_outputs
         else ""
     )
-    return (
-        DATA_QUERY_DESCRIPTION
-        + file_output
-        + (_DATA_QUERY_COMBINED_USAGE if combined else "")
-        + (_DATA_QUERY_PATH_USAGE if path_query else "")
-        + _DATA_QUERY_USAGE
-    )
+    return DATA_QUERY_DESCRIPTION + file_output + _DATA_QUERY_USAGE
 
 
 RELATIONAL_UPDATE_DESCRIPTION = (
@@ -903,11 +890,11 @@ class CombinedQueryEngine(Protocol):
 
 
 _ENGINE_ERRORS = {
-    "file_query_timeout": (
+    "folder_query_timeout": (
         "combined_query_timeout",
         "The combining query exceeded its bounded wall time.",
     ),
-    "file_query_limited": (
+    "folder_query_limited": (
         "combined_query_limited",
         "The combining query exceeded a bounded worker limit.",
     ),
@@ -1368,18 +1355,14 @@ def data_query_declarations(
     file_outputs: tuple[str, ...] = (),
     combined_engine: CombinedQueryEngine | None = None,
     tabular_backends: Mapping[str, TabularReadBackend] | None = None,
+    path_backends: Mapping[str, PathPatternReadBackend] | None = None,
 ) -> DataQueryDeclarations:
     """Declare data_query over SQL backends.
 
-    A backend that also queries files matched by ``path_pattern`` adds that
-    route; a combined engine adds the multi-source ``inputs`` route.
+    Path-pattern backends add the ``path_pattern`` route; a combined engine
+    adds the multi-source ``inputs`` route.
     """
 
-    path_backends = {
-        adapter_id: backend
-        for adapter_id, backend in backends.items()
-        if isinstance(backend, PathPatternReadBackend)
-    }
     executors: tuple[Executor, ...] = (DataQueryExecutor(agent_id, backends),)
     if path_backends:
         executors += (PathQueryExecutor(agent_id, path_backends),)
@@ -1885,12 +1868,20 @@ def _query_declarations(
     view = ToolView(
         name=DATA_QUERY_TOOL_NAME,
         capability_id=capability.id,
-        description=_data_query_description(file_outputs, combined, path_query),
+        description=_data_query_description(file_outputs),
         presentation=presentation,
         mode_capability_ids=routes if routed else (),
         mode_argument="output" if routed else "mode",
         default_mode="rows" if routed else None,
         presence_modes=presence_modes,
+        route_notes=(
+            *(
+                ((combined_capability.id, _DATA_QUERY_COMBINED_USAGE),)
+                if combined
+                else ()
+            ),
+            *(((path_capability.id, _DATA_QUERY_PATH_USAGE),) if path_query else ()),
+        ),
         # The description states the input shape; the full item rules stay in
         # the capability contract.
         summarized_arguments=("inputs",) if combined else (),

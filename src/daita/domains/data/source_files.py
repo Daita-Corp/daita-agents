@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Protocol, cast, runtime_checkable
+from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject
 from ...capabilities import (
@@ -103,7 +103,6 @@ class TextReadBackend(Protocol):
     async def read_text(self, request: TextReadRequest) -> SourceFileResult: ...
 
 
-@runtime_checkable
 class PathPatternReadBackend(Protocol):
     async def query_path_pattern(
         self, request: PathPatternQueryRequest
@@ -381,7 +380,8 @@ def path_query_capability() -> Capability:
         output_schema=_query_output_schema(),
         executor_id=PATH_QUERY_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
+        # Only a foreground user run has the live session folder it queries.
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
 
 

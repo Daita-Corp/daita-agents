@@ -9,6 +9,7 @@ import multiprocessing
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -123,6 +124,12 @@ def _frozen_objects(value: object) -> tuple[FrozenJsonObject, ...]:
             True,
         ),
         ("SELECT AVG(amount) FROM (SELECT amount FROM data) AS selected", True),
+        (
+            "SELECT CASE WHEN amount > 1 THEN 'big' ELSE 'small' END AS size, "
+            "TRY_CAST(amount AS INTEGER), DATE_TRUNC('month', day), "
+            "STRFTIME(day, '%Y') FROM data",
+            True,
+        ),
         ("ATTACH '/tmp/evil.db' AS evil", False),
         ("COPY data TO '/tmp/evil.csv'", False),
         ("EXPORT DATABASE '/tmp/evil'", False),
@@ -139,7 +146,7 @@ def _frozen_objects(value: object) -> tuple[FrozenJsonObject, ...]:
         ("SELECT * FROM data; SELECT 1", False),
         ("SELECT * FROM other", False),
         ("SELECT * FROM main.data", False),
-        ("SELECT * FROM data a JOIN data b USING (id)", False),
+        ("SELECT * FROM data a JOIN data b USING (id)", True),
         ("SELECT * FROM read_csv('/etc/hosts')", False),
         ("SELECT * FROM read_json('https://example.test/a.json')", False),
         ("SELECT * FROM parquet_scan('/tmp/a.parquet')", False),
@@ -148,7 +155,10 @@ def _frozen_objects(value: object) -> tuple[FrozenJsonObject, ...]:
         ("SELECT * FROM query_table('data')", False),
         ("SELECT * FROM data JOIN (VALUES (1)) v(x) ON true", False),
         ("SELECT * FROM data JOIN (SELECT 1) v ON true", False),
-        ("SELECT * FROM data UNION ALL SELECT * FROM data", False),
+        ("SELECT * FROM data UNION ALL SELECT * FROM data", True),
+        ("SELECT region FROM data EXCEPT SELECT region FROM data", False),
+        ("SELECT * FROM data UNION ALL SELECT * FROM read_csv('/etc/hosts')", False),
+        ("SELECT * FROM data UNION ALL SELECT 1", False),
         ("SELECT * FROM data WHERE region = 'https://example.test'", False),
         ("SELECT * FROM data WHERE region = '/etc/passwd'", False),
         ("SELECT 1", False),
@@ -415,7 +425,7 @@ async def test_incompatible_partition_schema_is_rejected_and_scratch_is_cleaned(
     try:
         with pytest.raises(LocalFileQueryError) as failure:
             await _query(backend, "*.csv", "SELECT COUNT(*) AS rows FROM data")
-        assert failure.value.code == "file_query_invalid"
+        assert failure.value.code == "folder_query_invalid"
         scratch = home / "file-query-scratch"
         assert not scratch.exists() or not tuple(scratch.iterdir())
     finally:
@@ -433,7 +443,7 @@ async def test_malformed_csv_json_and_parquet_fail_as_bounded_results(
         for name in ("broken.csv", "broken.json", "broken.parquet"):
             with pytest.raises(LocalFileQueryError) as failure:
                 await _query(backend, name, "SELECT COUNT(*) AS rows FROM data")
-            assert failure.value.code == "file_query_invalid"
+            assert failure.value.code == "folder_query_invalid"
             assert str(workspace) not in failure.value.message
         scratch = home / "file-query-scratch"
         assert not scratch.exists() or not tuple(scratch.iterdir())
@@ -468,7 +478,7 @@ async def test_result_row_byte_and_column_bounds_are_enforced(tmp_path: Path) ->
         assert utf8_bytes <= 48 * 1_024
         with pytest.raises(LocalFileQueryError) as columns:
             await _query(backend, "wide.csv", "SELECT * FROM data")
-        assert columns.value.code == "file_query_limited"
+        assert columns.value.code == "folder_query_limited"
     finally:
         await backend.close()
 
@@ -622,6 +632,36 @@ def test_worker_pipe_connection_reset_is_a_closed_stream() -> None:
     )
 
 
+async def test_concurrent_queries_wait_for_the_worker_instead_of_failing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend, workspace, _home = await _backend(tmp_path)
+    (workspace / "orders.csv").write_text("region,amount\nnorth,1\n", encoding="utf-8")
+    running: list[int] = []
+    peak: list[int] = []
+    worker = query_module._run_private_worker
+
+    def slow_worker(*args: object) -> object:
+        running.append(1)
+        peak.append(len(running))
+        try:
+            time.sleep(0.2)
+            return worker(*args)  # type: ignore[arg-type]
+        finally:
+            running.pop()
+
+    monkeypatch.setattr(query_module, "_run_private_worker", slow_worker)
+    try:
+        first, second = await asyncio.gather(
+            _query(backend, "orders.csv"), _query(backend, "orders.csv")
+        )
+    finally:
+        await backend.close()
+
+    assert first.data["rows"] == second.data["rows"]
+    assert max(peak) == 1
+
+
 @pytest.mark.parametrize(
     ("observer_name", "limit_name", "detail_name"),
     (
@@ -646,7 +686,7 @@ async def test_rss_and_spill_overruns_reap_worker_clean_scratch_and_allow_reuse(
             overrun.setattr(query_module, observer_name, lambda _value: limit + 1)
             with pytest.raises(LocalFileQueryError) as failure:
                 await _query(backend, "orders.csv")
-        assert failure.value.code == "file_query_limited"
+        assert failure.value.code == "folder_query_limited"
         assert failure.value.details[detail_name] == limit
         scratch = home / "file-query-scratch"
         assert not scratch.exists() or not tuple(scratch.iterdir())
@@ -677,7 +717,7 @@ async def test_timeout_and_cancellation_terminate_workers_and_remove_scratch(
     try:
         with pytest.raises(LocalFileQueryError) as timeout:
             await _query(backend, "orders.csv")
-        assert timeout.value.code == "file_query_timeout"
+        assert timeout.value.code == "folder_query_timeout"
         scratch = home / "file-query-scratch"
         assert not scratch.exists() or not tuple(scratch.iterdir())
     finally:
@@ -863,7 +903,7 @@ async def test_invalid_folder_query_sql_fails_before_workspace_io(
         assert rejected.is_error
         error = rejected.output["error"]
         assert isinstance(error, Mapping)
-        assert error["code"] == "file_query_invalid"
+        assert error["code"] == "folder_query_invalid"
     finally:
         await agent.close()
 

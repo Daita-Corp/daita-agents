@@ -74,9 +74,9 @@ tasks, and other machine-originated runs never receive the session folder
 source.
 
 `Agent.session_source_id` is the session folder source's stable ID. It is never
-listed by `Agent.list_sources()`. A run with explicit `source_scope_ids` keeps
-local files only when that list includes this ID; `files_only=True` scopes the
-run to exactly this source.
+listed by `Agent.list_sources()`. Explicit `source_scope_ids` narrow catalog
+sources and keep local files; `files_only=True` scopes the run to exactly this
+source.
 
 ## Read boundary
 
@@ -173,21 +173,24 @@ source = await agent.attach(FolderSource(Path("/data/sales"), name="Sales files"
 daita attach atlas folder /data/sales --source-name "Sales files"
 ```
 
-Discovery catalogs every folder and file under the root (or under the optional
-`subpaths`) with the same containment rules as the session folder: symlinks,
-special files, secret-like paths, and private Daita state are never cataloged,
-and a root that contains private Daita state cannot be attached. Each file gets
-format, media type, size, and a stat-based physical revision; csv, tsv,
-json-records, ndjson, and parquet files also get their column schema. Discovery
-is bounded; a folder with more entries than the limit is cataloged up to it and
-its catalog sync is marked truncated. `catalog_search` finds files by name or
-column, and declared catalog links can join a file to a database table.
+Discovery catalogs the data files under the root (or under the optional
+`subpaths`): csv, tsv, json-records, ndjson, and parquet files, and the folders
+that hold them. The same containment rules as the session folder apply:
+symlinks, special files, secret-like paths, and private Daita state are never
+cataloged, and a root that contains private Daita state cannot be attached.
+Each data file gets format, media type, size, a stat-based physical revision,
+and its column schema. Other files are not cataloged; reach them through the
+session folder. Discovery is bounded; a folder with more data files than the
+limit, or too slow to finish within the discovery budget, is cataloged up to it
+and its catalog sync is marked truncated. `catalog_search` finds files by name
+or column, and declared catalog links can join a file to a database table.
+Scheduled routines and graph jobs can read an attached folder they are granted.
 
 An attached folder answers only for its readable cataloged files. `file_search`
 and `file_read` reach them by root-relative path; `data_query` takes their
 `resource_ids` and reads them as one relation named `data`; a combined
-`data_query` accepts them as SQL or tabular inputs. Changing a file makes it
-stale until the source is refreshed: a read or query of a file whose physical
-revision no longer matches the catalog is refused with `query_binding_stale`.
+`data_query` accepts them as SQL inputs. Changing a file makes it stale until
+the source is refreshed: search skips it, and a read or query of it is refused
+with `query_binding_stale`.
 Attached folders are always contained to their root and are unavailable in
 hosted compositions.

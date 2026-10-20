@@ -19,6 +19,8 @@ _ALLOWED_FUNCTIONS = frozenset(
     {
         "ABS",
         "AVG",
+        # CASE parses to CASE with IF branches.
+        "CASE",
         "CAST",
         "CEIL",
         "CEILING",
@@ -31,6 +33,7 @@ _ALLOWED_FUNCTIONS = frozenset(
         "FIRST_VALUE",
         "FLOOR",
         "GREATEST",
+        "IF",
         "LAG",
         "LAST_VALUE",
         "LEAD",
@@ -51,7 +54,11 @@ _ALLOWED_FUNCTIONS = frozenset(
         "STDDEV_SAMP",
         "SUBSTRING",
         "SUM",
+        # strftime and date_trunc parse to these names.
+        "TIME_TO_STR",
+        "TIMESTAMP_TRUNC",
         "TRIM",
+        "TRY_CAST",
         "UPPER",
         "VAR_POP",
         "VAR_SAMP",
@@ -83,7 +90,7 @@ class ValidatedDuckDBRead:
 def validate_duckdb_read(
     sql: str, relations: tuple[str, ...] = ("data",)
 ) -> ValidatedDuckDBRead:
-    """Accept one canonical SELECT reading each code-owned relation exactly once."""
+    """Accept one canonical SELECT (or UNION) reading every code-owned relation."""
 
     names = frozenset(item.casefold() for item in relations)
     if not relations or len(names) != len(relations):
@@ -123,7 +130,7 @@ def validate_duckdb_read(
             "The query requires exactly one SELECT statement.",
         )
     root = cast(Any, parsed[0])
-    if not isinstance(root, exp.Select):
+    if not isinstance(root, (exp.Select, exp.Union)):
         raise DuckDBReadValidationError(
             "select_only",
             "The query accepts only one SELECT statement.",
@@ -205,6 +212,9 @@ def validate_duckdb_read(
             "SQL scope could not be resolved safely.",
         ) from error
     for scope in scopes:
+        if isinstance(scope.expression, exp.Union):
+            # A UNION selects nothing itself; each side is its own scope.
+            continue
         if not scope.selected_sources:
             raise DuckDBReadValidationError(
                 "source_forbidden",
@@ -230,10 +240,10 @@ def validate_duckdb_read(
                     "source_unknown",
                     "SQL contains an unsupported relation source.",
                 )
-    if any(count != 1 for count in references.values()):
+    if any(count < 1 for count in references.values()):
         raise DuckDBReadValidationError(
             "data_reference_count",
-            "SQL must reference each of " + ", ".join(relations) + " exactly once.",
+            "SQL must reference each of " + ", ".join(relations) + ".",
         )
 
     # sqlglot models AND/OR as functions; they are boolean operators.

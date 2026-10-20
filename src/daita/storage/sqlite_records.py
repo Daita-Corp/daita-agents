@@ -383,6 +383,8 @@ class SourcePermissionsInspection:
     catalog_generation: str | None
     state: SourcePermissionState
     resources: tuple[SourcePermissionResource, ...]
+    # Whether the source's type declares native update or upsert writes.
+    supports_relational_writes: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -390,6 +392,8 @@ class SourcePermissionsInspection:
             or _SOURCE_PERMISSION_SOURCE_ID.fullmatch(self.source_id) is None
         ):
             raise ValueError("permission inspection source_id must be canonical")
+        if not isinstance(self.supports_relational_writes, bool):
+            raise TypeError("permission inspection write support must be a boolean")
         _permission_text(
             self.source_display_name,
             "permission inspection source name",

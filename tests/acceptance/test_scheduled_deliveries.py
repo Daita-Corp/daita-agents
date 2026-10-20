@@ -18,6 +18,7 @@ import pytest
 from daita import (
     Agent,
     ArtifactRequirement,
+    FolderSource,
     IntervalSchedule,
     MCPToolSelection,
     MisfirePolicy,
@@ -60,6 +61,7 @@ from daita.catalog.models import (
     catalog_resource_id,
 )
 from daita.distribution import OutcomeState
+from daita.domains.data import DATA_QUERY_CAPABILITY_ID
 from daita.domains.data.export_capabilities import (
     ARTIFACT_CREATE_TOOL_NAME,
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
@@ -1356,5 +1358,120 @@ async def test_scheduled_text_report_uses_the_same_inbox_path(tmp_path: Path) ->
         )
         assert delivery.conclusion_preview == "Current value is 7."
         assert delivery.artifact_references == ()
+    finally:
+        await agent.close()
+
+
+def _tool_result(transcript: object, call_id: str) -> ToolResultBlock:
+    (block,) = tuple(
+        block
+        for message in cast(Any, transcript).messages
+        for block in message.content
+        if isinstance(block, ToolResultBlock) and block.call_id == call_id
+    )
+    return block
+
+
+async def test_scheduled_routine_reads_an_attached_folder_and_refuses_a_changed_file(
+    tmp_path: Path,
+) -> None:
+    folder = tmp_path / "drop"
+    folder.mkdir()
+    orders = folder / "orders.csv"
+    orders.write_text("region,amount\nnorth,10\nsouth,5\n", encoding="utf-8")
+    provider = ToolboxAwareMockModelProvider(
+        (_stop("Foreground authorization complete."),),
+        provider_id="mock:scheduled-folder",
+        complete_pricing=True,
+    )
+    agent = await Agent.create(
+        "scheduled-folder",
+        root=tmp_path / "state",
+        workspace=workspace_for(tmp_path / "state"),
+        model=provider,
+        model_profile=_profile(provider),
+        clock=lambda: NOW,
+    )
+    query = ToolCall(id="folder-total", name="data_query", arguments={})
+    try:
+        source = await agent.attach(FolderSource(folder, name="Drop folder"))
+        (resource,) = [
+            item
+            for item in await agent.list_catalog_resources(source_id=source.id)
+            if item.kind is ResourceKind.FILE
+        ]
+        query = ToolCall(
+            id="folder-total",
+            name="data_query",
+            arguments={
+                "source_id": source.id,
+                "resource_ids": (resource.id,),
+                "sql": "SELECT SUM(amount) AS total FROM data",
+            },
+        )
+        origin = await agent.run("Authorize the scheduled folder total.")
+        assert origin.conversation_id is not None
+        created = await _create_routine(
+            agent,
+            provider,
+            origin_run_id=origin.run_id,
+            conversation_id=origin.conversation_id,
+            source_ids=(source.id,),
+            connector_binding_ids=(),
+            resource_ids=(resource.id,),
+            capability_ids=(DATA_QUERY_CAPABILITY_ID,),
+            outcome_contract=_text_contract(),
+            script=(_tools(query), _stop("The total is 15.")),
+        )
+
+        seen: set[str] = set()
+
+        async def occurrence(count: int) -> ToolResultBlock:
+            routine = await agent.inspect_routine(created.routine_id)
+            await agent.run_routine_now(
+                created.routine_id, expected_revision=routine.routine.revision
+            )
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 15.0
+            while loop.time() < deadline:
+                deliveries = await agent.list_deliveries(
+                    conversation_id=origin.conversation_id
+                )
+                if len(deliveries) >= count:
+                    # The fixed clock gives every delivery one time; pick the new one.
+                    (latest,) = [
+                        item for item in deliveries if item.delivery_id not in seen
+                    ]
+                    seen.add(latest.delivery_id)
+                    assert latest.resulting_run_id is not None
+                    return _tool_result(
+                        await agent.transcript(latest.resulting_run_id), query.id
+                    )
+                await asyncio.sleep(0.01)
+            raise AssertionError(await agent.inspect_routine(created.routine_id))
+
+        read = await occurrence(1)
+        assert not read.is_error, read.output
+        # The scheduled run is never told about routes it cannot call.
+        (scheduled_query,) = [
+            tool for tool in provider.requests[-1].tools if tool.name == "data_query"
+        ]
+        assert "Join sources" not in scheduled_query.description
+        assert "Folder files" not in scheduled_query.description
+        assert not {"inputs", "path_pattern"} & set(
+            cast(Mapping[str, object], scheduled_query.input_schema["properties"])
+        )
+        data = cast(Mapping[str, object], read.output["data"])
+        assert [dict(row) for row in cast(tuple[Any, ...], data["rows"])] == [
+            {"total": 15}
+        ]
+
+        # The file changed after cataloging: the unattended read is refused.
+        orders.write_text("region,amount\nnorth,99\n", encoding="utf-8")
+        provider.replace_script((_tools(query), _stop("The file changed.")))
+        refused = await occurrence(2)
+        assert refused.is_error
+        error = cast(Mapping[str, object], refused.output["error"])
+        assert error["code"] == "query_binding_stale"
     finally:
         await agent.close()

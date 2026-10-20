@@ -159,10 +159,15 @@ class Agent:
         *,
         root: str | Path | None = None,
         keychain: KeychainStore | None = None,
+        config: AgentConfig | None = None,
     ) -> None:
-        """Permanently delete one inactive agent home and its owned credentials."""
+        """Permanently delete one inactive agent home and its owned credentials.
 
-        await EmbeddedAgent.delete(name, root=root, keychain=keychain)
+        Pass the ``config`` the agent was composed with so credentials of its
+        ``source_types`` are removed too.
+        """
+
+        await EmbeddedAgent.delete(name, root=root, keychain=keychain, config=config)
 
     @classmethod
     async def create(

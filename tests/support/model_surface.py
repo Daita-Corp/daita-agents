@@ -35,6 +35,7 @@ from daita._json import FrozenJsonObject
 from daita.capabilities import (
     RESERVED_TOOL_NAMES,
     TOOLBOX_DEFINITIONS,
+    AutomationEligibility,
     CallTargetLane,
     CapabilityRegistry,
     ToolDefinition,
@@ -203,8 +204,26 @@ def _registry_tools(registry: CapabilityRegistry) -> dict[str, object]:
     for name in sorted(registry.tool_names):
         view, capability = registry.resolve_tool(name)
         presentation = view.presentation
+        # Scheduled machine runs admit only automation-direct routes.
+        automated = tuple(
+            mode
+            for mode, capability_id in view.mode_capability_ids
+            if registry.capability(capability_id).automation_eligibility
+            is AutomationEligibility.AUTOMATION_DIRECT
+        )
         rendered = {
-            lane_name: _definition(registry.tool_definition(name, lane=lane))
+            lane_name: _definition(
+                registry.tool_definition(
+                    name,
+                    lane=lane,
+                    routes=(
+                        automated
+                        # A view with no such route is not offered there at all.
+                        if view.mode_capability_ids and lane is None and automated
+                        else None
+                    ),
+                )
+            )
             for lane_name, lane in LANES
         }
         foreground = rendered.pop("foreground")

@@ -118,6 +118,7 @@ async def test_source_permissions_configures_exact_relational_write_scope():
         catalog_generation="sync-one",
         state=initial_state,
         resources=(tickets,),
+        supports_relational_writes=True,
     )
     preview_calls: list[dict[str, object]] = []
     apply_calls: list[dict[str, object]] = []

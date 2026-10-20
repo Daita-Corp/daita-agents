@@ -22,18 +22,15 @@ from ..artifacts.renderers import (
     ExactXlsxRenderer,
     arrow_schema,
 )
-from ..domains.data.capabilities import (
-    ReadTabularRequest,
-    SQLiteReadResult,
-)
+from ..domains.data.capabilities import SQLiteReadResult
 from ..domains.data.controller import ReadScopedCatalogReader
 from ..domains.data.export_capabilities import (
     ExactTabularExportResult,
     ExactTabularProgress,
     resolved_exact_export_sensitivity,
 )
-from ..domains.data.results import BoundedResultProjection, project_result_rows
-from ..domains.data.sql import ResourceSchema, tabular_read_sql, validate_sqlite_read
+from ..domains.data.results import project_result_rows
+from ..domains.data.sql import ResourceSchema, validate_sqlite_read
 from ..errors import DaitaError
 from ..storage.sqlite_records import SourcePermissionStateError
 from .protocols import SourceStore
@@ -190,43 +187,6 @@ class SQLiteQueryBackend:
             projection=projection,
             resource_names=_resource_names(resources, validation.resource_ids),
         )
-
-    async def read_tabular(
-        self, request: ReadTabularRequest
-    ) -> BoundedResultProjection:
-        """Read catalog columns through the same validated bounded SQL path."""
-
-        resource = next(
-            (
-                item
-                for item in await self._catalog.resource_schemas(
-                    request.agent_id, request.source_id
-                )
-                if item.resource_id == request.resource_id
-            ),
-            None,
-        )
-        if resource is None:
-            raise SQLiteQueryError(
-                "query_binding_stale",
-                "A validated resource revision changed before source dispatch.",
-            )
-        sql, parameters = tabular_read_sql(
-            resource, "sqlite", request.columns, request.filters
-        )
-        result = await self.execute_read(
-            agent_id=request.agent_id,
-            source_id=request.source_id,
-            sql=sql,
-            parameters=parameters,
-            max_rows=request.limit,
-            max_bytes=request.max_bytes,
-            expected_resource_revisions=(
-                (request.resource_id, request.expected_revision),
-            ),
-            timeout_seconds=request.timeout_seconds,
-        )
-        return result.projection
 
     async def execute_exact_tabular(
         self,

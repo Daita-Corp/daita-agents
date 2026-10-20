@@ -60,7 +60,7 @@ NOW = datetime(2026, 7, 22, tzinfo=UTC)
 EAGER_LIMITS = LoopLimits()
 
 
-def _profile(provider: MockModelProvider, *, context: int = 32_000) -> ModelProfile:
+def _profile(provider: MockModelProvider, *, context: int = 24_000) -> ModelProfile:
     return ModelProfile(
         id=provider.provider_id,
         context_window_tokens=context,

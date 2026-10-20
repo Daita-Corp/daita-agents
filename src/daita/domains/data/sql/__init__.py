@@ -28,7 +28,6 @@ from .duckdb_read import (
 from .read_validation import (
     qualified_relation,
     read_validator,
-    tabular_read_sql,
     validate_postgresql_read,
     validate_sqlite_read,
 )
@@ -76,7 +75,6 @@ __all__ = [
     "normalize_sql",
     "qualified_relation",
     "read_validator",
-    "tabular_read_sql",
     "render_relational_update_statement",
     "sqlite_declared_type_affinity",
     "sqlite_identifier_key",
