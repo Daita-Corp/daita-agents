@@ -2083,6 +2083,17 @@ def _expand_query_pattern(
             os.close(child)
 
 
+def _list_directory(directory_descriptor: int) -> list[str]:
+    # Duplicated descriptors share one read offset, so concurrent listings of the
+    # same anchor can see an exhausted stream; read through a private open instead.
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    private = os.open(".", flags, dir_fd=directory_descriptor)
+    try:
+        return os.listdir(private)
+    finally:
+        os.close(private)
+
+
 def _query_directory_names(
     directory_descriptor: int,
     state: _QueryPatternState,
@@ -2093,7 +2104,7 @@ def _query_directory_names(
             sorted(
                 (
                     name
-                    for name in os.listdir(directory_descriptor)
+                    for name in _list_directory(directory_descriptor)
                     if _safe_segment(name)
                 ),
                 key=lambda name: name.encode("utf-8"),
@@ -2406,7 +2417,7 @@ def _scan_directory(
             sorted(
                 (
                     name
-                    for name in os.listdir(directory_descriptor)
+                    for name in _list_directory(directory_descriptor)
                     if _safe_segment(name)
                 ),
                 key=lambda name: name.encode("utf-8"),
