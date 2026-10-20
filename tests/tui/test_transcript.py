@@ -474,7 +474,7 @@ async def test_chat_accumulates_and_resumes_the_full_conversation_transcript(
             chat = app.chat()
             assert chat is not None
             assert chat.query_one("#next-steps").display is True
-            summaries = list(chat.query(".transcript-summary"))
+            summaries = list(chat.query(".transcript-summary").results(Static))
             assert len(summaries) == 2
             assert "answered directly" in str(summaries[-1].content)
             last_run = app.controller.last_answer
