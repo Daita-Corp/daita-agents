@@ -1428,6 +1428,7 @@ async def test_scheduled_routine_reads_an_attached_folder_and_refuses_a_changed_
 
         async def occurrence(count: int) -> ToolResultBlock:
             routine = await agent.inspect_routine(created.routine_id)
+            assert routine is not None
             await agent.run_routine_now(
                 created.routine_id, expected_revision=routine.routine.revision
             )

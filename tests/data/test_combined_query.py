@@ -174,7 +174,7 @@ def _tabular_regions(
 
 def _tabular_requests(agent: Agent) -> list[ReadTabularRequest]:
     backends = agent._embedded._source_backends[SourceOperation.TABULAR_READ]
-    return backends[MEMORY_ADAPTER_ID].requests  # type: ignore[no-any-return]
+    return cast(list[ReadTabularRequest], backends[MEMORY_ADAPTER_ID].requests)
 
 
 def _runtime(agent: Agent) -> CapabilityRuntime:

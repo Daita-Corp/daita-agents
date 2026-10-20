@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -432,7 +433,9 @@ async def test_source_narrowed_describe_takes_the_sensitivity_of_listed_link_end
     # The far endpoint's metadata is restricted, so the whole result is.
     assert result.sensitivity is ModelSensitivity.RESTRICTED
     assert result.sensitivity_provenance is not None
-    assert folder.id in result.sensitivity_provenance["source_ids"]
+    assert folder.id in cast(
+        tuple[str, ...], result.sensitivity_provenance["source_ids"]
+    )
 
 
 async def test_invalid_link_declarations_are_rejected_before_persistence(
