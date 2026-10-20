@@ -81,7 +81,6 @@ from daita.skills import Skill, validate_skill_name
 
 from .commands import (
     BUILTIN_SLASH_COMMANDS,
-    HELP_TEXT,
     learning_invocation_message,
     parse_source_override,
 )
@@ -215,6 +214,8 @@ class PresentationController:
         self.model_profile: Any = None
         self.agent: Agent | None = None
         self.conversation_id: str | None = None
+        # (conversation_id, run_id, question) of the latest answered question.
+        self.last_answer: tuple[str, str, str] | None = None
         self.validated_model = False
         self.model_configuration_requires_replacement = False
 
@@ -967,7 +968,9 @@ class PresentationController:
         if name == "/exit" and len(parts) == 1:
             return CommandOutcome("exit", conversation_id=conversation_id)
         if name == "/help" and len(parts) == 1:
-            return CommandOutcome("notice", HELP_TEXT, conversation_id=conversation_id)
+            return CommandOutcome(
+                "screen", screen="help", conversation_id=conversation_id
+            )
         if name == "/new" and len(parts) == 1:
             self.conversation_id = None
             return CommandOutcome("notice", "Conversation  new", conversation_id=None)
@@ -1141,6 +1144,8 @@ class PresentationController:
                 screen="model_setup",
                 conversation_id=conversation_id,
             )
+        if name in {"/save", "/schedule", "/teach"}:
+            return await self._next_step_command(name, command)
         if name == "/learn":
             invocation = learning_invocation_message(command)
             assert invocation is not None
@@ -1221,6 +1226,51 @@ class PresentationController:
             "Usage: /routines | /routines create <instruction> | "
             "/routines promote <basis-run-id> <instruction> | "
             "/routines update <routine-id> <instruction>",
+            conversation_id=conversation_id,
+        )
+
+    async def _next_step_command(self, name: str, command: str) -> CommandOutcome:
+        """Act on the latest answer without the user handling run identities."""
+
+        conversation_id = self.conversation_id
+        answer = self.last_answer
+        if answer is None or answer[0] != conversation_id:
+            return CommandOutcome(
+                "notice",
+                f"{name} acts on the latest answer. Ask a question first.",
+                conversation_id=conversation_id,
+            )
+        _conversation, run_id, question = answer
+        argument = command.removeprefix(name).strip()
+        if name == "/save":
+            return CommandOutcome(
+                "run",
+                run_message=(
+                    "Save your answer to the previous question in this conversation "
+                    "as a document artifact, keeping its content and tables as "
+                    "answered. Do not query sources again."
+                ),
+                conversation_id=conversation_id,
+            )
+        if name == "/schedule":
+            if not argument:
+                return CommandOutcome(
+                    "screen",
+                    screen="schedule_prompt",
+                    payload={"question": question},
+                    conversation_id=conversation_id,
+                )
+            promote = f"/routines promote {run_id} {question}\nSchedule: {argument}"
+            return await self._routines_command(promote.split(), promote)
+        material = (
+            f"The approach and facts behind my question {question!r} and your answer "
+            f"(run {run_id}) are correct and worth reusing."
+        )
+        if argument:
+            material += " " + argument
+        return CommandOutcome(
+            "run",
+            run_message=learning_invocation_message("/learn " + material),
             conversation_id=conversation_id,
         )
 
@@ -1802,8 +1852,9 @@ class PresentationController:
             f"Agent      {safe_display(agent.name, fallback='agent')}\n"
             f"Model      {safe_display(self.model_label(), fallback='model')}\n"
             f"Sources    {source}\n"
-            "Host       open in this TUI; background reasoning shares the run lock.\n"
-            "Handoff    exit this TUI, then start daita host --agent <name>. No progress while all hosts are closed.\n"
+            "Host       this window. Routines and jobs run while it is open.\n"
+            "Closing    run daita host --agent <name> to keep them running; "
+            "with no host open they wait.\n"
             f"Working dir  {safe_display(str(self.workspace.root), fallback='admitted')} "
             f"[{self.workspace.access.value} access; {self.workspace.sensitivity.value}]\n"
             "Conversation  " + safe_display(self.conversation_id, fallback="new")

@@ -143,7 +143,7 @@ async def test_work_command_routes_to_the_work_tab_without_a_model_call(
     assert (
         "/work",
         "/work",
-        "Show scheduled, running, waiting and finished work",
+        "See scheduled, running, waiting and finished work",
     ) in SLASH_COMMAND_COMPLETIONS
     assert not any(item[0].startswith("/inbox") for item in SLASH_COMMAND_COMPLETIONS)
     app, agent = await _app_with_board(tmp_path, monkeypatch, [_board()])

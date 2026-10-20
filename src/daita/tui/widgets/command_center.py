@@ -17,6 +17,7 @@ from textual.widgets.option_list import Option
 from daita import WorkBoard, WorkCard, WorkColumn, WorkKind
 from daita.artifacts import ArtifactRef
 
+from ..models import source_type_label
 from ..sanitization import safe_display
 
 _WORK_COLUMNS = (
@@ -44,8 +45,14 @@ class ProjectionList(OptionList):
         self.section = section
         self._empty = empty
         self._rows: tuple[tuple[str, str], ...] | None = None
+        self.details: dict[str, Text] = {}
 
-    def update_rows(self, rows: tuple[tuple[str, str], ...]) -> None:
+    def update_rows(
+        self,
+        rows: tuple[tuple[str, str], ...],
+        details: dict[str, Text] | None = None,
+    ) -> None:
+        self.details = details or {}
         if rows == self._rows:
             return
         selected = (
@@ -110,6 +117,44 @@ def work_card_label(card: WorkCard, now: datetime) -> Text:
     label = Text(safe_display(card.title, fallback="Work", maximum=120))
     label.append("\n" + " · ".join(details), style="dim")
     return label
+
+
+def _detail(title: str, rows: tuple[tuple[str, str], ...], hint: str) -> Text:
+    text = Text(safe_display(title, fallback="item", maximum=120), style="bold")
+    text.append("\n")
+    for label, value in rows:
+        if value:
+            text.append(f"\n{label.ljust(10)}", style="dim")
+            text.append(safe_display(value, fallback="", maximum=240))
+    text.append(f"\n\n{hint}", style="dim")
+    return text
+
+
+def source_detail(source: Any, type_label: str) -> Text:
+    return _detail(
+        source.display_name,
+        (
+            ("Type", type_label),
+            ("Connected", source.attached_at.astimezone().strftime("%Y-%m-%d %H:%M")),
+            ("About", getattr(source, "summary", "")),
+            ("Use when", getattr(source, "when_to_use", "")),
+        ),
+        "Enter opens tables, relationships, permissions and settings",
+    )
+
+
+def artifact_detail(item: ArtifactRef) -> Text:
+    size = item.byte_size
+    size_text = f"{size:,} B" if size < 1_024 else f"{size / 1_024:,.1f} KiB"
+    return _detail(
+        item.filename,
+        (
+            ("Type", item.media_type),
+            ("Size", size_text),
+            ("Created", item.created_at.astimezone().strftime("%Y-%m-%d %H:%M")),
+        ),
+        "Enter opens preview, save and delete",
+    )
 
 
 def _work_target(card: WorkCard) -> tuple[str, str | None]:
@@ -264,9 +309,11 @@ class CommandSections(ContentSwitcher):
                 classes="section-description",
                 markup=False,
             )
-            yield ProjectionList(
-                "sources", "No connected sources. Open Manage sources to add one."
-            )
+            with Horizontal(classes="section-body"):
+                yield ProjectionList(
+                    "sources", "No connected sources. Open Manage sources to add one."
+                )
+                yield Static("", id="detail-sources", classes="section-detail")
         with Vertical(id="section-work", classes="command-section"):
             with Horizontal(id="work-actions"):
                 yield Button("All jobs ›", id="open-jobs", classes="section-action")
@@ -275,7 +322,8 @@ class CommandSections(ContentSwitcher):
                 )
             yield WorkBoardView()
             yield Static(
-                "Scheduled work progresses while this host is open.",
+                "Routines run while Daita is open here, or while "
+                "`daita host --agent <name>` runs after you close it.",
                 classes="section-description",
                 markup=False,
             )
@@ -288,24 +336,70 @@ class CommandSections(ContentSwitcher):
                 classes="section-description",
                 markup=False,
             )
-            yield ProjectionList("artifacts", "No stored artifacts")
+            with Horizontal(classes="section-body"):
+                yield ProjectionList("artifacts", "No stored artifacts")
+                yield Static("", id="detail-artifacts", classes="section-detail")
 
-    def update_sources(self, sources: tuple[Any, ...]) -> None:
-        self.query_one("#command-sources", ProjectionList).update_rows(
+    def on_mount(self) -> None:
+        self.on_resize()
+
+    def on_resize(self) -> None:
+        # Lists sit beside their details only where both stay readable.
+        self.set_class(self.app.size.width >= 100, "-wide")
+
+    def update_sources(
+        self, sources: tuple[Any, ...], source_types: tuple[Any, ...] = ()
+    ) -> None:
+        active = tuple(item for item in sources if item.active)
+        self._update_list(
+            "sources",
             tuple(
                 (item.id, safe_display(item.display_name, maximum=80))
-                for item in sources
-                if item.active
-            )
+                for item in active
+            ),
+            {
+                item.id: source_detail(
+                    item, source_type_label(source_types, item.adapter_id)
+                )
+                for item in active
+            },
         )
 
     def update_work(self, board: WorkBoard) -> None:
         self.query_one(WorkBoardView).update_board(board)
 
     def update_artifacts(self, items: tuple[ArtifactRef, ...]) -> None:
-        self.query_one("#command-artifacts", ProjectionList).update_rows(
-            tuple((item.artifact_id, safe_display(item.filename)) for item in items)
+        self._update_list(
+            "artifacts",
+            tuple((item.artifact_id, safe_display(item.filename)) for item in items),
+            {item.artifact_id: artifact_detail(item) for item in items},
         )
+
+    def _update_list(
+        self,
+        section: str,
+        rows: tuple[tuple[str, str], ...],
+        details: dict[str, Text],
+    ) -> None:
+        listing = self.query_one(f"#command-{section}", ProjectionList)
+        listing.update_rows(rows, details)
+        self._show_detail(listing)
+
+    def _show_detail(self, listing: ProjectionList) -> None:
+        option = (
+            listing.get_option_at_index(listing.highlighted)
+            if listing.highlighted is not None
+            else None
+        )
+        detail = listing.details.get(option.id or "") if option else None
+        self.query_one(f"#detail-{listing.section}", Static).update(detail or "")
+
+    def on_option_list_option_highlighted(
+        self, event: OptionList.OptionHighlighted
+    ) -> None:
+        if isinstance(event.option_list, ProjectionList):
+            event.stop()
+            self._show_detail(event.option_list)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()

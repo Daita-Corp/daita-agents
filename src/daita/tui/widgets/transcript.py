@@ -76,7 +76,7 @@ class TranscriptView(VerticalScroll):
     def copy_text(self) -> str:
         parts: list[str] = []
         for block in self._blocks:
-            if block.kind == "tool" and not self._tools_visible:
+            if block.kind in {"tool", "summary"} and not self._tools_visible:
                 continue
             if block.kind == "tool" and block.tool_card is not None:
                 details = block.tool_card.details
@@ -108,6 +108,16 @@ class TranscriptView(VerticalScroll):
             self.mount(card)
             return
         classes = "transcript-user" if block.kind == "user" else "transcript-assistant"
+        if block.kind == "summary":
+            self.mount(
+                Static(
+                    "↳ " + block.text,
+                    id=_css_id(block.identity),
+                    classes="transcript-summary",
+                    markup=False,
+                )
+            )
+            return
         if block.kind == "notice":
             self.mount(
                 Static(

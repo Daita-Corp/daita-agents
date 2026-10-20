@@ -424,12 +424,17 @@ class SourceSetupScreen(Screen[bool]):
             )
             yield Input(placeholder="Display name", id="source-name")
             yield Input(placeholder="Path or PostgreSQL URL", id="source-path")
+            yield Input(placeholder="Schemas (comma-separated)", id="pg-schemas")
+            yield Button(
+                "Enter connection fields instead of a URL ›",
+                id="pg-fields",
+                classes="section-action",
+            )
             yield Input(placeholder="Host", id="pg-host")
             yield Input(placeholder="Port", id="pg-port")
             yield Input(placeholder="Database", id="pg-database")
             yield Input(placeholder="Username", id="pg-username")
             yield Input(placeholder="Password", id="pg-password", password=True)
-            yield Input(placeholder="Schemas (comma-separated)", id="pg-schemas")
             yield Select(
                 ((mode, mode) for mode in sorted(SSL_MODES)),
                 prompt="SSL mode",
@@ -439,11 +444,45 @@ class SourceSetupScreen(Screen[bool]):
             yield Button("Attach", id="attach-source", variant="primary")
             yield Footer()
 
+    # Shown by type; PostgreSQL's separate fields only after asking for them.
+    _PATH_PLACEHOLDERS = {
+        "sqlite": "Path to a .sqlite or .db file",
+        "folder": "Folder path",
+        "postgresql": "postgresql://user:password@host:5432/database",
+    }
+    _FIELD_IDS = ("pg-host", "pg-port", "pg-database", "pg-username", "pg-password")
+
+    def on_mount(self) -> None:
+        self._show_fields_for(None, separate_fields=False)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "source-type":
+            value = None if event.value is Select.NULL else str(event.value)
+            self._show_fields_for(value, separate_fields=False)
+
+    def _show_fields_for(self, kind: str | None, *, separate_fields: bool) -> None:
+        postgresql = kind == "postgresql"
+        path = self.query_one("#source-path", Input)
+        path.placeholder = self._PATH_PLACEHOLDERS.get(
+            kind or "", "Path or PostgreSQL URL"
+        )
+        path.display = not separate_fields
+        self.query_one("#pg-schemas").display = postgresql
+        self.query_one("#pg-ssl").display = postgresql
+        self.query_one("#pg-fields").display = postgresql and not separate_fields
+        for field_id in self._FIELD_IDS:
+            self.query_one(f"#{field_id}").display = separate_fields
+
     def action_cancel(self) -> None:
         if not self._busy:
             self.dismiss(False)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "pg-fields":
+            self.query_one("#source-path", Input).value = ""
+            self._show_fields_for("postgresql", separate_fields=True)
+            self.query_one("#pg-host", Input).focus()
+            return
         if event.button.id == "attach-source" and not self._busy:
             self._busy = True
             event.button.disabled = True

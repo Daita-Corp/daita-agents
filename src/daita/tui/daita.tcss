@@ -85,6 +85,12 @@ Screen {
     text-overflow: ellipsis;
 }
 
+#host-status {
+    width: auto;
+    height: 1;
+    padding: 0 1;
+}
+
 #context-window {
     width: auto;
     height: 1;
@@ -151,6 +157,28 @@ Screen {
     height: auto;
     padding: 0 1 1 1;
     color: $text-muted;
+}
+
+#pg-fields {
+    height: 1;
+    margin-bottom: 1;
+}
+
+.section-body {
+    height: 1fr;
+    min-height: 1;
+}
+
+.section-detail {
+    display: none;
+    width: 1fr;
+    height: auto;
+    padding: 0 2;
+    border-left: solid $border;
+}
+
+#command-sections.-wide .section-detail {
+    display: block;
 }
 
 ProjectionList {
@@ -238,8 +266,55 @@ ChatScreen.-narrow #main-tabs Tab {
     color: $text-muted;
 }
 
-#activity-bar {
+#suggestions-row {
+    height: auto;
+}
+
+#suggestions {
+    width: 64;
+    max-width: 100%;
+    height: auto;
+    max-height: 4;
+    border: none;
+    padding: 0 1;
+}
+
+#suggestions > .option-list--option-highlighted {
+    text-style: none;
+}
+
+#suggestions:focus > .option-list--option-highlighted,
+#suggestions > .option-list--option-hover {
+    text-style: bold reverse;
+}
+
+#next-steps {
     height: 1;
+    margin: 0 0 1 1;
+}
+
+#next-steps-label {
+    width: auto;
+    padding-right: 2;
+    color: $text-muted;
+}
+
+#next-steps Button {
+    width: auto;
+    min-width: 0;
+    margin-right: 2;
+    color: $foreground;
+    text-style: bold;
+}
+
+#next-steps Button:hover,
+#next-steps Button:focus {
+    text-style: bold reverse;
+}
+
+#activity-bar {
+    height: auto;
+    max-height: 6;
     padding: 0 1;
     color: $text-muted;
     border-left: solid $primary;
@@ -272,16 +347,23 @@ ChatScreen.-narrow #main-tabs Tab {
     padding: 0 1;
 }
 
+/* The user's turns carry the accent bar; answers sit flush beside them. */
 .transcript-user {
-    color: $text-muted;
-    padding: 1 0 0 1;
-    border-left: solid $primary;
+    color: $foreground;
+    text-style: bold;
+    margin-top: 1;
+    padding: 0 0 0 1;
+    border-left: outer $primary;
 }
 
 .transcript-assistant {
     color: $foreground;
-    padding: 1 0 0 1;
-    border-left: solid $border;
+    padding: 1 0 0 2;
+}
+
+.transcript-summary {
+    color: $text-muted;
+    padding: 0 0 0 2;
 }
 
 .transcript-notice {
@@ -371,6 +453,10 @@ PermissionsScreen {
     padding: 1 2;
     background: $background;
     border: solid $border;
+}
+
+#help-panel {
+    height: 90%;
 }
 
 #confirm {

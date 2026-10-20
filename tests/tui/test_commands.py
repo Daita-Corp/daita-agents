@@ -91,18 +91,19 @@ async def test_typed_command_palette_navigates_and_inserts_without_submitting(
                     is True
                 )
                 assert listing.highlighted == 0
-                assert popup.selected_insertion() == "/model"
+                assert popup.selected_insertion() == "/save"
                 assert listing.option_count == len(SLASH_COMMAND_COMPLETIONS)
 
                 for _ in range(len(SLASH_COMMAND_COMPLETIONS) - 1):
                     popup.move_highlight(1)
-                assert popup.selected_insertion() == "/exit"
+                assert popup.selected_insertion() == "/agent delete"
                 assert listing.scroll_offset.y > 0
                 for _ in range(len(SLASH_COMMAND_COMPLETIONS) - 1):
                     popup.move_highlight(-1)
-                assert popup.selected_insertion() == "/model"
+                assert popup.selected_insertion() == "/save"
 
-                await pilot.press("down", "enter")
+                # Answer actions lead the menu; /sources opens the Data group.
+                await pilot.press("down", "down", "down", "enter")
                 await pilot.pause()
                 assert composer.text == "/sources"
                 assert popup.display is False
@@ -362,3 +363,26 @@ async def test_multi_selection_shows_literal_marks_and_continue_button():
         assert await pilot.click(button) is True
         await pilot.pause()
     assert app.return_value == ("core",)
+
+
+def test_menu_groups_label_every_row_and_starter_questions_name_real_tables():
+    from daita.tui.commands import (
+        COMMAND_GROUPS,
+        completion_group,
+        suggested_questions,
+    )
+
+    for group, commands in COMMAND_GROUPS:
+        assert all(completion_group(display) == group for _i, display, _d in commands)
+    assert completion_group("@sales") == "Source"
+    assert completion_group("/weekly-report") == "Skill"
+
+    assert suggested_questions(("orders", "customers")) == (
+        "What is in orders?",
+        "Show the 10 most recent rows of orders",
+        "How does orders relate to customers?",
+    )
+    assert suggested_questions(("orders",))[-1] == (
+        "Show the 10 most recent rows of orders"
+    )
+    assert all("folder" in question for question in suggested_questions(()))

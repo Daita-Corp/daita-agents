@@ -545,7 +545,66 @@ def project_conversation(
                     run_failure_notice(run.result, run.transcript),
                 )
             )
+        elif run.result is not None:
+            blocks.append(
+                TranscriptBlock(
+                    "summary",
+                    f"{run.result.run_id}:summary",
+                    run_summary_text(
+                        run.result, run.transcript, tool_pairs[run.transcript.run.id]
+                    ),
+                )
+            )
     return tuple(blocks)
+
+
+def format_token_count(value: int) -> str:
+    """Format a non-negative token count without obscuring its scale."""
+
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError("token count must be a non-negative integer")
+    if value < 1_000:
+        return str(value)
+    if value < 10_000:
+        return f"{value / 1_000:.1f}K"
+    if value < 1_000_000:
+        return f"{value // 1_000}K"
+    if value < 10_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    return f"{value // 1_000_000}M"
+
+
+def run_summary_text(
+    result: LoopExit, transcript: Transcript, tool_pairs: ToolPairs
+) -> str:
+    """One line of what a completed answer drew on, from its recorded evidence."""
+
+    queries = rows = 0
+    for call, tool_result in tool_pairs:
+        if getattr(call, "name", "") != "data_query":
+            continue
+        queries += 1
+        if tool_result is None or tool_result.is_error:
+            continue
+        data = tool_result.output.get("data")
+        table = project_table_preview(dict(data) if isinstance(data, Mapping) else None)
+        if table is not None:
+            rows += table.total_rows or table.recorded_rows
+    seconds = max(0.0, (result.created_at - transcript.run.created_at).total_seconds())
+    parts = []
+    if queries:
+        parts.append(f"{queries} {'query' if queries == 1 else 'queries'}")
+    if rows:
+        parts.append(f"{rows:,} {'row' if rows == 1 else 'rows'}")
+    if tool_pairs:
+        steps = len(tool_pairs)
+        parts.append(f"{steps} {'step' if steps == 1 else 'steps'}")
+    else:
+        parts.append("answered directly")
+    parts.append(f"{seconds:.1f}s")
+    if result.usage.total_tokens:
+        parts.append(f"{format_token_count(result.usage.total_tokens)} tokens")
+    return " · ".join(parts)
 
 
 def tool_outcome_summary(result: ToolResultBlock) -> str | None:

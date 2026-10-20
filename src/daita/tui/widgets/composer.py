@@ -9,6 +9,7 @@ from textual.reactive import reactive
 from textual.widgets import OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
+from ..commands import completion_group
 from ..models import MAX_COMPOSER_CHARACTERS
 from ..sanitization import sanitize_terminal_text
 
@@ -161,7 +162,7 @@ class CompletionPopup(Static):
 
     def compose(self):
         yield Static(
-            "COMMANDS  Up/Down navigate  Tab/Enter insert",
+            "Up/Down choose  ·  Tab/Enter insert  ·  Esc close",
             id="completion-title",
             markup=False,
         )
@@ -171,8 +172,16 @@ class CompletionPopup(Static):
         listing = self.query_one(OptionList)
         listing.clear_options()
         self.matches = matches[: self.MAX_MATCHES]
+        previous_group = None
         for index, (_insertion, shown, description) in enumerate(self.matches):
+            group = completion_group(shown)
+            # Name each group once, on its first row.
             label = Text(
+                (group if group != previous_group else "").upper().ljust(8),
+                style="bold",
+            )
+            previous_group = group
+            label.append(
                 sanitize_terminal_text(
                     shown,
                     maximum=160,

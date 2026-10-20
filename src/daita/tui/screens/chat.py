@@ -9,12 +9,14 @@ from rich.cells import cell_len
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import ActiveBinding, Binding
-from textual.containers import Vertical
+from textual.containers import Center, Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Button, Footer, OptionList, Static, Tab, Tabs, TextArea
+from textual.widgets.option_list import Option
 
 from daita import ApprovalDecision, ApprovalRequest
 
+from ..commands import NEXT_STEPS
 from ..models import TranscriptBlock
 from ..widgets.approval import ApprovalPanel
 from ..widgets.command_center import (
@@ -31,6 +33,7 @@ from ..widgets.composer import (
 )
 from ..widgets.status import ActivityBar, NoticeBar, StatusBar
 from ..widgets.transcript import TranscriptView
+from .help import HelpScreen
 
 if TYPE_CHECKING:
     from ..app import DaitaApp
@@ -44,6 +47,43 @@ _WELCOME_LOGO = (
 )
 
 
+def welcome_text(
+    *, model: str | None = None, sources: int = 0, catalog_empty: bool = False
+) -> Text:
+    """The empty-chat greeting with a setup checklist beside the logo."""
+
+    model_line = (
+        ("✓", "Model", model) if model else ("○", "Model", "choose one with /model")
+    )
+    if not sources:
+        data_line = ("○", "Data", "connect with /sources, or ask about local files")
+    elif catalog_empty:
+        data_line = ("○", "Data", "0 tables found · open /sources and choose Edit")
+    else:
+        noun = "source" if sources == 1 else "sources"
+        data_line = ("✓", "Data", f"{sources} {noun} connected")
+    lines: tuple[tuple[str, str], ...] = (
+        ("What would you like to know?", "bold"),
+        ("Ask about your data or local files.", ""),
+        ("Type / for commands or @ to choose a source.", "dim"),
+        ("", ""),
+    )
+    welcome = Text()
+    for index, (logo, (line, style)) in enumerate(
+        zip(_WELCOME_LOGO, lines, strict=True)
+    ):
+        if index:
+            welcome.append("\n")
+        welcome.append(logo, style="bold")
+        welcome.append(line, style=style)
+    for mark, label, detail in (model_line, data_line):
+        welcome.append("\n" + " " * cell_len(_WELCOME_LOGO[0]))
+        welcome.append(mark, style="green" if mark == "✓" else "bold")
+        welcome.append(f" {label.ljust(6)}", style="bold")
+        welcome.append(detail, style="dim")
+    return welcome
+
+
 class ChatScreen(Screen[None]):
     AUTO_FOCUS = "#composer"
 
@@ -55,7 +95,7 @@ class ChatScreen(Screen[None]):
         Binding("f6", "focus_tabs", "Tabs", priority=True),
         Binding("f1", "help", "Help", priority=True),
         Binding("escape", "focus_conversation", "Chat", show=False),
-        Binding("ctrl+o", "toggle_tools", "Tools", priority=True),
+        Binding("ctrl+o", "toggle_tools", "Steps", priority=True),
         Binding("ctrl+end", "follow", "Latest", priority=True),
         Binding("ctrl+home", "start", "Start", priority=True),
         Binding("ctrl+c", "copy_or_cancel", "Copy / Cancel"),
@@ -87,29 +127,22 @@ class ChatScreen(Screen[None]):
             with Vertical(id="main-view"):
                 with Vertical(id="conversation-pane"):
                     with Vertical(id="welcome-region"):
-                        welcome = Text()
-                        for index, (logo, line, style) in enumerate(
-                            zip(
-                                _WELCOME_LOGO,
-                                (
-                                    "What would you like to know?",
-                                    "",
-                                    "Ask about your data or local files.",
-                                    "Type / for commands or @ to choose a source.",
-                                ),
-                                ("bold", "", "", ""),
-                                strict=True,
-                            )
-                        ):
-                            if index:
-                                welcome.append("\n")
-                            welcome.append(logo, style="bold")
-                            welcome.append(line, style=style)
-                        yield Static(welcome, id="welcome", markup=False)
+                        yield Static(welcome_text(), id="welcome", markup=False)
+                        with Center(id="suggestions-row"):
+                            yield OptionList(id="suggestions")
                     yield TranscriptView()
                     yield ApprovalPanel()
                 yield CommandSections()
             with Vertical(id="chat-bottom"):
+                with Horizontal(id="next-steps"):
+                    yield Static("Next", id="next-steps-label", markup=False)
+                    for command, label in NEXT_STEPS:
+                        yield Button(
+                            label,
+                            id=f"next-{command.removeprefix('/')}",
+                            compact=True,
+                            tooltip=command,
+                        )
                 yield ActivityBar()
                 yield NoticeBar()
                 yield CompletionPopup(id="completions")
@@ -124,7 +157,7 @@ class ChatScreen(Screen[None]):
             ("y", "n", "escape")
             if "y" in bindings
             else (
-                ("enter", "f6", "f1")
+                ("enter", "ctrl+o", "f6", "f1")
                 if self.section == "chat"
                 else (
                     ("enter", "d", "escape", "f1")
@@ -140,6 +173,7 @@ class ChatScreen(Screen[None]):
         }
 
     def on_mount(self) -> None:
+        self.query_one("#next-steps").display = False
         self.query_one(CompletionPopup).display = False
         self.query_one(TranscriptView).display = False
         self._show_section("chat")
@@ -209,9 +243,7 @@ class ChatScreen(Screen[None]):
         if self.query_one(ApprovalPanel).active:
             self.action_focus_conversation()
             return
-        self._show_section("chat")
-        self.focus_section()
-        self.run_worker(self.daita_app._handle_command("/help"), name="help")
+        self.app.push_screen(HelpScreen())
 
     def action_focus_conversation(self) -> None:
         if self.section != "chat":
@@ -226,6 +258,21 @@ class ChatScreen(Screen[None]):
             panel.query_one(target, Button).focus()
         else:
             self.query_one(Composer).focus()
+
+    def show_next_steps(self, visible: bool) -> None:
+        self.query_one("#next-steps").display = visible
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if not button_id.startswith("next-"):
+            return
+        event.stop()
+        self.run_worker(
+            self.daita_app._handle_command("/" + button_id.removeprefix("next-")),
+            name="next-step",
+            group="foreground-interaction",
+            exclusive=True,
+        )
 
     def on_command_center_navigate(self, event: CommandCenterNavigate) -> None:
         event.stop()
@@ -294,7 +341,35 @@ class ChatScreen(Screen[None]):
         self.dismiss_completions()
         event.stop()
 
+    def set_welcome(
+        self,
+        *,
+        model: str | None,
+        sources: int,
+        catalog_empty: bool,
+        suggestions: tuple[str, ...],
+    ) -> None:
+        self.query_one("#welcome", Static).update(
+            welcome_text(model=model, sources=sources, catalog_empty=catalog_empty)
+        )
+        listing = self.query_one("#suggestions", OptionList)
+        listing.clear_options()
+        listing.add_options(
+            [
+                Option(Text.assemble(("› ", "bold"), suggestion), id=suggestion)
+                for suggestion in suggestions
+            ]
+        )
+        listing.display = bool(suggestions)
+
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id == "suggestions":
+            event.stop()
+            composer = self.query_one(Composer)
+            composer.load_text(event.option.id or "")
+            composer.move_cursor((0, len(composer.text)))
+            composer.focus()
+            return
         if event.option_list.id != "completion-list":
             return
         popup = self.query_one(CompletionPopup)
@@ -417,6 +492,16 @@ class ChatScreen(Screen[None]):
     def clear_activity(self) -> None:
         self.query_one(ActivityBar).stop()
 
+    def step_started(self, call_id: str, label: str) -> None:
+        self.query_one(ActivityBar).step_started(call_id, label)
+
+    def step_finished(
+        self, call_id: str, *, success: bool, duration_ms: object = None
+    ) -> None:
+        self.query_one(ActivityBar).step_finished(
+            call_id, success=success, duration_ms=duration_ms
+        )
+
     async def request_approval(
         self,
         request: ApprovalRequest,
@@ -438,6 +523,10 @@ class ChatScreen(Screen[None]):
     def _show_conversation(self, has_blocks: bool) -> None:
         self.query_one("#welcome-region", Vertical).display = not has_blocks
         self.query_one("#welcome").display = not has_blocks
+        self.query_one("#suggestions").display = (
+            not has_blocks
+            and self.query_one("#suggestions", OptionList).option_count > 0
+        )
         self.query_one(TranscriptView).display = has_blocks
 
     def set_submitting(self, submitting: bool) -> None:
