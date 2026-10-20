@@ -91,6 +91,23 @@ class SQLiteSource:
         )
 
 
+def sqlite_source_from_registration(
+    registration: SourceRegistration,
+    *,
+    secret_provider: object = None,
+) -> SQLiteSource:
+    """Reconstruct one admitted SQLite source from its exact stored configuration."""
+
+    del secret_provider
+    configuration = registration.configuration
+    if set(configuration) != {"path"}:
+        raise ValueError("source configuration fields are invalid")
+    path = configuration["path"]
+    if not isinstance(path, str) or not path:
+        raise ValueError("source configuration text is invalid")
+    return SQLiteSource(path=path, name=registration.display_name)
+
+
 class SQLiteResourceAdapter:
     def __init__(
         self,
@@ -615,4 +632,9 @@ def _primary_key_columns(
     return tuple(str(row["name"]) for row in rows)
 
 
-__all__ = ["SQLiteResourceAdapter", "SQLiteSource", "SQLiteSourceError"]
+__all__ = [
+    "SQLiteResourceAdapter",
+    "SQLiteSource",
+    "SQLiteSourceError",
+    "sqlite_source_from_registration",
+]

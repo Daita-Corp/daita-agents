@@ -9,7 +9,8 @@ from typing import cast
 
 import pytest
 
-from daita._json import FrozenJsonObject, thaw_json
+from daita._json import FrozenJsonObject, canonical_json, thaw_json
+from daita.adapters.registry import SourceOperation, SourceTypeRegistry
 from daita.capabilities import (
     CallTargetLane,
     CapabilityDeclarations,
@@ -25,6 +26,7 @@ from daita.domains.data import (
     DATA_QUERY_CAPABILITY_ID,
     DATA_QUERY_EVIDENCE_KIND,
     DATA_QUERY_TOOL_NAME,
+    PATH_QUERY_CAPABILITY_ID,
     DataCapabilityDomain,
     DataDomainCatalog,
     DataExportTabularExecutor,
@@ -36,12 +38,12 @@ from daita.domains.data import (
     data_query_capability_declarations,
     exact_export_capability_declarations,
     exact_export_outputs,
-    local_file_capability_declarations,
     project_result_rows,
     relational_update_capability_declarations,
     relational_update_preview_capability_declarations,
     relational_upsert_capability_declarations,
     resource_revision_observation_declarations,
+    source_file_capability_declarations,
 )
 from daita.domains.data.routine_precheck import ResourceRevisionCatalog
 from daita.domains.learning import LearningCandidateGuard
@@ -79,7 +81,9 @@ def test_data_query_is_one_backend_neutral_model_tool() -> None:
 
 
 def test_data_export_is_one_backend_neutral_model_tool() -> None:
-    declarations = exact_export_capability_declarations()
+    declarations = exact_export_capability_declarations(
+        adapter_ids=("sqlite", "postgresql")
+    )
 
     assert tuple(item.id for item in declarations.capabilities) == (
         DATA_EXPORT_TABULAR_CAPABILITY_ID,
@@ -108,7 +112,7 @@ def test_data_export_is_one_backend_neutral_model_tool() -> None:
 
 
 def test_data_query_file_outputs_route_to_exact_export_with_one_limits_clause() -> None:
-    exports = exact_export_capability_declarations()
+    exports = exact_export_capability_declarations(adapter_ids=("sqlite", "postgresql"))
     query = data_query_capability_declarations(
         file_outputs=exact_export_outputs(allow_arrow=False),
         file_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
@@ -157,6 +161,11 @@ def test_data_query_file_outputs_route_to_exact_export_with_one_limits_clause() 
 
 
 class _Catalog:
+    # No live session folder source unless a test adds one.
+    @property
+    def session_source_id(self) -> str | None:
+        return None
+
     def __init__(self) -> None:
         self.write_applicability_calls: list[str] = []
         self.routing_enabled = True
@@ -275,15 +284,18 @@ def _run() -> RunInput:
     )
 
 
-def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDomain:
+def _domain(catalog: _Catalog, *, source_files: bool = False) -> DataCapabilityDomain:
     catalog_bundle = catalog_declarations(
         "agent-relational", cast(CatalogProjection, catalog)
     )
     query_bundle = data_query_capability_declarations(
         file_outputs=exact_export_outputs(allow_arrow=False),
         file_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
+        path_query=source_files,
     )
-    export_bundle = exact_export_capability_declarations()
+    export_bundle = exact_export_capability_declarations(
+        adapter_ids=("sqlite", "postgresql")
+    )
     preview_bundle = relational_update_preview_capability_declarations()
     update_bundle = relational_update_capability_declarations()
     upsert_bundle = relational_upsert_capability_declarations()
@@ -292,7 +304,7 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
         catalog=cast(ResourceRevisionCatalog, catalog),
         clock=lambda: datetime(2026, 9, 3, tzinfo=UTC),
     )
-    file_bundle = local_file_capability_declarations()
+    file_bundle = source_file_capability_declarations()
     capabilities = (
         *catalog_bundle.capabilities,
         *query_bundle.capabilities,
@@ -301,7 +313,7 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
         *update_bundle.capabilities,
         *upsert_bundle.capabilities,
         *revision_bundle.capabilities,
-        *(file_bundle.capabilities if local_files else ()),
+        *(file_bundle.capabilities if source_files else ()),
     )
     return DataCapabilityDomain(
         CapabilityDeclarations(
@@ -315,12 +327,14 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
                 *preview_bundle.tool_views,
                 *update_bundle.tool_views,
                 *upsert_bundle.tool_views,
-                *(file_bundle.tool_views if local_files else ()),
+                *(file_bundle.tool_views if source_files else ()),
             ),
         ),
         cast(DataDomainCatalog, catalog),
         LearningCandidateGuard(),
-        local_file_sensitivity=ModelSensitivity.RESTRICTED if local_files else None,
+        SourceTypeRegistry(),
+        source_files_available=source_files,
+        path_query_available=source_files,
     )
 
 
@@ -344,60 +358,117 @@ async def test_mixed_relational_catalog_projects_each_semantic_tool_once(
     )
 
 
-class _UnavailableCatalog(_Catalog):
-    async def source_routing_facts(self, *args, **kwargs):
-        raise AssertionError("Local files must not depend on relational catalog I/O")
+_SESSION_SOURCE = "source:workspace:sha256:" + "5" * 64
 
 
-@pytest.mark.parametrize(
-    "tool_name", ("file_search", "file_read", "file_query", "unknown")
-)
-@pytest.mark.parametrize("local_files", (True, False))
-async def test_exact_local_file_projection_is_independent_of_relational_catalog(
+class _FolderCatalog(_Catalog):
+    """The relational catalog plus a live session folder source when present."""
+
+    def __init__(self, *, session: bool) -> None:
+        super().__init__()
+        self._session = session
+
+    @property
+    def session_source_id(self) -> str | None:
+        return _SESSION_SOURCE if self._session else None
+
+    async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None:
+        if self._session and source_id == _SESSION_SOURCE:
+            return "folder"
+        return await super().source_adapter_id(agent_id, source_id)
+
+    async def source_routing_facts(
+        self, agent_id: str, source_ids: tuple[str, ...] = ()
+    ) -> tuple[Mapping[str, object], ...]:
+        facts = await super().source_routing_facts(agent_id, source_ids)
+        if self._session and (not source_ids or _SESSION_SOURCE in source_ids):
+            facts += ({"source_id": _SESSION_SOURCE, "adapter_id": "folder"},)
+        return facts
+
+    async def readable_resource_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+        *,
+        operation: str = "update",
+    ) -> frozenset[str]:
+        return await super().readable_resource_ids(
+            agent_id, tuple(item for item in source_ids if item != _SESSION_SOURCE)
+        )
+
+
+@pytest.mark.parametrize("tool_name", ("file_search", "file_read", "unknown"))
+@pytest.mark.parametrize("session", (True, False))
+async def test_folder_file_tools_project_only_with_a_folder_source_in_scope(
     tool_name,
-    local_files,
+    session,
 ):
-    domain = _domain(_UnavailableCatalog(), local_files=local_files)
+    domain = _domain(_FolderCatalog(session=session), source_files=True)
     projected = await domain.project_call(
         _run(), ToolCall(id="local", name=tool_name), None
     )
-    assert projected == (
-        () if tool_name == "unknown" or not local_files else (tool_name,)
-    )
+    assert projected == (() if tool_name == "unknown" or not session else (tool_name,))
 
 
 @pytest.mark.parametrize(
     ("tool_name", "arguments", "error"),
     (
-        ("file_read", {"path": "x.txt"}, None),
-        ("file_search", {"query": "x"}, None),
-        ("file_query", {"path": "x.csv", "sql": "SELECT * FROM data"}, None),
+        ("file_read", {"source_id": _SESSION_SOURCE, "path": "x.txt"}, None),
+        ("file_search", {"source_id": _SESSION_SOURCE, "query": "x"}, None),
+        (
+            "data_query",
+            {
+                "source_id": _SESSION_SOURCE,
+                "path_pattern": "x.csv",
+                "sql": "SELECT * FROM data",
+            },
+            None,
+        ),
         (
             "file_read",
-            {"path": "x", "source_id": "source-sqlite"},
+            {"source_id": "source:sha256:" + "0" * 64, "path": "x"},
             "source_scope_violation",
         ),
-        ("file_read", {"path": "x", "cursor": "cursor"}, "path_invalid"),
         (
-            "file_query",
-            {"path": "x.csv", "sql": "DELETE FROM data"},
-            "file_query_invalid",
+            "file_read",
+            {"source_id": _SESSION_SOURCE, "path": "x", "cursor": "cursor"},
+            "path_invalid",
+        ),
+        (
+            "data_query",
+            {
+                "source_id": "source-sqlite",
+                "path_pattern": "x.csv",
+                "sql": "SELECT * FROM data",
+            },
+            "path_pattern_unsupported",
+        ),
+        (
+            "data_query",
+            {
+                "source_id": _SESSION_SOURCE,
+                "path_pattern": "x.csv",
+                "sql": "DELETE FROM data",
+            },
+            "folder_query_invalid",
         ),
     ),
 )
-async def test_local_file_binding_keeps_validation_without_relational_catalog(
+async def test_folder_file_calls_bind_their_source_before_file_io(
     tool_name, arguments, error
 ):
-    domain = _domain(_UnavailableCatalog(), local_files=True)
-    capability = next(
-        c
-        for c in domain.declarations.capabilities
-        if c.id
-        == next(
-            v.capability_id
-            for v in domain.declarations.tool_views
-            if v.name == tool_name
+    domain = _domain(_FolderCatalog(session=True), source_files=True)
+    capability_id = (
+        PATH_QUERY_CAPABILITY_ID
+        if "path_pattern" in arguments
+        else next(
+            view.capability_id
+            for view in domain.declarations.tool_views
+            if view.name == tool_name
         )
+    )
+    capability = next(
+        item for item in domain.declarations.capabilities if item.id == capability_id
     )
     call = ToolCall(id="local", name=tool_name, arguments=arguments)
     if error is None:
@@ -408,11 +479,11 @@ async def test_local_file_binding_keeps_validation_without_relational_catalog(
             FrozenJsonObject.from_mapping(arguments),
             request_sensitivity=ModelSensitivity.RESTRICTED,
         )
-        if tool_name == "file_query":
+        assert bound["_adapter_id"] == "folder"
+        assert "_resource_ids" not in bound
+        if "path_pattern" in arguments:
             assert bound["sql"] == "SELECT * FROM data"
             assert isinstance(bound["sql_fingerprint"], str)
-        else:
-            assert bound.to_dict() == arguments
     else:
         with pytest.raises(CapabilityInputError) as raised:
             await domain.prepare_call(
@@ -438,10 +509,12 @@ async def test_exact_relational_projection_rechecks_current_source_admission():
 async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     domain = object.__new__(DataCapabilityDomain)
     domain._catalog = cast(DataDomainCatalog, _Catalog())
+    domain._source_types = SourceTypeRegistry()
 
     sqlite = await domain._validate_sql(
         _run(),
-        {
+        operation=SourceOperation.SQL_READ,
+        arguments={
             "source_id": "source-sqlite",
             "resource_ids": ("resource-sqlite",),
             "sql": "SELECT id FROM items",
@@ -449,7 +522,8 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     )
     postgresql = await domain._validate_sql(
         _run(),
-        {
+        operation=SourceOperation.SQL_READ,
+        arguments={
             "source_id": "source-postgresql",
             "resource_ids": ("resource-postgresql",),
             "sql": "SELECT id FROM public.items",
@@ -461,7 +535,8 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     with pytest.raises(CapabilityInputError, match="belong to the selected source"):
         await domain._validate_sql(
             _run(),
-            {
+            operation=SourceOperation.SQL_READ,
+            arguments={
                 "source_id": "source-sqlite",
                 "resource_ids": ("resource-postgresql",),
                 "sql": "SELECT id FROM items",
@@ -470,7 +545,8 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     with pytest.raises(CapabilityInputError, match="does not support relational"):
         await domain._validate_sql(
             _run(),
-            {
+            operation=SourceOperation.SQL_READ,
+            arguments={
                 "source_id": "source-unsupported",
                 "resource_ids": ("resource-sqlite",),
                 "sql": "SELECT id FROM items",
@@ -479,7 +555,8 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     with pytest.raises(CapabilityInputError) as unknown_source:
         await domain._validate_sql(
             _run(),
-            {
+            operation=SourceOperation.SQL_READ,
+            arguments={
                 "source_id": "source-missing",
                 "resource_ids": ("resource-sqlite",),
                 "sql": "SELECT id FROM items",
@@ -489,7 +566,8 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     with pytest.raises(CapabilityInputError) as unknown_resource:
         await domain._validate_sql(
             _run(),
-            {
+            operation=SourceOperation.SQL_READ,
+            arguments={
                 "source_id": "source-sqlite",
                 "resource_ids": ("resource-missing",),
                 "sql": "SELECT id FROM items",
@@ -499,7 +577,8 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     with pytest.raises(CapabilityInputError) as target_mismatch:
         await domain._validate_sql(
             _run(),
-            {
+            operation=SourceOperation.SQL_READ,
+            arguments={
                 "source_id": "source-sqlite",
                 "resource_ids": ("resource-sqlite",),
                 "sql": "SELECT id FROM other_items",
@@ -551,7 +630,9 @@ class _ReadBackend:
 async def test_data_query_routes_each_catalog_binding_to_exactly_one_backend() -> None:
     sqlite = _ReadBackend("sqlite")
     postgresql = _ReadBackend("postgresql")
-    executor = DataQueryExecutor("agent-relational", sqlite, postgresql)
+    executor = DataQueryExecutor(
+        "agent-relational", {"sqlite": sqlite, "postgresql": postgresql}
+    )
 
     for adapter_id in ("sqlite", "postgresql"):
         output = await executor.execute(
@@ -582,7 +663,9 @@ async def test_data_query_inline_byte_limit_reports_truncation() -> None:
         {"id": index, "detail": "x" * 1_000} for index in range(100)
     )
     sqlite = _ReadBackend("sqlite", rows)
-    executor = DataQueryExecutor("agent-relational", sqlite, _ReadBackend("postgresql"))
+    executor = DataQueryExecutor(
+        "agent-relational", {"sqlite": sqlite, "postgresql": _ReadBackend("postgresql")}
+    )
 
     output = await executor.execute(
         ToolExecution(
@@ -640,8 +723,7 @@ async def test_data_export_routes_each_catalog_binding_to_exactly_one_backend() 
     postgresql = _ExportBackend("postgresql")
     executor = DataExportTabularExecutor(
         "agent-relational",
-        sqlite,
-        postgresql,
+        {"sqlite": sqlite, "postgresql": postgresql},
         clock=lambda: datetime(2026, 9, 3, tzinfo=UTC),
     )
 
@@ -673,3 +755,17 @@ async def test_data_export_routes_each_catalog_binding_to_exactly_one_backend() 
 
     assert sqlite.calls == 1
     assert postgresql.calls == 1
+
+
+@pytest.mark.parametrize("slack", [0, -1])
+def test_result_projection_keeps_only_whole_rows_within_the_byte_limit(slack: int):
+    rows = tuple({"id": index, "label": "x" * (index * 7)} for index in range(6))
+    # Three rows encode as '[r0,r1,r2]': brackets, rows and two separators.
+    three_rows = 2 + sum(len(canonical_json(row)) for row in rows[:3]) + 2
+
+    projection = project_result_rows(rows, max_rows=5, max_bytes=three_rows + slack)
+
+    kept = 3 if slack == 0 else 2
+    assert projection.returned_rows == kept
+    assert projection.utf8_bytes == len(canonical_json(list(rows[:kept])))
+    assert projection.truncation_reasons == ("row_limit", "byte_limit")

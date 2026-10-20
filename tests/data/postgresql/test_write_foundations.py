@@ -9,6 +9,7 @@ import pytest
 from daita import Agent, PostgreSQLSource
 from daita.adapters import postgresql as postgresql_module
 from daita.adapters.models import DiscoveryRequest, DiscoveryResult, SourceRegistration
+from daita.adapters.registry import SourceTypeRegistry
 from daita.catalog.models import (
     CatalogFacet,
     CatalogSync,
@@ -25,7 +26,6 @@ from daita.domains.data.capabilities import (
     relational_update_capability_declarations,
     relational_update_preview_capability_declarations,
 )
-from daita.hosting import sources
 from daita.security import EmptySecretProvider, SecretReference
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
 from tests.support.workspace import workspace_for
@@ -129,9 +129,10 @@ async def test_default_read_scope_round_trips_through_agent_reopen(tmp_path):
     )
     try:
         assert await reopened.list_sources() == (registration,)
-        reconstructed = sources._source_from_registration(
-            registration,
-            secret_provider=EmptySecretProvider(),
+        reconstructed = (
+            SourceTypeRegistry()
+            .require(registration.adapter_id)
+            .from_registration(registration, secret_provider=EmptySecretProvider())
         )
         assert isinstance(reconstructed, PostgreSQLSource)
         with sqlite3.connect(reopened.home / "state.db") as connection:

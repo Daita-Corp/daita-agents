@@ -14,6 +14,7 @@ from daita.adapters import (
     postgresql_write as write_module,
 )
 from daita.adapters.models import SourceRegistration
+from daita.adapters.registry import SourceOperation
 from daita.catalog.models import ResourceKind, TabularColumn
 from daita.domains.data.sql import (
     ResourceSchema,
@@ -635,7 +636,9 @@ async def test_public_agent_readiness_delegates_exact_scope_without_mutation(
         return expected
 
     monkeypatch.setattr(
-        agent._embedded._relational_update_backend,
+        agent._embedded._source_backends[SourceOperation.RELATIONAL_UPDATE][
+            "postgresql"
+        ],
         "relational_update_readiness",
         readiness,
     )

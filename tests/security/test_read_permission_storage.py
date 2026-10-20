@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from daita.adapters.models import SourceRegistration
+from daita.adapters.registry import SourceTypeRegistry
 from daita.catalog.models import (
     CatalogFacet,
     CatalogResource,
@@ -200,7 +201,9 @@ async def test_admitted_resource_scope_derives_sensitivity_and_fails_closed(
         sensitivity=Sensitivity.PUBLIC,
     )
     await store.commit_snapshot(public_snapshot, registration=registration)
-    view = CatalogDataView(store, CatalogService(store, store), store)
+    view = CatalogDataView(
+        store, CatalogService(store, store), store, SourceTypeRegistry()
+    )
     try:
         assert (
             await view.admitted_model_sensitivity(

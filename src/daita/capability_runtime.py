@@ -7,7 +7,7 @@ import hmac
 import re
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -111,7 +111,7 @@ if TYPE_CHECKING:
 class AdmissionPermit(Protocol):
     async def __aenter__(self) -> object: ...
 
-    async def __aexit__(self, exc_type, exc, traceback) -> None: ...
+    async def __aexit__(self, exc_type, exc, traceback) -> bool | None: ...
 
 
 class CapabilityAdmissionCoordinator(Protocol):
@@ -1186,7 +1186,14 @@ class CapabilityRuntime:
         projected: dict[str, RunToolCatalogEntry] = {}
         for owner_id in sorted(self._domains):
             domain = self._domains[owner_id]
-            for name in await _domain_project(domain, run, session):
+            # A domain may also withhold mode routes no current source can serve.
+            project_routes = getattr(domain, "project_routes", None)
+            names, withheld = (
+                await project_routes(run, session)
+                if callable(project_routes)
+                else (await _domain_project(domain, run, session), frozenset())
+            )
+            for name in names:
                 if name in projected:
                     raise ValueError(f"tool projected by multiple domains: {name}")
                 view = self._registry.resolve_tool(name)[0]
@@ -1208,11 +1215,16 @@ class CapabilityRuntime:
                 routes = tuple(
                     (mode, admitted)
                     for mode, capability_id in view.mode_capability_ids
-                    if (admitted := admitted_by_capability[capability_id]) is not None
+                    if capability_id not in withheld
+                    and (admitted := admitted_by_capability[capability_id]) is not None
                 )
                 if not routes:
                     continue
-                primary = admitted_by_capability[view.capability_id] or routes[0][1]
+                primary = (
+                    None
+                    if view.capability_id in withheld
+                    else admitted_by_capability[view.capability_id]
+                ) or routes[0][1]
                 projected[name] = replace(primary, routes=routes)
         entries = tuple(projected[name] for name in sorted(projected))
         manifest = _toolbox_manifest(entries)
@@ -1266,7 +1278,7 @@ class CapabilityRuntime:
         pinned_definitions = tuple(
             sorted(
                 (
-                    self._registry.tool_definition(entry.view.name, lane=lane)
+                    _entry_definition(self._registry, entry, lane)
                     for entry in pinned_entries
                 ),
                 key=lambda item: item.name,
@@ -1381,8 +1393,8 @@ class CapabilityRuntime:
             sorted(
                 (
                     *(
-                        self._registry.tool_definition(
-                            entry.view.name, lane=catalog.call_target_lane
+                        _entry_definition(
+                            self._registry, entry, catalog.call_target_lane
                         )
                         for entry in callable_entries
                     ),
@@ -1394,9 +1406,7 @@ class CapabilityRuntime:
         _validate_step_surface(provider_definitions, self._limits)
         loaded_definition_bytes = _definition_bytes(
             tuple(
-                self._registry.tool_definition(
-                    entry.view.name, lane=catalog.call_target_lane
-                )
+                _entry_definition(self._registry, entry, catalog.call_target_lane)
                 for entry in loaded
             )
         )
@@ -1840,6 +1850,26 @@ class CapabilityRuntime:
             mode = tool_call_mode(entry.view, call.arguments)
             routed = entry.route(mode)
             if routed is None:
+                if mode in entry.view.presence_modes:
+                    return _ResolvedCall(
+                        outer,
+                        call,
+                        failure=_error(
+                            call,
+                            "invalid_argument_value",
+                            "This form of the tool is not available in this run.",
+                            recovery_details(
+                                ToolRecovery(
+                                    RecoveryKind.CORRECT_ARGUMENTS, f"Omit {mode}."
+                                ),
+                                {
+                                    "name": mode,
+                                    "constraint": "presence",
+                                    "execution_disposition": "not_dispatched",
+                                },
+                            ),
+                        ),
+                    )
                 if entry.view.mode_by_presence:
                     present = selector in call.arguments
                     return _ResolvedCall(
@@ -1866,6 +1896,11 @@ class CapabilityRuntime:
                             ),
                         ),
                     )
+                allowed = [
+                    name
+                    for name, _ in entry.routes
+                    if name not in entry.view.presence_modes
+                ]
                 return _ResolvedCall(
                     outer,
                     call,
@@ -1877,13 +1912,13 @@ class CapabilityRuntime:
                             ToolRecovery(
                                 RecoveryKind.CORRECT_ARGUMENTS,
                                 f"Set {selector} to one of: "
-                                + ", ".join(name for name, _ in entry.routes)
+                                + ", ".join(allowed)
                                 + ".",
                             ),
                             {
                                 "name": selector,
                                 "constraint": "enum",
-                                "allowed": [name for name, _ in entry.routes],
+                                "allowed": allowed,
                                 "execution_disposition": "not_dispatched",
                             },
                         ),
@@ -1899,6 +1934,8 @@ class CapabilityRuntime:
                         if selector in call.arguments
                         else f"without {selector}"
                     )
+                elif mode in entry.view.presence_modes:
+                    condition = f"with {mode}"
                 else:
                     condition = f"when {selector}={mode}"
                 return _ResolvedCall(
@@ -2467,9 +2504,7 @@ class CapabilityRuntime:
             )
         loaded = tuple(sorted(requested, key=lambda item: item.view.name))
         definitions = tuple(
-            self._registry.tool_definition(
-                entry.view.name, lane=projection.call_target_lane
-            )
+            _entry_definition(self._registry, entry, projection.call_target_lane)
             for entry in loaded
         )
         definition_bytes = _definition_bytes(definitions)
@@ -2492,8 +2527,8 @@ class CapabilityRuntime:
             sorted(
                 (
                     *(
-                        self._registry.tool_definition(
-                            item.view.name, lane=projection.call_target_lane
+                        _entry_definition(
+                            self._registry, item, projection.call_target_lane
                         )
                         for item in pinned
                     ),
@@ -3634,6 +3669,30 @@ class CapabilityRuntime:
                 deadline=deadline,
                 cancellation=cancellation,
             )
+        inputs = arguments.get("inputs")
+        if isinstance(inputs, tuple) and inputs:
+            # Each distinct input source is held once, in sorted order, so two
+            # inputs on one capacity-one source and concurrent multi-source
+            # calls cannot deadlock.
+            permits = AsyncExitStack()
+            try:
+                for input_source_id in sorted(
+                    {
+                        cast(str, cast(Mapping[str, object], item)["source_id"])
+                        for item in inputs
+                    }
+                ):
+                    await permits.enter_async_context(
+                        await coordinator.source_resource_permit(
+                            f"source:{input_source_id}",
+                            deadline=deadline,
+                            cancellation=cancellation,
+                        )
+                    )
+            except BaseException:
+                await permits.aclose()
+                raise
+            return permits
         if (
             capability.access_mode is AccessMode.READ
             and run.execution_scope is not None
@@ -5356,9 +5415,7 @@ def _verified_loaded_entries(
         for entry in entries
     ):
         return None
-    definitions = tuple(
-        registry.tool_definition(entry.view.name, lane=lane) for entry in entries
-    )
+    definitions = tuple(_entry_definition(registry, entry, lane) for entry in entries)
     definition_bytes = _definition_bytes(definitions)
     expected_activation = _activation_digest(run_id, catalog_digest, entries)
     expected_data: dict[str, object] = dict(data)
@@ -5533,7 +5590,7 @@ def _validate_step_projection(
     if projection.callable_entries != expected_callable:
         raise ValueError("step projection callable set is invalid")
     loaded_definitions = tuple(
-        registry.tool_definition(entry.view.name, lane=projection.call_target_lane)
+        _entry_definition(registry, entry, projection.call_target_lane)
         for entry in loaded
     )
     if (
@@ -5551,9 +5608,7 @@ def _validate_step_projection(
         sorted(
             (
                 *(
-                    registry.tool_definition(
-                        entry.view.name, lane=projection.call_target_lane
-                    )
+                    _entry_definition(registry, entry, projection.call_target_lane)
                     for entry in expected_callable
                 ),
                 *controls,
@@ -6044,6 +6099,20 @@ def _with_execution_disposition(
     return replace(
         result,
         output={**result.output, "error": {**error, "details": current}},
+    )
+
+
+def _entry_definition(
+    registry: CapabilityRegistry,
+    entry: RunToolCatalogEntry,
+    lane: CallTargetLane | None,
+) -> ToolDefinition:
+    """One provider definition describing only the routes this entry admits."""
+
+    return registry.tool_definition(
+        entry.view.name,
+        lane=lane,
+        routes=tuple(mode for mode, _ in entry.routes) if entry.routes else None,
     )
 
 

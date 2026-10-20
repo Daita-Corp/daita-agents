@@ -13,13 +13,15 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, Self, TypedDict, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Protocol, Self, TypedDict, TypeVar, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
     from ..adapters.mcp import MCPServerBinding, MCPToolBinding
 
 from .._json import FrozenJsonObject
+from ..adapters.folder import SessionFolderSource
+from ..adapters.local_file_query import LocalFileQueryBackend, LocalFileQueryLimits
 from ..adapters.local_workspace import LocalWorkspaceBackend
 from ..adapters.mcp import (
     MCPAdmissionError,
@@ -40,18 +42,21 @@ from ..adapters.mcp import (
     mcp_execution_origin_digest,
 )
 from ..adapters.models import DiscoveryRequest, SourceRegistration
-from ..adapters.postgresql import PostgreSQLProbeResult, PostgreSQLSource
-from ..adapters.postgresql_query import (
-    PostgreSQLQueryBackend,
-    PostgreSQLReadDiagnostics,
+from ..adapters.postgresql import (
+    POSTGRESQL_ADAPTER_ID,
+    PostgreSQLProbeResult,
+    PostgreSQLSource,
 )
-from ..adapters.postgresql_write import (
-    PostgreSQLWriteBackend,
-    RelationalUpdateReadiness,
-)
+from ..adapters.postgresql_query import PostgreSQLReadDiagnostics
+from ..adapters.postgresql_write import RelationalUpdateReadiness
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
+from ..adapters.registry import (
+    SourceBackendContext,
+    SourceOperation,
+    SourceType,
+    SourceTypeRegistry,
+)
 from ..adapters.sqlite import SQLiteSource
-from ..adapters.sqlite_query import SQLiteQueryBackend
 from ..artifacts.bytes import ArtifactByteStorage
 from ..artifacts.delivery import (
     ArtifactDestinationGrant,
@@ -71,6 +76,7 @@ from ..capabilities import (
     ApprovalRequest,
     Capability,
     CapabilityDeclarations,
+    CapabilityInputError,
     CapabilityRegistry,
     EffectOutcome,
     ExecutionContractBindings,
@@ -82,12 +88,15 @@ from ..catalog.capabilities import (
     catalog_declarations,
 )
 from ..catalog.models import (
+    CatalogLink,
+    CatalogLinkStatus,
     CatalogResource,
     CatalogSearchRequest,
     CatalogSearchResult,
     CatalogSummary,
     CatalogSync,
     CatalogSyncStatus,
+    RelationshipFieldPair,
 )
 from ..catalog.service import CatalogService
 from ..config import (
@@ -111,10 +120,13 @@ from ..distribution import (
 from ..domains.analysis import AnalysisCapabilityDomain
 from ..domains.data import (
     ARTIFACT_DOMAIN_OWNER_ID,
+    DATA_QUERY_MAX_BYTES,
+    DATA_QUERY_MAX_ROWS,
     LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS,
     LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS,
-    LOCAL_FILE_CAPABILITY_IDS,
-    LOCAL_FILE_EXECUTOR_IDS,
+    PATH_QUERY_CAPABILITY_ID,
+    PATH_QUERY_EXECUTOR_ID,
+    SOURCE_FILE_CAPABILITY_IDS,
     ArtifactCapabilityDomain,
     CatalogDataView,
     DataCapabilityDomain,
@@ -122,12 +134,13 @@ from ..domains.data import (
     data_query_declarations,
     exact_export_declarations,
     exact_export_outputs,
-    local_file_declarations,
     relational_update_declarations,
     relational_update_preview_declarations,
     relational_upsert_declarations,
     resource_revision_observation_declarations,
+    source_file_declarations,
 )
+from ..domains.data.catalog import RELATIONAL_WRITE_OPERATIONS
 from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
 from ..domains.data.profile_jobs import (
     DATA_PROFILE_DOMAIN_OWNER_ID,
@@ -257,7 +270,7 @@ from ..routines.models import (
 )
 from ..routines.owner import RoutineError, RoutineOwner, routine_approval_arguments
 from ..routines.supervisor import RoutineSupervisor
-from ..scope import resolve_effective_source_scope
+from ..scope import EffectiveSourceScope, resolve_effective_source_scope
 from ..security import (
     CredentialSession,
     KeychainSecretProvider,
@@ -333,7 +346,7 @@ from .configuration import (
     _model_execution_contracts,
     _model_route,
     _owned_agent_credential_references,
-    _owned_source_credential_reference,
+    _owned_source_credential_references,
     _read_model_configuration,
     _read_model_configuration_document,
     _resolve_candidate_reviewer_profile,
@@ -369,8 +382,45 @@ from .sources import (
     _inspect_source_permissions,
     _resolve_source_selector,
     _source_edit_read_scope,
-    _source_from_registration,
 )
+
+SourceBackends = Mapping[SourceOperation, Mapping[str, Any]]
+
+
+def _backends_with(backends: SourceBackends, method: str) -> tuple[Any, ...]:
+    """Each distinct source backend that implements one lifecycle method."""
+
+    unique: dict[int, Any] = {}
+    for by_adapter in backends.values():
+        for backend in by_adapter.values():
+            unique.setdefault(id(backend), backend)
+    return tuple(
+        backend
+        for backend in unique.values()
+        if callable(getattr(backend, method, None))
+    )
+
+
+async def _relational_upsert_readiness(
+    data_view: CatalogDataView,
+    backends: SourceBackends,
+    agent_id: str,
+    constraints: FrozenJsonObject,
+) -> FrozenJsonObject:
+    adapter_id = await data_view.source_adapter_id(
+        agent_id, str(constraints["source_id"])
+    )
+    backend = (
+        None
+        if adapter_id is None
+        else backends[SourceOperation.RELATIONAL_UPSERT].get(adapter_id)
+    )
+    if backend is None:
+        raise CapabilityInputError(
+            "resource_write_not_allowed",
+            "Explicit current upsert permission is required.",
+        )
+    return cast(FrozenJsonObject, await backend.upsert_readiness(agent_id, constraints))
 
 
 class _RoutineDraftValues(TypedDict):
@@ -578,7 +628,6 @@ class EmbeddedAgent:
         data_profile_job_domain: DataProfileCapabilityDomain,
         learning_candidate_guard: LearningCandidateGuard,
         semantic_domain: SemanticCapabilityDomain,
-        relational_update_backend: PostgreSQLWriteBackend,
         memory_store: MemoryStore,
         skill_store: SkillStore,
         candidate_reviewer: OneShotCandidateReviewer,
@@ -588,7 +637,9 @@ class EmbeddedAgent:
         candidate_acceptance_supported: bool,
         admission_coordinator: RunAdmissionCoordinator,
         host_capacity: HostCapacityLimits,
-        postgresql_backend: PostgreSQLQueryBackend,
+        source_types: SourceTypeRegistry,
+        source_backends: SourceBackends,
+        combined_query_engine: LocalFileQueryBackend | None,
         model_profile: ModelProfile | None,
         model_route: ModelRoute | None,
         owned_model_provider: ManagedModelProvider | None,
@@ -651,7 +702,6 @@ class EmbeddedAgent:
         self._data_profile_job_domain = data_profile_job_domain
         self._learning_candidate_guard = learning_candidate_guard
         self._semantic_domain = semantic_domain
-        self._relational_update_backend = relational_update_backend
         self._memory_store = memory_store
         self._skill_store = skill_store
         self._candidate_reviewer = candidate_reviewer
@@ -663,7 +713,9 @@ class EmbeddedAgent:
         self._id_factory = id_factory
         self._admission_coordinator = admission_coordinator
         self._host_capacity = host_capacity
-        self._postgresql_backend = postgresql_backend
+        self._source_types = source_types
+        self._source_backends = source_backends
+        self._combined_query_engine = combined_query_engine
         self._model_management_lock = asyncio.Lock()
         self._effect_resolution_lock = asyncio.Lock()
         self._routine_management_lock = asyncio.Lock()
@@ -692,6 +744,12 @@ class EmbeddedAgent:
                 "externally stored agents have no local home; configuration belongs to the caller"
             )
         return self._home
+
+    @property
+    def session_source_id(self) -> str | None:
+        """The live session folder source of this open agent, if it has one."""
+
+        return self._data_view.session_source_id
 
     @property
     def workspace(self) -> LocalWorkspace:
@@ -767,6 +825,7 @@ class EmbeddedAgent:
         *,
         root: str | Path | None = None,
         keychain: KeychainStore | None = None,
+        config: AgentConfig | None = None,
     ) -> None:
         """Delete one inactive agent home after removing its owned credentials."""
 
@@ -775,6 +834,9 @@ class EmbeddedAgent:
                 name,
                 root=root,
                 keychain=keychain or KeychainSecretProvider(),
+                source_types=SourceTypeRegistry(
+                    () if config is None else config.source_types
+                ),
             )
         )
         if cancelled:
@@ -787,6 +849,7 @@ class EmbeddedAgent:
         *,
         root: str | Path | None,
         keychain: KeychainStore,
+        source_types: SourceTypeRegistry,
     ) -> None:
         del cls
         (home, writer_lock), _cancelled = await _await_sync_completion(
@@ -801,7 +864,7 @@ class EmbeddedAgent:
             try:
                 (
                     identity,
-                    source_reference_values,
+                    source_configurations,
                     mcp_reference_values,
                 ) = await store.load_deletion_credential_inventory(manifest.id)
             except (OSError, sqlite3.Error, TypeError, ValueError) as error:
@@ -819,7 +882,8 @@ class EmbeddedAgent:
             references = _owned_agent_credential_references(
                 identity.id,
                 model_document=model_document,
-                source_reference_values=source_reference_values,
+                source_configurations=source_configurations,
+                source_types=source_types,
                 mcp_reference_values=mcp_reference_values,
             )
             failures = 0
@@ -959,6 +1023,7 @@ class EmbeddedAgent:
                 analysis_limits=None if config is None else config.analysis_limits,
                 host_capacity=None if config is None else config.host_capacity,
                 postgresql_reads=None if config is None else config.postgresql_reads,
+                source_types=() if config is None else config.source_types,
                 admission_observations=(
                     False if config is None else config.admission_observations
                 ),
@@ -1176,6 +1241,7 @@ class EmbeddedAgent:
                 analysis_limits=None if config is None else config.analysis_limits,
                 host_capacity=None if config is None else config.host_capacity,
                 postgresql_reads=None if config is None else config.postgresql_reads,
+                source_types=() if config is None else config.source_types,
                 admission_observations=(
                     False if config is None else config.admission_observations
                 ),
@@ -1300,6 +1366,7 @@ class EmbeddedAgent:
                     postgresql_reads=(
                         None if config is None else config.postgresql_reads
                     ),
+                    source_types=() if config is None else config.source_types,
                     admission_observations=(
                         False if config is None else config.admission_observations
                     ),
@@ -1351,6 +1418,7 @@ class EmbeddedAgent:
         analysis_limits: AnalysisLimits | None = None,
         host_capacity: HostCapacityLimits | None = None,
         postgresql_reads: PostgreSQLReadLimits | None = None,
+        source_types: tuple[SourceType, ...] = (),
         admission_observations: bool = False,
         model_call_policy: ModelCallPolicy,
         clock: Callable[[], datetime],
@@ -1380,22 +1448,43 @@ class EmbeddedAgent:
                     "configured model route did not produce a managed provider"
                 )
             owned_model_provider = model
+        # Hosted hosts have no local file authority: no folder type, no session source.
+        registry = SourceTypeRegistry(source_types, local_files=not hosted)
+        session_source = (
+            None
+            if workspace is None or workspace_backend is None
+            else SessionFolderSource.for_workspace(identity.id, workspace)
+        )
         catalog_service = CatalogService(store, store)
-        data_view = CatalogDataView(store, catalog_service, store)
+        data_view = CatalogDataView(
+            store, catalog_service, store, registry, session_source=session_source
+        )
         catalog = catalog_declarations(identity.id, data_view)
-        sqlite_backend = SQLiteQueryBackend(store, data_view)
         host_capacity = host_capacity or HostCapacityLimits()
-        postgresql_backend = PostgreSQLQueryBackend(
-            store,
-            data_view,
-            secret_provider or keychain,
-            read_limits=postgresql_reads,
-            source_capacity=host_capacity.postgresql_read_capacity,
+        backend_context = SourceBackendContext(
+            store=store,
+            catalog=data_view,
+            secret_provider=secret_provider or keychain,
+            clock=clock,
+            host_capacity=host_capacity,
+            postgresql_reads=postgresql_reads,
             deadline_reader=lambda: admission_coordinator.current_deadline(),
             observer=observer if admission_observations else None,
+            home=home,
+            session_workspace=workspace_backend,
+            session_source_id=(
+                None if session_source is None else session_source.source_id
+            ),
         )
+        source_backends: dict[SourceOperation, dict[str, Any]] = {
+            operation: {} for operation in SourceOperation
+        }
+        for source_type in registry.types():
+            for operation, backend in source_type.backends(backend_context).items():
+                source_backends[operation][source_type.adapter_id] = backend
         if admission_cleanup is not None:
-            admission_cleanup.push_async_callback(postgresql_backend.close)
+            for backend in _backends_with(source_backends, "close"):
+                admission_cleanup.push_async_callback(backend.close)
         from ..adapters.analytical_workspace.runtime import runtime_status
 
         scientific_admitted = not hosted and runtime_status()["available"] is True
@@ -1417,40 +1506,54 @@ class EmbeddedAgent:
         relational_export = (
             exact_export_declarations(
                 identity.id,
-                sqlite_backend,
-                postgresql_backend,
+                source_backends[SourceOperation.TABULAR_EXPORT],
                 clock,
                 arrow_bounds=export_arrow_bounds,
             )
             if artifact_store.available
             else None
         )
+        # Combined queries join their inputs in the same private DuckDB worker
+        # as file queries; it needs local scratch, so homeless hosts omit them.
+        combined_engine = (
+            None
+            if home is None
+            else LocalFileQueryBackend(
+                scratch_parent=home / "combined-query-scratch",
+                limits=LocalFileQueryLimits(
+                    max_result_rows=DATA_QUERY_MAX_ROWS,
+                    max_result_bytes=DATA_QUERY_MAX_BYTES,
+                ),
+            )
+        )
+        if combined_engine is not None and admission_cleanup is not None:
+            admission_cleanup.push_async_callback(combined_engine.close)
         relational_query = data_query_declarations(
             identity.id,
-            sqlite_backend,
-            postgresql_backend,
+            source_backends[SourceOperation.SQL_READ],
+            combined_engine=combined_engine,
+            tabular_backends=source_backends[SourceOperation.TABULAR_READ],
+            path_backends=source_backends[SourceOperation.PATH_QUERY],
             file_outputs=(
                 exact_export_outputs(allow_arrow=export_arrow_bounds is not None)
                 if relational_export is not None
                 else ()
             ),
         )
-        postgresql_preview_backend = PostgreSQLWriteBackend(
-            store,
-            data_view,
-            secret_provider or keychain,
-            clock=clock,
-        )
-        postgresql_preview = relational_update_preview_declarations(
+        relational_update_preview = relational_update_preview_declarations(
             identity.id,
-            postgresql_preview_backend,
+            source_backends[SourceOperation.RELATIONAL_UPDATE],
+            data_view.source_adapter_id,
         )
         relational_update = relational_update_declarations(
             identity.id,
-            postgresql_preview_backend,
+            source_backends[SourceOperation.RELATIONAL_UPDATE],
+            data_view.source_adapter_id,
         )
         relational_upsert = relational_upsert_declarations(
-            identity.id, postgresql_preview_backend
+            identity.id,
+            source_backends[SourceOperation.RELATIONAL_UPSERT],
+            data_view.source_adapter_id,
         )
         routine_precheck = resource_revision_observation_declarations(
             agent_id=identity.id,
@@ -1461,22 +1564,45 @@ class EmbeddedAgent:
             raise AgentHomeError("workspace composition is inconsistent")
         if hosted != (artifact_delivery is None):
             raise AgentHomeError("artifact delivery composition is inconsistent")
-        local_files = (
-            None
-            if workspace_backend is None
-            else local_file_declarations(workspace_backend)
+        source_files = (
+            source_file_declarations(
+                identity.id,
+                source_backends[SourceOperation.FILE_SEARCH],
+                source_backends[SourceOperation.TEXT_READ],
+            )
+            if source_backends[SourceOperation.FILE_SEARCH]
+            else None
         )
         memory_lock = asyncio.Lock()
         skill_lock = asyncio.Lock()
-        source_capacities = {
-            f"source:{registration.id}": (
-                host_capacity.postgresql_read_capacity
-                if registration.adapter_id == "postgresql"
-                else 1
-            )
+        available_sources = tuple(
+            registration
             for registration in await store.list_sources(identity.id)
-            if registration.active
+            if registration.active and registry.get(registration.adapter_id)
+        )
+        for registration in available_sources:
+            for scope in await store.list_relational_write_scopes(
+                identity.id, registration.id
+            ):
+                if any(
+                    not registry.supports(
+                        registration.adapter_id, RELATIONAL_WRITE_OPERATIONS[name]
+                    )
+                    for name in scope.allowed_operations
+                ):
+                    raise AgentHomeError(
+                        "stored relational write scope is foreign to its source type"
+                    )
+        source_capacities = {
+            f"source:{registration.id}": registry.read_capacity(
+                registration.adapter_id, host_capacity
+            )
+            for registration in available_sources
         }
+        if session_source is not None:
+            source_capacities[f"source:{session_source.source_id}"] = (
+                registry.read_capacity(session_source.adapter_id, host_capacity)
+            )
         admission_coordinator = RunAdmissionCoordinator(
             observer=observer if admission_observations else None,
             execution_capacity=host_capacity.execution_capacity,
@@ -1586,8 +1712,8 @@ class EmbeddedAgent:
             agent_id=identity.id,
             catalog=data_view,
             owner=job_owner,
-            sqlite_backend=sqlite_backend,
-            postgresql_backend=postgresql_backend,
+            backends=source_backends[SourceOperation.PROFILE],
+            source_types=registry,
             artifacts=artifact_store,
             distribution=distribution_owner,
             clock=clock,
@@ -1599,11 +1725,11 @@ class EmbeddedAgent:
             catalog,
             relational_query,
             relational_export,
-            postgresql_preview,
+            relational_update_preview,
             relational_update,
             relational_upsert,
             routine_precheck,
-            local_files,
+            source_files,
         )
         memory_declarations = _domain_declarations(MEMORY_DOMAIN_OWNER_ID, memory)
         skill_declaration_bundle = _domain_declarations(SKILL_DOMAIN_OWNER_ID, skills)
@@ -1628,11 +1754,19 @@ class EmbeddedAgent:
             data_declarations,
             data_view,
             learning_candidate_guard,
+            registry,
             relational_export_available=relational_export is not None,
+            combined_query_available=combined_engine is not None,
             transcript_loader=store.load,
-            upsert_readiness=postgresql_preview_backend.upsert_readiness,
-            local_file_sensitivity=(
-                None if workspace_backend is None else workspace_backend.sensitivity
+            upsert_readiness=lambda agent_id, constraints: (
+                _relational_upsert_readiness(
+                    data_view, source_backends, agent_id, constraints
+                )
+            ),
+            source_files_available=source_files is not None,
+            path_query_available=any(
+                capability.id == PATH_QUERY_CAPABILITY_ID
+                for capability in relational_query.capabilities
             ),
         )
         skill_domain = SkillCapabilityDomain(
@@ -1739,11 +1873,11 @@ class EmbeddedAgent:
             *catalog.executors,
             *relational_query.executors,
             *(relational_export.executors if relational_export is not None else ()),
-            *postgresql_preview.executors,
+            *relational_update_preview.executors,
             *relational_update.executors,
             *relational_upsert.executors,
             *routine_precheck.executors,
-            *(local_files.executors if local_files is not None else ()),
+            *(source_files.executors if source_files is not None else ()),
             *memory.executors,
             *skills.executors,
             *semantics.executors,
@@ -1869,9 +2003,10 @@ class EmbeddedAgent:
                 executor.executor_id for executor in registered_executors
             }
             if (
-                declared_capability_ids & LOCAL_FILE_CAPABILITY_IDS
-                or declared_view_ids & LOCAL_FILE_CAPABILITY_IDS
-                or registered_executor_ids & LOCAL_FILE_EXECUTOR_IDS
+                declared_capability_ids & SOURCE_FILE_CAPABILITY_IDS
+                or declared_view_ids & SOURCE_FILE_CAPABILITY_IDS
+                or PATH_QUERY_EXECUTOR_ID in registered_executor_ids
+                or session_source is not None
                 or declared_capability_ids & LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS
                 or declared_view_ids & LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS
                 or registered_executor_ids & LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS
@@ -2005,8 +2140,13 @@ class EmbeddedAgent:
                 ),
                 local_file_context=(
                     None
-                    if workspace_backend is None
-                    else workspace_backend.model_context()
+                    if workspace_backend is None or session_source is None
+                    else FrozenJsonObject.from_mapping(
+                        {
+                            **workspace_backend.model_context().to_dict(),
+                            "source_id": session_source.source_id,
+                        }
+                    )
                 ),
                 max_context_evidence_bytes=limits.max_context_evidence_bytes,
             )
@@ -2166,7 +2306,6 @@ class EmbeddedAgent:
             data_profile_job_domain=data_profile_job_domain,
             learning_candidate_guard=learning_candidate_guard,
             semantic_domain=semantic_domain,
-            relational_update_backend=postgresql_preview_backend,
             memory_store=memory_store,
             skill_store=skill_store,
             candidate_reviewer=candidate_reviewer,
@@ -2183,7 +2322,9 @@ class EmbeddedAgent:
             ),
             admission_coordinator=admission_coordinator,
             host_capacity=host_capacity,
-            postgresql_backend=postgresql_backend,
+            source_types=registry,
+            source_backends=source_backends,
+            combined_query_engine=combined_engine,
             model_profile=model_profile,
             model_route=model_route,
             owned_model_provider=owned_model_provider,
@@ -2499,9 +2640,9 @@ class EmbeddedAgent:
             else conversation_id
         )
         _validate_conversation_id(resolved_conversation)
-        if files_only:
-            if self._workspace_backend is None:
-                raise AgentHomeError("files_only requires admitted local file access")
+        session_source_id = self._data_view.session_source_id
+        if files_only and session_source_id is None:
+            raise AgentHomeError("files_only requires admitted local file access")
         resolved_run_id = run_id or self._id_factory("run")
         deadline = (
             asyncio.get_running_loop().time() + self._limits.max_wall_time_seconds
@@ -2537,6 +2678,8 @@ class EmbeddedAgent:
                 for source in await self._store.list_sources(self.identity.id)
                 if source.active
             }
+            if session_source_id is not None:
+                active_ids.add(session_source_id)
             if not set(source_scope_ids) <= active_ids:
                 raise ValueError("A requested source is not active for this agent")
             prior_messages = _project_completed_history(
@@ -2566,10 +2709,17 @@ class EmbeddedAgent:
                     default=ModelSensitivity.PUBLIC,
                 ),
             )
+            # Files-only scopes the run to exactly the live session folder source.
             run_input = replace(
                 run_input,
-                resolved_source_scope=await resolve_effective_source_scope(
-                    run_input, self._data_view, files_only=files_only
+                resolved_source_scope=(
+                    EffectiveSourceScope(
+                        frozenset({cast(str, session_source_id)}), frozenset()
+                    )
+                    if files_only
+                    else await resolve_effective_source_scope(
+                        run_input, self._data_view
+                    )
                 ),
             )
             predecessor_run = await self._store.latest_terminal_conversation_run(
@@ -2638,7 +2788,8 @@ class EmbeddedAgent:
         return await self._store.load_analysis_evidence(self.identity.id, run_id)
 
     def postgresql_read_diagnostics(self) -> PostgreSQLReadDiagnostics:
-        return self._postgresql_backend.diagnostics()
+        backend = self._source_backends[SourceOperation.SQL_READ][POSTGRESQL_ADAPTER_ID]
+        return cast(PostgreSQLReadDiagnostics, backend.diagnostics())
 
     def admission_diagnostics(self) -> CoordinatorDiagnostics:
         return self._admission_coordinator.diagnostics()
@@ -4451,6 +4602,7 @@ class EmbeddedAgent:
         registration = opened_registration
         sync: CatalogSync | None = None
         try:
+            self._source_types.require(registration.adapter_id)
             if persisted_registration is not None:
                 current_identity = replace(
                     opened_registration,
@@ -4479,6 +4631,8 @@ class EmbeddedAgent:
                     source_id=registration.id,
                     sync_id=sync.id,
                     requested_at=sync.started_at,
+                    agent_root=None if self._home is None else self._home.parent.parent,
+                    agent_home=self._home,
                 )
             )
             await self._store.commit_snapshot(
@@ -4487,10 +4641,8 @@ class EmbeddedAgent:
             )
             self._admission_coordinator.configure_source_resource_capacity(
                 f"source:{registration.id}",
-                (
-                    self._host_capacity.postgresql_read_capacity
-                    if registration.adapter_id == "postgresql"
-                    else 1
+                self._source_types.read_capacity(
+                    registration.adapter_id, self._host_capacity
                 ),
             )
             return registration
@@ -4542,6 +4694,7 @@ class EmbeddedAgent:
                 current = await self._store.load_source(self.identity.id, source_id)
                 if current is None or not current.active:
                     raise ValueError("source edit requires an active owned source")
+                self._source_types.require(current.adapter_id)
                 current_read_scope = await self._store.load_source_read_scope(
                     self.identity.id,
                     source_id,
@@ -4631,16 +4784,21 @@ class EmbeddedAgent:
                         read_scope=read_scope,
                     )
                     committed = True
-                    old_reference = _owned_source_credential_reference(
-                        current,
+                    new_references = _owned_source_credential_references(
+                        registration.adapter_id,
+                        registration.configuration,
                         agent_id=self.identity.id,
-                    )
-                    new_reference = _owned_source_credential_reference(
-                        registration,
-                        agent_id=self.identity.id,
+                        source_types=self._source_types,
                     )
                     previous_credential_deleted = True
-                    if old_reference is not None and old_reference != new_reference:
+                    for old_reference in _owned_source_credential_references(
+                        current.adapter_id,
+                        current.configuration,
+                        agent_id=self.identity.id,
+                        source_types=self._source_types,
+                    ):
+                        if old_reference in new_references:
+                            continue
                         try:
                             await asyncio.wait_for(
                                 self._keychain.delete(old_reference),
@@ -4698,7 +4856,7 @@ class EmbeddedAgent:
             reference = SecretReference.keychain(
                 _credential_account(
                     self.identity.id,
-                    "postgresql",
+                    POSTGRESQL_ADAPTER_ID,
                     self._id_factory("credential"),
                 )
             )
@@ -4726,7 +4884,7 @@ class EmbeddedAgent:
             not isinstance(reference, SecretReference)
             or reference.scheme != "keychain"
             or not reference.name.startswith(
-                _credential_account_prefix(self.identity.id, "postgresql")
+                _credential_account_prefix(self.identity.id, POSTGRESQL_ADAPTER_ID)
             )
         ):
             raise ValueError(
@@ -4918,7 +5076,7 @@ class EmbeddedAgent:
                     preview.after.relational_write_scopes,
                 )
                 inspection = await self._inspect_source_permissions_locked(source_id)
-            await self._postgresql_backend.retire_source(self.identity.id, source_id)
+            await self._retire_source_backends(source_id)
             return inspection
 
     async def _inspect_source_permissions_locked(
@@ -4926,7 +5084,11 @@ class EmbeddedAgent:
         source_id: str,
     ) -> SourcePermissionsInspection:
         return await _inspect_source_permissions(
-            self._store, self._data_view, self.identity.id, source_id
+            self._store,
+            self._data_view,
+            self._source_types,
+            self.identity.id,
+            source_id,
         )
 
     async def _build_source_permissions_preview(
@@ -4941,6 +5103,7 @@ class EmbeddedAgent:
             self._store,
             self._catalog_service,
             self._data_view,
+            self._source_types,
             self.identity.id,
             self._source_permission_confirmation_key,
             inspection,
@@ -4966,8 +5129,8 @@ class EmbeddedAgent:
                     **permission.constraints(),
                 }
             )
-            return await self._relational_update_backend.upsert_readiness(
-                self.identity.id, constraints
+            return await _relational_upsert_readiness(
+                self._data_view, self._source_backends, self.identity.id, constraints
             )
 
     async def relational_update_readiness(
@@ -4979,12 +5142,20 @@ class EmbeddedAgent:
         """Inspect one exact PostgreSQL update scope without mutating state."""
 
         self._require_open()
-        return await self._relational_update_backend.relational_update_readiness(
+        # The PostgreSQL readiness record also reports other sources as unavailable.
+        backend = self._source_backends[SourceOperation.RELATIONAL_UPDATE][
+            POSTGRESQL_ADAPTER_ID
+        ]
+        return await backend.relational_update_readiness(
             agent_id=self.identity.id,
             source_id=source_id,
             resource_id=resource_id,
             assignment_columns=assignment_columns,
         )
+
+    async def _retire_source_backends(self, source_id: str) -> None:
+        for backend in _backends_with(self._source_backends, "retire_source"):
+            await backend.retire_source(self.identity.id, source_id)
 
     async def detach(self, source_id: str) -> SourceRegistration:
         async with self._admit_owned_system_work(
@@ -4995,12 +5166,14 @@ class EmbeddedAgent:
                 detached = await self._store.detach_source(
                     self.identity.id, source_id, self._clock()
                 )
-                reference = _owned_source_credential_reference(
-                    detached,
+                references = _owned_source_credential_references(
+                    detached.adapter_id,
+                    detached.configuration,
                     agent_id=self.identity.id,
+                    source_types=self._source_types,
                 )
-            await self._postgresql_backend.retire_source(self.identity.id, source_id)
-            if reference is not None:
+            await self._retire_source_backends(source_id)
+            for reference in references:
                 try:
                     await self._keychain.delete(reference)
                 except Exception:
@@ -5024,12 +5197,17 @@ class EmbeddedAgent:
                 )
                 if registration is None or not registration.active:
                     raise ValueError("unknown active source for this agent")
-                source = _source_from_registration(
-                    registration,
-                    secret_provider=default_secret_provider(
-                        self._secret_provider or self._keychain
-                    ),
-                )
+                try:
+                    source = self._source_types.require(
+                        registration.adapter_id
+                    ).from_registration(
+                        registration,
+                        secret_provider=default_secret_provider(
+                            self._secret_provider or self._keychain
+                        ),
+                    )
+                except (TypeError, ValueError) as error:
+                    raise AgentHomeError(str(error)) from error
                 return await self._attach_source_locked(
                     source,
                     attached_at=registration.attached_at,
@@ -5039,6 +5217,16 @@ class EmbeddedAgent:
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
         self._require_open()
         return await self._store.list_sources(self.identity.id)
+
+    async def unavailable_sources(self) -> tuple[SourceRegistration, ...]:
+        """Active sources whose type is not registered in this composition."""
+
+        return tuple(
+            registration
+            for registration in await self.list_sources()
+            if registration.active
+            and self._source_types.get(registration.adapter_id) is None
+        )
 
     async def list_catalog_resources(
         self, *, source_id: str | None = None
@@ -5080,6 +5268,39 @@ class EmbeddedAgent:
         return await self._catalog_service.inspect_resource(
             self.identity.id, resource_id
         )
+
+    async def declare_catalog_link(
+        self,
+        from_resource_id: str,
+        to_resource_id: str,
+        field_pairs: tuple[tuple[str, str], ...],
+        *,
+        note: str | None = None,
+    ) -> CatalogLink:
+        pairs = tuple(
+            RelationshipFieldPair(source_field, target_field, ordinal)
+            for ordinal, (source_field, target_field) in enumerate(field_pairs)
+        )
+        async with self._source_commit_lock:
+            self._require_open()
+            return await self._catalog_service.declare_link(
+                self.identity.id,
+                from_resource_id,
+                to_resource_id,
+                pairs,
+                declared_at=self._clock(),
+                note=note,
+            )
+
+    async def remove_catalog_link(self, link_id: str) -> bool:
+        async with self._source_commit_lock:
+            self._require_open()
+            return await self._catalog_service.remove_link(self.identity.id, link_id)
+
+    async def list_catalog_links(self) -> tuple[CatalogLinkStatus, ...]:
+        async with self._source_commit_lock:
+            self._require_open()
+            return await self._catalog_service.link_statuses(self.identity.id)
 
     @asynccontextmanager
     async def _admit_system_work(self, label: str):
@@ -5153,11 +5374,19 @@ class EmbeddedAgent:
             if first_error is not None:
                 raise error from first_error
             raise
-        try:
-            await self._postgresql_backend.close()
-        except BaseException as error:
-            if first_error is None:
-                first_error = error
+        for backend in (
+            *_backends_with(self._source_backends, "close"),
+            *(
+                ()
+                if self._combined_query_engine is None
+                else (self._combined_query_engine,)
+            ),
+        ):
+            try:
+                await backend.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
         owned_model_provider = self._owned_model_provider
         model_shutdown_deadline = (
             asyncio.get_running_loop().time()

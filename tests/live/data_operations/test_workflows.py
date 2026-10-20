@@ -126,7 +126,7 @@ async def test_live_partial_file_does_not_establish_a_complete_total(dataops):
     path.write_text("order_id,amount_minor\n" + "1,123456789\n" * 60_000)
     capture = await evaluation.run(
         "Read only the first file_read chunk of partial-sales.csv, without following "
-        "its cursor or using file_query, Python, or any other read. Determine whether "
+        "its cursor or using data_query, Python, or any other read. Determine whether "
         "that one chunk establishes the total for the entire file. Return only JSON "
         "with complete (boolean) and total_minor (null when total is unavailable).",
         phase="partial_file_coverage",
@@ -141,7 +141,7 @@ async def test_live_partial_file_does_not_establish_a_complete_total(dataops):
         "total_minor": None,
     }
     assert not any(
-        call.name in {"file_query", "python_execute"}
+        call.name in {"data_query", "python_execute"}
         for call, _ in capture.transcript.tool_pairs
     )
 

@@ -1616,6 +1616,9 @@ class SemanticDomainCatalog(Protocol):
         source_ids: tuple[str, ...] = (),
     ) -> frozenset[str]: ...
 
+    @property
+    def session_source_id(self) -> str | None: ...
+
     async def semantic_resource_facts(
         self,
         agent_id: str,
@@ -1717,9 +1720,7 @@ class SemanticCapabilityDomain:
         files_only = session is not None and session.options.files_only
         if files_only:
             return ()
-        scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=files_only
-        )
+        scope = await resolve_effective_source_scope(run, self._catalog)
         run = replace(run, resolved_source_scope=scope)
         facts = (
             ()
@@ -1845,9 +1846,7 @@ class SemanticCapabilityDomain:
             self._learning.mark_effect_succeeded(session, call.id)
         if output.sensitivity is not None:
             return output
-        scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=False
-        )
+        scope = await resolve_effective_source_scope(run, self._catalog)
         source_id = arguments.get("source_id")
         source_ids = (
             (source_id,)
@@ -2051,9 +2050,7 @@ class SemanticCapabilityDomain:
         arguments: Mapping[str, object],
         output: ToolOutput,
     ) -> ToolOutput:
-        scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=False
-        )
+        scope = await resolve_effective_source_scope(run, self._catalog)
         source_id = arguments.get("source_id")
         resource_id = arguments.get("resource_id")
         kind = arguments.get("kind")
@@ -2297,9 +2294,7 @@ class SemanticCapabilityDomain:
         capability: Capability,
         arguments: Mapping[str, object],
     ) -> None:
-        scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=False
-        )
+        scope = await resolve_effective_source_scope(run, self._catalog)
         selected_source_ids = scope.source_ids
         supplied = arguments.get("source_id")
         if supplied is not None and supplied not in selected_source_ids:

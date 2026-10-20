@@ -1,4 +1,8 @@
-"""Validate the narrow DuckDB read contract used by local ``file_query``."""
+"""Validate the narrow DuckDB read contract of the private query worker.
+
+A folder-source ``data_query`` exposes one relation, ``data``; a combined
+``data_query`` exposes its input aliases.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +19,8 @@ _ALLOWED_FUNCTIONS = frozenset(
     {
         "ABS",
         "AVG",
+        # CASE parses to CASE with IF branches.
+        "CASE",
         "CAST",
         "CEIL",
         "CEILING",
@@ -27,6 +33,7 @@ _ALLOWED_FUNCTIONS = frozenset(
         "FIRST_VALUE",
         "FLOOR",
         "GREATEST",
+        "IF",
         "LAG",
         "LAST_VALUE",
         "LEAD",
@@ -47,7 +54,11 @@ _ALLOWED_FUNCTIONS = frozenset(
         "STDDEV_SAMP",
         "SUBSTRING",
         "SUM",
+        # strftime and date_trunc parse to these names.
+        "TIME_TO_STR",
+        "TIMESTAMP_TRUNC",
         "TRIM",
+        "TRY_CAST",
         "UPPER",
         "VAR_POP",
         "VAR_SAMP",
@@ -76,8 +87,14 @@ class ValidatedDuckDBRead:
     functions: tuple[str, ...]
 
 
-def validate_duckdb_read(sql: str) -> ValidatedDuckDBRead:
-    """Accept one canonical read over exactly one base relation named ``data``."""
+def validate_duckdb_read(
+    sql: str, relations: tuple[str, ...] = ("data",)
+) -> ValidatedDuckDBRead:
+    """Accept one canonical SELECT (or UNION) reading every code-owned relation."""
+
+    names = frozenset(item.casefold() for item in relations)
+    if not relations or len(names) != len(relations):
+        raise ValueError("DuckDB read relations must be unique non-empty names")
 
     if (
         not isinstance(sql, str)
@@ -86,7 +103,7 @@ def validate_duckdb_read(sql: str) -> ValidatedDuckDBRead:
     ):
         raise DuckDBReadValidationError(
             "sql_size",
-            "File query SQL must be bounded non-empty text.",
+            "SQL must be bounded non-empty text of at most 8 KiB.",
         )
     sqlglot, exp, traverse_scope = _load_sqlglot()
     try:
@@ -105,18 +122,18 @@ def validate_duckdb_read(sql: str) -> ValidatedDuckDBRead:
             raise
         raise DuckDBReadValidationError(
             "parse_error",
-            "File query SQL could not be parsed safely.",
+            "SQL could not be parsed safely.",
         ) from error
     if len(parsed) != 1 or parsed[0] is None:
         raise DuckDBReadValidationError(
             "statement_count",
-            "File query requires exactly one SELECT statement.",
+            "The query requires exactly one SELECT statement.",
         )
     root = cast(Any, parsed[0])
-    if not isinstance(root, exp.Select):
+    if not isinstance(root, (exp.Select, exp.Union)):
         raise DuckDBReadValidationError(
             "select_only",
-            "File query accepts only one SELECT statement.",
+            "The query accepts only one SELECT statement.",
         )
     expression = cast(Any, root)
     forbidden_nodes = tuple(
@@ -157,7 +174,7 @@ def validate_duckdb_read(sql: str) -> ValidatedDuckDBRead:
     ):
         raise DuckDBReadValidationError(
             "operation_forbidden",
-            "File query SQL contains a prohibited operation.",
+            "SQL contains a prohibited operation.",
         )
     if any(
         isinstance(node, (exp.Values, exp.Placeholder, exp.Parameter))
@@ -165,22 +182,22 @@ def validate_duckdb_read(sql: str) -> ValidatedDuckDBRead:
     ):
         raise DuckDBReadValidationError(
             "source_forbidden",
-            "File query SQL cannot introduce values, parameters, or another source.",
+            "SQL cannot introduce values, parameters, or another source.",
         )
     for with_clause in expression.find_all(exp.With):
         if bool(with_clause.args.get("recursive", False)):
             raise DuckDBReadValidationError(
                 "recursive_cte",
-                "Recursive file queries are not supported.",
+                "Recursive queries are not supported.",
             )
     for cte in expression.find_all(exp.CTE):
-        if str(cte.alias_or_name).casefold() == "data":
+        if str(cte.alias_or_name).casefold() in names:
             raise DuckDBReadValidationError(
                 "data_shadowed",
-                "The code-owned data relation cannot be shadowed.",
+                "A code-owned relation cannot be shadowed.",
             )
 
-    data_references = 0
+    references = dict.fromkeys(names, 0)
     try:
         scopes = tuple(traverse_scope(expression))
     except Exception as error:
@@ -192,51 +209,63 @@ def validate_duckdb_read(sql: str) -> ValidatedDuckDBRead:
             raise
         raise DuckDBReadValidationError(
             "scope_error",
-            "File query SQL scope could not be resolved safely.",
+            "SQL scope could not be resolved safely.",
         ) from error
     for scope in scopes:
+        if isinstance(scope.expression, exp.Union):
+            # A UNION selects nothing itself; each side is its own scope.
+            continue
         if not scope.selected_sources:
             raise DuckDBReadValidationError(
                 "source_forbidden",
-                "Every file-query relation must derive from data.",
+                "Every relation must derive from a code-owned relation.",
             )
         for _node, source in scope.selected_sources.values():
             if isinstance(source, exp.Table):
                 if not isinstance(source.this, exp.Identifier):
                     raise DuckDBReadValidationError(
                         "table_function",
-                        "File query SQL cannot invoke a table or filesystem function.",
+                        "SQL cannot invoke a table or filesystem function.",
                     )
-                if source.catalog or source.db or source.name.casefold() != "data":
+                if source.catalog or source.db or source.name.casefold() not in names:
                     raise DuckDBReadValidationError(
                         "relation_forbidden",
-                        "File query SQL can reference only the relation data.",
+                        "SQL can reference only the relations "
+                        + ", ".join(relations)
+                        + ".",
                     )
-                data_references += 1
+                references[source.name.casefold()] += 1
             elif not hasattr(source, "expression"):
                 raise DuckDBReadValidationError(
                     "source_unknown",
-                    "File query SQL contains an unsupported relation source.",
+                    "SQL contains an unsupported relation source.",
                 )
-    if data_references != 1:
+    if any(count < 1 for count in references.values()):
         raise DuckDBReadValidationError(
             "data_reference_count",
-            "File query SQL must reference the relation data exactly once.",
+            "SQL must reference each of " + ", ".join(relations) + ".",
         )
 
+    # sqlglot models AND/OR as functions; they are boolean operators.
     functions = tuple(
-        sorted({_function_name(node) for node in expression.find_all(exp.Func)})
+        sorted(
+            {
+                _function_name(node)
+                for node in expression.find_all(exp.Func)
+                if not isinstance(node, exp.Connector)
+            }
+        )
     )
     if any(name not in _ALLOWED_FUNCTIONS for name in functions):
         raise DuckDBReadValidationError(
             "function_forbidden",
-            "File query SQL contains a function outside the bounded read contract.",
+            "SQL contains a function outside the bounded read contract.",
         )
     for literal in expression.find_all(exp.Literal):
         if literal.is_string and _SCHEME_OR_ABSOLUTE.match(str(literal.this)):
             raise DuckDBReadValidationError(
                 "external_literal",
-                "File query SQL cannot contain an external URL or absolute path.",
+                "SQL cannot contain an external URL or absolute path.",
             )
 
     canonical = expression.sql(dialect="duckdb", pretty=False)
@@ -245,7 +274,7 @@ def validate_duckdb_read(sql: str) -> ValidatedDuckDBRead:
     except Exception as error:  # pragma: no cover - sqlglot invariant
         raise DuckDBReadValidationError(
             "canonicalization",
-            "File query SQL could not be canonicalized safely.",
+            "SQL could not be canonicalized safely.",
         ) from error
     if (
         len(reparsed) != 1
@@ -254,7 +283,7 @@ def validate_duckdb_read(sql: str) -> ValidatedDuckDBRead:
     ):
         raise DuckDBReadValidationError(
             "canonicalization",
-            "File query SQL could not be canonicalized safely.",
+            "SQL could not be canonicalized safely.",
         )
     return ValidatedDuckDBRead(
         canonical_sql=canonical,

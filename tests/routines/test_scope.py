@@ -130,6 +130,9 @@ def _scheduled_run(scope: ExecutionScope) -> RunInput:
 
 async def test_empty_machine_source_ceiling_never_queries_all_current_sources():
     class ForbiddenCatalog:
+        # No live session folder source.
+        session_source_id: str | None = None
+
         async def source_routing_facts(self, agent_id, source_ids=()):
             raise AssertionError("an empty machine ceiling cannot enumerate sources")
 

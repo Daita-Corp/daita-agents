@@ -38,6 +38,7 @@ from .mcp import (
     MCPCompletionSemantics,
     MCP_SUPPORTED_PROTOCOL_VERSIONS,
 )
+from .folder import FolderSource
 from .sqlite import SQLiteResourceAdapter, SQLiteSource, SQLiteSourceError
 from .sqlite_query import SQLiteQueryBackend, SQLiteQueryError
 from .postgresql import (
@@ -85,6 +86,7 @@ __all__ = [
     "SQLiteQueryBackend",
     "SQLiteQueryError",
     "SQLiteResourceAdapter",
+    "FolderSource",
     "SQLiteSource",
     "SQLiteSourceError",
     "SourceClosedError",

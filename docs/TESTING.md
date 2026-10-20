@@ -9,7 +9,10 @@ unit/integration directory hierarchy.
 - `tests/agent`, `loop`, `context`, `capabilities`, and `llm` cover the public
   facade and direct model/tool execution path.
 - `tests/catalog`, `data`, `workspace`, and `mcp` cover source truth, bounded
-  I/O, writes, files, and remote-tool contracts.
+  I/O, writes, folder sources and local files, and remote-tool contracts;
+  `tests/data/folder` runs the source contract kit against attached and session
+  folders. The live folder-query suite is gated by
+  `DAITA_RUN_LIVE_FOLDER_QUERY=1`.
 - `tests/artifacts`, `jobs`, `routines`, and `distribution` cover durable work
   and outputs.
 - `tests/memory`, `skills`, `semantics`, `learning`, `storage`, `security`, and
@@ -374,6 +377,31 @@ key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, or `XAI_API_KEY`).
 default is one reviewed OpenAI model, with a $0.15 estimated-cost ceiling per run
 and at most $0.45 across the three interactions. Temporary exports stay inside the
 test's private directory. Collection does not contact a model or resolve credentials.
+
+### Real-model combined query
+
+`tests/live/data/test_model_combined_query.py` asks three phrasings of one
+question whose answer needs two sources: revenue from an in-memory source type
+with no SQL (`tests/support/memory_source.py`) and region managers from a SQLite
+table, joined by a declared catalog link. The model can reach that revenue only
+through a tabular input of a combined `data_query`, so each case requires a successful combined result whose
+lineage names that source's columns, and a final answer with both managers'
+totals. It checks that the model finds and builds the input form from the
+summarized `inputs` argument; execution semantics stay with
+`tests/data/test_combined_query.py`.
+
+Run only after explicit live-model authorization:
+
+```bash
+DAITA_LIVE_BILLING=subscription DAITA_RUN_LIVE_COMBINED_QUERY=1 \
+.venv/bin/python -m pytest tests/live/data/test_model_combined_query.py \
+  -o addopts="--tb=short -q --strict-markers"
+```
+
+Under API billing, choose the model with `DAITA_COMBINED_QUERY_LIVE_MODEL_ID`
+(default `openai:gpt-5.6-terra`), set `DAITA_COMBINED_QUERY_LIVE_LLM_API_KEY` or
+the provider's ordinary key, and cap each run with
+`DAITA_COMBINED_QUERY_LIVE_MAX_COST_USD` (default `$0.50`).
 
 ### Real remote MCP reads
 

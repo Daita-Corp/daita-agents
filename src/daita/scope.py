@@ -96,23 +96,25 @@ class SourceScopeCatalog(Protocol):
         self, agent_id: str, source_ids: tuple[str, ...] = ()
     ) -> frozenset[str]: ...
 
+    @property
+    def session_source_id(self) -> str | None: ...
+
 
 async def resolve_effective_source_scope(
     run: RunInput,
     catalog: SourceScopeCatalog,
-    *,
-    files_only: bool = False,
 ) -> EffectiveSourceScope:
     """Intersect current reads, trusted filters, preparation and machine ceilings.
 
     Only an unprepared foreground request may interpret its empty caller filter
     as all admitted candidates. Never forward an empty-as-all sentinel after
-    resolving authority.
+    resolving authority. The live session source belongs only to a foreground
+    user run; machine-originated runs never receive it.
     """
 
+    from .loop.models import RunOrigin
+
     empty = EffectiveSourceScope(frozenset(), frozenset())
-    if files_only:
-        return empty
     ceiling = run.execution_scope
     prepared = run.resolved_source_scope
     requested: frozenset[str] | None = (
@@ -121,6 +123,14 @@ async def resolve_effective_source_scope(
     if ceiling is not None:
         allowed = frozenset(ceiling.allowed_source_ids)
         requested = allowed if requested is None else requested & allowed
+    elif (
+        requested is not None
+        and run.origin is RunOrigin.USER
+        and catalog.session_source_id is not None
+    ):
+        # The live session folder is not a catalog source; a source filter
+        # narrows catalog sources and never drops local files.
+        requested |= {catalog.session_source_id}
     if prepared is not None:
         requested = (
             prepared.source_ids
@@ -137,6 +147,8 @@ async def resolve_effective_source_scope(
     )
     if requested is not None:
         sources &= requested
+    if ceiling is not None or run.origin is not RunOrigin.USER:
+        sources -= {catalog.session_source_id}
     if not sources:
         return empty
     resources = await catalog.readable_resource_ids(

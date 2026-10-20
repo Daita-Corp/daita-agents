@@ -30,7 +30,7 @@ from daita.capabilities import ArtifactPolicy, Capability, ToolOutput
 from daita.capability_runtime import CapabilityRuntime
 from daita.catalog.models import Sensitivity
 from daita.domains.data.export_capabilities import _resolved_sensitivity
-from daita.domains.data.file_capabilities import LocalFileReadExecutor
+from daita.domains.data.source_files import TextReadExecutor
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
@@ -328,7 +328,7 @@ def test_tool_artifact_is_removed_without_a_compatibility_alias() -> None:
 async def test_ordinary_local_file_read_no_longer_produces_an_implicit_artifact() -> (
     None
 ):
-    assert "artifact" not in LocalFileReadExecutor.__annotations__
+    assert "artifact" not in TextReadExecutor.__annotations__
     assert "artifact" not in capabilities_module.ToolOutput.__annotations__ or (
         capabilities_module.ToolOutput.__annotations__["artifact"]
         == "ArtifactDraft | None"

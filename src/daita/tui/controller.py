@@ -19,6 +19,7 @@ from daita import (
     ConversationRun,
     DeliveryInspection,
     DeliveryView,
+    FolderSource,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningReviewStatus,
@@ -33,6 +34,8 @@ from daita import (
     ScheduledRoutine,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
+    SourceType,
+    SourceTypeRegistry,
     Transcript,
     WorkBoard,
 )
@@ -50,6 +53,7 @@ from daita.artifacts import (
     ArtifactPayload,
     ArtifactRef,
 )
+from daita.errors import StateCompatibilityError
 from daita.jobs import (
     GraphBoardProjection,
     GraphInspection,
@@ -344,7 +348,7 @@ class PresentationController:
             raise UserInputError(
                 "That agent is active in another Daita process. Close it, then retry."
             ) from error
-        except AgentHomeError as error:
+        except (AgentHomeError, StateCompatibilityError) as error:
             raise UserInputError(str(error)) from error
 
     async def reopen_agent(
@@ -483,6 +487,9 @@ class PresentationController:
 
     async def attach_sqlite(self, path: Path, *, name: str | None) -> Any:
         return await self.require_agent().attach_sqlite(path, name=name)
+
+    async def attach_folder(self, path: Path, *, name: str | None) -> Any:
+        return await self.require_agent().attach(FolderSource(path, name=name))
 
     async def store_postgresql_password(self, password: str) -> SecretReference:
         return await self.require_agent().store_postgresql_password(password)
@@ -669,6 +676,10 @@ class PresentationController:
 
     async def list_sources(self) -> tuple[Any, ...]:
         return await self.require_agent().list_sources()
+
+    def source_types(self) -> tuple[SourceType, ...]:
+        # Matches this controller's AgentConfig(): built-in types only.
+        return SourceTypeRegistry().types()
 
     async def list_jobs(self) -> tuple[GraphJob, ...]:
         return await self.require_agent().list_jobs(limit=50)

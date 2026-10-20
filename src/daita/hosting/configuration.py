@@ -16,7 +16,7 @@ from typing import cast
 from uuid import uuid4
 
 from .._json import canonical_json
-from ..adapters.models import SourceRegistration
+from ..adapters.registry import SourceTypeRegistry
 from ..config import AgentConfig
 from ..learning_candidates import LEARNING_REVIEW_MAX_TOTAL_TOKENS
 from ..llm.errors import ModelProviderError, ProviderErrorCode
@@ -481,36 +481,40 @@ def _credential_reference_is_owned(
     )
 
 
-def _owned_source_credential_reference(
-    registration: SourceRegistration,
+def _owned_source_credential_references(
+    adapter_id: str,
+    configuration: Mapping[str, object],
     *,
     agent_id: str,
-) -> SecretReference | None:
-    if registration.agent_id != agent_id or registration.adapter_id != "postgresql":
-        return None
-    value = registration.configuration.get("credential_ref")
-    if not isinstance(value, str):
-        return None
-    try:
-        reference = SecretReference.parse(value)
-    except ValueError:
-        return None
-    return (
-        reference
+    source_types: SourceTypeRegistry,
+) -> tuple[SecretReference, ...]:
+    """Return credentials this agent created for one source's declared fields."""
+
+    source_type = source_types.get(adapter_id)
+    references: list[SecretReference] = []
+    for name in () if source_type is None else source_type.credential_fields:
+        value = configuration.get(name)
+        if not isinstance(value, str):
+            continue
+        try:
+            reference = SecretReference.parse(value)
+        except ValueError:
+            continue
         if _credential_reference_is_owned(
             reference,
             agent_id=agent_id,
-            provider="postgresql",
-        )
-        else None
-    )
+            provider=adapter_id,
+        ):
+            references.append(reference)
+    return tuple(references)
 
 
 def _owned_agent_credential_references(
     agent_id: str,
     *,
     model_document: object | None,
-    source_reference_values: tuple[str, ...],
+    source_configurations: tuple[tuple[str, Mapping[str, object]], ...],
+    source_types: SourceTypeRegistry,
     mcp_reference_values: tuple[str, ...] = (),
 ) -> tuple[SecretReference, ...]:
     references: dict[str, SecretReference] = {}
@@ -551,15 +555,12 @@ def _owned_agent_credential_references(
                 provider=provider,
             ):
                 references[reference.to_uri()] = reference
-    for reference_value in source_reference_values:
-        try:
-            reference = SecretReference.parse(reference_value)
-        except ValueError:
-            continue
-        if _credential_reference_is_owned(
-            reference,
+    for adapter_id, configuration in source_configurations:
+        for reference in _owned_source_credential_references(
+            adapter_id,
+            configuration,
             agent_id=agent_id,
-            provider="postgresql",
+            source_types=source_types,
         ):
             references[reference.to_uri()] = reference
     for reference_value in mcp_reference_values:

@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import sqlite3
 import stat
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 import daita.hosting.configuration as configuration
-from daita import Agent, SQLiteSource, cli
+from daita import Agent, AgentConfig, SQLiteSource, cli
 from daita.adapters.models import SourceRegistration
 from daita.agent import AgentHomeError
 from daita.llm.models import (
@@ -22,6 +23,12 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.security import KeychainSecretProvider, SecretReference
 from daita.skills import Skill
 from daita.tui.controller import PresentationController
+from tests.support.memory_source import (
+    MEMORY_ADAPTER_ID,
+    MEMORY_NOW,
+    MEMORY_TYPE,
+    MemorySource,
+)
 from tests.support.workspace import workspace_for
 
 NOW = datetime(2026, 7, 29, tzinfo=UTC)
@@ -196,6 +203,35 @@ async def test_detach_deletes_only_an_owned_postgresql_credential(
         assert reference.name not in keychain.values
     finally:
         await agent.close()
+
+
+async def test_agent_delete_removes_credentials_of_composed_source_types(
+    tmp_path: Path,
+) -> None:
+    keychain = _Keychain()
+    config = AgentConfig(
+        source_types=(replace(MEMORY_TYPE, credential_fields=("credential_ref",)),)
+    )
+    agent = await Agent.create(
+        "atlas",
+        root=tmp_path,
+        keychain=keychain,
+        config=config,
+        clock=lambda: MEMORY_NOW,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        prefix = configuration._credential_account_prefix(agent.id, MEMORY_ADAPTER_ID)
+        reference = SecretReference.keychain(prefix + "0" * 24)
+        await keychain.set(reference, "token")
+        await agent.attach(MemorySource("Tokens", reference.to_uri()))
+    finally:
+        await agent.close()
+
+    await Agent.delete("atlas", root=tmp_path, keychain=keychain, config=config)
+
+    assert keychain.deleted == [reference.name]
+    assert keychain.values == {}
 
 
 async def test_agent_delete_removes_home_and_all_owned_credentials(

@@ -126,34 +126,35 @@ def _source() -> SourceRegistration:
     )
 
 
-@pytest.mark.parametrize(
-    ("adapter_id", "message"),
-    (
-        ("local-directory", "unsupported current adapter"),
-        ("future-adapter", "unsupported current adapter"),
-    ),
-)
-def test_source_codec_rejects_adapters_outside_the_current_state_shape(
+@pytest.mark.parametrize("adapter_id", ("postgresql", "future-adapter"))
+def test_source_codec_keeps_any_adapter_but_never_embedded_write_admission(
     adapter_id: str,
-    message: str,
 ) -> None:
-    source = _source()
-    payload = json.loads(encode_source(source))
-    payload["fields"]["adapter_id"] = adapter_id
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    current = _source()
+    source = SourceRegistration.build(
+        agent_id=current.agent_id,
+        adapter_id=adapter_id,
+        native_identity=current.native_identity,
+        display_name=current.display_name,
+        configuration=current.configuration,
+        attached_at=current.attached_at,
+    )
+    _assert_round_trip(source, encode_source, decode_source)
 
-    with pytest.raises(ValueError, match=message):
-        decode_source(encoded)
-    unsupported = SourceRegistration.build(
+    payload = json.loads(encode_source(source))
+    payload["fields"]["configuration"]["write_access"] = True
+    with pytest.raises(ValueError, match="embedded write admission"):
+        decode_source(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    admitted = SourceRegistration.build(
         agent_id=source.agent_id,
         adapter_id=adapter_id,
         native_identity=source.native_identity,
         display_name=source.display_name,
-        configuration=source.configuration,
+        configuration={**source.configuration, "write_access": True},
         attached_at=source.attached_at,
     )
-    with pytest.raises(ValueError, match=message):
-        encode_source(unsupported)
+    with pytest.raises(ValueError, match="embedded write admission"):
+        encode_source(admitted)
 
 
 def _receipt() -> EffectReceipt:

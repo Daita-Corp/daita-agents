@@ -30,9 +30,8 @@ from tests.tui._support import (
 def test_tool_projection_and_approval_document():
     assert CAPABILITY_LABELS["toolbox_search"] == "Search toolboxes"
     assert CAPABILITY_LABELS["toolbox_load"] == "Load selected tools"
-    assert CAPABILITY_LABELS["file_search"] == "Search local files"
-    assert CAPABILITY_LABELS["file_read"] == "Read local file"
-    assert CAPABILITY_LABELS["file_query"] == "Query local file data"
+    assert CAPABILITY_LABELS["file_search"] == "Search folder files"
+    assert CAPABILITY_LABELS["file_read"] == "Read folder file"
     assert CAPABILITY_LABELS["artifact_edit_text"] == "Prepare local file edit"
     assert CAPABILITY_LABELS["artifact_save_local"] == "Save artifact locally"
     details = project_tool_details(

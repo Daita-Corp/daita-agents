@@ -16,7 +16,8 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time as datetime_time, timedelta
 from decimal import Decimal
 from functools import lru_cache
@@ -41,7 +42,12 @@ _GIB = 1_024 * _MIB
 _PROTOCOL = "daita.local_file_query.v1"
 _DUCKDB_VERSION = "1.5.5"
 _MAX_REQUEST_BYTES = 512 * 1_024
-_MAX_RESPONSE_BYTES = 64 * 1_024
+# The worker message envelope beyond the result rows' own byte limit.
+_RESPONSE_OVERHEAD_BYTES = 16 * 1_024
+# Internal source reads (combined-query inputs, catalog discovery) may return
+# more rows than one model-visible result; they are never shown to a model.
+_MAX_READ_ROWS = 10_000
+_MAX_READ_BYTES = 4 * _MIB
 _MAX_COLUMN_NAME_BYTES = 256
 _MAX_VALUE_DEPTH = 16
 _POLL_SECONDS = 0.01
@@ -81,8 +87,8 @@ class LocalFileQueryLimits:
 
     def __post_init__(self) -> None:
         integer_bounds = (
-            (self.max_result_rows, "max_result_rows", 1, 100),
-            (self.max_result_bytes, "max_result_bytes", 1_024, 48 * 1_024),
+            (self.max_result_rows, "max_result_rows", 1, _MAX_READ_ROWS),
+            (self.max_result_bytes, "max_result_bytes", 2, _MAX_READ_BYTES),
             (self.max_result_columns, "max_result_columns", 1, 512),
             (
                 self.duckdb_memory_bytes,
@@ -114,6 +120,19 @@ class LocalFileQueryLimits:
             raise ValueError("max_query_seconds is outside its code-owned bound")
 
 
+def _response_bound(max_result_bytes: int) -> int:
+    return max_result_bytes + _RESPONSE_OVERHEAD_BYTES
+
+
+@dataclass(frozen=True, slots=True)
+class QueryRelation:
+    """One named in-memory input relation: its columns and bounded JSON rows."""
+
+    name: str
+    columns: tuple[str, ...]
+    rows: tuple[Mapping[str, object], ...]
+
+
 @dataclass(frozen=True, slots=True)
 class LocalFileQueryResult:
     data: FrozenJsonObject
@@ -133,8 +152,8 @@ class LocalFileQueryBackend:
             raise TypeError("scratch_parent must be one absolute pathlib.Path")
         self._scratch_parent = scratch_parent
         self._limits = limits or LocalFileQueryLimits()
-        self._gate = asyncio.Lock()
-        self._active_query = False
+        # One worker at a time; later queries wait their turn rather than fail.
+        self._turn = asyncio.Lock()
         self._active: dict[asyncio.Task[dict[str, object]], threading.Event] = {}
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
@@ -149,7 +168,100 @@ class LocalFileQueryBackend:
         manifest: LocalFileQueryManifest,
         canonical_sql: str,
         sql_fingerprint: str,
+        limits: LocalFileQueryLimits | None = None,
     ) -> LocalFileQueryResult:
+        payload = await self._run(
+            manifest, None, canonical_sql, sql_fingerprint, limits=limits
+        )
+        manifest.revalidate()
+        data = {
+            **payload,
+            "path_pattern": manifest.qualified_path_pattern,
+            "format": manifest.format,
+            "input_file_count": len(manifest.bindings),
+            "input_bytes": manifest.input_bytes,
+            "manifest_bytes": manifest.encoded_bytes,
+            "manifest_sha256": manifest.manifest_sha256,
+            "input_bindings": tuple(
+                item.result_mapping() for item in manifest.bindings
+            ),
+        }
+        return LocalFileQueryResult(
+            data=FrozenJsonObject.from_mapping(data),
+            sensitivity_provenance=FrozenJsonObject.from_mapping(
+                manifest.provenance_mapping()
+            ),
+        )
+
+    async def query_relations(
+        self,
+        *,
+        relations: tuple[QueryRelation, ...],
+        canonical_sql: str,
+        sql_fingerprint: str,
+    ) -> FrozenJsonObject:
+        """Run one validated SELECT over named in-memory input relations.
+
+        Each relation is written to this call's private scratch and bound under
+        its name with column types derived from its values; the worker, its
+        locked security profile and its result bounds are those of file query.
+        """
+
+        if not relations or any(
+            not isinstance(item, QueryRelation) for item in relations
+        ):
+            raise TypeError("relations must be non-empty QueryRelation values")
+        payload = await self._run(None, relations, canonical_sql, sql_fingerprint)
+        return FrozenJsonObject.from_mapping(payload)
+
+    async def describe(
+        self, *, manifest: LocalFileQueryManifest
+    ) -> tuple[tuple[tuple[str, str], ...] | None, ...]:
+        """Read each bound file's logical schema without running a query.
+
+        Files of one manifest may differ in schema; a malformed file yields
+        None rather than failing the others.
+        """
+
+        from ..domains.data.sql.duckdb_read import validate_duckdb_read
+
+        placeholder = validate_duckdb_read("SELECT * FROM data")
+        payload = await self._run(
+            manifest,
+            None,
+            placeholder.canonical_sql,
+            placeholder.sql_fingerprint,
+            limits=replace(self._limits, max_result_bytes=_MAX_READ_BYTES),
+            describe=True,
+        )
+        schemas = cast(list[object], payload["schemas"])
+        if len(schemas) != len(manifest.bindings):
+            raise LocalFileQueryError(
+                "folder_query_invalid",
+                "The private file-query worker returned an invalid result.",
+            )
+        return tuple(
+            (
+                None
+                if item is None
+                else tuple(
+                    (str(column["name"]), str(column["type"]))
+                    for column in cast(list[dict[str, object]], item)
+                )
+            )
+            for item in schemas
+        )
+
+    async def _run(
+        self,
+        manifest: LocalFileQueryManifest | None,
+        relations: tuple[QueryRelation, ...] | None,
+        canonical_sql: str,
+        sql_fingerprint: str,
+        *,
+        limits: LocalFileQueryLimits | None = None,
+        describe: bool = False,
+    ) -> dict[str, object]:
         if self._closed:
             raise LocalFileQueryError(
                 "workspace_unavailable", "The local file-query backend is closed."
@@ -160,62 +272,36 @@ class LocalFileQueryBackend:
             "sha256:"
         ):
             raise TypeError("sql_fingerprint must use sha256")
-        async with self._gate:
+        async with self._turn:
             if self._closed:
                 raise LocalFileQueryError(
                     "workspace_unavailable",
                     "The local file-query backend is closed.",
                 )
-            if self._active_query:
-                raise LocalFileQueryError(
-                    "file_query_limited",
-                    "Only one local structured-file query may run at a time.",
-                    {"concurrent_query_limit": 1},
+            cancellation = threading.Event()
+            worker: asyncio.Task[dict[str, object]] = asyncio.create_task(
+                asyncio.to_thread(
+                    _run_private_worker,
+                    manifest,
+                    relations,
+                    canonical_sql,
+                    sql_fingerprint,
+                    self._scratch_parent,
+                    limits or self._limits,
+                    cancellation,
+                    describe,
                 )
-            self._active_query = True
-        cancellation = threading.Event()
-        worker: asyncio.Task[dict[str, object]] = asyncio.create_task(
-            asyncio.to_thread(
-                _run_private_worker,
-                manifest,
-                canonical_sql,
-                sql_fingerprint,
-                self._scratch_parent,
-                self._limits,
-                cancellation,
             )
-        )
-        self._active[worker] = cancellation
-        try:
+            self._active[worker] = cancellation
             try:
-                payload = await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                cancellation.set()
-                await _settle_worker(worker)
-                raise
-            manifest.revalidate()
-            data = {
-                **payload,
-                "path_pattern": manifest.qualified_path_pattern,
-                "format": manifest.format,
-                "input_file_count": len(manifest.bindings),
-                "input_bytes": manifest.input_bytes,
-                "manifest_bytes": manifest.encoded_bytes,
-                "manifest_sha256": manifest.manifest_sha256,
-                "input_bindings": tuple(
-                    item.result_mapping() for item in manifest.bindings
-                ),
-            }
-            return LocalFileQueryResult(
-                data=FrozenJsonObject.from_mapping(data),
-                sensitivity_provenance=FrozenJsonObject.from_mapping(
-                    manifest.provenance_mapping()
-                ),
-            )
-        finally:
-            self._active.pop(worker, None)
-            async with self._gate:
-                self._active_query = False
+                try:
+                    return await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    cancellation.set()
+                    await _settle_worker(worker)
+                    raise
+            finally:
+                self._active.pop(worker, None)
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -250,12 +336,14 @@ async def _settle_worker(worker: asyncio.Task[object]) -> None:
 
 
 def _run_private_worker(
-    manifest: LocalFileQueryManifest,
+    manifest: LocalFileQueryManifest | None,
+    relations: tuple[QueryRelation, ...] | None,
     canonical_sql: str,
     sql_fingerprint: str,
     scratch_parent: Path,
     limits: LocalFileQueryLimits,
     cancellation: threading.Event,
+    describe: bool = False,
 ) -> dict[str, object]:
     scratch = _create_private_scratch(scratch_parent)
     context = multiprocessing.get_context("spawn")
@@ -266,13 +354,26 @@ def _run_private_worker(
     peak_rss = 0
     final: dict[str, object] | None = None
     try:
-        manifest.revalidate()
+        if manifest is not None:
+            manifest.revalidate()
         if not (sys.platform == "darwin" or sys.platform.startswith("linux")):
             raise LocalFileQueryError(
                 "dependency_unavailable",
                 "This platform cannot monitor private file-query worker RSS.",
             )
-        request = _request_mapping(manifest, canonical_sql, sql_fingerprint, limits)
+        request = (
+            _request_mapping(
+                manifest, canonical_sql, sql_fingerprint, limits, describe=describe
+            )
+            if manifest is not None
+            else _relations_request_mapping(
+                cast(tuple[QueryRelation, ...], relations),
+                scratch,
+                canonical_sql,
+                sql_fingerprint,
+                limits,
+            )
+        )
         request_bytes = canonical_json(request).encode("utf-8")
         if len(request_bytes) > _MAX_REQUEST_BYTES:
             raise LocalFileQueryError(
@@ -294,7 +395,7 @@ def _run_private_worker(
         from multiprocessing.reduction import send_handle
 
         assert process.pid is not None
-        for binding in manifest.bindings:
+        for binding in () if manifest is None else manifest.bindings:
             send_handle(live_parent, binding.descriptor, process.pid)
         while process.is_alive():
             now = time.monotonic()
@@ -302,7 +403,7 @@ def _run_private_worker(
             observed_rss = _process_rss_bytes(process.pid)
             if observed_rss is not None:
                 peak_rss = max(peak_rss, observed_rss)
-            final = _receive_messages(live_parent, final)
+            final = _receive_messages(live_parent, final, limits)
             if cancellation.is_set():
                 termination = "cancelled"
             elif now - started >= limits.max_query_seconds:
@@ -321,25 +422,25 @@ def _run_private_worker(
             process.kill()
             process.join(timeout=1.0)
         process.join()
-        final = _receive_messages(live_parent, final)
+        final = _receive_messages(live_parent, final, limits)
         peak_spill = max(peak_spill, _directory_bytes(scratch))
         if termination == "cancelled":
             raise _WorkerCancelled()
         if termination == "timeout":
             raise LocalFileQueryError(
-                "file_query_timeout",
+                "folder_query_timeout",
                 "The local structured-file query exceeded its bounded wall time.",
                 {"limit_seconds": limits.max_query_seconds},
             )
         if termination == "spill_limit":
             raise LocalFileQueryError(
-                "file_query_limited",
+                "folder_query_limited",
                 "The local structured-file query exceeded its private spill bound.",
                 {"spill_limit_bytes": limits.max_spill_bytes},
             )
         if termination == "rss_limit":
             raise LocalFileQueryError(
-                "file_query_limited",
+                "folder_query_limited",
                 "The private file-query worker exceeded its monitored RSS bound.",
                 {"rss_limit_bytes": limits.max_worker_rss_bytes},
             )
@@ -350,7 +451,7 @@ def _run_private_worker(
             )
         if final is None:
             raise LocalFileQueryError(
-                "file_query_invalid",
+                "folder_query_invalid",
                 "The private file-query worker ended without a bounded result.",
             )
         if final.get("status") != "success":
@@ -358,7 +459,7 @@ def _run_private_worker(
             message = final.get("message")
             details = final.get("details")
             raise LocalFileQueryError(
-                code if isinstance(code, str) else "file_query_invalid",
+                code if isinstance(code, str) else "folder_query_invalid",
                 (
                     message
                     if isinstance(message, str)
@@ -369,10 +470,11 @@ def _run_private_worker(
         payload = final.get("data")
         if not isinstance(payload, dict):
             raise LocalFileQueryError(
-                "file_query_invalid",
+                "folder_query_invalid",
                 "The private file-query worker returned an invalid result.",
             )
-        manifest.revalidate()
+        if manifest is not None:
+            manifest.revalidate()
         return payload
     except _WorkerCancelled as error:
         raise asyncio.CancelledError from error
@@ -380,7 +482,7 @@ def _run_private_worker(
         raise
     except (EOFError, OSError, ValueError) as error:
         raise LocalFileQueryError(
-            "file_query_invalid",
+            "folder_query_invalid",
             "The private file-query worker could not complete safely.",
         ) from error
     finally:
@@ -424,16 +526,19 @@ def _private_worker_entry(
     descriptors: list[int] = []
     duckdb_connection: Any | None = None
     final: dict[str, object]
+    response_bound = _response_bound(LocalFileQueryLimits().max_result_bytes)
     try:
         _set_worker_limits()
         request = _validate_request(connection.recv_bytes(maxlength=_MAX_REQUEST_BYTES))
         _revalidate_canonical_sql(request)
         from multiprocessing.reduction import recv_handle
 
-        for _binding in request["bindings"]:
+        relations = request.get("relations")
+        bindings = request["bindings"] if relations is None else []
+        for _binding in bindings:
             descriptors.append(int(recv_handle(cast(Any, connection))))
         descriptor_paths = tuple(_descriptor_path(item) for item in descriptors)
-        _revalidate_descriptors(descriptors, request["bindings"])
+        _revalidate_descriptors(descriptors, bindings)
         duckdb = _load_duckdb()
         duckdb_connection = duckdb.connect(":memory:")
         _apply_security_profile(
@@ -442,11 +547,17 @@ def _private_worker_entry(
             Path(scratch_text),
             request,
         )
-        schema = _bind_data(
-            duckdb_connection,
-            format_name=str(request["format"]),
-            descriptor_paths=descriptor_paths,
+        schema = (
+            _bind_data(
+                duckdb_connection,
+                format_name=str(request["format"]),
+                descriptor_paths=descriptor_paths,
+                describe=request.get("describe") is True,
+            )
+            if relations is None
+            else _bind_relations(duckdb_connection, relations, Path(scratch_text))
         )
+        response_bound = _response_bound(int(request["max_result_bytes"]))
         _send_message(
             connection,
             {
@@ -454,16 +565,20 @@ def _private_worker_entry(
                 "duckdb_version": duckdb.__version__,
                 "schema": schema,
             },
+            response_bound,
         )
-        data = _execute_bounded_query(
-            duckdb_connection,
-            str(request["canonical_sql"]),
-            str(request["sql_fingerprint"]),
-            max_rows=int(request["max_result_rows"]),
-            max_bytes=int(request["max_result_bytes"]),
-            max_columns=int(request["max_result_columns"]),
-        )
-        _revalidate_descriptors(descriptors, request["bindings"])
+        if request.get("describe") is True:
+            data: dict[str, object] = {"schemas": schema}
+        else:
+            data = _execute_bounded_query(
+                duckdb_connection,
+                str(request["canonical_sql"]),
+                str(request["sql_fingerprint"]),
+                max_rows=int(request["max_result_rows"]),
+                max_bytes=int(request["max_result_bytes"]),
+                max_columns=int(request["max_result_columns"]),
+            )
+        _revalidate_descriptors(descriptors, bindings)
         final = {"kind": "final", "status": "success", "data": data}
     except ImportError as error:
         final = {
@@ -485,7 +600,7 @@ def _private_worker_entry(
         final = {
             "kind": "final",
             "status": "error",
-            "code": "file_query_invalid",
+            "code": "folder_query_invalid",
             "message": "The local structured-file query could not be executed safely.",
             "details": {},
         }
@@ -501,7 +616,7 @@ def _private_worker_entry(
             except OSError:
                 pass
         try:
-            _send_message(connection, final)
+            _send_message(connection, final, response_bound)
         except (BrokenPipeError, EOFError, OSError):
             pass
         connection.close()
@@ -512,10 +627,13 @@ def _request_mapping(
     canonical_sql: str,
     sql_fingerprint: str,
     limits: LocalFileQueryLimits,
+    *,
+    describe: bool = False,
 ) -> dict[str, object]:
     return {
         "protocol": _PROTOCOL,
         "duckdb_version": _DUCKDB_VERSION,
+        "describe": describe,
         "format": manifest.format,
         "workspace_id": manifest.workspace_id,
         "path_pattern": manifest.path_pattern,
@@ -535,24 +653,215 @@ def _request_mapping(
     }
 
 
+_RELATION_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
+_RELATION_TYPES = frozenset({"NULL", "BOOLEAN", "BIGINT", "DOUBLE", "VARCHAR", "JSON"})
+_DECIMAL_TYPE = re.compile(r"DECIMAL\(38,([0-9]|[12][0-9]|3[0-7])\)")
+_MAX_RELATIONS = 8
+_MAX_RELATION_COLUMNS = 512
+
+
+def _relations_request_mapping(
+    relations: tuple[QueryRelation, ...],
+    scratch: Path,
+    canonical_sql: str,
+    sql_fingerprint: str,
+    limits: LocalFileQueryLimits,
+) -> dict[str, object]:
+    """Write each relation as typed NDJSON in private scratch; describe it."""
+
+    described: list[dict[str, object]] = []
+    for index, relation in enumerate(relations):
+        types = tuple(
+            _relation_column_type(tuple(row.get(column) for row in relation.rows))
+            for column in relation.columns
+        )
+        with (scratch / f"input-{index}.ndjson").open("x", encoding="utf-8") as file:
+            for row in relation.rows:
+                file.write(
+                    canonical_json(
+                        {
+                            column: _relation_value(row.get(column), kind)
+                            for column, kind in zip(
+                                relation.columns, types, strict=True
+                            )
+                        }
+                    )
+                    + "\n"
+                )
+        described.append(
+            {
+                "name": relation.name,
+                "columns": [
+                    {"name": column, "type": kind}
+                    for column, kind in zip(relation.columns, types, strict=True)
+                ],
+            }
+        )
+    return {
+        "protocol": _PROTOCOL,
+        "duckdb_version": _DUCKDB_VERSION,
+        "relations": described,
+        "canonical_sql": canonical_sql,
+        "sql_fingerprint": sql_fingerprint,
+        "query_seconds": float(limits.max_query_seconds),
+        "max_result_rows": limits.max_result_rows,
+        "max_result_bytes": limits.max_result_bytes,
+        "max_result_columns": limits.max_result_columns,
+        "memory_bytes": limits.duckdb_memory_bytes,
+        "spill_bytes": limits.max_spill_bytes,
+        "rss_bytes": limits.max_worker_rss_bytes,
+        "threads": limits.duckdb_threads,
+    }
+
+
+def _decimal_text(value: object) -> str | None:
+    """The exact text of a source's tagged decimal value, if it is one."""
+
+    if (
+        isinstance(value, Mapping)
+        and set(value) == {"type", "value"}
+        and value["type"] == "decimal"
+        and isinstance(value["value"], str)
+    ):
+        return value["value"]
+    return None
+
+
+def _relation_column_type(values: tuple[object, ...]) -> str:
+    """One deterministic DuckDB type for a column, from its JSON values."""
+
+    present = tuple(item for item in values if item is not None)
+    if not present:
+        # No value fixes a type; NULL casts to whatever the join or aggregate needs.
+        return "NULL"
+    if all(isinstance(item, bool) for item in present):
+        return "BOOLEAN"
+    if all(isinstance(item, int) and not isinstance(item, bool) for item in present):
+        if all(-(2**63) <= cast(int, item) < 2**63 for item in present):
+            return "BIGINT"
+        return "VARCHAR"
+    if all(
+        isinstance(item, (int, float)) and not isinstance(item, bool)
+        for item in present
+    ):
+        return "DOUBLE"
+    if all(
+        (isinstance(item, int) and not isinstance(item, bool))
+        or _decimal_text(item) is not None
+        for item in present
+    ):
+        digits = [
+            Decimal(
+                str(item) if isinstance(item, int) else cast(str, _decimal_text(item))
+            ).as_tuple()
+            for item in present
+        ]
+        scale = max(max(0, -cast(int, item.exponent)) for item in digits)
+        whole = max(len(item.digits) + cast(int, item.exponent) for item in digits)
+        # Exact text is kept when DECIMAL(38, scale) cannot hold every value.
+        return (
+            f"DECIMAL(38,{scale})" if scale <= 37 and whole <= 38 - scale else "VARCHAR"
+        )
+    if all(isinstance(item, str) for item in present):
+        return "VARCHAR"
+    return "JSON"
+
+
+def _relation_value(value: object, kind: str) -> object:
+    if value is None:
+        return None
+    if kind.startswith("DECIMAL") or (kind == "VARCHAR" and not isinstance(value, str)):
+        return _decimal_text(value) or str(value)
+    return value
+
+
+def _validate_relations(value: object) -> None:
+    if not isinstance(value, list) or not 1 <= len(value) <= _MAX_RELATIONS:
+        raise _WorkerFailure(
+            "folder_query_invalid", "The query input relations are invalid."
+        )
+    names: set[str] = set()
+    for relation in value:
+        if (
+            not isinstance(relation, dict)
+            or set(relation) != {"name", "columns"}
+            or not isinstance(relation["name"], str)
+            or _RELATION_NAME.fullmatch(relation["name"]) is None
+            or relation["name"] in names
+            or not isinstance(relation["columns"], list)
+            or not 1 <= len(relation["columns"]) <= _MAX_RELATION_COLUMNS
+        ):
+            raise _WorkerFailure(
+                "folder_query_invalid", "The query input relations are invalid."
+            )
+        names.add(relation["name"])
+        columns: set[str] = set()
+        for column in relation["columns"]:
+            if (
+                not isinstance(column, dict)
+                or set(column) != {"name", "type"}
+                or not isinstance(column["name"], str)
+                or not column["name"]
+                or len(column["name"].encode("utf-8")) > _MAX_COLUMN_NAME_BYTES
+                or column["name"] in columns
+                or not isinstance(column["type"], str)
+                or (
+                    column["type"] not in _RELATION_TYPES
+                    and _DECIMAL_TYPE.fullmatch(column["type"]) is None
+                )
+            ):
+                raise _WorkerFailure(
+                    "folder_query_invalid", "The query input relations are invalid."
+                )
+            columns.add(column["name"])
+
+
+def _bind_relations(
+    connection: Any, relations: list[dict[str, Any]], scratch: Path
+) -> tuple[dict[str, str], ...]:
+    schema: list[dict[str, str]] = []
+    for index, relation in enumerate(relations):
+        columns = (
+            "{"
+            + ",".join(
+                f"{_sql_string(item['name'])}:{_sql_string(item['type'])}"
+                for item in relation["columns"]
+            )
+            + "}"
+        )
+        reader = (
+            f"read_json({_sql_string(os.fspath(scratch / f'input-{index}.ndjson'))}, "
+            f"format='newline_delimited', columns={columns})"
+        )
+        try:
+            connection.execute(
+                f'CREATE TEMP VIEW "{relation["name"]}" AS SELECT * FROM {reader}'
+            )
+        except BaseException as error:
+            raise _WorkerFailure(
+                "folder_query_invalid",
+                "A query input relation could not be bound safely.",
+                {"stage": "binding", "relation": relation["name"]},
+            ) from error
+        schema.extend(
+            {"name": f"{relation['name']}.{item['name']}", "type": item["type"]}
+            for item in relation["columns"]
+        )
+    return tuple(schema)
+
+
 def _validate_request(raw: bytes) -> dict[str, Any]:
     try:
         value = json.loads(raw)
     except (UnicodeError, json.JSONDecodeError) as error:
         raise _WorkerFailure(
-            "file_query_invalid", "The private file-query request is malformed."
+            "folder_query_invalid", "The private file-query request is malformed."
         ) from error
-    expected = {
+    common = {
         "protocol",
         "duckdb_version",
-        "format",
-        "workspace_id",
-        "path_pattern",
         "canonical_sql",
         "sql_fingerprint",
-        "manifest_sha256",
-        "manifest_bytes",
-        "bindings",
         "query_seconds",
         "max_result_rows",
         "max_result_bytes",
@@ -562,83 +871,103 @@ def _validate_request(raw: bytes) -> dict[str, Any]:
         "rss_bytes",
         "threads",
     }
-    if not isinstance(value, dict) or set(value) != expected:
+    file_fields = {
+        "describe",
+        "format",
+        "workspace_id",
+        "path_pattern",
+        "manifest_sha256",
+        "manifest_bytes",
+        "bindings",
+    }
+    if not isinstance(value, dict) or set(value) not in (
+        common | file_fields,
+        common | {"relations"},
+    ):
         raise _WorkerFailure(
-            "file_query_invalid", "The private file-query request is invalid."
+            "folder_query_invalid", "The private file-query request is invalid."
         )
     if value["protocol"] != _PROTOCOL or value["duckdb_version"] != _DUCKDB_VERSION:
         raise _WorkerFailure(
             "dependency_unavailable",
             "The local structured-file query protocol is incompatible.",
         )
-    if value["format"] not in {
-        "csv",
-        "tsv",
-        "json_records",
-        "ndjson",
-        "parquet",
-    }:
-        raise _WorkerFailure(
-            "format_unsupported", "The structured-file format is unsupported."
-        )
-    if (
-        not isinstance(value["workspace_id"], str)
-        or not value["workspace_id"].startswith("workspace:sha256:")
-        or not isinstance(value["path_pattern"], str)
-        or not value["path_pattern"]
-        or value["path_pattern"].startswith("/")
-        or "\\" in value["path_pattern"]
-        or "\x00" in value["path_pattern"]
-    ):
-        raise _WorkerFailure(
-            "file_query_invalid", "The bound file-query manifest is invalid."
-        )
-    bindings = value["bindings"]
-    if not isinstance(bindings, list) or not 1 <= len(bindings) <= 1_000:
-        raise _WorkerFailure(
-            "file_pattern_too_broad", "The bound file-query manifest is invalid."
-        )
-    required_binding = {
-        "path",
-        "format",
-        "physical_revision",
-        "device",
-        "inode",
-        "mode",
-        "uid",
-        "gid",
-        "link_count",
-        "size_bytes",
-        "modified_ns",
-        "changed_ns",
-        "observed_at",
-    }
-    if any(
-        not isinstance(item, dict)
-        or set(item) != required_binding
-        or item.get("format") != value["format"]
-        for item in bindings
-    ):
-        raise _WorkerFailure(
-            "file_query_invalid", "The bound file-query manifest is invalid."
-        )
-    manifest_material = {
-        "protocol": "daita.local_file_query_manifest.v1",
-        "workspace_id": value["workspace_id"],
-        "path_pattern": value["path_pattern"],
-        "format": value["format"],
-        "bindings": bindings,
-    }
-    encoded_manifest = canonical_json(manifest_material).encode("utf-8")
-    if (
-        not isinstance(value["manifest_bytes"], int)
-        or isinstance(value["manifest_bytes"], bool)
-        or value["manifest_bytes"] != len(encoded_manifest)
-        or value["manifest_sha256"] != "sha256:" + sha256(encoded_manifest).hexdigest()
-    ):
-        raise _WorkerFailure(
-            "file_query_invalid", "The bound file-query manifest changed."
-        )
+    if "relations" in value:
+        _validate_relations(value["relations"])
+    else:
+        if not isinstance(value["describe"], bool):
+            raise _WorkerFailure(
+                "folder_query_invalid", "The private file-query request is invalid."
+            )
+        if value["format"] not in {
+            "csv",
+            "tsv",
+            "json_records",
+            "ndjson",
+            "parquet",
+        }:
+            raise _WorkerFailure(
+                "format_unsupported", "The structured-file format is unsupported."
+            )
+        if (
+            not isinstance(value["workspace_id"], str)
+            or not value["workspace_id"].startswith("workspace:sha256:")
+            or not isinstance(value["path_pattern"], str)
+            or not value["path_pattern"]
+            or value["path_pattern"].startswith("/")
+            or "\\" in value["path_pattern"]
+            or "\x00" in value["path_pattern"]
+        ):
+            raise _WorkerFailure(
+                "folder_query_invalid", "The bound file-query manifest is invalid."
+            )
+        bindings = value["bindings"]
+        if not isinstance(bindings, list) or not 1 <= len(bindings) <= 1_000:
+            raise _WorkerFailure(
+                "file_pattern_too_broad", "The bound file-query manifest is invalid."
+            )
+        required_binding = {
+            "path",
+            "format",
+            "physical_revision",
+            "device",
+            "inode",
+            "mode",
+            "uid",
+            "gid",
+            "link_count",
+            "size_bytes",
+            "modified_ns",
+            "changed_ns",
+            "observed_at",
+        }
+        if any(
+            not isinstance(item, dict)
+            or set(item) != required_binding
+            or item.get("format") != value["format"]
+            for item in bindings
+        ):
+            raise _WorkerFailure(
+                "folder_query_invalid", "The bound file-query manifest is invalid."
+            )
+        manifest_material = {
+            "protocol": "daita.local_file_query_manifest.v1",
+            "workspace_id": value["workspace_id"],
+            "path_pattern": value["path_pattern"],
+            "format": value["format"],
+            "bindings": bindings,
+        }
+        encoded_manifest = canonical_json(manifest_material).encode("utf-8")
+        if (
+            not isinstance(value["manifest_bytes"], int)
+            or isinstance(value["manifest_bytes"], bool)
+            or value["manifest_bytes"] != len(encoded_manifest)
+            or value["manifest_sha256"]
+            != "sha256:" + sha256(encoded_manifest).hexdigest()
+        ):
+            raise _WorkerFailure(
+                "folder_query_invalid", "The bound file-query manifest changed."
+            )
     integer_names = (
         "max_result_rows",
         "max_result_bytes",
@@ -656,7 +985,7 @@ def _validate_request(raw: bytes) -> dict[str, Any]:
         or isinstance(value["query_seconds"], bool)
     ):
         raise _WorkerFailure(
-            "file_query_invalid", "The private file-query limits are invalid."
+            "folder_query_invalid", "The private file-query limits are invalid."
         )
     try:
         LocalFileQueryLimits(
@@ -671,17 +1000,17 @@ def _validate_request(raw: bytes) -> dict[str, Any]:
         )
     except (TypeError, ValueError) as error:
         raise _WorkerFailure(
-            "file_query_invalid", "The private file-query limits are invalid."
+            "folder_query_invalid", "The private file-query limits are invalid."
         ) from error
     canonical_sql = value["canonical_sql"]
     if not isinstance(canonical_sql, str) or not 1 <= len(canonical_sql) <= 8 * 1_024:
         raise _WorkerFailure(
-            "file_query_invalid", "The canonical file query is invalid."
+            "folder_query_invalid", "The canonical file query is invalid."
         )
     fingerprint = "sha256:" + sha256(canonical_sql.encode("utf-8")).hexdigest()
     if value["sql_fingerprint"] != fingerprint:
         raise _WorkerFailure(
-            "file_query_invalid", "The canonical file-query fingerprint changed."
+            "folder_query_invalid", "The canonical file-query fingerprint changed."
         )
     return value
 
@@ -708,11 +1037,15 @@ def _revalidate_canonical_sql(request: dict[str, Any]) -> None:
         validate_duckdb_read,
     )
 
+    relations = request.get("relations")
+    names = (
+        ("data",) if relations is None else tuple(item["name"] for item in relations)
+    )
     try:
-        validated = validate_duckdb_read(str(request["canonical_sql"]))
+        validated = validate_duckdb_read(str(request["canonical_sql"]), names)
     except DuckDBReadValidationError as error:
         raise _WorkerFailure(
-            "file_query_invalid",
+            "folder_query_invalid",
             "The private worker rejected non-canonical file-query SQL.",
             {"reason": error.reason},
         ) from error
@@ -721,7 +1054,7 @@ def _revalidate_canonical_sql(request: dict[str, Any]) -> None:
         or validated.sql_fingerprint != request["sql_fingerprint"]
     ):
         raise _WorkerFailure(
-            "file_query_invalid",
+            "folder_query_invalid",
             "The private worker rejected changed file-query SQL.",
         )
 
@@ -970,8 +1303,12 @@ def _bind_data(
     *,
     format_name: str,
     descriptor_paths: tuple[str, ...],
-) -> tuple[dict[str, str], ...]:
+    describe: bool = False,
+) -> Any:
+    """Bind one homogeneous relation ``data``, or only describe each file."""
+
     schemas: list[tuple[tuple[object, ...], ...]] = []
+    described: list[list[dict[str, str]] | None] = []
     for path in descriptor_paths:
         reader = _reader_sql(format_name, (path,))
         try:
@@ -982,15 +1319,23 @@ def _bind_data(
                 ).fetchall()
             )
         except BaseException as error:
+            if describe:
+                described.append(None)
+                continue
             raise _WorkerFailure(
-                "file_query_invalid",
+                "folder_query_invalid",
                 "A matched structured file is malformed or unreadable.",
                 {"stage": "schema"},
             ) from error
         schemas.append(schema)
+        described.append(
+            [{"name": str(item[0]), "type": str(item[1])} for item in schema]
+        )
+    if describe:
+        return described
     if any(item != schemas[0] for item in schemas[1:]):
         raise _WorkerFailure(
-            "file_query_invalid",
+            "folder_query_invalid",
             "Matched files do not have one compatible logical schema.",
             {"stage": "schema_compatibility"},
         )
@@ -1001,7 +1346,7 @@ def _bind_data(
         )
     except BaseException as error:
         raise _WorkerFailure(
-            "file_query_invalid",
+            "folder_query_invalid",
             "The homogeneous structured dataset could not be bound safely.",
             {"stage": "binding"},
         ) from error
@@ -1044,12 +1389,12 @@ def _execute_bounded_query(
         cursor = connection.execute(sql)
         if cursor.description is None:
             raise _WorkerFailure(
-                "file_query_invalid", "The validated file query returned no rows."
+                "folder_query_invalid", "The validated file query returned no rows."
             )
         raw_names = tuple(str(item[0]) for item in cursor.description)
         if len(raw_names) > max_columns:
             raise _WorkerFailure(
-                "file_query_limited",
+                "folder_query_limited",
                 "The file query returned too many columns.",
                 {"column_limit": max_columns},
             )
@@ -1058,7 +1403,7 @@ def _execute_bounded_query(
             for name in raw_names
         ):
             raise _WorkerFailure(
-                "file_query_limited",
+                "folder_query_limited",
                 "A file-query result column name exceeded its bound.",
             )
         columns = _unique_columns(raw_names)
@@ -1068,29 +1413,32 @@ def _execute_bounded_query(
         raise
     except BaseException as error:
         raise _WorkerFailure(
-            "file_query_invalid",
+            "folder_query_invalid",
             "The validated local structured-file query failed.",
             {"stage": "query"},
         ) from error
 
     rows: list[dict[str, object]] = []
     byte_limited = False
+    # The canonical JSON array's size: brackets, rows and separating commas.
+    encoded_size = 2
     for raw in raw_rows[:max_rows]:
         row = {
             column: _json_value(value)
             for column, value in zip(columns, raw, strict=True)
         }
-        candidate = [*rows, row]
-        if len(canonical_json(candidate).encode("utf-8")) > max_bytes:
+        row_size = len(canonical_json(row).encode("utf-8")) + (1 if rows else 0)
+        if encoded_size + row_size > max_bytes:
             byte_limited = True
             break
         rows.append(row)
+        encoded_size += row_size
     reasons: list[str] = []
     if len(raw_rows) > max_rows:
         reasons.append("row_limit")
     if byte_limited:
         reasons.append("byte_limit")
-    encoded_rows = len(canonical_json(rows).encode("utf-8"))
+    encoded_rows = encoded_size
     data = {
         "canonical_sql": sql,
         "sql_fingerprint": sql_fingerprint,
@@ -1109,9 +1457,9 @@ def _execute_bounded_query(
     probe = canonical_json({"kind": "final", "status": "success", "data": data}).encode(
         "utf-8"
     )
-    if len(probe) > _MAX_RESPONSE_BYTES:
+    if len(probe) > _response_bound(max_bytes):
         raise _WorkerFailure(
-            "file_query_limited", "The file-query result exceeded its byte bound."
+            "folder_query_limited", "The file-query result exceeded its byte bound."
         )
     return data
 
@@ -1119,7 +1467,7 @@ def _execute_bounded_query(
 def _json_value(value: object, *, depth: int = 0) -> object:
     if depth > _MAX_VALUE_DEPTH:
         raise _WorkerFailure(
-            "file_query_limited",
+            "folder_query_limited",
             "A file-query value exceeded the bounded JSON projection.",
         )
     if value is None or isinstance(value, (bool, int, str)):
@@ -1127,14 +1475,14 @@ def _json_value(value: object, *, depth: int = 0) -> object:
     if isinstance(value, float):
         if not math.isfinite(value):
             raise _WorkerFailure(
-                "file_query_limited",
+                "folder_query_limited",
                 "A file-query value exceeded the bounded JSON projection.",
             )
         return value
     if isinstance(value, Decimal):
         if not value.is_finite():
             raise _WorkerFailure(
-                "file_query_limited",
+                "folder_query_limited",
                 "A file-query value exceeded the bounded JSON projection.",
             )
         return {"type": "decimal", "value": str(value)}
@@ -1157,19 +1505,19 @@ def _json_value(value: object, *, depth: int = 0) -> object:
     if isinstance(value, (tuple, list)):
         if len(value) > 1_024:
             raise _WorkerFailure(
-                "file_query_limited",
+                "folder_query_limited",
                 "A file-query value exceeded the bounded JSON projection.",
             )
         return [_json_value(item, depth=depth + 1) for item in value]
     if isinstance(value, dict):
         if len(value) > 1_024 or any(not isinstance(key, str) for key in value):
             raise _WorkerFailure(
-                "file_query_limited",
+                "folder_query_limited",
                 "A file-query value exceeded the bounded JSON projection.",
             )
         return {key: _json_value(item, depth=depth + 1) for key, item in value.items()}
     raise _WorkerFailure(
-        "file_query_limited",
+        "folder_query_limited",
         "A file-query value exceeded the bounded JSON projection.",
     )
 
@@ -1244,14 +1592,16 @@ def _sql_list(values: tuple[str, ...]) -> str:
     return "[" + ",".join(_sql_string(item) for item in values) + "]"
 
 
-def _send_message(connection: _PipeEndpoint, value: dict[str, object]) -> None:
+def _send_message(
+    connection: _PipeEndpoint, value: dict[str, object], bound: int
+) -> None:
     encoded = canonical_json(value).encode("utf-8")
-    if len(encoded) > _MAX_RESPONSE_BYTES:
+    if len(encoded) > bound:
         encoded = canonical_json(
             {
                 "kind": "final",
                 "status": "error",
-                "code": "file_query_limited",
+                "code": "folder_query_limited",
                 "message": "The private file-query result exceeded its byte bound.",
                 "details": {},
             }
@@ -1260,18 +1610,22 @@ def _send_message(connection: _PipeEndpoint, value: dict[str, object]) -> None:
 
 
 def _receive_messages(
-    connection: _PipeEndpoint, final: dict[str, object] | None
+    connection: _PipeEndpoint,
+    final: dict[str, object] | None,
+    limits: LocalFileQueryLimits,
 ) -> dict[str, object] | None:
     while connection.poll(0):
         try:
-            raw = connection.recv_bytes(maxlength=_MAX_RESPONSE_BYTES)
+            raw = connection.recv_bytes(
+                maxlength=_response_bound(limits.max_result_bytes)
+            )
         except (EOFError, ConnectionResetError):
             break
         try:
             message = json.loads(raw)
         except (UnicodeError, json.JSONDecodeError) as error:
             raise LocalFileQueryError(
-                "file_query_invalid",
+                "folder_query_invalid",
                 "The private file-query worker returned a malformed result.",
             ) from error
         if not isinstance(message, dict) or message.get("kind") not in {
@@ -1279,7 +1633,7 @@ def _receive_messages(
             "final",
         }:
             raise LocalFileQueryError(
-                "file_query_invalid",
+                "folder_query_invalid",
                 "The private file-query worker returned an invalid result.",
             )
         if message.get("kind") == "final":

@@ -24,7 +24,7 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
 from daita.loop.models import LoopExitKind, RunInput
-from daita.scope import resolve_effective_source_scope
+from daita.scope import EffectiveSourceScope, resolve_effective_source_scope
 from tests.support.workspace import workspace_for
 
 
@@ -244,8 +244,9 @@ async def test_one_run_filter_narrows_sources_and_preserves_classified_history(
         override_run = (await agent.transcript(override.run_id)).run
         assert override_run.source_scope_ids == (second_source.id,)
         assert override_run.resolved_source_scope is not None
+        # The filter narrows catalog sources; the live session folder stays.
         assert override_run.resolved_source_scope.source_ids == frozenset(
-            {second_source.id}
+            {second_source.id, agent.session_source_id}
         )
         assert _user_texts(provider.requests[0]) == ("Question about first_records",)
         assert _user_texts(provider.requests[1]) == (
@@ -383,8 +384,11 @@ async def test_source_filter_still_projects_source_independent_file_tools(
 
 
 class _ScopeCatalog:
-    def __init__(self):
+    def __init__(self, session_source_id: str | None = None):
         self.resources = {"first": {"first-row"}, "second": {"second-row"}}
+        self.session_source_id = session_source_id
+        if session_source_id is not None:
+            self.resources[session_source_id] = set()
         self.calls = 0
 
     async def source_routing_facts(self, agent_id, source_ids=()):
@@ -508,11 +512,9 @@ async def test_frozen_catalog_ceiling_blocks_expansion_and_revocation_narrows(
 
 
 async def test_prepared_empty_and_files_only_scope_never_expand():
-    catalog = _ScopeCatalog()
+    catalog = _ScopeCatalog("live")
     run = RunInput("empty", "agent", "Files only", datetime.now(UTC))
-    denied = await resolve_effective_source_scope(run, catalog, files_only=True)
-    assert not denied.source_ids and not denied.resource_ids
-    assert catalog.calls == 0
+    denied = EffectiveSourceScope(frozenset(), frozenset())
     assert (
         await resolve_effective_source_scope(
             replace(run, resolved_source_scope=denied), catalog
@@ -520,6 +522,15 @@ async def test_prepared_empty_and_files_only_scope_never_expand():
         == denied
     )
     assert catalog.calls == 0
+    # A files-only run is prepared with exactly the live session source.
+    files_only = EffectiveSourceScope(frozenset({"live"}), frozenset())
+    catalog.resources["third"] = {"third-row"}
+    assert (
+        await resolve_effective_source_scope(
+            replace(run, resolved_source_scope=files_only), catalog
+        )
+        == files_only
+    )
 
 
 async def test_private_continuity_survives_detach_compression_and_restart(tmp_path):

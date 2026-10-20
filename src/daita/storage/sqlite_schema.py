@@ -53,7 +53,17 @@ CREATE TABLE analysis_evidence (
 );
 CREATE INDEX analysis_evidence_by_agent_run ON analysis_evidence (agent_id, run_id);
 """
-CURRENT_DATABASE_SQL = REVISION_3_DATABASE_SQL + ANALYSIS_EVIDENCE_SQL
+CATALOG_LINKS_SQL = """
+CREATE TABLE catalog_links (
+    agent_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY(agent_id, id)
+);
+"""
+CURRENT_DATABASE_SQL = (
+    REVISION_3_DATABASE_SQL + ANALYSIS_EVIDENCE_SQL + CATALOG_LINKS_SQL
+)
 SCHEMA_REVISION_4 = schema_from_sql(CURRENT_DATABASE_SQL)
 CURRENT_SCHEMA = SCHEMA_REVISION_4
 

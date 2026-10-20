@@ -107,9 +107,11 @@ class StateStore(
 
     async def load_identity(self) -> AgentIdentity | None: ...
 
-    async def load_deletion_credential_inventory(
-        self, agent_id: str
-    ) -> tuple[AgentIdentity | None, tuple[str, ...], tuple[str, ...]]: ...
+    async def load_deletion_credential_inventory(self, agent_id: str) -> tuple[
+        AgentIdentity | None,
+        tuple[tuple[str, Mapping[str, object]], ...],
+        tuple[str, ...],
+    ]: ...
 
     async def store_mcp_binding(
         self, binding: MCPServerBinding, *, expected_revision: int | None

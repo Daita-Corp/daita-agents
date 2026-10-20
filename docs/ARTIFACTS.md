@@ -74,7 +74,8 @@ Daita XLSX snapshot to CSV without rerunning its source. `artifact_save_local`
 saves a copy to an approved local destination.
 
 An edit artifact retains the exact physical anchor, anchor-relative path,
-revision, and original content hash authenticated by `file_read`. This applies
+revision, and original content hash authenticated by a session folder
+`file_read`. This applies
 equally to the working directory and an external local location. Replacement
 approval displays the qualified target, then the delivery path reopens and
 revalidates that same anchor and file; it never rebases a failed external edit

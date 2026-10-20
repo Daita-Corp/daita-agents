@@ -29,6 +29,7 @@ from . import (
     CalendarSchedule,
     EffectReceipt,
     EffectResolutionDecision,
+    FolderSource,
     IntervalSchedule,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
@@ -49,6 +50,7 @@ from . import (
     ResourceRevisionPrecheck,
     RoutineState,
     ScheduledRoutineDraft,
+    SourceTypeRegistry,
     SQLiteSource,
     __version__,
     create_llm_provider,
@@ -400,7 +402,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     attach = commands.add_parser("attach", help="attach a read-only source")
     attach.add_argument("name")
-    attach.add_argument("kind", choices=("sqlite", "postgresql"))
+    attach.add_argument(
+        "kind",
+        choices=tuple(item.adapter_id for item in SourceTypeRegistry().types()),
+    )
     attach.add_argument("path", type=Path, nargs="?")
     attach.add_argument("--host")
     attach.add_argument("--port", type=int, default=5432)
@@ -2340,11 +2345,17 @@ async def _execute(args: argparse.Namespace) -> object:
 
 def _source_from_attach_args(
     args: argparse.Namespace,
-) -> SQLiteSource | PostgreSQLSource:
+) -> SQLiteSource | PostgreSQLSource | FolderSource:
     if args.kind == "sqlite":
         if args.path is None:
             raise ValueError("attach sqlite requires a path")
         return SQLiteSource(args.path)
+    if args.kind == "folder":
+        if args.path is None:
+            raise ValueError("attach folder requires a path")
+        return FolderSource(args.path, name=args.source_name)
+    if args.kind != "postgresql":
+        raise ValueError(f"attach {args.kind} has no command-line form")
     if args.path is not None:
         raise ValueError("attach postgresql does not accept a path")
     required = {

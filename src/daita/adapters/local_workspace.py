@@ -127,7 +127,7 @@ class LocalWorkspaceLimits:
 
     def __post_init__(self) -> None:
         integer_limits = (
-            (self.max_search_results, "max_search_results", 1, 1_000),
+            (self.max_search_results, "max_search_results", 1, 10_000),
             (self.max_search_entries, "max_search_entries", 1, 1_000_000),
             (self.max_search_depth, "max_search_depth", 1, 128),
             (
@@ -533,6 +533,8 @@ class _SearchState:
     cancellation: threading.Event
     deadline: float
     matches: list[LocalFileSearchMatch]
+    allowed_revisions: Mapping[str, str] | None = None
+    structured_only: bool = False
     scanned_entries: int = 0
     scanned_content_bytes: int = 0
     total_matches: int = 0
@@ -584,7 +586,7 @@ class _QueryPatternState:
         _check_cancelled(self.cancellation)
         if time.monotonic() >= self.deadline:
             raise LocalWorkspaceError(
-                "file_query_timeout",
+                "folder_query_timeout",
                 "File-query pattern binding exceeded its bounded worker time.",
             )
 
@@ -757,7 +759,14 @@ class LocalWorkspaceBackend:
         mode: str = "paths",
         glob: str | None = None,
         order_by: str = "path",
+        allowed_revisions: Mapping[str, str] | None = None,
+        structured_only: bool = False,
     ) -> LocalFileSearchResult:
+        """Search admitted files; ``allowed_revisions`` limits matches to exact
+        root-relative files still at their physical revision, checked before
+        any content is read, and ``structured_only`` to files with a query
+        format."""
+
         _required_run_id(run_id)
         raw_paths = _search_roots(path, paths)
         if mode not in {"paths", "content", "both"}:
@@ -805,6 +814,8 @@ class LocalWorkspaceBackend:
             self._limits,
             self._protected_identities,
             self._protected_paths,
+            allowed_revisions,
+            structured_only,
             cancellation,
             timeout=self._limits.max_search_seconds + 1.0,
             timeout_code="search_timeout",
@@ -818,7 +829,11 @@ class LocalWorkspaceBackend:
         path: str | None = None,
         cursor: str | None = None,
         position: str | None = None,
+        allowed_revisions: Mapping[str, str] | None = None,
     ) -> LocalFileReadResult:
+        """Read one bounded chunk; ``allowed_revisions`` admits only those
+        root-relative files at those physical revisions, before any I/O."""
+
         _required_run_id(run_id)
         if (path is None) == (cursor is None):
             raise LocalWorkspaceError(
@@ -857,6 +872,17 @@ class LocalWorkspaceBackend:
             location = self._resolve_location(path, allow_root=False)
             relative_path = location.relative_path
             direction = "backward" if position == "end" else "forward"
+        if allowed_revisions is not None:
+            allowed = allowed_revisions.get(relative_path)
+            if allowed is None:
+                raise LocalWorkspaceError(
+                    "path_not_allowed", "The file is not admitted for this read."
+                )
+            if expected_revision not in (None, allowed):
+                raise LocalWorkspaceError(
+                    "file_changed", "The file changed after the previous read chunk."
+                )
+            expected_revision = allowed
         if cursor is not None:
             anchor_id = _token_text(payload, "workspace_id")
             root = self._anchor_for_workspace_id(anchor_id)
@@ -943,17 +969,31 @@ class LocalWorkspaceBackend:
 
         _required_run_id(run_id)
         location, pattern_parts = self._resolve_query_pattern(path_pattern)
-        descriptor = self._duplicate_anchor(location.root)
+        return await self._bind_manifest(
+            location.root,
+            location.relative_path,
+            location.qualified_path,
+            (pattern_parts,),
+        )
+
+    async def _bind_manifest(
+        self,
+        root: _RootDescriptor,
+        pattern: str,
+        qualified_pattern: str,
+        patterns: tuple[tuple[str, ...], ...],
+    ) -> LocalFileQueryManifest:
+        descriptor = self._duplicate_anchor(root)
         cancellation = threading.Event()
         worker: asyncio.Task[LocalFileQueryManifest] = asyncio.create_task(
             asyncio.to_thread(
                 _bind_query_manifest_sync,
                 descriptor,
-                location.root,
-                _workspace_id(location.root),
-                location.relative_path,
-                location.qualified_path,
-                pattern_parts,
+                root,
+                _workspace_id(root),
+                pattern,
+                qualified_pattern,
+                patterns,
                 self._limits,
                 _utc_iso(self._clock()),
                 self._protected_identities,
@@ -973,7 +1013,7 @@ class LocalWorkspaceBackend:
                 await _settle_worker(worker)
                 _close_query_manifest_result(worker)
                 raise LocalWorkspaceError(
-                    "file_query_timeout",
+                    "folder_query_timeout",
                     "File-query pattern binding exceeded its bounded worker time.",
                 ) from error
             except asyncio.CancelledError:
@@ -983,6 +1023,31 @@ class LocalWorkspaceBackend:
                 raise
         finally:
             self._active.pop(worker, None)
+
+    async def bind_exact_manifest(
+        self,
+        *,
+        run_id: str,
+        paths: tuple[str, ...],
+    ) -> LocalFileQueryManifest:
+        """Retain exact root-relative files as one homogeneous dataset."""
+
+        _required_run_id(run_id)
+        if self.access is not LocalFileAccess.WORKSPACE:
+            raise LocalWorkspaceError(
+                "path_invalid", "Exact file binding requires a contained workspace."
+            )
+        if not paths or len(set(paths)) != len(paths):
+            raise LocalWorkspaceError(
+                "path_invalid", "Exact file binding needs distinct paths."
+            )
+        patterns = tuple(_query_pattern(_logical_path(item)) for item in paths)
+        if any(_pattern_has_magic(part) for parts in patterns for part in parts):
+            raise LocalWorkspaceError(
+                "path_invalid", "Exact file binding cannot use patterns."
+            )
+        label = paths[0] if len(paths) == 1 else canonical_json(sorted(paths))
+        return await self._bind_manifest(self._root, label, label, patterns)
 
     async def query(
         self,
@@ -1004,6 +1069,41 @@ class LocalWorkspaceBackend:
                 canonical_sql=canonical_sql,
                 sql_fingerprint=sql_fingerprint,
             )
+        finally:
+            manifest.close()
+
+    async def query_manifest(
+        self,
+        *,
+        manifest: LocalFileQueryManifest,
+        canonical_sql: str,
+        sql_fingerprint: str,
+        limits: LocalFileQueryLimits | None = None,
+    ) -> LocalFileQueryResult:
+        """Execute one validated query over a manifest this backend bound."""
+
+        if manifest.workspace_id not in self._roots_by_id:
+            raise LocalWorkspaceError(
+                "workspace_unavailable", "The file-query manifest is foreign."
+            )
+        return await self._query_backend.query(
+            manifest=manifest,
+            canonical_sql=canonical_sql,
+            sql_fingerprint=sql_fingerprint,
+            limits=limits,
+        )
+
+    async def describe(
+        self,
+        *,
+        run_id: str,
+        paths: tuple[str, ...],
+    ) -> tuple[tuple[tuple[str, str], ...] | None, ...]:
+        """Read the logical schema of exact files of one structured format."""
+
+        manifest = await self.bind_exact_manifest(run_id=run_id, paths=paths)
+        try:
+            return await self._query_backend.describe(manifest=manifest)
         finally:
             manifest.close()
 
@@ -1719,6 +1819,12 @@ def _physical_revision(value: os.stat_result) -> str:
     return "sha256:" + sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 
+def structured_file_format(relative_path: str) -> str | None:
+    """Return the query format a file suffix names, or None if unstructured."""
+
+    return _LOCAL_QUERY_FORMATS.get(PurePosixPath(relative_path).suffix.casefold())
+
+
 def physical_revision_for_facts(value: os.stat_result) -> str:
     """Return the canonical physical revision for a code-observed regular file."""
 
@@ -1731,7 +1837,7 @@ def _bind_query_manifest_sync(
     workspace_id: str,
     pattern: str,
     qualified_pattern: str,
-    pattern_parts: tuple[str, ...],
+    patterns: tuple[tuple[str, ...], ...],
     limits: LocalWorkspaceLimits,
     observed_at: str,
     protected_identities: frozenset[tuple[int, int]],
@@ -1760,14 +1866,15 @@ def _bind_query_manifest_sync(
                 "workspace_identity_changed",
                 "The local file anchor changed after admission.",
             )
-        _expand_query_pattern(
-            root_descriptor,
-            (),
-            pattern_parts,
-            0,
-            depth=0,
-            state=state,
-        )
+        for pattern_parts in patterns:
+            _expand_query_pattern(
+                root_descriptor,
+                (),
+                pattern_parts,
+                0,
+                depth=0,
+                state=state,
+            )
         state.check()
         if not state.bindings:
             raise LocalWorkspaceError(
@@ -2012,7 +2119,7 @@ def _bind_query_file(
     relative_path = PurePosixPath(*parents, name).as_posix()
     if relative_path in state.bindings:
         return
-    format_name = _LOCAL_QUERY_FORMATS.get(PurePosixPath(name).suffix.casefold())
+    format_name = structured_file_format(name)
     if format_name is None:
         raise LocalWorkspaceError(
             "format_unsupported",
@@ -2076,6 +2183,8 @@ def _search_many_sync(
     limits: LocalWorkspaceLimits,
     protected_identities: frozenset[tuple[int, int]],
     protected_paths: tuple[Path, ...],
+    allowed_revisions: Mapping[str, str] | None,
+    structured_only: bool,
     cancellation: threading.Event,
 ) -> LocalFileSearchResult:
     open_descriptors = {descriptor for _index, descriptor, _location in roots}
@@ -2089,6 +2198,8 @@ def _search_many_sync(
         cancellation=cancellation,
         deadline=time.monotonic() + limits.max_search_seconds,
         matches=[],
+        allowed_revisions=allowed_revisions,
+        structured_only=structured_only,
     )
     coverage = dict(initial_coverage)
     if any(item.status == "failed" for item in coverage.values()):
@@ -2354,7 +2465,13 @@ def _scan_directory(
             continue
         if state.glob is not None and not fnmatch.fnmatchcase(name, state.glob):
             continue
+        if state.structured_only and structured_file_format(name) is None:
+            continue
         relative_path = PurePosixPath(*parents, name).as_posix()
+        if state.allowed_revisions is not None and state.allowed_revisions.get(
+            relative_path
+        ) != _physical_revision(before):
+            continue
         path_matches = state.query_folded in relative_path.casefold()
         if state.mode in {"paths", "both"} and path_matches:
             _add_search_match(
@@ -3521,4 +3638,5 @@ __all__ = [
     "LocalWorkspaceError",
     "LocalWorkspaceLimits",
     "physical_revision_for_facts",
+    "structured_file_format",
 ]

@@ -581,9 +581,9 @@ class _NativeProvider(_Provider):
                 )
             else:
                 prefix = (
-                    "rs = tools.batch([{'name':'file_read', 'arguments':{'path':p}} for p in ['one.txt','two.txt']])"
+                    "rs = tools.batch([{'name':'file_read', 'arguments':{'source_id':'s1','path':p}} for p in ['one.txt','two.txt']])"
                     if self.mode == "batch"
-                    else "rs = [tools.call('file_read', {'path':p}) for p in ['one.txt','two.txt']]"
+                    else "rs = [tools.call('file_read', {'source_id':'s1', 'path':p}) for p in ['one.txt','two.txt']]"
                 )
                 code = (
                     prefix

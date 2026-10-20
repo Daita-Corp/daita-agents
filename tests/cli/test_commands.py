@@ -21,6 +21,7 @@ from daita import (
     Agent,
     ApprovalDecision,
     ApprovalRequest,
+    FolderSource,
     PostgreSQLSource,
     Skill,
     SkillSummary,
@@ -497,6 +498,26 @@ def test_attach_postgresql_reports_missing_connection_fields():
         ValueError,
         match=r"attach postgresql requires --host, --database, --username",
     ):
+        cli._source_from_attach_args(args)
+
+
+def test_attach_parser_builds_folder_source(tmp_path: Path):
+    args = cli.build_parser().parse_args(
+        ["attach", "atlas", "folder", str(tmp_path), "--source-name", "Drop"]
+    )
+
+    source = cli._source_from_attach_args(args)
+
+    assert isinstance(source, FolderSource)
+    assert Path(source.root) == tmp_path
+    assert source.name == "Drop"
+
+
+def test_attach_refuses_a_kind_without_a_command_line_form():
+    args = cli.build_parser().parse_args(["attach", "atlas", "postgresql"])
+    args.kind = "memory-table"
+
+    with pytest.raises(ValueError, match="attach memory-table has no command-line"):
         cli._source_from_attach_args(args)
 
 

@@ -21,6 +21,7 @@ from daita import (
     WorkColumn,
     WorkKind,
 )
+from daita.errors import StateCompatibilityError
 from daita.observation import AgentEventKind
 from daita.security import KeychainStore
 
@@ -260,25 +261,38 @@ class DaitaApp(App[int]):
 
     async def _bootstrap_inner(self) -> None:
         names = await self.controller.list_agents()
-        if self._requested_agent:
-            await self._open(self._requested_agent)
-            if self._requested_conversation_id is not None:
+        # Agents whose state this release cannot admit stay listed so the user
+        # can still pick, create, or delete another agent.
+        unavailable: set[str] = set()
+        picker_error = ""
+        if self._requested_conversation_id is not None and not self._requested_agent:
+            raise ValueError("conversation_id requires a requested agent")
+        first = self._requested_agent or (names[0] if len(names) == 1 else None)
+        if first:
+            picker_error = await self._open_or_report(first, unavailable)
+            if not picker_error and self._requested_conversation_id is not None:
                 if not await self.controller.require_agent().conversation_exists(
                     self._requested_conversation_id
                 ):
                     raise ValueError("unknown conversation for requested agent")
                 self.controller.conversation_id = self._requested_conversation_id
-        elif self._requested_conversation_id is not None:
-            raise ValueError("conversation_id requires a requested agent")
-        elif len(names) == 1:
-            await self._open(names[0])
-        elif names:
-            picker_error = ""
+        if names:
             while self.controller.agent is None:
                 selected = await self._await_modal(
                     SelectionScreen(
                         title="Select an agent",
-                        options=tuple(PickerOption(name, name) for name in names),
+                        options=tuple(
+                            PickerOption(
+                                name,
+                                name,
+                                (
+                                    "cannot open with this release"
+                                    if name in unavailable
+                                    else ""
+                                ),
+                            )
+                            for name in names
+                        ),
                         secondary_action=PickerOption(
                             _CREATE_NEW_AGENT_SELECTION,
                             "Create new agent",
@@ -333,8 +347,8 @@ class DaitaApp(App[int]):
                             self.exit(0)
                             return
                     continue
-                await self._open(selected[0])
-        else:
+                picker_error = await self._open_or_report(selected[0], unavailable)
+        elif self.controller.agent is None:
             created = await self._await_modal(AgentCreateScreen())
             if created is None:
                 self.exit(0)
@@ -348,6 +362,17 @@ class DaitaApp(App[int]):
             observer=self._observer,
             approval_handler=self.handle_approval,
         )
+
+    async def _open_or_report(self, name: str, unavailable: set[str]) -> str:
+        """Open one agent, or return a picker error when its state is incompatible."""
+
+        try:
+            await self._open(name)
+        except StateCompatibilityError as error:
+            unavailable.add(name)
+            return f"{name}: {error}"
+        unavailable.discard(name)
+        return ""
 
     async def _open(self, name: str) -> None:
         self._reset_background_status()
@@ -529,7 +554,8 @@ class DaitaApp(App[int]):
                 skill_matches = ()
             try:
                 source_matches = source_override_completions(
-                    await self.controller.list_sources()
+                    await self.controller.list_sources(),
+                    self.controller.source_types(),
                 )
             except Exception:
                 source_matches = ()
@@ -1417,9 +1443,8 @@ class DaitaApp(App[int]):
             activity = {
                 "toolbox_search": "Searching toolboxes",
                 "toolbox_load": "Loading selected tools",
-                "file_search": "Searching local files",
-                "file_read": "Reading local file",
-                "file_query": "Querying local file data",
+                "file_search": "Searching folder files",
+                "file_read": "Reading folder file",
                 "catalog_search": "Searching catalog",
                 "catalog_describe": "Describing catalog",
                 "data_query": "Querying data source",

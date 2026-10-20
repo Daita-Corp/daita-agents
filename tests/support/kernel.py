@@ -187,6 +187,9 @@ class _RuntimeCatalog:
 
 
 class _SnapshotCatalog:
+    # No live session folder source.
+    session_source_id: str | None = None
+
     async def source_routing_facts(self, agent_id, source_ids=()):
         return ({"source_id": "source-snapshot", "adapter_id": "sqlite"},)
 

@@ -347,24 +347,24 @@ async def test_python_guidance_follows_applicable_loaded_projection(
         ),
         (
             "Compute from this input.",
-            "data.local_file.query",
-            "data.local_file.query_result",
+            "data.query_files",
+            "data.query_files_result",
             {"format": "csv", "columns": ["aliased_total"]},
             False,
             {"CSV", "query results"},
         ),
         (
             "Compute from this input.",
-            "data.local_file.read",
-            "data.local_file.read_result",
+            "data.read_text",
+            "data.read_text_result",
             {"path": "sales.CSV"},
             False,
             {"CSV"},
         ),
         (
             "Compute from this input.",
-            "data.local_file.read",
-            "data.local_file.read_result",
+            "data.read_text",
+            "data.read_text_result",
             {"path": "notes.txt", "content": "CSV database query chart"},
             False,
             set(),
@@ -399,7 +399,7 @@ async def test_python_procedures_use_current_task_and_typed_metadata(
             supports_tools=True,
         ),
     )
-    ids = ("analysis.execute", "data.query", "data.local_file.query")
+    ids = ("analysis.execute", "data.query", "data.query_files")
     projection = ContextToolProjectionAdapter(
         tuple(
             ToolDefinition(
@@ -407,7 +407,7 @@ async def test_python_procedures_use_current_task_and_typed_metadata(
                 description="Read or compute.",
                 input_schema={"type": "object"},
             )
-            for name in ("python_execute", "data_query", "file_query")
+            for name in ("python_execute", "data_query", "file_read")
         ),
         capability_ids=ids,
     )
@@ -464,7 +464,7 @@ async def test_python_procedures_use_current_task_and_typed_metadata(
     assert {tool.name for tool in request.tools} == {
         "python_execute",
         "data_query",
-        "file_query",
+        "file_read",
         "toolbox_inspect",
     }
     assert request.messages[-len(messages) :] == messages
@@ -613,7 +613,9 @@ async def test_dataset_guidance_requires_exact_loaded_export_metadata(
 
     monkeypatch.setattr("daita.domains.analysis.domain.available", lambda: True)
     analysis = AnalysisCapabilityDomain(RunAdmissionCoordinator())
-    exports = exact_export_capability_declarations(allow_arrow=arrow)
+    exports = exact_export_capability_declarations(
+        adapter_ids=("sqlite", "postgresql"), allow_arrow=arrow
+    )
     query = data_query_capability_declarations(
         file_outputs=exact_export_outputs(allow_arrow=arrow),
         file_capability_id=exports.capabilities[0].id,

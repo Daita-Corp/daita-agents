@@ -6,6 +6,7 @@ import pytest
 
 from daita import Agent, SQLiteSource
 from daita.adapters import sqlite_query as sqlite_query_module
+from daita.adapters.registry import SourceTypeRegistry
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -15,6 +16,10 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop import LoopExitKind
+from daita.security import EmptySecretProvider
+from tests.support.source_contract import (
+    assert_source_type_contract,
+)
 from tests.support.workspace import workspace_for
 
 
@@ -287,7 +292,7 @@ async def test_public_agent_queries_sqlite_and_reopens_exact_transcript(tmp_path
     provider = MockModelProvider(())
     profile = ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=24_000,
+        context_window_tokens=32_000,
         max_output_tokens=1_000,
         supports_tools=True,
         supports_parallel_tools=True,
@@ -403,3 +408,16 @@ async def test_invalid_sql_is_a_model_visible_tool_error(tmp_path):
         assert provider.requests[1].messages[-2] == transcript.messages[2]
     finally:
         await agent.close()
+
+
+@pytest.mark.contract
+async def test_sqlite_source_type_satisfies_the_source_contract(tmp_path) -> None:
+    database = tmp_path / "contract.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, total REAL)")
+
+    await assert_source_type_contract(
+        SourceTypeRegistry().require("sqlite"),
+        SQLiteSource(database, name="Contract"),
+        secret_provider=EmptySecretProvider(),
+    )

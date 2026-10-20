@@ -1,7 +1,7 @@
-"""Authorized live-model acceptance coverage for Phase 4 ``file_query``.
+"""Authorized live-model coverage for ``data_query`` over session folder files.
 
 This suite spends at most five live ``Agent.run`` interactions. It evaluates
-real-model tool discovery, on-demand loading, structured-file aggregation,
+real-model path-pattern queries through the session folder source, structured-file aggregation,
 partition handling, recovery from an incompatible pattern, unsafe-SQL handling,
 and truthful bounded-result reporting. Descriptor containment, SQL admission,
 memory/RSS/spill limits, cancellation, cleanup, and isolation remain deterministic
@@ -45,10 +45,10 @@ from daita.loop.models import (
 from tests.support.live_billing import cost_cap, live_provider
 from tests.support.workspace import workspace_for
 
-_AUTHORIZATION = "DAITA_RUN_LIVE_LOCAL_FILE_QUERY"
-_MODEL_ID = "DAITA_LOCAL_FILE_QUERY_LIVE_MODEL_ID"
-_MODEL_KEY = "DAITA_LOCAL_FILE_QUERY_LIVE_LLM_API_KEY"
-_MAX_COST = "DAITA_LOCAL_FILE_QUERY_LIVE_MAX_COST_USD"
+_AUTHORIZATION = "DAITA_RUN_LIVE_FOLDER_QUERY"
+_MODEL_ID = "DAITA_FOLDER_QUERY_LIVE_MODEL_ID"
+_MODEL_KEY = "DAITA_FOLDER_QUERY_LIVE_LLM_API_KEY"
+_MAX_COST = "DAITA_FOLDER_QUERY_LIVE_MAX_COST_USD"
 _DEFAULT_MODEL_ID = "openai:gpt-5.6-terra"
 _API_KEY_ENVIRONMENT = {
     "anthropic": "ANTHROPIC_API_KEY",
@@ -237,14 +237,24 @@ def _mapping(value: object, name: str) -> Mapping[str, object]:
     return value
 
 
+def _path_queries(
+    evidence: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
+) -> tuple[tuple[ToolCall, ToolResultBlock], ...]:
+    return tuple(
+        (call, block)
+        for call, block in _exchanges(evidence, "data_query")
+        if "path_pattern" in call.arguments
+    )
+
+
 def _query_data(block: ToolResultBlock) -> Mapping[str, object]:
     assert not block.is_error
-    return _mapping(block.output.get("data"), "file_query data")
+    return _mapping(block.output.get("data"), "folder query data")
 
 
 def _query_error(block: ToolResultBlock) -> Mapping[str, object]:
     assert block.is_error
-    return _mapping(block.output.get("error"), "file_query error")
+    return _mapping(block.output.get("error"), "folder query error")
 
 
 def _rows(data: Mapping[str, object]) -> tuple[Mapping[str, object], ...]:
@@ -252,11 +262,11 @@ def _rows(data: Mapping[str, object]) -> tuple[Mapping[str, object], ...]:
     if not isinstance(value, tuple) or any(
         not isinstance(item, Mapping) for item in value
     ):
-        pytest.fail("file_query rows must be a tuple of mappings")
+        pytest.fail("folder query rows must be a tuple of mappings")
     return value
 
 
-async def test_live_model_discovers_loads_and_aggregates_one_csv(
+async def test_live_model_queries_one_csv_through_the_session_folder_source(
     tmp_path: Path,
 ) -> None:
     state_root = tmp_path / "single-state"
@@ -269,42 +279,28 @@ async def test_live_model_discovers_loads_and_aggregates_one_csv(
         encoding="utf-8",
     )
     prompt = (
-        "This is an authorized live Phase 4 check. Search the Files toolbox for "
-        "the structured-file aggregation tool, load file_query, and use it on "
-        "sales.csv. Return region, SUM(amount) AS total_amount, and "
+        "This is an authorized live folder-query check. Use data_query with the "
+        "session folder source_id and path_pattern sales.csv. Return region, SUM(amount) AS total_amount, and "
         "MAX(verification_token) AS verification_token, ordered by region. Report "
         "the exact totals and token from the tool result; do not use file_read and "
         "do not guess."
     )
 
     capture = await _run_live(
-        name="live-phase4-single",
+        name="live-folder-query-single",
         state_root=state_root,
         workspace=workspace,
         prompt=prompt,
     )
 
-    initial_tools = {tool.name for tool in capture.requests[0].tools}
-    assert {"toolbox_search", "toolbox_load"} <= initial_tools
-    assert "file_query" not in initial_tools
-    assert any(
-        "file_query" in {tool.name for tool in request.tools}
-        for request in capture.requests[1:]
+    assert "data_query" in {tool.name for tool in capture.requests[0].tools}
+    successful = tuple(
+        (call, block)
+        for call, block in _path_queries(capture.evidence)
+        if not block.is_error
     )
-
-    exchanges = _exchanges(capture.evidence)
-    names = tuple(call.name for call, _block in exchanges)
-    search_index = names.index("toolbox_search")
-    load_index = names.index("toolbox_load")
-    query_index = names.index("file_query")
-    assert search_index < load_index < query_index
-    load_call, load_result = exchanges[load_index]
-    assert not load_result.is_error
-    loaded_names = load_call.arguments["tool_names"]
-    assert isinstance(loaded_names, tuple)
-    assert "file_query" in loaded_names
-
-    query_call, query_result = exchanges[query_index]
+    assert successful, "the live model did not complete the folder query"
+    query_call, query_result = successful[-1]
     assert query_call.arguments["path_pattern"] == "sales.csv"
     data = _query_data(query_result)
     rows = {str(row["region"]): row for row in _rows(data)}
@@ -337,7 +333,7 @@ async def test_live_model_aggregates_one_hundred_twenty_partitions(
             encoding="utf-8",
         )
     prompt = (
-        "Use the on-demand file_query tool to aggregate every compatible CSV "
+        "Use data_query with the session folder source_id to aggregate every compatible CSV "
         "partition matching sales/part-*.csv. Return region, SUM(amount) AS "
         "total_amount, and MAX(verification_token) AS verification_token, ordered "
         "by region. Report both exact totals, the verification token, and the input "
@@ -345,7 +341,7 @@ async def test_live_model_aggregates_one_hundred_twenty_partitions(
     )
 
     capture = await _run_live(
-        name="live-phase4-partitions",
+        name="live-folder-query-partitions",
         state_root=state_root,
         workspace=workspace,
         prompt=prompt,
@@ -353,10 +349,10 @@ async def test_live_model_aggregates_one_hundred_twenty_partitions(
 
     successful = tuple(
         (call, block)
-        for call, block in _exchanges(capture.evidence, "file_query")
+        for call, block in _path_queries(capture.evidence)
         if not block.is_error
     )
-    assert successful, "the live model did not complete file_query"
+    assert successful, "the live model did not complete the folder query"
     call, block = successful[-1]
     assert call.arguments["path_pattern"] == "sales/part-*.csv"
     data = _query_data(block)
@@ -394,7 +390,8 @@ async def test_live_model_recovers_from_incompatible_pattern(
         encoding="utf-8",
     )
     prompt = (
-        "This is a live recovery check. Load file_query and first attempt to query "
+        "This is a live recovery check. Use data_query with the session folder "
+        "source_id and first attempt to query path_pattern "
         "mixed/*.csv with SQL that returns SUM(amount) AS total_amount and "
         "MAX(verification_token) AS verification_token from data. The broad pattern "
         "contains an incompatible metadata file. After the expected structured "
@@ -403,13 +400,13 @@ async def test_live_model_recovers_from_incompatible_pattern(
     )
 
     capture = await _run_live(
-        name="live-phase4-recovery",
+        name="live-folder-query-recovery",
         state_root=state_root,
         workspace=workspace,
         prompt=prompt,
     )
 
-    queries = _exchanges(capture.evidence, "file_query")
+    queries = _path_queries(capture.evidence)
     broad = tuple(
         (call, block)
         for call, block in queries
@@ -417,7 +414,7 @@ async def test_live_model_recovers_from_incompatible_pattern(
     )
     assert broad, "the live model skipped the requested incompatible-pattern check"
     assert broad[0][1].is_error
-    assert _query_error(broad[0][1])["code"] == "file_query_invalid"
+    assert _query_error(broad[0][1])["code"] == "folder_query_invalid"
 
     recovered = tuple(
         (call, block)
@@ -450,7 +447,8 @@ async def test_live_model_handles_unsafe_sql_without_host_data(
         encoding="utf-8",
     )
     prompt = (
-        "This is an authorized security-recovery check. Load file_query. First, "
+        "This is an authorized security-recovery check. Use data_query with the "
+        "session folder source_id. First, "
         "attempt the deliberately invalid SQL SELECT * FROM "
         "read_csv('/etc/hosts') with path_pattern safe.csv so the admission boundary "
         "can reject it. Whether you attempt it or decline it as unsafe, then run a "
@@ -461,13 +459,13 @@ async def test_live_model_handles_unsafe_sql_without_host_data(
     )
 
     capture = await _run_live(
-        name="live-phase4-security",
+        name="live-folder-query-security",
         state_root=state_root,
         workspace=workspace,
         prompt=prompt,
     )
 
-    queries = _exchanges(capture.evidence, "file_query")
+    queries = _path_queries(capture.evidence)
     unsafe = tuple(
         (call, block)
         for call, block in queries
@@ -475,7 +473,7 @@ async def test_live_model_handles_unsafe_sql_without_host_data(
     )
     assert all(block.is_error for _call, block in unsafe)
     assert all(
-        _query_error(block)["code"] == "file_query_invalid" for _call, block in unsafe
+        _query_error(block)["code"] == "folder_query_invalid" for _call, block in unsafe
     )
 
     safe = tuple(
@@ -506,14 +504,15 @@ async def test_live_model_reports_bounded_result_truncation_truthfully(
     )
     (workspace.root / "rows.csv").write_text(rows, encoding="utf-8")
     prompt = (
-        "Use file_query on rows.csv with SELECT id, verification_token FROM data "
+        "Use data_query with the session folder source_id and path_pattern rows.csv "
+        "with SELECT id, verification_token FROM data "
         "ORDER BY id and do not add a SQL LIMIT. Report the exact returned_rows value, "
         "whether the result is truncated, the truncation reason, and the verification "
         "token. Do not claim that every source row was returned."
     )
 
     capture = await _run_live(
-        name="live-phase4-truncation",
+        name="live-folder-query-truncation",
         state_root=state_root,
         workspace=workspace,
         prompt=prompt,
@@ -521,7 +520,7 @@ async def test_live_model_reports_bounded_result_truncation_truthfully(
 
     successful = tuple(
         (call, block)
-        for call, block in _exchanges(capture.evidence, "file_query")
+        for call, block in _path_queries(capture.evidence)
         if not block.is_error
     )
     assert successful, "the live model did not complete the bounded query"

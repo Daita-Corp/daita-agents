@@ -65,11 +65,12 @@ publication fails, earlier references remain available and `save_status="failed"
 reports the incomplete set. Check references before claiming that every requested
 file was retained. Candidates alone are not delivered artifacts.
 
-The version-1 worker helpers are ordinary Python objects:
+The version-1 worker helpers are ordinary Python objects. In these examples
+`source_id` is the session folder source's ID from the run context:
 
 ```python
 import json
-result = tools.call("file_read", {"path": "sales.json"})
+result = tools.call("file_read", {"source_id": source_id, "path": "sales.json"})
 if result["is_error"]:
     raise ValueError(result["output"])
 data = result["output"]["data"]
@@ -83,8 +84,8 @@ the same result shape for each element, in submission order:
 
 ```python
 results = tools.batch([
-    {"name": "file_read", "arguments": {"path": "sales.json"}},
-    {"name": "file_read", "arguments": {"path": "rates.json"}},
+    {"name": "file_read", "arguments": {"source_id": source_id, "path": "sales.json"}},
+    {"name": "file_read", "arguments": {"source_id": source_id, "path": "rates.json"}},
 ])
 for result in results:
     if result["is_error"]:
@@ -166,7 +167,7 @@ For example, with `file_read` already callable:
 import csv
 import io
 
-result = tools.call("file_read", {"path": "sales.csv"})
+result = tools.call("file_read", {"source_id": source_id, "path": "sales.csv"})
 if result["is_error"]:
     raise ValueError(result["output"])
 data = result["output"]["data"]

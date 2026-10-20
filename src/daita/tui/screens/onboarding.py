@@ -23,7 +23,6 @@ from ..models import (
     MODEL_SUGGESTIONS,
     POSTGRESQL_CONNECTION_URL_ERROR,
     PROVIDERS,
-    SOURCE_TYPES,
     SSL_MODES,
     PickerOption,
 )
@@ -416,7 +415,10 @@ class SourceSetupScreen(Screen[bool]):
         with Vertical(id="onboard", classes="control-panel source-panel"):
             yield Label("Attach a source", id="onboard-title", markup=False)
             yield Select(
-                ((label, key) for key, label in SOURCE_TYPES),
+                (
+                    (source_type.label, source_type.adapter_id)
+                    for source_type in self.app.controller.source_types()  # type: ignore[attr-defined]
+                ),
                 prompt="Source type",
                 id="source-type",
             )
@@ -468,6 +470,13 @@ class SourceSetupScreen(Screen[bool]):
                 )
             elif kind == "postgresql":
                 registration = await self._attach_postgresql(name, path_value)
+            elif kind == "folder":
+                if not path_value:
+                    raise ValueError("A folder requires a path")
+                registration = await self.app.controller.attach_folder(  # type: ignore[attr-defined]
+                    Path(path_value).expanduser(),
+                    name=name,
+                )
             else:
                 raise ValueError("Choose a source type")
             if registration is None:

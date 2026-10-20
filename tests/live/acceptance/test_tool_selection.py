@@ -14,6 +14,7 @@ import sqlite3
 from collections.abc import AsyncIterator, Mapping
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -295,12 +296,13 @@ async def test_live_mixed_file_source_comparison_uses_separate_queries(
         result = await agent.run(
             "This is an authorized Phase 5 mixed-workspace check. Compare local "
             "sales.csv with the connected customers table using separate validated "
-            "queries; never federate them in one SQL statement. Search the Files "
-            "toolbox, load file_query, and aggregate local revenue by region with "
-            "the local verification token. Separately inspect the connected schema "
+            "queries; never federate them in one SQL statement. Use data_query with "
+            "the session folder source_id and path_pattern to aggregate local "
+            "revenue by region with the local verification token. Separately "
+            "inspect the connected schema "
             "and query customer counts by segment with its verification token. "
             "Report the exact totals, counts, and both tokens from tool results.",
-            source_scope_ids=(source.id,),
+            source_scope_ids=(source.id, cast(str, agent.session_source_id)),
         )
         transcript = await agent.transcript(result.run_id)
         evidence = await agent.tool_evidence(result.run_id)
@@ -317,15 +319,17 @@ async def test_live_mixed_file_source_comparison_uses_separate_queries(
         for token in (_MIXED_FILE_TOKEN, _MIXED_SOURCE_TOKEN, "15", "20", "2", "1")
     )
     exchanges = _exchanges(evidence)
-    names = tuple(call.name for call, _block in exchanges)
-    assert (
-        names.index("toolbox_search")
-        < names.index("toolbox_load")
-        < names.index("file_query")
+    queries = _successful(evidence, "data_query")
+    file_call, file_result = next(
+        item for item in reversed(queries) if "path_pattern" in item[0].arguments
     )
-    assert names.index("catalog_describe") < names.index("data_query")
-    file_call, file_result = _successful(evidence, "file_query")[-1]
-    source_call, source_result = _successful(evidence, "data_query")[-1]
+    source_call, source_result = next(
+        item for item in reversed(queries) if "resource_ids" in item[0].arguments
+    )
+    names = tuple(call.name for call, _block in exchanges)
+    assert names.index("catalog_describe") < exchanges.index(
+        (source_call, source_result)
+    )
     assert file_call.arguments["path_pattern"] == "sales.csv"
     assert "customers" not in str(file_call.arguments["sql"])
     assert "sales.csv" not in str(source_call.arguments["sql"])

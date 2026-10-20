@@ -773,7 +773,7 @@ def test_compact_file_and_sql_error_receipts_keep_shape_state_and_order():
     file_call = ToolCall(
         id="file-call",
         name="file_read",
-        arguments={"path": "customers.csv"},
+        arguments={"source_id": "local-files", "path": "customers.csv"},
     )
     query_call = ToolCall(
         id="query-error-call",
@@ -799,7 +799,7 @@ def test_compact_file_and_sql_error_receipts_keep_shape_state_and_order():
                 ToolResultBlock(
                     call_id=file_call.id,
                     output={
-                        "kind": "data.local_file.read_result",
+                        "kind": "data.read_text_result",
                         "data": {
                             "path": "customers.csv",
                             "binding": "expired-binding-authority",

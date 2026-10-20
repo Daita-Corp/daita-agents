@@ -45,8 +45,8 @@ in a terminal. Run `daita` in a new terminal to return later.
 
 The first launch guides you through creating an agent, configuring a model, and
 optionally attaching a data source for reading. The launch directory becomes
-the default local working directory; foreground Files tools also accept
-explicit local paths.
+the default local working directory of the session folder source, which also
+accepts explicit local paths. You can attach other folders as cataloged sources.
 
 Try asking:
 

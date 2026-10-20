@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent
+from daita import Agent, SQLiteSource
+from daita.catalog import CatalogLinkStaleReason
 from daita.llm.models import TextBlock
 from daita.storage.home_migrations import (
     CURRENT_HOME_REVISION,
@@ -153,3 +154,50 @@ async def test_every_supported_golden_home_reaches_current_revision(
         assert not (home / ".home-rollbacks").exists()
     else:
         assert len(tuple((home / ".home-rollbacks").iterdir())) == 1
+
+
+async def test_released_revision_3_home_upgrades_and_keeps_declared_links(
+    tmp_path: Path,
+) -> None:
+    _materialize_fixture(FIXTURES / "revision-3", tmp_path / "agents/golden")
+    database = tmp_path / "linked.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY)")
+        connection.execute("CREATE TABLE orders (id INTEGER, customer_id INTEGER)")
+
+    agent = await Agent.open("golden", root=tmp_path, workspace=workspace_for(tmp_path))
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        resources = {
+            resource.name: resource.id
+            for resource in await agent.list_catalog_resources(source_id=source.id)
+        }
+        link = await agent.declare_catalog_link(
+            resources["orders"], resources["customers"], (("customer_id", "id"),)
+        )
+    finally:
+        await agent.close()
+
+    reopened = await Agent.open(
+        "golden", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        (status,) = await reopened.list_catalog_links()
+        assert status.link == link
+        assert status.current
+    finally:
+        await reopened.close()
+    assert len(tuple((tmp_path / "agents/golden/.home-rollbacks").iterdir())) == 1
+
+
+async def test_revision_4_golden_home_retains_its_declared_link(
+    tmp_path: Path,
+) -> None:
+    _materialize_fixture(FIXTURES / "revision-4", tmp_path / "agents/golden")
+    agent = await Agent.open("golden", root=tmp_path, workspace=workspace_for(tmp_path))
+    try:
+        (status,) = await agent.list_catalog_links()
+        assert status.link.note == "Golden declared link."
+        assert status.stale_reason is CatalogLinkStaleReason.SOURCE_INACTIVE
+    finally:
+        await agent.close()

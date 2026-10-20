@@ -1,4 +1,4 @@
-"""Phase 2 vertical locks for source-free local workspace reads."""
+"""Public locks for local workspace reads through the session folder source."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import inspect
 import json
 import sqlite3
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,12 @@ import daita
 from daita import Agent, LocalFileAccess, LocalWorkspace, SQLiteSource
 from daita.adapters.local_workspace import LocalWorkspaceBackend
 from daita.adapters.models import SourceRegistration
-from daita.domains.data import LOCAL_FILE_CAPABILITY_IDS, LOCAL_FILE_EXECUTOR_IDS
+from daita.domains.data import (
+    FILE_SEARCH_EXECUTOR_ID,
+    PATH_QUERY_EXECUTOR_ID,
+    SOURCE_FILE_CAPABILITY_IDS,
+    TEXT_READ_EXECUTOR_ID,
+)
 from daita.domains.data.export_capabilities import (
     ARTIFACT_EDIT_TEXT_TOOL_NAME,
     ARTIFACT_SAVE_LOCAL_EXECUTOR_ID,
@@ -34,6 +40,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.loop.models import RunInput
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -94,9 +101,9 @@ async def test_source_free_user_run_projects_and_executes_workspace_file_tools(
             _call(
                 "search",
                 "file_search",
-                {"query": "notes", "mode": "paths"},
+                {"source_id": "s1", "query": "notes", "mode": "paths"},
             ),
-            _call("read", "file_read", {"path": "notes.txt"}),
+            _call("read", "file_read", {"source_id": "s1", "path": "notes.txt"}),
             _stop("found it"),
         )
     )
@@ -170,7 +177,11 @@ async def test_public_computer_search_executes_multi_root_schema_once(
             _call(
                 "search",
                 "file_search",
-                {"paths": [str(downloads), str(documents)], "glob": "*.csv"},
+                {
+                    "source_id": "s1",
+                    "paths": [str(downloads), str(documents)],
+                    "glob": "*.csv",
+                },
             ),
             _stop(),
         )
@@ -207,7 +218,7 @@ async def test_public_computer_search_executes_multi_root_schema_once(
         await agent.close()
 
 
-async def test_files_only_omits_all_source_tools_with_multiple_sources(
+async def test_files_only_scopes_the_run_to_the_session_folder_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -225,24 +236,33 @@ async def test_files_only_omits_all_source_tools_with_multiple_sources(
         model_profile=_profile(provider),
     )
     try:
-        await agent.attach(SQLiteSource(first_database))
-        await agent.attach(SQLiteSource(second_database))
+        first = await agent.attach(SQLiteSource(first_database))
+        second = await agent.attach(SQLiteSource(second_database))
+
+        view = agent._embedded._data_view
+        session_source_id = agent.session_source_id
 
         async def unexpected_source_read(*_args, **_kwargs):
-            raise AssertionError("files-only projection must not read source state")
+            raise AssertionError("files-only context must not read catalog state")
 
+        def session_only(method_name: str):
+            original = getattr(view, method_name)
+
+            async def read(agent_id, source_ids=(), *args, **kwargs):
+                # Projection may consult only the live session folder source.
+                assert source_ids and set(source_ids) <= {session_source_id}
+                return await original(agent_id, source_ids, *args, **kwargs)
+
+            return read
+
+        for method_name in ("catalog_context", "semantic_resource_facts"):
+            monkeypatch.setattr(view, method_name, unexpected_source_read)
         for method_name in (
             "source_routing_facts",
             "relational_write_applicable_source_ids",
             "admitted_model_sensitivity",
-            "catalog_context",
-            "semantic_resource_facts",
         ):
-            monkeypatch.setattr(
-                agent._embedded._data_view,
-                method_name,
-                unexpected_source_read,
-            )
+            monkeypatch.setattr(view, method_name, session_only(method_name))
         await agent.run("Use files only", files_only=True)
         names = {tool.name for tool in provider.requests[0].tools}
         assert {"file_search", "file_read"} <= names
@@ -256,7 +276,9 @@ async def test_files_only_omits_all_source_tools_with_multiple_sources(
             for block in message.content
             if isinstance(block, TextBlock)
         )
-        assert '"sources":[]' in prompt
+        # The live session folder is the only source the run can see.
+        assert first.id not in prompt and second.id not in prompt
+        assert "Working folder" in prompt
     finally:
         await agent.close()
 
@@ -271,7 +293,7 @@ async def test_file_read_mixed_continuation_shape_fails_before_workspace_io(
             _call(
                 "invalid-continuation",
                 "file_read",
-                {"cursor": "opaque-cursor", "position": "start"},
+                {"source_id": "s1", "cursor": "opaque-cursor", "position": "start"},
             ),
             _stop(),
         )
@@ -349,10 +371,14 @@ async def test_hosted_composition_has_no_local_file_authority(tmp_path: Path) ->
         assert "artifact_save_local" not in embedded._capabilities.tool_names
         assert embedded._workspace_backend is None
         assert embedded._artifact_delivery is None
+        assert hosted.session_source_id is None
         assert not (
-            set(embedded._capabilities._capabilities) & LOCAL_FILE_CAPABILITY_IDS
+            set(embedded._capabilities._capabilities) & SOURCE_FILE_CAPABILITY_IDS
         )
-        assert not (set(embedded._capabilities._executors) & LOCAL_FILE_EXECUTOR_IDS)
+        assert not (
+            set(embedded._capabilities._executors)
+            & {FILE_SEARCH_EXECUTOR_ID, TEXT_READ_EXECUTOR_ID, PATH_QUERY_EXECUTOR_ID}
+        )
         assert not (
             set(embedded._capabilities._capabilities)
             & LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS
@@ -498,3 +524,39 @@ async def test_removed_preproduction_file_source_home_is_explicitly_rejected(
         await Agent.open("old-file-state", workspace=workspace, root=tmp_path)
     assert captured.value.code is StateCompatibilityCode.DAMAGED
     assert state_path.read_bytes() == before
+
+
+async def test_data_query_offers_only_routes_a_source_in_scope_can_serve(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    database = tmp_path / "orders.sqlite"
+    _database(database, "orders")
+    agent = await Agent.create("query-routes", workspace=workspace, root=tmp_path)
+    try:
+        runtime = agent._embedded._capability_runtime
+
+        async def routes(*source_scope_ids: str) -> set[str]:
+            run = RunInput(
+                f"routes-{len(source_scope_ids)}",
+                agent.id,
+                "Query the data",
+                datetime(2026, 10, 20, tzinfo=UTC),
+                source_scope_ids=source_scope_ids,
+            )
+            catalog = await runtime.prepare_run(run)
+            (entry,) = [
+                item for item in catalog.entries if item.view.name == "data_query"
+            ]
+            return {mode for mode, _route in entry.routes}
+
+        # The session folder alone exports nothing; it queries by path_pattern.
+        local_only = await routes()
+        assert "path_pattern" in local_only
+        assert not {"csv", "xlsx"} & local_only
+        source = await agent.attach(SQLiteSource(database))
+        # A source filter narrows catalog sources; the session folder stays.
+        narrowed = await routes(source.id)
+        assert {"csv", "xlsx", "path_pattern"} <= narrowed
+    finally:
+        await agent.close()

@@ -2,7 +2,10 @@
 
 A local Daita session can read ordinary files allowed by the host OS. The
 launch directory sets the default for relative paths, but you can also give an
-absolute or `~/` path. Local Files are separate from registered data sources.
+absolute or `~/` path. These files reach the agent through the **session folder
+source**: a live folder source built for each session from the working
+directory and never stored in the agent home. You can also attach a folder as a
+durable, cataloged source (see [Attached folders](#attached-folders)).
 To change an existing text file, Daita first creates an edit artifact and then
 asks for approval before saving to that exact file.
 
@@ -30,9 +33,9 @@ the first model request, including turns that do not ultimately read a file.
 
 The terminal status and `/workspace` command show computer access and the
 working directory. Use
-`/files <question>` for a turn that omits attached source, MCP, and source-job
-tools. Ordinary user turns may use both the Files tools and the selected data
-source.
+`/files <question>` for a turn scoped to the session folder source only, which
+omits attached source, MCP, and source-job tools. Ordinary user turns may use
+both the session folder source and the selected data sources.
 
 For headless use:
 
@@ -66,13 +69,20 @@ For bounded mode, the workspace and agent-state roots must not overlap in either
 direction, and filesystem root/home cannot be the workspace. Computer mode can
 use home or a directory that contains private state, but direct state access is
 rejected and broad searches prune state subtrees. Hosted compositions have no
-ambient local backend, and scheduled routines, graph tasks, and other
-machine-originated runs cannot use foreground computer access.
+session folder source and no folder source type, and scheduled routines, graph
+tasks, and other machine-originated runs never receive the session folder
+source.
+
+`Agent.session_source_id` is the session folder source's stable ID. It is never
+listed by `Agent.list_sources()`. Explicit `source_scope_ids` narrow catalog
+sources and keep local files; `files_only=True` scopes the run to exactly this
+source.
 
 ## Read boundary
 
-`file_search`, `file_read`, and `file_query` accept working-relative, absolute,
-and `~/` paths in computer mode. `file_search` accepts either one `path` or a
+`file_search`, `file_read`, and `data_query` with `path_pattern` take the
+session folder source's `source_id` and accept working-relative, absolute, and
+`~/` paths in computer mode. `file_search` accepts either one `path` or a
 `paths` list of one to eight roots. A paths-mode filename search may omit
 `query` when it supplies a filename-only glob such as `*.csv`; traversal is
 already recursive, so `**/*.csv` is not a valid filename glob. Multi-root
@@ -100,8 +110,9 @@ Bounded-workspace mode continues to expose only relative paths.
 
 ## Structured file queries
 
-`file_query` is an on-demand Files tool for direct analysis of one homogeneous
-CSV, TSV, JSON-records/NDJSON, or Parquet dataset. Its `path_pattern` follows
+`data_query` with `source_id`, `path_pattern`, and `sql` analyzes one
+homogeneous CSV, TSV, JSON-records/NDJSON, or Parquet dataset in the session
+folder source. Its `path_pattern` follows
 the same path rules and is expanded by Daita without a shell. Daita opens and
 revision-binds every exact regular file before execution, rejects mixed formats
 or incompatible schemas, and records every input path and physical revision
@@ -127,8 +138,9 @@ worker and removes its private scratch state.
 
 For one bounded UTF-8 text file, Daita can perform the cohesive sequence
 `file_read` → `artifact_edit_text` → approval → `artifact_save_local`. The edit
-tool accepts only the authenticated current-run binding returned by
-`file_read`; it does not accept a path, revision, or file bytes. It applies
+tool accepts only the authenticated current-run binding returned by a session
+folder `file_read`; it does not accept a path, revision, or file bytes. Attached
+folders are read-only sources, so their reads carry no edit binding. It applies
 ordered exact replacements, including exact-anchor insertion and deletion,
 then commits the complete replacement as an internal artifact. Preparing the
 artifact never changes the local file.
@@ -147,8 +159,38 @@ document editor, or generic filesystem API. New files continue through a
 committed artifact and `artifact_save_local` in `create_new` mode. Hosted and
 machine-originated runs receive no ambient local edit authority.
 
-## Development-state compatibility
+## Attached folders
 
-An unreleased development home containing the removed cataloged file-source
-registration is rejected during admission. Delete and recreate that agent;
-unreleased state has no compatibility alias or migration.
+Attach a folder to catalog its files as a durable source:
+
+```python
+from daita import FolderSource
+
+source = await agent.attach(FolderSource(Path("/data/sales"), name="Sales files"))
+```
+
+```bash
+daita attach atlas folder /data/sales --source-name "Sales files"
+```
+
+Discovery catalogs the data files under the root (or under the optional
+`subpaths`): csv, tsv, json-records, ndjson, and parquet files, and the folders
+that hold them. The same containment rules as the session folder apply:
+symlinks, special files, secret-like paths, and private Daita state are never
+cataloged, and a root that contains private Daita state cannot be attached.
+Each data file gets format, media type, size, a stat-based physical revision,
+and its column schema. Other files are not cataloged; reach them through the
+session folder. Discovery is bounded; a folder with more data files than the
+limit, or too slow to finish within the discovery budget, is cataloged up to it
+and its catalog sync is marked truncated. `catalog_search` finds files by name
+or column, and declared catalog links can join a file to a database table.
+Scheduled routines and graph jobs can read an attached folder they are granted.
+
+An attached folder answers only for its readable cataloged files. `file_search`
+and `file_read` reach them by root-relative path; `data_query` takes their
+`resource_ids` and reads them as one relation named `data`; a combined
+`data_query` accepts them as SQL inputs. Changing a file makes it stale until
+the source is refreshed: search skips it, and a read or query of it is refused
+with `query_binding_stale`.
+Attached folders are always contained to their root and are unavailable in
+hosted compositions.

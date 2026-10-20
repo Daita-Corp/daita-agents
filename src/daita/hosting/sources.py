@@ -1,4 +1,4 @@
-"""Source selection, edit previews, permission inspection and registration decoding."""
+"""Source selection, edit previews and permission inspection."""
 
 from __future__ import annotations
 
@@ -11,15 +11,13 @@ from typing import cast
 
 from .._json import canonical_json
 from ..adapters.models import SourceRegistration
-from ..adapters.postgresql import PostgreSQLSource
-from ..adapters.protocols import ResourceSource
-from ..adapters.sqlite import SQLiteSource
+from ..adapters.registry import SourceTypeRegistry
 from ..capabilities import CapabilityInputError
 from ..catalog.models import CatalogResource, ResourceKind, SourceCatalogSnapshot
 from ..catalog.service import CatalogService
 from ..domains.data import CatalogDataView
+from ..domains.data.catalog import RELATIONAL_WRITE_OPERATIONS
 from ..domains.data.sql import validate_relational_write_scope
-from ..security import SecretProvider, SecretReference
 from ..storage.protocols import StateStore
 from ..storage.sqlite_records import (
     RelationalWriteScope,
@@ -32,7 +30,6 @@ from ..storage.sqlite_records import (
     SourceReadScope,
     relational_write_authorization_fingerprint,
 )
-from .errors import AgentHomeError
 
 _SOURCE_ALIAS_SEPARATOR = re.compile(r"[^a-z0-9]+")
 
@@ -124,107 +121,6 @@ def _source_permission_state_payload(
     }
 
 
-def _source_from_registration(
-    registration: SourceRegistration,
-    *,
-    secret_provider: SecretProvider,
-) -> ResourceSource:
-    """Reconstruct one admitted source only at the composition boundary."""
-
-    configuration = registration.configuration
-    adapter_id = registration.adapter_id
-    if adapter_id == "sqlite":
-        _require_configuration_fields(configuration, {"path"})
-        return SQLiteSource(
-            path=_configuration_text(configuration, "path"),
-            name=registration.display_name,
-        )
-    if adapter_id == "postgresql":
-        required = {
-            "database",
-            "host",
-            "port",
-            "schemas",
-            "ssl_mode",
-            "username",
-        }
-        allowed = required | {"credential_ref", "public_network_only"}
-        fields = set(configuration)
-        if not required <= fields or not fields <= allowed:
-            raise AgentHomeError("PostgreSQL source configuration is invalid")
-        raw_schemas = configuration["schemas"]
-        if not isinstance(raw_schemas, tuple) or any(
-            not isinstance(schema, str) for schema in raw_schemas
-        ):
-            raise AgentHomeError("PostgreSQL source configuration is invalid")
-        raw_reference = configuration.get("credential_ref")
-        if raw_reference is not None and not isinstance(raw_reference, str):
-            raise AgentHomeError("PostgreSQL source configuration is invalid")
-        try:
-            reference = (
-                None if raw_reference is None else SecretReference.parse(raw_reference)
-            )
-            return PostgreSQLSource(
-                host=_configuration_text(configuration, "host"),
-                port=_configuration_integer(configuration, "port"),
-                database=_configuration_text(configuration, "database"),
-                username=_configuration_text(configuration, "username"),
-                credential=reference,
-                schemas=cast(tuple[str, ...], raw_schemas),
-                ssl_mode=_configuration_text(configuration, "ssl_mode"),
-                public_network_only=_configuration_boolean(
-                    configuration, "public_network_only", default=False
-                ),
-                name=registration.display_name,
-                secret_provider=secret_provider,
-            )
-        except (TypeError, ValueError) as error:
-            raise AgentHomeError(
-                "PostgreSQL source configuration is invalid"
-            ) from error
-    raise AgentHomeError("registered source adapter cannot be refreshed")
-
-
-def _require_configuration_fields(
-    configuration: Mapping[str, object],
-    expected: set[str],
-) -> None:
-    if set(configuration) != expected:
-        raise AgentHomeError("source configuration fields are invalid")
-
-
-def _configuration_text(
-    configuration: Mapping[str, object],
-    name: str,
-) -> str:
-    value = configuration[name]
-    if not isinstance(value, str) or not value:
-        raise AgentHomeError("source configuration text is invalid")
-    return value
-
-
-def _configuration_integer(
-    configuration: Mapping[str, object],
-    name: str,
-) -> int:
-    value = configuration[name]
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise AgentHomeError("source configuration integer is invalid")
-    return value
-
-
-def _configuration_boolean(
-    configuration: Mapping[str, object],
-    name: str,
-    *,
-    default: bool,
-) -> bool:
-    value = configuration.get(name, default)
-    if not isinstance(value, bool):
-        raise AgentHomeError("source configuration boolean is invalid")
-    return value
-
-
 def _source_edit_read_scope(
     *,
     current_read_scope: SourceReadScope,
@@ -293,9 +189,19 @@ def _source_edit_read_scope(
     )
 
 
+def _supports_relational_writes(
+    source_types: SourceTypeRegistry, adapter_id: str
+) -> bool:
+    return any(
+        source_types.supports(adapter_id, operation)
+        for operation in RELATIONAL_WRITE_OPERATIONS.values()
+    )
+
+
 async def _inspect_source_permissions(
     store: StateStore,
     data_view: CatalogDataView,
+    source_types: SourceTypeRegistry,
     agent_id: str,
     source_id: str,
 ) -> SourcePermissionsInspection:
@@ -332,11 +238,8 @@ async def _inspect_source_permissions(
         )
         if resource.agent_id == agent_id and resource.source_id == source_id
     )
-    schemas = (
-        await data_view.resource_schemas(agent_id, source_id)
-        if registration.adapter_id == "postgresql"
-        else ()
-    )
+    writable = _supports_relational_writes(source_types, registration.adapter_id)
+    schemas = await data_view.resource_schemas(agent_id, source_id) if writable else ()
     schemas_by_resource_id = {schema.resource_id: schema for schema in schemas}
     choices: list[SourcePermissionResource] = []
     from ..domains.data.sql.relational_upsert import (
@@ -419,6 +322,7 @@ async def _inspect_source_permissions(
         catalog_generation=catalog_generation,
         state=SourcePermissionState(read_scope, update_scopes),
         resources=tuple(choices),
+        supports_relational_writes=writable,
     )
 
 
@@ -426,6 +330,7 @@ async def _build_source_permissions_preview(
     store: StateStore,
     catalog_service: CatalogService,
     data_view: CatalogDataView,
+    source_types: SourceTypeRegistry,
     agent_id: str,
     confirmation_key: bytes,
     inspection: SourcePermissionsInspection,
@@ -455,8 +360,11 @@ async def _build_source_permissions_preview(
             raise ValueError(
                 "selected read resources are not current resources of this source"
             )
-    if relational_write_scopes and inspection.adapter_id != "postgresql":
-        raise ValueError("PostgreSQL update scopes require an active PostgreSQL source")
+    if relational_write_scopes and not inspection.supports_relational_writes:
+        raise ValueError(
+            "Relational write scopes require an active source whose type "
+            "supports native writes"
+        )
 
     registration = await store.load_source(
         agent_id,
@@ -524,6 +432,13 @@ async def _build_source_permissions_preview(
             max_rows=cast(int, constraints["max_rows"]),
             authorization_fingerprint="sha256:" + "0" * 64,
         )
+        if any(
+            not source_types.supports(
+                inspection.adapter_id, RELATIONAL_WRITE_OPERATIONS[name]
+            )
+            for name in scope.allowed_operations
+        ):
+            raise ValueError("source type does not support the requested write")
         if "update" in scope.allowed_operations:
             if (
                 set(scope.key_columns) != set(schema.primary_key_columns)

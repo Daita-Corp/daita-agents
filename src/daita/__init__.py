@@ -2,6 +2,7 @@
 
 from ._version import __version__
 from .adapters import (
+    FolderSource,
     MCPAdmissionError,
     MCPAuthentication,
     MCPAuthenticationMode,
@@ -19,6 +20,12 @@ from .adapters import (
     SQLiteSource,
 )
 from .adapters.postgresql_write import RelationalUpdateReadiness
+from .adapters.registry import (
+    SourceBackendContext,
+    SourceOperation,
+    SourceType,
+    SourceTypeRegistry,
+)
 from .agent import Agent
 from .artifacts import (
     ArtifactDeliveryReceipt,
@@ -143,6 +150,10 @@ __all__ = [
     "EffectEvidenceBasis",
     "Agent",
     "AgentConfig",
+    "SourceBackendContext",
+    "SourceOperation",
+    "SourceType",
+    "SourceTypeRegistry",
     "HostCapacityLimits",
     "PostgreSQLReadLimits",
     "AgentEvent",
@@ -229,6 +240,7 @@ __all__ = [
     "ResourceRevisionPrecheck",
     "RoutineState",
     "ResourceRevisionBinding",
+    "FolderSource",
     "SQLiteSource",
     "SemanticAnnotation",
     "SemanticAnnotationState",

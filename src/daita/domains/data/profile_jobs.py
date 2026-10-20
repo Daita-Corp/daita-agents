@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from ..._json import FrozenJsonObject, canonical_json, freeze_json
+from ...adapters.registry import SourceOperation, SourceTypeRegistry
 from ...artifacts.models import (
     ArtifactAuthorship,
     ArtifactDraft,
@@ -62,7 +63,7 @@ from ...loop.models import RunInput
 from ...loop.session import RunSession
 from ...storage.sqlite_records import SourcePermissionStateError
 from .capabilities import SqlReadBackend, SqlReadResult
-from .sql import ResourceSchema, validate_postgresql_read
+from .sql import ResourceSchema, qualified_relation, read_validator
 
 DATA_PROFILE_DOMAIN_OWNER_ID = "data_profile_jobs"
 DATA_PROFILE_EXECUTION_CAPABILITY_ID = "jobs.data_profile.execute"
@@ -182,11 +183,13 @@ class DataProfileAdmission:
         execution_capability: Capability,
         finalizer_capability: Capability,
         distribution: DistributionOwner,
+        source_types: SourceTypeRegistry,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
     ) -> None:
         self._agent_id = agent_id
         self._catalog = catalog
+        self._source_types = source_types
         self._owner = owner
         self._execution_capability = execution_capability
         self._finalizer_capability = finalizer_capability
@@ -590,7 +593,9 @@ class DataProfileAdmission:
                 self._agent_id,
                 source_id,
             )
-            if adapter not in {"sqlite", "postgresql"}:
+            if adapter is None or not self._source_types.supports(
+                adapter, SourceOperation.PROFILE
+            ):
                 raise CapabilityInputError(
                     "data_profile_adapter_unsupported",
                     "The first data-profile job supports SQLite and PostgreSQL resources.",
@@ -616,19 +621,25 @@ class DataProfileAdmission:
                     "data_profile_resource_stale",
                     "One requested data-profile resource changed during admission.",
                 )
-            if adapters[source_id] == "postgresql":
-                validation = validate_postgresql_read(
-                    _profile_sql(schema, "postgresql", _MAX_PROFILE_SAMPLE_ROWS),
-                    source_id=source_id,
-                    resources=schemas_by_source[source_id],
-                    parameters=(),
-                    allowed_resource_ids=readable,
+            dialect = self._source_types.require(adapters[source_id]).sql_dialect
+            validator = read_validator(dialect)
+            if validator is None:
+                raise CapabilityInputError(
+                    "data_profile_adapter_unsupported",
+                    "The first data-profile job supports SQLite and PostgreSQL resources.",
                 )
-                if not validation.valid or validation.resource_ids != (resource_id,):
-                    raise CapabilityInputError(
-                        "data_profile_query_invalid",
-                        "A selected PostgreSQL resource cannot be profiled under its current catalog contract.",
-                    )
+            validation = validator(
+                _profile_sql(schema, dialect, _MAX_PROFILE_SAMPLE_ROWS),
+                source_id=source_id,
+                resources=schemas_by_source[source_id],
+                parameters=(),
+                allowed_resource_ids=readable,
+            )
+            if not validation.valid or validation.resource_ids != (resource_id,):
+                raise CapabilityInputError(
+                    "data_profile_query_invalid",
+                    "A selected resource cannot be profiled under its current catalog contract.",
+                )
             bindings.append(
                 ProfileResourceBinding(
                     source_id=source_id,
@@ -652,13 +663,13 @@ class DataProfileExecutor:
         *,
         agent_id: str,
         catalog: DataProfileCatalog,
-        sqlite_backend: SqlReadBackend,
-        postgresql_backend: SqlReadBackend,
+        backends: Mapping[str, SqlReadBackend],
+        source_types: SourceTypeRegistry,
     ) -> None:
         self._agent_id = agent_id
         self._catalog = catalog
-        self._sqlite = sqlite_backend
-        self._postgresql = postgresql_backend
+        self._backends = dict(backends)
+        self._source_types = source_types
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         job_id = request.arguments["job_id"]
@@ -768,8 +779,17 @@ class DataProfileExecutor:
         schema: ResourceSchema,
         sample_rows: int,
     ) -> SqlReadResult:
-        backend = self._sqlite if binding.adapter_id == "sqlite" else self._postgresql
-        sql = _profile_sql(schema, binding.adapter_id, sample_rows)
+        backend = self._backends.get(binding.adapter_id)
+        if backend is None:
+            raise CapabilityInputError(
+                "data_profile_adapter_unsupported",
+                "Data profiles support only SQLite and PostgreSQL resources.",
+            )
+        sql = _profile_sql(
+            schema,
+            self._source_types.require(binding.adapter_id).sql_dialect,
+            sample_rows,
+        )
         result = await backend.execute_read(
             agent_id=self._agent_id,
             source_id=binding.source_id,
@@ -1048,8 +1068,8 @@ def data_profile_declarations(
     agent_id: str,
     catalog: DataProfileCatalog,
     owner: JobOwner,
-    sqlite_backend: SqlReadBackend,
-    postgresql_backend: SqlReadBackend,
+    backends: Mapping[str, SqlReadBackend],
+    source_types: SourceTypeRegistry,
     artifacts: AgentHomeArtifactStore,
     distribution: DistributionOwner,
     clock: Callable[[], datetime],
@@ -1104,6 +1124,7 @@ def data_profile_declarations(
         execution_capability=internal,
         finalizer_capability=finalizer,
         distribution=distribution,
+        source_types=source_types,
         clock=clock,
         id_factory=id_factory,
     )
@@ -1114,8 +1135,8 @@ def data_profile_declarations(
                 DataProfileExecutor(
                     agent_id=agent_id,
                     catalog=catalog,
-                    sqlite_backend=sqlite_backend,
-                    postgresql_backend=postgresql_backend,
+                    backends=backends,
+                    source_types=source_types,
                 ),
                 DataProfileFinalizerExecutor(artifacts),
             ),
@@ -1316,32 +1337,12 @@ def _maximum_sensitivity(
     return max(values or (ModelSensitivity.RESTRICTED,), key=order.__getitem__)
 
 
-def _profile_sql(schema: ResourceSchema, adapter_id: str, sample_rows: int) -> str:
-    def quote(identifier: str) -> str:
-        return '"' + identifier.replace('"', '""') + '"'
-
-    if adapter_id == "sqlite":
-        relation = quote(schema.name)
-    elif adapter_id == "postgresql":
-        identity = next(
-            (
-                (alias[: -len(suffix)], schema.name)
-                for alias in schema.aliases
-                for suffix in ("." + schema.name,)
-                if alias.endswith(suffix) and len(alias) > len(suffix)
-            ),
-            None,
-        )
-        if identity is None:
-            raise CapabilityInputError(
-                "data_profile_resource_stale",
-                "A PostgreSQL profile resource lacks its exact qualified catalog identity.",
-            )
-        relation = ".".join(quote(part) for part in identity)
-    else:
+def _profile_sql(schema: ResourceSchema, dialect: str | None, sample_rows: int) -> str:
+    relation = qualified_relation(schema, dialect)
+    if relation is None:
         raise CapabilityInputError(
-            "data_profile_adapter_unsupported",
-            "Data profiles support only SQLite and PostgreSQL resources.",
+            "data_profile_resource_stale",
+            "A PostgreSQL profile resource lacks its exact qualified catalog identity.",
         )
     return f"SELECT * FROM {relation} LIMIT {sample_rows}"
 

@@ -21,14 +21,6 @@ MAX_QUEUED_EVENTS = 4_096
 PROVIDERS = (*PROVIDER_PRESENTATION, ("custom", "Custom API (OpenAI-compatible)"))
 BUILTIN_PROVIDER_IDS = _DEFINED_BUILTIN_PROVIDER_IDS
 SUBSCRIPTION_PROVIDER_IDS = _DEFINED_SUBSCRIPTION_PROVIDER_IDS
-SOURCE_TYPES = (
-    ("sqlite", "SQLite file"),
-    ("postgresql", "PostgreSQL"),
-)
-SOURCE_TYPE_LABELS = {
-    "postgresql": "PostgreSQL",
-    "sqlite": "SQLite",
-}
 SSL_MODES = frozenset(
     {"disable", "prefer", "allow", "require", "verify-ca", "verify-full"}
 )
@@ -387,3 +379,12 @@ def parse_candidate_review_cost_limit(value: str) -> Decimal:
         ) from None
     validate_candidate_review_cost_limit(limit)
     return limit
+
+
+def source_type_label(source_types: tuple[Any, ...], adapter_id: str) -> str:
+    """Display one source type's registered label, or its raw adapter ID."""
+
+    return next(
+        (item.label for item in source_types if item.adapter_id == adapter_id),
+        adapter_id,
+    )

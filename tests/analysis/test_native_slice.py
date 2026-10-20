@@ -177,7 +177,7 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
                         "python_execute",
                         {
                             "code": "import json\n"
-                            "assert tools.call('file_read', {'path':'values.sqlite'})['is_error']\n"
+                            "assert tools.call('file_read', {'source_id':'s1', 'path':'values.sqlite'})['is_error']\n"
                             f"assert tools.call('data_query', {{'source_id':{excluded.id!r}, 'resource_ids':[{excluded_resource.id!r}], 'sql':'SELECT n FROM secret'}})['is_error']\n"
                             f"r = tools.call('data_query', {{'source_id':{source.id!r}, 'resource_ids':[{resource.id!r}], 'sql':'SELECT n FROM numbers'}})\n"
                             "assert not r['is_error'], r\n"
@@ -515,7 +515,7 @@ async def test_batch_reads_overlap_finish_out_of_order_and_retain_individual_err
                 "batch",
                 "python_execute",
                 {
-                    "code": "rs = tools.batch([{'name':'file_read','arguments':{'path':p}} for p in ['one.txt','missing.txt','two.txt']])\nassert [r['is_error'] for r in rs] == [False,True,False], rs\nassert [rs[i]['output']['data']['content'] for i in [0,2]] == ['17','25'], rs\nprint('ordered')",
+                    "code": "rs = tools.batch([{'name':'file_read','arguments':{'source_id':'s1','path':p}} for p in ['one.txt','missing.txt','two.txt']])\nassert [r['is_error'] for r in rs] == [False,True,False], rs\nassert [rs[i]['output']['data']['content'] for i in [0,2]] == ['17','25'], rs\nprint('ordered')",
                     "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
@@ -597,7 +597,10 @@ async def test_batch_rejects_whole_envelopes_before_io_and_counts_attempts(
         return await original(self, path=path, **kwargs)
 
     monkeypatch.setattr(LocalWorkspaceBackend, "read", read)
-    calls = [{"name": "file_read", "arguments": {"path": "one.txt"}} for _ in range(3)]
+    calls = [
+        {"name": "file_read", "arguments": {"source_id": "s1", "path": "one.txt"}}
+        for _ in range(3)
+    ]
     if failure == "malformed":
         calls[-1] = {"name": "file_read"}
     model = ToolboxAwareMockModelProvider(
@@ -665,7 +668,7 @@ async def test_batch_interruption_settles_dispatched_and_queued_children(
             settled.set()
 
     monkeypatch.setattr(LocalWorkspaceBackend, "read", read)
-    code = "tools.batch([{'name':'file_read','arguments':{'path':p}} for p in ['one.txt','two.txt','three.txt']])"
+    code = "tools.batch([{'name':'file_read','arguments':{'source_id':'s1','path':p}} for p in ['one.txt','two.txt','three.txt']])"
     model = ToolboxAwareMockModelProvider(
         (
             _tool(
@@ -750,7 +753,7 @@ async def test_batch_trace_exhaustion_dispatches_nothing_and_retains_requested_u
                 "batch",
                 "python_execute",
                 {
-                    "code": "tools.batch([{'name':'file_read','arguments':{'path':'one.txt'}}]*3)",
+                    "code": "tools.batch([{'name':'file_read','arguments':{'source_id':'s1','path':'one.txt'}}]*3)",
                     "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
@@ -791,7 +794,7 @@ async def test_python_threads_serialize_batches_and_keep_each_response_identity(
     workspace = workspace_for(tmp_path)
     for name in ("one", "two"):
         (workspace.root / f"{name}.txt").write_text(name)
-    code = "from concurrent.futures import ThreadPoolExecutor\ndef fetch(name):\n rs = tools.batch([{'name':'file_read','arguments':{'path':name+'.txt'}}]*2)\n assert all(not r['is_error'] and r['output']['data']['content'] == name for r in rs), rs\n return name\nwith ThreadPoolExecutor(max_workers=2) as pool:\n print(list(pool.map(fetch, ['one','two'])))"
+    code = "from concurrent.futures import ThreadPoolExecutor\ndef fetch(name):\n rs = tools.batch([{'name':'file_read','arguments':{'source_id':'s1','path':name+'.txt'}}]*2)\n assert all(not r['is_error'] and r['output']['data']['content'] == name for r in rs), rs\n return name\nwith ThreadPoolExecutor(max_workers=2) as pool:\n print(list(pool.map(fetch, ['one','two'])))"
     model = ToolboxAwareMockModelProvider(
         (
             _tool(
@@ -982,7 +985,7 @@ async def test_worker_rejects_stale_batch_response_identity_without_replay(
                 "batch",
                 "python_execute",
                 {
-                    "code": "tools.batch([{'name':'file_read','arguments':{'path':'one.txt'}}])",
+                    "code": "tools.batch([{'name':'file_read','arguments':{'source_id':'s1','path':'one.txt'}}])",
                     "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
@@ -1028,13 +1031,24 @@ async def test_real_python_broker_reads_and_denies_recursive_calls(
 ):
     workspace = workspace_for(tmp_path)
     (workspace.root / "values.txt").write_text("17,25")
-    model = ToolboxAwareMockModelProvider(
+    model = ToolboxAwareMockModelProvider(())
+    agent = await Agent.create(
+        "broker-slice",
+        root=tmp_path,
+        model=model,
+        model_profile=_profile(model),
+        workspace=workspace,
+    )
+    # Attached sources take the first handles, so name the session folder exactly.
+    model.replace_script(
         (
             _tool(
                 "cell-read",
                 "python_execute",
                 {
-                    "code": "r = tools.call('file_read', {'path': 'values.txt'})\nprint(r)\n"
+                    "code": "r = tools.call('file_read', "
+                    f"{{'source_id':'{agent.session_source_id}', 'path': 'values.txt'}})"
+                    "\nprint(r)\n"
                     "assert not r['is_error']\n"
                     "denied = tools.call('python_execute', {})\nassert denied['is_error']",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -1042,13 +1056,6 @@ async def test_real_python_broker_reads_and_denies_recursive_calls(
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="Read complete"),
         )
-    )
-    agent = await Agent.create(
-        "broker-slice",
-        root=tmp_path,
-        model=model,
-        model_profile=_profile(model),
-        workspace=workspace,
     )
     try:
         if with_catalog:

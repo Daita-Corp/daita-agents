@@ -10,6 +10,7 @@ from typing import Protocol, cast
 from ..._json import FrozenJsonObject, canonical_json
 from ...adapters.local_file_query import LocalFileQueryError
 from ...adapters.local_workspace import LocalWorkspaceError
+from ...adapters.registry import SourceOperation, SourceTypeRegistry
 from ...artifacts.models import (
     ArtifactAuthorship,
     ArtifactDraft,
@@ -50,21 +51,15 @@ from ...loop.session import RunSession
 from ...scope import EffectiveSourceScope, resolve_effective_source_scope
 from ...storage.sqlite_records import RelationalWriteScope, SourcePermissionStateError
 from ..learning import LearningCandidateGuard
-from .file_capabilities import (
-    LOCAL_FILE_CAPABILITY_IDS,
-    LOCAL_FILE_QUERY_CAPABILITY_ID,
-    LOCAL_FILE_READ_CAPABILITY_ID,
-)
 from .routine_precheck import RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID
 from .sql import (
     DuckDBReadValidationError,
     RelationalUpdateCommand,
     RelationalUpdateIntent,
     ResourceSchema,
+    read_validator,
     validate_duckdb_read,
-    validate_postgresql_read,
     validate_relational_update_intent,
-    validate_sqlite_read,
 )
 from .sql.relational_upsert import (
     RelationalUpsertIntent,
@@ -75,11 +70,23 @@ from .sql.relational_upsert import (
 DATA_DOMAIN_OWNER_ID = "data"
 DATA_QUERY_CAPABILITY_ID = "data.query"
 DATA_QUERY_EVIDENCE_KIND = "data.query_result"
+DATA_QUERY_COMBINED_CAPABILITY_ID = "data.query_combined"
+DATA_QUERY_COMBINED_EVIDENCE_KIND = "data.query_combined_result"
 DATA_EXPORT_TABULAR_CAPABILITY_ID = "data.export_tabular"
 RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID = "data.preview_update_rows"
 RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND = "data.preview_update_rows"
 RELATIONAL_UPDATE_CAPABILITY_ID = "data.update_rows"
 RELATIONAL_UPDATE_EVIDENCE_KIND = "data.update_rows_result"
+FILE_SEARCH_CAPABILITY_ID = "data.search_files"
+FILE_SEARCH_OUTPUT_KIND = "data.search_files_result"
+TEXT_READ_CAPABILITY_ID = "data.read_text"
+TEXT_READ_OUTPUT_KIND = "data.read_text_result"
+PATH_QUERY_CAPABILITY_ID = "data.query_files"
+PATH_QUERY_OUTPUT_KIND = "data.query_files_result"
+# Folder-source reads whose results carry their own binding provenance.
+SOURCE_FILE_CAPABILITY_IDS = frozenset(
+    {FILE_SEARCH_CAPABILITY_ID, TEXT_READ_CAPABILITY_ID, PATH_QUERY_CAPABILITY_ID}
+)
 
 _CATALOG_CAPABILITIES = frozenset(
     {
@@ -118,24 +125,25 @@ _RESOURCE_ARGUMENT_CAPABILITIES = frozenset(
     }
 )
 _RESOURCE_LIST_ARGUMENT_CAPABILITIES = _RELATIONAL_READ_CAPABILITIES
-_RELATIONAL_ADAPTER_IDS = frozenset({"sqlite", "postgresql"})
 _RESOURCE_READ_DENIED_MESSAGE = (
     "The requested resource is not available for reading in this run. Copy exact "
     "current catalog IDs without shortening them; do not guess or substitute another resource."
 )
-_ADAPTER_CAPABILITIES = {
-    "postgresql": frozenset(
-        {
-            *_UPSERT_CAPABILITIES,
-            RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
-            RELATIONAL_UPDATE_CAPABILITY_ID,
-        }
-    ),
+# The source operation a source's registered type must declare for each capability.
+_CAPABILITY_OPERATIONS = {
+    DATA_QUERY_CAPABILITY_ID: SourceOperation.SQL_READ,
+    DATA_EXPORT_TABULAR_CAPABILITY_ID: SourceOperation.TABULAR_EXPORT,
+    FILE_SEARCH_CAPABILITY_ID: SourceOperation.FILE_SEARCH,
+    TEXT_READ_CAPABILITY_ID: SourceOperation.TEXT_READ,
+    PATH_QUERY_CAPABILITY_ID: SourceOperation.PATH_QUERY,
+    **{item: SourceOperation.RELATIONAL_UPDATE for item in _UPDATE_CAPABILITIES},
+    **{item: SourceOperation.RELATIONAL_UPSERT for item in _UPSERT_CAPABILITIES},
 }
+# Combined-query inputs each need SQL_READ or TABULAR_READ, checked per input.
 _SOURCE_CAPABILITIES = frozenset().union(
     _CATALOG_CAPABILITIES,
-    _RELATIONAL_READ_CAPABILITIES,
-    *_ADAPTER_CAPABILITIES.values(),
+    _CAPABILITY_OPERATIONS,
+    {DATA_QUERY_COMBINED_CAPABILITY_ID},
 )
 
 
@@ -293,18 +301,14 @@ class DataDomainCatalog(
         resource_id: str,
     ) -> tuple[str, str, str] | None: ...
 
-    async def is_current_tabular_file(
-        self,
-        agent_id: str,
-        source_id: str,
-        resource_id: str,
-    ) -> bool: ...
-
     async def admitted_model_sensitivity(
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
     ) -> ModelSensitivity | None: ...
+
+    @property
+    def session_source_id(self) -> str | None: ...
 
 
 def _reads_resource(
@@ -338,7 +342,7 @@ def _reads_resource(
 
 
 class DataCapabilityDomain:
-    """Own native catalog, SQL, update, and local-file call semantics."""
+    """Own native catalog, SQL, update, and folder-file call semantics."""
 
     domain_owner_id = DATA_DOMAIN_OWNER_ID
 
@@ -347,13 +351,16 @@ class DataCapabilityDomain:
         declarations: CapabilityDeclarations,
         catalog: DataDomainCatalog,
         learning: LearningCandidateGuard,
+        source_types: SourceTypeRegistry,
         *,
         relational_export_available: bool = True,
+        combined_query_available: bool = False,
         transcript_loader: Callable[[str], Awaitable[Transcript]] | None = None,
         upsert_readiness: (
             Callable[[str, FrozenJsonObject], Awaitable[FrozenJsonObject]] | None
         ) = None,
-        local_file_sensitivity: ModelSensitivity | None = None,
+        source_files_available: bool = False,
+        path_query_available: bool = False,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("data declarations have the wrong domain owner")
@@ -361,21 +368,18 @@ class DataCapabilityDomain:
         expected_ids = _SOURCE_CAPABILITIES
         if not relational_export_available:
             expected_ids -= {DATA_EXPORT_TABULAR_CAPABILITY_ID}
-        if local_file_sensitivity is not None:
-            expected_ids |= LOCAL_FILE_CAPABILITY_IDS
+        if not combined_query_available:
+            expected_ids -= {DATA_QUERY_COMBINED_CAPABILITY_ID}
+        if not source_files_available:
+            expected_ids -= {FILE_SEARCH_CAPABILITY_ID, TEXT_READ_CAPABILITY_ID}
+        if not path_query_available:
+            expected_ids -= {PATH_QUERY_CAPABILITY_ID}
         if declared_ids != expected_ids:
             raise ValueError(
                 "data declarations must exactly match supported native capabilities"
             )
-        if local_file_sensitivity is not None and not isinstance(
-            local_file_sensitivity, ModelSensitivity
-        ):
-            raise TypeError("local_file_sensitivity must be ModelSensitivity")
-        for adapter_id, capability_ids in _ADAPTER_CAPABILITIES.items():
-            if not capability_ids <= declared_ids:
-                raise ValueError(
-                    f"data adapter capability admission is incomplete: {adapter_id}"
-                )
+        if not isinstance(source_types, SourceTypeRegistry):
+            raise TypeError("source_types must be a SourceTypeRegistry")
         for method_name in (
             "source_routing_facts",
             "resource_schemas",
@@ -392,7 +396,7 @@ class DataCapabilityDomain:
         self._declarations = declarations
         self._catalog = catalog
         self._learning = learning
-        self._local_file_sensitivity = local_file_sensitivity
+        self._source_types = source_types
         self._views = {item.name: item for item in declarations.tool_views}
         self._capabilities = {item.id: item for item in declarations.capabilities}
 
@@ -411,21 +415,37 @@ class DataCapabilityDomain:
         *,
         tool_names: frozenset[str] | None = None,
     ) -> tuple[str, ...]:
+        return (await self._projection(run, session, tool_names))[0]
+
+    project_session = project
+
+    async def project_routes(
+        self, run: RunInput, session: RunSession | None = None
+    ) -> tuple[tuple[str, ...], frozenset[str]]:
+        """Project the tool names and the routed capabilities no source in this
+        run's scope can serve, from one scope resolution.
+
+        ``data_query`` is offered for any SQL source, but its export route needs
+        a ``TABULAR_EXPORT`` source and its ``path_pattern`` route the live
+        session folder; offering them otherwise only invites refused calls.
+        """
+
+        return await self._projection(run, session, None)
+
+    async def _projection(
+        self,
+        run: RunInput,
+        session: RunSession | None,
+        tool_names: frozenset[str] | None,
+    ) -> tuple[tuple[str, ...], frozenset[str]]:
         views = {
             name: view
             for name, view in self._views.items()
             if tool_names is None or name in tool_names
         }
-        source_capability_ids = {
-            view.capability_id
-            for view in views.values()
-            if view.capability_id not in LOCAL_FILE_CAPABILITY_IDS
-        }
-        files_only = session is not None and session.options.files_only
+        source_capability_ids = {view.capability_id for view in views.values()}
         scope = (
-            await resolve_effective_source_scope(
-                run, self._catalog, files_only=files_only
-            )
+            await resolve_effective_source_scope(run, self._catalog)
             if source_capability_ids
             else EffectiveSourceScope(frozenset(), frozenset())
         )
@@ -478,39 +498,36 @@ class DataCapabilityDomain:
             ):
                 continue
             if capability.id in _CATALOG_CAPABILITIES:
-                if facts:
-                    names.append(name)
-                continue
-            if capability.id in LOCAL_FILE_CAPABILITY_IDS:
-                if (
-                    self._local_file_sensitivity is not None
-                    and run.origin is RunOrigin.USER
-                    and run.execution_scope is None
+                # The live session folder source has no catalog to discover.
+                if any(
+                    fact.get("source_id") != self._catalog.session_source_id
+                    for fact in facts
                 ):
                     names.append(name)
                 continue
-            if capability.id in _RELATIONAL_READ_CAPABILITIES:
-                if active_adapter_ids & _RELATIONAL_ADAPTER_IDS:
-                    names.append(name)
-                continue
-            required_adapter = next(
-                (
-                    adapter_id
-                    for adapter_id, capability_ids in _ADAPTER_CAPABILITIES.items()
-                    if capability.id in capability_ids
-                ),
-                None,
-            )
-            if required_adapter not in active_adapter_ids:
+            operation = _CAPABILITY_OPERATIONS.get(capability.id)
+            if operation is None or not any(
+                self._source_types.supports(adapter_id, operation)
+                for adapter_id in active_adapter_ids
+            ):
                 continue
             if capability.id in _UPDATE_CAPABILITIES and not update_source_ids:
                 continue
             if capability.id in _UPSERT_CAPABILITIES and not upsert_source_ids:
                 continue
             names.append(name)
-        return tuple(names)
-
-    project_session = project
+        withheld = {
+            capability_id
+            for capability_id, operation in _CAPABILITY_OPERATIONS.items()
+            if capability_id in self._capabilities
+            and not any(
+                self._source_types.supports(adapter_id, operation)
+                for adapter_id in active_adapter_ids
+            )
+        }
+        if self._catalog.session_source_id not in scope.source_ids:
+            withheld.add(PATH_QUERY_CAPABILITY_ID)
+        return tuple(names), frozenset(withheld)
 
     async def project_call(
         self, run: RunInput, call: ToolCall, session: RunSession | None
@@ -535,53 +552,7 @@ class DataCapabilityDomain:
         request_sensitivity: ModelSensitivity,
         session: RunSession | None = None,
     ) -> FrozenJsonObject:
-        if capability.id in LOCAL_FILE_CAPABILITY_IDS:
-            if (
-                self._local_file_sensitivity is None
-                or run.origin is not RunOrigin.USER
-                or run.execution_scope is not None
-            ):
-                raise CapabilityInputError(
-                    "workspace_unavailable",
-                    "Local file access is unavailable for this run.",
-                )
-            if "source_id" in arguments or "resource_id" in arguments:
-                raise CapabilityInputError(
-                    "source_scope_violation",
-                    "Local file tools do not accept source authority.",
-                )
-            if capability.id == LOCAL_FILE_READ_CAPABILITY_ID:
-                has_path = "path" in arguments
-                has_cursor = "cursor" in arguments
-                if has_path == has_cursor:
-                    raise CapabilityInputError(
-                        "path_invalid",
-                        "File read requires exactly one path or cursor.",
-                    )
-                if has_cursor and "position" in arguments:
-                    raise CapabilityInputError(
-                        "cursor_invalid",
-                        "A file cursor cannot be combined with a position.",
-                    )
-            if capability.id == LOCAL_FILE_QUERY_CAPABILITY_ID:
-                try:
-                    validated = validate_duckdb_read(cast(str, arguments["sql"]))
-                except DuckDBReadValidationError as error:
-                    raise CapabilityInputError(
-                        "file_query_invalid",
-                        error.message,
-                        {"reason": error.reason},
-                    ) from error
-                prepared = arguments.to_dict()
-                prepared["sql"] = validated.canonical_sql
-                prepared["sql_fingerprint"] = validated.sql_fingerprint
-                return FrozenJsonObject.from_mapping(prepared)
-            return arguments
-        scope = await resolve_effective_source_scope(
-            run,
-            self._catalog,
-            files_only=session is not None and session.options.files_only,
-        )
+        scope = await resolve_effective_source_scope(run, self._catalog)
         run = replace(run, resolved_source_scope=scope)
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.validate_effect(session, call, arguments)
@@ -606,10 +577,15 @@ class DataCapabilityDomain:
                 )
         if capability.id == CATALOG_DESCRIBE_CAPABILITY_ID:
             _validate_describe_arguments(arguments)
+        if capability.id == DATA_QUERY_COMBINED_CAPABILITY_ID:
+            arguments = await self._prepare_combined_query(run, arguments)
+        if capability.id in SOURCE_FILE_CAPABILITY_IDS:
+            arguments = await self._prepare_source_file_call(run, capability, arguments)
         if capability.id in _RELATIONAL_READ_CAPABILITIES:
             arguments = await self._validate_sql(
                 run,
                 arguments,
+                operation=_CAPABILITY_OPERATIONS[capability.id],
                 bind_revisions=capability.id == DATA_QUERY_CAPABILITY_ID,
             )
         if capability.id in _UPDATE_CAPABILITIES | _UPSERT_CAPABILITIES:
@@ -963,8 +939,7 @@ class DataCapabilityDomain:
 
     finalize_session_output = finalize_output
 
-    @staticmethod
-    def _validate_export_summary(output: ToolOutput) -> None:
+    def _validate_export_summary(self, output: ToolOutput) -> None:
         draft = output.artifact
         if (
             draft is None
@@ -975,7 +950,8 @@ class DataCapabilityDomain:
             )
         valid = (
             bool(draft.provenance.resource_bindings)
-            and output.data.get("adapter_id") in _RELATIONAL_ADAPTER_IDS
+            and isinstance(adapter_id := output.data.get("adapter_id"), str)
+            and self._source_types.supports(adapter_id, SourceOperation.TABULAR_EXPORT)
             and output.data.get("format") in {"csv", "xlsx", "arrow"}
             and output.data.get("filename") == draft.suggested_filename
             and output.data.get("source_id")
@@ -1021,7 +997,10 @@ class DataCapabilityDomain:
             or any(not isinstance(item, str) for item in resource_ids)
             or not isinstance(sql, str)
             or not isinstance(parameters, tuple)
-            or adapter_id not in _RELATIONAL_ADAPTER_IDS
+            or not isinstance(adapter_id, str)
+            or not self._source_types.supports(
+                adapter_id, SourceOperation.TABULAR_EXPORT
+            )
         ):
             raise ToolOutputValidationError(
                 "relational export execution arguments are unavailable"
@@ -1040,11 +1019,9 @@ class DataCapabilityDomain:
             readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
-        validator = (
-            validate_postgresql_read
-            if adapter_id == "postgresql"
-            else validate_sqlite_read
-        )
+        validator = read_validator(self._source_types.require(adapter_id).sql_dialect)
+        if validator is None:
+            raise _incomplete_export(draft, "catalog_changed")
         validation = validator(
             sql,
             source_id=source_id,
@@ -1131,15 +1108,102 @@ class DataCapabilityDomain:
             return CapabilityFailure(error.code, error.message, error.details)
         return None
 
+    async def _prepare_source_file_call(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+    ) -> FrozenJsonObject:
+        """Bind one folder-file read to its source type before any file I/O.
+
+        The live session source answers only its own foreground user; a
+        cataloged folder answers only for its readable cataloged files.
+        """
+
+        source_id = cast(str, arguments["source_id"])
+        adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
+        live = source_id == self._catalog.session_source_id
+        if (
+            capability.id == PATH_QUERY_CAPABILITY_ID
+            and adapter_id is not None
+            and not live
+        ):
+            # Any cataloged source answers by catalog resources instead.
+            raise CapabilityInputError(
+                "path_pattern_unsupported",
+                "A cataloged source is queried by its catalog resources, "
+                "not by path_pattern.",
+                {"source_id": source_id},
+                recovery=ToolRecovery(
+                    RecoveryKind.CORRECT_ARGUMENTS,
+                    "Query this source with resource_ids from its catalog.",
+                ),
+            )
+        if adapter_id is None or not self._source_types.supports(
+            adapter_id, _CAPABILITY_OPERATIONS[capability.id]
+        ):
+            raise CapabilityInputError(
+                "source_operation_unsupported",
+                "The selected source does not support this file operation.",
+                {"source_id": source_id},
+            )
+        if live and (
+            run.origin is not RunOrigin.USER or run.execution_scope is not None
+        ):
+            raise CapabilityInputError(
+                "workspace_unavailable",
+                "Local file access is unavailable for this run.",
+            )
+        prepared = arguments.to_dict()
+        prepared["_adapter_id"] = adapter_id
+        if capability.id == TEXT_READ_CAPABILITY_ID:
+            has_path = "path" in arguments
+            has_cursor = "cursor" in arguments
+            if has_path == has_cursor:
+                raise CapabilityInputError(
+                    "path_invalid",
+                    "File read requires exactly one path or cursor.",
+                )
+            if has_cursor and "position" in arguments:
+                raise CapabilityInputError(
+                    "cursor_invalid",
+                    "A file cursor cannot be combined with a position.",
+                )
+        if capability.id == PATH_QUERY_CAPABILITY_ID:
+            try:
+                validated = validate_duckdb_read(cast(str, arguments["sql"]))
+            except DuckDBReadValidationError as error:
+                raise CapabilityInputError(
+                    "folder_query_invalid",
+                    error.message,
+                    {"reason": error.reason},
+                ) from error
+            prepared["sql"] = validated.canonical_sql
+            prepared["sql_fingerprint"] = validated.sql_fingerprint
+        elif not live:
+            try:
+                readable = await self._catalog.readable_resource_ids(
+                    run.agent_id, (source_id,)
+                )
+            except SourcePermissionStateError as error:
+                raise CapabilityInputError(
+                    "source_permission_state_invalid",
+                    "Stored source permission state is missing or invalid.",
+                ) from error
+            if run.resolved_source_scope is not None:
+                readable &= run.resolved_source_scope.resource_ids
+            if run.execution_scope is not None:
+                readable &= frozenset(run.execution_scope.allowed_resource_ids)
+            prepared["_resource_ids"] = tuple(sorted(readable))
+        return FrozenJsonObject.from_mapping(prepared)
+
     async def _validate_source_scope(
         self,
         run: RunInput,
         capability: Capability,
         arguments: Mapping[str, object],
     ) -> None:
-        scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=False
-        )
+        scope = await resolve_effective_source_scope(run, self._catalog)
         selected_source_ids = scope.source_ids
         supplied_source_id = arguments.get("source_id")
         if (
@@ -1228,6 +1292,7 @@ class DataCapabilityDomain:
         run: RunInput,
         arguments: Mapping[str, object],
         *,
+        operation: SourceOperation,
         bind_revisions: bool = False,
     ) -> FrozenJsonObject:
         source_id = arguments.get("source_id")
@@ -1257,7 +1322,11 @@ class DataCapabilityDomain:
                 "The selected source is not active for this agent.",
                 {"source_id": source_id},
             )
-        if adapter_id not in _RELATIONAL_ADAPTER_IDS:
+        source_type = self._source_types.get(adapter_id)
+        validator = (
+            None if source_type is None else read_validator(source_type.sql_dialect)
+        )
+        if validator is None or not self._source_types.supports(adapter_id, operation):
             raise CapabilityInputError(
                 "sql_source_adapter_unsupported",
                 "The selected source does not support relational SQL reads.",
@@ -1293,11 +1362,6 @@ class DataCapabilityDomain:
             readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
-        validator = (
-            validate_postgresql_read
-            if adapter_id == "postgresql"
-            else validate_sqlite_read
-        )
         referenced: set[str] = set()
         revisions: dict[str, str] = {}
         for index, (sql, parameters) in enumerate(statements):
@@ -1307,6 +1371,7 @@ class DataCapabilityDomain:
                 resources=resources,
                 parameters=parameters,
                 allowed_resource_ids=readable,
+                requested_resource_ids=requested_resource_ids,
             )
             if not result.valid:
                 if {item.code for item in result.issues} & {
@@ -1359,6 +1424,172 @@ class DataCapabilityDomain:
             prepared["_resource_revisions"] = tuple(sorted(revisions.items()))
         return FrozenJsonObject.from_mapping(prepared)
 
+    async def _prepare_combined_query(
+        self, run: RunInput, arguments: Mapping[str, object]
+    ) -> FrozenJsonObject:
+        """Validate every input as one single-source read, then the combining SQL.
+
+        Each input takes the exact data_query scope, catalog, dialect and
+        revision path; declared catalog links grant no read authority here.
+        """
+
+        single = self._capabilities[DATA_QUERY_CAPABILITY_ID]
+        inputs = cast(tuple[Mapping[str, object], ...], arguments["inputs"])
+        aliases = tuple(cast(str, item["alias"]) for item in inputs)
+        if len(set(aliases)) != len(aliases):
+            raise CapabilityInputError(
+                "combined_query_invalid",
+                "Every input needs a distinct alias.",
+                {"aliases": aliases},
+                recovery=_CORRECT_SQL,
+            )
+        prepared: list[dict[str, object]] = []
+        for alias, item in zip(aliases, inputs, strict=True):
+            tabular = "sql" not in item
+            # Both forms take the same scope checks; a tabular input names
+            # its one resource as resource_id.
+            read = FrozenJsonObject.from_mapping(
+                {
+                    "source_id": item["source_id"],
+                    "resource_ids": (
+                        (item["resource_id"],) if tabular else item["resource_ids"]
+                    ),
+                    **({} if tabular else {"sql": item["sql"]}),
+                }
+            )
+            try:
+                await self._validate_source_scope(run, single, read)
+                self._validate_execution_resource_scope(run, single, read)
+                await self._validate_resource_read_scope(run, single, read)
+                validated = (
+                    await self._validate_tabular_read(run, item)
+                    if tabular
+                    else await self._validate_sql(
+                        run,
+                        read,
+                        operation=SourceOperation.SQL_READ,
+                        bind_revisions=True,
+                    )
+                )
+                if "_resource_revisions" not in validated:
+                    # A join never reads an input it cannot recheck for staleness.
+                    raise CapabilityInputError(
+                        "catalog_provenance_missing",
+                        "A resource has no current catalog revision; refresh "
+                        "the source.",
+                        {"resource_ids": read["resource_ids"]},
+                    )
+            except CapabilityInputError as error:
+                raise CapabilityInputError(
+                    error.code,
+                    str(error),
+                    {**error.details.to_dict(), "input_alias": alias},
+                ) from error
+            prepared.append({**validated.to_dict(), "alias": alias})
+        try:
+            combining = validate_duckdb_read(cast(str, arguments["sql"]), aliases)
+        except DuckDBReadValidationError as error:
+            raise CapabilityInputError(
+                "combined_query_invalid",
+                error.message,
+                {"reason": error.reason, "aliases": aliases},
+                recovery=_CORRECT_SQL,
+            ) from error
+        return FrozenJsonObject.from_mapping(
+            {
+                "inputs": tuple(prepared),
+                "sql": combining.canonical_sql,
+                "_sql_fingerprint": combining.sql_fingerprint,
+            }
+        )
+
+    async def _validate_tabular_read(
+        self, run: RunInput, item: Mapping[str, object]
+    ) -> FrozenJsonObject:
+        """Check one tabular input against the current catalog before any I/O."""
+
+        # capabilities imports this module, so its records load at call time.
+        from .capabilities import TabularFilter
+
+        source_id = cast(str, item["source_id"])
+        resource_id = cast(str, item["resource_id"])
+        adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
+        if adapter_id is None:
+            raise CapabilityInputError(
+                "sql_source_not_available",
+                "The selected source is not active for this agent.",
+                {"source_id": source_id},
+            )
+        if not self._source_types.supports(adapter_id, SourceOperation.TABULAR_READ):
+            raise CapabilityInputError(
+                "tabular_source_adapter_unsupported",
+                "The selected source does not support tabular reads; send this "
+                "input as sql with resource_ids instead.",
+                {"source_id": source_id},
+                recovery=_CORRECT_SQL,
+            )
+        resource = next(
+            (
+                schema
+                for schema in await self._catalog.resource_schemas(
+                    run.agent_id, source_id
+                )
+                if schema.resource_id == resource_id
+            ),
+            None,
+        )
+        if resource is None:
+            raise CapabilityInputError(
+                "sql_resource_source_mismatch",
+                "The resource must belong to the selected source.",
+                {"resource_id": resource_id, "source_id": source_id},
+                recovery=_CORRECT_SQL,
+            )
+        if resource.revision is None or resource.source_revision is None:
+            raise CapabilityInputError(
+                "catalog_provenance_missing",
+                "The resource has no current catalog revision; refresh the source.",
+                {"resource_id": resource_id},
+            )
+        try:
+            filters = tuple(
+                TabularFilter.from_mapping(cast(Mapping[str, object], value))
+                for value in cast(tuple[object, ...], item.get("filters", ()))
+            )
+        except ValueError as error:
+            raise CapabilityInputError(
+                "tabular_filter_invalid",
+                str(error),
+                {"resource_id": resource_id},
+                recovery=_CORRECT_SQL,
+            ) from error
+        columns = cast(tuple[str, ...], item["columns"])
+        unknown = sorted(
+            {*columns, *(value.column for value in filters)} - set(resource.columns)
+        )
+        if unknown:
+            raise CapabilityInputError(
+                "tabular_column_unknown",
+                "Every column and filter column must exist in the resource's "
+                "current catalog schema.",
+                {
+                    "resource_id": resource_id,
+                    "unknown_columns": tuple(unknown),
+                    "available_columns": resource.columns,
+                },
+                recovery=_CORRECT_SQL,
+            )
+        return FrozenJsonObject.from_mapping(
+            {
+                **item,
+                "_adapter_id": adapter_id,
+                # The backend rechecks this exact revision before reading.
+                "_resource_revisions": ((resource_id, resource.revision),),
+                "_source_revision": resource.source_revision,
+                "_resource_name": resource.name,
+            }
+        )
+
     def _validate_execution_resource_scope(
         self,
         run: RunInput,
@@ -1410,9 +1641,9 @@ class DataCapabilityDomain:
                 "write_source_not_available",
                 "PostgreSQL update requires an exact current source.",
             )
-        if (
-            await self._catalog.source_adapter_id(run.agent_id, source_id)
-            != "postgresql"
+        adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
+        if adapter_id is None or not self._source_types.supports(
+            adapter_id, SourceOperation.RELATIONAL_UPDATE
         ):
             raise CapabilityInputError(
                 "write_source_not_available",
@@ -1843,7 +2074,7 @@ class DataCapabilityDomain:
         arguments: FrozenJsonObject,
         output: ToolOutput,
     ) -> ToolOutput:
-        if capability.id in LOCAL_FILE_CAPABILITY_IDS:
+        if capability.id in SOURCE_FILE_CAPABILITY_IDS:
             if output.sensitivity is None or not output.sensitivity_provenance:
                 raise CapabilityInputError(
                     "result_classification_unavailable",
@@ -1852,16 +2083,27 @@ class DataCapabilityDomain:
             return output
         if output.sensitivity is not None:
             return output
-        scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=False
-        )
+        scope = await resolve_effective_source_scope(run, self._catalog)
         run = replace(run, resolved_source_scope=scope)
         # Resolved arguments carry full IDs; the call keeps what the model sent.
         source_id = arguments.get("source_id")
+        inputs = arguments.get("inputs")
         source_ids = (
-            (source_id,)
+            # A narrowed describe still lists link endpoints in other sources.
+            tuple(sorted({source_id, *_endpoint_source_ids(output.data)}))
             if isinstance(source_id, str)
-            else tuple(sorted(scope.source_ids))
+            else (
+                tuple(
+                    sorted(
+                        {
+                            cast(str, cast(Mapping[str, object], item)["source_id"])
+                            for item in inputs
+                        }
+                    )
+                )
+                if isinstance(inputs, tuple)
+                else tuple(sorted(scope.source_ids))
+            )
         )
         sensitivity = await self._catalog.admitted_model_sensitivity(
             run.agent_id,
@@ -1897,6 +2139,22 @@ class DataCapabilityDomain:
         )
 
 
+def _endpoint_source_ids(data: Mapping[str, object]) -> set[str]:
+    """Sources of the relationship endpoints a result returns outside its seeds."""
+
+    relationships = data.get("relationships")
+    return {
+        cast(str, endpoint["source_id"])
+        for relationship in (
+            relationships if isinstance(relationships, (tuple, list)) else ()
+        )
+        for endpoint in cast(
+            tuple[Mapping[str, object], ...],
+            cast(Mapping[str, object], relationship).get("unselected_endpoints", ()),
+        )
+    }
+
+
 def _incomplete_export(draft: ArtifactDraft, reason: str) -> ArtifactError:
     return ArtifactError(
         "artifact_incomplete_export",
@@ -1928,6 +2186,8 @@ __all__ = [
     "DataCapabilityDomain",
     "DataDomainCatalog",
     "DATA_QUERY_CAPABILITY_ID",
+    "DATA_QUERY_COMBINED_CAPABILITY_ID",
+    "DATA_QUERY_COMBINED_EVIDENCE_KIND",
     "DATA_QUERY_EVIDENCE_KIND",
     "DATA_EXPORT_TABULAR_CAPABILITY_ID",
     "RELATIONAL_UPDATE_CAPABILITY_ID",

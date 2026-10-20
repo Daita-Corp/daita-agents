@@ -174,9 +174,9 @@ class PermissionsScreen(Screen[bool]):
 
     async def _preview_write(self, controller: Any) -> None:
         inspection = await controller.inspect_source_permissions(self._source_id)
-        if inspection.adapter_id != "postgresql":
+        if not inspection.supports_relational_writes:
             raise ValueError(
-                "Native write access is available only for PostgreSQL sources."
+                "Native write access needs a source type that supports writes."
             )
         state = self._proposal_state(inspection)
         scopes = {

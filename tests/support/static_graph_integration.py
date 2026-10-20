@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
+from daita.adapters.registry import SourceTypeRegistry
 from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import (
     Capability,
@@ -263,8 +264,8 @@ class StaticGraphIntegration:
             agent_id=AGENT_ID,
             catalog=catalog,
             owner=owner,
-            sqlite_backend=resolved_backend,
-            postgresql_backend=resolved_backend,
+            backends={"sqlite": resolved_backend, "postgresql": resolved_backend},
+            source_types=SourceTypeRegistry(),
             artifacts=artifacts,
             distribution=distribution,
             clock=resolved_clock,

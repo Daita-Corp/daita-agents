@@ -243,7 +243,7 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             name
             for name in registry.tool_names
             if registry.resolve_tool(name)[0].presentation.toolbox_id is ToolboxId.FILES
-        } == {"file_query", "file_read", "file_search"}
+        } == {"file_read", "file_search"}
         # Profile graphs keep internal capabilities only; data_query profiles.
         assert not any(
             registry.resolve_tool(name)[1].id.startswith("jobs.data_profile.")
@@ -271,6 +271,8 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
                 ("rows", "data.query"),
                 ("csv", "data.export_tabular"),
                 ("xlsx", "data.export_tabular"),
+                ("inputs", "data.query_combined"),
+                ("path_pattern", "data.query_files"),
             ),
             "data_update_rows": (
                 ("preview", "data.preview_update_rows"),
@@ -325,7 +327,7 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
         ("artifact_create", "routine_save"),
         ("routine_save", "artifact_create"),
         ("skill_save", "artifact_create"),
-        ("file_query", "artifact_edit_text"),
+        ("memory_set", "artifact_edit_text"),
     ],
 )
 async def test_contract_schema_survives_replacement_in_real_request(

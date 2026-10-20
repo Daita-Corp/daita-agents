@@ -7,6 +7,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from hashlib import sha256
+from pathlib import Path
 from typing import TypeVar
 
 from .._json import FrozenJsonObject, canonical_json
@@ -182,6 +183,10 @@ class DiscoveryRequest:
     max_columns_per_resource: int = 512
     max_indexes_per_resource: int = 256
     max_relationships: int = 2_000
+    # The host's private agent state, which a filesystem source must never
+    # read or catalog; None for hosts without a local agent home.
+    agent_root: Path | None = None
+    agent_home: Path | None = None
 
     def __post_init__(self) -> None:
         _text(self.agent_id, "discovery agent_id")
@@ -204,6 +209,11 @@ class DiscoveryRequest:
             "discovery max_relationships",
             20_000,
         )
+        if (self.agent_root is None) != (self.agent_home is None) or any(
+            item is not None and (not isinstance(item, Path) or not item.is_absolute())
+            for item in (self.agent_root, self.agent_home)
+        ):
+            raise ValueError("discovery agent state paths must be absolute together")
 
 
 @dataclass(frozen=True, slots=True)

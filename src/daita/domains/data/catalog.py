@@ -6,7 +6,10 @@ from hashlib import sha256
 from typing import Protocol
 
 from ..._json import FrozenJsonObject
+from ...adapters.folder import SessionFolderSource
+from ...adapters.models import SourceRegistration
 from ...adapters.protocols import SourceStore
+from ...adapters.registry import SourceOperation, SourceTypeRegistry
 from ...catalog.models import (
     CatalogDescribeRequest,
     CatalogResource,
@@ -14,7 +17,6 @@ from ...catalog.models import (
     CatalogSearchRequest,
     CatalogSearchResult,
     CatalogTraversalRequest,
-    FacetKind,
     ResourceKind,
     Sensitivity,
 )
@@ -46,6 +48,13 @@ class CatalogPermissionStore(SourceStore, Protocol):
     ) -> tuple[RelationalWriteScope, ...]: ...
 
 
+# The source operation each relational write-scope operation requires.
+RELATIONAL_WRITE_OPERATIONS = {
+    "update": SourceOperation.RELATIONAL_UPDATE,
+    "upsert": SourceOperation.RELATIONAL_UPSERT,
+}
+
+
 class CatalogDataView:
     """Translate catalog records without creating a second catalog owner."""
 
@@ -54,6 +63,8 @@ class CatalogDataView:
         store: CatalogStore,
         service: CatalogService,
         sources: CatalogPermissionStore,
+        source_types: SourceTypeRegistry,
+        session_source: SessionFolderSource | None = None,
     ) -> None:
         if not isinstance(store, CatalogStore):
             raise TypeError("store must implement CatalogStore")
@@ -69,22 +80,45 @@ class CatalogDataView:
         ):
             if not callable(getattr(sources, method_name, None)):
                 raise TypeError(f"sources must provide {method_name}")
+        if not isinstance(source_types, SourceTypeRegistry):
+            raise TypeError("source_types must be a SourceTypeRegistry")
         self._store = store
         self._service = service
         self._sources = sources
+        self._source_types = source_types
+        self._session_source = session_source
+
+    @property
+    def session_source_id(self) -> str | None:
+        """The live, never-stored session folder source, if this host has one."""
+
+        return None if self._session_source is None else self._session_source.source_id
+
+    def _available(self, registration: SourceRegistration, agent_id: str) -> bool:
+        """An active owned source whose type is registered in this composition."""
+
+        return (
+            registration.agent_id == agent_id
+            and registration.active
+            and self._source_types.get(registration.adapter_id) is not None
+        )
 
     async def source_routing_facts(
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
     ) -> tuple[FrozenJsonObject, ...]:
-        """Project only active, declared source-routing control facts."""
+        """Project only active, declared source-routing control facts.
+
+        The session folder source is always readable by its foreground user
+        and sorts after every stored source.
+        """
 
         selected_source_ids = frozenset(source_ids)
         registrations = await self._sources.list_sources(agent_id)
         readable_sources: set[str] = set()
         for registration in registrations:
-            if registration.agent_id != agent_id or not registration.active:
+            if not self._available(registration, agent_id):
                 continue
             if selected_source_ids and registration.id not in selected_source_ids:
                 continue
@@ -114,10 +148,17 @@ class CatalogDataView:
                 registrations,
                 key=lambda item: (item.id, item.adapter_id),
             )
-            if registration.agent_id == agent_id
-            and registration.active
+            if self._available(registration, agent_id)
             and registration.id in readable_sources
             and (not selected_source_ids or registration.id in selected_source_ids)
+        ) + (
+            (self._session_source.routing_fact(),)
+            if self._session_source is not None
+            and (
+                not selected_source_ids
+                or self._session_source.source_id in selected_source_ids
+            )
+            else ()
         )
 
     def empty_catalog_context(
@@ -158,6 +199,10 @@ class CatalogDataView:
             and registration.active
             and (not source_ids or registration.id in source_ids)
         )
+        if self._session_source is not None and (
+            not source_ids or self._session_source.source_id in source_ids
+        ):
+            sensitivities.append(self._session_source.presentation_sensitivity)
         for resource in resources:
             if resource.sensitivity is Sensitivity.UNKNOWN:
                 return None
@@ -173,12 +218,14 @@ class CatalogDataView:
     ) -> tuple[CatalogResource, ...]:
         """Resolve the one exact current resource scope used by reads and routing."""
 
-        selected_source_ids = frozenset(source_ids)
+        # The uncataloged session source admits no catalog resources.
+        selected_source_ids = frozenset(source_ids) - {self.session_source_id}
+        if source_ids and not selected_source_ids:
+            return ()
         registrations = tuple(
             registration
             for registration in await self._sources.list_sources(agent_id)
-            if registration.agent_id == agent_id
-            and registration.active
+            if self._available(registration, agent_id)
             and (not selected_source_ids or registration.id in selected_source_ids)
         )
         if selected_source_ids and selected_source_ids != {
@@ -277,10 +324,10 @@ class CatalogDataView:
         *,
         readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
-        readable = await self.readable_resource_ids(
-            request.agent_id,
-            (() if request.source_id is None else (request.source_id,)),
-        )
+        # Every source's readable set, as traverse uses: the service applies the
+        # source_id narrowing itself, and a declared link listed from that source
+        # still needs its readable far endpoint.
+        readable = await self.readable_resource_ids(request.agent_id)
         if readable_resource_ids is not None:
             readable &= readable_resource_ids
         return await self._service.describe(
@@ -422,14 +469,15 @@ class CatalogDataView:
         agent_id: str,
         source_id: str,
     ) -> str | None:
-        """Return the durable attached-source adapter identity, if current."""
+        """Return the source's adapter identity, if current."""
 
+        if self._session_source is not None and source_id == self.session_source_id:
+            return self._session_source.adapter_id
         registration = await self._sources.load_source(agent_id, source_id)
         if (
             registration is None
-            or registration.agent_id != agent_id
             or registration.id != source_id
-            or not registration.active
+            or not self._available(registration, agent_id)
         ):
             return None
         return registration.adapter_id
@@ -519,32 +567,6 @@ class CatalogDataView:
             for resource in sorted(resources.values(), key=lambda item: item.id)
         )
 
-    async def is_current_tabular_file(
-        self,
-        agent_id: str,
-        source_id: str,
-        resource_id: str,
-    ) -> bool:
-        if resource_id not in await self.readable_resource_ids(
-            agent_id,
-            (source_id,),
-        ):
-            return False
-        resource = await self._store.load_resource(agent_id, resource_id)
-        if (
-            resource is None
-            or resource.agent_id != agent_id
-            or resource.source_id != source_id
-            or resource.kind is not ResourceKind.FILE
-        ):
-            return False
-        facets = await self._store.load_facets(
-            agent_id,
-            resource.id,
-            resource.current_revision,
-        )
-        return any(facet.kind is FacetKind.TABULAR for facet in facets)
-
     async def catalog_context(
         self,
         agent_id: str,
@@ -607,7 +629,10 @@ class CatalogDataView:
             or registration.agent_id != agent_id
             or registration.id != source_id
             or not registration.active
-            or registration.adapter_id != "postgresql"
+            or operation not in RELATIONAL_WRITE_OPERATIONS
+            or not self._source_types.supports(
+                registration.adapter_id, RELATIONAL_WRITE_OPERATIONS[operation]
+            )
         ):
             return (
                 "resource_update_not_allowed",
@@ -724,7 +749,10 @@ class CatalogDataView:
             if (
                 registration.agent_id != agent_id
                 or not registration.active
-                or registration.adapter_id != "postgresql"
+                or operation not in RELATIONAL_WRITE_OPERATIONS
+                or not self._source_types.supports(
+                    registration.adapter_id, RELATIONAL_WRITE_OPERATIONS[operation]
+                )
                 or (selected and registration.id not in selected)
             ):
                 continue
@@ -745,4 +773,4 @@ class CatalogDataView:
         return frozenset(applicable)
 
 
-__all__ = ["CatalogDataView"]
+__all__ = ["RELATIONAL_WRITE_OPERATIONS", "CatalogDataView"]

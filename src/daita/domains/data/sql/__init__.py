@@ -25,7 +25,12 @@ from .duckdb_read import (
     ValidatedDuckDBRead,
     validate_duckdb_read,
 )
-from .read_validation import validate_postgresql_read, validate_sqlite_read
+from .read_validation import (
+    qualified_relation,
+    read_validator,
+    validate_postgresql_read,
+    validate_sqlite_read,
+)
 from .relational_update import (
     RELATIONAL_UPDATE_MAX_CANONICAL_BYTES,
     RelationalUpdateCell,
@@ -68,6 +73,8 @@ __all__ = [
     "analyze_postgresql_sql",
     "analyze_sqlite_sql",
     "normalize_sql",
+    "qualified_relation",
+    "read_validator",
     "render_relational_update_statement",
     "sqlite_declared_type_affinity",
     "sqlite_identifier_key",

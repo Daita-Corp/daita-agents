@@ -358,7 +358,7 @@ async def test_every_model_facing_identity_argument_admits_handles(tmp_path: Pat
     )
     names = ("source_id", "source_ids", "resource_id", "resource_ids")
     patterns = {
-        "source": "^(source:sha256:[0-9a-f]{64}|s[1-9][0-9]{0,4})$",
+        "source": "^(source:(?:workspace:)?sha256:[0-9a-f]{64}|s[1-9][0-9]{0,4})$",
         "resource": "^(catalog-resource:sha256:[0-9a-f]{64}|t[1-9][0-9]{0,4})$",
     }
     found: dict[str, str | None] = {}

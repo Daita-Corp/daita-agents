@@ -192,7 +192,9 @@ def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -
 
 def test_d2_certifies_only_the_three_accepted_scheduled_artifact_capabilities() -> None:
     declarations = artifact_capability_declarations()
-    data_declarations = exact_export_capability_declarations()
+    data_declarations = exact_export_capability_declarations(
+        adapter_ids=("sqlite", "postgresql")
+    )
     capabilities = (*declarations.capabilities, *data_declarations.capabilities)
     by_id = {capability.id: capability for capability in capabilities}
     scheduled = {
@@ -1165,6 +1167,9 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
 
 
 class _Catalog:
+    # No live session folder source.
+    session_source_id: str | None = None
+
     async def source_routing_facts(self, agent_id, source_ids=()):
         return ()
 

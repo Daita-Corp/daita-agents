@@ -9,6 +9,7 @@ import multiprocessing
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Mapping
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -28,11 +29,7 @@ from daita.adapters.local_workspace import (
     LocalWorkspaceError,
     LocalWorkspaceLimits,
 )
-from daita.domains.data import (
-    LOCAL_FILE_QUERY_CAPABILITY_ID,
-    LOCAL_FILE_QUERY_EXECUTOR_ID,
-    LOCAL_FILE_QUERY_TOOL_NAME,
-)
+from daita.domains.data import PATH_QUERY_CAPABILITY_ID, PATH_QUERY_EXECUTOR_ID
 from daita.domains.data.sql import (
     DuckDBReadValidationError,
     validate_duckdb_read,
@@ -119,10 +116,20 @@ def _frozen_objects(value: object) -> tuple[FrozenJsonObject, ...]:
         ("SELECT region, SUM(amount) FROM data GROUP BY region", True),
         ("SELECT * FROM data WHERE amount > 10 ORDER BY amount LIMIT 5", True),
         (
+            "SELECT * FROM data WHERE amount > 1 AND (region = 'n' OR region = 's')",
+            True,
+        ),
+        (
             "WITH filtered AS (SELECT * FROM data WHERE amount > 0) SELECT COUNT(*) FROM filtered",
             True,
         ),
         ("SELECT AVG(amount) FROM (SELECT amount FROM data) AS selected", True),
+        (
+            "SELECT CASE WHEN amount > 1 THEN 'big' ELSE 'small' END AS size, "
+            "TRY_CAST(amount AS INTEGER), DATE_TRUNC('month', day), "
+            "STRFTIME(day, '%Y') FROM data",
+            True,
+        ),
         ("ATTACH '/tmp/evil.db' AS evil", False),
         ("COPY data TO '/tmp/evil.csv'", False),
         ("EXPORT DATABASE '/tmp/evil'", False),
@@ -139,7 +146,7 @@ def _frozen_objects(value: object) -> tuple[FrozenJsonObject, ...]:
         ("SELECT * FROM data; SELECT 1", False),
         ("SELECT * FROM other", False),
         ("SELECT * FROM main.data", False),
-        ("SELECT * FROM data a JOIN data b USING (id)", False),
+        ("SELECT * FROM data a JOIN data b USING (id)", True),
         ("SELECT * FROM read_csv('/etc/hosts')", False),
         ("SELECT * FROM read_json('https://example.test/a.json')", False),
         ("SELECT * FROM parquet_scan('/tmp/a.parquet')", False),
@@ -148,7 +155,10 @@ def _frozen_objects(value: object) -> tuple[FrozenJsonObject, ...]:
         ("SELECT * FROM query_table('data')", False),
         ("SELECT * FROM data JOIN (VALUES (1)) v(x) ON true", False),
         ("SELECT * FROM data JOIN (SELECT 1) v ON true", False),
-        ("SELECT * FROM data UNION ALL SELECT * FROM data", False),
+        ("SELECT * FROM data UNION ALL SELECT * FROM data", True),
+        ("SELECT region FROM data EXCEPT SELECT region FROM data", False),
+        ("SELECT * FROM data UNION ALL SELECT * FROM read_csv('/etc/hosts')", False),
+        ("SELECT * FROM data UNION ALL SELECT 1", False),
         ("SELECT * FROM data WHERE region = 'https://example.test'", False),
         ("SELECT * FROM data WHERE region = '/etc/passwd'", False),
         ("SELECT 1", False),
@@ -415,7 +425,7 @@ async def test_incompatible_partition_schema_is_rejected_and_scratch_is_cleaned(
     try:
         with pytest.raises(LocalFileQueryError) as failure:
             await _query(backend, "*.csv", "SELECT COUNT(*) AS rows FROM data")
-        assert failure.value.code == "file_query_invalid"
+        assert failure.value.code == "folder_query_invalid"
         scratch = home / "file-query-scratch"
         assert not scratch.exists() or not tuple(scratch.iterdir())
     finally:
@@ -433,7 +443,7 @@ async def test_malformed_csv_json_and_parquet_fail_as_bounded_results(
         for name in ("broken.csv", "broken.json", "broken.parquet"):
             with pytest.raises(LocalFileQueryError) as failure:
                 await _query(backend, name, "SELECT COUNT(*) AS rows FROM data")
-            assert failure.value.code == "file_query_invalid"
+            assert failure.value.code == "folder_query_invalid"
             assert str(workspace) not in failure.value.message
         scratch = home / "file-query-scratch"
         assert not scratch.exists() or not tuple(scratch.iterdir())
@@ -468,7 +478,7 @@ async def test_result_row_byte_and_column_bounds_are_enforced(tmp_path: Path) ->
         assert utf8_bytes <= 48 * 1_024
         with pytest.raises(LocalFileQueryError) as columns:
             await _query(backend, "wide.csv", "SELECT * FROM data")
-        assert columns.value.code == "file_query_limited"
+        assert columns.value.code == "folder_query_limited"
     finally:
         await backend.close()
 
@@ -616,7 +626,40 @@ def test_worker_pipe_connection_reset_is_a_closed_stream() -> None:
         "data": {},
     }
     connection = cast(Connection, ResetConnection())
-    assert query_module._receive_messages(connection, final) is final
+    assert (
+        query_module._receive_messages(connection, final, LocalFileQueryLimits())
+        is final
+    )
+
+
+async def test_concurrent_queries_wait_for_the_worker_instead_of_failing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend, workspace, _home = await _backend(tmp_path)
+    (workspace / "orders.csv").write_text("region,amount\nnorth,1\n", encoding="utf-8")
+    running: list[int] = []
+    peak: list[int] = []
+    worker = query_module._run_private_worker
+
+    def slow_worker(*args: object) -> object:
+        running.append(1)
+        peak.append(len(running))
+        try:
+            time.sleep(0.2)
+            return worker(*args)  # type: ignore[arg-type]
+        finally:
+            running.pop()
+
+    monkeypatch.setattr(query_module, "_run_private_worker", slow_worker)
+    try:
+        first, second = await asyncio.gather(
+            _query(backend, "orders.csv"), _query(backend, "orders.csv")
+        )
+    finally:
+        await backend.close()
+
+    assert first.data["rows"] == second.data["rows"]
+    assert max(peak) == 1
 
 
 @pytest.mark.parametrize(
@@ -643,7 +686,7 @@ async def test_rss_and_spill_overruns_reap_worker_clean_scratch_and_allow_reuse(
             overrun.setattr(query_module, observer_name, lambda _value: limit + 1)
             with pytest.raises(LocalFileQueryError) as failure:
                 await _query(backend, "orders.csv")
-        assert failure.value.code == "file_query_limited"
+        assert failure.value.code == "folder_query_limited"
         assert failure.value.details[detail_name] == limit
         scratch = home / "file-query-scratch"
         assert not scratch.exists() or not tuple(scratch.iterdir())
@@ -674,7 +717,7 @@ async def test_timeout_and_cancellation_terminate_workers_and_remove_scratch(
     try:
         with pytest.raises(LocalFileQueryError) as timeout:
             await _query(backend, "orders.csv")
-        assert timeout.value.code == "file_query_timeout"
+        assert timeout.value.code == "folder_query_timeout"
         scratch = home / "file-query-scratch"
         assert not scratch.exists() or not tuple(scratch.iterdir())
     finally:
@@ -712,7 +755,7 @@ async def check():
     agent = await EmbeddedAgent.create('hosted-lazy', hosted=True, root=root)
     try:
         assert 'duckdb' not in sys.modules
-        assert 'file_query' not in agent._capabilities.tool_names
+        assert 'data.query_files' not in agent._capabilities._capabilities
     finally:
         await agent.close()
 asyncio.run(check())
@@ -740,7 +783,7 @@ asyncio.run(check())
         builtins.__import__ = original_import
 
 
-async def test_public_agent_loads_and_executes_file_query_through_one_runtime(
+async def test_public_agent_queries_folder_files_through_data_query_route(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -751,14 +794,10 @@ async def test_public_agent_loads_and_executes_file_query_through_one_runtime(
     provider = MockModelProvider(
         (
             _call(
-                "load-query",
-                "toolbox_load",
-                {"tool_names": [LOCAL_FILE_QUERY_TOOL_NAME]},
-            ),
-            _call(
                 "query",
-                LOCAL_FILE_QUERY_TOOL_NAME,
+                "data_query",
                 {
+                    "source_id": "s1",
                     "path_pattern": "orders.csv",
                     "sql": (
                         "SELECT region, SUM(amount) AS total FROM data "
@@ -780,19 +819,16 @@ async def test_public_agent_loads_and_executes_file_query_through_one_runtime(
     try:
         result = await agent.run("Total sales by region in orders.csv")
         assert result.final_text == "north totals 15"
-        assert LOCAL_FILE_QUERY_TOOL_NAME not in {
-            tool.name for tool in provider.requests[0].tools
-        }
-        assert LOCAL_FILE_QUERY_TOOL_NAME in {
-            tool.name for tool in provider.requests[1].tools
-        }
-        view, capability, owner = agent._embedded._capabilities.resolve_tool_owner(
-            LOCAL_FILE_QUERY_TOOL_NAME
+        assert "data_query" in {tool.name for tool in provider.requests[0].tools}
+        _view, capability, owner = agent._embedded._capabilities.resolve_tool_owner(
+            "data_query"
         )
-        assert capability.id == LOCAL_FILE_QUERY_CAPABILITY_ID
-        assert capability.executor_id == LOCAL_FILE_QUERY_EXECUTOR_ID
         assert owner == "data"
-        assert view.presentation.load_mode.value == "on_demand"
+        routed = agent._embedded._capabilities.call_capability(
+            "data_query", {"source_id": "s1", "path_pattern": "x", "sql": "x"}
+        )
+        assert routed.id == PATH_QUERY_CAPABILITY_ID
+        assert routed.executor_id == PATH_QUERY_EXECUTOR_ID
         transcript = await agent.transcript(result.run_id)
         query_result = next(
             block
@@ -816,7 +852,7 @@ async def test_public_agent_loads_and_executes_file_query_through_one_runtime(
         await agent.close()
 
 
-async def test_invalid_file_query_sql_fails_before_workspace_io(
+async def test_invalid_folder_query_sql_fails_before_workspace_io(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -825,14 +861,10 @@ async def test_invalid_file_query_sql_fails_before_workspace_io(
     provider = MockModelProvider(
         (
             _call(
-                "load-query",
-                "toolbox_load",
-                {"tool_names": [LOCAL_FILE_QUERY_TOOL_NAME]},
-            ),
-            _call(
                 "invalid-query",
-                LOCAL_FILE_QUERY_TOOL_NAME,
+                "data_query",
                 {
+                    "source_id": "s1",
                     "path_pattern": "orders.csv",
                     "sql": "SELECT * FROM read_csv('/etc/hosts')",
                 },
@@ -871,18 +903,19 @@ async def test_invalid_file_query_sql_fails_before_workspace_io(
         assert rejected.is_error
         error = rejected.output["error"]
         assert isinstance(error, Mapping)
-        assert error["code"] == "file_query_invalid"
+        assert error["code"] == "folder_query_invalid"
     finally:
         await agent.close()
 
 
-async def test_hosted_registry_contains_no_file_query_authority(tmp_path: Path) -> None:
+async def test_hosted_registry_contains_no_folder_query_authority(
+    tmp_path: Path,
+) -> None:
     from daita.hosting.embedded import EmbeddedAgent
 
     hosted = await EmbeddedAgent.create("phase4-hosted", hosted=True, root=tmp_path)
     try:
-        assert LOCAL_FILE_QUERY_TOOL_NAME not in hosted._capabilities.tool_names
-        assert LOCAL_FILE_QUERY_CAPABILITY_ID not in hosted._capabilities._capabilities
-        assert LOCAL_FILE_QUERY_EXECUTOR_ID not in hosted._capabilities._executors
+        assert PATH_QUERY_CAPABILITY_ID not in hosted._capabilities._capabilities
+        assert PATH_QUERY_EXECUTOR_ID not in hosted._capabilities._executors
     finally:
         await hosted.close()

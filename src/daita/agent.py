@@ -42,6 +42,8 @@ from .artifacts.models import (
 )
 from .capabilities import ApprovalHandler
 from .catalog.models import (
+    CatalogLink,
+    CatalogLinkStatus,
     CatalogResource,
     CatalogSearchRequest,
     CatalogSearchResult,
@@ -157,10 +159,15 @@ class Agent:
         *,
         root: str | Path | None = None,
         keychain: KeychainStore | None = None,
+        config: AgentConfig | None = None,
     ) -> None:
-        """Permanently delete one inactive agent home and its owned credentials."""
+        """Permanently delete one inactive agent home and its owned credentials.
 
-        await EmbeddedAgent.delete(name, root=root, keychain=keychain)
+        Pass the ``config`` the agent was composed with so credentials of its
+        ``source_types`` are removed too.
+        """
+
+        await EmbeddedAgent.delete(name, root=root, keychain=keychain, config=config)
 
     @classmethod
     async def create(
@@ -365,6 +372,15 @@ class Agent:
     @property
     def workspace(self) -> LocalWorkspace:
         return self._embedded.workspace
+
+    @property
+    def session_source_id(self) -> str | None:
+        """The live session folder source's ID, never stored; None when hosted.
+
+        Include it in ``source_scope_ids`` to keep local files in a narrowed run.
+        """
+
+        return self._embedded.session_source_id
 
     @property
     def model_profile(self) -> ModelProfile | None:
@@ -1585,6 +1601,11 @@ class Agent:
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
         return await self._embedded.list_sources()
 
+    async def unavailable_sources(self) -> tuple[SourceRegistration, ...]:
+        """Active sources whose type is not registered; they get no tools."""
+
+        return await self._embedded.unavailable_sources()
+
     async def list_catalog_resources(
         self, *, source_id: str | None = None
     ) -> tuple[CatalogResource, ...]:
@@ -1611,6 +1632,48 @@ class Agent:
 
     async def inspect_catalog_resource(self, resource_id: str) -> FrozenJsonObject:
         return await self._embedded.inspect_catalog_resource(resource_id)
+
+    async def declare_catalog_link(
+        self,
+        from_resource_id: str,
+        to_resource_id: str,
+        field_pairs: tuple[tuple[str, str], ...],
+        *,
+        note: str | None = None,
+    ) -> CatalogLink:
+        """Declare that fields of one resource reference fields of another.
+
+        Each pair is ``(from_field, to_field)``. The resources may be in
+        different sources. Both endpoints and every field must exist in the
+        current catalog; catalog traversal and join selection then follow
+        the link while it stays current.
+        """
+
+        if (
+            not isinstance(field_pairs, tuple)
+            or not field_pairs
+            or any(
+                not isinstance(pair, tuple)
+                or len(pair) != 2
+                or not all(isinstance(name, str) for name in pair)
+                for pair in field_pairs
+            )
+        ):
+            raise TypeError("field_pairs must be a non-empty tuple of (from, to) names")
+        return await self._embedded.declare_catalog_link(
+            from_resource_id,
+            to_resource_id,
+            field_pairs,
+            note=note,
+        )
+
+    async def remove_catalog_link(self, link_id: str) -> bool:
+        return await self._embedded.remove_catalog_link(link_id)
+
+    async def list_catalog_links(self) -> tuple[CatalogLinkStatus, ...]:
+        """Return every declared link, current or stale with its reason."""
+
+        return await self._embedded.list_catalog_links()
 
     async def close(self) -> None:
         await self._embedded.close()

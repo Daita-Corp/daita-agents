@@ -275,6 +275,9 @@ LIMIT $1
 """
 
 
+POSTGRESQL_ADAPTER_ID = "postgresql"
+
+
 class PostgreSQLSourceError(ResourceAdapterError):
     def __init__(
         self,
@@ -473,6 +476,60 @@ class PostgreSQLSource:
         if result is None:
             raise AssertionError("PostgreSQL probe completed without a result")
         return result
+
+
+def postgresql_source_from_registration(
+    registration: SourceRegistration,
+    *,
+    secret_provider: SecretProvider,
+) -> PostgreSQLSource:
+    """Reconstruct one admitted PostgreSQL source from its exact configuration."""
+
+    configuration = registration.configuration
+    required = {"database", "host", "port", "schemas", "ssl_mode", "username"}
+    fields = set(configuration)
+    if not required <= fields or not fields <= required | {
+        "credential_ref",
+        "public_network_only",
+    }:
+        raise ValueError("PostgreSQL source configuration is invalid")
+    raw_schemas = configuration["schemas"]
+    if not isinstance(raw_schemas, tuple) or any(
+        not isinstance(schema, str) for schema in raw_schemas
+    ):
+        raise ValueError("PostgreSQL source configuration is invalid")
+    raw_reference = configuration.get("credential_ref")
+    if raw_reference is not None and not isinstance(raw_reference, str):
+        raise ValueError("PostgreSQL source configuration is invalid")
+    texts = {}
+    for name in ("host", "database", "username", "ssl_mode"):
+        value = configuration[name]
+        if not isinstance(value, str) or not value:
+            raise ValueError("source configuration text is invalid")
+        texts[name] = value
+    port = configuration["port"]
+    if not isinstance(port, int) or isinstance(port, bool):
+        raise ValueError("source configuration integer is invalid")
+    public_network_only = configuration.get("public_network_only", False)
+    if not isinstance(public_network_only, bool):
+        raise ValueError("source configuration boolean is invalid")
+    try:
+        return PostgreSQLSource(
+            host=texts["host"],
+            port=port,
+            database=texts["database"],
+            username=texts["username"],
+            credential=(
+                None if raw_reference is None else SecretReference.parse(raw_reference)
+            ),
+            schemas=raw_schemas,
+            ssl_mode=texts["ssl_mode"],
+            public_network_only=public_network_only,
+            name=registration.display_name,
+            secret_provider=secret_provider,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("PostgreSQL source configuration is invalid") from error
 
 
 class PostgreSQLResourceAdapter:
@@ -1597,9 +1654,11 @@ def _row_bool(row: Mapping[str, object], key: str) -> bool:
 
 
 __all__ = [
+    "POSTGRESQL_ADAPTER_ID",
     "PostgreSQLProbeResult",
     "PostgreSQLProbeSchema",
     "PostgreSQLResourceAdapter",
     "PostgreSQLSource",
     "PostgreSQLSourceError",
+    "postgresql_source_from_registration",
 ]

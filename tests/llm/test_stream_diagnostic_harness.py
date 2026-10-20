@@ -276,7 +276,7 @@ async def test_public_workflow_fixtures_use_actual_agent_and_tool_results(
         responses = [answer("RELIABILITY_OK")]
     elif case.scale == "workspace":
         responses = [
-            call("read", "file_read", {"path": "probe.txt"}),
+            call("read", "file_read", {"source_id": "s1", "path": "probe.txt"}),
             answer(runner.FILE_TOKEN),
         ]
     else:
