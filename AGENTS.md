@@ -424,7 +424,10 @@ a resource outside scope.
 `daita.adapters` implements source admission, containment, discovery,
 freshness checks, and I/O. One composed `SourceTypeRegistry` per agent maps each
 `adapter_id` to its factory, credential fields, read capacity, SQL dialect and
-operation backends. A stored source whose type is not registered stays listed
+operation backends. `SourceOperation` names those backends: `SQL_READ`,
+`TABULAR_READ`, `TABULAR_EXPORT`, `PROFILE`, `RELATIONAL_UPDATE` and
+`RELATIONAL_UPSERT`; every operation except `TABULAR_READ` requires an SQL
+dialect. A stored source whose type is not registered stays listed
 but unavailable: it gets no tools or source capacity, and refresh or edit fails. SQLite paths must be absolute and bounded. Local
 workspace access uses only admitted relative logical paths and rejects
 symlink, traversal, secret-file, and special-file access. PostgreSQL and MCP
@@ -436,10 +439,21 @@ apply during execution. Do not duplicate either mechanism in a generic policy
 layer.
 
 `data_query` with `inputs` routes to `data.query_combined`, a foreground-only
-read that joins two to four sources. Each input `{alias, source_id,
+read that joins two to four sources. Each SQL input `{alias, source_id,
 resource_ids, sql}` takes the single-source path unchanged: run scope, catalog
 validation by the source type's `sql_dialect`, bound resource revisions and that
-type's registry backend. Inputs read at most an internal, model-invisible
+type's registry backend. A tabular input `{alias, source_id, resource_id,
+columns, filters}` names one resource of a type that declares `TABULAR_READ`; it
+takes the same scope checks, every column and filter column must be in the
+current catalog schema, and filters are only AND-combined `eq`, `in`, `lt`,
+`lte`, `gt` and `gte` on scalar values. Its backend receives one
+`ReadTabularRequest` bound to the validated resource revision, refuses a stale
+revision with `query_binding_stale`, and returns a `BoundedResultProjection`.
+SQLite and PostgreSQL implement it by rendering parameterized SQL through their
+own validated read path. A type with `TABULAR_READ` but no `SQL_READ` is usable
+only as a combined-query input; single-source `data_query` is refused for it,
+and `data_query` is offered only while a source with `SQL_READ` is in scope.
+Inputs read at most an internal, model-invisible
 ceiling (`COMBINED_QUERY_INPUT_MAX_ROWS`/`_BYTES`); an input that reaches it
 refuses the whole call with `combined_input_truncated`, so no join ever sees
 incomplete input. The combining `sql` is one DuckDB SELECT validated before
@@ -447,7 +461,8 @@ execution to reference each alias exactly once and nothing else: no table
 functions, file, HTTP or extension access. It runs in the same private DuckDB
 worker as `file_query`. The result carries the union of input resource
 revisions, the highest input sensitivity and per-input lineage (`source_id`,
-`source_revision`, `canonical_sql`, `sql_fingerprint`). Declared catalog links
+`source_revision`, and `canonical_sql`/`sql_fingerprint` for SQL inputs or
+`columns`/`filters` for tabular inputs). Declared catalog links
 inform discovery and join paths only; they grant no read authority.
 
 Data capabilities are reads except for explicitly admitted `data_update_rows` and
@@ -1101,7 +1116,9 @@ When adding a source or data capability:
 1. register a `SourceType` (built-in in `adapters/registry.py`, or passed at agent
    composition through `AgentConfig.source_types`) and never add adapter-id
    dispatch outside the type's own modules; run `tests/support/source_contract.py`
-   against it;
+   against it (`assert_source_type_contract`, plus `assert_tabular_read_contract`
+   when it declares `TABULAR_READ`); a source without SQL needs only discovery
+   and a `TABULAR_READ` backend to join combined queries;
 2. extend the existing adapter, catalog, and concrete domain;
 3. declare stable `Capability`, `Executor`, and optional `ToolView` identities;
 4. compose them in `EmbeddedAgent` through `CapabilityRegistry`;

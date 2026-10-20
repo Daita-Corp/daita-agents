@@ -1507,6 +1507,7 @@ class EmbeddedAgent:
             identity.id,
             source_backends[SourceOperation.SQL_READ],
             combined_engine=combined_engine,
+            tabular_backends=source_backends[SourceOperation.TABULAR_READ],
             file_outputs=(
                 exact_export_outputs(allow_arrow=export_arrow_bounds is not None)
                 if relational_export is not None

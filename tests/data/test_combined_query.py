@@ -44,11 +44,12 @@ from daita.domains.data import (
     DATA_QUERY_COMBINED_CAPABILITY_ID,
     DATA_QUERY_COMBINED_EVIDENCE_KIND,
 )
-from daita.domains.data.capabilities import SqlReadResult
-from daita.domains.data.results import project_result_rows
+from daita.domains.data.capabilities import ReadTabularRequest, SqlReadResult
+from daita.domains.data.results import BoundedResultProjection, project_result_rows
 from daita.llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
+from daita.scope import EffectiveSourceScope, scope_refs
 from tests.support.capability_runtime import execute_projected
 from tests.support.workspace import workspace_for
 
@@ -143,6 +144,18 @@ def _inputs(shop: _Shop) -> tuple[dict[str, object], ...]:
     )
 
 
+def _tabular_customers(shop: _Shop, **changes: object) -> dict[str, object]:
+    """The customers input read as catalog columns instead of SQL."""
+
+    return {
+        "alias": "c",
+        "source_id": shop.customers_source,
+        "resource_id": shop.customers,
+        "columns": ("id", "region"),
+        **changes,
+    }
+
+
 def _runtime(agent: Agent) -> CapabilityRuntime:
     loop = agent._embedded._loop
     assert loop is not None
@@ -206,6 +219,14 @@ class _CountingBackend:
             self.before(request)
         return await self.delegate.execute_read(**request)  # type: ignore[attr-defined]
 
+    async def read_tabular(
+        self, request: ReadTabularRequest
+    ) -> BoundedResultProjection:
+        self.reads.append(request.source_id)
+        if self.before is not None:
+            self.before({"source_id": request.source_id})
+        return await self.delegate.read_tabular(request)  # type: ignore[attr-defined]
+
 
 def _wrap_sqlite_reads(
     agent: Agent, before: Callable[[Mapping[str, object]], None] | None = None
@@ -217,16 +238,39 @@ def _wrap_sqlite_reads(
     backends = executor._backends  # type: ignore[attr-defined]
     counting = _CountingBackend(backends["sqlite"], before)
     backends["sqlite"] = counting
+    executor._tabular_backends["sqlite"] = counting  # type: ignore[attr-defined]
     return counting
 
 
+@pytest.mark.parametrize("customers_form", ["sql", "tabular"])
 async def test_combined_query_totals_revenue_by_region_across_two_sqlite_sources(
-    tmp_path: Path,
+    tmp_path: Path, customers_form: str
 ):
     shop = await _shop(tmp_path)
     try:
-        result = await _call(shop, {"inputs": _inputs(shop), "sql": REVENUE_BY_REGION})
+        inputs = _inputs(shop)
+        if customers_form == "tabular":
+            # The model may name the tabular input's identities by run handles.
+            refs = scope_refs(
+                EffectiveSourceScope(
+                    frozenset({shop.orders_source, shop.customers_source}),
+                    frozenset({shop.orders, shop.customers}),
+                )
+            )
+            inputs = (
+                inputs[0],
+                _tabular_customers(
+                    shop,
+                    source_id=refs.handles[shop.customers_source],
+                    resource_id=refs.handles[shop.customers],
+                ),
+            )
+        result = await _call(shop, {"inputs": inputs, "sql": REVENUE_BY_REGION})
         data = _data(result)
+        # A SQL read of the same source reports the revision it read.
+        sql_inputs = _data(
+            await _call(shop, {"inputs": _inputs(shop), "sql": REVENUE_BY_REGION})
+        )["inputs"]
         catalog = {
             item.id: item
             for source_id in (shop.orders_source, shop.customers_source)
@@ -246,14 +290,21 @@ async def test_combined_query_totals_revenue_by_region_across_two_sqlite_sources
         item["resource_id"]: item["revision"]
         for item in cast(tuple[Mapping[str, object], ...], data["resource_revisions"])
     } == {resource_id: item.current_revision for resource_id, item in catalog.items()}
-    inputs = cast(tuple[Mapping[str, object], ...], data["inputs"])
+    inputs = cast(tuple[Mapping[str, object], ...], data["inputs"])  # type: ignore[assignment]
     assert [(item["alias"], item["source_id"], item["rows"]) for item in inputs] == [
         ("o", shop.orders_source, 3),
         ("c", shop.customers_source, 3),
     ]
-    for item in inputs:
+    for item in inputs if customers_form == "sql" else inputs[:1]:
         assert str(item["canonical_sql"]).upper().startswith("SELECT")
         assert str(item["sql_fingerprint"]).startswith("sha256:")
+    if customers_form == "tabular":
+        assert inputs[1]["columns"] == ("id", "region")
+        assert inputs[1]["filters"] == ()
+        assert (
+            inputs[1]["source_revision"]
+            == cast(tuple[Mapping[str, object], ...], sql_inputs)[1]["source_revision"]
+        )
     assert str(data["sql_fingerprint"]).startswith("sha256:")
     assert result.capability_id == DATA_QUERY_COMBINED_CAPABILITY_ID
     assert result.sensitivity_provenance is not None
@@ -388,13 +439,32 @@ async def test_input_permits_are_taken_once_each_in_sorted_source_order(
     assert recorder.events[2:] == ["release source:source:b", "release source:source:a"]
 
 
+@pytest.mark.parametrize("orders_form", ["sql", "tabular"])
 async def test_input_past_its_internal_ceiling_refuses_the_whole_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, orders_form: str
 ):
     monkeypatch.setattr(data_capabilities, "COMBINED_QUERY_INPUT_MAX_ROWS", 2)
     shop = await _shop(tmp_path)
     try:
-        result = await _call(shop, {"inputs": _inputs(shop), "sql": REVENUE_BY_REGION})
+        arguments: dict[str, object] = {
+            "inputs": _inputs(shop),
+            "sql": REVENUE_BY_REGION,
+        }
+        if orders_form == "tabular":
+            arguments = {
+                "inputs": (
+                    {
+                        "alias": "o",
+                        "source_id": shop.orders_source,
+                        "resource_id": shop.orders,
+                        "columns": ("customer_id", "total"),
+                    },
+                    _inputs(shop)[1],
+                ),
+                "sql": "SELECT c.region, SUM(o.total) AS revenue FROM o "
+                "JOIN c ON c.id = o.customer_id GROUP BY c.region",
+            }
+        result = await _call(shop, arguments)
     finally:
         await shop.agent.close()
 
@@ -405,10 +475,14 @@ async def test_input_past_its_internal_ceiling_refuses_the_whole_call(
     assert details["truncation_reasons"] == ("row_limit",)
 
 
+@pytest.mark.parametrize("customers_form", ["sql", "tabular"])
 async def test_schema_change_after_validation_fails_the_whole_call_as_stale(
-    tmp_path: Path,
+    tmp_path: Path, customers_form: str
 ):
     shop = await _shop(tmp_path)
+    inputs = _inputs(shop)
+    if customers_form == "tabular":
+        inputs = (inputs[0], _tabular_customers(shop))
 
     def alter_customers(request: Mapping[str, object]) -> None:
         if request["source_id"] == shop.customers_source:
@@ -417,7 +491,7 @@ async def test_schema_change_after_validation_fails_the_whole_call_as_stale(
 
     try:
         reads = _wrap_sqlite_reads(shop.agent, alter_customers)
-        result = await _call(shop, {"inputs": _inputs(shop), "sql": REVENUE_BY_REGION})
+        result = await _call(shop, {"inputs": inputs, "sql": REVENUE_BY_REGION})
     finally:
         await shop.agent.close()
 
@@ -425,14 +499,17 @@ async def test_schema_change_after_validation_fails_the_whole_call_as_stale(
     assert _error(result)["code"] == "catalog_source_stale"
 
 
+@pytest.mark.parametrize("customers_form", ["sql", "tabular"])
 @pytest.mark.parametrize("foreign", ["source", "resource"])
 async def test_input_outside_the_run_scope_is_refused_before_any_source_read(
-    tmp_path: Path, foreign: str
+    tmp_path: Path, foreign: str, customers_form: str
 ):
     shop = await _shop(tmp_path)
     try:
         reads = _wrap_sqlite_reads(shop.agent)
         inputs = list(_inputs(shop))
+        if customers_form == "tabular":
+            inputs[1] = _tabular_customers(shop)
         if foreign == "resource":
             # The input names an in-scope source but reads a table of another.
             inputs[1] = {**inputs[1], "source_id": shop.orders_source}
@@ -490,6 +567,85 @@ async def test_combining_sql_outside_the_input_aliases_is_rejected_before_execut
     error = _error(result)
     assert error["code"] == "combined_query_invalid"
     assert cast(Mapping[str, object], error["details"])["reason"] == reason
+    assert reads.reads == []
+
+
+@pytest.mark.parametrize(
+    ("changes", "code"),
+    [
+        (
+            {"filters": ({"column": "region", "operator": "ne", "value": "north"},)},
+            "invalid_argument_value",
+        ),
+        (
+            {"filters": ({"column": "region", "operator": "like", "value": "n%"},)},
+            "invalid_argument_value",
+        ),
+        (
+            {"filters": ({"column": "region", "operator": "is_null", "value": True},)},
+            "invalid_argument_value",
+        ),
+        (
+            {"filters": ({"column": "region", "operator": "in", "value": "north"},)},
+            "tabular_filter_invalid",
+        ),
+        (
+            {"filters": ({"column": "region", "operator": "in", "value": ()},)},
+            "tabular_filter_invalid",
+        ),
+        (
+            {"filters": ({"column": "region", "operator": "in", "value": (("n",),)},)},
+            "tabular_filter_invalid",
+        ),
+        (
+            {"filters": ({"column": "id", "operator": "eq", "value": (1, 2)},)},
+            "tabular_filter_invalid",
+        ),
+        (
+            {"filters": ({"column": "id", "operator": "gte", "value": None},)},
+            "tabular_filter_invalid",
+        ),
+        (
+            {"filters": ({"column": "id", "operator": "lt", "value": {"n": 2}},)},
+            "tabular_filter_invalid",
+        ),
+        ({"columns": ("id", "country")}, "tabular_column_unknown"),
+        (
+            {"filters": ({"column": "tier", "operator": "eq", "value": "gold"},)},
+            "tabular_column_unknown",
+        ),
+    ],
+    ids=[
+        "not_equal",
+        "like",
+        "null_test",
+        "in_scalar",
+        "in_empty",
+        "in_nested",
+        "eq_array",
+        "range_null",
+        "range_object",
+        "unknown_column",
+        "unknown_filter_column",
+    ],
+)
+async def test_tabular_input_outside_equality_in_and_range_on_catalog_columns_is_refused(
+    tmp_path: Path, changes: Mapping[str, object], code: str
+):
+    shop = await _shop(tmp_path)
+    try:
+        reads = _wrap_sqlite_reads(shop.agent)
+        result = await _call(
+            shop,
+            {
+                "inputs": (_inputs(shop)[0], _tabular_customers(shop, **changes)),
+                "sql": REVENUE_BY_REGION,
+            },
+        )
+    finally:
+        await shop.agent.close()
+
+    assert _error(result)["code"] == code
     assert reads.reads == []
 
 
@@ -667,3 +823,38 @@ async def test_result_takes_the_highest_input_sensitivity_and_each_type_backend(
         {"region": "south", "revenue": 4.5, "target": 4.0},
     )
     assert result.sensitivity is ModelSensitivity.CONFIDENTIAL
+
+
+async def test_tabular_input_on_a_type_without_tabular_reads_is_refused(
+    tmp_path: Path,
+):
+    shop = await _shop(tmp_path, AgentConfig(source_types=(_targets_type(),)))
+    try:
+        targets_source = await shop.agent.attach(_TargetsSource())
+        (targets,) = await shop.agent.list_catalog_resources(
+            source_id=targets_source.id
+        )
+        reads = _wrap_sqlite_reads(shop.agent)
+        result = await _call(
+            shop,
+            {
+                "inputs": (
+                    _inputs(shop)[1],
+                    {
+                        "alias": "t",
+                        "source_id": targets_source.id,
+                        "resource_id": targets.id,
+                        "columns": ("region", "target"),
+                    },
+                ),
+                "sql": "SELECT c.region, t.target FROM c JOIN t ON t.region = c.region",
+            },
+            scope=(shop.customers_source, targets_source.id),
+        )
+    finally:
+        await shop.agent.close()
+
+    error = _error(result)
+    assert error["code"] == "tabular_source_adapter_unsupported"
+    assert cast(Mapping[str, object], error["details"])["input_alias"] == "t"
+    assert reads.reads == []

@@ -127,14 +127,15 @@ _RESOURCE_READ_DENIED_MESSAGE = (
 # The source operation a source's registered type must declare for each capability.
 _CAPABILITY_OPERATIONS = {
     DATA_QUERY_CAPABILITY_ID: SourceOperation.SQL_READ,
-    DATA_QUERY_COMBINED_CAPABILITY_ID: SourceOperation.SQL_READ,
     DATA_EXPORT_TABULAR_CAPABILITY_ID: SourceOperation.TABULAR_EXPORT,
     **{item: SourceOperation.RELATIONAL_UPDATE for item in _UPDATE_CAPABILITIES},
     **{item: SourceOperation.RELATIONAL_UPSERT for item in _UPSERT_CAPABILITIES},
 }
+# Combined-query inputs each need SQL_READ or TABULAR_READ, checked per input.
 _SOURCE_CAPABILITIES = frozenset().union(
     _CATALOG_CAPABILITIES,
     _CAPABILITY_OPERATIONS,
+    {DATA_QUERY_COMBINED_CAPABILITY_ID},
 )
 
 
@@ -1377,18 +1378,31 @@ class DataCapabilityDomain:
             )
         prepared: list[dict[str, object]] = []
         for alias, item in zip(aliases, inputs, strict=True):
+            tabular = "sql" not in item
+            # Both forms take the same scope checks; a tabular input names
+            # its one resource as resource_id.
             read = FrozenJsonObject.from_mapping(
-                {name: item[name] for name in ("source_id", "resource_ids", "sql")}
+                {
+                    "source_id": item["source_id"],
+                    "resource_ids": (
+                        (item["resource_id"],) if tabular else item["resource_ids"]
+                    ),
+                    **({} if tabular else {"sql": item["sql"]}),
+                }
             )
             try:
                 await self._validate_source_scope(run, single, read)
                 self._validate_execution_resource_scope(run, single, read)
                 await self._validate_resource_read_scope(run, single, read)
-                validated = await self._validate_sql(
-                    run,
-                    read,
-                    operation=SourceOperation.SQL_READ,
-                    bind_revisions=True,
+                validated = (
+                    await self._validate_tabular_read(run, item)
+                    if tabular
+                    else await self._validate_sql(
+                        run,
+                        read,
+                        operation=SourceOperation.SQL_READ,
+                        bind_revisions=True,
+                    )
                 )
             except CapabilityInputError as error:
                 raise CapabilityInputError(
@@ -1411,6 +1425,93 @@ class DataCapabilityDomain:
                 "inputs": tuple(prepared),
                 "sql": combining.canonical_sql,
                 "_sql_fingerprint": combining.sql_fingerprint,
+            }
+        )
+
+    async def _validate_tabular_read(
+        self, run: RunInput, item: Mapping[str, object]
+    ) -> FrozenJsonObject:
+        """Check one tabular input against the current catalog before any I/O."""
+
+        # capabilities imports this module, so its records load at call time.
+        from .capabilities import TabularFilter
+
+        source_id = cast(str, item["source_id"])
+        resource_id = cast(str, item["resource_id"])
+        adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
+        if adapter_id is None:
+            raise CapabilityInputError(
+                "sql_source_not_available",
+                "The selected source is not active for this agent.",
+                {"source_id": source_id},
+            )
+        if not self._source_types.supports(adapter_id, SourceOperation.TABULAR_READ):
+            raise CapabilityInputError(
+                "tabular_source_adapter_unsupported",
+                "The selected source does not support tabular reads; send this "
+                "input as sql with resource_ids instead.",
+                {"source_id": source_id},
+                recovery=_CORRECT_SQL,
+            )
+        resource = next(
+            (
+                schema
+                for schema in await self._catalog.resource_schemas(
+                    run.agent_id, source_id
+                )
+                if schema.resource_id == resource_id
+            ),
+            None,
+        )
+        if resource is None:
+            raise CapabilityInputError(
+                "sql_resource_source_mismatch",
+                "The resource must belong to the selected source.",
+                {"resource_id": resource_id, "source_id": source_id},
+                recovery=_CORRECT_SQL,
+            )
+        if resource.revision is None or resource.source_revision is None:
+            raise CapabilityInputError(
+                "catalog_provenance_missing",
+                "The resource has no current catalog revision; refresh the source.",
+                {"resource_id": resource_id},
+            )
+        try:
+            filters = tuple(
+                TabularFilter.from_mapping(cast(Mapping[str, object], value))
+                for value in cast(tuple[object, ...], item.get("filters", ()))
+            )
+        except ValueError as error:
+            raise CapabilityInputError(
+                "tabular_filter_invalid",
+                str(error),
+                {"resource_id": resource_id},
+                recovery=_CORRECT_SQL,
+            ) from error
+        columns = cast(tuple[str, ...], item["columns"])
+        unknown = sorted(
+            {*columns, *(value.column for value in filters)} - set(resource.columns)
+        )
+        if unknown:
+            raise CapabilityInputError(
+                "tabular_column_unknown",
+                "Every column and filter column must exist in the resource's "
+                "current catalog schema.",
+                {
+                    "resource_id": resource_id,
+                    "unknown_columns": tuple(unknown),
+                    "available_columns": resource.columns,
+                },
+                recovery=_CORRECT_SQL,
+            )
+        return FrozenJsonObject.from_mapping(
+            {
+                **item,
+                "_adapter_id": adapter_id,
+                # The backend rechecks this exact revision before reading.
+                "_resource_revisions": ((resource_id, resource.revision),),
+                "_source_revision": resource.source_revision,
+                "_resource_name": resource.name,
             }
         )
 

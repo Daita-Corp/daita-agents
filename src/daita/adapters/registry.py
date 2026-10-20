@@ -30,10 +30,11 @@ class SourceOperation(str, Enum):
     PROFILE = "profile"
     RELATIONAL_UPDATE = "relational_update"
     RELATIONAL_UPSERT = "relational_upsert"
+    TABULAR_READ = "tabular_read"
 
 
 # Operations whose validation and execution depend on the type's SQL dialect.
-_SQL_OPERATIONS = frozenset(SourceOperation)
+_SQL_OPERATIONS = frozenset(SourceOperation) - {SourceOperation.TABULAR_READ}
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +167,7 @@ def _sqlite_operations(
         SourceOperation.SQL_READ: backend,
         SourceOperation.TABULAR_EXPORT: backend,
         SourceOperation.PROFILE: backend,
+        SourceOperation.TABULAR_READ: backend,
     }
 
 
@@ -194,6 +196,7 @@ def _postgresql_operations(
         SourceOperation.SQL_READ: reads,
         SourceOperation.TABULAR_EXPORT: reads,
         SourceOperation.PROFILE: reads,
+        SourceOperation.TABULAR_READ: reads,
         SourceOperation.RELATIONAL_UPDATE: writes,
         SourceOperation.RELATIONAL_UPSERT: writes,
     }
@@ -219,6 +222,7 @@ def _builtin_source_types() -> tuple[SourceType, ...]:
                     SourceOperation.SQL_READ,
                     SourceOperation.TABULAR_EXPORT,
                     SourceOperation.PROFILE,
+                    SourceOperation.TABULAR_READ,
                 }
             ),
             create_backends=_sqlite_operations,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -96,15 +97,18 @@ _DATA_QUERY_USAGE = (
 _DATA_QUERY_COMBINED_CAPABILITY_DESCRIPTION = (
     "Join or aggregate data from several sources in one bounded read. Each of "
     "2 to 4 inputs runs read-only SQL in its own source's dialect on exact "
-    "catalog resources; sql is one DuckDB SELECT that references each input "
-    "alias exactly once and nothing else. Returns columns, rows, truncation, "
-    "per-input lineage and timing. Limits: 5s per input, 15s for all inputs, "
-    "100 rows and 16 KB in the result; an input too large to join completely "
-    "refuses the whole call, so aggregate or filter inside each input."
+    "catalog resources, or reads exact catalog columns of one resource with "
+    "optional equality, in and range filters; sql is one DuckDB SELECT that "
+    "references each input alias exactly once and nothing else. Returns "
+    "columns, rows, truncation, per-input lineage and timing. Limits: 5s per "
+    "input, 15s for all inputs, 100 rows and 16 KB in the result; an input too "
+    "large to join completely refuses the whole call, so aggregate or filter "
+    "inside each input."
 )
 _DATA_QUERY_COMBINED_USAGE = (
     " To join sources, send inputs (2-4 {alias, source_id, resource_ids, sql}, "
-    "each in its source's dialect) and sql as one DuckDB SELECT over only "
+    "each in its source's dialect, or {alias, source_id, resource_id, columns, "
+    "filters} for a source without SQL) and sql as one DuckDB SELECT over only "
     "those aliases; aggregate or filter in each input, since an input too "
     "large to join completely refuses the call."
 )
@@ -538,6 +542,111 @@ class SqlReadBackend(Protocol):
     ) -> SqlReadResult: ...
 
 
+TABULAR_FILTER_OPERATORS = ("eq", "in", "lt", "lte", "gt", "gte")
+TABULAR_READ_MAX_COLUMNS = 64
+TABULAR_READ_MAX_FILTERS = 16
+TABULAR_FILTER_MAX_VALUES = 100
+
+
+def _tabular_scalar(value: object) -> bool:
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return isinstance(value, (str, int, bool))
+
+
+@dataclass(frozen=True, slots=True)
+class TabularFilter:
+    """One AND-combined predicate: equality, IN or one side of a range."""
+
+    column: str
+    operator: str
+    value: object
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.column, str) or not self.column.strip():
+            raise ValueError("a filter needs a column name")
+        if self.operator not in TABULAR_FILTER_OPERATORS:
+            raise ValueError(
+                "filter operator must be one of " + ", ".join(TABULAR_FILTER_OPERATORS)
+            )
+        if self.operator == "in":
+            if (
+                not isinstance(self.value, (tuple, list))
+                or not 1 <= len(self.value) <= TABULAR_FILTER_MAX_VALUES
+                or not all(_tabular_scalar(item) for item in self.value)
+            ):
+                raise ValueError(
+                    "an in filter needs an array of 1 to "
+                    f"{TABULAR_FILTER_MAX_VALUES} strings, numbers or booleans"
+                )
+            object.__setattr__(self, "value", tuple(self.value))
+        elif not _tabular_scalar(self.value):
+            raise ValueError(
+                f"an {self.operator} filter needs one string, number or boolean"
+            )
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> TabularFilter:
+        return cls(
+            cast(str, value["column"]), cast(str, value["operator"]), value["value"]
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {"column": self.column, "operator": self.operator, "value": self.value}
+
+
+@dataclass(frozen=True, slots=True)
+class ReadTabularRequest:
+    """One bounded read of named columns from one catalog resource.
+
+    The backend refuses the read when ``expected_revision`` is no longer the
+    resource's current catalog revision.
+    """
+
+    agent_id: str
+    source_id: str
+    resource_id: str
+    expected_revision: str
+    columns: tuple[str, ...]
+    filters: tuple[TabularFilter, ...]
+    limit: int
+    max_bytes: int
+    timeout_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.agent_id, "agent_id"),
+            (self.source_id, "source_id"),
+            (self.resource_id, "resource_id"),
+            (self.expected_revision, "expected_revision"),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"tabular read {name} must be non-empty text")
+        columns = tuple(self.columns)
+        if (
+            not 1 <= len(columns) <= TABULAR_READ_MAX_COLUMNS
+            or len(set(columns)) != len(columns)
+            or any(not isinstance(item, str) or not item for item in columns)
+        ):
+            raise ValueError("tabular read columns must be unique non-empty names")
+        filters = tuple(self.filters)
+        if len(filters) > TABULAR_READ_MAX_FILTERS or any(
+            not isinstance(item, TabularFilter) for item in filters
+        ):
+            raise ValueError("tabular read filters must be TabularFilter values")
+        for bound, name in ((self.limit, "limit"), (self.max_bytes, "max_bytes")):
+            if not isinstance(bound, int) or isinstance(bound, bool) or bound < 1:
+                raise ValueError(f"tabular read {name} must be a positive integer")
+        object.__setattr__(self, "columns", columns)
+        object.__setattr__(self, "filters", filters)
+
+
+class TabularReadBackend(Protocol):
+    async def read_tabular(
+        self, request: ReadTabularRequest
+    ) -> BoundedResultProjection: ...
+
+
 SourceAdapterLookup = Callable[[str, str], Awaitable[str | None]]
 _Backend = TypeVar("_Backend")
 
@@ -788,11 +897,23 @@ _ENGINE_ERRORS = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class _InputRead:
+    """One complete input read and the lineage it contributes."""
+
+    columns: tuple[str, ...]
+    projection: BoundedResultProjection
+    resource_revisions: tuple[tuple[str, str], ...]
+    resource_names: tuple[tuple[str, str], ...]
+    lineage: dict[str, object]
+
+
 class DataQueryCombinedExecutor:
     """Join complete bounded per-source reads in the private DuckDB worker.
 
-    Each input runs through its source's registry backend under the catalog
-    revisions validated before dispatch, within one shared input deadline.
+    Each input runs through its source's registry backend, as SQL or as a
+    tabular read, under the catalog revisions validated before dispatch,
+    within one shared input deadline.
     """
 
     executor_id = DATA_QUERY_COMBINED_EXECUTOR_ID
@@ -803,10 +924,12 @@ class DataQueryCombinedExecutor:
         backends: Mapping[str, SqlReadBackend],
         engine: CombinedQueryEngine,
         *,
+        tabular_backends: Mapping[str, TabularReadBackend] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._agent_id = agent_id
         self._backends = dict(backends)
+        self._tabular_backends = dict(tabular_backends or {})
         self._engine = engine
         self._clock = clock
 
@@ -814,13 +937,9 @@ class DataQueryCombinedExecutor:
         inputs = cast(tuple[Mapping[str, object], ...], request.arguments["inputs"])
         started = self._clock()
         deadline = started + DATA_QUERY_TOTAL_TIMEOUT_SECONDS
-        reads: list[tuple[str, SqlReadResult]] = []
+        reads: list[tuple[str, _InputRead]] = []
         for item in inputs:
             alias = cast(str, item["alias"])
-            source_id = cast(str, item["source_id"])
-            backend = self._backends.get(cast(str, item["_adapter_id"]))
-            if backend is None:
-                raise ValueError("relational query adapter binding is unsupported")
             remaining_seconds = deadline - self._clock()
             if remaining_seconds <= 0:
                 raise DataQueryError(
@@ -828,47 +947,34 @@ class DataQueryCombinedExecutor:
                     "The inputs exceeded the total read deadline of "
                     f"{DATA_QUERY_TOTAL_TIMEOUT_SECONDS:g} seconds.",
                 )
-            result = await backend.execute_read(
-                agent_id=self._agent_id,
-                source_id=source_id,
-                sql=cast(str, item["sql"]),
-                parameters=(),
-                max_rows=COMBINED_QUERY_INPUT_MAX_ROWS,
-                max_bytes=COMBINED_QUERY_INPUT_MAX_BYTES,
-                expected_resource_revisions=_expected_resource_revisions(item),
-                timeout_seconds=min(
-                    DATA_QUERY_STATEMENT_TIMEOUT_SECONDS, remaining_seconds
-                ),
+            timeout = min(DATA_QUERY_STATEMENT_TIMEOUT_SECONDS, remaining_seconds)
+            read = await (
+                self._read_sql(item, timeout)
+                if "sql" in item
+                else self._read_tabular(item, timeout)
             )
-            if (
-                not isinstance(result, SqlReadResult)
-                or result.source_id != source_id
-                or frozenset(result.resource_ids)
-                != frozenset(cast(tuple[str, ...], item["resource_ids"]))
-            ):
-                raise ValueError("SQL backend returned different catalog binding facts")
-            if result.projection.truncated:
+            if read.projection.truncated:
                 raise CapabilityInputError(
                     "combined_input_truncated",
                     f"Input {alias} returned more rows or bytes than can be "
                     "joined completely, so no result was returned.",
                     {
                         "alias": alias,
-                        "source_id": source_id,
-                        "truncation_reasons": result.projection.truncation_reasons,
+                        "source_id": item["source_id"],
+                        "truncation_reasons": read.projection.truncation_reasons,
                     },
                     recovery=ToolRecovery(
                         RecoveryKind.CORRECT_ARGUMENTS,
-                        f"Aggregate or filter inside input {alias}'s own SQL so "
-                        "it returns fewer rows, then retry the combined query.",
+                        f"Aggregate or filter inside input {alias} so it "
+                        "returns fewer rows, then retry the combined query.",
                     ),
                 )
-            reads.append((alias, result))
+            reads.append((alias, read))
         try:
             payload = await self._engine.query_relations(
                 relations=tuple(
-                    QueryRelation(alias, result.columns, result.projection.rows)
-                    for alias, result in reads
+                    QueryRelation(alias, read.columns, read.projection.rows)
+                    for alias, read in reads
                 ),
                 canonical_sql=cast(str, request.arguments["sql"]),
                 sql_fingerprint=cast(str, request.arguments["_sql_fingerprint"]),
@@ -897,29 +1003,16 @@ class DataQueryCombinedExecutor:
             truncation_reasons=cast(tuple[str, ...], payload["truncation_reasons"]),
         )
         revisions = dict(
-            revision for _, result in reads for revision in result.resource_revisions
+            revision for _, read in reads for revision in read.resource_revisions
         )
-        names = dict(name for _, result in reads for name in result.resource_names)
+        names = dict(name for _, read in reads for name in read.resource_names)
         data = projection.to_payload().to_dict()
         data.update(
             {
                 "canonical_sql": payload["canonical_sql"],
                 "columns": payload["columns"],
                 "inputs": tuple(
-                    {
-                        "alias": alias,
-                        "source_id": result.source_id,
-                        "source_revision": result.source_revision,
-                        "canonical_sql": result.canonical_sql,
-                        "sql_fingerprint": result.sql_fingerprint,
-                        "resource_ids": result.resource_ids,
-                        "resource_revisions": tuple(
-                            {"resource_id": resource_id, "revision": revision}
-                            for resource_id, revision in result.resource_revisions
-                        ),
-                        "rows": result.projection.returned_rows,
-                    }
-                    for alias, result in reads
+                    {"alias": alias, **read.lineage} for alias, read in reads
                 ),
                 "resource_ids": tuple(sorted(revisions)),
                 "resource_revisions": tuple(
@@ -938,6 +1031,104 @@ class DataQueryCombinedExecutor:
             }
         )
         return ToolOutput(kind=DATA_QUERY_COMBINED_EVIDENCE_KIND, data=data)
+
+    async def _read_sql(self, item: Mapping[str, object], timeout: float) -> _InputRead:
+        source_id = cast(str, item["source_id"])
+        backend = self._backends.get(cast(str, item["_adapter_id"]))
+        if backend is None:
+            raise ValueError("relational query adapter binding is unsupported")
+        result = await backend.execute_read(
+            agent_id=self._agent_id,
+            source_id=source_id,
+            sql=cast(str, item["sql"]),
+            parameters=(),
+            max_rows=COMBINED_QUERY_INPUT_MAX_ROWS,
+            max_bytes=COMBINED_QUERY_INPUT_MAX_BYTES,
+            expected_resource_revisions=_expected_resource_revisions(item),
+            timeout_seconds=timeout,
+        )
+        if (
+            not isinstance(result, SqlReadResult)
+            or result.source_id != source_id
+            or frozenset(result.resource_ids)
+            != frozenset(cast(tuple[str, ...], item["resource_ids"]))
+        ):
+            raise ValueError("SQL backend returned different catalog binding facts")
+        return _InputRead(
+            columns=result.columns,
+            projection=result.projection,
+            resource_revisions=result.resource_revisions,
+            resource_names=result.resource_names,
+            lineage={
+                "source_id": result.source_id,
+                "source_revision": result.source_revision,
+                "canonical_sql": result.canonical_sql,
+                "sql_fingerprint": result.sql_fingerprint,
+                "resource_ids": result.resource_ids,
+                "resource_revisions": _revision_payload(result.resource_revisions),
+                "rows": result.projection.returned_rows,
+            },
+        )
+
+    async def _read_tabular(
+        self, item: Mapping[str, object], timeout: float
+    ) -> _InputRead:
+        backend = self._tabular_backends.get(cast(str, item["_adapter_id"]))
+        if backend is None:
+            raise ValueError("tabular read adapter binding is unsupported")
+        resource_id = cast(str, item["resource_id"])
+        ((_, revision),) = cast(
+            tuple[tuple[str, str], ...], item["_resource_revisions"]
+        )
+        columns = cast(tuple[str, ...], item["columns"])
+        filters = tuple(
+            TabularFilter.from_mapping(cast(Mapping[str, object], value))
+            for value in cast(tuple[object, ...], item.get("filters", ()))
+        )
+        projection = await backend.read_tabular(
+            ReadTabularRequest(
+                agent_id=self._agent_id,
+                source_id=cast(str, item["source_id"]),
+                resource_id=resource_id,
+                expected_revision=revision,
+                columns=columns,
+                filters=filters,
+                limit=COMBINED_QUERY_INPUT_MAX_ROWS,
+                max_bytes=COMBINED_QUERY_INPUT_MAX_BYTES,
+                timeout_seconds=timeout,
+            )
+        )
+        if not isinstance(projection, BoundedResultProjection) or any(
+            set(row) != set(columns) for row in projection.rows
+        ):
+            raise ValueError("tabular backend returned different columns")
+        revisions = ((resource_id, revision),)
+        return _InputRead(
+            columns=columns,
+            projection=projection,
+            resource_revisions=revisions,
+            resource_names=((resource_id, cast(str, item["_resource_name"])),),
+            lineage={
+                "source_id": item["source_id"],
+                # The backend confirmed the bound revision, so the catalog
+                # source revision bound with it is the one that was read.
+                "source_revision": item["_source_revision"],
+                "columns": columns,
+                "filters": tuple(value.to_payload() for value in filters),
+                "resource_ids": (resource_id,),
+                "resource_revisions": _revision_payload(revisions),
+                "rows": projection.returned_rows,
+            },
+        )
+
+
+def _revision_payload(
+    revisions: tuple[tuple[str, str], ...],
+) -> tuple[dict[str, str], ...]:
+    return tuple(
+        {"resource_id": resource_id, "revision": revision}
+        for resource_id, revision in revisions
+    )
 
 
 def _expected_resource_revisions(
@@ -1159,10 +1350,18 @@ def data_query_declarations(
     *,
     file_outputs: tuple[str, ...] = (),
     combined_engine: CombinedQueryEngine | None = None,
+    tabular_backends: Mapping[str, TabularReadBackend] | None = None,
 ) -> DataQueryDeclarations:
     executors: tuple[Executor, ...] = (DataQueryExecutor(agent_id, backends),)
     if combined_engine is not None:
-        executors += (DataQueryCombinedExecutor(agent_id, backends, combined_engine),)
+        executors += (
+            DataQueryCombinedExecutor(
+                agent_id,
+                backends,
+                combined_engine,
+                tabular_backends=tabular_backends,
+            ),
+        )
     declarations = data_query_capability_declarations(
         file_outputs=file_outputs,
         file_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID if file_outputs else None,
@@ -1537,6 +1736,8 @@ def _query_declarations(
             graph_max_targets=16,
         ),
     )
+    alias_rule = {"type": "string", "pattern": r"^[a-z][a-z0-9_]{0,31}$"}
+    column_rule = {"type": "string", "minLength": 1, "maxLength": 256}
     resource_ids_rule = {
         "type": "array",
         "items": resource_id_schema(),
@@ -1555,23 +1756,72 @@ def _query_declarations(
                     "minItems": 2,
                     "maxItems": COMBINED_QUERY_MAX_INPUTS,
                     "items": {
-                        "type": "object",
-                        "properties": {
-                            "alias": {
-                                "type": "string",
-                                "pattern": r"^[a-z][a-z0-9_]{0,31}$",
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "alias": alias_rule,
+                                    "source_id": source_id_schema(),
+                                    "resource_ids": resource_ids_rule,
+                                    "sql": sql_rule,
+                                },
+                                "required": [
+                                    "alias",
+                                    "source_id",
+                                    "resource_ids",
+                                    "sql",
+                                ],
+                                "additionalProperties": False,
                             },
-                            "source_id": source_id_schema(),
-                            "resource_ids": resource_ids_rule,
-                            "sql": sql_rule,
-                        },
-                        "required": ["alias", "source_id", "resource_ids", "sql"],
-                        "additionalProperties": False,
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "alias": alias_rule,
+                                    "source_id": source_id_schema(),
+                                    "resource_id": resource_id_schema(),
+                                    "columns": {
+                                        "type": "array",
+                                        "items": column_rule,
+                                        "minItems": 1,
+                                        "maxItems": TABULAR_READ_MAX_COLUMNS,
+                                        "uniqueItems": True,
+                                    },
+                                    "filters": {
+                                        "type": "array",
+                                        "maxItems": TABULAR_READ_MAX_FILTERS,
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "column": column_rule,
+                                                "operator": {
+                                                    "type": "string",
+                                                    "enum": list(
+                                                        TABULAR_FILTER_OPERATORS
+                                                    ),
+                                                },
+                                                "value": {},
+                                            },
+                                            "required": ["column", "operator", "value"],
+                                            "additionalProperties": False,
+                                        },
+                                    },
+                                },
+                                "required": [
+                                    "alias",
+                                    "source_id",
+                                    "resource_id",
+                                    "columns",
+                                ],
+                                "additionalProperties": False,
+                            },
+                        ]
                     },
                     "description": (
                         "Use with sql as one DuckDB SELECT over these aliases "
-                        "to join sources; each input sql uses its own source's "
-                        "dialect."
+                        "to join sources. Each input is either sql in its own "
+                        "source's dialect, or exact catalog columns of one "
+                        "resource_id with optional AND-combined filters "
+                        "(eq, in, lt, lte, gt, gte)."
                     ),
                 },
                 "sql": sql_rule,
@@ -1811,6 +2061,10 @@ __all__ = [
     "RelationalUpdateResult",
     "RelationalUpdateSample",
     "SQLiteReadResult",
+    "ReadTabularRequest",
+    "TABULAR_FILTER_OPERATORS",
+    "TabularFilter",
+    "TabularReadBackend",
     "data_query_declarations",
     "data_query_capability_declarations",
     "relational_update_preview_declarations",

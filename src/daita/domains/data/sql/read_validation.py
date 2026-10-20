@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
-from typing import Literal
+from typing import Literal, Protocol, cast
 
 from .analysis import (
     _MAX_CANDIDATES,
@@ -525,6 +525,61 @@ def qualified_relation(schema: ResourceSchema, dialect: str | None) -> str | Non
         None,
     )
     return None if identity is None else ".".join(quote(part) for part in identity)
+
+
+class TabularPredicate(Protocol):
+    @property
+    def column(self) -> str: ...
+
+    @property
+    def operator(self) -> str: ...
+
+    @property
+    def value(self) -> object: ...
+
+
+_TABULAR_COMPARISONS = {"eq": "=", "lt": "<", "lte": "<=", "gt": ">", "gte": ">="}
+
+
+def tabular_read_sql(
+    resource: ResourceSchema,
+    dialect: str,
+    columns: Sequence[str],
+    filters: Sequence[TabularPredicate],
+) -> tuple[str, tuple[object, ...]]:
+    """Render a tabular read as parameterized SQL over one catalog relation.
+
+    SQL backends run the result through their own validated read path.
+    """
+
+    relation = qualified_relation(resource, dialect)
+    if relation is None:
+        raise ValueError("tabular reads need an exact catalog relation")
+
+    def quote(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
+
+    parameters: list[object] = []
+
+    def placeholder(value: object) -> str:
+        parameters.append(value)
+        return "?" if dialect == "sqlite" else f"${len(parameters)}"
+
+    clauses = [
+        (
+            f"{quote(item.column)} IN ("
+            + ", ".join(placeholder(value) for value in cast(tuple, item.value))
+            + ")"
+            if item.operator == "in"
+            else f"{quote(item.column)} {_TABULAR_COMPARISONS[item.operator]} "
+            + placeholder(item.value)
+        )
+        for item in filters
+    ]
+    sql = f"SELECT {', '.join(quote(item) for item in columns)} FROM {relation}"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    return sql, tuple(parameters)
 
 
 def _validate_sql_read(

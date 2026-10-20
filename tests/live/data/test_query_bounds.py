@@ -364,3 +364,106 @@ async def test_postgresql_input_joins_a_sqlite_input_in_one_combined_query(
         cast(Mapping[str, object], item)["source_id"]
         for item in cast(tuple[object, ...], data["inputs"])
     } == {source_id, targets_source.id}
+
+
+async def test_postgresql_tabular_input_joins_a_sqlite_input_in_one_combined_query(
+    tmp_path: Path,
+):
+    agent, source_id, by_name = await _agent(
+        tmp_path,
+        username="daita_large_reader",
+        password=os.environ.get(
+            "DAITA_LARGE_POSTGRES_PASSWORD", "daita_large_fixture_password"
+        ),
+        schemas=ATTACHED_SCHEMAS,
+    )
+    admin = await _admin()
+    try:
+        expected = {
+            row["region_code"]: row["reps"]
+            for row in await admin.fetch(
+                "SELECT region_code, COUNT(*) AS reps FROM sales.sales_reps "
+                "WHERE region_code IN ('AMER', 'EMEA') AND quota_amount >= 800000 "
+                "AND sales_rep_id < 200 GROUP BY region_code"
+            )
+        }
+        assert set(expected) == {"AMER", "EMEA"}
+        labels = tmp_path / "labels.sqlite"
+        with sqlite3.connect(labels) as connection:
+            connection.execute("CREATE TABLE labels (region_code TEXT, label TEXT)")
+            connection.executemany(
+                "INSERT INTO labels VALUES (?, ?)",
+                (("AMER", "Americas"), ("EMEA", "Europe"), ("APAC", "Asia")),
+            )
+        labels_source = await agent.attach(SQLiteSource(labels))
+        (labels_table,) = await agent.list_catalog_resources(source_id=labels_source.id)
+        loop = agent._embedded._loop
+        assert loop is not None
+        (result,) = await execute_projected(
+            cast(CapabilityRuntime, loop._tools),
+            RunInput(
+                id="combined-tabular-postgresql-run",
+                agent_id=agent.id,
+                message="count senior reps by region label",
+                created_at=_OBSERVED_AT,
+                conversation_id="combined-tabular-postgresql-conversation",
+                source_scope_ids=(source_id, labels_source.id),
+            ),
+            (
+                ToolCall(
+                    id="combined",
+                    name="data_query",
+                    arguments={
+                        "inputs": (
+                            {
+                                "alias": "r",
+                                "source_id": source_id,
+                                "resource_id": by_name["sales.sales_reps"],
+                                "columns": ("sales_rep_id", "region_code"),
+                                "filters": (
+                                    {
+                                        "column": "region_code",
+                                        "operator": "in",
+                                        "value": ("AMER", "EMEA"),
+                                    },
+                                    {
+                                        "column": "quota_amount",
+                                        "operator": "gte",
+                                        "value": 800000,
+                                    },
+                                    {
+                                        "column": "sales_rep_id",
+                                        "operator": "lt",
+                                        "value": 200,
+                                    },
+                                ),
+                            },
+                            {
+                                "alias": "l",
+                                "source_id": labels_source.id,
+                                "resource_ids": (labels_table.id,),
+                                "sql": "SELECT region_code, label FROM labels",
+                            },
+                        ),
+                        "sql": "SELECT l.region_code, l.label, COUNT(*) AS reps "
+                        "FROM r JOIN l ON l.region_code = r.region_code "
+                        "GROUP BY l.region_code, l.label ORDER BY l.region_code",
+                    },
+                ),
+            ),
+        )
+    finally:
+        await admin.close()
+        await agent.close()
+
+    output = cast(Mapping[str, object], result.output)
+    assert "error" not in output, output
+    data = cast(Mapping[str, object], output["data"])
+    rows = cast(tuple[Mapping[str, object], ...], data["rows"])
+    assert [(row["region_code"], row["label"], row["reps"]) for row in rows] == [
+        ("AMER", "Americas", expected["AMER"]),
+        ("EMEA", "Europe", expected["EMEA"]),
+    ]
+    tabular = cast(tuple[Mapping[str, object], ...], data["inputs"])[0]
+    assert tabular["source_id"] == source_id
+    assert tabular["resource_ids"] == (by_name["sales.sales_reps"],)

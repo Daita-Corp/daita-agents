@@ -1396,8 +1396,13 @@ def identity_ref_paths(schema: Mapping[str, object]) -> tuple[tuple[str, str], .
             return
         pattern = rule.get("pattern")
         if path and isinstance(pattern, str) and pattern in _IDENTITY_REFS:
-            found.append((path, pattern))
+            if (path, pattern) not in found:
+                found.append((path, pattern))
             return
+        alternatives = rule.get("oneOf")
+        if isinstance(alternatives, (list, tuple)):
+            for alternative in alternatives:
+                visit(alternative, path)
         properties = rule.get("properties")
         if isinstance(properties, Mapping):
             for name, child in properties.items():

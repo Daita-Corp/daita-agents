@@ -17,7 +17,10 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop import LoopExitKind
 from daita.security import EmptySecretProvider
-from tests.support.source_contract import assert_source_type_contract
+from tests.support.source_contract import (
+    assert_source_type_contract,
+    assert_tabular_read_contract,
+)
 from tests.support.workspace import workspace_for
 
 
@@ -419,3 +422,40 @@ async def test_sqlite_source_type_satisfies_the_source_contract(tmp_path) -> Non
         SQLiteSource(database, name="Contract"),
         secret_provider=EmptySecretProvider(),
     )
+
+
+@pytest.mark.contract
+async def test_sqlite_tabular_reads_satisfy_the_tabular_read_contract(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "sales.sqlite"
+    with sqlite3.connect(database) as connection:
+        # A quoted column name proves generated SQL quotes catalog identifiers.
+        connection.execute(
+            'CREATE TABLE sales (id INTEGER PRIMARY KEY, region TEXT, "unit price" REAL)'
+        )
+        connection.executemany(
+            "INSERT INTO sales VALUES (?, ?, ?)",
+            (
+                (1, "north", 4.5),
+                (2, "south", 10.0),
+                (3, "north", 7.25),
+                (4, "east", 1.0),
+            ),
+        )
+    agent = await Agent.create(
+        "sqlite-tabular-contract", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database, name="Sales"))
+        (resource,) = await agent.list_catalog_resources(source_id=source.id)
+        await assert_tabular_read_contract(
+            agent,
+            source_id=source.id,
+            resource_id=resource.id,
+            columns=("region", "unit price"),
+            key_column="region",
+            range_column="unit price",
+        )
+    finally:
+        await agent.close()

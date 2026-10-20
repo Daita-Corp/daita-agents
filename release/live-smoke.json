@@ -1,6 +1,6 @@
 {
-  "surface_digest": "sha256:6f928f23074c7d3b9b9cd4e399b688b566cfb2ea51fb219ddd67c5ff0b68a053",
-  "recorded_on": "2026-10-19",
+  "surface_digest": "sha256:e22a0805ac7a6e581714ebbd061b6d8e3661042b4bcfd01e379dec09d3b31b98",
+  "recorded_on": "2026-10-20",
   "cases": {
     "tests/live/acceptance/test_result_refs.py::test_l8_graph_task_complete_cites_its_read[0]": "passed",
     "tests/live/analysis/test_public_journeys.py::test_real_model_dependent_cells_and_error_correction": "passed",

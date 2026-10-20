@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -39,8 +40,13 @@ from daita.catalog.models import (
     TabularFacet,
     catalog_resource_id,
 )
-from daita.domains.data.capabilities import SqlReadResult
-from daita.domains.data.results import project_result_rows
+from daita.domains.data.capabilities import (
+    DataQueryError,
+    ReadTabularRequest,
+    SqlReadResult,
+    TabularFilter,
+)
+from daita.domains.data.results import BoundedResultProjection, project_result_rows
 from daita.hosting.errors import AgentHomeError
 from daita.llm.models import (
     FinishReason,
@@ -51,7 +57,10 @@ from daita.llm.models import (
 )
 from daita.loop.models import Transcript
 from daita.security import EmptySecretProvider
-from tests.support.source_contract import assert_source_type_contract
+from tests.support.source_contract import (
+    assert_source_type_contract,
+    assert_tabular_read_contract,
+)
 from tests.support.toolbox_model import ToolboxAwareMockModelProvider
 from tests.support.workspace import workspace_for
 
@@ -219,10 +228,66 @@ class _StubReadBackend:
         )
 
 
+REGION_ROWS = (
+    {"region": "north", "revenue": 15},
+    {"region": "south", "revenue": 7},
+    {"region": "east", "revenue": 15},
+    {"region": "west", "revenue": 3},
+)
+_COMPARE: dict[str, Callable[[object, object], bool]] = {
+    "eq": lambda value, bound: value == bound,
+    "in": lambda value, bound: value in cast(tuple[object, ...], bound),
+    "lt": lambda value, bound: cast(int, value) < cast(int, bound),
+    "lte": lambda value, bound: cast(int, value) <= cast(int, bound),
+    "gt": lambda value, bound: cast(int, value) > cast(int, bound),
+    "gte": lambda value, bound: cast(int, value) >= cast(int, bound),
+}
+
+
+class _MemoryTabularBackend:
+    """Read the in-memory table's rows; the type has no SQL at all."""
+
+    def __init__(self, context: SourceBackendContext) -> None:
+        self._catalog = context.catalog
+        self.requests: list[ReadTabularRequest] = []
+
+    async def read_tabular(
+        self, request: ReadTabularRequest
+    ) -> BoundedResultProjection:
+        self.requests.append(request)
+        current = {
+            item.resource_id: item.revision
+            for item in await self._catalog.resource_schemas(
+                request.agent_id, request.source_id
+            )
+        }
+        if current.get(request.resource_id) != request.expected_revision:
+            raise DataQueryError(
+                "query_binding_stale", "The table changed since validation."
+            )
+
+        def matches(row: Mapping[str, object], item: TabularFilter) -> bool:
+            return _COMPARE[item.operator](row[item.column], item.value)
+
+        return project_result_rows(
+            tuple(
+                {column: row[column] for column in request.columns}
+                for row in REGION_ROWS
+                if all(matches(row, item) for item in request.filters)
+            ),
+            max_rows=request.limit,
+            max_bytes=request.max_bytes,
+        )
+
+
 MEMORY_TYPE = SourceType(
     adapter_id=MEMORY_ADAPTER_ID,
     label="In-memory table",
     from_registration=_memory_from_registration,
+    operations=frozenset({SourceOperation.TABULAR_READ}),
+    create_backends=lambda context: {
+        SourceOperation.TABULAR_READ: _MemoryTabularBackend(context)
+    },
 )
 
 
@@ -304,6 +369,122 @@ async def test_in_memory_source_type_satisfies_the_source_contract() -> None:
     await assert_source_type_contract(
         MEMORY_TYPE, _MemorySource("contract"), secret_provider=EmptySecretProvider()
     )
+
+
+@pytest.mark.contract
+async def test_in_memory_tabular_reads_satisfy_the_tabular_read_contract(
+    tmp_path: Path,
+) -> None:
+    agent = await Agent.create(
+        "memory-tabular-contract",
+        root=tmp_path,
+        config=AgentConfig(source_types=(MEMORY_TYPE,)),
+        clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        source = await agent.attach(_MemorySource("Regions"))
+        (resource,) = await agent.list_catalog_resources(source_id=source.id)
+        await assert_tabular_read_contract(
+            agent,
+            source_id=source.id,
+            resource_id=resource.id,
+            columns=("region", "revenue"),
+            key_column="region",
+            range_column="revenue",
+        )
+    finally:
+        await agent.close()
+
+
+@pytest.mark.acceptance
+async def test_type_with_only_tabular_reads_joins_a_sqlite_table_but_gets_no_sql(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "managers.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE managers (region TEXT, manager TEXT)")
+        connection.executemany(
+            "INSERT INTO managers VALUES (?, ?)",
+            (("north", "Ada"), ("south", "Grace"), ("east", "Edsger")),
+        )
+    provider = ToolboxAwareMockModelProvider((), provider_id="mock:memory-join")
+    agent = await Agent.create(
+        "memory-join",
+        root=tmp_path,
+        config=AgentConfig(source_types=(MEMORY_TYPE,)),
+        model=provider,
+        model_profile=_profile(provider),
+        clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        regions = await agent.attach(_MemorySource("Regions"))
+        managers = await agent.attach(SQLiteSource(database, name="Managers"))
+        (regions_table,) = await agent.list_catalog_resources(source_id=regions.id)
+        (managers_table,) = await agent.list_catalog_resources(source_id=managers.id)
+        results = await _run(
+            agent,
+            provider,
+            (
+                _tool(
+                    "single",
+                    "data_query",
+                    {
+                        "source_id": regions.id,
+                        "resource_ids": [regions_table.id],
+                        "sql": "SELECT region, revenue FROM regions",
+                    },
+                ),
+                _tool(
+                    "join",
+                    "data_query",
+                    {
+                        "inputs": [
+                            {
+                                "alias": "r",
+                                "source_id": regions.id,
+                                "resource_id": regions_table.id,
+                                "columns": ["region", "revenue"],
+                                "filters": [
+                                    {"column": "revenue", "operator": "gte", "value": 5}
+                                ],
+                            },
+                            {
+                                "alias": "m",
+                                "source_id": managers.id,
+                                "resource_ids": [managers_table.id],
+                                "sql": "SELECT region, manager FROM managers",
+                            },
+                        ],
+                        "sql": "SELECT m.manager, r.revenue FROM r "
+                        "JOIN m ON m.region = r.region ORDER BY m.manager",
+                    },
+                ),
+                _stop("Ada and Edsger lead the 15 regions; Grace leads 7."),
+            ),
+        )
+    finally:
+        await agent.close()
+
+    single = results["single"].output["error"]
+    assert isinstance(single, Mapping)
+    assert single["code"] == "sql_source_adapter_unsupported"
+    assert not results["join"].is_error, results["join"].output
+    data = cast(Mapping[str, object], results["join"].output["data"])
+    assert [
+        dict(row) for row in cast(tuple[Mapping[str, object], ...], data["rows"])
+    ] == [
+        {"manager": "Ada", "revenue": 15},
+        {"manager": "Edsger", "revenue": 15},
+        {"manager": "Grace", "revenue": 7},
+    ]
+    regions_input = cast(tuple[Mapping[str, object], ...], data["inputs"])[0]
+    assert regions_input["source_id"] == regions.id
+    assert regions_input["columns"] == ("region", "revenue")
+    assert [dict(item) for item in regions_input["resource_revisions"]] == [  # type: ignore[attr-defined]
+        {"resource_id": regions_table.id, "revision": regions_table.current_revision}
+    ]
 
 
 @pytest.mark.acceptance
