@@ -39,7 +39,7 @@ from tests.support.model_graph_integration import (
     ModelGraphIntegration,
     graph_read_declarations,
 )
-from tests.support.toolbox_model import RefCitingMockModelProvider, result_ref
+from tests.support.toolbox_model import PlannerFirstMockModelProvider, result_ref
 
 pytestmark = pytest.mark.integration
 
@@ -124,7 +124,7 @@ async def integration(tmp_path: Path) -> AsyncIterator[ModelGraphIntegration]:
 
 async def _run_to_replacement(integration: ModelGraphIntegration, admission, script):
     """Run one admission to success; return its tool results, terminal, replacement."""
-    provider = RefCitingMockModelProvider(
+    provider = PlannerFirstMockModelProvider(
         script, provider_id=MODEL_ROUTE_ID, complete_pricing=True
     )
     assert integration.supervisor._graph_model_loop is not None

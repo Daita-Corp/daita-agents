@@ -677,7 +677,9 @@ async def test_batch_interruption_settles_dispatched_and_queued_children(
                 {
                     "code": code,
                     "expected_state": {"generation": 0, "revision": 0},
-                    "timeout_seconds": 0.25 if interruption == "timeout" else 30,
+                    # The cell budget also covers worker start and first dispatch,
+                    # so a tighter one can expire before the blocked read begins.
+                    "timeout_seconds": 2 if interruption == "timeout" else 30,
                 },
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="The cell stopped."),
