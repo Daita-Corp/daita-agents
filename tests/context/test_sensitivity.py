@@ -132,6 +132,9 @@ class _NoSourceCatalog:
 
 
 class _StaticContextCatalog:
+    # No live session folder source.
+    session_source_id: str | None = None
+
     async def source_routing_facts(self, agent_id, source_ids=()):
         return ({"source_id": "source-static", "adapter_id": "sqlite"},)
 

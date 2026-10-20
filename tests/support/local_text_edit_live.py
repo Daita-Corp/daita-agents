@@ -259,7 +259,7 @@ async def run_live_text_edit_scenario(
     binding = read_data.get("binding")
     assert isinstance(binding, str) and binding
     assert read_call.arguments["path"] == _RELATIVE_PATH
-    assert set(read_call.arguments) <= {"path", "position"}
+    assert set(read_call.arguments) <= {"source_id", "path", "position"}
     assert read_call.arguments.get("position") in {None, "start"}
     assert set(edit_call.arguments) == {"binding", "replacements"}
     assert edit_call.arguments["binding"] == binding

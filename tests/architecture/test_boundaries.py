@@ -353,10 +353,11 @@ def test_local_workspace_backend_is_explicit_and_conditionally_composed():
     )
     assert compose_text is not None
     assert "LocalDirectoryReadBackend" not in compose_text
-    assert "local_file_declarations(workspace_backend)" in compose_text
-    assert "if workspace_backend is None" in compose_text
-    assert "routine_precheck,\n            local_files,\n        )" in compose_text
-    assert "local_files.executors if local_files is not None else ()" in compose_text
+    # The session's backend reaches the model only as the live folder source.
+    assert "SessionFolderSource.for_workspace(identity.id, workspace)" in compose_text
+    assert "session_workspace=workspace_backend" in compose_text
+    assert "SourceTypeRegistry(source_types, local_files=not hosted)" in compose_text
+    assert "routine_precheck,\n            source_files,\n        )" in compose_text
 
 
 def test_bound_text_edit_has_one_artifact_producer_and_publication_owner():
@@ -499,16 +500,18 @@ def test_mcp_is_server_neutral_lazy_and_uses_existing_runtime_owners():
     )
 
 
-def test_file_query_stays_lazy_private_and_inside_existing_owners():
+def test_folder_queries_stay_lazy_private_and_inside_existing_owners():
     adapter_path = PACKAGE / "adapters" / "local_file_query.py"
     workspace_path = PACKAGE / "adapters" / "local_workspace.py"
-    capability_path = PACKAGE / "domains" / "data" / "file_capabilities.py"
+    folder_path = PACKAGE / "adapters" / "folder.py"
+    capability_path = PACKAGE / "domains" / "data" / "source_files.py"
     controller_path = PACKAGE / "domains" / "data" / "controller.py"
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     adapter = adapter_path.read_text(encoding="utf-8")
     workspace = workspace_path.read_text(encoding="utf-8")
     capabilities = capability_path.read_text(encoding="utf-8")
     controller = controller_path.read_text(encoding="utf-8")
+    folder = folder_path.read_text(encoding="utf-8")
     tree = ast.parse(adapter)
     top_level_imports = {
         alias.name.split(".")[0]
@@ -521,20 +524,19 @@ def test_file_query_stays_lazy_private_and_inside_existing_owners():
         if isinstance(node, ast.ImportFrom)
     }
     assert "duckdb" not in top_level_imports
+    assert "duckdb" not in _imports(folder_path)
     assert "subprocess" not in _imports(adapter_path)
     assert "subprocess" not in _imports(workspace_path)
     assert "shell=True" not in adapter + workspace
     assert "os.system" not in adapter + workspace
     assert _class_owners("LocalFileQueryBackend") == {"adapters/local_file_query.py"}
-    assert _class_owners("LocalFileQueryExecutor") == {
-        "domains/data/file_capabilities.py"
-    }
-    assert "CapabilityRuntime(" not in adapter + workspace + capabilities + controller
-    assert "CapabilityRegistry(" not in adapter + workspace + capabilities + controller
-    assert "ToolLoadMode.ON_DEMAND" in capabilities
-    assert 'LOCAL_FILE_QUERY_TOOL_NAME = "file_query"' in capabilities
-    assert "local_file_declarations(workspace_backend)" in embedded
-    assert "call.name == LOCAL_FILE_QUERY_TOOL_NAME" not in controller
+    assert _class_owners("PathQueryExecutor") == {"domains/data/source_files.py"}
+    assert _class_owners("FolderBackend") == {"adapters/folder.py"}
+    owners = adapter + workspace + folder + capabilities + controller
+    assert "CapabilityRuntime(" not in owners
+    assert "CapabilityRegistry(" not in owners
+    # The folder backend reuses the workspace backend's one DuckDB worker.
+    assert "LocalFileQueryBackend(" not in folder + embedded.split("combined")[0]
     for prohibited in (
         "DuckDBRuntime",
         "FileQueryRuntime",
@@ -543,7 +545,7 @@ def test_file_query_stays_lazy_private_and_inside_existing_owners():
         "persistent_duckdb",
         "prepared_parquet_cache",
     ):
-        assert prohibited not in adapter + workspace + capabilities + controller
+        assert prohibited not in owners
 
 
 async def test_registry_assigns_every_native_tool_to_one_static_owner(
@@ -583,7 +585,6 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["data_query"] == "data"
         assert resolved["file_search"] == "data"
         assert resolved["file_read"] == "data"
-        assert resolved["file_query"] == "data"
         assert resolved["data_update_rows"] == "data"
         assert resolved["memory_set"] == "memory"
         assert resolved["skill_view"] == "skills"
@@ -605,6 +606,7 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         for capability_id, required in (
             ("data.query", {"source_id", "resource_ids"}),
             ("data.query_combined", {"inputs", "sql"}),
+            ("data.query_files", {"source_id", "path_pattern", "sql"}),
         ):
             route_required = registry.capability(capability_id).input_schema.get(
                 "required"
@@ -613,9 +615,14 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
             assert required <= set(route_required)
         query_properties = query_schema.get("properties")
         assert isinstance(query_properties, Mapping)
-        assert {"source_id", "resource_ids", "sql", "statements", "inputs"} <= set(
-            query_properties
-        )
+        assert {
+            "source_id",
+            "resource_ids",
+            "sql",
+            "statements",
+            "inputs",
+            "path_pattern",
+        } <= set(query_properties)
     finally:
         await agent.close()
 
@@ -730,6 +737,7 @@ def test_public_surface_is_focused():
         "EffectRequirement",
         "OutcomeReference",
         "OutcomeState",
+        "FolderSource",
         "PostgreSQLSource",
         "RelationalUpdateReadiness",
         "RelationalWriteScope",
@@ -991,6 +999,18 @@ _SOURCE_TYPE_LITERAL_FILES = frozenset(
 )
 
 
+# Files that may name the built-in folder type literally.
+_FOLDER_LITERAL_FILES = frozenset(
+    {
+        "adapters/folder.py",  # folder adapter owns its adapter id
+        "adapters/registry.py",  # built-in SourceType registration
+        "catalog/models.py",  # ResourceKind.FOLDER resource vocabulary
+        "cli.py",  # per-type `daita attach` flow
+        "tui/screens/onboarding.py",  # per-type onboarding form
+    }
+)
+
+
 def test_source_type_dispatch_goes_through_the_registry():
     offenders: list[str] = []
     for path in sorted(PACKAGE.rglob("*.py")):
@@ -1011,7 +1031,10 @@ def test_source_type_dispatch_goes_through_the_registry():
             f"{relative}:{node.lineno}"
             for node in ast.walk(tree)
             if isinstance(node, ast.Constant)
-            and node.value in {"sqlite", "postgresql"}
+            and (
+                node.value in {"sqlite", "postgresql"}
+                or (node.value == "folder" and relative not in _FOLDER_LITERAL_FILES)
+            )
             and id(node) not in vocabulary
         )
     assert offenders == []
@@ -1023,8 +1046,18 @@ def test_source_type_dispatch_goes_through_the_registry():
         "_ADAPTER_CAPABILITIES",
         "_postgresql_backend",
         "SOURCE_TYPE_LABELS",
+        # The local Files surface the folder source replaced.
+        "file_capabilities",
+        "data.local_file",
+        "LOCAL_FILE_",
+        "LocalFileSearchExecutor",
+        "LocalFileReadExecutor",
+        "LocalFileQueryExecutor",
+        "local_file_declarations",
+        "local_file_sensitivity",
     ):
         assert deleted not in package_text
+    assert not (PACKAGE / "domains" / "data" / "file_capabilities.py").exists()
 
 
 def test_memory_keeps_storage_separate_from_one_fixed_write_identity():
@@ -2484,7 +2517,8 @@ def test_artifact_payloads_and_destination_grants_never_enter_sqlite_messages_or
 def test_local_workspace_read_path_never_imports_or_constructs_artifact_bytes():
     for relative in (
         "adapters/local_workspace.py",
-        "domains/data/file_capabilities.py",
+        "adapters/folder.py",
+        "domains/data/source_files.py",
     ):
         text = (PACKAGE / relative).read_text(encoding="utf-8")
         assert "ToolArtifact" not in text

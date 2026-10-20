@@ -369,6 +369,15 @@ class Agent:
         return self._embedded.workspace
 
     @property
+    def session_source_id(self) -> str | None:
+        """The live session folder source's ID, never stored; None when hosted.
+
+        Include it in ``source_scope_ids`` to keep local files in a narrowed run.
+        """
+
+        return self._embedded.session_source_id
+
+    @property
     def model_profile(self) -> ModelProfile | None:
         return self._embedded.model_profile
 

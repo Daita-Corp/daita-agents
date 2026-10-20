@@ -106,7 +106,7 @@ async def test_real_model_python_broker_duckdb_chart_dataset_and_artifact_lifecy
     )
     try:
         result = await agent.run(
-            "Analyze sales.csv and rates.csv with the local Python tool. Read both files programmatically using tools.call('file_read', {'path': ...}) inside Python. "
+            "Analyze sales.csv and rates.csv with the local Python tool. Read both files programmatically using tools.call('file_read', {'source_id': <the session folder source_id>, 'path': ...}) inside Python. "
             "Combine their rows using DuckDB SQL and compute total USD sales (units * unit_price * usd_rate). "
             "Create a Matplotlib PNG chart and a JSON dataset containing total_usd and by_region, register both named output candidates, "
             "and explicitly save both as two artifacts through separate analysis calls. Do not deliver them to external directories. Report the total."
@@ -243,7 +243,7 @@ async def test_real_model_tui_python_and_broker(tmp_path, paid_case, analysis_re
             try:
                 await app._show_chat()
                 await app.submit_composer(
-                    "Use python_execute. Inside Python, call tools.call('file_read', {'path': 'numbers.txt'}), inspect r['is_error'] and r['output']['data']['content'], then compute and print {'sum': the_sum}. Make the file_read call inside Python even if you already read the file elsewhere. Report the sum."
+                    "Use python_execute. Inside Python, call tools.call('file_read', {'source_id': <the session folder source_id>, 'path': 'numbers.txt'}), inspect r['is_error'] and r['output']['data']['content'], then compute and print {'sum': the_sum}. Make the file_read call inside Python even if you already read the file elsewhere. Report the sum."
                 )
                 assert app._run_task is not None
                 await asyncio.wait_for(app._run_task, 300)

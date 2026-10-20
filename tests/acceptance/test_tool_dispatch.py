@@ -74,7 +74,7 @@ PHASE5_ROUTES = {
     ),
     "file_revenue": (
         "Total revenue by region in sales.csv",
-        ("toolbox_search", "toolbox_load", "file_query"),
+        ("data_query",),
     ),
     "customer_columns": (
         "What columns exist in the connected customer table?",
@@ -86,13 +86,7 @@ PHASE5_ROUTES = {
     ),
     "mixed_compare": (
         "Compare local sales.csv to the connected customer table",
-        (
-            "toolbox_search",
-            "toolbox_load",
-            "file_query",
-            "catalog_describe",
-            "data_query",
-        ),
+        ("data_query", "catalog_describe", "data_query"),
     ),
     "files_only": (
         "Use only files for this question: find the Q4 forecast file",
@@ -249,7 +243,7 @@ async def test_direct_file_dispatch_preserves_authenticated_result(
                 _tool(
                     "find-forecast",
                     "file_search",
-                    {"query": "Q4", "mode": "paths"},
+                    {"source_id": "s1", "query": "Q4", "mode": "paths"},
                 ),
                 _stop("The Q4 forecast is planning/Q4-forecast.md."),
             ),
@@ -259,7 +253,11 @@ async def test_direct_file_dispatch_preserves_authenticated_result(
         (
             "read_todo",
             (
-                _tool("read-todo", "file_read", {"path": "notes/todo.md"}),
+                _tool(
+                    "read-todo",
+                    "file_read",
+                    {"source_id": "s1", "path": "notes/todo.md"},
+                ),
                 _stop("The todo token is TODO_8C32."),
             ),
             "read-todo",
@@ -296,7 +294,7 @@ async def test_direct_file_dispatch_preserves_authenticated_result(
             await agent.close()
 
 
-async def test_file_query_search_load_dispatch_preserves_result(
+async def test_folder_query_dispatch_preserves_result(
     tmp_path: Path,
 ) -> None:
     workspace = _workspace(tmp_path)
@@ -307,18 +305,10 @@ async def test_file_query_search_load_dispatch_preserves_result(
     provider = MockModelProvider(
         (
             _tool(
-                "search-query",
-                "toolbox_search",
-                {
-                    "query": "total revenue by region sales csv",
-                    "limit": 5,
-                },
-            ),
-            _tool("load-query", "toolbox_load", {"tool_names": ["file_query"]}),
-            _tool(
                 "query-sales",
-                "file_query",
+                "data_query",
                 {
+                    "source_id": "s1",
                     "path_pattern": "sales.csv",
                     "sql": (
                         "SELECT region, SUM(revenue) AS total_revenue FROM data "
@@ -342,10 +332,6 @@ async def test_file_query_search_load_dispatch_preserves_result(
         transcript = await agent.transcript(result.run_id)
         _assert_route(transcript, "file_revenue")
         results = _results(transcript)
-        matches = _data(results["search-query"])["matches"]
-        assert isinstance(matches, tuple) and matches
-        assert matches[0]["tool_name"] == "file_query"
-        assert _data(results["load-query"])["loaded_names"] == ("file_query",)
         query_data = _data(results["query-sales"])
         rows = query_data["rows"]
         assert isinstance(rows, tuple)
@@ -358,8 +344,7 @@ async def test_file_query_search_load_dispatch_preserves_result(
         )
         assert result.final_text is not None
         assert "15" in result.final_text and "20" in result.final_text
-        assert "file_query" not in {tool.name for tool in provider.requests[0].tools}
-        assert "file_query" in {tool.name for tool in provider.requests[2].tools}
+        assert "data_query" in {tool.name for tool in provider.requests[0].tools}
         _assert_no_workspace_path(workspace, provider, transcript)
     finally:
         await agent.close()
@@ -551,25 +536,15 @@ async def test_mixed_file_and_source_dispatch_keeps_results_separate(
     try:
         source = await agent.attach(SQLiteSource(database, name="Customers"))
         (resource,) = await agent.list_catalog_resources(source_id=source.id)
+        session_source_id = agent.session_source_id
+        assert session_source_id is not None
         provider.replace_script(
             (
                 _tool(
-                    "mixed-search",
-                    "toolbox_search",
-                    {
-                        "query": "aggregate local sales csv",
-                        "limit": 5,
-                    },
-                ),
-                _tool(
-                    "mixed-load",
-                    "toolbox_load",
-                    {"tool_names": ["file_query"]},
-                ),
-                _tool(
                     "mixed-file-query",
-                    "file_query",
+                    "data_query",
                     {
+                        "source_id": session_source_id,
                         "path_pattern": "sales.csv",
                         "sql": (
                             "SELECT region, SUM(revenue) AS total_revenue FROM data "
@@ -605,13 +580,18 @@ async def test_mixed_file_and_source_dispatch_keeps_results_separate(
             )
         )
         result = await agent.run(
-            PHASE5_ROUTES["mixed_compare"][0], source_scope_ids=(source.id,)
+            PHASE5_ROUTES["mixed_compare"][0],
+            source_scope_ids=(source.id, session_source_id),
         )
         transcript = await agent.transcript(result.run_id)
         _assert_route(transcript, "mixed_compare")
         calls = {call.id: call for call in _calls(transcript)}
         assert calls["mixed-file-query"].arguments["path_pattern"] == "sales.csv"
-        assert set(calls["mixed-file-query"].arguments) == {"path_pattern", "sql"}
+        assert set(calls["mixed-file-query"].arguments) == {
+            "source_id",
+            "path_pattern",
+            "sql",
+        }
         assert set(calls["mixed-source-query"].arguments) == {
             "source_id",
             "resource_ids",
@@ -647,7 +627,7 @@ async def test_files_only_scope_projects_and_dispatches_only_file_tools(
             _tool(
                 "files-only-search",
                 "file_search",
-                {"query": "Q4", "mode": "paths"},
+                {"source_id": "s1", "query": "Q4", "mode": "paths"},
             ),
             _stop("The files-only forecast is Q4-forecast.md."),
         ),
@@ -696,6 +676,7 @@ async def test_latest_log_dispatch_searches_before_bound_tail_read(
                 "latest-search",
                 "file_search",
                 {
+                    "source_id": "s1",
                     "query": "*.log",
                     "mode": "paths",
                     "order_by": "modified_desc",
@@ -704,7 +685,7 @@ async def test_latest_log_dispatch_searches_before_bound_tail_read(
             _tool(
                 "latest-read",
                 "file_read",
-                {"path": "logs/latest.log", "position": "end"},
+                {"source_id": "s1", "path": "logs/latest.log", "position": "end"},
             ),
             _stop("The latest log ends with LATEST_TAIL_9D11."),
         ),
@@ -724,6 +705,7 @@ async def test_latest_log_dispatch_searches_before_bound_tail_read(
         calls = {call.id: call for call in _calls(transcript)}
         assert calls["latest-search"].arguments["order_by"] == "modified_desc"
         assert dict(calls["latest-read"].arguments) == {
+            "source_id": "s1",
             "path": "logs/latest.log",
             "position": "end",
         }
@@ -843,7 +825,9 @@ class _EditRoutingProvider:
         self.requests.append(request)
         results = _request_results(request)
         if "edit-read" not in results:
-            return _tool("edit-read", "file_read", {"path": "config.yaml"})
+            return _tool(
+                "edit-read", "file_read", {"source_id": "s1", "path": "config.yaml"}
+            )
         if "edit-search" not in results:
             return _tool(
                 "edit-search",
@@ -1040,7 +1024,9 @@ def _generated_runtime(
     executors: list[_GeneratedExecutor] = []
     toolboxes = tuple(ToolboxId)
     for index in range(count):
-        name = "file_query" if index == count - 1 else f"generated_tool_{index:03d}"
+        name = (
+            "csv_region_query" if index == count - 1 else f"generated_tool_{index:03d}"
+        )
         executor = _GeneratedExecutor(f"test.phase5.generated.executor.{index:03d}")
         capability = Capability(
             id=f"test.phase5.generated.capability.{index:03d}",
@@ -1060,7 +1046,7 @@ def _generated_runtime(
             executor_id=executor.executor_id,
             access_mode=AccessMode.READ,
         )
-        relevant = name == "file_query"
+        relevant = name == "csv_region_query"
         toolbox_id = ToolboxId.FILES if relevant else toolboxes[index % len(toolboxes)]
         views.append(
             ToolView(
@@ -1183,7 +1169,7 @@ async def test_maximum_catalog_dispatch_is_bounded_searchable_and_replacing(
         )
         assert request.tools == initial.provider_definitions
         assert "generated_tool_500" not in system_text
-        assert "file_query" not in system_text
+        assert "csv_region_query" not in system_text
         assert '"on_demand_count":' in system_text
 
         assert len(catalog.entries) == limits.max_run_tool_catalog_entries == 512
@@ -1218,7 +1204,7 @@ async def test_maximum_catalog_dispatch_is_bounded_searchable_and_replacing(
             ]
         )
         assert "generated_tool_" not in manifest_json
-        assert "file_query" not in manifest_json
+        assert "csv_region_query" not in manifest_json
         assert len(manifest_json.encode("utf-8")) == catalog.manifest_bytes
 
         search = ToolCall(
@@ -1254,7 +1240,7 @@ async def test_maximum_catalog_dispatch_is_bounded_searchable_and_replacing(
             assert isinstance(match, Mapping)
             matches.append(match)
         assert 0 < len(matches) <= 5
-        assert matches[0]["tool_name"] == "file_query"
+        assert matches[0]["tool_name"] == "csv_region_query"
         assert all("domain_owner_id" not in match for match in matches)
         # Traverse every bounded page, including unmatched fallbacks. The same
         # exact prepared catalog remains reachable under legal maximum pressure.
@@ -1298,7 +1284,7 @@ async def test_maximum_catalog_dispatch_is_bounded_searchable_and_replacing(
         load_query = ToolCall(
             id="maximum-load-query",
             name="toolbox_load",
-            arguments={"tool_names": ["file_query"]},
+            arguments={"tool_names": ["csv_region_query"]},
         )
         load_query_result = await _execute_control(
             runtime,
@@ -1311,7 +1297,7 @@ async def test_maximum_catalog_dispatch_is_bounded_searchable_and_replacing(
         messages = _append_exchange((start,), load_query, load_query_result)
         query_projection = runtime.project(catalog, messages)
         assert tuple(entry.view.name for entry in query_projection.loaded_entries) == (
-            "file_query",
+            "csv_region_query",
         )
         assert query_projection.loaded_definition_bytes <= (
             limits.max_loaded_tool_definition_bytes
@@ -1345,12 +1331,12 @@ async def test_maximum_catalog_dispatch_is_bounded_searchable_and_replacing(
         )
         names = {definition.name for definition in replaced.provider_definitions}
         assert replacement_name in names
-        assert "file_query" not in names
+        assert "csv_region_query" not in names
         assert len(names) == limits.max_pinned_tools + 3 + 1
         inspect_call = ToolCall(
             id="maximum-exact-inspection",
             name="toolbox_inspect",
-            arguments={"tool_name": "file_query"},
+            arguments={"tool_name": "csv_region_query"},
         )
         inspected = await _execute_control(
             runtime,

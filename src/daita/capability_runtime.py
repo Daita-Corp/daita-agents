@@ -1186,6 +1186,11 @@ class CapabilityRuntime:
         projected: dict[str, RunToolCatalogEntry] = {}
         for owner_id in sorted(self._domains):
             domain = self._domains[owner_id]
+            # A domain may withhold mode routes no current source can serve.
+            withhold = getattr(domain, "withheld_routes", None)
+            withheld: frozenset[str] = (
+                await withhold(run, session) if callable(withhold) else frozenset()
+            )
             for name in await _domain_project(domain, run, session):
                 if name in projected:
                     raise ValueError(f"tool projected by multiple domains: {name}")
@@ -1208,11 +1213,16 @@ class CapabilityRuntime:
                 routes = tuple(
                     (mode, admitted)
                     for mode, capability_id in view.mode_capability_ids
-                    if (admitted := admitted_by_capability[capability_id]) is not None
+                    if capability_id not in withheld
+                    and (admitted := admitted_by_capability[capability_id]) is not None
                 )
                 if not routes:
                     continue
-                primary = admitted_by_capability[view.capability_id] or routes[0][1]
+                primary = (
+                    None
+                    if view.capability_id in withheld
+                    else admitted_by_capability[view.capability_id]
+                ) or routes[0][1]
                 projected[name] = replace(primary, routes=routes)
         entries = tuple(projected[name] for name in sorted(projected))
         manifest = _toolbox_manifest(entries)

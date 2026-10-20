@@ -2,6 +2,7 @@
 
 from ._version import __version__
 from .adapters import (
+    FolderSource,
     MCPAdmissionError,
     MCPAuthentication,
     MCPAuthenticationMode,
@@ -239,6 +240,7 @@ __all__ = [
     "ResourceRevisionPrecheck",
     "RoutineState",
     "ResourceRevisionBinding",
+    "FolderSource",
     "SQLiteSource",
     "SemanticAnnotation",
     "SemanticAnnotationState",

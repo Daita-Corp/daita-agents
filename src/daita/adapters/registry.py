@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..config import HostCapacityLimits, PostgreSQLReadLimits
@@ -20,6 +21,7 @@ from .protocols import ResourceSource, SourceStore
 if TYPE_CHECKING:
     from ..domains.data.catalog import CatalogDataView
     from ..observation import AgentObserver
+    from .local_workspace import LocalWorkspaceBackend
 
 
 class SourceOperation(str, Enum):
@@ -31,10 +33,16 @@ class SourceOperation(str, Enum):
     RELATIONAL_UPDATE = "relational_update"
     RELATIONAL_UPSERT = "relational_upsert"
     TABULAR_READ = "tabular_read"
+    FILE_SEARCH = "file_search"
+    TEXT_READ = "text_read"
 
 
 # Operations whose validation and execution depend on the type's SQL dialect.
-_SQL_OPERATIONS = frozenset(SourceOperation) - {SourceOperation.TABULAR_READ}
+_SQL_OPERATIONS = frozenset(SourceOperation) - {
+    SourceOperation.TABULAR_READ,
+    SourceOperation.FILE_SEARCH,
+    SourceOperation.TEXT_READ,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +57,10 @@ class SourceBackendContext:
     postgresql_reads: PostgreSQLReadLimits | None
     deadline_reader: Callable[[], float | None]
     observer: AgentObserver | None
+    # The local agent home, and the session's live folder, when the host has them.
+    home: Path | None = None
+    session_workspace: LocalWorkspaceBackend | None = None
+    session_source_id: str | None = None
 
 
 def _one_read(_: HostCapacityLimits) -> int:
@@ -120,9 +132,17 @@ class UnknownSourceTypeError(ValueError):
 class SourceTypeRegistry:
     """The composed set of source types, keyed by ``adapter_id``."""
 
-    def __init__(self, types: Iterable[SourceType] = ()) -> None:
+    def __init__(
+        self, types: Iterable[SourceType] = (), *, local_files: bool = True
+    ) -> None:
+        """Register the built-ins, then ``types``.
+
+        Hosts without local file authority (``local_files=False``) omit the
+        built-in folder type, so a stored folder source stays unavailable.
+        """
+
         self._types: dict[str, SourceType] = {}
-        for source_type in (*_builtin_source_types(), *types):
+        for source_type in (*_builtin_source_types(local_files), *types):
             self.register(source_type)
 
     def register(self, source_type: SourceType) -> None:
@@ -202,11 +222,32 @@ def _postgresql_operations(
     }
 
 
+def _folder_operations(
+    context: SourceBackendContext,
+) -> Mapping[SourceOperation, object]:
+    from .folder import FolderBackend
+
+    backend = FolderBackend(context)
+    return {
+        SourceOperation.SQL_READ: backend,
+        SourceOperation.TABULAR_READ: backend,
+        SourceOperation.FILE_SEARCH: backend,
+        SourceOperation.TEXT_READ: backend,
+    }
+
+
+def _folder_read_capacity(host_capacity: HostCapacityLimits) -> int:
+    # Local file reads are independent descriptor reads; only execution
+    # capacity bounds them, as it did before folders were sources.
+    return host_capacity.execution_capacity
+
+
 def _postgresql_read_capacity(host_capacity: HostCapacityLimits) -> int:
     return host_capacity.postgresql_read_capacity
 
 
-def _builtin_source_types() -> tuple[SourceType, ...]:
+def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
+    from .folder import folder_source_from_registration
     from .postgresql import postgresql_source_from_registration
     from .sqlite import sqlite_source_from_registration
 
@@ -234,8 +275,31 @@ def _builtin_source_types() -> tuple[SourceType, ...]:
             credential_fields=("credential_ref",),
             read_capacity=_postgresql_read_capacity,
             sql_dialect="postgresql",
-            operations=frozenset(SourceOperation),
+            operations=frozenset(SourceOperation)
+            - {SourceOperation.FILE_SEARCH, SourceOperation.TEXT_READ},
             create_backends=_postgresql_operations,
+        ),
+        *(
+            (
+                SourceType(
+                    adapter_id="folder",
+                    label="Folder",
+                    from_registration=folder_source_from_registration,
+                    read_capacity=_folder_read_capacity,
+                    sql_dialect="duckdb",
+                    operations=frozenset(
+                        {
+                            SourceOperation.SQL_READ,
+                            SourceOperation.TABULAR_READ,
+                            SourceOperation.FILE_SEARCH,
+                            SourceOperation.TEXT_READ,
+                        }
+                    ),
+                    create_backends=_folder_operations,
+                ),
+            )
+            if local_files
+            else ()
         ),
     )
 

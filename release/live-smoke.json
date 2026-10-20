@@ -1,5 +1,5 @@
 {
-  "surface_digest": "sha256:e22a0805ac7a6e581714ebbd061b6d8e3661042b4bcfd01e379dec09d3b31b98",
+  "surface_digest": "sha256:28f68c7a2417912c86fb62ffb80787bc4952fd7430410502dc1369f9cd5582d7",
   "recorded_on": "2026-10-20",
   "cases": {
     "tests/live/acceptance/test_result_refs.py::test_l8_graph_task_complete_cites_its_read[0]": "passed",
@@ -14,6 +14,6 @@
     "tests/live/mcp/test_actions.py::test_live_research_and_honest_action_evidence[openai:gpt-5.6-terra-0-success]": "passed",
     "tests/live/mcp/test_read_workflows.py::test_live_dependent_reads_discover_tools_and_bind_returned_account[0-2-2026-07-28-normal]": "passed",
     "tests/live/routines/test_contract_authoring.py::test_model_authors_scheduled_contract_without_dispatch[0-familiar]": "passed",
-    "tests/live/workspace/test_text_edit.py::test_live_model_reads_edits_approves_and_replaces_exact_bound_file": "passed"
+    "tests/live/workspace/test_text_edit.py::test_live_model_reads_edits_approves_and_replaces_exact_bound_file": "passed_on_rerun"
   }
 }

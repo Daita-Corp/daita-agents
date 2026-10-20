@@ -624,35 +624,45 @@ class TabularFacet:
         }
 
 
+# The workspace query formats, plus plain text and binary files.
+_FILE_FACET_FORMATS = frozenset(
+    {"csv", "tsv", "json_records", "ndjson", "parquet", "text", "binary"}
+)
+
+
 @dataclass(frozen=True, slots=True)
 class FileFacet:
-    """Typed local-file facts with freshness kept outside structural identity."""
+    """Typed local-file facts with freshness kept outside structural identity.
+
+    ``physical_revision`` is the stat-derived revision of the observed file, so
+    discovery never hashes file content.
+    """
 
     format: str
     media_type: str
-    encoding: str
+    encoding: str | None
     size_bytes: int
-    content_sha256: str
+    physical_revision: str
     modified_at: datetime
 
     def __post_init__(self) -> None:
-        if self.format not in {"csv", "json"}:
-            raise ValueError("file format must be 'csv' or 'json'")
+        if self.format not in _FILE_FACET_FORMATS:
+            raise ValueError("file format is unsupported")
         _required_text(self.media_type, "file media_type", maximum=256)
-        if self.encoding not in {"utf-8", "utf-8-sig"}:
-            raise ValueError("file encoding must be 'utf-8' or 'utf-8-sig'")
+        if self.encoding not in {None, "utf-8", "utf-8-sig"}:
+            raise ValueError("file encoding must be 'utf-8', 'utf-8-sig' or None")
         _non_negative_int(self.size_bytes, "file size_bytes")
-        _require_hash(self.content_sha256, "file content_sha256")
+        _require_hash(self.physical_revision, "file physical_revision")
         _aware(self.modified_at, "file modified_at")
 
     def structural_payload(self) -> dict[str, object]:
         """Return facts whose changes create a new structural file revision."""
 
         return {
-            "content_sha256": self.content_sha256,
             "encoding": self.encoding,
             "format": self.format,
             "media_type": self.media_type,
+            "physical_revision": self.physical_revision,
             "size_bytes": self.size_bytes,
         }
 
@@ -1206,6 +1216,8 @@ class CatalogSync:
     resource_count: int = 0
     relationship_count: int = 0
     error_code: str | None = None
+    # A bounded discovery that omitted resources beyond its request limits.
+    truncated: bool = False
 
     def __post_init__(self) -> None:
         _required_text(self.id, "catalog sync id")
@@ -1228,6 +1240,10 @@ class CatalogSync:
             "catalog sync relationship_count",
         )
         _optional_text(self.error_code, "catalog sync error_code", maximum=128)
+        if not isinstance(self.truncated, bool):
+            raise TypeError("catalog sync truncated must be a boolean")
+        if self.truncated and self.status is not CatalogSyncStatus.SUCCEEDED:
+            raise ValueError("only a successful catalog sync can be truncated")
 
         if self.status is CatalogSyncStatus.RUNNING:
             if self.completed_at is not None or self.error_code is not None:

@@ -140,7 +140,7 @@ class AnalysisCapabilityDomain:
         description = (
             "Run Python in an isolated bounded workspace to compute over or transform "
             "authenticated tool results. Prefer data_query for SQL and aggregates, "
-            "file_query for local file data. Start with expected_state={generation:0,"
+            "including local file data. Start with expected_state={generation:0,"
             "revision:0}, then pass the returned state. r=tools.call(name, args): "
             "r['is_error'], r['output']['data'], r['evidence_id']. outputs.add('name',"
             "'f.png') registers a temporary file (letter, then letters, digits, _ or "

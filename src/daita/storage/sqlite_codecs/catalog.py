@@ -20,6 +20,7 @@ from ...catalog.models import (
 )
 from .common import (
     JsonValue,
+    boolean,
     datetime_decode,
     datetime_encode,
     dump_payload,
@@ -375,6 +376,7 @@ def _encode_catalog_sync(value: CatalogSync) -> dict[str, JsonValue]:
             "resource_count": value.resource_count,
             "relationship_count": value.relationship_count,
             "error_code": value.error_code,
+            "truncated": value.truncated,
         },
     )
 
@@ -395,6 +397,7 @@ def _decode_catalog_sync(value: JsonValue) -> CatalogSync:
             "resource_count",
             "relationship_count",
             "error_code",
+            "truncated",
         ),
     )
     return CatalogSync(
@@ -413,6 +416,7 @@ def _decode_catalog_sync(value: JsonValue) -> CatalogSync:
             fields["relationship_count"], "catalog relationship_count"
         ),
         error_code=optional_text(fields["error_code"], "catalog sync error_code"),
+        truncated=boolean(fields["truncated"], "catalog sync truncated"),
     )
 
 

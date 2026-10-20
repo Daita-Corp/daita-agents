@@ -111,11 +111,12 @@ Actual consumption is never clipped to an authorization or reservation ceiling.
 Unknown machine-run usage consumes at least its reservation; it is never recorded
 as measured zero. Exhausted cumulative budgets prevent subsequent reservation.
 
-Daita supports catalog-backed SQLite and PostgreSQL reads, foreground local
-computer file access with a bounded-workspace option for typed callers, and
-explicitly admitted server-neutral remote MCP reads and external actions. SQL is
-validated against the current catalog before source I/O. Local file reads are
-descriptor-contained and revision-bound. MCP calls
+Daita supports catalog-backed SQLite, PostgreSQL and folder reads, foreground
+local computer file access through the live session folder source with a
+bounded-workspace option for typed callers, and explicitly admitted
+server-neutral remote MCP reads and external actions. SQL is validated against
+the current catalog before source I/O. Local file reads are descriptor-contained
+and revision-bound. MCP calls
 revalidate the exact binding revision, remote identity, and schemas.
 
 Agent identity, source registrations, current catalog snapshots, declared
@@ -145,6 +146,7 @@ src/daita/
   catalog/                    # normalized source and resource truth
   adapters/                   # source admission, discovery, and bounded I/O
   adapters/registry.py        # source types: identity, factory, declared operations
+  adapters/folder.py          # folder source type: attached and session folders
   artifacts/                  # artifact records, renderers, storage, delivery
   jobs/                       # durable job records, lifecycle, supervisor
   routines/                   # scheduled routines and occurrence supervisor
@@ -249,8 +251,8 @@ Foreground `RunInput.source_scope_ids=()` admits all currently readable sources
 as candidates at preparation; a nonempty tuple narrows them to exact caller IDs.
 One explicit effective scope freezes source and resource candidates for that run.
 Revocation narrows it; later attachment or permission expansion cannot widen it.
-An empty machine ceiling or resolved scope means no sources. Files-only excludes
-both catalog and MCP tools. There is no active source, conversation source, or
+An empty machine ceiling or resolved scope means no sources. Files-only scopes the
+run to exactly the session folder source, which excludes catalog and MCP tools. There is no active source, conversation source, or
 implicit source argument injection.
 
 Clarification is ordinary foreground model behavior within the direct loop, not a
@@ -426,9 +428,9 @@ lists each current link leaving that source, with its far endpoint unselected.
 freshness checks, and I/O. One composed `SourceTypeRegistry` per agent maps each
 `adapter_id` to its factory, credential fields, read capacity, SQL dialect and
 operation backends. `SourceOperation` names those backends: `SQL_READ`,
-`TABULAR_READ`, `TABULAR_EXPORT`, `PROFILE`, `RELATIONAL_UPDATE` and
-`RELATIONAL_UPSERT`; every operation except `TABULAR_READ` requires an SQL
-dialect. A stored source whose type is not registered stays listed
+`TABULAR_READ`, `TABULAR_EXPORT`, `PROFILE`, `RELATIONAL_UPDATE`,
+`RELATIONAL_UPSERT`, `FILE_SEARCH` and `TEXT_READ`; every operation except
+`TABULAR_READ`, `FILE_SEARCH` and `TEXT_READ` requires an SQL dialect. A stored source whose type is not registered stays listed
 but unavailable: it gets no tools or source capacity, and refresh or edit fails. SQLite paths must be absolute and bounded. Local
 workspace access uses only admitted relative logical paths and rejects
 symlink, traversal, secret-file, and special-file access. PostgreSQL and MCP
@@ -454,13 +456,15 @@ SQLite and PostgreSQL implement it by rendering parameterized SQL through their
 own validated read path. A type with `TABULAR_READ` but no `SQL_READ` is usable
 only as a combined-query input; single-source `data_query` is refused for it,
 and `data_query` is offered only while a source with `SQL_READ` is in scope.
+A run withholds the `data_query` routes no in-scope source can serve: export
+needs a `TABULAR_EXPORT` source and `path_pattern` needs the session folder.
 Inputs read at most an internal, model-invisible
 ceiling (`COMBINED_QUERY_INPUT_MAX_ROWS`/`_BYTES`); an input that reaches it
 refuses the whole call with `combined_input_truncated`, so no join ever sees
 incomplete input. The combining `sql` is one DuckDB SELECT validated before
 execution to reference each alias exactly once and nothing else: no table
 functions, file, HTTP or extension access. It runs in the same private DuckDB
-worker as `file_query`. The result carries the union of input resource
+worker as folder-source SQL. The result carries the union of input resource
 revisions, the highest input sensitivity and per-input lineage (`source_id`,
 `source_revision`, and `canonical_sql`/`sql_fingerprint` for SQL inputs or
 `columns`/`filters` for tabular inputs). Declared catalog links
@@ -493,29 +497,55 @@ Native graph release is limited to these same PostgreSQL update/upsert contracts
 
 ## Local computer files and artifacts
 
-The local Files surface is separate from cataloged sources. Plain local CLI/TUI
-composition uses computer access: its frozen working directory is the default,
-while absolute and `~/` paths can address other OS-permitted locations.
-`file_search` supports one root or a bounded multi-root set with one shared
-budget, qualified matches, and per-root coverage. Typed `LocalWorkspace` callers
-remain contained by default unless they explicitly select computer access. Both
-modes use the same resolver, descriptor-contained backend, declarations, runtime,
-and edit pipeline. Hosted and machine-originated runs have no ambient local-file
-authority. Private Daita state is rejected when targeted and pruned from broader
-searches.
+Local files reach the agent only through the `folder` source type
+(`adapters/folder.py`), which wraps the descriptor-contained
+`LocalWorkspaceBackend` and its private DuckDB worker. There are two kinds of
+folder source:
 
-`file_search`, `file_read`, and `file_query` return bounded, revision-bound
-results. `file_query` uses a private one-call DuckDB worker over an exact input
-manifest and exposes only the relation `data` to validated SQL. A combined
-`data_query` uses the same worker and validator, binding typed copies of its
-complete inputs in private scratch and exposing only their aliases; homes
-without local scratch (`Agent.from_storage`) do not offer it.
+- An **attached folder** (`Agent.attach(FolderSource(root, subpaths=...))`) is a
+  durable, cataloged source like any other. Discovery catalogs FOLDER and FILE
+  resources with `CONTAINS` edges, a `FileFacet` (format, media type, size,
+  stat-based physical revision) for every file, and a `TabularFacet` read
+  through the worker for csv, tsv, json-records, ndjson and parquet files. It is
+  bounded by `max_resources`; a truncated discovery commits a bounded snapshot
+  with `CatalogSync.truncated`. Attached folders are always contained to their
+  root; hosted compositions do not register the folder type.
+- The **session folder source** is built by the composition root from the
+  session's `LocalWorkspace`. Its `source:workspace:sha256:` ID is stable for the agent
+  and workspace, sorts after every stored source, and is never written to the
+  agent home: it is not a registration and is never listed. It is not cataloged;
+  its operations run live. Plain local CLI/TUI composition uses computer access:
+  its frozen working directory is the default, while absolute and `~/` paths can
+  address other OS-permitted locations. Typed `LocalWorkspace` callers remain
+  contained by default unless they explicitly select computer access. Only a
+  foreground user run receives it: hosted compositions have none, and scope
+  resolution drops it for machine-originated runs even when a frozen scope names
+  it. Explicit `source_scope_ids` keep it only when they include
+  `Agent.session_source_id`.
 
-An authenticated current-run `file_read` binding can feed
+Private Daita state is rejected when targeted, pruned from broader searches and
+refused as an attached root. `file_search` and `file_read` take a folder
+`source_id`; `file_search` supports one root or a bounded multi-root set with one
+shared budget, qualified matches, and per-root coverage, and `file_read` returns
+bounded chunks, `position=end` tail windows and opaque cursors. `data_query` with
+`source_id`, `path_pattern` and `sql` queries one homogeneous dataset matched
+live in the session folder and exposes only the relation `data`. An attached
+folder answers only for its readable cataloged files: search and read are
+limited to them before any file content is read, `data_query` takes their
+`resource_ids` as the one relation `data`, combined queries accept them as SQL
+or tabular inputs, and a file whose physical revision no longer matches its
+catalog revision is refused with `query_binding_stale`. Every result carries the
+source's sensitivity and its binding provenance. A combined `data_query` uses
+the same worker and validator, binding typed copies of its complete inputs in
+private scratch and exposing only their aliases; homes without local scratch
+(`Agent.from_storage`) do not offer it.
+
+An authenticated current-run session-folder `file_read` binding can feed
 `artifact_edit_text`. That capability commits a complete replacement artifact
 without changing the local file. `artifact_save_local` requires exact approval,
 revalidates the unchanged bound file, and atomically publishes the artifact.
-Drift requires a fresh read and edit.
+Drift requires a fresh read and edit. Attached folders are read-only sources:
+their reads carry no edit binding.
 
 The artifact store is the sole storage boundary for committed artifact bytes
 and manifests. `ArtifactByteStorage` supplies only exclusive publication,
@@ -1118,8 +1148,9 @@ When adding a source or data capability:
    composition through `AgentConfig.source_types`) and never add adapter-id
    dispatch outside the type's own modules; run `tests/support/source_contract.py`
    against it (`assert_source_type_contract`, plus `assert_tabular_read_contract`
-   when it declares `TABULAR_READ`); a source without SQL needs only discovery
-   and a `TABULAR_READ` backend to join combined queries;
+   when it declares `TABULAR_READ` and `assert_live_source_contract` for a live
+   uncataloged source); a source without SQL needs only discovery and a
+   `TABULAR_READ` backend to join combined queries;
 2. extend the existing adapter, catalog, and concrete domain;
 3. declare stable `Capability`, `Executor`, and optional `ToolView` identities;
 4. compose them in `EmbeddedAgent` through `CapabilityRegistry`;
@@ -1142,6 +1173,7 @@ Do not commit changes unless the task explicitly requests a commit.
 | `src/daita/capabilities.py` | declarations and registry |
 | `src/daita/capability_runtime.py` | common execution mechanics |
 | `src/daita/adapters/registry.py` | source type registry and built-in source types |
+| `src/daita/adapters/folder.py` | folder source type: attached and session folders |
 | `src/daita/context.py` | model-request construction |
 | `src/daita/domains/data/sql/` | catalog-scoped SQL validation |
 | `src/daita/domains/mcp.py` | MCP projection and call-time rechecks |

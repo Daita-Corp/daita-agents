@@ -19,6 +19,7 @@ from daita import (
     ConversationRun,
     DeliveryInspection,
     DeliveryView,
+    FolderSource,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningReviewStatus,
@@ -485,6 +486,9 @@ class PresentationController:
 
     async def attach_sqlite(self, path: Path, *, name: str | None) -> Any:
         return await self.require_agent().attach_sqlite(path, name=name)
+
+    async def attach_folder(self, path: Path, *, name: str | None) -> Any:
+        return await self.require_agent().attach(FolderSource(path, name=name))
 
     async def store_postgresql_password(self, password: str) -> SecretReference:
         return await self.require_agent().store_postgresql_password(password)

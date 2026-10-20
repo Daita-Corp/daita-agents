@@ -7,7 +7,7 @@ CREATE TABLE agent_home_migrations (
 INSERT INTO "agent_home_migrations" VALUES(1,'agent_home_revision_1','a08bdc56e3cb7c3dbe77dc0d8b8ed9aac1299a6a701902dba8e11a5ebe70f25e');
 INSERT INTO "agent_home_migrations" VALUES(2,'0002_durable_adaptive_task_graph','cb98e978fcb6db71cc1cb3ee5532d92ce99117db7359a008a98a4651df1c20e2');
 INSERT INTO "agent_home_migrations" VALUES(3,'0003_framework_caller_authority','3357ee7ad8153e5160d06133082be89dca1e868f1529029f5b63988fae5dca42');
-INSERT INTO "agent_home_migrations" VALUES(4,'0004_foreground_analysis_evidence','8023aec3e4bd55a1222bc078197a11c117abbabb2726866f95e18b1c9ddd63c8');
+INSERT INTO "agent_home_migrations" VALUES(4,'0004_foreground_analysis_evidence','fb675270be548207199b3737d0c3f6c75e9b41e2ddc906ac674ec42f9d98b528');
 CREATE TABLE analysis_evidence (
     agent_id TEXT NOT NULL,
     run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,

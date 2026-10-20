@@ -126,9 +126,12 @@ async def _run(
     agent: Agent,
     provider: ToolboxAwareMockModelProvider,
     script: tuple[ModelResponse, ...],
+    source_scope_ids: tuple[str, ...] = (),
 ) -> dict[str, ToolResultBlock]:
     provider.replace_script(script)
-    result = await agent.run("Use the connected data.")
+    result = await agent.run(
+        "Use the connected data.", source_scope_ids=source_scope_ids
+    )
     return _results(await agent.transcript(result.run_id))
 
 
@@ -293,6 +296,8 @@ async def test_registered_type_without_sql_attaches_catalogs_reopens_and_detache
                 _tool("describe", "catalog_describe", {"resource_ids": [resource.id]}),
                 _stop("The regions table has region and revenue."),
             ),
+            # Only the SQL-less source: the live session folder answers SQL.
+            source_scope_ids=(source.id,),
         )
         assert not results["search"].is_error
         assert resource.id in repr(results["search"].output)

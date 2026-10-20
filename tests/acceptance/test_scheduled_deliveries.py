@@ -338,6 +338,24 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
     # Restore the revision-2 schema and contiguous ledger so revision 3 recovers
     # its full registry record from the owned manifest before upgrading to current.
     with sqlite3.connect(reopened.home / "state.db") as connection:
+        # Historical catalog syncs predate the truncation flag.
+        for table, key, nested in (
+            ("syncs", "id", False),
+            ("snapshots", "source_id", True),
+        ):
+            for row_key, encoded in connection.execute(
+                f"SELECT {key}, data FROM {table}"  # noqa: S608
+            ).fetchall():
+                record = json.loads(encoded)
+                sync = record["fields"]["sync"] if nested else record
+                del sync["fields"]["truncated"]
+                connection.execute(
+                    f"UPDATE {table} SET data = ? WHERE {key} = ?",  # noqa: S608
+                    (
+                        json.dumps(record, sort_keys=True, separators=(",", ":")),
+                        row_key,
+                    ),
+                )
         connection.execute("DROP TABLE analysis_evidence")
         connection.execute("DROP TABLE catalog_links")
         connection.execute("DROP TABLE artifacts")

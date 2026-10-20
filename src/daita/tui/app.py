@@ -1418,9 +1418,8 @@ class DaitaApp(App[int]):
             activity = {
                 "toolbox_search": "Searching toolboxes",
                 "toolbox_load": "Loading selected tools",
-                "file_search": "Searching local files",
-                "file_read": "Reading local file",
-                "file_query": "Querying local file data",
+                "file_search": "Searching folder files",
+                "file_read": "Reading folder file",
                 "catalog_search": "Searching catalog",
                 "catalog_describe": "Describing catalog",
                 "data_query": "Querying data source",

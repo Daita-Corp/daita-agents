@@ -372,7 +372,7 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
         # The model may pass the full ID or the run-scoped handle shown beside it.
         source_rule = {
             "type": "string",
-            "pattern": "^(source:sha256:[0-9a-f]{64}|s[1-9][0-9]{0,4})$",
+            "pattern": "^(source:(?:workspace:)?sha256:[0-9a-f]{64}|s[1-9][0-9]{0,4})$",
         }
         limit_rule = {
             "type": "integer",

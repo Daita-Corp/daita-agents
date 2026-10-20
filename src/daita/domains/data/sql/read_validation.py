@@ -1,4 +1,4 @@
-"""Validate parsed SQLite and PostgreSQL reads against catalog resources and fields."""
+"""Validate parsed SQLite, PostgreSQL and DuckDB reads against catalog resources."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from .contracts import (
     _ASCII_IDENTIFIER_CASE_TRANSLATION,
     MAX_SQL_PARAMETERS,
     ResourceSchema,
+    SqlAnalysis,
     SqlAnalysisError,
     SqlColumnReference,
     SqlTableReference,
@@ -460,9 +461,15 @@ def validate_sqlite_read(
     resources: Iterable[ResourceSchema],
     parameters: Sequence[object] = (),
     allowed_resource_ids: Iterable[str] | None = None,
+    requested_resource_ids: Sequence[str] = (),
 ) -> SqlValidationResult:
-    """Validate a single SQLite read against catalog-owned source scope."""
+    """Validate a single SQLite read against catalog-owned source scope.
 
+    The SQL names its relations, so the caller's requested resources are
+    compared with the resolved ones by the caller.
+    """
+
+    del requested_resource_ids
     return _validate_sql_read(
         sql,
         source_id=source_id,
@@ -480,9 +487,11 @@ def validate_postgresql_read(
     resources: Iterable[ResourceSchema],
     parameters: Sequence[object] = (),
     allowed_resource_ids: Iterable[str] | None = None,
+    requested_resource_ids: Sequence[str] = (),
 ) -> SqlValidationResult:
     """Validate a single PostgreSQL read against catalog-owned source scope."""
 
+    del requested_resource_ids
     return _validate_sql_read(
         sql,
         source_id=source_id,
@@ -493,9 +502,108 @@ def validate_postgresql_read(
     )
 
 
+def validate_duckdb_catalog_read(
+    sql: str,
+    *,
+    source_id: str,
+    resources: Iterable[ResourceSchema],
+    parameters: Sequence[object] = (),
+    allowed_resource_ids: Iterable[str] | None = None,
+    requested_resource_ids: Sequence[str] = (),
+) -> SqlValidationResult:
+    """Validate one DuckDB read over the relation ``data``.
+
+    ``data`` is the union of the requested catalog resources, so the SQL names
+    no resource itself; each requested resource must be current and readable.
+    """
+
+    from .duckdb_read import DuckDBReadValidationError, validate_duckdb_read
+
+    source_id = _required_text(source_id, "source_id")
+    by_id = {
+        item.resource_id: item for item in resources if item.source_id == source_id
+    }
+    allowed = None if allowed_resource_ids is None else frozenset(allowed_resource_ids)
+    issues: list[SqlValidationIssue] = []
+    for resource_id in requested_resource_ids:
+        if resource_id not in by_id:
+            issues.append(
+                SqlValidationIssue(
+                    "unknown_resource",
+                    "A requested resource is not a current catalog resource.",
+                    {"resource_id": resource_id},
+                )
+            )
+        elif allowed is not None and resource_id not in allowed:
+            issues.append(
+                SqlValidationIssue(
+                    "resource_out_of_scope",
+                    "A requested resource is outside the readable scope.",
+                    {"resource_id": resource_id},
+                )
+            )
+    if parameters:
+        issues.append(
+            SqlValidationIssue(
+                "parameters_unsupported",
+                "SQL over files takes no parameters; write values as literals.",
+            )
+        )
+    try:
+        validated = validate_duckdb_read(sql, ("data",))
+    except DuckDBReadValidationError as error:
+        issues.append(SqlValidationIssue(error.reason, error.message))
+        validated = None
+    if issues or validated is None:
+        return SqlValidationResult(
+            valid=False,
+            source_id=source_id,
+            analysis=None,
+            resource_ids=(),
+            resource_revisions=(),
+            source_revision=None,
+            issues=tuple(issues[:_MAX_ISSUES]),
+        )
+    selected = tuple(by_id[item] for item in requested_resource_ids)
+    source_revisions = {item.source_revision for item in selected}
+    return SqlValidationResult(
+        valid=True,
+        source_id=source_id,
+        analysis=SqlAnalysis(
+            sql=sql,
+            canonical_sql=validated.canonical_sql,
+            sql_fingerprint=validated.sql_fingerprint,
+            statement_type="select",
+            statement_count=1,
+            is_read=True,
+            has_limit=False,
+            mutation_types=(),
+            tables=(),
+            columns=(),
+            selected_columns=(),
+            select_aliases=(),
+            positional_parameter_count=0,
+            function_names=validated.functions,
+        ),
+        resource_ids=tuple(item.resource_id for item in selected),
+        resource_revisions=tuple(
+            (item.resource_id, item.revision)
+            for item in selected
+            if item.revision is not None
+        ),
+        source_revision=(
+            next(iter(source_revisions))
+            if len(source_revisions) == 1 and None not in source_revisions
+            else None
+        ),
+        issues=(),
+    )
+
+
 _READ_VALIDATORS: dict[str, Callable[..., SqlValidationResult]] = {
     "sqlite": validate_sqlite_read,
     "postgresql": validate_postgresql_read,
+    "duckdb": validate_duckdb_catalog_read,
 }
 
 
@@ -549,9 +657,13 @@ def tabular_read_sql(
 ) -> tuple[str, tuple[object, ...]]:
     """Render a tabular read as parameterized SQL over one catalog relation.
 
-    SQL backends run the result through their own validated read path.
+    SQL backends run the result through their own validated read path. DuckDB
+    reads one file as the relation ``data`` and its worker takes no
+    parameters, so its values are rendered as escaped literals.
     """
 
+    if dialect == "duckdb":
+        return _duckdb_tabular_sql(columns, filters), ()
     relation = qualified_relation(resource, dialect)
     if relation is None:
         raise ValueError("tabular reads need an exact catalog relation")
@@ -580,6 +692,37 @@ def tabular_read_sql(
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     return sql, tuple(parameters)
+
+
+def _duckdb_literal(value: object) -> str:
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _duckdb_tabular_sql(
+    columns: Sequence[str], filters: Sequence[TabularPredicate]
+) -> str:
+    def quote(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
+
+    clauses = [
+        (
+            f"{quote(item.column)} IN ("
+            + ", ".join(_duckdb_literal(value) for value in cast(tuple, item.value))
+            + ")"
+            if item.operator == "in"
+            else f"{quote(item.column)} {_TABULAR_COMPARISONS[item.operator]} "
+            + _duckdb_literal(item.value)
+        )
+        for item in filters
+    ]
+    sql = f"SELECT {', '.join(quote(item) for item in columns)} FROM data"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    return sql
 
 
 def _validate_sql_read(

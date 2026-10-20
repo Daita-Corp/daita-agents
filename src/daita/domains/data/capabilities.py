@@ -13,6 +13,8 @@ from ..._json import FrozenJsonObject, canonical_json
 from ...adapters.local_file_query import LocalFileQueryError, QueryRelation
 from ...artifacts.renderers import MAX_CSV_ROWS, MAX_CSV_SECONDS
 from ...capabilities import (
+    RESOURCE_ID_PATTERN,
+    SOURCE_ID_PATTERN,
     AccessMode,
     AutomationEligibility,
     AutomationGrantPolicy,
@@ -51,6 +53,12 @@ from .controller import (
     native_preview_capability,
 )
 from .results import BoundedResultProjection
+from .source_files import (
+    PATH_QUERY_EXECUTOR_ID,
+    PathPatternReadBackend,
+    PathQueryExecutor,
+    path_query_capability,
+)
 from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
@@ -114,7 +122,15 @@ _DATA_QUERY_COMBINED_USAGE = (
 )
 
 
-def _data_query_description(file_outputs: tuple[str, ...], combined: bool) -> str:
+_DATA_QUERY_PATH_USAGE = (
+    " Folder files: sql reads relation data, from path_pattern in a live folder "
+    "or resource_ids in an attached one."
+)
+
+
+def _data_query_description(
+    file_outputs: tuple[str, ...], combined: bool, path_query: bool = False
+) -> str:
     file_output = (
         f" output={'|'.join(file_outputs)} exports one sql in full as a file "
         f"({MAX_CSV_ROWS:,} rows, {MAX_CSV_SECONDS:.0f}s), no rows; to save "
@@ -126,6 +142,7 @@ def _data_query_description(file_outputs: tuple[str, ...], combined: bool) -> st
         DATA_QUERY_DESCRIPTION
         + file_output
         + (_DATA_QUERY_COMBINED_USAGE if combined else "")
+        + (_DATA_QUERY_PATH_USAGE if path_query else "")
         + _DATA_QUERY_USAGE
     )
 
@@ -1352,7 +1369,20 @@ def data_query_declarations(
     combined_engine: CombinedQueryEngine | None = None,
     tabular_backends: Mapping[str, TabularReadBackend] | None = None,
 ) -> DataQueryDeclarations:
+    """Declare data_query over SQL backends.
+
+    A backend that also queries files matched by ``path_pattern`` adds that
+    route; a combined engine adds the multi-source ``inputs`` route.
+    """
+
+    path_backends = {
+        adapter_id: backend
+        for adapter_id, backend in backends.items()
+        if isinstance(backend, PathPatternReadBackend)
+    }
     executors: tuple[Executor, ...] = (DataQueryExecutor(agent_id, backends),)
+    if path_backends:
+        executors += (PathQueryExecutor(agent_id, path_backends),)
     if combined_engine is not None:
         executors += (
             DataQueryCombinedExecutor(
@@ -1366,6 +1396,7 @@ def data_query_declarations(
         file_outputs=file_outputs,
         file_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID if file_outputs else None,
         combined=combined_engine is not None,
+        path_query=bool(path_backends),
     )
     return DataQueryDeclarations(
         declarations.capabilities, executors, declarations.tool_views
@@ -1405,10 +1436,12 @@ def data_query_capability_declarations(
     file_outputs: tuple[str, ...] = (),
     file_capability_id: str | None = None,
     combined: bool = False,
+    path_query: bool = False,
 ) -> CapabilityDeclarations:
     """Declare data_query; file outputs route to the exact export capability.
 
-    A call that supplies ``inputs`` routes to the combined multi-source read.
+    A call that supplies ``inputs`` routes to the combined multi-source read,
+    and one that supplies ``path_pattern`` to the live folder-file query.
     """
 
     return _query_declarations(
@@ -1455,6 +1488,7 @@ def data_query_capability_declarations(
         file_outputs=file_outputs,
         file_capability_id=file_capability_id,
         combined=combined,
+        path_query=path_query,
     )
 
 
@@ -1507,11 +1541,11 @@ def relational_update_preview_capability_declarations() -> CapabilityDeclaration
             "properties": {
                 "source_id": {
                     "type": "string",
-                    "pattern": r"^source:sha256:[0-9a-f]{64}$",
+                    "pattern": SOURCE_ID_PATTERN,
                 },
                 "resource_id": {
                     "type": "string",
-                    "pattern": r"^catalog-resource:sha256:[0-9a-f]{64}$",
+                    "pattern": RESOURCE_ID_PATTERN,
                 },
                 "where": {
                     "type": "array",
@@ -1586,11 +1620,11 @@ def relational_update_capability_declarations() -> CapabilityDeclarations:
             "properties": {
                 "source_id": {
                     "type": "string",
-                    "pattern": r"^source:sha256:[0-9a-f]{64}$",
+                    "pattern": SOURCE_ID_PATTERN,
                 },
                 "resource_id": {
                     "type": "string",
-                    "pattern": r"^catalog-resource:sha256:[0-9a-f]{64}$",
+                    "pattern": RESOURCE_ID_PATTERN,
                 },
                 "where": {
                     "type": "array",
@@ -1678,6 +1712,7 @@ def _query_declarations(
     file_outputs: tuple[str, ...] = (),
     file_capability_id: str | None = None,
     combined: bool = False,
+    path_query: bool = False,
 ) -> CapabilityDeclarations:
     if bool(file_outputs) != (file_capability_id is not None):
         raise ValueError("data_query file outputs require their export capability")
@@ -1835,31 +1870,42 @@ def _query_declarations(
         access_mode=AccessMode.READ,
         automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
+    path_capability = path_query_capability()
+    presence_modes = (
+        *(("inputs",) if combined else ()),
+        *(("path_pattern",) if path_query else ()),
+    )
     routes: tuple[tuple[str, str], ...] = (
         ("rows", capability.id),
         *((output, cast(str, file_capability_id)) for output in file_outputs),
         *((("inputs", combined_capability.id),) if combined else ()),
+        *((("path_pattern", path_capability.id),) if path_query else ()),
     )
     routed = len(routes) > 1
     view = ToolView(
         name=DATA_QUERY_TOOL_NAME,
         capability_id=capability.id,
-        description=_data_query_description(file_outputs, combined),
+        description=_data_query_description(file_outputs, combined, path_query),
         presentation=presentation,
         mode_capability_ids=routes if routed else (),
         mode_argument="output" if routed else "mode",
         default_mode="rows" if routed else None,
-        presence_modes=("inputs",) if combined else (),
+        presence_modes=presence_modes,
         # The description states the input shape; the full item rules stay in
         # the capability contract.
         summarized_arguments=("inputs",) if combined else (),
     )
     return CapabilityDeclarations(
         domain_owner_id="data",
-        capabilities=(capability, *((combined_capability,) if combined else ())),
+        capabilities=(
+            capability,
+            *((combined_capability,) if combined else ()),
+            *((path_capability,) if path_query else ()),
+        ),
         executor_ids=(
             DATA_QUERY_EXECUTOR_ID,
             *((DATA_QUERY_COMBINED_EXECUTOR_ID,) if combined else ()),
+            *((PATH_QUERY_EXECUTOR_ID,) if path_query else ()),
         ),
         tool_views=(view,),
     )
@@ -2279,10 +2325,10 @@ _UPSERT_RECEIPT_SCHEMA: dict[str, object] = {
 
 def relational_upsert_capability_declarations() -> CapabilityDeclarations:
     properties: dict[str, object] = {
-        "source_id": {"type": "string", "pattern": r"^source:sha256:[0-9a-f]{64}$"},
+        "source_id": {"type": "string", "pattern": SOURCE_ID_PATTERN},
         "resource_id": {
             "type": "string",
-            "pattern": r"^catalog-resource:sha256:[0-9a-f]{64}$",
+            "pattern": RESOURCE_ID_PATTERN,
         },
         "key_columns": {**_NATIVE_COLUMNS_SCHEMA, "minItems": 1},
         "insert_columns": {**_NATIVE_COLUMNS_SCHEMA, "minItems": 1},

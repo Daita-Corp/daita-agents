@@ -5,12 +5,14 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path, PurePosixPath
 from typing import cast
 
 import pytest
 
 from daita import Agent
 from daita._json import canonical_json
+from daita.adapters.local_workspace import LocalWorkspaceError
 from daita.adapters.models import DiscoveryRequest, ResourceRef
 from daita.adapters.protocols import (
     ResourceAdapter,
@@ -22,6 +24,15 @@ from daita.adapters.registry import SourceOperation, SourceType
 from daita.catalog.models import FacetKind, SourceCatalogSnapshot, TabularFacet
 from daita.domains.data import ReadTabularRequest, TabularFilter, TabularReadBackend
 from daita.domains.data.results import BoundedResultProjection
+from daita.domains.data.source_files import (
+    FileSearchBackend,
+    FileSearchRequest,
+    PathPatternQueryRequest,
+    PathPatternReadBackend,
+    TextReadBackend,
+    TextReadRequest,
+)
+from daita.domains.data.sql import validate_duckdb_read
 from daita.errors import DaitaError
 from daita.security import SecretProvider
 
@@ -29,12 +40,16 @@ CONTRACT_AGENT_ID = "agent-source-contract"
 CONTRACT_NOW = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
 
 
-def _request(adapter: ResourceAdapter, sync_id: str) -> DiscoveryRequest:
+def _request(
+    adapter: ResourceAdapter, sync_id: str, agent_home: Path | None = None
+) -> DiscoveryRequest:
     return DiscoveryRequest(
         agent_id=CONTRACT_AGENT_ID,
         source_id=adapter.registration.id,
         sync_id=sync_id,
         requested_at=CONTRACT_NOW,
+        agent_root=None if agent_home is None else agent_home.parent.parent,
+        agent_home=agent_home,
     )
 
 
@@ -60,8 +75,13 @@ async def assert_source_type_contract(
     source: ResourceSource,
     *,
     secret_provider: SecretProvider,
+    agent_home: Path | None = None,
 ) -> None:
-    """Open, discover, inspect, health-check, close and rebuild one source."""
+    """Open, discover, inspect, health-check, close and rebuild one source.
+
+    A filesystem source receives ``agent_home`` as the private state it must
+    never catalog.
+    """
 
     adapter = await source.open(
         agent_id=CONTRACT_AGENT_ID,
@@ -72,11 +92,11 @@ async def assert_source_type_contract(
     try:
         assert registration.adapter_id == source_type.adapter_id
 
-        first_request = _request(adapter, "sync-contract-first")
+        first_request = _request(adapter, "sync-contract-first", agent_home)
         first = (await adapter.discover(first_request)).snapshot
         _assert_within_request(first, first_request)
         assert first.resources, "the contract needs at least one resource"
-        second_request = _request(adapter, "sync-contract-second")
+        second_request = _request(adapter, "sync-contract-second", agent_home)
         second = (await adapter.discover(second_request)).snapshot
         _assert_within_request(second, second_request)
         assert {item.id for item in second.resources} == {
@@ -119,7 +139,7 @@ async def assert_source_type_contract(
 
     await adapter.close()
     with pytest.raises(SourceClosedError):
-        await adapter.discover(_request(adapter, "sync-contract-closed"))
+        await adapter.discover(_request(adapter, "sync-contract-closed", agent_home))
     with pytest.raises(SourceClosedError):
         await adapter.inspect(
             ResourceRef(
@@ -229,9 +249,102 @@ async def assert_tabular_read_contract(
     assert stale.value.error_code == "query_binding_stale"
 
 
+async def assert_live_source_contract(
+    agent: Agent,
+    *,
+    source_id: str,
+    text_path: str,
+    text: str,
+    dataset_pattern: str,
+) -> None:
+    """Search, read and query one live uncataloged source through its type.
+
+    ``text_path`` holds ``text`` (longer than one chunk is not required), and
+    ``dataset_pattern`` matches a homogeneous structured dataset.
+    """
+
+    adapter_id = await agent._embedded._data_view.source_adapter_id(agent.id, source_id)
+    assert adapter_id is not None
+    source_type = agent._embedded._source_types.require(adapter_id)
+    assert {
+        SourceOperation.FILE_SEARCH,
+        SourceOperation.TEXT_READ,
+        SourceOperation.SQL_READ,
+    } <= source_type.operations
+    backends = agent._embedded._source_backends
+    search = cast(FileSearchBackend, backends[SourceOperation.FILE_SEARCH][adapter_id])
+    read = cast(TextReadBackend, backends[SourceOperation.TEXT_READ][adapter_id])
+    query = backends[SourceOperation.SQL_READ][adapter_id]
+    assert isinstance(query, PathPatternReadBackend)
+    assert source_id not in {item.id for item in await agent.list_sources()}
+
+    found = await search.search_files(
+        FileSearchRequest(
+            agent_id=agent.id,
+            run_id="contract-run",
+            source_id=source_id,
+            query=PurePosixPath(text_path).name,
+            path=None,
+            paths=None,
+            mode="paths",
+            glob=None,
+            order_by="path",
+            resource_ids=None,
+        )
+    )
+    assert found.data["source_id"] == source_id
+    assert any(
+        item["path"].endswith(text_path)
+        for item in cast(tuple[Mapping[str, str], ...], found.data["matches"])
+    )
+    assert found.sensitivity is not None and found.provenance
+
+    chunk = await read.read_text(
+        TextReadRequest(
+            agent_id=agent.id,
+            run_id="contract-run",
+            source_id=source_id,
+            path=text_path,
+            cursor=None,
+            position=None,
+            resource_ids=None,
+        )
+    )
+    assert chunk.data["content"] == text and chunk.data["complete"] is True
+    assert isinstance(chunk.data["binding"], str)
+    with pytest.raises(LocalWorkspaceError) as misused:
+        await read.read_text(
+            TextReadRequest(
+                agent_id=agent.id,
+                run_id="contract-run",
+                source_id=source_id,
+                path=None,
+                cursor=cast(str, chunk.data["binding"]),
+                position=None,
+                resource_ids=None,
+            )
+        )
+    assert misused.value.code == "cursor_invalid"
+
+    validated = validate_duckdb_read("SELECT COUNT(*) AS n FROM data")
+    rows = await query.query_path_pattern(
+        PathPatternQueryRequest(
+            agent_id=agent.id,
+            run_id="contract-run",
+            source_id=source_id,
+            path_pattern=dataset_pattern,
+            canonical_sql=validated.canonical_sql,
+            sql_fingerprint=validated.sql_fingerprint,
+        )
+    )
+    assert rows.data["columns"] == ("n",)
+    assert rows.data["source_id"] == source_id
+
+
 __all__ = [
     "CONTRACT_AGENT_ID",
     "CONTRACT_NOW",
+    "assert_live_source_contract",
     "assert_source_type_contract",
     "assert_tabular_read_contract",
 ]

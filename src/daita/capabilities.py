@@ -1352,7 +1352,9 @@ _RESULT_REF_PATH = re.compile(
 # Canonical persisted identities. Capability contracts validate these exact
 # forms; model-facing schemas additionally admit the run-scoped short handle,
 # which the runtime replaces with the full ID before validation.
-SOURCE_ID_PATTERN = r"^source:sha256:[0-9a-f]{64}$"
+# Stored sources are source:sha256:...; the live session folder is
+# source:workspace:sha256:..., which sorts after every stored source.
+SOURCE_ID_PATTERN = r"^source:(?:workspace:)?sha256:[0-9a-f]{64}$"
 RESOURCE_ID_PATTERN = r"^catalog-resource:sha256:[0-9a-f]{64}$"
 # Canonical pattern -> (family, handle prefix, handle-admitting model pattern).
 _IDENTITY_REFS: Mapping[str, tuple[str, str, str]] = MappingProxyType(

@@ -1167,6 +1167,9 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
 
 
 class _Catalog:
+    # No live session folder source.
+    session_source_id: str | None = None
+
     async def source_routing_facts(self, agent_id, source_ids=()):
         return ()
 

@@ -1,7 +1,7 @@
 """Validate the narrow DuckDB read contract of the private query worker.
 
-Local ``file_query`` exposes one relation, ``data``; a combined ``data_query``
-exposes its input aliases.
+A folder-source ``data_query`` exposes one relation, ``data``; a combined
+``data_query`` exposes its input aliases.
 """
 
 from __future__ import annotations
@@ -236,8 +236,15 @@ def validate_duckdb_read(
             "SQL must reference each of " + ", ".join(relations) + " exactly once.",
         )
 
+    # sqlglot models AND/OR as functions; they are boolean operators.
     functions = tuple(
-        sorted({_function_name(node) for node in expression.find_all(exp.Func)})
+        sorted(
+            {
+                _function_name(node)
+                for node in expression.find_all(exp.Func)
+                if not isinstance(node, exp.Connector)
+            }
+        )
     )
     if any(name not in _ALLOWED_FUNCTIONS for name in functions):
         raise DuckDBReadValidationError(

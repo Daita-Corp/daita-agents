@@ -470,6 +470,13 @@ class SourceSetupScreen(Screen[bool]):
                 )
             elif kind == "postgresql":
                 registration = await self._attach_postgresql(name, path_value)
+            elif kind == "folder":
+                if not path_value:
+                    raise ValueError("A folder requires a path")
+                registration = await self.app.controller.attach_folder(  # type: ignore[attr-defined]
+                    Path(path_value).expanduser(),
+                    name=name,
+                )
             else:
                 raise ValueError("Choose a source type")
             if registration is None:

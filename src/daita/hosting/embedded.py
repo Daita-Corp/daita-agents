@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from ..adapters.mcp import MCPServerBinding, MCPToolBinding
 
 from .._json import FrozenJsonObject
+from ..adapters.folder import SessionFolderSource
 from ..adapters.local_file_query import LocalFileQueryBackend, LocalFileQueryLimits
 from ..adapters.local_workspace import LocalWorkspaceBackend
 from ..adapters.mcp import (
@@ -123,8 +124,9 @@ from ..domains.data import (
     DATA_QUERY_MAX_ROWS,
     LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS,
     LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS,
-    LOCAL_FILE_CAPABILITY_IDS,
-    LOCAL_FILE_EXECUTOR_IDS,
+    PATH_QUERY_CAPABILITY_ID,
+    PATH_QUERY_EXECUTOR_ID,
+    SOURCE_FILE_CAPABILITY_IDS,
     ArtifactCapabilityDomain,
     CatalogDataView,
     DataCapabilityDomain,
@@ -132,11 +134,11 @@ from ..domains.data import (
     data_query_declarations,
     exact_export_declarations,
     exact_export_outputs,
-    local_file_declarations,
     relational_update_declarations,
     relational_update_preview_declarations,
     relational_upsert_declarations,
     resource_revision_observation_declarations,
+    source_file_declarations,
 )
 from ..domains.data.catalog import RELATIONAL_WRITE_OPERATIONS
 from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
@@ -268,7 +270,7 @@ from ..routines.models import (
 )
 from ..routines.owner import RoutineError, RoutineOwner, routine_approval_arguments
 from ..routines.supervisor import RoutineSupervisor
-from ..scope import resolve_effective_source_scope
+from ..scope import EffectiveSourceScope, resolve_effective_source_scope
 from ..security import (
     CredentialSession,
     KeychainSecretProvider,
@@ -742,6 +744,12 @@ class EmbeddedAgent:
                 "externally stored agents have no local home; configuration belongs to the caller"
             )
         return self._home
+
+    @property
+    def session_source_id(self) -> str | None:
+        """The live session folder source of this open agent, if it has one."""
+
+        return self._data_view.session_source_id
 
     @property
     def workspace(self) -> LocalWorkspace:
@@ -1436,9 +1444,17 @@ class EmbeddedAgent:
                     "configured model route did not produce a managed provider"
                 )
             owned_model_provider = model
-        registry = SourceTypeRegistry(source_types)
+        # Hosted hosts have no local file authority: no folder type, no session source.
+        registry = SourceTypeRegistry(source_types, local_files=not hosted)
+        session_source = (
+            None
+            if workspace is None or workspace_backend is None
+            else SessionFolderSource.for_workspace(identity.id, workspace)
+        )
         catalog_service = CatalogService(store, store)
-        data_view = CatalogDataView(store, catalog_service, store, registry)
+        data_view = CatalogDataView(
+            store, catalog_service, store, registry, session_source=session_source
+        )
         catalog = catalog_declarations(identity.id, data_view)
         host_capacity = host_capacity or HostCapacityLimits()
         backend_context = SourceBackendContext(
@@ -1450,6 +1466,11 @@ class EmbeddedAgent:
             postgresql_reads=postgresql_reads,
             deadline_reader=lambda: admission_coordinator.current_deadline(),
             observer=observer if admission_observations else None,
+            home=home,
+            session_workspace=workspace_backend,
+            session_source_id=(
+                None if session_source is None else session_source.source_id
+            ),
         )
         source_backends: dict[SourceOperation, dict[str, Any]] = {
             operation: {} for operation in SourceOperation
@@ -1538,10 +1559,14 @@ class EmbeddedAgent:
             raise AgentHomeError("workspace composition is inconsistent")
         if hosted != (artifact_delivery is None):
             raise AgentHomeError("artifact delivery composition is inconsistent")
-        local_files = (
-            None
-            if workspace_backend is None
-            else local_file_declarations(workspace_backend)
+        source_files = (
+            source_file_declarations(
+                identity.id,
+                source_backends[SourceOperation.FILE_SEARCH],
+                source_backends[SourceOperation.TEXT_READ],
+            )
+            if source_backends[SourceOperation.FILE_SEARCH]
+            else None
         )
         memory_lock = asyncio.Lock()
         skill_lock = asyncio.Lock()
@@ -1569,6 +1594,10 @@ class EmbeddedAgent:
             )
             for registration in available_sources
         }
+        if session_source is not None:
+            source_capacities[f"source:{session_source.source_id}"] = (
+                registry.read_capacity(session_source.adapter_id, host_capacity)
+            )
         admission_coordinator = RunAdmissionCoordinator(
             observer=observer if admission_observations else None,
             execution_capacity=host_capacity.execution_capacity,
@@ -1695,7 +1724,7 @@ class EmbeddedAgent:
             relational_update,
             relational_upsert,
             routine_precheck,
-            local_files,
+            source_files,
         )
         memory_declarations = _domain_declarations(MEMORY_DOMAIN_OWNER_ID, memory)
         skill_declaration_bundle = _domain_declarations(SKILL_DOMAIN_OWNER_ID, skills)
@@ -1729,8 +1758,10 @@ class EmbeddedAgent:
                     data_view, source_backends, agent_id, constraints
                 )
             ),
-            local_file_sensitivity=(
-                None if workspace_backend is None else workspace_backend.sensitivity
+            source_files_available=source_files is not None,
+            path_query_available=any(
+                capability.id == PATH_QUERY_CAPABILITY_ID
+                for capability in relational_query.capabilities
             ),
         )
         skill_domain = SkillCapabilityDomain(
@@ -1841,7 +1872,7 @@ class EmbeddedAgent:
             *relational_update.executors,
             *relational_upsert.executors,
             *routine_precheck.executors,
-            *(local_files.executors if local_files is not None else ()),
+            *(source_files.executors if source_files is not None else ()),
             *memory.executors,
             *skills.executors,
             *semantics.executors,
@@ -1967,9 +1998,10 @@ class EmbeddedAgent:
                 executor.executor_id for executor in registered_executors
             }
             if (
-                declared_capability_ids & LOCAL_FILE_CAPABILITY_IDS
-                or declared_view_ids & LOCAL_FILE_CAPABILITY_IDS
-                or registered_executor_ids & LOCAL_FILE_EXECUTOR_IDS
+                declared_capability_ids & SOURCE_FILE_CAPABILITY_IDS
+                or declared_view_ids & SOURCE_FILE_CAPABILITY_IDS
+                or PATH_QUERY_EXECUTOR_ID in registered_executor_ids
+                or session_source is not None
                 or declared_capability_ids & LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS
                 or declared_view_ids & LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS
                 or registered_executor_ids & LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS
@@ -2103,8 +2135,13 @@ class EmbeddedAgent:
                 ),
                 local_file_context=(
                     None
-                    if workspace_backend is None
-                    else workspace_backend.model_context()
+                    if workspace_backend is None or session_source is None
+                    else FrozenJsonObject.from_mapping(
+                        {
+                            **workspace_backend.model_context().to_dict(),
+                            "source_id": session_source.source_id,
+                        }
+                    )
                 ),
                 max_context_evidence_bytes=limits.max_context_evidence_bytes,
             )
@@ -2598,9 +2635,9 @@ class EmbeddedAgent:
             else conversation_id
         )
         _validate_conversation_id(resolved_conversation)
-        if files_only:
-            if self._workspace_backend is None:
-                raise AgentHomeError("files_only requires admitted local file access")
+        session_source_id = self._data_view.session_source_id
+        if files_only and session_source_id is None:
+            raise AgentHomeError("files_only requires admitted local file access")
         resolved_run_id = run_id or self._id_factory("run")
         deadline = (
             asyncio.get_running_loop().time() + self._limits.max_wall_time_seconds
@@ -2636,6 +2673,8 @@ class EmbeddedAgent:
                 for source in await self._store.list_sources(self.identity.id)
                 if source.active
             }
+            if session_source_id is not None:
+                active_ids.add(session_source_id)
             if not set(source_scope_ids) <= active_ids:
                 raise ValueError("A requested source is not active for this agent")
             prior_messages = _project_completed_history(
@@ -2665,10 +2704,17 @@ class EmbeddedAgent:
                     default=ModelSensitivity.PUBLIC,
                 ),
             )
+            # Files-only scopes the run to exactly the live session folder source.
             run_input = replace(
                 run_input,
-                resolved_source_scope=await resolve_effective_source_scope(
-                    run_input, self._data_view, files_only=files_only
+                resolved_source_scope=(
+                    EffectiveSourceScope(
+                        frozenset({cast(str, session_source_id)}), frozenset()
+                    )
+                    if files_only
+                    else await resolve_effective_source_scope(
+                        run_input, self._data_view
+                    )
                 ),
             )
             predecessor_run = await self._store.latest_terminal_conversation_run(
@@ -4580,6 +4626,8 @@ class EmbeddedAgent:
                     source_id=registration.id,
                     sync_id=sync.id,
                     requested_at=sync.started_at,
+                    agent_root=None if self._home is None else self._home.parent.parent,
+                    agent_home=self._home,
                 )
             )
             await self._store.commit_snapshot(

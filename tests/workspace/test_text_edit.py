@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -87,7 +87,9 @@ class _EditWorkflowProvider:
         visible = {tool.name for tool in request.tools}
         read = results.get("read")
         if read is None:
-            return _call("read", "file_read", {"path": self.target_path})
+            return _call(
+                "read", "file_read", {"source_id": "s1", "path": self.target_path}
+            )
         if read.is_error:
             return _stop("read failed")
         if self.after_read is not None:
@@ -1212,7 +1214,8 @@ async def test_machine_origin_cannot_project_or_forge_ambient_workspace_edit_aut
         grant_id="grant-local-edit-negative",
         job_id="job-local-edit-negative",
         job_revision=1,
-        allowed_source_ids=(source.id,),
+        # A frozen session folder identity still grants a machine run nothing.
+        allowed_source_ids=(source.id, cast(str, agent.session_source_id)),
         allowed_resource_ids=(resource.id,),
         allowed_capability_ids=("artifact.edit_text", "artifact.save_local"),
         allowed_access_modes=frozenset({AccessMode.NONE, AccessMode.READ}),
@@ -1257,6 +1260,9 @@ async def test_machine_origin_cannot_project_or_forge_ambient_workspace_edit_aut
             entry.view.name for entry in catalog.entries
         }
         assert "file_read" not in {entry.view.name for entry in catalog.entries}
+        frozen = await embedded._capability_runtime.freeze_source_scope(run)
+        assert frozen.resolved_source_scope is not None
+        assert frozen.resolved_source_scope.source_ids == frozenset({source.id})
         projection = embedded._capability_runtime.project(catalog, messages)
         outcome = await embedded._capability_runtime.execute_all(
             run,

@@ -66,7 +66,7 @@ async def test_partial_broker_read_retains_coverage_and_contract_after_history_c
                 "partial",
                 "python_execute",
                 {
-                    "code": "import json\nr=tools.call('file_read', {'path':'partial.txt'})\nassert not r['is_error']\nd=r['output']['data']\nsummary={'captured_bytes':len(d['content'].encode()), 'complete':d['complete']}\nprint(summary)\nopen('coverage.json','w').write(json.dumps(summary))\noutputs.add('coverage','coverage.json')",
+                    "code": "import json\nr=tools.call('file_read', {'source_id':'s1', 'path':'partial.txt'})\nassert not r['is_error']\nd=r['output']['data']\nsummary={'captured_bytes':len(d['content'].encode()), 'complete':d['complete']}\nprint(summary)\nopen('coverage.json','w').write(json.dumps(summary))\noutputs.add('coverage','coverage.json')",
                     "expected_state": {"generation": 0, "revision": 0},
                     "save_output": "coverage",
                 },
@@ -104,7 +104,7 @@ async def test_partial_broker_read_retains_coverage_and_contract_after_history_c
         )
         child = evidence["children"][0]
         assert child["coverage"]["complete"] is False
-        assert child["capability_id"] == "data.local_file.read"
+        assert child["capability_id"] == "data.read_text"
         assert child["contract_digest"].startswith("sha256:")
         assert child["input_schema_digest"].startswith("sha256:")
         issued = next(record for record in records if record.kind == "child")

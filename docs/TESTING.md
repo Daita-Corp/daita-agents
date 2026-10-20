@@ -9,7 +9,10 @@ unit/integration directory hierarchy.
 - `tests/agent`, `loop`, `context`, `capabilities`, and `llm` cover the public
   facade and direct model/tool execution path.
 - `tests/catalog`, `data`, `workspace`, and `mcp` cover source truth, bounded
-  I/O, writes, files, and remote-tool contracts.
+  I/O, writes, folder sources and local files, and remote-tool contracts;
+  `tests/data/folder` runs the source contract kit against attached and session
+  folders. The live folder-query suite is gated by
+  `DAITA_RUN_LIVE_FOLDER_QUERY=1`.
 - `tests/artifacts`, `jobs`, `routines`, and `distribution` cover durable work
   and outputs.
 - `tests/memory`, `skills`, `semantics`, `learning`, `storage`, `security`, and

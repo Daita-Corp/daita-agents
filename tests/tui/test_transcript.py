@@ -235,9 +235,8 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
             for tool_name, expected in (
                 ("toolbox_search", "Searching toolboxes"),
                 ("toolbox_load", "Loading selected tools"),
-                ("file_search", "Searching local files"),
-                ("file_read", "Reading local file"),
-                ("file_query", "Querying local file data"),
+                ("file_search", "Searching folder files"),
+                ("file_read", "Reading folder file"),
                 ("python_execute", "Running Python"),
                 ("artifact_edit_text", "Preparing local file edit"),
                 ("artifact_save_local", "Publishing local artifact"),
@@ -279,7 +278,7 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
 
             for tool_name, call_id in (
                 ("data_query", "call-live"),
-                ("file_query", "call-file"),
+                ("file_read", "call-file"),
             ):
                 await app.on_observer_event(
                     ObserverEvent(
@@ -312,7 +311,7 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
                 ),
             )
             await app.on_observer_event(ObserverEvent(tool_completed))
-            assert "Querying local file data" in str(activity.content)
+            assert "Reading folder file" in str(activity.content)
             await app.on_observer_event(
                 ObserverEvent(
                     AgentEvent(
@@ -321,7 +320,7 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
                         run_id="run-live",
                         conversation_id="conversation-live",
                         data=FrozenJsonObject.from_mapping(
-                            {"tool_name": "file_query", "call_id": "call-file"}
+                            {"tool_name": "file_read", "call_id": "call-file"}
                         ),
                     )
                 )

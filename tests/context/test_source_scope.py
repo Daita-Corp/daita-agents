@@ -24,7 +24,7 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
 from daita.loop.models import LoopExitKind, RunInput
-from daita.scope import resolve_effective_source_scope
+from daita.scope import EffectiveSourceScope, resolve_effective_source_scope
 from tests.support.workspace import workspace_for
 
 
@@ -351,14 +351,16 @@ async def test_runtime_binds_catalog_scope_without_injection_and_rejects_outside
         await agent.close()
 
 
-async def test_source_filter_still_projects_source_independent_file_tools(
+async def test_source_filter_keeps_local_files_only_with_the_session_source(
     tmp_path: Path,
 ):
     first_database = tmp_path / "first.sqlite"
     second_database = tmp_path / "second.sqlite"
     _database(first_database, "first_records")
     _database(second_database, "second_records")
-    provider = MockModelProvider((_stop("second source selected"),))
+    provider = MockModelProvider(
+        (_stop("second source selected"), _stop("files included"))
+    )
     agent = await Agent.create(
         "source-tool-projection",
         root=tmp_path,
@@ -372,19 +374,31 @@ async def test_source_filter_still_projects_source_independent_file_tools(
 
         second = await agent.resolve_source("second-source")
         await agent.run(
-            "What data and workspace files are available?",
+            "What data is available?",
             source_scope_ids=(second.id,),
         )
+        narrowed = {tool.name for tool in provider.requests[0].tools}
+        assert "data_query" in narrowed
+        assert not {"file_search", "file_read"} & narrowed
 
-        tool_names = {tool.name for tool in provider.requests[0].tools}
+        session_source_id = agent.session_source_id
+        assert session_source_id is not None
+        await agent.run(
+            "What data and workspace files are available?",
+            source_scope_ids=(second.id, session_source_id),
+        )
+        tool_names = {tool.name for tool in provider.requests[1].tools}
         assert {"file_search", "file_read", "data_query"} <= tool_names
     finally:
         await agent.close()
 
 
 class _ScopeCatalog:
-    def __init__(self):
+    def __init__(self, session_source_id: str | None = None):
         self.resources = {"first": {"first-row"}, "second": {"second-row"}}
+        self.session_source_id = session_source_id
+        if session_source_id is not None:
+            self.resources[session_source_id] = set()
         self.calls = 0
 
     async def source_routing_facts(self, agent_id, source_ids=()):
@@ -508,11 +522,9 @@ async def test_frozen_catalog_ceiling_blocks_expansion_and_revocation_narrows(
 
 
 async def test_prepared_empty_and_files_only_scope_never_expand():
-    catalog = _ScopeCatalog()
+    catalog = _ScopeCatalog("live")
     run = RunInput("empty", "agent", "Files only", datetime.now(UTC))
-    denied = await resolve_effective_source_scope(run, catalog, files_only=True)
-    assert not denied.source_ids and not denied.resource_ids
-    assert catalog.calls == 0
+    denied = EffectiveSourceScope(frozenset(), frozenset())
     assert (
         await resolve_effective_source_scope(
             replace(run, resolved_source_scope=denied), catalog
@@ -520,6 +532,15 @@ async def test_prepared_empty_and_files_only_scope_never_expand():
         == denied
     )
     assert catalog.calls == 0
+    # A files-only run is prepared with exactly the live session source.
+    files_only = EffectiveSourceScope(frozenset({"live"}), frozenset())
+    catalog.resources["third"] = {"third-row"}
+    assert (
+        await resolve_effective_source_scope(
+            replace(run, resolved_source_scope=files_only), catalog
+        )
+        == files_only
+    )
 
 
 async def test_private_continuity_survives_detach_compression_and_restart(tmp_path):

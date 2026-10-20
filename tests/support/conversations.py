@@ -265,6 +265,9 @@ class FreshQueryTools:
 
 
 class CatalogSpy:
+    # No live session folder source.
+    session_source_id: str | None = None
+
     async def source_routing_facts(self, agent_id, source_ids=()):
         ids = {item.get("source_id", "source-history") for item in self.resources} or {
             "source-history"

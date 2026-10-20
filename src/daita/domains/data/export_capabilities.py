@@ -1784,13 +1784,6 @@ class ArtifactDomainCatalog(SourceScopeCatalog, Protocol):
         resource_id: str,
     ) -> tuple[str, str, str] | None: ...
 
-    async def is_current_tabular_file(
-        self,
-        agent_id: str,
-        source_id: str,
-        resource_id: str,
-    ) -> bool: ...
-
     async def admitted_model_sensitivity(
         self,
         agent_id: str,

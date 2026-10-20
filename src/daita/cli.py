@@ -29,6 +29,7 @@ from . import (
     CalendarSchedule,
     EffectReceipt,
     EffectResolutionDecision,
+    FolderSource,
     IntervalSchedule,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
@@ -2344,11 +2345,15 @@ async def _execute(args: argparse.Namespace) -> object:
 
 def _source_from_attach_args(
     args: argparse.Namespace,
-) -> SQLiteSource | PostgreSQLSource:
+) -> SQLiteSource | PostgreSQLSource | FolderSource:
     if args.kind == "sqlite":
         if args.path is None:
             raise ValueError("attach sqlite requires a path")
         return SQLiteSource(args.path)
+    if args.kind == "folder":
+        if args.path is None:
+            raise ValueError("attach folder requires a path")
+        return FolderSource(args.path, name=args.source_name)
     if args.path is not None:
         raise ValueError("attach postgresql does not accept a path")
     required = {

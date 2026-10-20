@@ -70,7 +70,6 @@ ON_DEMAND_LOAD = (
     "artifact_save_local",
     "artifact_set_export_location",
     "delivery_inspect",
-    "file_query",
     "memory_set",
     "python_execute",
     "routine_save",

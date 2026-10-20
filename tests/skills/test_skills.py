@@ -60,7 +60,7 @@ NOW = datetime(2026, 7, 22, tzinfo=UTC)
 EAGER_LIMITS = LoopLimits()
 
 
-def _profile(provider: MockModelProvider, *, context: int = 20_000) -> ModelProfile:
+def _profile(provider: MockModelProvider, *, context: int = 32_000) -> ModelProfile:
     return ModelProfile(
         id=provider.provider_id,
         context_window_tokens=context,
@@ -541,6 +541,8 @@ async def test_skill_view_is_fixed_and_projected_without_sources(tmp_path):
         assert tuple(tool.name for tool in provider.requests[0].tools) == (
             "artifact_list",
             "artifact_read",
+            # The live session folder source answers SQL over local files.
+            "data_query",
             "delivery_list",
             "distribution_destination_list",
             "file_read",
@@ -777,6 +779,8 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
         assert tuple(tool.name for tool in provider.requests[0].tools) == (
             "artifact_list",
             "artifact_read",
+            # The live session folder source answers SQL over local files.
+            "data_query",
             "delivery_list",
             "distribution_destination_list",
             "file_read",

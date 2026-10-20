@@ -28,11 +28,7 @@ from daita.adapters.local_workspace import (
     LocalWorkspaceError,
     LocalWorkspaceLimits,
 )
-from daita.domains.data import (
-    LOCAL_FILE_QUERY_CAPABILITY_ID,
-    LOCAL_FILE_QUERY_EXECUTOR_ID,
-    LOCAL_FILE_QUERY_TOOL_NAME,
-)
+from daita.domains.data import PATH_QUERY_CAPABILITY_ID, PATH_QUERY_EXECUTOR_ID
 from daita.domains.data.sql import (
     DuckDBReadValidationError,
     validate_duckdb_read,
@@ -118,6 +114,10 @@ def _frozen_objects(value: object) -> tuple[FrozenJsonObject, ...]:
     (
         ("SELECT region, SUM(amount) FROM data GROUP BY region", True),
         ("SELECT * FROM data WHERE amount > 10 ORDER BY amount LIMIT 5", True),
+        (
+            "SELECT * FROM data WHERE amount > 1 AND (region = 'n' OR region = 's')",
+            True,
+        ),
         (
             "WITH filtered AS (SELECT * FROM data WHERE amount > 0) SELECT COUNT(*) FROM filtered",
             True,
@@ -616,7 +616,10 @@ def test_worker_pipe_connection_reset_is_a_closed_stream() -> None:
         "data": {},
     }
     connection = cast(Connection, ResetConnection())
-    assert query_module._receive_messages(connection, final) is final
+    assert (
+        query_module._receive_messages(connection, final, LocalFileQueryLimits())
+        is final
+    )
 
 
 @pytest.mark.parametrize(
@@ -712,7 +715,7 @@ async def check():
     agent = await EmbeddedAgent.create('hosted-lazy', hosted=True, root=root)
     try:
         assert 'duckdb' not in sys.modules
-        assert 'file_query' not in agent._capabilities.tool_names
+        assert 'data.query_files' not in agent._capabilities._capabilities
     finally:
         await agent.close()
 asyncio.run(check())
@@ -740,7 +743,7 @@ asyncio.run(check())
         builtins.__import__ = original_import
 
 
-async def test_public_agent_loads_and_executes_file_query_through_one_runtime(
+async def test_public_agent_queries_folder_files_through_data_query_route(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -751,14 +754,10 @@ async def test_public_agent_loads_and_executes_file_query_through_one_runtime(
     provider = MockModelProvider(
         (
             _call(
-                "load-query",
-                "toolbox_load",
-                {"tool_names": [LOCAL_FILE_QUERY_TOOL_NAME]},
-            ),
-            _call(
                 "query",
-                LOCAL_FILE_QUERY_TOOL_NAME,
+                "data_query",
                 {
+                    "source_id": "s1",
                     "path_pattern": "orders.csv",
                     "sql": (
                         "SELECT region, SUM(amount) AS total FROM data "
@@ -780,19 +779,16 @@ async def test_public_agent_loads_and_executes_file_query_through_one_runtime(
     try:
         result = await agent.run("Total sales by region in orders.csv")
         assert result.final_text == "north totals 15"
-        assert LOCAL_FILE_QUERY_TOOL_NAME not in {
-            tool.name for tool in provider.requests[0].tools
-        }
-        assert LOCAL_FILE_QUERY_TOOL_NAME in {
-            tool.name for tool in provider.requests[1].tools
-        }
-        view, capability, owner = agent._embedded._capabilities.resolve_tool_owner(
-            LOCAL_FILE_QUERY_TOOL_NAME
+        assert "data_query" in {tool.name for tool in provider.requests[0].tools}
+        _view, capability, owner = agent._embedded._capabilities.resolve_tool_owner(
+            "data_query"
         )
-        assert capability.id == LOCAL_FILE_QUERY_CAPABILITY_ID
-        assert capability.executor_id == LOCAL_FILE_QUERY_EXECUTOR_ID
         assert owner == "data"
-        assert view.presentation.load_mode.value == "on_demand"
+        routed = agent._embedded._capabilities.call_capability(
+            "data_query", {"source_id": "s1", "path_pattern": "x", "sql": "x"}
+        )
+        assert routed.id == PATH_QUERY_CAPABILITY_ID
+        assert routed.executor_id == PATH_QUERY_EXECUTOR_ID
         transcript = await agent.transcript(result.run_id)
         query_result = next(
             block
@@ -816,7 +812,7 @@ async def test_public_agent_loads_and_executes_file_query_through_one_runtime(
         await agent.close()
 
 
-async def test_invalid_file_query_sql_fails_before_workspace_io(
+async def test_invalid_folder_query_sql_fails_before_workspace_io(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -825,14 +821,10 @@ async def test_invalid_file_query_sql_fails_before_workspace_io(
     provider = MockModelProvider(
         (
             _call(
-                "load-query",
-                "toolbox_load",
-                {"tool_names": [LOCAL_FILE_QUERY_TOOL_NAME]},
-            ),
-            _call(
                 "invalid-query",
-                LOCAL_FILE_QUERY_TOOL_NAME,
+                "data_query",
                 {
+                    "source_id": "s1",
                     "path_pattern": "orders.csv",
                     "sql": "SELECT * FROM read_csv('/etc/hosts')",
                 },
@@ -876,13 +868,14 @@ async def test_invalid_file_query_sql_fails_before_workspace_io(
         await agent.close()
 
 
-async def test_hosted_registry_contains_no_file_query_authority(tmp_path: Path) -> None:
+async def test_hosted_registry_contains_no_folder_query_authority(
+    tmp_path: Path,
+) -> None:
     from daita.hosting.embedded import EmbeddedAgent
 
     hosted = await EmbeddedAgent.create("phase4-hosted", hosted=True, root=tmp_path)
     try:
-        assert LOCAL_FILE_QUERY_TOOL_NAME not in hosted._capabilities.tool_names
-        assert LOCAL_FILE_QUERY_CAPABILITY_ID not in hosted._capabilities._capabilities
-        assert LOCAL_FILE_QUERY_EXECUTOR_ID not in hosted._capabilities._executors
+        assert PATH_QUERY_CAPABILITY_ID not in hosted._capabilities._capabilities
+        assert PATH_QUERY_EXECUTOR_ID not in hosted._capabilities._executors
     finally:
         await hosted.close()

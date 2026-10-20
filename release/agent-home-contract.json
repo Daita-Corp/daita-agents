@@ -132,8 +132,8 @@
         "affected_paths": [
           "state.db"
         ],
-        "checksum": "8023aec3e4bd55a1222bc078197a11c117abbabb2726866f95e18b1c9ddd63c8",
-        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored.",
+        "checksum": "fb675270be548207199b3737d0c3f6c75e9b41e2ddc906ac674ec42f9d98b528",
+        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete.",
         "migration_id": "0004_foreground_analysis_evidence",
         "revision": 4
       }
@@ -352,7 +352,8 @@
         "source_revision",
         "resource_count",
         "relationship_count",
-        "error_code"
+        "error_code",
+        "truncated"
       ],
       "ConversationInboxTarget": [
         "conversation_id",
@@ -4122,7 +4123,7 @@
       }
     }
   },
-  "contract_sha256": "1486caea30076987ae2c035344879ee3c94c331eabadffbf885493df7c52d4e6",
+  "contract_sha256": "dc0ec492d101c1c9ca9636f256d33af9d5a2c3f0ee1dd99cfc08c0baede675e9",
   "home_revision": 4,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1
