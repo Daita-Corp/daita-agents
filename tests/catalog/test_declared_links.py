@@ -13,6 +13,8 @@ import daita.storage.sql as sql_storage
 from daita import Agent, SQLiteSource
 from daita.adapters.models import SourceRegistration
 from daita.catalog import (
+    CatalogDescribeDetail,
+    CatalogDescribeRequest,
     CatalogLinkStaleReason,
     CatalogResourceNotFoundError,
     CatalogSchemaRequest,
@@ -272,6 +274,76 @@ async def test_run_scope_excluding_a_linked_source_never_reveals_its_resources(
         } == {sources.orders, refunds}
         assert projection["paths"] == ()
         assert projection["relationships"] == ()
+    finally:
+        await agent.close()
+
+
+async def test_source_narrowed_describe_lists_declared_links_leaving_that_source(
+    tmp_path: Path,
+):
+    sources = await _two_sources(tmp_path)
+    agent = sources.agent
+    try:
+        with sqlite3.connect(tmp_path / "orders.sqlite") as connection:
+            connection.execute(
+                "CREATE TABLE refunds (id INTEGER PRIMARY KEY, customer_id INTEGER)"
+            )
+        await agent.refresh_source(sources.orders_source.id)
+        refunds = next(
+            resource.id
+            for resource in await agent.list_catalog_resources(
+                source_id=sources.orders_source.id
+            )
+            if resource.name == "refunds"
+        )
+        orders_link = await agent.declare_catalog_link(
+            sources.orders, sources.customers, (("customer_id", "id"),)
+        )
+        refunds_link = await agent.declare_catalog_link(
+            refunds, sources.customers, (("customer_id", "id"),)
+        )
+        view = agent._embedded._data_view
+
+        async def describe(
+            *resource_ids: str, readable: frozenset[str] | None = None
+        ) -> Mapping[str, object]:
+            return await view.describe(
+                CatalogDescribeRequest(
+                    agent_id=agent.id,
+                    detail=CatalogDescribeDetail.SCHEMA,
+                    resource_ids=resource_ids,
+                    source_id=sources.orders_source.id,
+                ),
+                readable_resource_ids=readable,
+            )
+
+        # One seed or several: source_id narrows the described resources, while
+        # each current link leaving that source is listed with its far endpoint.
+        for resource_ids, links in (
+            ((sources.orders,), {orders_link.id}),
+            ((sources.orders, refunds), {orders_link.id, refunds_link.id}),
+        ):
+            narrowed = await describe(*resource_ids)
+            assert {
+                item["resource_id"] for item in _mapping_sequence(narrowed["resources"])
+            } == set(resource_ids)
+            relationships = _mapping_sequence(narrowed["relationships"])
+            assert {item["relationship_id"] for item in relationships} == links
+            for relationship in relationships:
+                assert relationship["provenance"] == "declared"
+                assert relationship["cross_source"] is True
+                assert [
+                    endpoint["resource_id"]
+                    for endpoint in _mapping_sequence(
+                        relationship["unselected_endpoints"]
+                    )
+                ] == [sources.customers]
+
+        # A scope without the far endpoint still never reveals it.
+        scoped = await describe(
+            sources.orders, readable=frozenset({sources.orders, refunds})
+        )
+        assert scoped["relationships"] == ()
     finally:
         await agent.close()
 

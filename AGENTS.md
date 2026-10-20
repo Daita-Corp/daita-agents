@@ -419,7 +419,8 @@ source relationships in one edge set, labelled `provenance: "declared"` with
 `cross_source_unsupported` remains only for seeds with no linking group. Links
 are read fresh for each projection, outside the per-source index cache. Readable
 and run-scope filters apply to both link endpoints, so traversal never crosses
-a resource outside scope.
+a resource outside scope. A `catalog_describe` narrowed by `source_id` still
+lists each current link leaving that source, with its far endpoint unselected.
 
 `daita.adapters` implements source admission, containment, discovery,
 freshness checks, and I/O. One composed `SourceTypeRegistry` per agent maps each

@@ -1534,6 +1534,14 @@ class CatalogService:
             ),
             readable_resource_ids,
         )
+        # A source_id narrows which resources are described, not which current
+        # declared links touch them: links leaving that source are still listed,
+        # with their far endpoint unselected.
+        listed_links = (
+            link_graph
+            if request.source_id is None
+            else _current_link_graph(links, indexes, readable_resource_ids)
+        )
 
         match_by_resource_id: dict[str, CatalogSearchHit] = {}
         normalized_query = _normalize_search_text(request.query or "")
@@ -1794,15 +1802,20 @@ class CatalogService:
                     edge.relationship_id
                     for edge in (
                         *index.adjacency_by_resource_id.get(resource.id, ()),
-                        *link_graph.adjacency_by_resource_id.get(resource.id, ()),
+                        *listed_links.adjacency_by_resource_id.get(resource.id, ()),
                     )
                     if (
                         edge.relationship_id in relationships_by_id
-                        or edge.relationship_id in link_graph.links_by_id
+                        or edge.relationship_id in listed_links.links_by_id
                     )
                     and (
                         len(seeds) == 1
                         or edge.neighbor_resource_id in selected_resources
+                        or (
+                            resource.id in seed_ids
+                            and edge.relationship_id in listed_links.links_by_id
+                            and edge.relationship_id not in link_graph.links_by_id
+                        )
                     )
                 )
             # Preserve every selected join path before optional adjacent edges.
@@ -1820,7 +1833,7 @@ class CatalogService:
                 relationships_truncated = True
             selected_ids = set(selected_resources)
             for relationship_id in ordered_ids[:relationship_limit]:
-                link = link_graph.links_by_id.get(relationship_id)
+                link = listed_links.links_by_id.get(relationship_id)
                 edge: CatalogRelationship | CatalogLink
                 if link is None:
                     edge = relationships_by_id[relationship_id]

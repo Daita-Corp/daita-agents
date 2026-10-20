@@ -297,10 +297,10 @@ class CatalogDataView:
         *,
         readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
-        readable = await self.readable_resource_ids(
-            request.agent_id,
-            (() if request.source_id is None else (request.source_id,)),
-        )
+        # Every source's readable set, as traverse uses: the service applies the
+        # source_id narrowing itself, and a declared link listed from that source
+        # still needs its readable far endpoint.
+        readable = await self.readable_resource_ids(request.agent_id)
         if readable_resource_ids is not None:
             readable &= readable_resource_ids
         return await self._service.describe(
