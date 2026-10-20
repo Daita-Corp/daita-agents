@@ -97,7 +97,7 @@ def test_context_window_copy_is_compact_exact_and_warns_near_capacity():
     assert format_token_count(8_500) == "8.5K"
     assert format_token_count(32_000) == "32K"
     assert format_token_count(1_050_000) == "1.1M"
-    assert context_window_text(None, 32_000).plain == "ctx — / 32K"
+    assert context_window_text(None, 32_000).plain == ""
     healthy = context_window_text(8_500, 32_000)
     warning = context_window_text(25_000, 32_000)
     critical = context_window_text(30_000, 32_000)
@@ -107,6 +107,51 @@ def test_context_window_copy_is_compact_exact_and_warns_near_capacity():
     assert critical.style == "red"
     with pytest.raises(ValueError):
         format_token_count(-1)
+
+
+def test_answer_summary_reports_queries_rows_steps_time_and_tokens():
+    from datetime import timedelta
+
+    from daita import LoopExitKind, Transcript
+    from daita.llm.models import ModelUsage, ToolCall, ToolResultBlock
+    from daita.loop.models import RunInput
+    from daita.tui.projection import run_summary_text
+
+    started = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
+    transcript = Transcript(
+        run=RunInput(id="run-1", agent_id="agent", message="q", created_at=started)
+    )
+    result = LoopExit(
+        run_id="run-1",
+        conversation_id="conversation-1",
+        kind=LoopExitKind.COMPLETED,
+        reason="done",
+        created_at=started + timedelta(seconds=4.1),
+        final_text="answer",
+        usage=ModelUsage(input_tokens=3_000, output_tokens=200),
+    )
+    pairs = (
+        (
+            ToolCall(id="c1", name="data_query"),
+            ToolResultBlock(
+                call_id="c1",
+                output={
+                    "data": {"columns": ["n"], "rows": [{"n": 1}], "total_rows": 1_204}
+                },
+            ),
+        ),
+        (
+            ToolCall(id="c2", name="data_query"),
+            ToolResultBlock(call_id="c2", output={"error": {}}, is_error=True),
+        ),
+        (ToolCall(id="c3", name="catalog_search"), None),
+    )
+    assert run_summary_text(result, transcript, pairs) == (
+        "2 queries · 1,204 rows · 3 steps · 4.1s · 3.2K tokens"
+    )
+    assert run_summary_text(result, transcript, ()) == (
+        "answered directly · 4.1s · 3.2K tokens"
+    )
 
 
 async def test_live_activity_and_exact_model_context_update_from_observation(
@@ -140,7 +185,7 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
             assert chat is not None
             activity = chat.query_one(ActivityBar)
             context = chat.query_one("#context-window", Static)
-            assert "ctx — / 32K" in str(context.content)
+            assert str(context.content) == "" and not context.display
 
             pending_run = asyncio.create_task(asyncio.sleep(3600))
             app._run_task = pending_run
@@ -312,6 +357,8 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
             )
             await app.on_observer_event(ObserverEvent(tool_completed))
             assert "Reading folder file" in str(activity.content)
+            # Finished steps stay visible as a timeline with their outcome.
+            assert "✓ Query data  0.0s" in str(activity.content)
             await app.on_observer_event(
                 ObserverEvent(
                     AgentEvent(
@@ -320,12 +367,17 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
                         run_id="run-live",
                         conversation_id="conversation-live",
                         data=FrozenJsonObject.from_mapping(
-                            {"tool_name": "file_read", "call_id": "call-file"}
+                            {
+                                "tool_name": "file_read",
+                                "call_id": "call-file",
+                                "success": False,
+                            }
                         ),
                     )
                 )
             )
             assert "Waiting for model" in str(activity.content)
+            assert "✗ Read folder file" in str(activity.content)
 
             run_completed = AgentEvent(
                 kind=AgentEventKind.RUN_COMPLETED,
@@ -419,6 +471,31 @@ async def test_chat_accumulates_and_resumes_the_full_conversation_transcript(
             await app._run_task
             await pilot.pause()
 
+            chat = app.chat()
+            assert chat is not None
+            assert chat.query_one("#next-steps").display is True
+            summaries = list(chat.query(".transcript-summary").results(Static))
+            assert len(summaries) == 2
+            assert "answered directly" in str(summaries[-1].content)
+            last_run = app.controller.last_answer
+            assert last_run is not None
+            assert last_run[0] == conversation_id
+            assert last_run[2] == "Second question"
+
+            scheduled = await app.controller.dispatch_command("/schedule every monday")
+            assert scheduled.kind == "run" and scheduled.run_message is not None
+            assert last_run[1] in scheduled.run_message
+            assert "Second question\nSchedule: every monday" in scheduled.run_message
+            prompt = await app.controller.dispatch_command("/schedule")
+            assert prompt.screen == "schedule_prompt"
+            assert prompt.payload == {"question": "Second question"}
+            taught = await app.controller.dispatch_command("/learn")
+            assert taught.kind == "run" and taught.run_message is not None
+            assert taught.run_message.startswith("/learn ")
+            assert last_run[1] in taught.run_message
+            saved = await app.controller.dispatch_command("/save")
+            assert saved.kind == "run"
+
             transcript = app.screen.query_one(TranscriptView)
             rendered = transcript.copy_text()
             assert rendered.index("First question") < rendered.index("First answer")
@@ -427,6 +504,9 @@ async def test_chat_accumulates_and_resumes_the_full_conversation_transcript(
 
             await app._handle_command("/new")
             await pilot.pause()
+            assert chat.query_one("#next-steps").display is False
+            stale = await app.controller.dispatch_command("/save")
+            assert stale.kind == "notice" and "Ask a question first" in stale.message
             assert "First question" not in transcript.copy_text()
             assert "Second answer" not in transcript.copy_text()
 

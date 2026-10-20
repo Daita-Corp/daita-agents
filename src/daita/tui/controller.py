@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import subprocess
 import tempfile
 from collections.abc import Callable
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -20,9 +18,6 @@ from daita import (
     DeliveryInspection,
     DeliveryView,
     FolderSource,
-    LearningCandidateRejectionReason,
-    LearningCandidateStatus,
-    LearningReviewStatus,
     LocalWorkspace,
     LoopExit,
     MCPAdmissionError,
@@ -63,13 +58,10 @@ from daita.jobs import (
     TaskControl,
     TaskResult,
 )
-from daita.learning_candidates import (
-    learning_candidate_content_from_mapping,
-    learning_candidate_content_to_mapping,
-)
 from daita.llm import ModelSensitivity
 from daita.llm.models import ToolCall, ToolResultBlock
 from daita.llm.provider_definitions import SUBSCRIPTION_CLIENTS
+from daita.memory.capabilities import MEMORY_SET_TOOL_NAME
 from daita.observation import AgentObserver
 from daita.security import (
     CredentialSession,
@@ -77,11 +69,12 @@ from daita.security import (
     KeychainStore,
     SecretReference,
 )
+from daita.semantics import SEMANTIC_SAVE_TOOL_NAME
 from daita.skills import Skill, validate_skill_name
+from daita.skills.capabilities import SKILL_SAVE_TOOL_NAME
 
 from .commands import (
     BUILTIN_SLASH_COMMANDS,
-    HELP_TEXT,
     learning_invocation_message,
     parse_source_override,
 )
@@ -89,11 +82,13 @@ from .models import (
     PROVIDERS,
     CommandOutcome,
     UserInputError,
-    parse_candidate_review_cost_limit,
 )
 from .projection import artifact_delivery_messages
-from .sanitization import MAX_DISPLAY_CHARACTERS, render_model_answer, safe_display
+from .sanitization import MAX_DISPLAY_CHARACTERS, safe_display
 
+_LEARNING_WRITE_TOOLS = frozenset(
+    {MEMORY_SET_TOOL_NAME, SEMANTIC_SAVE_TOOL_NAME, SKILL_SAVE_TOOL_NAME}
+)
 VALIDATION_ERRORS = {
     "authentication_error": "The API key was rejected. Replace it and retry.",
     "model_not_found": "This account cannot access {model}.",
@@ -197,7 +192,6 @@ class PresentationController:
         workspace: LocalWorkspace,
         keychain: KeychainStore | None = None,
         model_validator: Any = None,
-        reviewer_max_estimated_cost_usd: Decimal | None = None,
     ) -> None:
         self.root = root
         if not isinstance(workspace, LocalWorkspace):
@@ -210,11 +204,12 @@ class PresentationController:
             self.keychain = CredentialSession(keychain or KeychainSecretProvider())
             self._owns_credential_session = True
         self.model_validator = model_validator
-        self.reviewer_max_estimated_cost_usd = reviewer_max_estimated_cost_usd
         self.model: Any = None
         self.model_profile: Any = None
         self.agent: Agent | None = None
         self.conversation_id: str | None = None
+        # (conversation_id, run_id, question) of the latest answered question.
+        self.last_answer: tuple[str, str, str] | None = None
         self.validated_model = False
         self.model_configuration_requires_replacement = False
 
@@ -256,7 +251,6 @@ class PresentationController:
                 model_profile=self.model_profile,
                 keychain=self.keychain,
                 model_validator=self.model_validator,
-                reviewer_max_estimated_cost_usd=self.reviewer_max_estimated_cost_usd,
                 observer=observer,
                 approval_handler=approval_handler,
             )
@@ -270,7 +264,6 @@ class PresentationController:
                 model_profile=self.model_profile,
                 keychain=self.keychain,
                 model_validator=self.model_validator,
-                reviewer_max_estimated_cost_usd=self.reviewer_max_estimated_cost_usd,
                 observer=observer,
                 approval_handler=approval_handler,
             )
@@ -324,7 +317,6 @@ class PresentationController:
                 model_profile=self.model_profile,
                 keychain=self.keychain,
                 model_validator=self.model_validator,
-                reviewer_max_estimated_cost_usd=self.reviewer_max_estimated_cost_usd,
                 observer=observer,
                 approval_handler=approval_handler,
             )
@@ -967,7 +959,9 @@ class PresentationController:
         if name == "/exit" and len(parts) == 1:
             return CommandOutcome("exit", conversation_id=conversation_id)
         if name == "/help" and len(parts) == 1:
-            return CommandOutcome("notice", HELP_TEXT, conversation_id=conversation_id)
+            return CommandOutcome(
+                "screen", screen="help", conversation_id=conversation_id
+            )
         if name == "/new" and len(parts) == 1:
             self.conversation_id = None
             return CommandOutcome("notice", "Conversation  new", conversation_id=None)
@@ -1066,7 +1060,7 @@ class PresentationController:
         if name == "/conversation" and parts[1:] == ["clear"]:
             return CommandOutcome(
                 "confirm",
-                "Clear all conversation history and learning candidate records?",
+                "Clear all conversation history?",
                 conversation_id=conversation_id,
                 screen="confirm_clear_conversations",
             )
@@ -1141,6 +1135,8 @@ class PresentationController:
                 screen="model_setup",
                 conversation_id=conversation_id,
             )
+        if name in {"/save", "/schedule"} or parts == ["/learn"]:
+            return await self._next_step_command(name, command)
         if name == "/learn":
             invocation = learning_invocation_message(command)
             assert invocation is not None
@@ -1221,6 +1217,54 @@ class PresentationController:
             "Usage: /routines | /routines create <instruction> | "
             "/routines promote <basis-run-id> <instruction> | "
             "/routines update <routine-id> <instruction>",
+            conversation_id=conversation_id,
+        )
+
+    async def _next_step_command(self, name: str, command: str) -> CommandOutcome:
+        """Act on the latest answer without the user handling run identities."""
+
+        conversation_id = self.conversation_id
+        answer = self.last_answer
+        if answer is None or answer[0] != conversation_id:
+            return CommandOutcome(
+                "notice",
+                (
+                    "Usage: /learn <material>, or /learn alone right after an "
+                    "answer to remember what worked."
+                    if name == "/learn"
+                    else f"{name} acts on the latest answer. Ask a question first."
+                ),
+                conversation_id=conversation_id,
+            )
+        _conversation, run_id, question = answer
+        argument = command.removeprefix(name).strip()
+        if name == "/save":
+            return CommandOutcome(
+                "run",
+                run_message=(
+                    "Save your answer to the previous question in this conversation "
+                    "as a document artifact, keeping its content and tables as "
+                    "answered. Do not query sources again."
+                ),
+                conversation_id=conversation_id,
+            )
+        if name == "/schedule":
+            if not argument:
+                return CommandOutcome(
+                    "screen",
+                    screen="schedule_prompt",
+                    payload={"question": question},
+                    conversation_id=conversation_id,
+                )
+            promote = f"/routines promote {run_id} {question}\nSchedule: {argument}"
+            return await self._routines_command(promote.split(), promote)
+        material = (
+            f"The approach and facts behind my question {question!r} and your answer "
+            f"(run {run_id}) are correct and worth reusing."
+        )
+        return CommandOutcome(
+            "run",
+            run_message=learning_invocation_message("/learn " + material),
             conversation_id=conversation_id,
         )
 
@@ -1433,11 +1477,6 @@ class PresentationController:
         name = parts[0] if parts else ""
         conversation_id = self.conversation_id
         agent = self.require_agent()
-        if name == "/review":
-            if len(parts) not in {1, 2}:
-                return CommandOutcome("notice", "Usage: /review [cost-usd]")
-            requested = None if len(parts) == 1 else parts[1]
-            return await self.review_candidates(requested)
         if name in {"/memory", "/user"}:
             return await self._memory_command(parts)
         if name != "/skills":
@@ -1535,54 +1574,15 @@ class PresentationController:
                 )
             content = await agent.read_memory()
             return CommandOutcome("notice", await self._memory_surface(content))
-        if target == "memory" and parts[1:] == ["list"]:
-            return CommandOutcome(
-                "notice",
-                self._candidate_list_text(await agent.list_learning_candidates()),
-            )
         if target == "user" and parts[1:] == ["edit"]:
             return CommandOutcome("screen", screen="edit_user")
         if target == "memory" and parts[1:] == ["edit"]:
             return CommandOutcome("screen", screen="edit_memory")
         if target == "memory" and len(parts) == 3 and parts[1] == "show":
-            candidate = await agent.read_learning_candidate(parts[2])
-            if candidate is not None:
-                return CommandOutcome("notice", self._candidate_view_text(candidate))
             view = await agent.read_semantic_annotation(parts[2])
             if view is None:
                 raise ValueError(f"memory record not found: {parts[2]}")
             return CommandOutcome("notice", self._semantic_view_text(view))
-        if target == "memory" and len(parts) == 3 and parts[1] == "edit":
-            return CommandOutcome(
-                "screen",
-                screen="edit_candidate",
-                payload={"candidate_id": parts[2]},
-            )
-        if target == "memory" and len(parts) == 3 and parts[1] == "accept":
-            result = await agent.accept_learning_candidate(parts[2])
-            return CommandOutcome(
-                "notice",
-                "Candidate acceptance run:\n"
-                + render_model_answer(
-                    result.final_text,
-                    fallback=f"{result.kind.value}: {result.reason}",
-                ),
-            )
-        if target == "memory" and len(parts) in {3, 4} and parts[1] == "reject":
-            reason = (
-                LearningCandidateRejectionReason.USER_DECLINED
-                if len(parts) == 3
-                else LearningCandidateRejectionReason(parts[3])
-            )
-            rejected = await agent.reject_learning_candidate(parts[2], reason)
-            return CommandOutcome(
-                "notice",
-                f"Learning candidate {rejected.candidate.id!r} rejected.",
-            )
-        if target == "memory" and parts[1:] == ["clear-rejected"]:
-            cleared = await agent.clear_rejected_learning_candidates()
-            noun = "rejected candidate" if cleared == 1 else "rejected candidates"
-            return CommandOutcome("notice", f"Cleared {cleared} {noun}.")
         if target == "memory" and len(parts) == 3 and parts[1] == "delete":
             return CommandOutcome(
                 "confirm",
@@ -1591,30 +1591,11 @@ class PresentationController:
                 payload={"annotation_id": parts[2]},
             )
         usage = (
-            "/memory [list|show <id>|edit [id]|accept <id>|"
-            "reject <id> [reason]|clear-rejected|delete <semantic-id>]"
+            "/memory [show <semantic-id>|edit|delete <semantic-id>]"
             if target == "memory"
             else "/user [edit]"
         )
         return CommandOutcome("notice", f"Usage: {usage}")
-
-    async def review_candidates(self, requested: str | None) -> CommandOutcome:
-        agent = self.require_agent()
-        if requested is None:
-            result = await agent.review_learning_candidates()
-            if result.status in {
-                LearningReviewStatus.DISABLED,
-                LearningReviewStatus.COST_LIMIT_REQUIRED,
-            }:
-                return CommandOutcome(
-                    "screen",
-                    "Candidate review needs one-time authorization.",
-                    screen="review_cost",
-                )
-            return CommandOutcome("notice", self._review_text(result))
-        limit = parse_candidate_review_cost_limit(requested)
-        result = await agent.review_learning_candidates(max_estimated_cost_usd=limit)
-        return CommandOutcome("notice", self._review_text(result))
 
     async def save_skill(self, name: str, description: str, instructions: str) -> bool:
         validate_skill_name(name)
@@ -1639,30 +1620,6 @@ class PresentationController:
 
     async def read_user_profile(self) -> str:
         return await self.require_agent().read_user_profile()
-
-    async def candidate_editor_document(self, candidate_id: str) -> str:
-        view = await self.require_agent().read_learning_candidate(candidate_id)
-        if view is None:
-            raise ValueError(f"learning candidate not found: {candidate_id}")
-        if view.status is not LearningCandidateStatus.AWAITING_REVIEW:
-            raise ValueError(f"learning candidate is not editable: {view.status.value}")
-        mapping = learning_candidate_content_to_mapping(view.candidate.content)
-        return json.dumps(mapping.to_dict(), indent=2, sort_keys=True) + "\n"
-
-    async def save_candidate_document(self, candidate_id: str, text: str) -> None:
-        view = await self.require_agent().read_learning_candidate(candidate_id)
-        if view is None:
-            raise ValueError(f"learning candidate not found: {candidate_id}")
-        if view.status is not LearningCandidateStatus.AWAITING_REVIEW:
-            raise ValueError(f"learning candidate is not editable: {view.status.value}")
-        try:
-            value = json.loads(text)
-        except json.JSONDecodeError as error:
-            raise ValueError("edited candidate content must be valid JSON") from error
-        if not isinstance(value, dict):
-            raise ValueError("edited candidate content must be one JSON object")
-        content = learning_candidate_content_from_mapping(view.candidate.target, value)
-        await self.require_agent().edit_learning_candidate(candidate_id, content)
 
     async def delete_semantic_annotation(self, annotation_id: str) -> bool:
         view = await self.require_agent().read_semantic_annotation(annotation_id)
@@ -1763,6 +1720,16 @@ class PresentationController:
             pass
         return tuple(notices)
 
+    async def learning_saved(self, run_id: str) -> bool:
+        """Whether a run changed memory, semantics or skills, not what it claimed."""
+
+        return any(
+            call.name in _LEARNING_WRITE_TOOLS
+            and output is not None
+            and not output.is_error
+            for call, output in await self.require_agent().tool_evidence(run_id)
+        )
+
     def _settings_text(self) -> str:
         agent = self.require_agent()
         route = agent.model_route
@@ -1802,8 +1769,9 @@ class PresentationController:
             f"Agent      {safe_display(agent.name, fallback='agent')}\n"
             f"Model      {safe_display(self.model_label(), fallback='model')}\n"
             f"Sources    {source}\n"
-            "Host       open in this TUI; background reasoning shares the run lock.\n"
-            "Handoff    exit this TUI, then start daita host --agent <name>. No progress while all hosts are closed.\n"
+            "Host       this window. Routines and jobs run while it is open.\n"
+            "Closing    run daita host --agent <name> to keep them running; "
+            "with no host open they wait.\n"
             f"Working dir  {safe_display(str(self.workspace.root), fallback='admitted')} "
             f"[{self.workspace.access.value} access; {self.workspace.sensitivity.value}]\n"
             "Conversation  " + safe_display(self.conversation_id, fallback="new")
@@ -1820,19 +1788,7 @@ class PresentationController:
             safe_display(
                 memory_text, fallback="(empty)", maximum=MAX_DISPLAY_CHARACTERS
             ),
-            "",
-            "Pending candidates:",
         ]
-        candidates = await agent.list_learning_candidates()
-        if not candidates:
-            lines.append("  (none)")
-        else:
-            for view in candidates[:12]:
-                lines.append(
-                    "  "
-                    + safe_display(view.candidate.id, fallback="candidate")
-                    + f" [{view.status.value}/{view.candidate.target.value}]"
-                )
         views = await agent.list_semantic_annotations()
         for heading, state in (
             ("Active data semantics", SemanticAnnotationState.ACTIVE),
@@ -1860,26 +1816,6 @@ class PresentationController:
                 )
         return "\n".join(lines)
 
-    def _candidate_list_text(self, views: tuple[Any, ...]) -> str:
-        if not views:
-            return "Learning candidates\n  (none)"
-        lines = ["Learning candidates"]
-        for view in views:
-            lines.append(
-                "  "
-                + safe_display(view.candidate.id, fallback="candidate")
-                + f" [{view.status.value}/{view.candidate.target.value}]"
-            )
-        return "\n".join(lines)
-
-    def _candidate_view_text(self, view: Any) -> str:
-        candidate = view.candidate
-        return (
-            f"Learning candidate: {safe_display(candidate.id)}\n"
-            f"Status: {view.status.value}\n"
-            f"Target: {candidate.target.value}"
-        )
-
     def _semantic_view_text(self, view: Any) -> str:
         annotation = view.annotation
         lines = [
@@ -1904,15 +1840,6 @@ class PresentationController:
         for evidence in annotation.evidence:
             lines.append(f"  {evidence.kind.value} in run {evidence.run_id}")
         return "\n".join(lines)
-
-    def _review_text(self, result: Any) -> str:
-        return (
-            "Learning review\n"
-            f"  Status: {result.status.value}\n"
-            f"  Reviewed runs: {len(result.reviewed_run_ids)}\n"
-            f"  New candidates: {len(result.candidates)}\n"
-            f"  Model calls: {result.model_calls}"
-        )
 
 
 def _configuration_text(configuration: Any, key: str) -> str:

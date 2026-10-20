@@ -2,7 +2,6 @@
 
 import asyncio
 from contextlib import contextmanager
-from decimal import Decimal
 
 import pytest
 
@@ -236,9 +235,8 @@ async def test_failed_composition_closes_owned_models_but_not_borrowed_state(
                 advisory_storage=advisory_storage,
                 artifact_storage=artifact_byte_storage,
                 config=AgentConfig(model_route=route),
-                reviewer_max_estimated_cost_usd=Decimal("1"),
             )
-    assert len(closed) == 2 and closed[0] is not closed[1]
+    assert len(closed) == 1
     assert await state_store.load_identity() == identity
 
 

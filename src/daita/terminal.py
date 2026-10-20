@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from ._installation import repair_guidance
 from .security import KeychainStore
-from .tui.models import validate_candidate_review_cost_limit
 from .workspace import LocalWorkspace
 
 
@@ -32,7 +30,6 @@ async def run_terminal_application(
     workspace: LocalWorkspace,
     agent_name: str | None = None,
     conversation_id: str | None = None,
-    reviewer_max_estimated_cost_usd: Decimal | None = None,
     keychain: KeychainStore | None = None,
     model_validator: Any = None,
     input_stream: Any = None,
@@ -45,7 +42,6 @@ async def run_terminal_application(
 ) -> int:
     """Start one Textual app. Extra stream arguments are ignored after cutover."""
 
-    validate_candidate_review_cost_limit(reviewer_max_estimated_cost_usd)
     run_app = _load_textual_app()
     return await run_app(
         root=root,
@@ -54,7 +50,6 @@ async def run_terminal_application(
         conversation_id=conversation_id,
         keychain=keychain,
         model_validator=model_validator,
-        reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
     )
 
 

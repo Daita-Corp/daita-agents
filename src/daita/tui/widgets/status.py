@@ -9,33 +9,17 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import Static, Tabs
 
+from ..projection import format_token_count
 from ..sanitization import sanitize_terminal_text
-
-
-def format_token_count(value: int) -> str:
-    """Format a non-negative token count without obscuring its scale."""
-
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError("token count must be a non-negative integer")
-    if value < 1_000:
-        return str(value)
-    if value < 10_000:
-        return f"{value / 1_000:.1f}K"
-    if value < 1_000_000:
-        return f"{value // 1_000}K"
-    if value < 10_000_000:
-        return f"{value / 1_000_000:.1f}M"
-    return f"{value // 1_000_000}M"
 
 
 def context_window_text(used: int | None, total: int | None) -> Text:
     """Build a truthful compact view of the latest exact request usage."""
 
-    if total is None or total <= 0:
-        return Text("ctx —", style="dim")
+    if total is None or total <= 0 or used is None or used <= 0:
+        # Nothing measured yet; an empty label hides the indicator.
+        return Text()
     total_label = format_token_count(total)
-    if used is None or used <= 0:
-        return Text(f"ctx — / {total_label}", style="dim")
     percentage = used / total * 100
     style = "red" if percentage >= 90 else "yellow" if percentage >= 75 else "dim"
     return Text(
@@ -55,6 +39,14 @@ class StatusBar(Horizontal):
         yield Static(Text("DAITA", style="bold"), id="status-primary")
         if self._navigation is not None:
             yield self._navigation
+        host = Static(Text("● host open", style="green"), id="host-status")
+        host.tooltip = (
+            "Routines and jobs run only while a Daita host is open: this window, "
+            "or `daita host --agent <name>` after you close it. With no host open "
+            "they wait."
+        )
+        host.display = False
+        yield host
         context = Static(context_window_text(None, None), id="context-window")
         context.tooltip = (
             "Exact input tokens in the latest model request / model context window"
@@ -79,14 +71,19 @@ class StatusBar(Horizontal):
     ) -> None:
         primary = self.query_one("#status-primary", Static)
         context = self.query_one("#context-window", Static)
+        host = self.query_one("#host-status", Static)
         if too_small:
+            host.display = False
             message = Text("DAITA", style="bold")
             message.append("  Terminal too small; 32x8 required", style="bold")
             primary.update(message)
             primary.tooltip = message.copy()
             context.display = False
             return
-        context.display = self.app.size.width >= 100
+        label = context_window_text(context_used, context_total)
+        context.update(label)
+        context.display = bool(label) and self.app.size.width >= 100
+        host.display = bool(scheduled or running) and self.app.size.width >= 80
         safe_source = sanitize_terminal_text(
             source, maximum=48, preserve_lines=False, fallback="none"
         )
@@ -119,13 +116,16 @@ class StatusBar(Horizontal):
             message.append(f"  reporting {active_reports}", style="dim")
         primary.update(message)
         primary.tooltip = message.copy()
-        context.update(context_window_text(context_used, context_total))
 
 
 class ActivityBar(Static):
-    """Animated, observable run activity without exposing hidden reasoning."""
+    """Animated run activity with a short timeline of the run's tool steps.
+
+    Private model chain-of-thought is never exposed; only executed steps are.
+    """
 
     _FRAMES = ("◆", "◇")
+    _VISIBLE_STEPS = 4
 
     def __init__(self) -> None:
         super().__init__("", id="activity-bar", markup=False)
@@ -133,6 +133,8 @@ class ActivityBar(Static):
         self._started_at: float | None = None
         self._frame = 0
         self._timer: object | None = None
+        # call_id -> (label, started_at, (mark, seconds) once finished).
+        self._steps: dict[str, tuple[str, float, tuple[str, float] | None]] = {}
         self.display = False
         self.tooltip = (
             "Live execution activity. Private model chain-of-thought is not exposed."
@@ -144,6 +146,7 @@ class ActivityBar(Static):
     def start(self, stage: str = "Thinking") -> None:
         self._started_at = time.monotonic()
         self._frame = 0
+        self._steps = {}
         self.display = True
         self.update_stage(stage)
         timer = self._timer
@@ -156,11 +159,41 @@ class ActivityBar(Static):
         )
         self._render_activity()
 
+    def step_started(self, call_id: str, label: str) -> None:
+        self._steps[call_id] = (
+            sanitize_terminal_text(
+                label, maximum=72, preserve_lines=False, fallback="Tool"
+            ),
+            time.monotonic(),
+            None,
+        )
+        self._render_activity()
+
+    def step_finished(
+        self, call_id: str, *, success: bool, duration_ms: object = None
+    ) -> None:
+        step = self._steps.get(call_id)
+        if step is None:
+            return
+        seconds = (
+            duration_ms / 1000
+            if isinstance(duration_ms, (int, float))
+            and not isinstance(duration_ms, bool)
+            else time.monotonic() - step[1]
+        )
+        self._steps[call_id] = (
+            step[0],
+            step[1],
+            ("✓" if success else "✗", max(0.0, seconds)),
+        )
+        self._render_activity()
+
     def stop(self) -> None:
         timer = self._timer
         if timer is not None:
             timer.pause()  # type: ignore[attr-defined]
         self._started_at = None
+        self._steps = {}
         self.update("")
         self.display = False
 
@@ -171,10 +204,20 @@ class ActivityBar(Static):
         self._render_activity()
 
     def _render_activity(self) -> None:
+        content = Text()
+        finished = [step for step in self._steps.values() if step[2] is not None]
+        hidden = len(finished) - self._VISIBLE_STEPS
+        if hidden > 0:
+            content.append(f"  … {hidden} earlier steps\n", style="dim")
+        for label, _started, outcome in finished[-self._VISIBLE_STEPS :]:
+            assert outcome is not None
+            mark, seconds = outcome
+            content.append(f"  {mark} ", style="green" if mark == "✓" else "red")
+            content.append(f"{label}  {seconds:.1f}s\n", style="dim")
         elapsed = 0.0
         if self._started_at is not None:
             elapsed = max(0.0, time.monotonic() - self._started_at)
-        content = Text(self._FRAMES[self._frame], style="bold")
+        content.append(self._FRAMES[self._frame], style="bold")
         content.append(f"  {self._stage}", style="italic dim")
         content.append(f"  {elapsed:.1f}s", style="dim")
         self.update(content)

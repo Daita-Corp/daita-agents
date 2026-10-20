@@ -122,7 +122,11 @@ async def test_schema_bound_memory_redirects_to_semantics_and_survives_restart(
                 ToolCall(
                     id="plain-memory",
                     name="memory_set",
-                    arguments={"target": "memory", "content": statement},
+                    arguments={
+                        "target": "memory",
+                        "action": "add",
+                        "content": statement,
+                    },
                 )
             ),
             _call(
@@ -801,13 +805,13 @@ async def test_natural_language_and_learn_route_to_semantics_without_new_command
             if isinstance(block, TextBlock)
         )
         assert "semantic_save=current resource/field meaning" in prompt
+        assert "resource/field-scoped semantic annotation" in prompt
+        assert "approval card is the only confirmation" in prompt
         assert len(approvals) == 1
     finally:
         await agent.close()
 
     routed = _learning_invocation_message(
-        "/learn Booked revenue uses invoices.booked_at."
+        "/learn  Booked revenue uses invoices.booked_at. "
     )
-    assert routed is not None
-    assert "resource/field-scoped semantic annotation" in routed
-    assert "approval card is the only confirmation" in routed
+    assert routed == "/learn Booked revenue uses invoices.booked_at."

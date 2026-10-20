@@ -26,12 +26,6 @@ from .identity import (
     encode_identifier,
     encode_identity,
 )
-from .learning import (
-    decode_learning_candidate,
-    decode_review_stamps,
-    encode_learning_candidate,
-    encode_review_stamps,
-)
 from .mcp_bindings import decode_mcp_binding, encode_mcp_binding
 from .receipts import decode_receipt, encode_receipt
 from .routines import (
@@ -70,7 +64,6 @@ __all__ = [
     "decode_conversation_inbox_target",
     "decode_delivery",
     "decode_distribution_plan",
-    "decode_learning_candidate",
     "decode_loop_exit",
     "decode_mcp_binding",
     "decode_message",
@@ -78,7 +71,6 @@ __all__ = [
     "decode_outcome_contract",
     "decode_outcome_reference",
     "decode_receipt",
-    "decode_review_stamps",
     "decode_routine_occurrence",
     "decode_run_input",
     "decode_semantic_annotation",
@@ -94,7 +86,6 @@ __all__ = [
     "encode_conversation_inbox_target",
     "encode_delivery",
     "encode_distribution_plan",
-    "encode_learning_candidate",
     "encode_loop_exit",
     "encode_mcp_binding",
     "encode_message",
@@ -102,7 +93,6 @@ __all__ = [
     "encode_outcome_contract",
     "encode_outcome_reference",
     "encode_receipt",
-    "encode_review_stamps",
     "encode_routine_occurrence",
     "encode_run_input",
     "encode_semantic_annotation",

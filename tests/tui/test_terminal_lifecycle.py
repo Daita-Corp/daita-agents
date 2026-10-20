@@ -117,6 +117,43 @@ async def test_active_run_cancellation_does_not_retry_agent(tmp_path: Path):
         await opened.close()
 
 
+async def test_learn_command_runs_explicit_learning(tmp_path: Path):
+    opened = await Agent.create(
+        "learn-route", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    calls: list[tuple[str, str]] = []
+    called = asyncio.Event()
+
+    def record(kind: str):
+        async def capture(message: str, **_kwargs: object):
+            calls.append((kind, message))
+            called.set()
+            await asyncio.Event().wait()
+
+        return capture
+
+    opened.run = record("run")  # type: ignore[method-assign]
+    opened.learn = record("learn")  # type: ignore[method-assign]
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
+    app.controller.agent = opened
+    try:
+        async with app.run_test(size=(80, 24)) as pilot:
+            await app._show_chat()
+            bare = await app.controller.dispatch_command("/learn")
+            assert bare.kind == "notice" and bare.message.startswith("Usage: /learn")
+            await app.submit_composer("/learn fiscal year starts in February")
+            await asyncio.wait_for(called.wait(), timeout=1)
+            await app.copy_or_cancel()
+            await pilot.pause()
+            app.exit(0)
+    finally:
+        await opened.close()
+    assert [kind for kind, _message in calls] == ["learn"]
+    assert "fiscal year starts in February" in calls[0][1]
+
+
 async def test_approval_presentation_failure_is_not_converted_to_denial():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     request = ApprovalRequest(

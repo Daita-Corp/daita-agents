@@ -94,18 +94,6 @@ from ..jobs.graph.models import (
     canonical_digest,
     reserved_artifact_id,
 )
-from ..learning_candidates import (
-    LEARNING_CANDIDATE_MAX_RECORDS,
-    LEARNING_REVIEW_MAX_PROPOSALS,
-    LEARNING_REVIEW_MAX_STAMPS,
-    LearningCandidate,
-    LearningCandidateError,
-    LearningCandidateNotFoundError,
-    LearningCandidateRejectionReason,
-    LearningCandidateReviewStamp,
-    LearningCandidateStatus,
-    LearningReviewRunTail,
-)
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -166,13 +154,11 @@ from .sqlite_codecs import (
     decode_catalog_sync,
     decode_delivery,
     decode_identity,
-    decode_learning_candidate,
     decode_loop_exit,
     decode_mcp_binding,
     decode_message,
     decode_receipt,
     decode_relational_write_scope,
-    decode_review_stamps,
     decode_routine_occurrence,
     decode_run_input,
     decode_scheduled_routine,
@@ -185,13 +171,11 @@ from .sqlite_codecs import (
     encode_catalog_sync,
     encode_delivery,
     encode_identity,
-    encode_learning_candidate,
     encode_loop_exit,
     encode_mcp_binding,
     encode_message,
     encode_receipt,
     encode_relational_write_scope,
-    encode_review_stamps,
     encode_run_input,
     encode_scheduled_routine,
     encode_semantic_annotation,
@@ -226,7 +210,6 @@ from .sqlite_records import (
 )
 
 _CATALOG_SNAPSHOT_SOURCE_FILTER_BATCH = 64
-_LEARNING_REVIEW_STAMPS_KEY_PREFIX = "learning_review_stamps:"
 _T = TypeVar("_T")
 
 
@@ -236,10 +219,6 @@ def _active_mcp_tool_count(bindings: Iterable[MCPServerBinding]) -> int:
         for binding in bindings
         if binding.state is MCPBindingState.ACTIVE
     )
-
-
-def _learning_review_stamps_key(agent_id: str) -> str:
-    return f"{_LEARNING_REVIEW_STAMPS_KEY_PREFIX}{agent_id}"
 
 
 def _load_delivery_row(
@@ -3389,375 +3368,6 @@ class SQLStateStore:
         deleted = await run_sql_transaction(self._database, write)
         return deleted
 
-    async def recent_completed_runs(
-        self,
-        agent_id: str,
-        *,
-        limit: int,
-    ) -> LearningReviewRunTail:
-        """Return a bounded chronological tail of terminal completed runs."""
-
-        if not isinstance(agent_id, str) or not agent_id:
-            raise ValueError("agent_id must be a non-empty string")
-        if (
-            not isinstance(limit, int)
-            or isinstance(limit, bool)
-            or limit < 1
-            or limit > LEARNING_REVIEW_MAX_STAMPS
-        ):
-            raise ValueError("completed-run review limit is invalid")
-
-        def read() -> LearningReviewRunTail:
-            with _connect_read_only(self._database) as connection:
-                rows = connection.execute(
-                    f"""SELECT id, turn_index, input, result
-                       FROM runs
-                       WHERE agent_id = ? AND result IS NOT NULL
-                       ORDER BY {connection.insertion_order} DESC
-                       LIMIT ?""",
-                    (agent_id, limit),
-                ).fetchall()
-                records: list[ConversationRun] = []
-                unreadable_run_count = 0
-                for run_id, turn_index, input_data, result_data in rows:
-                    try:
-                        result = decode_loop_exit(result_data)
-                        if result.kind is not LoopExitKind.COMPLETED:
-                            continue
-                        message_rows = connection.execute(
-                            """SELECT data FROM messages
-                               WHERE run_id = ? ORDER BY position""",
-                            (run_id,),
-                        ).fetchall()
-                        record = ConversationRun(
-                            turn_index=int(turn_index),
-                            transcript=Transcript(
-                                run=decode_run_input(input_data),
-                                messages=tuple(
-                                    decode_message(data) for (data,) in message_rows
-                                ),
-                            ),
-                            result=result,
-                        )
-                    except (KeyError, TypeError, ValueError):
-                        unreadable_run_count += 1
-                        continue
-                    records.append(record)
-            records.reverse()
-            return LearningReviewRunTail(
-                tuple(records),
-                unreadable_run_count=unreadable_run_count,
-            )
-
-        return await settled_thread(read)
-
-    async def list_learning_candidates(
-        self,
-        agent_id: str,
-    ) -> tuple[LearningCandidate, ...]:
-        """Return one bounded deterministic agent-isolated candidate inbox."""
-
-        _validate_learning_agent_id(agent_id)
-
-        def read() -> tuple[LearningCandidate, ...]:
-            with _connect_read_only(self._database) as connection:
-                return _learning_candidate_rows(connection, agent_id)
-
-        return await settled_thread(read)
-
-    async def load_learning_candidate(
-        self,
-        agent_id: str,
-        candidate_id: str,
-    ) -> LearningCandidate | None:
-        _validate_learning_agent_id(agent_id)
-        _validate_learning_candidate_id(candidate_id)
-
-        def read() -> LearningCandidate | None:
-            with _connect_read_only(self._database) as connection:
-                row = connection.execute(
-                    """SELECT data FROM learning_candidates
-                       WHERE agent_id = ? AND id = ?""",
-                    (agent_id, candidate_id),
-                ).fetchone()
-            return None if row is None else decode_learning_candidate(row[0])
-
-        return await settled_thread(read)
-
-    async def learning_candidate_review_stamps(
-        self,
-        agent_id: str,
-    ) -> tuple[LearningCandidateReviewStamp, ...]:
-        _validate_learning_agent_id(agent_id)
-
-        def read() -> tuple[LearningCandidateReviewStamp, ...]:
-            with _connect_read_only(self._database) as connection:
-                return _learning_review_stamps(connection, agent_id)
-
-        return await settled_thread(read)
-
-    async def save_learning_candidate_review(
-        self,
-        agent_id: str,
-        *,
-        stamps: tuple[LearningCandidateReviewStamp, ...],
-        candidates: tuple[LearningCandidate, ...],
-    ) -> tuple[LearningCandidate, ...]:
-        """Atomically record one completed review and its inactive candidates."""
-
-        _validate_learning_agent_id(agent_id)
-        stamps = tuple(stamps)
-        candidates = tuple(candidates)
-        if (
-            not stamps
-            or len(stamps) > LEARNING_REVIEW_MAX_STAMPS
-            or any(
-                not isinstance(item, LearningCandidateReviewStamp) for item in stamps
-            )
-            or len(set(stamps)) != len(stamps)
-        ):
-            raise LearningCandidateError("review stamps exceed their unique bound")
-        if len(candidates) > LEARNING_REVIEW_MAX_PROPOSALS or any(
-            not isinstance(item, LearningCandidate) for item in candidates
-        ):
-            raise LearningCandidateError("review candidates exceed their bound")
-        for candidate in candidates:
-            _validate_learning_candidate_owner(agent_id, candidate)
-            if candidate.status is not LearningCandidateStatus.AWAITING_REVIEW:
-                raise LearningCandidateError(
-                    "new review candidates must be awaiting review"
-                )
-
-        def write(connection: SQLConnection) -> tuple[LearningCandidate, ...]:
-            current_stamps = _learning_review_stamps(connection, agent_id)
-            current_stamp_set = set(current_stamps)
-            if all(stamp in current_stamp_set for stamp in stamps):
-                review_fingerprints = {item.review_fingerprint for item in candidates}
-                return tuple(
-                    item
-                    for item in _learning_candidate_rows(connection, agent_id)
-                    if item.review_fingerprint in review_fingerprints
-                )
-            merged_stamps = (
-                *current_stamps,
-                *(stamp for stamp in stamps if stamp not in current_stamp_set),
-            )
-            if len(merged_stamps) > LEARNING_REVIEW_MAX_STAMPS:
-                raise LearningCandidateError(
-                    "learning review stamp capacity is exhausted"
-                )
-            current = _learning_candidate_rows(connection, agent_id)
-            by_id = {item.id: item for item in current}
-            identities = {item.candidate_identity_sha256 for item in current}
-            inserted: list[LearningCandidate] = []
-            for candidate in candidates:
-                existing = by_id.get(candidate.id)
-                if existing is not None:
-                    if (
-                        existing.candidate_identity_sha256
-                        == candidate.candidate_identity_sha256
-                    ):
-                        continue
-                    raise LearningCandidateError(
-                        "learning candidate record identity collision"
-                    )
-                if candidate.candidate_identity_sha256 in identities:
-                    continue
-                if len(current) + len(inserted) >= LEARNING_CANDIDATE_MAX_RECORDS:
-                    raise LearningCandidateError(
-                        "learning candidate capacity is exhausted"
-                    )
-                connection.execute(
-                    """INSERT INTO learning_candidates(agent_id, id, data)
-                       VALUES (?, ?, ?)""",
-                    (agent_id, candidate.id, encode_learning_candidate(candidate)),
-                )
-                by_id[candidate.id] = candidate
-                identities.add(candidate.candidate_identity_sha256)
-                inserted.append(candidate)
-            connection.execute(
-                f"""INSERT INTO metadata(key, data) VALUES (?, ?)
-                   ON CONFLICT({connection.conflict('key')}) DO UPDATE SET data = excluded.data""",
-                (
-                    _learning_review_stamps_key(agent_id),
-                    encode_review_stamps(tuple(merged_stamps)),
-                ),
-            )
-            return tuple(inserted)
-
-        return await run_sql_transaction(self._database, write)
-
-    async def edit_learning_candidate(
-        self,
-        agent_id: str,
-        candidate: LearningCandidate,
-        *,
-        expected_fingerprint: str,
-    ) -> LearningCandidate:
-        """Atomically replace only one awaiting candidate's bounded content."""
-
-        _validate_learning_agent_id(agent_id)
-        _validate_learning_candidate_owner(agent_id, candidate)
-        _validate_learning_digest(expected_fingerprint, "expected_fingerprint")
-
-        def write(connection: SQLConnection) -> LearningCandidate:
-            current = _load_learning_candidate_required(
-                connection,
-                agent_id,
-                candidate.id,
-            )
-            _require_candidate_transition(
-                current,
-                expected_fingerprint=expected_fingerprint,
-            )
-            if candidate.status is not LearningCandidateStatus.AWAITING_REVIEW:
-                raise LearningCandidateError(
-                    "edited candidate must remain awaiting review"
-                )
-            unchanged = (
-                "id",
-                "agent_id",
-                "target",
-                "source_ids",
-                "reviewed_runs",
-                "supporting_run_ids",
-                "review_fingerprint",
-                "artifact_state_sha256",
-                "catalog_revisions",
-                "status",
-                "created_at",
-                "rejection_reason",
-            )
-            if any(
-                getattr(current, field_name) != getattr(candidate, field_name)
-                for field_name in unchanged
-            ):
-                raise LearningCandidateError(
-                    "candidate edit may change only bounded proposed content"
-                )
-            if candidate.updated_at < current.updated_at:
-                raise LearningCandidateError(
-                    "candidate edit timestamp cannot move backwards"
-                )
-            if any(
-                item.id != candidate.id
-                and item.candidate_identity_sha256
-                == candidate.candidate_identity_sha256
-                for item in _learning_candidate_rows(connection, agent_id)
-            ):
-                raise LearningCandidateError(
-                    "candidate edit duplicates an existing normalized identity"
-                )
-            connection.execute(
-                """UPDATE learning_candidates SET data = ?
-                   WHERE agent_id = ? AND id = ?""",
-                (encode_learning_candidate(candidate), agent_id, candidate.id),
-            )
-            return candidate
-
-        return await run_sql_transaction(self._database, write)
-
-    async def reject_learning_candidate(
-        self,
-        agent_id: str,
-        candidate_id: str,
-        *,
-        expected_fingerprint: str,
-        reason: LearningCandidateRejectionReason,
-        rejected_at: datetime,
-    ) -> LearningCandidate:
-        _validate_learning_agent_id(agent_id)
-        _validate_learning_candidate_id(candidate_id)
-        _validate_learning_digest(expected_fingerprint, "expected_fingerprint")
-        if not isinstance(reason, LearningCandidateRejectionReason):
-            raise TypeError("candidate rejection reason is invalid")
-
-        def write(connection: SQLConnection) -> LearningCandidate:
-            current = _load_learning_candidate_required(
-                connection,
-                agent_id,
-                candidate_id,
-            )
-            _require_candidate_transition(
-                current,
-                expected_fingerprint=expected_fingerprint,
-            )
-            rejected = replace(
-                current,
-                status=LearningCandidateStatus.REJECTED,
-                updated_at=rejected_at,
-                rejection_reason=reason,
-            )
-            connection.execute(
-                """UPDATE learning_candidates SET data = ?
-                   WHERE agent_id = ? AND id = ?""",
-                (encode_learning_candidate(rejected), agent_id, candidate_id),
-            )
-            return rejected
-
-        return await run_sql_transaction(self._database, write)
-
-    async def accept_learning_candidate(
-        self,
-        agent_id: str,
-        candidate_id: str,
-        *,
-        expected_fingerprint: str,
-        accepted_at: datetime,
-    ) -> LearningCandidate:
-        _validate_learning_agent_id(agent_id)
-        _validate_learning_candidate_id(candidate_id)
-        _validate_learning_digest(expected_fingerprint, "expected_fingerprint")
-
-        def write(connection: SQLConnection) -> LearningCandidate:
-            current = _load_learning_candidate_required(
-                connection,
-                agent_id,
-                candidate_id,
-            )
-            _require_candidate_transition(
-                current,
-                expected_fingerprint=expected_fingerprint,
-            )
-            accepted = replace(
-                current,
-                status=LearningCandidateStatus.ACCEPTED,
-                updated_at=accepted_at,
-            )
-            connection.execute(
-                """UPDATE learning_candidates SET data = ?
-                   WHERE agent_id = ? AND id = ?""",
-                (encode_learning_candidate(accepted), agent_id, candidate_id),
-            )
-            return accepted
-
-        return await run_sql_transaction(self._database, write)
-
-    async def clear_rejected_learning_candidates(self, agent_id: str) -> int:
-        """Delete only explicit rejection tombstones and reset their review stamps."""
-
-        _validate_learning_agent_id(agent_id)
-
-        def write(connection: SQLConnection) -> int:
-            rejected_ids = tuple(
-                item.id
-                for item in _learning_candidate_rows(connection, agent_id)
-                if item.status is LearningCandidateStatus.REJECTED
-            )
-            if rejected_ids:
-                connection.executemany(
-                    """DELETE FROM learning_candidates
-                       WHERE agent_id = ? AND id = ?""",
-                    ((agent_id, candidate_id) for candidate_id in rejected_ids),
-                )
-                connection.execute(
-                    "DELETE FROM metadata WHERE key = ?",
-                    (_learning_review_stamps_key(agent_id),),
-                )
-            return len(rejected_ids)
-
-        return await run_sql_transaction(self._database, write)
-
     _UNSPECIFIED_PREDECESSOR = object()
 
     async def start(
@@ -4658,7 +4268,7 @@ class SQLStateStore:
         return updated
 
     async def clear_conversations(self, agent_id: str) -> int:
-        """Delete transcripts and candidate records derived from them."""
+        """Delete transcripts, keeping runs that active work still needs."""
 
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("agent_id must be a non-empty string")
@@ -4748,14 +4358,6 @@ class SQLStateStore:
             connection.executemany(
                 "DELETE FROM runs WHERE id = ? AND agent_id = ?",
                 ((run_id, agent_id) for run_id in run_ids),
-            )
-            connection.execute(
-                "DELETE FROM learning_candidates WHERE agent_id = ?",
-                (agent_id,),
-            )
-            connection.execute(
-                "DELETE FROM metadata WHERE key = ?",
-                (_learning_review_stamps_key(agent_id),),
             )
             return len(run_ids)
 
@@ -5137,96 +4739,6 @@ def _semantic_delete_fingerprint(
     )
 
 
-def _validate_learning_agent_id(agent_id: str) -> None:
-    if not isinstance(agent_id, str) or not agent_id:
-        raise ValueError("learning candidate agent_id must be non-empty text")
-
-
-def _validate_learning_candidate_id(candidate_id: str) -> None:
-    if not isinstance(candidate_id, str) or not candidate_id:
-        raise ValueError("learning candidate id must be non-empty text")
-
-
-def _validate_learning_digest(value: str, field_name: str) -> None:
-    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
-        raise LearningCandidateError(f"{field_name} must be lowercase SHA-256")
-
-
-def _validate_learning_candidate_owner(
-    agent_id: str,
-    candidate: LearningCandidate,
-) -> None:
-    if not isinstance(candidate, LearningCandidate):
-        raise TypeError("candidate must be LearningCandidate")
-    if candidate.agent_id != agent_id:
-        raise LearningCandidateError("learning candidate belongs to another agent")
-
-
-def _learning_candidate_rows(
-    connection: SQLConnection,
-    agent_id: str,
-) -> tuple[LearningCandidate, ...]:
-    rows = connection.execute(
-        """SELECT data FROM learning_candidates
-           WHERE agent_id = ? ORDER BY id""",
-        (agent_id,),
-    ).fetchall()
-    if len(rows) > LEARNING_CANDIDATE_MAX_RECORDS:
-        raise RuntimeError("stored learning candidate collection exceeds bound")
-    values = tuple(decode_learning_candidate(data) for (data,) in rows)
-    if any(item.agent_id != agent_id for item in values):
-        raise RuntimeError("stored learning candidate owner is invalid")
-    return values
-
-
-def _learning_review_stamps(
-    connection: SQLConnection,
-    agent_id: str,
-) -> tuple[LearningCandidateReviewStamp, ...]:
-    row = connection.execute(
-        "SELECT data FROM metadata WHERE key = ?",
-        (_learning_review_stamps_key(agent_id),),
-    ).fetchone()
-    if row is None:
-        return ()
-    value = decode_review_stamps(row[0])
-    if len(value) > LEARNING_REVIEW_MAX_STAMPS or len(set(value)) != len(value):
-        raise RuntimeError("stored learning review stamps exceed their bound")
-    return value
-
-
-def _load_learning_candidate_required(
-    connection: SQLConnection,
-    agent_id: str,
-    candidate_id: str,
-) -> LearningCandidate:
-    row = connection.execute(
-        """SELECT data FROM learning_candidates
-           WHERE agent_id = ? AND id = ?""",
-        (agent_id, candidate_id),
-    ).fetchone()
-    if row is None:
-        raise LearningCandidateNotFoundError(candidate_id)
-    candidate = decode_learning_candidate(row[0])
-    _validate_learning_candidate_owner(agent_id, candidate)
-    return candidate
-
-
-def _require_candidate_transition(
-    current: LearningCandidate,
-    *,
-    expected_fingerprint: str,
-) -> None:
-    if current.status is not LearningCandidateStatus.AWAITING_REVIEW:
-        raise LearningCandidateError(
-            f"candidate is not awaiting review: {current.status.value}"
-        )
-    if current.candidate_fingerprint != expected_fingerprint:
-        raise LearningCandidateError(
-            "learning candidate changed; load it again before mutation"
-        )
-
-
 async def settled_thread(
     function: Callable[..., _T],
     /,
@@ -5450,15 +4962,6 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
             if identity is not None:
                 raise ValueError("state contains duplicate agent identity")
             identity = decode_identity(data)
-        elif isinstance(key, str) and key.startswith(
-            _LEARNING_REVIEW_STAMPS_KEY_PREFIX
-        ):
-            agent_id = key.removeprefix(_LEARNING_REVIEW_STAMPS_KEY_PREFIX)
-            if not agent_id:
-                raise ValueError("stored learning review owner is invalid")
-            if identity is not None and agent_id != identity.id:
-                raise ValueError("stored learning review belongs to another agent")
-            decode_review_stamps(data)
         else:
             raise ValueError("state metadata key is unsupported")
 
@@ -5709,14 +5212,6 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
             raise ValueError("stored catalog link ownership is invalid")
         if identity is not None and link.agent_id != identity.id:
             raise ValueError("stored catalog link belongs to another agent")
-    for agent_id, candidate_id, data in connection.execute(
-        "SELECT agent_id, id, data FROM learning_candidates"
-    ):
-        candidate = decode_learning_candidate(data)
-        if candidate.agent_id != agent_id or candidate.id != candidate_id:
-            raise ValueError("stored learning candidate ownership is invalid")
-        if identity is not None and candidate.agent_id != identity.id:
-            raise ValueError("stored learning candidate belongs to another agent")
 
     # Keep only job records: later checks need nothing else, so history size
     # does not bound how many jobs an agent may have.

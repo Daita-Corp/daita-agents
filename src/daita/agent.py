@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
-from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Self
 
@@ -83,13 +82,6 @@ from .jobs.graph.models import (
 )
 from .jobs.owner import GraphBlockerProjection
 from .jobs.projections import GraphBoardProjection, GraphTimelinePage
-from .learning_candidates import (
-    LearningCandidateContent,
-    LearningCandidateRejectionReason,
-    LearningCandidateStatus,
-    LearningCandidateView,
-    LearningReviewResult,
-)
 from .llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
 from .llm.protocols import ModelProvider
 from .llm.routing import ModelRoute
@@ -188,9 +180,6 @@ class Agent:
         mcp_connection_provider: MCPConnectionProvider | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
-        reviewer_model: ModelProvider | None = None,
-        reviewer_profile: ModelProfile | None = None,
-        reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
@@ -223,9 +212,6 @@ class Agent:
                 mcp_connection_provider=mcp_connection_provider,
                 keychain=keychain,
                 model_validator=model_validator,
-                reviewer_model=reviewer_model,
-                reviewer_profile=reviewer_profile,
-                reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
                 approval_handler=approval_handler,
                 downloads_directory=downloads_directory,
@@ -252,9 +238,6 @@ class Agent:
         mcp_connection_provider: MCPConnectionProvider | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
-        reviewer_model: ModelProvider | None = None,
-        reviewer_profile: ModelProfile | None = None,
-        reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
@@ -287,9 +270,6 @@ class Agent:
                 mcp_connection_provider=mcp_connection_provider,
                 keychain=keychain,
                 model_validator=model_validator,
-                reviewer_model=reviewer_model,
-                reviewer_profile=reviewer_profile,
-                reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
                 approval_handler=approval_handler,
                 downloads_directory=downloads_directory,
@@ -315,9 +295,6 @@ class Agent:
         mcp_client_factory: MCPClientFactory | None = None,
         mcp_connection_provider: MCPConnectionProvider | None = None,
         keychain: KeychainStore | None = None,
-        reviewer_model: ModelProvider | None = None,
-        reviewer_profile: ModelProfile | None = None,
-        reviewer_max_estimated_cost_usd: Decimal | None = None,
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         diagnostics_path: Path | None = None,
@@ -348,9 +325,6 @@ class Agent:
                 mcp_client_factory=mcp_client_factory,
                 mcp_connection_provider=mcp_connection_provider,
                 keychain=keychain,
-                reviewer_model=reviewer_model,
-                reviewer_profile=reviewer_profile,
-                reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
                 observer=observer,
                 approval_handler=approval_handler,
                 diagnostics_path=diagnostics_path,
@@ -1134,68 +1108,6 @@ class Agent:
         self, text: str, *, sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
     ) -> None:
         await self._embedded.set_user_profile(text, sensitivity=sensitivity)
-
-    async def review_learning_candidates(
-        self,
-        *,
-        max_estimated_cost_usd: Decimal | None = None,
-    ) -> LearningReviewResult:
-        if max_estimated_cost_usd is not None and (
-            not isinstance(max_estimated_cost_usd, Decimal)
-            or not max_estimated_cost_usd.is_finite()
-            or max_estimated_cost_usd < 0
-        ):
-            raise ValueError(
-                "candidate review cost ceiling must be finite and non-negative"
-            )
-        return await self._embedded.review_learning_candidates(
-            max_estimated_cost_usd=max_estimated_cost_usd,
-        )
-
-    async def list_learning_candidates(
-        self,
-        *,
-        status: LearningCandidateStatus | None = None,
-    ) -> tuple[LearningCandidateView, ...]:
-        return await self._embedded.list_learning_candidates(status=status)
-
-    async def read_learning_candidate(
-        self,
-        candidate_id: str,
-    ) -> LearningCandidateView | None:
-        return await self._embedded.read_learning_candidate(candidate_id)
-
-    async def edit_learning_candidate(
-        self,
-        candidate_id: str,
-        content: LearningCandidateContent,
-    ) -> LearningCandidateView:
-        return await self._embedded.edit_learning_candidate(candidate_id, content)
-
-    async def reject_learning_candidate(
-        self,
-        candidate_id: str,
-        reason: LearningCandidateRejectionReason,
-    ) -> LearningCandidateView:
-        return await self._embedded.reject_learning_candidate(candidate_id, reason)
-
-    async def accept_learning_candidate(
-        self,
-        candidate_id: str,
-        *,
-        conversation_id: str | None = None,
-        source_id: str | None = None,
-        caller_principal_id: str | None = None,
-    ) -> LoopExit:
-        return await self._embedded.accept_learning_candidate(
-            candidate_id,
-            conversation_id=conversation_id,
-            source_id=source_id,
-            caller_principal_id=caller_principal_id,
-        )
-
-    async def clear_rejected_learning_candidates(self) -> int:
-        return await self._embedded.clear_rejected_learning_candidates()
 
     async def list_semantic_annotations(
         self,

@@ -28,14 +28,6 @@ from daita.catalog.models import (
     SourceCatalogSnapshot,
 )
 from daita.identity import AgentIdentity
-from daita.learning_candidates import (
-    DocumentCandidateContent,
-    LearningCandidate,
-    LearningCandidateReviewStamp,
-    LearningCandidateRunReference,
-    LearningCandidateStatus,
-    LearningCandidateTarget,
-)
 from daita.llm.errors import ProviderFailureDiagnostic, ProviderFailurePhase
 from daita.llm.models import (
     CanonicalMessage,
@@ -61,12 +53,10 @@ from daita.storage.sqlite_codecs import (
     decode_catalog_sync,
     decode_identifier,
     decode_identity,
-    decode_learning_candidate,
     decode_loop_exit,
     decode_message,
     decode_receipt,
     decode_relational_write_scope,
-    decode_review_stamps,
     decode_run_input,
     decode_semantic_annotation,
     decode_source,
@@ -75,12 +65,10 @@ from daita.storage.sqlite_codecs import (
     encode_catalog_sync,
     encode_identifier,
     encode_identity,
-    encode_learning_candidate,
     encode_loop_exit,
     encode_message,
     encode_receipt,
     encode_relational_write_scope,
-    encode_review_stamps,
     encode_run_input,
     encode_semantic_annotation,
     encode_source,
@@ -228,34 +216,6 @@ def _annotation() -> SemanticAnnotation:
     )
 
 
-def _candidate() -> tuple[LearningCandidate, LearningCandidateReviewStamp]:
-    digest = "1" * 64
-    reference = LearningCandidateRunReference("run-codec", digest)
-    candidate = LearningCandidate(
-        id="candidate-codec",
-        agent_id="agent-codec",
-        target=LearningCandidateTarget.MEMORY,
-        content=DocumentCandidateContent("A durable definition."),
-        source_ids=(),
-        reviewed_runs=(reference,),
-        supporting_run_ids=(reference.run_id,),
-        review_fingerprint=digest,
-        artifact_state_sha256="2" * 64,
-        catalog_revisions=(),
-        candidate_fingerprint="3" * 64,
-        status=LearningCandidateStatus.AWAITING_REVIEW,
-        created_at=NOW,
-        updated_at=NOW,
-    )
-    stamp = LearningCandidateReviewStamp(
-        run_id=reference.run_id,
-        transcript_sha256=digest,
-        artifact_state_sha256="2" * 64,
-        catalog_state_sha256="4" * 64,
-    )
-    return candidate, stamp
-
-
 def _loop_exit() -> LoopExit:
     artifact = ArtifactRef(
         artifact_id="artifact-00000000000000000000000000000001",
@@ -325,7 +285,6 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
     message = CanonicalMessage(MessageRole.USER, content=(TextBlock("Question?"),))
     result = _loop_exit()
     annotation = _annotation()
-    candidate, stamp = _candidate()
 
     _assert_round_trip(identity, encode_identity, decode_identity)
     _assert_round_trip(receipt, encode_receipt, decode_receipt)
@@ -339,18 +298,12 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
         encode_semantic_annotation,
         decode_semantic_annotation,
     )
-    _assert_round_trip(
-        candidate,
-        encode_learning_candidate,
-        decode_learning_candidate,
-    )
 
     encoded_source = encode_source(source)
     stored_source = decode_source(encoded_source)
     assert stored_source == source
     assert encode_source(stored_source) == encoded_source
     assert decode_identifier(encode_identifier("source-codec")) == "source-codec"
-    assert decode_review_stamps(encode_review_stamps((stamp,))) == (stamp,)
 
     read_scope = SourceReadScope(
         agent_id="agent-codec",
@@ -573,12 +526,6 @@ def test_current_record_shape_rejects_missing_fields() -> None:
     del payload["fields"]["source_scope_ids"]
     with pytest.raises(ValueError, match="missing fields"):
         decode_run_input(json.dumps(payload))
-
-    candidate, _stamp = _candidate()
-    candidate_payload = json.loads(encode_learning_candidate(candidate))
-    del candidate_payload["fields"]["candidate_identity_sha256"]
-    with pytest.raises(ValueError, match="missing fields"):
-        decode_learning_candidate(json.dumps(candidate_payload))
 
 
 def test_unknown_fields_and_stored_class_names_are_rejected_explicitly() -> None:

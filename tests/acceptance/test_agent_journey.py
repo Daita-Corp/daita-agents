@@ -96,7 +96,12 @@ async def test_completed_public_agent_journey_survives_cold_reopen(tmp_path):
             _call(
                 "replace-memory",
                 "memory_set",
-                {"target": "memory", "content": updated_memory},
+                {
+                    "target": "memory",
+                    "action": "replace",
+                    "old_text": initial_memory,
+                    "content": updated_memory,
+                },
             ),
             _stop(update_answer),
         )
@@ -176,6 +181,8 @@ async def test_completed_public_agent_journey_survives_cold_reopen(tmp_path):
         assert approvals[0].tool_name == "memory_set"
         assert dict(approvals[0].arguments) == {
             "target": "memory",
+            "action": "replace",
+            "old_text": initial_memory,
             "content": updated_memory,
         }
         replacement_results = tuple(

@@ -16,69 +16,122 @@ from .sanitization import safe_display
 SKILL_DESCRIPTION_PLACEHOLDER = "Describe when the agent should use this skill."
 SKILL_INSTRUCTIONS_PLACEHOLDER = "Write the reusable procedure here."
 
-SLASH_COMMAND_COMPLETIONS = (
-    ("/model", "/model", "Choose or validate the active model"),
+# Advertised commands in menu order, grouped by what the user is doing.
+# Each group's commands stay together so the popup can label the group once.
+COMMAND_GROUPS = (
     (
-        "/sources",
-        "/sources",
-        "Manage sources and explore the catalog relationship tree",
-    ),
-    ("/jobs", "/jobs", "Manage durable jobs"),
-    ("/work", "/work", "Show scheduled, running, waiting and finished work"),
-    ("/artifacts", "/artifacts", "View, save and delete stored artifacts"),
-    ("/routines", "/routines", "Inspect and control saved assignments"),
-    (
-        "/routines create ",
-        "/routines create <self-contained instruction>",
-        "Propose and approve a saved assignment",
+        "Answer",
+        (
+            ("/save", "/save", "Save the latest answer as a document"),
+            (
+                "/schedule ",
+                "/schedule [when]",
+                "Run the latest question again on a schedule",
+            ),
+        ),
     ),
     (
-        "/routines promote ",
-        "/routines promote <basis-run-id> <instruction>",
-        "Promote one successful run into a scheduled routine",
+        "Data",
+        (
+            (
+                "/sources",
+                "/sources",
+                "Connect databases and folders; browse what is in them",
+            ),
+            ("/files ", "/files <question>", "Ask using only local files"),
+            ("/workspace", "/workspace", "Show which local folder Daita can read"),
+            ("/mcp", "/mcp", "Connect external tools (MCP servers)"),
+        ),
     ),
     (
-        "/routines update ",
-        "/routines update <routine-id> <instruction>",
-        "Revise one scheduled routine through exact inspection and approval",
+        "Work",
+        (
+            ("/work", "/work", "See scheduled, running, waiting and finished work"),
+            ("/routines", "/routines", "View, pause and run your routines"),
+            (
+                "/routines create ",
+                "/routines create <instruction>",
+                "Describe a new routine in plain words",
+            ),
+            (
+                "/routines update ",
+                "/routines update <routine-id> <instruction>",
+                "Change one routine's instruction",
+            ),
+            ("/jobs", "/jobs", "Multi-step background jobs"),
+            ("/artifacts", "/artifacts", "Files Daita created: preview, save, delete"),
+        ),
     ),
-    ("/mcp", "/mcp", "Manage MCP servers and tool access"),
-    ("/settings", "/settings", "Show agent and model settings"),
-    ("/new", "/new", "Start a new conversation"),
-    ("/resume ", "/resume <id>", "Resume a previous conversation"),
     (
-        "/conversation clear",
-        "/conversation clear",
-        "Delete all conversation history",
+        "Learn",
+        (
+            (
+                "/learn ",
+                "/learn [material]",
+                "Teach a fact, preference or procedure; alone, remember what "
+                "worked in the latest answer",
+            ),
+            (
+                "/memory",
+                "/memory",
+                "What Daita remembers, including duplicate, stale, conflicting, and "
+                "superseded definitions",
+            ),
+            ("/user", "/user", "Your profile and preferences"),
+            ("/skills", "/skills", "List reusable procedures"),
+            ("/skills create", "/skills create", "Write a new skill"),
+            ("/skills use ", "/skills use <name> [request]", "Run a skill by name"),
+        ),
     ),
-    ("/learn ", "/learn <material>", "Teach durable knowledge or a procedure"),
     (
-        "/review",
-        "/review [cost-usd]",
-        "Review recent runs for memory or skill suggestions",
+        "Session",
+        (
+            ("/new", "/new", "Start a new conversation"),
+            ("/resume ", "/resume <id>", "Return to an earlier conversation"),
+            ("/conversation", "/conversation", "Show this conversation's ID"),
+            (
+                "/conversation clear",
+                "/conversation clear",
+                "Delete all conversation history",
+            ),
+            ("/help", "/help", "Keys and commands"),
+            ("/exit", "/exit", "Quit Daita"),
+        ),
     ),
     (
-        "/memory",
-        "/memory",
-        "Inspect global memory, semantics, learning candidates, and "
-        "duplicate, stale, conflicting, and superseded states",
+        "Agent",
+        (
+            ("/model", "/model", "Choose the AI model"),
+            ("/settings", "/settings", "Agent and model settings"),
+            ("/status", "/status", "Agent, sources and host status"),
+            ("/agent delete", "/agent delete", "Permanently delete this agent"),
+        ),
     ),
-    ("/user", "/user", "View or edit the user profile"),
-    ("/skills", "/skills", "List available skills"),
-    ("/skills create", "/skills create", "Start guided skill creation"),
-    (
-        "/skills use ",
-        "/skills use <name> [request]",
-        "Invoke a skill by name",
-    ),
-    ("/status", "/status", "Show current agent status"),
-    ("/workspace", "/workspace", "Show local file access and working directory"),
-    ("/files ", "/files <question>", "Run using local files only"),
-    ("/conversation", "/conversation", "Show the current conversation ID"),
-    ("/agent delete", "/agent delete", "Permanently delete this agent"),
-    ("/help", "/help", "Show controls and usage help"),
-    ("/exit", "/exit", "Exit Daita"),
 )
+SLASH_COMMAND_COMPLETIONS = tuple(
+    command for _group, commands in COMMAND_GROUPS for command in commands
+)
+_COMMAND_GROUP_BY_DISPLAY = {
+    display: group
+    for group, commands in COMMAND_GROUPS
+    for _insertion, display, _description in commands
+}
+# Answer actions offered under each completed answer, in display order.
+NEXT_STEPS = (
+    ("/save", "Save as document"),
+    ("/schedule", "Run on a schedule"),
+    ("/learn", "Teach this"),
+)
+
+
+def completion_group(display: str) -> str:
+    """Name the menu group of one completion row."""
+
+    if display.startswith("@"):
+        return "Source"
+    return _COMMAND_GROUP_BY_DISPLAY.get(display, "Skill")
+
+
 UNADVERTISED_SOURCE_COMMANDS = frozenset(
     {
         "/catalog",
@@ -95,22 +148,25 @@ BUILTIN_SLASH_COMMAND_ROOTS = frozenset(
     for _insertion, display, _description in SLASH_COMMAND_COMPLETIONS
 ) | frozenset(command.split(maxsplit=1)[0] for command in UNADVERTISED_SOURCE_COMMANDS)
 BUILTIN_SLASH_COMMANDS = BUILTIN_SLASH_COMMAND_ROOTS
-HELP_TEXT = (
-    "Type / to browse commands and their descriptions.\n"
-    "Ask across admitted connections without selecting a source.\n"
-    'Use @"source name" <question> to narrow one request.\n'
-    "Saved assignments: /routines · work board: /work\n"
-    "Stored files: /artifacts\n"
-    "MCP servers and tool access: /mcp\n"
-    "Execution requires an open host; stop this TUI before starting daita host --agent <name>.\n"
-    "F6 focus tabs · Ctrl-1…4 switch Chat, Sources, Work, Artifacts · F1 help\n"
-    "Work board: arrows move · Enter opens · d dismisses a result\n"
-    "Enter submit · Ctrl-J newline · Esc Esc clear input · Ctrl-D exit\n"
-    "Wheel or Page Up/Page Down review · Ctrl-Home start · Ctrl-End latest\n"
-    "Ctrl-O show/hide tool results · Ctrl-C copy selection or cancel the run\n"
-    "Approvals accept only Yes or No; other input does not decide\n"
-    "OSC 52 reports only that a copy request was sent, not that it succeeded"
-)
+
+
+def suggested_questions(resource_names: tuple[str, ...]) -> tuple[str, ...]:
+    """Starter questions for an empty chat, named after real catalog tables."""
+
+    names = tuple(
+        safe_display(name, fallback="", maximum=60) for name in resource_names
+    )
+    names = tuple(name for name in names if name)
+    if not names:
+        return (
+            "What files are in this folder?",
+            "Summarize the most important file in this folder",
+        )
+    first = names[0]
+    questions = [f"What is in {first}?", f"Show the 10 most recent rows of {first}"]
+    if len(names) > 1:
+        questions.append(f"How does {first} relate to {names[1]}?")
+    return tuple(questions)
 
 
 class LearningInvocation(str):
@@ -160,18 +216,8 @@ def learning_invocation_message(message: str) -> str | None:
         return None
     if len(parts) == 1 or not parts[1].strip():
         raise ValueError("usage: /learn <material>")
-    material = parts[1].strip()
-    return LearningInvocation(
-        "Treat the following as an explicit teaching request. Determine whether it "
-        "belongs in stable user preferences, agent-wide business memory, a current "
-        "resource/field-scoped semantic annotation, or a reusable procedural skill. "
-        "Apply the normal foreground-learning safety rules and inspect current catalog "
-        "scope and existing memory, semantics, or skills when needed. Call the smallest "
-        "fitting learning tool immediately; its approval card is the only confirmation, "
-        "so never ask the user for a typed approval phrase. Do not claim that a workflow "
-        "is verified unless it was executed successfully or the user explicitly "
-        "confirmed it.\n\nTeaching material:\n" + material
-    )
+    # The explicit-learning run supplies the routing instructions.
+    return LearningInvocation("/learn " + parts[1].strip())
 
 
 def quoted_source_override(selector: str) -> str:

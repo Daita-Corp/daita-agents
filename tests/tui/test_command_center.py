@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import pytest
 from rich.text import Text
-from textual.widgets import OptionList, Tab, Tabs
+from textual.widgets import OptionList, Static, Tab, Tabs
 
 from daita import Agent
 from daita.tui.app import DaitaApp
 from daita.tui.models import TranscriptBlock
 from daita.tui.screens.artifacts import ArtifactsScreen
 from daita.tui.screens.catalog import CatalogScreen
+from daita.tui.screens.help import HelpScreen
 from daita.tui.widgets.command_center import (
     CommandSections,
     ProjectionList,
@@ -52,7 +53,8 @@ async def test_tabs_show_one_view_preserve_draft_and_fit_terminal(tmp_path, size
             assert navigation.region.y == identity.region.y
             assert navigation.region.height == identity.region.height == 1
             assert identity.region.right <= navigation.region.x
-            assert context.display is (size[0] >= 100)
+            # Context usage appears only once a model request has measured it.
+            assert not context.display
             if context.display:
                 assert context.region.y == identity.region.y
                 assert navigation.region.right <= context.region.x
@@ -67,7 +69,12 @@ async def test_tabs_show_one_view_preserve_draft_and_fit_terminal(tmp_path, size
             assert transcript.region.bottom <= composer.region.y
             assert not sections.display
             hints = list(chat.query("FooterKey"))
-            assert [getattr(hint, "key") for hint in hints] == ["enter", "f6", "f1"]
+            assert [getattr(hint, "key") for hint in hints] == [
+                "enter",
+                "ctrl+o",
+                "f6",
+                "f1",
+            ]
             assert all(hint.region.right <= size[0] for hint in hints)
 
             for number, section in enumerate(("sources", "work", "artifacts"), 2):
@@ -124,6 +131,10 @@ async def test_tabs_show_one_view_preserve_draft_and_fit_terminal(tmp_path, size
                 assert tab.region.right <= navigation.region.right
             await pilot.press("f1")
             await pilot.pause()
+            assert isinstance(app.screen, HelpScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.screen is chat
             assert composer.text == "unsent question"
             assert app._run_task is None
         finally:
@@ -159,6 +170,16 @@ async def test_projection_opens_exact_owner_item_and_restores_composer(
             await app.refresh_background_status(notify_new=False)
             await pilot.pause()
             listing = chat.query_one(f"#command-{section}", ProjectionList)
+            # Wide terminals show the highlighted item's facts beside the list.
+            detail = chat.query_one(f"#detail-{section}", Static)
+            assert detail.display and detail.region.x > listing.region.x
+            expected_detail = "SQLite" if section == "sources" else "Size"
+            assert expected_detail in str(detail.content)
+            await pilot.resize_terminal(90, 40)
+            await pilot.pause()
+            assert detail.region.width == 0
+            await pilot.resize_terminal(140, 40)
+            await pilot.pause()
             await pilot.click(listing, offset=(2, 0))
             await pilot.pause()
             screen_type, selector, expected_id = targets[section]

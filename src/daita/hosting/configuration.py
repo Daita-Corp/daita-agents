@@ -18,7 +18,6 @@ from uuid import uuid4
 from .._json import canonical_json
 from ..adapters.registry import SourceTypeRegistry
 from ..config import AgentConfig
-from ..learning_candidates import LEARNING_REVIEW_MAX_TOTAL_TOKENS
 from ..llm.errors import ModelProviderError, ProviderErrorCode
 from ..llm.factory import create_model_route_provider
 from ..llm.models import (
@@ -79,9 +78,6 @@ _MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 16
 
 
 _REASONING_MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 25_000
-
-
-_CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS = LEARNING_REVIEW_MAX_TOTAL_TOKENS // 4
 
 
 def _stage_c_model_routes(
@@ -238,72 +234,6 @@ def _injected_concurrency_key(
     provider_id: str, *, identity: str, home: Path | None
 ) -> str:
     return f"injected:{provider_id}:{home.resolve() if home is not None else identity}"
-
-
-def _resolve_candidate_reviewer_profile(
-    model: ModelProvider | None,
-    profile: ModelProfile | None,
-) -> ModelProfile | None:
-    """Admit one direct provider profile without retry or fallback."""
-
-    if model is None:
-        if profile is not None:
-            raise ValueError("reviewer_profile requires reviewer_model")
-        return None
-    if isinstance(model, ModelRouter) and (
-        len(model.candidates) != 1
-        or model.retry_policy.max_attempts_per_candidate != 1
-        or model.retry_policy.max_total_attempts != 1
-    ):
-        raise ValueError("candidate reviewer requires one attempt without fallback")
-    resolved = profile
-    if resolved is None:
-        candidate = getattr(model, "model_profile", None)
-        if isinstance(candidate, ModelProfile):
-            resolved = candidate
-    if not isinstance(resolved, ModelProfile):
-        raise ValueError("candidate reviewer requires an explicit bounded ModelProfile")
-    if resolved.max_output_tokens >= LEARNING_REVIEW_MAX_TOTAL_TOKENS:
-        raise ValueError(
-            "candidate reviewer profile output limit exceeds review token budget"
-        )
-    return resolved
-
-
-def _candidate_reviewer_from_route(
-    route: ModelRoute,
-    *,
-    secret_provider: SecretProvider | None,
-) -> tuple[ManagedModelProvider, ModelProfile]:
-    """Derive one bounded, direct reviewer from the persisted primary route."""
-
-    primary = route.candidates[0]
-    profile = replace(
-        primary.profile,
-        max_output_tokens=min(
-            primary.profile.max_output_tokens,
-            _CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS,
-        ),
-    )
-    direct_route = ModelRoute(
-        (
-            ModelRouteCandidate(
-                provider_id=primary.provider_id,
-                profile=profile,
-                base_url=primary.base_url,
-                secret_reference=primary.secret_reference,
-                allowed_sensitivities=primary.allowed_sensitivities,
-            ),
-        ),
-        retry_policy=_ONE_ATTEMPT_RETRY_POLICY,
-    )
-    return (
-        create_model_route_provider(
-            direct_route,
-            secret_provider=secret_provider,
-        ),
-        profile,
-    )
 
 
 def _resolve_configuration(

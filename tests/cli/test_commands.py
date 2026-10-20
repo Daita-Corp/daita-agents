@@ -959,7 +959,10 @@ def test_cli_3_run_still_installs_no_approval_handler():
     proposed = "A one-shot run must not prompt or write."
     provider = MockModelProvider(
         (
-            _call("memory_set", {"target": "memory", "content": proposed}),
+            _call(
+                "memory_set",
+                {"target": "memory", "action": "add", "content": proposed},
+            ),
             _stop("approval remains required"),
         )
     )
@@ -1052,19 +1055,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
     )
 
     memory = _subcommands(commands["memory"])
-    assert set(memory) == {
-        "accept-candidate",
-        "clear-rejected",
-        "edit",
-        "edit-candidate",
-        "inspect",
-        "list-candidates",
-        "read",
-        "reject-candidate",
-        "review",
-        "set",
-        "show-candidate",
-    }
+    assert set(memory) == {"edit", "inspect", "read", "set"}
     assert _surface(memory["read"]) == (
         ("name",),
         frozenset({"-h", "--help", "--target"}),
@@ -1388,7 +1379,7 @@ def test_future_cli_4_direct_knowledge_commands_survive_reopen():
     assert inspect_code == 0
     assert inspect_stderr == ""
     assert _json_lines(inspect_stdout) == (
-        {"annotations": [], "candidates": [], "global_memory": memory_text},
+        {"annotations": [], "global_memory": memory_text},
     )
     assert memory == memory_text
     assert skill is not None

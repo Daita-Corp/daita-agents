@@ -8,10 +8,7 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static
 
-from ..models import (
-    DEFAULT_CANDIDATE_REVIEW_COST_LIMIT_USD,
-    parse_candidate_review_cost_limit,
-)
+from ..sanitization import sanitize_terminal_text
 
 
 class SkillNameScreen(ModalScreen[str | None]):
@@ -62,33 +59,39 @@ class SkillNameScreen(ModalScreen[str | None]):
         self.dismiss(name)
 
 
-class ReviewCostScreen(ModalScreen[str | None]):
+class ScheduleScreen(ModalScreen[str | None]):
+    """Ask when to repeat the latest answer; the agent proposes the routine."""
+
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
+    def __init__(self, *, question: str) -> None:
+        super().__init__()
+        self._question = question
+
     def compose(self) -> ComposeResult:
-        with Vertical(id="review-cost"):
-            yield Label(
-                "Authorize one learning review",
-                id="onboard-title",
+        with Vertical(id="editor-prompt"):
+            yield Label("Run this on a schedule", id="onboard-title", markup=False)
+            yield Static(
+                sanitize_terminal_text(
+                    self._question, maximum=512, preserve_lines=False, fallback=""
+                ),
+                id="schedule-question",
                 markup=False,
             )
             yield Static(
-                "This can make one model call and only adds suggestions to the "
-                "review inbox. Memory and skills change only after acceptance. "
-                "Provider charges can still apply.",
+                "Daita proposes a routine from this answer for your approval.",
                 markup=False,
             )
             yield Input(
-                value=str(DEFAULT_CANDIDATE_REVIEW_COST_LIMIT_USD),
-                placeholder="Maximum estimated cost in USD",
-                id="review-cost-value",
+                placeholder="every weekday at 9am",
+                id="schedule-when",
             )
-            yield Label("", id="review-cost-error", markup=False)
-            yield Button("Run review", id="review-cost-accept", variant="primary")
-            yield Button("Cancel", id="review-cost-cancel")
+            yield Label("", id="editor-prompt-error", markup=False)
+            yield Button("Continue", id="schedule-continue", variant="primary")
+            yield Button("Cancel", id="editor-prompt-cancel")
 
     def on_mount(self) -> None:
-        self.query_one("#review-cost-value", Input).focus()
+        self.query_one("#schedule-when", Input).focus()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -97,19 +100,17 @@ class ReviewCostScreen(ModalScreen[str | None]):
         self._submit()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "review-cost-cancel":
+        if event.button.id == "editor-prompt-cancel":
             self.dismiss(None)
             return
-        if event.button.id == "review-cost-accept":
+        if event.button.id == "schedule-continue":
             self._submit()
 
     def _submit(self) -> None:
-        value = self.query_one("#review-cost-value", Input).value.strip()
-        try:
-            parse_candidate_review_cost_limit(value)
-        except ValueError:
-            self.query_one("#review-cost-error", Label).update(
-                "Enter a finite non-negative USD amount."
+        when = self.query_one("#schedule-when", Input).value.strip()
+        if not when:
+            self.query_one("#editor-prompt-error", Label).update(
+                "Say when it should run."
             )
             return
-        self.dismiss(value)
+        self.dismiss(when)

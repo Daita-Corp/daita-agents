@@ -132,7 +132,8 @@ async def test_learning_tool_descriptions_route_documents_and_require_write_firs
         assert "MEMORY.md(target=memory)=schema-independent" in (memory_description)
         assert "SKILL.md=procedures" in memory_description
         assert "Text ends run: call first" in memory_description
-        assert "replace duplicates" in memory_description
+        assert "Replace instead of duplicating" in memory_description
+        assert "never resend the whole document" in memory_description
         assert "sole approval card" in memory_description
         assert "current_sha256" in skill_view_description
         assert "reusable validated steps with use, verification, and failure" in (

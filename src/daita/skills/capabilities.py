@@ -25,7 +25,6 @@ from ..capabilities import (
     ToolView,
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
-from ..domains.learning import LearningCandidateGuard
 from ..llm.models import ModelSensitivity, ToolCall
 from ..loop.models import RunInput, RunOrigin
 from ..loop.session import RunSession
@@ -385,7 +384,6 @@ class SkillCapabilityDomain:
     def __init__(
         self,
         declarations: CapabilityDeclarations,
-        learning: LearningCandidateGuard,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("skill declarations have the wrong domain owner")
@@ -396,7 +394,6 @@ class SkillCapabilityDomain:
         }:
             raise ValueError("skill domain requires its exact capabilities")
         self._declarations = declarations
-        self._learning = learning
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
 
@@ -409,18 +406,7 @@ class SkillCapabilityDomain:
         run: RunInput,
         session: RunSession | None = None,
     ) -> tuple[str, ...]:
-        return tuple(
-            view.name
-            for view in self._views
-            if self._learning.allows(
-                session,
-                view.name,
-                effectful=(
-                    self._capabilities[view.capability_id].operational_effect
-                    is not OperationalEffect.NONE
-                ),
-            )
-        )
+        return tuple(view.name for view in self._views)
 
     project_session = project
 
@@ -442,8 +428,6 @@ class SkillCapabilityDomain:
         session: RunSession | None = None,
     ) -> FrozenJsonObject:
         del request_sensitivity
-        if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.validate_effect(session, call, arguments)
         if capability.id == SKILL_VIEW_CAPABILITY_ID:
             name = arguments.get("name")
             try:
@@ -513,8 +497,6 @@ class SkillCapabilityDomain:
         request_sensitivity: ModelSensitivity,
         session: RunSession | None = None,
     ) -> ToolOutput:
-        if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.mark_effect_succeeded(session, call.id)
         if output.sensitivity is not None:
             return output
         return replace(

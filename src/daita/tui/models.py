@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
 from typing import Any
 
 from ..llm.provider_definitions import (
@@ -29,7 +28,6 @@ POSTGRESQL_CONNECTION_URL_ERROR = (
     "Enter a valid postgres:// or postgresql:// URL with a username, host, "
     "and database. Only the sslmode query parameter is supported."
 )
-DEFAULT_CANDIDATE_REVIEW_COST_LIMIT_USD = Decimal("0.05")
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,26 +357,6 @@ class TranscriptBlock:
 
 class UserInputError(ValueError):
     """Recoverable composer or command input that should not close the app."""
-
-
-def validate_candidate_review_cost_limit(value: Decimal | None) -> None:
-    if value is not None and (
-        not isinstance(value, Decimal) or not value.is_finite() or value < 0
-    ):
-        raise ValueError(
-            "candidate review cost ceiling must be finite and non-negative"
-        )
-
-
-def parse_candidate_review_cost_limit(value: str) -> Decimal:
-    try:
-        limit = Decimal(value)
-    except Exception:
-        raise ValueError(
-            "candidate review cost ceiling must be a finite non-negative decimal"
-        ) from None
-    validate_candidate_review_cost_limit(limit)
-    return limit
 
 
 def source_type_label(source_types: tuple[Any, ...], adapter_id: str) -> str:

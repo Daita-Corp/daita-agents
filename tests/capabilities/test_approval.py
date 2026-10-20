@@ -197,6 +197,7 @@ async def test_approval_executes_the_exact_frozen_invocation_once(
         assert requests[0].capability_id == MEMORY_SET_CAPABILITY_ID
         assert dict(requests[0].arguments) == {
             "target": "memory",
+            "action": "add",
             "content": content,
         }
         assert await agent.read_memory() == content
@@ -526,9 +527,9 @@ async def test_two_approved_replacements_are_sequential_and_keep_result_order(
             _memory_call("two", content="two"),
         )
         assert tuple(result.call_id for result in results) == ("one", "two")
-        assert executions == ["one", "two"]
+        assert executions == ["one", "one\ntwo"]
         assert maximum_active == 1
-        assert await agent.read_memory() == "two"
+        assert await agent.read_memory() == "one\ntwo"
     finally:
         await agent.close()
 

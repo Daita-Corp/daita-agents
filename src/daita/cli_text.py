@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import subprocess
@@ -10,14 +9,8 @@ import tempfile
 from pathlib import Path
 from typing import TextIO
 
-from daita import Agent, LearningCandidateStatus, LoopExit
+from daita import Agent, LoopExit
 from daita.artifacts.models import ArtifactDeliveryMode, ArtifactDeliveryOutcome
-from daita.learning_candidates import (
-    LearningCandidateView,
-    LearningReviewResult,
-    learning_candidate_content_from_mapping,
-    learning_candidate_content_to_mapping,
-)
 from daita.semantics import SemanticAnnotationState, SemanticAnnotationView
 
 from .tui.projection import artifact_delivery_messages
@@ -67,59 +60,6 @@ async def _write_artifact_outcomes(
         return
 
 
-def _write_learning_candidate_list(
-    views: tuple[LearningCandidateView, ...],
-    output_stream: TextIO,
-) -> None:
-    print("Learning candidates", file=output_stream)
-    if not views:
-        print("  (none)", file=output_stream)
-        return
-    for view in views:
-        print(
-            "  "
-            + safe_display(view.candidate.id, fallback="candidate")
-            + f" [{view.status.value}/{view.candidate.target.value}]",
-            file=output_stream,
-        )
-
-
-def _write_learning_candidate_view(
-    view: LearningCandidateView,
-    output_stream: TextIO,
-) -> None:
-    candidate = view.candidate
-    print(f"Learning candidate: {safe_display(candidate.id)}", file=output_stream)
-    print(f"Status: {view.status.value}", file=output_stream)
-    print(f"Target: {candidate.target.value}", file=output_stream)
-    content = learning_candidate_content_to_mapping(candidate.content)
-    print("Proposed content:", file=output_stream)
-    print(
-        safe_display(
-            json.dumps(content.to_dict(), indent=2, sort_keys=True),
-            fallback="(invalid)",
-            maximum=MAX_DISPLAY_CHARACTERS,
-        ),
-        file=output_stream,
-    )
-
-
-def _write_learning_review_result(
-    result: LearningReviewResult,
-    output_stream: TextIO,
-) -> None:
-    print("Learning review", file=output_stream)
-    print(f"  Status: {result.status.value}", file=output_stream)
-    print(f"  Reviewed runs: {len(result.reviewed_run_ids)}", file=output_stream)
-    print(f"  New candidates: {len(result.candidates)}", file=output_stream)
-    print(f"  Model calls: {result.model_calls}", file=output_stream)
-    if result.skipped_run_count:
-        print(
-            f"  Skipped unreadable runs: {result.skipped_run_count}",
-            file=output_stream,
-        )
-
-
 async def _write_memory_surface(
     agent: Agent,
     memory_text: str,
@@ -132,19 +72,6 @@ async def _write_memory_surface(
         safe_display(memory_text, fallback="(empty)", maximum=MAX_DISPLAY_CHARACTERS),
         file=output_stream,
     )
-    candidates = await agent.list_learning_candidates()
-    print(file=output_stream)
-    print("Pending candidates:", file=output_stream)
-    if not candidates:
-        print("  (none)", file=output_stream)
-    else:
-        for view in candidates[:12]:
-            print(
-                "  "
-                + safe_display(view.candidate.id, fallback="candidate")
-                + f" [{view.status.value}/{view.candidate.target.value}]",
-                file=output_stream,
-            )
     views = await agent.list_semantic_annotations()
     for heading, state in (
         ("Active data semantics", SemanticAnnotationState.ACTIVE),
@@ -236,22 +163,3 @@ def _edit_document(seed: str, *, agent_home: Path) -> str:
                 temporary_path.unlink()
             except FileNotFoundError:
                 pass
-
-
-async def _edit_learning_candidate(agent: Agent, candidate_id: str) -> None:
-    view = await agent.read_learning_candidate(candidate_id)
-    if view is None:
-        raise ValueError(f"learning candidate not found: {candidate_id}")
-    if view.status is not LearningCandidateStatus.AWAITING_REVIEW:
-        raise ValueError(f"learning candidate is not editable: {view.status.value}")
-    mapping = learning_candidate_content_to_mapping(view.candidate.content)
-    current = json.dumps(mapping.to_dict(), indent=2, sort_keys=True) + "\n"
-    edited = _edit_document(current, agent_home=agent.home)
-    try:
-        value = json.loads(edited)
-    except json.JSONDecodeError as error:
-        raise ValueError("edited candidate content must be valid JSON") from error
-    if not isinstance(value, dict):
-        raise ValueError("edited candidate content must be one JSON object")
-    content = learning_candidate_content_from_mapping(view.candidate.target, value)
-    await agent.edit_learning_candidate(candidate_id, content)

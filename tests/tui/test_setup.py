@@ -428,11 +428,11 @@ async def test_agent_home_is_available_without_model_source_or_catalog(tmp_path:
             await app._ensure_ready()
             await pilot.pause()
             assert isinstance(app.screen, ChatScreen)
-            notice = str(app.screen.query_one("#notice-bar", Static).content)
-            assert "no model · use /model" in notice
-            assert "Files:" not in notice
-            assert "Sources:" not in notice
-            assert "no source · use /source add" not in notice
+            # An empty chat carries setup in its checklist rather than a notice.
+            welcome = str(app.screen.query_one("#welcome", Static).content)
+            assert "○ Model choose one with /model" in welcome
+            assert "○ Data  connect with /sources" in welcome
+            assert not app.screen.query_one("#notice-bar", Static).display
             assert app.screen.query_one(Composer).disabled is False
             app.exit(0)
     finally:
@@ -1119,6 +1119,8 @@ async def test_postgresql_url_honors_an_explicit_ssl_selection(monkeypatch):
         setup = app.screen
         assert isinstance(setup, SourceSetupScreen)
         setup.query_one("#source-type", Select).value = "postgresql"
+        # The form shows PostgreSQL's fields once the type change settles.
+        await pilot.pause()
         setup.query_one("#source-path", Input).value = (
             "postgresql://postgres:fixture_admin_password@127.0.0.1:55432/"
             "daita_fixture"
@@ -1185,6 +1187,13 @@ async def test_postgresql_setup_probes_and_preselects_schemas_with_tables(monkey
         setup = app.screen
         assert isinstance(setup, SourceSetupScreen)
         setup.query_one("#source-type", Select).value = "postgresql"
+        await pilot.pause()
+        # Separate connection fields stay hidden until asked for.
+        assert setup.query_one("#pg-host", Input).display is False
+        assert await pilot.click("#pg-fields") is True
+        await pilot.pause()
+        assert setup.query_one("#pg-host", Input).display is True
+        assert setup.query_one("#source-path", Input).display is False
         setup.query_one("#pg-host", Input).value = "127.0.0.1"
         setup.query_one("#pg-database", Input).value = "fixture"
         setup.query_one("#pg-username", Input).value = "reader"

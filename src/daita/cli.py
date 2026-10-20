@@ -12,7 +12,6 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -31,9 +30,6 @@ from . import (
     EffectResolutionDecision,
     FolderSource,
     IntervalSchedule,
-    LearningCandidateRejectionReason,
-    LearningCandidateStatus,
-    LearningCandidateView,
     LocalFileAccess,
     LocalWorkspace,
     LoopLimits,
@@ -63,9 +59,6 @@ from .artifacts.models import (
     artifact_destination_to_mapping,
     artifact_ref_to_mapping,
 )
-from .cli_text import (
-    _edit_learning_candidate,
-)
 from .distribution import (
     ArtifactRequirement,
     OutcomeContract,
@@ -76,10 +69,6 @@ from .distribution import (
 from .errors import StateCompatibilityError
 from .jobs.graph.models import GraphInspection, GraphState, TaskState
 from .jobs.owner import GraphBlockerProjection
-from .learning_candidates import (
-    LEARNING_REVIEW_MAX_TOTAL_TOKENS,
-    learning_candidate_content_to_mapping,
-)
 from .llm import (
     ModelProfile,
     ModelSensitivity,
@@ -90,13 +79,9 @@ from .observation import summarize_diagnostics
 from .routines.capabilities import routine_inspection_projection, routine_projection
 from .security import SecretReference
 from .terminal import run_terminal_application
-from .tui.models import (
-    validate_candidate_review_cost_limit as _validate_candidate_review_cost_limit,
-)
 from .tui.projection import run_failure_notice, tool_outcome_summary
 from .work_board import work_board_projection
 
-_CANDIDATE_REVIEW_COST_LIMIT_ENV = "DAITA_CANDIDATE_REVIEW_MAX_COST_USD"
 _HOST_NOTICE = (
     "Host open for this command only. Saved assignments progress while a host is open; "
     "this command closes its host on exit. For continued execution, run "
@@ -262,49 +247,6 @@ def _effect_receipt_mapping(receipt: EffectReceipt) -> dict[str, object]:
             ),
         }
     ).to_dict()
-
-
-_CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS = LEARNING_REVIEW_MAX_TOTAL_TOKENS // 4
-
-
-def _candidate_reviewer_profile(profile: ModelProfile) -> ModelProfile:
-    """Project one explicit CLI model into the fixed review token budget."""
-
-    if not isinstance(profile, ModelProfile):
-        raise TypeError("candidate reviewer profile must be ModelProfile")
-    return replace(
-        profile,
-        max_output_tokens=min(
-            profile.max_output_tokens,
-            _CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS,
-        ),
-    )
-
-
-def _learning_candidate_mapping(
-    view: LearningCandidateView,
-    *,
-    include_content: bool = False,
-) -> dict[str, object]:
-    candidate = view.candidate
-    value: dict[str, object] = {
-        "id": candidate.id,
-        "target": candidate.target.value,
-        "status": view.status.value,
-        "source_ids": candidate.source_ids,
-        "supporting_run_ids": candidate.supporting_run_ids,
-        "obsolete_reasons": view.obsolete_reasons,
-        "rejection_reason": (
-            None
-            if candidate.rejection_reason is None
-            else candidate.rejection_reason.value
-        ),
-    }
-    if include_content:
-        value["content"] = learning_candidate_content_to_mapping(
-            candidate.content
-        ).to_dict()
-    return value
 
 
 def _mcp_authentication(
@@ -532,7 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
     conversation_clear.add_argument(
         "--yes",
         action="store_true",
-        help="confirm transcript and candidate-record deletion",
+        help="confirm transcript deletion",
     )
 
     artifacts = commands.add_parser("artifacts", help="save a known run artifact by ID")
@@ -756,43 +698,6 @@ def build_parser() -> argparse.ArgumentParser:
     memory_set.add_argument("name")
     memory_set.add_argument("--target", choices=("memory", "user"), required=True)
     memory_set.add_argument("--file", required=True)
-    memory_review = memory_commands.add_parser("review")
-    memory_review.add_argument("name")
-    memory_review.add_argument("--model", required=True, help="provider:model")
-    memory_review.add_argument(
-        "--cost-limit",
-        type=Decimal,
-        required=True,
-        help="maximum estimated USD cost for the one reviewer request",
-    )
-    memory_candidates = memory_commands.add_parser("list-candidates")
-    memory_candidates.add_argument("name")
-    memory_candidates.add_argument(
-        "--status",
-        choices=tuple(item.value for item in LearningCandidateStatus),
-    )
-    memory_show_candidate = memory_commands.add_parser("show-candidate")
-    memory_show_candidate.add_argument("name")
-    memory_show_candidate.add_argument("candidate_id")
-    memory_edit_candidate = memory_commands.add_parser("edit-candidate")
-    memory_edit_candidate.add_argument("name")
-    memory_edit_candidate.add_argument("candidate_id")
-    memory_accept_candidate = memory_commands.add_parser("accept-candidate")
-    memory_accept_candidate.add_argument("name")
-    memory_accept_candidate.add_argument("candidate_id")
-    memory_accept_candidate.add_argument(
-        "--model", required=True, help="provider:model"
-    )
-    memory_reject_candidate = memory_commands.add_parser("reject-candidate")
-    memory_reject_candidate.add_argument("name")
-    memory_reject_candidate.add_argument("candidate_id")
-    memory_reject_candidate.add_argument(
-        "--reason",
-        choices=tuple(item.value for item in LearningCandidateRejectionReason),
-        default=LearningCandidateRejectionReason.USER_DECLINED.value,
-    )
-    memory_clear_rejected = memory_commands.add_parser("clear-rejected")
-    memory_clear_rejected.add_argument("name")
 
     skills = commands.add_parser("skills", help="manage agent skills")
     skill_commands = skills.add_subparsers(dest="skills_command", required=True)
@@ -986,20 +891,6 @@ def _provider_profile(provider: ManagedModelProvider) -> ModelProfile:
     return profile
 
 
-def _reviewer_model_configuration(
-    model_id: str,
-) -> tuple[ManagedModelProvider, ModelProfile]:
-    """Construct one direct provider with the fixed candidate-review output bound."""
-
-    provider = create_llm_provider(
-        model_id,
-        max_output_tokens=_CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS,
-    )
-    profile = _provider_profile(provider)
-    reviewer_profile = _candidate_reviewer_profile(profile)
-    return provider, reviewer_profile
-
-
 async def _close_cli_resources(
     *,
     agent: Agent | None,
@@ -1021,20 +912,6 @@ async def _close_cli_resources(
                 first_error = error
     if first_error is not None:
         raise first_error
-
-
-def _candidate_review_cost_limit_from_environment() -> Decimal | None:
-    raw = os.environ.get(_CANDIDATE_REVIEW_COST_LIMIT_ENV)
-    if raw is None:
-        return None
-    try:
-        value = Decimal(raw)
-    except (InvalidOperation, ValueError):
-        raise ValueError(
-            f"{_CANDIDATE_REVIEW_COST_LIMIT_ENV} must be a finite non-negative decimal"
-        ) from None
-    _validate_candidate_review_cost_limit(value)
-    return value
 
 
 def _require_chat_terminal() -> None:
@@ -1845,7 +1722,6 @@ async def _execute(args: argparse.Namespace) -> object:
         finally:
             await agent.close()
     if args.command == "run":
-        _validate_candidate_review_cost_limit(args.max_cost_usd)
         if args.model is None and any(
             value is not None
             for value in (args.base_url, args.context_window, args.max_output)
@@ -1953,61 +1829,7 @@ async def _execute(args: argparse.Namespace) -> object:
             workspace=workspace,
             agent_name=args.name,
             conversation_id=args.conversation,
-            reviewer_max_estimated_cost_usd=(
-                _candidate_review_cost_limit_from_environment()
-            ),
         )
-    if args.command == "memory" and args.memory_command == "review":
-        _validate_candidate_review_cost_limit(args.cost_limit)
-        provider, profile = _reviewer_model_configuration(args.model)
-        review_agent: Agent | None = None
-        try:
-            review_agent = await Agent.open(
-                args.name,
-                workspace=workspace,
-                root=args.root,
-                reviewer_model=provider,
-                reviewer_profile=profile,
-                reviewer_max_estimated_cost_usd=args.cost_limit,
-            )
-            review_result = await review_agent.review_learning_candidates()
-            return {
-                "status": review_result.status.value,
-                "reviewed_run_ids": review_result.reviewed_run_ids,
-                "candidate_ids": tuple(
-                    item.candidate.id for item in review_result.candidates
-                ),
-                "model_calls": review_result.model_calls,
-                "skipped_run_count": review_result.skipped_run_count,
-                "duplicate_proposals_suppressed": (
-                    review_result.duplicate_proposals_suppressed
-                ),
-                "total_tokens": review_result.usage.total_tokens,
-            }
-        finally:
-            await _close_cli_resources(agent=review_agent, provider=provider)
-    if args.command == "memory" and args.memory_command == "accept-candidate":
-        provider, profile = _model_configuration(args.model)
-        accept_agent: Agent | None = None
-        try:
-            accept_agent = await Agent.open(
-                args.name,
-                workspace=workspace,
-                root=args.root,
-                model=provider,
-                model_profile=profile,
-                approval_handler=_prompt_for_exact_approval,
-            )
-            result = await accept_agent.accept_learning_candidate(args.candidate_id)
-            return {
-                "candidate_id": args.candidate_id,
-                "run_id": result.run_id,
-                "status": result.kind.value,
-                "reason": result.reason,
-                "text": result.final_text,
-            }
-        finally:
-            await _close_cli_resources(agent=accept_agent, provider=provider)
     agent = await Agent.open(
         args.name,
         workspace=workspace,
@@ -2149,10 +1971,6 @@ async def _execute(args: argparse.Namespace) -> object:
             if args.memory_command == "inspect":
                 return {
                     "global_memory": await agent.read_memory(),
-                    "candidates": [
-                        _learning_candidate_mapping(view)
-                        for view in await agent.list_learning_candidates()
-                    ],
                     "annotations": [
                         {
                             "id": view.annotation.id,
@@ -2171,38 +1989,6 @@ async def _execute(args: argparse.Namespace) -> object:
                         for view in await agent.list_semantic_annotations()
                     ],
                 }
-            if args.memory_command == "list-candidates":
-                candidate_status = (
-                    None
-                    if args.status is None
-                    else LearningCandidateStatus(args.status)
-                )
-                return [
-                    _learning_candidate_mapping(view)
-                    for view in await agent.list_learning_candidates(
-                        status=candidate_status
-                    )
-                ]
-            if args.memory_command == "show-candidate":
-                view = await agent.read_learning_candidate(args.candidate_id)
-                if view is None:
-                    raise ValueError(
-                        f"learning candidate not found: {args.candidate_id}"
-                    )
-                return _learning_candidate_mapping(view, include_content=True)
-            if args.memory_command == "edit-candidate":
-                await _edit_learning_candidate(agent, args.candidate_id)
-                view = await agent.read_learning_candidate(args.candidate_id)
-                assert view is not None
-                return _learning_candidate_mapping(view, include_content=True)
-            if args.memory_command == "reject-candidate":
-                view = await agent.reject_learning_candidate(
-                    args.candidate_id,
-                    LearningCandidateRejectionReason(args.reason),
-                )
-                return _learning_candidate_mapping(view)
-            if args.memory_command == "clear-rejected":
-                return {"cleared": await agent.clear_rejected_learning_candidates()}
             if args.memory_command == "edit":
                 await _edit_memory_target(agent, args.target)
                 return {"target": args.target, "updated": True}
@@ -2395,9 +2181,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     workspace=_resolve_cli_workspace(args),
                     agent_name=args.agent,
                     conversation_id=None,
-                    reviewer_max_estimated_cost_usd=(
-                        _candidate_review_cost_limit_from_environment()
-                    ),
                     input_stream=sys.stdin,
                     output_stream=sys.stdout,
                 )

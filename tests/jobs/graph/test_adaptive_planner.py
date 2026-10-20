@@ -44,7 +44,7 @@ from tests.support.model_graph_integration import (
     READ_CAPABILITY_ID,
     ModelGraphIntegration,
 )
-from tests.support.toolbox_model import RefCitingMockModelProvider, result_ref
+from tests.support.toolbox_model import PlannerFirstMockModelProvider, result_ref
 
 pytestmark = pytest.mark.integration
 
@@ -285,7 +285,7 @@ async def test_unexpected_discovery_replans_with_immutable_replacement(
             },
         ),
     )
-    provider = RefCitingMockModelProvider(
+    provider = PlannerFirstMockModelProvider(
         script,
         provider_id=MODEL_ROUTE_ID,
         complete_pricing=True,

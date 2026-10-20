@@ -132,8 +132,8 @@
         "affected_paths": [
           "state.db"
         ],
-        "checksum": "fb675270be548207199b3737d0c3f6c75e9b41e2ddc906ac674ec42f9d98b528",
-        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete.",
+        "checksum": "0b0775dd1335a7333cb5b449e70a3de707ad28ecc7a17b14c3cb2ed6473283f7",
+        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete. Retire inactive learning candidates and their review stamps; approved knowledge is unaffected.",
         "migration_id": "0004_foreground_analysis_evidence",
         "revision": 4
       }
@@ -402,9 +402,6 @@
         "required_target_count",
         "plan_digest"
       ],
-      "DocumentCandidateContent": [
-        "text"
-      ],
       "EffectReceipt": [
         "receipt_id",
         "receipt_kind",
@@ -632,35 +629,6 @@
         "created_at",
         "updated_at",
         "topology_digest"
-      ],
-      "LearningCandidate": [
-        "id",
-        "agent_id",
-        "target",
-        "content",
-        "source_ids",
-        "reviewed_runs",
-        "supporting_run_ids",
-        "review_fingerprint",
-        "artifact_state_sha256",
-        "catalog_revisions",
-        "candidate_fingerprint",
-        "status",
-        "created_at",
-        "updated_at",
-        "rejection_reason",
-        "candidate_identity_sha256",
-        "sensitivity"
-      ],
-      "LearningCandidateReviewStamp": [
-        "run_id",
-        "transcript_sha256",
-        "artifact_state_sha256",
-        "catalog_state_sha256"
-      ],
-      "LearningCandidateRunReference": [
-        "run_id",
-        "transcript_sha256"
       ],
       "LoopExit": [
         "run_id",
@@ -956,15 +924,6 @@
         "supersedes_id",
         "sensitivity"
       ],
-      "SemanticCandidateContent": [
-        "action",
-        "subject",
-        "kind",
-        "statement",
-        "catalog_revisions",
-        "annotation_id",
-        "supersedes_id"
-      ],
       "SemanticEvidence": [
         "kind",
         "run_id",
@@ -980,12 +939,6 @@
         "source_ids",
         "resource_ids",
         "fields"
-      ],
-      "SkillCandidateContent": [
-        "action",
-        "name",
-        "description",
-        "instructions"
       ],
       "SourceCatalogSnapshot": [
         "sync",
@@ -3619,29 +3572,6 @@
             0
           ]
         ],
-        "learning_candidates": [
-          [
-            "agent_id",
-            "TEXT",
-            1,
-            null,
-            1
-          ],
-          [
-            "id",
-            "TEXT",
-            1,
-            null,
-            2
-          ],
-          [
-            "data",
-            "TEXT",
-            1,
-            null,
-            0
-          ]
-        ],
         "mcp_server_bindings": [
           [
             "agent_id",
@@ -4123,7 +4053,7 @@
       }
     }
   },
-  "contract_sha256": "dc0ec492d101c1c9ca9636f256d33af9d5a2c3f0ee1dd99cfc08c0baede675e9",
+  "contract_sha256": "d01ed39a4c3a02a78e7789f8df3685ae400db09590eb9106dd06daa986649912",
   "home_revision": 4,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1

@@ -125,7 +125,7 @@ async def test_machine_origin_observations_do_not_project_into_foreground_chat(
             )
             assert transcript.is_empty
             assert "Hidden report draft" not in transcript.copy_text()
-            assert "ctx —" in str(context.content)
+            assert str(context.content) == ""
             assert chat.query_one(ActivityBar).display is False
 
             await app.on_observer_event(

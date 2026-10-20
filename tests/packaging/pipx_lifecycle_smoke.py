@@ -301,14 +301,6 @@ from daita import (
     SQLiteSource,
 )
 from daita.adapters.models import SourceRegistration
-from daita.learning_candidates import (
-    DocumentCandidateContent,
-    LearningCandidate,
-    LearningCandidateReviewStamp,
-    LearningCandidateRunReference,
-    LearningCandidateStatus,
-    LearningCandidateTarget,
-)
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -496,34 +488,6 @@ async def main():
     )
     await agent.save_semantic_annotation(annotation)
 
-    digest = "1" * 64
-    candidate = LearningCandidate(
-        id="upgrade-candidate",
-        agent_id=agent.id,
-        target=LearningCandidateTarget.MEMORY,
-        content=DocumentCandidateContent("Invoices use their booking date."),
-        source_ids=(),
-        reviewed_runs=(LearningCandidateRunReference(run.run_id, digest),),
-        supporting_run_ids=(run.run_id,),
-        review_fingerprint="2" * 64,
-        artifact_state_sha256="3" * 64,
-        catalog_revisions=(),
-        candidate_fingerprint="4" * 64,
-        status=LearningCandidateStatus.AWAITING_REVIEW,
-        created_at=datetime(2026, 7, 30, tzinfo=UTC),
-        updated_at=datetime(2026, 7, 30, tzinfo=UTC),
-    )
-    stamp = LearningCandidateReviewStamp(
-        run_id=run.run_id,
-        transcript_sha256=digest,
-        artifact_state_sha256="3" * 64,
-        catalog_state_sha256="5" * 64,
-    )
-    await agent._embedded._store.save_learning_candidate_review(
-        agent.id,
-        stamps=(stamp,),
-        candidates=(candidate,),
-    )
     expectations = {
         "agent_id": agent.id,
         "artifact_id": run.artifacts[0].artifact_id,
@@ -626,7 +590,6 @@ async def main():
     runs = await agent.conversation_runs(expected["conversation_id"])
     skill = await agent.read_skill("upgrade-check")
     semantics = await agent.list_semantic_annotations()
-    candidates = await agent.list_learning_candidates()
     artifact = await agent.read_artifact(expected["artifact_id"])
     export_destination = await agent.export_destination()
     receipt = await agent._embedded._store.load_effect_receipt(
@@ -653,7 +616,6 @@ async def main():
             "saved_path": delivery.saved_path,
             "sha256": delivery.sha256,
         },
-        "candidate_ids": [item.candidate.id for item in candidates],
         "catalog_relationship_count": summary.relationship_count,
         "catalog_resource_count": summary.resource_count,
         "conversation_run_ids": [item.transcript.run.id for item in runs],

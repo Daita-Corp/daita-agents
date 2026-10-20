@@ -677,7 +677,9 @@ async def test_batch_interruption_settles_dispatched_and_queued_children(
                 {
                     "code": code,
                     "expected_state": {"generation": 0, "revision": 0},
-                    "timeout_seconds": 0.25 if interruption == "timeout" else 30,
+                    # The cell budget also covers worker start and first dispatch,
+                    # so a tighter one can expire before the blocked read begins.
+                    "timeout_seconds": 2 if interruption == "timeout" else 30,
                 },
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="The cell stopped."),
@@ -875,7 +877,9 @@ async def test_batch_uses_distinct_source_lanes_and_rechecks_revoked_authority(
         "batch-authority",
         root=tmp_path,
         model=model,
-        model_profile=_profile(model),
+        # Two tool round trips with python_execute and the data tools loaded
+        # outgrow the shared 32k profile under the fail-closed char estimate.
+        model_profile=replace(_profile(model), context_window_tokens=40_000),
         workspace=workspace_for(tmp_path),
     )
     for index in range(2):

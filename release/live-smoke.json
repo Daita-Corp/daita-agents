@@ -1,5 +1,5 @@
 {
-  "surface_digest": "sha256:f02326da8db7f66df8acbc847f1f6efc07f53c81a174bc62b0322ec51d3b0977",
+  "surface_digest": "sha256:d4a3de81712484b34c54f86cf7ad77b8740e7058e385a353ae5136b40be8937d",
   "recorded_on": "2026-10-20",
   "cases": {
     "tests/live/acceptance/test_result_refs.py::test_l8_graph_task_complete_cites_its_read[0]": "passed",

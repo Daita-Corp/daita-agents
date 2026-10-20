@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
 from decimal import Decimal
-from typing import cast
+from typing import Any, cast
 
 from daita.capabilities import RESERVED_TOOL_NAMES
 from daita.llm.models import (
@@ -215,3 +216,29 @@ class RefCitingMockModelProvider(MockModelProvider):
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         return cite_result_refs(await super().generate(request), request)
+
+
+class PlannerFirstMockModelProvider(RefCitingMockModelProvider):
+    """Serve a replacement worker's turns only after the planner's final turn.
+
+    The script's last two turns belong to the replacement. A planner's supersede
+    makes that replacement ready while the planner still needs its closing turn,
+    so with parallel graph tasks either could otherwise take the next response.
+    """
+
+    def __init__(self, script: Iterable[ScriptItem], **kwargs: Any) -> None:
+        items = tuple(script)
+        super().__init__(items, **kwargs)
+        self._plan_end = len(items) - 2
+        self._plan_served = asyncio.Event()
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        planner = any(
+            tool.name == "graph_supersede_unstarted" for tool in request.tools
+        )
+        if not planner and 0 < self._cursor < self._plan_end:
+            await self._plan_served.wait()
+        response = await super().generate(request)
+        if self._cursor >= self._plan_end:
+            self._plan_served.set()
+        return response

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import sys
 import traceback
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -29,10 +28,12 @@ from .clipboard import deliver_clipboard
 from .commands import (
     SKILL_DESCRIPTION_PLACEHOLDER,
     SKILL_INSTRUCTIONS_PLACEHOLDER,
+    LearningInvocation,
     matching_completions,
     parse_skill_editor_document,
     render_skill_editor_document,
     source_override_completions,
+    suggested_questions,
 )
 from .controller import PresentationController
 from .models import (
@@ -42,7 +43,6 @@ from .models import (
     PickerOption,
     TranscriptBlock,
     UserInputError,
-    validate_candidate_review_cost_limit,
 )
 from .observer import ObserverEvent, RunObserver
 from .projection import CAPABILITY_LABELS, project_conversation
@@ -51,7 +51,8 @@ from .screens.artifacts import ArtifactsScreen
 from .screens.catalog import CatalogScreen, SourceManagerAction
 from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
-from .screens.editing import ReviewCostScreen, SkillNameScreen
+from .screens.editing import ScheduleScreen, SkillNameScreen
+from .screens.help import HelpScreen
 from .screens.jobs import JobsScreen
 from .screens.mcp import MCPManagementScreen, MCPSetupScreen
 from .screens.onboarding import (
@@ -71,6 +72,7 @@ from .widgets.composer import (
     ComposerLimitReached,
     ComposerSubmitted,
 )
+from .widgets.transcript import TranscriptView
 from .widgets.welcome import WelcomeView
 
 # ANSI defaults defer foreground, background, and opacity to the terminal.
@@ -130,7 +132,6 @@ class DaitaApp(App[int]):
         conversation_id: str | None = None,
         keychain: KeychainStore | None = None,
         model_validator: Any = None,
-        reviewer_max_estimated_cost_usd: Decimal | None = None,
         model: Any = None,
         model_profile: Any = None,
         start_bootstrap: bool = True,
@@ -138,13 +139,11 @@ class DaitaApp(App[int]):
         super().__init__(ansi_color=True)
         self.register_theme(DAITA_THEME)
         self.theme = DAITA_THEME.name
-        validate_candidate_review_cost_limit(reviewer_max_estimated_cost_usd)
         self.controller = PresentationController(
             root=root,
             workspace=workspace,
             keychain=keychain,
             model_validator=model_validator,
-            reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
         )
         self.controller.model = model
         self.controller.model_profile = model_profile
@@ -155,6 +154,7 @@ class DaitaApp(App[int]):
         self._foreground_run_id: str | None = None
         self._foreground_tools: dict[str, str] = {}
         self._pending_user_identity: str | None = None
+        self._pending_question: str | None = None
         self._partial_identity = "assistant.partial"
         self._partial_text = ""
         self._context_input_tokens: int | None = None
@@ -409,14 +409,35 @@ class DaitaApp(App[int]):
         chat = self.chat()
         if chat is None or self.controller.agent is None:
             return
-        setup_guidance: list[str] = []
         agent = self.controller.require_agent()
-        if agent.model_profile is None:
-            setup_guidance.append("no model · use /model")
         sources = tuple(
             source for source in await self.controller.list_sources() if source.active
         )
-        if sources and (await self.controller.catalog_summary()).is_empty:
+        catalog_empty = (
+            bool(sources) and (await self.controller.catalog_summary()).is_empty
+        )
+        resources = (
+            await self.controller.list_catalog_resources()
+            if sources and not catalog_empty
+            else ()
+        )
+        chat.set_welcome(
+            model=(
+                None if agent.model_profile is None else self.controller.model_label()
+            ),
+            sources=len(sources),
+            catalog_empty=catalog_empty,
+            suggestions=suggested_questions(
+                tuple(resource.name for resource in resources[:2])
+            ),
+        )
+        # The empty chat shows the checklist; a resumed conversation needs a notice.
+        if chat.query_one(TranscriptView).is_empty:
+            return
+        setup_guidance: list[str] = []
+        if agent.model_profile is None:
+            setup_guidance.append("no model · use /model")
+        if catalog_empty:
             setup_guidance.append(
                 "catalog has 0 resources · open /sources and choose Edit"
             )
@@ -430,6 +451,7 @@ class DaitaApp(App[int]):
         await self.push_screen(ChatScreen())
         await self._replace_conversation_transcript()
         await self._refresh_status()
+        await self._show_home_guidance()
         await self.refresh_background_status(notify_new=False)
 
     def _reset_background_status(self) -> None:
@@ -481,7 +503,9 @@ class DaitaApp(App[int]):
                 try:
                     sources = await self.controller.list_sources()
                     self._source_count = sum(item.active for item in sources)
-                    screen.query_one(CommandSections).update_sources(sources)
+                    screen.query_one(CommandSections).update_sources(
+                        sources, self.controller.source_types()
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -721,6 +745,7 @@ class DaitaApp(App[int]):
                 message,
                 files_only=True,
                 display=text,
+                question=message,
             )
             return
         if text.startswith("/"):
@@ -731,7 +756,7 @@ class DaitaApp(App[int]):
         except UserInputError as error:
             screen.show_notice(str(error))
             return
-        await self._start_run(message, source_id=source_id, display=text)
+        await self._start_run(message, source_id=source_id, display=text, question=text)
 
     async def _handle_command(self, command: str) -> None:
         screen = self.chat()
@@ -755,6 +780,7 @@ class DaitaApp(App[int]):
             screen.show_notice(str(error))
             return
         if self.controller.conversation_id != prior_conversation_id:
+            screen.show_next_steps(False)
             self._reset_context_usage()
             await self._replace_conversation_transcript()
             await self._refresh_status()
@@ -811,6 +837,16 @@ class DaitaApp(App[int]):
         payload: dict[str, Any],
         message: str = "",
     ) -> None:
+        if screen_name == "help":
+            await self._await_modal(HelpScreen())
+            return
+        if screen_name == "schedule_prompt":
+            when = await self._await_modal(
+                ScheduleScreen(question=str(payload.get("question", "")))
+            )
+            if when is not None:
+                await self._handle_command(f"/schedule {when}")
+            return
         if screen_name == "source_setup":
             await self._await_modal(SourceSetupScreen())
             await self._refresh_status()
@@ -899,12 +935,6 @@ class DaitaApp(App[int]):
             return
         if screen_name == "edit_user":
             await self._edit_memory_target("user")
-            return
-        if screen_name == "edit_candidate":
-            await self._edit_candidate(str(payload.get("candidate_id", "")))
-            return
-        if screen_name == "review_cost":
-            await self._review_with_cost()
             return
         if screen_name == "confirm_clear_conversations":
             accepted = await self._await_modal(ConfirmScreen(message))
@@ -1222,29 +1252,6 @@ class DaitaApp(App[int]):
                 chat.show_notice(f"Skill {name!r} created. Invoke it with /{name}.")
             return
 
-    async def _edit_candidate(self, candidate_id: str) -> None:
-        document = await self.controller.candidate_editor_document(candidate_id)
-        edited = self._edit_document(document)
-        await self.controller.save_candidate_document(candidate_id, edited)
-        chat = self.chat()
-        if chat is not None:
-            chat.show_notice(f"Learning candidate {candidate_id!r} updated.")
-
-    async def _review_with_cost(self) -> None:
-        value = await self._await_modal(ReviewCostScreen())
-        if value is None:
-            return
-        outcome = await self.controller.review_candidates(value)
-        chat = self.chat()
-        if chat is not None:
-            chat.append_block(
-                TranscriptBlock(
-                    "notice",
-                    f"review-{id(outcome)}",
-                    outcome.message,
-                )
-            )
-
     async def _start_run(
         self,
         message: str,
@@ -1252,12 +1259,17 @@ class DaitaApp(App[int]):
         source_id: str | None = None,
         files_only: bool = False,
         display: str | None = None,
+        question: str | None = None,
     ) -> None:
+        """Start one foreground run; ``question`` marks an answer to act on."""
+
         if self._run_task is not None and not self._run_task.done():
             return
         screen = self.chat()
         if screen is None:
             return
+        screen.show_next_steps(False)
+        self._pending_question = question
         pending_user_identity = f"user-{id(message)}"
         self._pending_user_identity = pending_user_identity
         screen.append_block(
@@ -1299,13 +1311,25 @@ class DaitaApp(App[int]):
     ) -> None:
         agent = self.controller.require_agent()
         try:
-            result = await agent.run(
-                message,
-                conversation_id=self.controller.conversation_id,
-                source_scope_ids=(() if source_id is None else (source_id,)),
-                files_only=files_only,
+            scope = () if source_id is None else (source_id,)
+            # /learn needs the explicit-learning run so semantic_save is offered.
+            result = await (
+                agent.learn(
+                    message,
+                    conversation_id=self.controller.conversation_id,
+                    source_scope_ids=scope,
+                )
+                if isinstance(message, LearningInvocation)
+                else agent.run(
+                    message,
+                    conversation_id=self.controller.conversation_id,
+                    source_scope_ids=scope,
+                    files_only=files_only,
+                )
             )
-            await self._settle_result(result)
+            await self._settle_result(
+                result, learning=isinstance(message, LearningInvocation)
+            )
         except asyncio.CancelledError:
             screen = self.chat()
             if screen is not None:
@@ -1344,12 +1368,22 @@ class DaitaApp(App[int]):
         if error is not None and not isinstance(error, asyncio.CancelledError):
             return
 
-    async def _settle_result(self, result: LoopExit) -> None:
+    async def _settle_result(self, result: LoopExit, *, learning: bool = False) -> None:
         self.controller.conversation_id = result.conversation_id
         self._context_conversation_id = result.conversation_id
+        question, self._pending_question = self._pending_question, None
+        if result.kind is LoopExitKind.COMPLETED and question is not None:
+            self.controller.last_answer = (
+                result.conversation_id,
+                result.run_id,
+                question,
+            )
         screen = self.chat()
         if screen is None:
             return
+        screen.show_next_steps(
+            result.kind is LoopExitKind.COMPLETED and question is not None
+        )
         screen.remove_block(self._partial_identity)
         if self._pending_user_identity is not None:
             screen.remove_block(self._pending_user_identity)
@@ -1363,6 +1397,15 @@ class DaitaApp(App[int]):
             screen.append_block(
                 TranscriptBlock(
                     "notice", f"artifact-{result.run_id}-{id(notice)}", notice
+                )
+            )
+        if learning and not await self.controller.learning_saved(result.run_id):
+            screen.append_block(
+                TranscriptBlock(
+                    "notice",
+                    f"learning-{result.run_id}",
+                    "Nothing was saved. Daita keeps what you teach only after "
+                    "you approve a change.",
                 )
             )
         summary = await self.controller.require_agent().analysis_usage(result.run_id)
@@ -1459,6 +1502,9 @@ class DaitaApp(App[int]):
             call_id = event.data.get("call_id")
             if isinstance(call_id, str):
                 self._foreground_tools[call_id] = activity
+                screen.step_started(
+                    call_id, CAPABILITY_LABELS.get(tool_name, tool_name)
+                )
             screen.set_activity(activity)
             await self._refresh_status(running=True, state=activity.casefold())
             return
@@ -1466,6 +1512,11 @@ class DaitaApp(App[int]):
             call_id = event.data.get("call_id")
             if isinstance(call_id, str):
                 self._foreground_tools.pop(call_id, None)
+                screen.step_finished(
+                    call_id,
+                    success=event.data.get("success") is not False,
+                    duration_ms=event.data.get("duration_ms"),
+                )
             screen.set_activity(
                 next(reversed(self._foreground_tools.values()))
                 if self._foreground_tools
@@ -1551,7 +1602,6 @@ async def run_daita_app(
     conversation_id: str | None = None,
     keychain: KeychainStore | None = None,
     model_validator: Any = None,
-    reviewer_max_estimated_cost_usd: Decimal | None = None,
 ) -> int:
     app = DaitaApp(
         root=root,
@@ -1560,7 +1610,6 @@ async def run_daita_app(
         conversation_id=conversation_id,
         keychain=keychain,
         model_validator=model_validator,
-        reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
     )
     result = await app.run_async()
     if app._startup_error is not None:

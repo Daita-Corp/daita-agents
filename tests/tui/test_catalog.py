@@ -496,8 +496,11 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
                     ):
                         break
                 assert isinstance(app.screen, CatalogScreen)
-                assert await pilot.click("FooterKey") is True
-                await pilot.pause()
+                # The footer can rebuild its keys between lookup and click, so
+                # pilot.click's widget-identity result is unreliable; assert
+                # the outcome instead.
+                await pilot.click("FooterKey")
+                await settle_until(pilot, lambda: isinstance(app.screen, ChatScreen))
                 assert isinstance(app.screen, ChatScreen)
 
                 composer = app.screen.query_one(Composer)

@@ -46,7 +46,6 @@ from daita.domains.data import (
     source_file_capability_declarations,
 )
 from daita.domains.data.routine_precheck import ResourceRevisionCatalog
-from daita.domains.learning import LearningCandidateGuard
 from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import RunInput
 
@@ -331,7 +330,6 @@ def _domain(catalog: _Catalog, *, source_files: bool = False) -> DataCapabilityD
             ),
         ),
         cast(DataDomainCatalog, catalog),
-        LearningCandidateGuard(),
         SourceTypeRegistry(),
         source_files_available=source_files,
         path_query_available=source_files,

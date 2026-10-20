@@ -50,6 +50,7 @@ async def test_model_retained_advice_keeps_full_request_floor_across_reopen(
             "memory_set",
             {
                 "target": "memory",
+                "action": "add",
                 "content": "Use the confidential accounting convention.",
             },
         )

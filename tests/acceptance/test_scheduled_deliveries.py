@@ -81,6 +81,7 @@ from daita.llm.pricing import CostEstimate
 from daita.routines import RoutineOccurrenceDisposition
 from daita.routines.owner import RoutineError
 from daita.storage.home_migrations import CURRENT_HOME_REVISION
+from tests.support.home_revisions import undo_revision_4_schema
 from tests.support.mcp import (
     MCPConformanceTransport,
     MCPFixtureIdentity,
@@ -358,8 +359,7 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
                         row_key,
                     ),
                 )
-        connection.execute("DROP TABLE analysis_evidence")
-        connection.execute("DROP TABLE catalog_links")
+        undo_revision_4_schema(connection)
         connection.execute("DROP TABLE artifacts")
         connection.execute("DELETE FROM agent_home_migrations WHERE revision >= 3")
     legacy = await Agent.inspect_home("d2-sqlite-csv", root=tmp_path)

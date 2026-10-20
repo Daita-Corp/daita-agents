@@ -143,7 +143,6 @@ def test_ratified_graph_target_has_one_execution_path_and_closed_model_origins()
     host_origins = _files_with_method_call(PACKAGE, "generate") - provider_internals
     assert host_origins == {
         "hosting/configuration.py",
-        "learning_candidates.py",
         "loop/driver.py",
     }
 
@@ -162,14 +161,6 @@ def test_all_current_model_origins_use_admission_and_run_sessions():
     assert "RunSession(" in supervisor
     assert "RunSessionWriter(" in supervisor
     assert "return await self._run(" in _function_text(embedded_path, "learn")
-    assert "return await self._run(" in _function_text(
-        embedded_path, "accept_learning_candidate"
-    ) or "result = await self._run(" in _function_text(
-        embedded_path, "accept_learning_candidate"
-    )
-    assert "admit_execution" in _function_text(
-        embedded_path, "review_learning_candidates"
-    )
     assert "_admit_owned_system_work" in _function_text(
         embedded_path, "configure_model"
     )
@@ -184,7 +175,6 @@ def test_all_current_model_origins_use_admission_and_run_sessions():
 def test_cutover_removed_global_run_state_and_registered_only_revision_two():
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     context = (PACKAGE / "context.py").read_text(encoding="utf-8")
-    learning = (PACKAGE / "domains" / "learning.py").read_text(encoding="utf-8")
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
     profiles = (PACKAGE / "domains" / "data" / "profile_jobs.py").read_text(
         encoding="utf-8"
@@ -213,8 +203,6 @@ def test_cutover_removed_global_run_state_and_registered_only_revision_two():
     assert daita.HostCapacityLimits().foreground_provider_reserve == 1
     assert "_files_only_runs" not in _python_text(PACKAGE)
     assert "_selected_learning_candidates" not in context
-    assert "self._selected" not in learning
-    assert "self._successful" not in learning
     assert "_explicit_learning_runs" not in semantics
     assert "_selected_profiles" not in profiles
     assert "_scheduled_bindings" not in skills
@@ -689,7 +677,6 @@ def test_public_surface_is_focused():
         "ConversationInboxTarget",
         "ConversationRun",
         "CatalogSummary",
-        "DocumentCandidateContent",
         "Delivery",
         "DeliveryInspection",
         "DeliverySubjectKind",
@@ -698,15 +685,6 @@ def test_public_surface_is_focused():
         "DistributionDestination",
         "DistributionPlan",
         "DistributionTargetBinding",
-        "LearningCandidate",
-        "LearningCandidateAction",
-        "LearningCandidateError",
-        "LearningCandidateRejectionReason",
-        "LearningCandidateStatus",
-        "LearningCandidateTarget",
-        "LearningCandidateView",
-        "LearningReviewResult",
-        "LearningReviewStatus",
         "GraphInspection",
         "GraphJob",
         "GraphState",
@@ -768,9 +746,7 @@ def test_public_surface_is_focused():
         "SemanticKind",
         "SemanticSubject",
         "SemanticValidationError",
-        "SemanticCandidateContent",
         "Skill",
-        "SkillCandidateContent",
         "SkillSummary",
         "ScheduledRoutineDraft",
         "RequestedCapabilityGrant",
@@ -788,7 +764,7 @@ def test_public_surface_is_focused():
     }
 
 
-def test_confirmed_dead_error_and_learning_candidate_apis_do_not_return():
+def test_confirmed_dead_error_apis_do_not_return():
     errors_tree = ast.parse((PACKAGE / "errors.py").read_text(encoding="utf-8"))
     error_classes = {
         node.name for node in errors_tree.body if isinstance(node, ast.ClassDef)
@@ -817,15 +793,6 @@ def test_confirmed_dead_error_and_learning_candidate_apis_do_not_return():
         "is_permanent",
     }.isdisjoint(daita_error_methods)
 
-    learning_tree = ast.parse(
-        (PACKAGE / "learning_candidates.py").read_text(encoding="utf-8")
-    )
-    learning_functions = {
-        node.name
-        for node in learning_tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    assert "candidate_matches_successful_mutation" not in learning_functions
     assert {
         "SkillError",
         "RetryableError",
@@ -982,9 +949,11 @@ def test_deleted_lifecycle_systems_remain_absent():
         "approvals.py",
         "governance.py",
         "learning.py",
+        "learning_candidates.py",
         "sessions.py",
     ):
         assert not (PACKAGE / module_name).exists()
+    assert not (PACKAGE / "domains" / "learning.py").exists()
 
 
 # Files that may name a built-in source type literally. Everywhere else dispatches
@@ -1197,7 +1166,7 @@ def test_semantics_use_existing_storage_context_and_runtime_owners():
         encoding="utf-8"
     )
     controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
-    assert "/memory [list|show <id>|edit [id]|accept <id>|" in controller
+    assert "/memory [show <semantic-id>|edit|delete <semantic-id>]" in controller
     assert "/knowledge" not in _python_text(PACKAGE)
 
     expected = {
@@ -1281,10 +1250,8 @@ def test_semantic_maintenance_is_read_time_and_evaluation_is_caller_owned():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
     context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
-    learning = (PACKAGE / "domains" / "learning.py").read_text(encoding="utf-8")
     storage = (PACKAGE / "storage" / "sql.py").read_text(encoding="utf-8")
     evaluation = (PACKAGE / "evaluation.py").read_text(encoding="utf-8")
-    candidates = (PACKAGE / "learning_candidates.py").read_text(encoding="utf-8")
     package_text = _python_text(PACKAGE)
 
     assert _class_owners("AgentLoop") == {"loop/driver.py"}
@@ -1300,7 +1267,6 @@ def test_semantic_maintenance_is_read_time_and_evaluation_is_caller_owned():
     session = (PACKAGE / "loop" / "session.py").read_text(encoding="utf-8")
     assert "explicit_learning" in session
     assert "_maintenance_requested" in semantics
-    assert "class LearningCandidateGuard" in learning
     for capability_id in (
         "semantics.list",
         "semantics.view",
@@ -1309,11 +1275,7 @@ def test_semantic_maintenance_is_read_time_and_evaluation_is_caller_owned():
     ):
         assert capability_id not in runtime
     assert "semantic_annotations" in storage
-    assert "learning_candidates" in CURRENT_SCHEMA.tables
-    assert "tools=()" in candidates
-    assert "AgentLoop" not in candidates
-    assert "CapabilityRuntime" not in candidates
-    assert "data_query" not in candidates
+    assert "learning_candidates" not in CURRENT_SCHEMA.tables
     assert "evaluation" not in storage.lower()
     assert "telemetry" not in storage.lower()
     assert "from .storage" not in evaluation
@@ -2708,8 +2670,6 @@ _RAW_TOOL_CALL_OWNERS = (
     "storage/sqlite_codecs/",
     "storage/home_migrations/",
 )
-# Functions that serialize messages already derived from executed records.
-_EXECUTED_MESSAGE_SERIALIZERS = {("learning_candidates.py", "_message_mapping")}
 _CALL_IDENTITY_ATTRIBUTES = {"id", "name"}
 
 
@@ -2726,13 +2686,6 @@ def _raw_tool_call_reads(relative: str, tree: ast.Module) -> list[str]:
     for node in ast.walk(tree):
         for child in ast.iter_child_nodes(node):
             parents[child] = node
-
-    def enclosing_function(node: ast.AST) -> str | None:
-        while node in parents:
-            node = parents[node]
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                return node.name
-        return None
 
     def is_raw(node: ast.AST) -> bool:
         return isinstance(node, ast.Attribute) and node.attr in {
@@ -2773,8 +2726,6 @@ def _raw_tool_call_reads(relative: str, tree: ast.Module) -> list[str]:
 
     found: list[str] = []
     for node in ast.walk(tree):
-        if (relative, enclosing_function(node)) in _EXECUTED_MESSAGE_SERIALIZERS:
-            continue
         loops: list[tuple[ast.AST, ast.AST, list[ast.AST]]] = []
         if isinstance(node, (ast.For, ast.AsyncFor)):
             loops.append((node.target, node.iter, [*node.body, *node.orelse]))

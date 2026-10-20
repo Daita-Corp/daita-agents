@@ -136,16 +136,6 @@ async def test_clear_conversations_removes_transcript_derived_state_only(
         )
         result = await agent.run("Remember this transcript only.")
         state_path = agent.home / "state.db"
-        with sqlite3.connect(state_path) as connection:
-            connection.execute(
-                """INSERT INTO learning_candidates(agent_id, id, data)
-                   VALUES (?, ?, ?)""",
-                (agent.id, "candidate-sensitive", "sensitive candidate"),
-            )
-            connection.execute(
-                "INSERT INTO metadata(key, data) VALUES (?, ?)",
-                (f"learning_review_stamps:{agent.id}", "sensitive stamps"),
-            )
 
         assert await agent.clear_conversations() == 1
         assert not await agent.conversation_exists(result.conversation_id)
@@ -162,12 +152,6 @@ async def test_clear_conversations_removes_transcript_derived_state_only(
             assert connection.execute("SELECT COUNT(*) FROM messages").fetchone() == (
                 0,
             )
-            assert connection.execute(
-                "SELECT COUNT(*) FROM learning_candidates"
-            ).fetchone() == (0,)
-            assert connection.execute(
-                "SELECT COUNT(*) FROM metadata WHERE key LIKE 'learning_review_stamps:%'"
-            ).fetchone() == (0,)
     finally:
         await agent.close()
 

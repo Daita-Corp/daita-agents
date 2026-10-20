@@ -17,7 +17,6 @@ from daita.catalog.models import (
     SourceCatalogSnapshot,
     catalog_resource_id,
 )
-from daita.learning_candidates import LearningCandidateRejectionReason
 from daita.semantics import (
     ResourceRevisionBinding,
     SemanticAnnotation,
@@ -30,7 +29,6 @@ from daita.semantics import (
 )
 from daita.storage.sqlite_codecs.mcp_bindings import decode_mcp_binding
 from daita.storage.sqlite_records import SourceReadScope
-from tests.learning._candidate_support import _stored_candidate
 from tests.support.graph import GRAPH_NOW
 from tests.support.paths import REPO_ROOT
 
@@ -103,8 +101,7 @@ async def test_catalog_reopen_edit_and_detach_preserve_permission_authority(
         assert await reopened.list_current_snapshot_refs("agent-1", ()) == refs
 
 
-async def test_advisory_cas_and_review_stamps_survive_reopen(state_store_factory):
-    candidate, stamp = _stored_candidate(0, agent_id="agent-1")
+async def test_advisory_cas_survives_reopen(state_store_factory):
     annotation = SemanticAnnotation(
         id="meaning",
         agent_id="agent-1",
@@ -122,15 +119,8 @@ async def test_advisory_cas_and_review_stamps_survive_reopen(state_store_factory
         confirmed_by="local-user",
     )
     async with state_store_factory() as store:
-        assert await store.save_learning_candidate_review(
-            "agent-1", stamps=(stamp,), candidates=(candidate,)
-        ) == (candidate,)
         assert await store.save_semantic_annotation("agent-1", annotation)
     async with state_store_factory() as reopened:
-        assert await reopened.learning_candidate_review_stamps("agent-1") == (stamp,)
-        assert (
-            await reopened.load_learning_candidate("agent-1", candidate.id) == candidate
-        )
         assert (
             await reopened.load_semantic_annotation("agent-1", annotation.id)
             == annotation
@@ -146,15 +136,6 @@ async def test_advisory_cas_and_review_stamps_survive_reopen(state_store_factory
         assert (
             await reopened.load_semantic_annotation("agent-1", annotation.id) == updated
         )
-        await reopened.reject_learning_candidate(
-            "agent-1",
-            candidate.id,
-            expected_fingerprint=candidate.candidate_fingerprint,
-            reason=LearningCandidateRejectionReason.USER_DECLINED,
-            rejected_at=GRAPH_NOW,
-        )
-        assert await reopened.clear_rejected_learning_candidates("agent-1") == 1
-        assert await reopened.list_learning_candidates("agent-1") == ()
 
 
 async def test_released_connector_binding_reopens_and_rejects_stale_revision(
