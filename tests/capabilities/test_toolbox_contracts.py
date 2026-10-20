@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from daita.capabilities import CallTargetLane
+from daita.adapters.analytical_workspace.runtime import runtime_status
 from tests.capabilities._toolbox_support import (
     NOW,
     TOOLBOX_DEFINITIONS,
@@ -271,6 +271,12 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
                 ("rows", "data.query"),
                 ("csv", "data.export_tabular"),
                 ("xlsx", "data.export_tabular"),
+                # Arrow export is admitted only where the analysis runtime is.
+                *(
+                    (("arrow", "data.export_tabular"),)
+                    if runtime_status()["available"] is True
+                    else ()
+                ),
                 ("inputs", "data.query_combined"),
                 ("path_pattern", "data.query_files"),
             ),
@@ -309,14 +315,9 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             "semantic_view",
             "skill_save",
         ):
-            assert (
-                len(
-                    registry.tool_definition(
-                        name, lane=CallTargetLane.FOREGROUND
-                    ).description.encode()
-                )
-                <= 600
-            )
+            # The budget covers the base description; route notes for admitted
+            # data_query routes (inputs, path_pattern) are appended per run.
+            assert len(registry.resolve_tool(name)[0].description.encode()) <= 600
     finally:
         await agent.close()
 
