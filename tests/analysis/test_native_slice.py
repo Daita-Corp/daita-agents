@@ -875,7 +875,9 @@ async def test_batch_uses_distinct_source_lanes_and_rechecks_revoked_authority(
         "batch-authority",
         root=tmp_path,
         model=model,
-        model_profile=_profile(model),
+        # Two tool round trips with python_execute and the data tools loaded
+        # outgrow the shared 32k profile under the fail-closed char estimate.
+        model_profile=replace(_profile(model), context_window_tokens=40_000),
         workspace=workspace_for(tmp_path),
     )
     for index in range(2):
