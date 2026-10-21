@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 
 import pytest
 
@@ -17,7 +18,7 @@ from tests.support.approval_learning import (
     _memory_call,
     _stop,
 )
-from tests.support.graph import graph_admission
+from tests.support.graph import GRAPH_NOW, graph_admission
 from tests.support.host import (
     error_code,
     finished_run,
@@ -108,7 +109,9 @@ async def test_startup_opens_only_agents_with_background_work(
     finally:
         await store.close()
 
-    harness = await start_host(root=root)
+    # Inside the job's one-hour deadline, so the supervisor never expires it.
+    clock = GRAPH_NOW + timedelta(minutes=10)
+    harness = await start_host(root=root, agent_options={"clock": lambda: clock})
 
     assert harness.host.registry.open_names() == ("busy",)
 

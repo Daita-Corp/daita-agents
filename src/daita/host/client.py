@@ -143,6 +143,9 @@ class HostClient:
         self.paths = paths
         self._http = httpx.AsyncClient(
             transport=httpx.AsyncHTTPTransport(uds=os.fspath(paths.socket)),
+            # A fresh local connection per request, so a dropped or restarted
+            # host never leaves a dead pooled connection for the next call.
+            limits=httpx.Limits(max_keepalive_connections=0),
             base_url="http://daita-host",
             headers={
                 PROTOCOL_HEADER: str(PROTOCOL_VERSION),
@@ -572,13 +575,20 @@ class RemoteAgent:
         raise asyncio.CancelledError
 
     async def _finished(self, ref: str) -> dict[str, Any]:
+        import httpx
+
         wake = self._runs[ref] = asyncio.Event()
         try:
             while True:
                 wake.clear()
                 # A new host never knows this run, so a vanished host is final.
                 path = f"/runs/{_segment(ref)}"
-                view = decode(await self._request("GET", path, start=False))
+                try:
+                    view = decode(await self._request("GET", path, start=False))
+                except httpx.TransportError:
+                    # Dropped mid-request; the stream's replay or failure wakes us.
+                    await wake.wait()
+                    continue
                 if view["state"] not in ACTIVE_STATES:
                     return typing.cast(dict[str, Any], view)
                 await wake.wait()

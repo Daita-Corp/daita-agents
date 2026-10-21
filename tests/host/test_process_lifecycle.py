@@ -16,6 +16,8 @@ import pytest
 
 import daita
 from daita import Agent, LocalFileAccess, LocalWorkspace
+from daita.capabilities import ApprovalDecision, ApprovalRequest
+from daita.host import HostUnavailableError
 from daita.host.codec import decode
 from daita.host.paths import HostPaths, host_paths
 from daita.host.supervise import host_status, request, stop_host
@@ -181,3 +183,45 @@ async def test_connect_starts_a_host_when_none_runs(paths: HostPaths) -> None:
     assert status["agents"] == ("sales",)
     # Closing the client leaves the agent open in the host.
     assert (await asyncio.to_thread(host_status, paths) or {})["agents"] == ("sales",)
+
+
+async def test_a_run_whose_host_vanishes_fails_without_starting_another(
+    paths: HostPaths,
+) -> None:
+    host = subprocess.Popen(
+        [sys.executable, "-c", _SCRIPTED_HOST, str(paths.root)],
+        cwd=REPOSITORY,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    asked = asyncio.Event()
+
+    async def hold(request: ApprovalRequest) -> ApprovalDecision:
+        asked.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    try:
+        await asyncio.to_thread(_wait, lambda: host_status(paths))
+        request(paths, "POST", "/v1/agents", body={"name": "sales"})
+        agent = await daita.connect(
+            "sales", cwd=work_folder(paths.root), root=paths.root, approval_handler=hold
+        )
+        try:
+            run = asyncio.create_task(agent.run("Remember this."))
+            await asyncio.wait_for(asked.wait(), 20)
+            host.send_signal(signal.SIGKILL)
+            await asyncio.to_thread(host.wait, 20)
+            with pytest.raises(HostUnavailableError):
+                await asyncio.wait_for(run, 20)
+            # The wait reported the loss instead of starting a host that never
+            # knew the run.
+            assert host_status(paths) is None
+        finally:
+            await agent.close()
+    finally:
+        if host.poll() is None:
+            host.kill()
+            host.wait(timeout=20)
+    # kill -9 leaves the socket file; the next start removes it, as tested above.
+    paths.socket.unlink()

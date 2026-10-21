@@ -63,6 +63,7 @@ from daita.llm.models import (
 )
 from daita.llm.pricing import CostEstimate
 from daita.llm.subscription_auth import CodexDevicePrompt, CodexOAuthCredential
+from daita.loop.models import LoopExitKind
 from tests.host.conftest import StartHost
 from tests.support.approval_learning import (
     MockModelProvider,
@@ -291,8 +292,9 @@ async def _agents(agent: Any, seeded: Seeded) -> object:
 
 
 async def _runs(agent: Any, seeded: Seeded) -> object:
-    return await agent.run(
-        "Which region leads?", conversation_id=seeded.conversation_id
+    return (
+        await agent.run("Which region leads?", conversation_id=seeded.conversation_id),
+        await agent.learn("Remember that EMEA leads.", conversation_id=None),
     )
 
 
@@ -452,7 +454,7 @@ SCENARIOS: dict[str, Callable[[Any, Seeded], Awaitable[object]]] = {
     "errors": _errors,
 }
 _SCRIPTS: dict[str, tuple[ModelResponse, ...]] = {
-    "runs": (_answer("EMEA still leads."),)
+    "runs": (_answer("EMEA still leads."), _answer("Noted."))
 }
 
 
@@ -873,3 +875,152 @@ def test_connect_and_the_host_errors_are_public() -> None:
         HostUnavailableError,
         HostVersionMismatch,
     )
+
+
+class _Unreviewable(Exception):
+    """A client that cannot show the question, like a too-small terminal."""
+
+
+async def _raises(_request: ApprovalRequest) -> ApprovalDecision:
+    raise _Unreviewable("terminal is too small to review this change")
+
+
+async def _closes(_request: ApprovalRequest) -> ApprovalDecision:
+    raise asyncio.CancelledError  # the TUI's answer when a card is closed
+
+
+async def _never(_request: ApprovalRequest) -> ApprovalDecision:
+    await asyncio.Event().wait()
+    raise AssertionError("unreachable")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("handler", "options"),
+    (
+        (_raises, {}),
+        (_closes, {}),
+        (_never, {"interaction_expiry": timedelta(milliseconds=200)}),
+    ),
+    ids=("handler_raises", "handler_closes", "question_expires"),
+)
+async def test_an_unanswered_approval_interrupts_the_run_and_never_denies(
+    start_host: StartHost,
+    handler: Callable[[ApprovalRequest], Awaitable[ApprovalDecision]],
+    options: dict[str, object],
+) -> None:
+    harness = await start_host(model=_remembering("Saved."), **options)
+    await harness.create_agent()
+    agent = await daita.connect(
+        "sales",
+        cwd=harness.work(),
+        root=harness.root,
+        approval_handler=handler,  # type: ignore[arg-type]
+    )
+    try:
+        exit = await asyncio.wait_for(agent.run("Remember revenue."), 20)
+        memory = await agent.read_memory()
+    finally:
+        await agent.close()
+
+    # A denial would let the model answer; an interruption ends the run unwritten.
+    assert (exit.kind, exit.reason, exit.final_text) == (
+        LoopExitKind.INTERRUPTED,
+        "tool_batch_interrupted",
+        None,
+    )
+    assert memory == ""
+
+
+@pytest.mark.integration
+async def test_configuring_the_model_refreshes_the_cached_properties(
+    start_host: StartHost,
+) -> None:
+    validation = ModelResponse(
+        finish_reason=FinishReason.TOOL_CALLS,
+        tool_calls=(
+            ToolCall(
+                id="validation-call", name="daita_validate_tool_support", arguments={}
+            ),
+        ),
+        provider_id="openai:test-model",
+    )
+    validator = MockModelProvider((validation,), provider_id="openai:test-model")
+    harness = await start_host(agent_options={"model_validator": validator})
+    await harness.create_agent()
+    agent = await daita.connect("sales", cwd=harness.work(), root=harness.root)
+    try:
+        route = await agent.configure_model(
+            provider="openai",
+            model="test-model",
+            api_key="sk-test-not-real",
+            context_window_tokens=8_192,
+            max_output_tokens=1_024,
+        )
+        # Like Agent, the open agent keeps its route until it is reopened.
+        unchanged = agent.model_route
+        live = value(await harness.http.get("/v1/agents/sales"))["model_route"]
+        reopened = await harness.http.post(
+            "/v1/agents/sales/open", json={"cwd": str(harness.work("other"))}
+        )
+        await bounded(lambda: agent.model_route == route)
+    finally:
+        await agent.close()
+
+    assert (unchanged, live) == (None, None)
+    assert value(reopened)["model_route"] == route
+    assert route.candidates[0].provider_id == "openai:test-model"
+
+
+@pytest.mark.integration
+async def test_a_folder_switch_by_another_client_refreshes_the_workspace(
+    start_host: StartHost,
+) -> None:
+    harness = await start_host()
+    await harness.create_agent()
+    here, there = harness.work(), harness.work("other")
+    first = await daita.connect("sales", cwd=here, root=harness.root)
+    try:
+        before = (first.workspace.root, first.session_source_id)
+        second = await daita.connect("sales", cwd=there, root=harness.root)
+        try:
+            await bounded(lambda: first.workspace.root == there)
+            after = (first.workspace.root, first.session_source_id)
+            expected = (second.workspace.root, second.session_source_id)
+        finally:
+            await second.close()
+    finally:
+        await first.close()
+
+    assert before[0] == here
+    assert after == expected
+    assert after[1] != before[1]
+
+
+@pytest.mark.integration
+async def test_a_run_finishing_while_the_stream_is_down_still_returns(
+    start_host: StartHost,
+) -> None:
+    harness = await start_host(model=_remembering("Saved."))
+    await harness.create_agent()
+    asked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def approve_later(request: ApprovalRequest) -> ApprovalDecision:
+        asked.set()
+        await release.wait()
+        return ApprovalDecision.APPROVE
+
+    agent = await daita.connect(
+        "sales", cwd=harness.work(), root=harness.root, approval_handler=approve_later
+    )
+    try:
+        run = asyncio.create_task(agent.run("Remember revenue."))
+        await asyncio.wait_for(asked.wait(), 10)
+        assert harness.drop_connections() >= 1
+        release.set()  # the run ends before the stream's first reconnect attempt
+        exit = await asyncio.wait_for(run, 20)
+    finally:
+        await agent.close()
+
+    assert exit.final_text == "Saved."
