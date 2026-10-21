@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import getpass
 import json
 import os
@@ -11,6 +12,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import typing
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -20,8 +22,11 @@ from . import (
     Agent,
     AgentConfig,
     AgentEvent,
+    AgentEventKind,
+    AgentObserver,
     AmbiguousTimePolicy,
     ApprovalDecision,
+    ApprovalHandler,
     ApprovalRequest,
     ArtifactError,
     CalendarDaySelector,
@@ -338,6 +343,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="internal",
     )
     parser.add_argument("--agent", help="agent to open in terminal mode")
+    parser.add_argument(
+        "--no-host",
+        action="store_true",
+        help="open the agent in this process instead of the Daita host; "
+        "fails if the host holds it",
+    )
     commands = parser.add_subparsers(dest="command")
 
     create = commands.add_parser("create", help="create an agent")
@@ -568,7 +579,8 @@ def build_parser() -> argparse.ArgumentParser:
     host_serve.add_argument(
         "--log-level", choices=("debug", "info", "warning", "error"), default="info"
     )
-    # Set by `daita host start`: losing the singleton race then exits quietly.
+    # Set by `daita host start` and the login service: losing the singleton race
+    # exits quietly, and the host exits when idle unless the service is installed.
     host_serve.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
     host_commands.add_parser("start", help="start the host in the background")
     host_commands.add_parser("stop", help="stop the host gracefully")
@@ -576,6 +588,13 @@ def build_parser() -> argparse.ArgumentParser:
     host_status.add_argument("--json", action="store_true", dest="as_json")
     host_logs = host_commands.add_parser("logs", help="print the host log")
     host_logs.add_argument("-f", "--follow", action="store_true")
+    host_install = host_commands.add_parser(
+        "install", help="run the host as a login service (launchd or systemd)"
+    )
+    host_install.add_argument(
+        "--no-start", action="store_true", help="start it at the next login"
+    )
+    host_commands.add_parser("uninstall", help="remove the login service")
 
     diagnostics = commands.add_parser(
         "diagnostics",
@@ -851,6 +870,38 @@ def _write_event_jsonl(event: AgentEvent) -> None:
     )
 
 
+class _RunEvents:
+    """Collect user-run events from the host stream and write one run's in order.
+
+    The stream carries every run of the agent, and this run's id is known only
+    once it returns, so its events are written then, before the result.
+    """
+
+    def __init__(self) -> None:
+        self._events: dict[str, list[AgentEvent]] = {}
+        self._completed: set[str] = set()
+        self._changed = asyncio.Event()
+
+    def observe(self, event: AgentEvent) -> None:
+        if event.run_origin != "user":
+            return
+        self._events.setdefault(event.run_id, []).append(event)
+        if event.kind is AgentEventKind.RUN_COMPLETED:
+            self._completed.add(event.run_id)
+            self._changed.set()
+
+    async def write(self, run_id: str, timeout: float = 10.0) -> None:
+        # run() returns on the run's state, which can overtake its last events;
+        # a stream that never delivers them still leaves what did arrive.
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(timeout):
+                while run_id not in self._completed:
+                    self._changed.clear()
+                    await self._changed.wait()
+        for event in self._events.pop(run_id, ()):
+            _write_event_jsonl(event)
+
+
 def _model_configuration(
     model_id: str,
     *,
@@ -1097,7 +1148,10 @@ async def _prompt_for_exact_approval(
     print(document)
     while True:
         try:
-            answer = input("Approve this exact change once? [y/n]")
+            # Off the event loop, so a host client keeps reading its stream.
+            answer = await asyncio.to_thread(
+                input, "Approve this exact change once? [y/n]"
+            )
         except EOFError:
             print()
             return ApprovalDecision.DENY
@@ -1130,6 +1184,51 @@ def _resolve_cli_workspace(args: argparse.Namespace) -> LocalWorkspace:
         sensitivity=sensitivity,
         access=LocalFileAccess.COMPUTER,
     )
+
+
+def _host_workspace(workspace: LocalWorkspace) -> None:
+    if workspace.sensitivity is not LocalWorkspace(workspace.root).sensitivity:
+        raise ValueError(
+            f"--workspace-sensitivity {workspace.sensitivity.value} needs --no-host: "
+            "the Daita host opens folders at the default sensitivity"
+        )
+
+
+async def _open_agent(
+    args: argparse.Namespace,
+    workspace: LocalWorkspace,
+    library: Mapping[str, typing.Any],
+    *,
+    observer: AgentObserver | None = None,
+    approval_handler: ApprovalHandler | None = None,
+) -> Agent:
+    """Open the agent through the Daita host, or in this process with --no-host.
+
+    ``library`` holds the in-process composition; it never crosses the socket.
+    """
+
+    if args.no_host:
+        return await Agent.open(
+            args.name, workspace=workspace, root=args.root, **library
+        )
+    from .host.client import RemoteAgent
+
+    _host_workspace(workspace)
+    remote = await RemoteAgent.open(
+        args.name,
+        workspace=workspace,
+        root=args.root,
+        observer=observer,
+        approval_handler=approval_handler,
+    )
+    # RemoteAgent mirrors every Agent member the CLI calls.
+    return typing.cast(Agent, remote)
+
+
+async def _deny_without_prompting(request: ApprovalRequest) -> ApprovalDecision:
+    # A one-shot run never prompts or writes; in process it has no handler.
+    del request
+    return ApprovalDecision.DENY
 
 
 def _write_resident_ready(ready: object) -> None:
@@ -1401,13 +1500,28 @@ async def _execute(args: argparse.Namespace) -> object:
     if args.command == "delete":
         if not args.yes:
             raise ValueError("delete requires --yes")
-        await Agent.delete(args.name, root=args.root)
+        if args.no_host:
+            await Agent.delete(args.name, root=args.root)
+        else:
+            from .host.client import RemoteAgent
+
+            # The host closes the agent first if it holds it.
+            await RemoteAgent.delete(args.name, root=args.root)
         return {"name": args.name, "deleted": True}
     if args.command == "diagnostics":
         return {"runs": summarize_diagnostics(args.path)}
     workspace = _resolve_cli_workspace(args)
     if args.command == "create":
-        agent = await Agent.create(args.name, workspace=workspace, root=args.root)
+        if args.no_host:
+            agent = await Agent.create(args.name, workspace=workspace, root=args.root)
+        else:
+            from .host.client import RemoteAgent
+
+            _host_workspace(workspace)
+            created = await RemoteAgent.create(
+                args.name, workspace=workspace, root=args.root
+            )
+            agent = typing.cast(Agent, created)
         try:
             return {"agent_id": agent.id, "name": agent.name, "home": str(agent.home)}
         finally:
@@ -1426,12 +1540,7 @@ async def _execute(args: argparse.Namespace) -> object:
         )
         return {"agent": args.host_agent, "host": "stopped"}
     if args.command == "jobs":
-        agent = await Agent.open(
-            args.name,
-            workspace=workspace,
-            root=args.root,
-            config=AgentConfig(),
-        )
+        agent = await _open_agent(args, workspace, {"config": AgentConfig()})
         try:
             if args.jobs_command == "list":
                 job_states = frozenset(GraphState(item) for item in (args.state or ()))
@@ -1709,12 +1818,7 @@ async def _execute(args: argparse.Namespace) -> object:
     if args.command == "detach":
         if not args.yes:
             raise ValueError("detach requires --yes")
-        agent = await Agent.open(
-            args.name,
-            workspace=workspace,
-            root=args.root,
-            config=AgentConfig(),
-        )
+        agent = await _open_agent(args, workspace, {"config": AgentConfig()})
         try:
             detached_source = await agent.detach(args.source_id)
             return {
@@ -1727,12 +1831,7 @@ async def _execute(args: argparse.Namespace) -> object:
     if args.command == "conversations":
         if not args.yes:
             raise ValueError("conversations clear requires --yes")
-        agent = await Agent.open(
-            args.name,
-            workspace=workspace,
-            root=args.root,
-            config=AgentConfig(),
-        )
+        agent = await _open_agent(args, workspace, {"config": AgentConfig()})
         try:
             return {
                 "name": args.name,
@@ -1748,55 +1847,74 @@ async def _execute(args: argparse.Namespace) -> object:
             raise ValueError(
                 "--base-url, --context-window, and --max-output require --model"
             )
+        local = tuple(
+            flag
+            for flag, value in (
+                ("--model", args.model),
+                ("--max-cost-usd", args.max_cost_usd),
+                ("--diagnostics-path", args.diagnostics_path),
+            )
+            if value is not None
+        )
+        if local and not args.no_host:
+            raise ValueError(
+                f"{', '.join(local)}: only with --no-host; the Daita host runs "
+                "the agent with its saved model settings"
+            )
         provider: ManagedModelProvider | None = None
         run_agent: Agent | None = None
+        events = _RunEvents() if args.events_jsonl and not args.no_host else None
         try:
-            if args.model is None:
-                run_agent = await Agent.open(
-                    args.name,
-                    workspace=workspace,
-                    root=args.root,
-                    observer=_write_event_jsonl if args.events_jsonl else None,
-                    diagnostics_path=_absolute_path(args.diagnostics_path),
-                    limits=(
-                        None
-                        if args.max_cost_usd is None
-                        else LoopLimits(max_estimated_cost_usd=args.max_cost_usd)
-                    ),
+            if not args.no_host:
+                run_agent = await _open_agent(
+                    args,
+                    workspace,
+                    {},
+                    observer=None if events is None else events.observe,
+                    approval_handler=_deny_without_prompting,
                 )
             else:
-                provider, profile = _model_configuration(
-                    args.model,
-                    base_url=args.base_url,
-                    context_window=args.context_window,
-                    max_output=args.max_output,
-                )
-                run_agent = await Agent.open(
-                    args.name,
-                    workspace=workspace,
-                    root=args.root,
-                    model=provider,
-                    model_profile=profile,
-                    observer=_write_event_jsonl if args.events_jsonl else None,
-                    diagnostics_path=_absolute_path(args.diagnostics_path),
-                    limits=(
+                library: dict[str, object] = {
+                    "observer": _write_event_jsonl if args.events_jsonl else None,
+                    "diagnostics_path": _absolute_path(args.diagnostics_path),
+                    "limits": (
                         None
                         if args.max_cost_usd is None
                         else LoopLimits(max_estimated_cost_usd=args.max_cost_usd)
                     ),
+                }
+                if args.model is not None:
+                    provider, profile = _model_configuration(
+                        args.model,
+                        base_url=args.base_url,
+                        context_window=args.context_window,
+                        max_output=args.max_output,
+                    )
+                    library.update(model=provider, model_profile=profile)
+                run_agent = await _open_agent(args, workspace, library)
+            try:
+                result = (
+                    await run_agent.run(
+                        args.message,
+                        conversation_id=args.conversation_id,
+                        files_only=True,
+                    )
+                    if args.files_only
+                    else await run_agent.run(
+                        args.message,
+                        conversation_id=args.conversation_id,
+                    )
                 )
-            result = (
-                await run_agent.run(
-                    args.message,
-                    conversation_id=args.conversation_id,
-                    files_only=True,
-                )
-                if args.files_only
-                else await run_agent.run(
-                    args.message,
-                    conversation_id=args.conversation_id,
-                )
-            )
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is None or task.cancelling():
+                    raise
+                # The host ended the run: it shut down, or a question expired.
+                raise RuntimeError(
+                    "the run was interrupted in the Daita host"
+                ) from None
+            if events is not None:
+                await events.write(result.run_id)
             transcript = await run_agent.transcript(result.run_id)
             analysis = await run_agent.analysis_usage(result.run_id)
             return {
@@ -1849,10 +1967,10 @@ async def _execute(args: argparse.Namespace) -> object:
             agent_name=args.name,
             conversation_id=args.conversation,
         )
-    agent = await Agent.open(
-        args.name,
-        workspace=workspace,
-        root=args.root,
+    agent = await _open_agent(
+        args,
+        workspace,
+        {"approval_handler": _prompt_for_exact_approval},
         approval_handler=_prompt_for_exact_approval,
     )
     owned_mcp_credential: SecretReference | None = None
@@ -2043,7 +2161,8 @@ async def _execute(args: argparse.Namespace) -> object:
             deleted = await agent.delete_skill(args.skill_name)
             return {"name": args.skill_name, "deleted": deleted}
         if args.command == "work":
-            print(_HOST_NOTICE, file=sys.stderr)
+            if args.no_host:
+                print(_HOST_NOTICE, file=sys.stderr)
             if args.work_command == "show":
                 return work_board_projection(
                     await agent.work_board(done_window=timedelta(hours=args.done_hours))
@@ -2058,7 +2177,8 @@ async def _execute(args: argparse.Namespace) -> object:
                 raise ValueError("delivery not found")
             return delivery_view_projection(dismissed)
         if args.command == "routines":
-            print(_HOST_NOTICE, file=sys.stderr)
+            if args.no_host:
+                print(_HOST_NOTICE, file=sys.stderr)
             if args.routines_command == "destinations":
                 return [
                     distribution_destination_projection(item)
@@ -2189,12 +2309,24 @@ def _source_from_attach_args(
 
 
 def _host_command(args: argparse.Namespace) -> int:
+    from .host import service
     from .host.paths import host_paths
     from .host.supervise import host_status, log_tail, start_host, stop_host
 
     paths = host_paths(args.root)
     if args.host_command == "serve":
         return _serve_host(args, paths)
+    if args.host_command == "install":
+        for note in service.install(paths, start=not args.no_start):
+            print(note)
+        return 0
+    if args.host_command == "uninstall":
+        print(
+            "Daita host service removed."
+            if service.uninstall(paths)
+            else "The Daita host service was not installed."
+        )
+        return 0
     if args.host_command == "start":
         status = start_host(paths)
         print(f"Daita host {'started' if status['started'] else 'already running'}.")
@@ -2206,6 +2338,7 @@ def _host_command(args: argparse.Namespace) -> int:
         return 0
     if args.host_command == "status":
         status = host_status(paths) or {"running": False}
+        status["service_installed"] = service.installed()
         if args.as_json:
             print(json.dumps(status, default=str, sort_keys=True))
         elif not status["running"]:
@@ -2220,6 +2353,12 @@ def _host_command(args: argparse.Namespace) -> int:
             else:
                 print(f"Agents open: {', '.join(status['agents']) or 'none'}")  # type: ignore[arg-type]
                 print(f"Socket: {status['socket']}")
+        if not args.as_json:
+            print(
+                "Service: installed (starts at login)"
+                if status["service_installed"]
+                else "Service: not installed (daita host install)"
+            )
         print(f"Log: {paths.log}")
         return 0
     lines = log_tail(paths)
@@ -2234,6 +2373,7 @@ def _serve_host(args: argparse.Namespace, paths: object) -> int:
     import signal
     from logging.handlers import RotatingFileHandler
 
+    from .host.notify import desktop_sender
     from .host.paths import HostPaths
     from .host.server import HostAlreadyRunning, serve_host
 
@@ -2262,7 +2402,10 @@ def _serve_host(args: argparse.Namespace, paths: object) -> int:
 
     async def serve() -> None:
         asyncio.get_running_loop().add_signal_handler(signal.SIGHUP, reopen_log)
-        await serve_host(paths, handle_signals=True)
+        # Started by a client or the service: exit when idle unless installed.
+        await serve_host(
+            paths, handle_signals=True, idle_exit=args.auto, notify=desktop_sender()
+        )
 
     try:
         asyncio.run(serve())
@@ -2289,6 +2432,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
         result: object
+        if args.no_host and args.command in (None, "chat"):
+            raise ValueError("the terminal app always uses the Daita host")
         if args.command == "host" and args.host_command is not None:
             return _host_command(args)
         if args.command is None:

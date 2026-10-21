@@ -131,6 +131,9 @@ async def test_a_lock_held_by_a_script_is_reported_and_never_taken(
     try:
         locked = await harness.http.get("/v1/agents/sales/memory")
         assert (locked.status_code, error_code(locked)) == (423, "agent_locked")
+        assert locked.json()["error"]["message"] == (
+            f"In use by a Python script (pid {os.getpid()})."
+        )
         holder = locked.json()["error"]["details"]["attributes"]["holder"]["v"]
         assert (holder["role"], holder["pid"]) == ("script", os.getpid())
         assert holder["started_at"].endswith("Z")

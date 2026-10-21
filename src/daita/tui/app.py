@@ -22,7 +22,7 @@ from daita import (
     WorkKind,
 )
 from daita.errors import StateCompatibilityError
-from daita.host.protocol import WorkspaceBusyError
+from daita.host.protocol import AgentLockedError, WorkspaceBusyError
 from daita.observation import AgentEventKind
 
 from .clipboard import deliver_clipboard
@@ -372,6 +372,9 @@ class DaitaApp(App[int]):
             await self._open(name)
         except StateCompatibilityError as error:
             unavailable.add(name)
+            return f"{name}: {error}"
+        except AgentLockedError as error:
+            # Held by a script: "In use by a Python script (pid 5530)."
             return f"{name}: {error}"
         unavailable.discard(name)
         return ""
@@ -1528,6 +1531,39 @@ class DaitaApp(App[int]):
                     "notice",
                     f"analysis-{result.run_id}",
                     f"Python cleanup incomplete: {'; '.join(cleanup_issues)}.",
+                )
+            )
+        await self._offer_background_host(result.run_id)
+
+    async def _offer_background_host(self, run_id: str) -> None:
+        """Once, after a run creates a routine, offer the login service (§12.2)."""
+
+        if not self.controller.background_offer_due():
+            return
+        if not await self.controller.created_routine(run_id):
+            return
+        accepted = await self._await_modal(
+            ConfirmScreen(
+                "Keep Daita running in the background after you close this "
+                "window?\nRoutines then run while no window is open "
+                "(daita host install). You won't be asked again."
+            )
+        )
+        try:
+            # No polling meanwhile: a poll could start a host while the
+            # service takes over.
+            async with self._background_refresh_lock:
+                notes = await self.controller.answer_background_offer(accepted)
+        except (ValueError, RuntimeError, OSError) as error:
+            notes = [f"Could not install the Daita host service: {error}"]
+        screen = self.chat()
+        if screen is not None and notes:
+            screen.show_notice(
+                sanitize_terminal_text(
+                    " ".join(notes),
+                    maximum=512,
+                    preserve_lines=False,
+                    fallback="Daita host service installed.",
                 )
             )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 import pytest
@@ -10,6 +11,7 @@ from textual.widgets import Static
 
 from daita import Agent, connect
 from daita.tui.app import DaitaApp
+from daita.tui.screens.selection import SelectionScreen
 from daita.tui.widgets.approval import ApprovalPanel
 from daita.tui.widgets.status import ActivityBar
 from daita.tui.widgets.transcript import TranscriptView
@@ -29,6 +31,7 @@ from tests.support.host import (
     remote_agent,
     value,
 )
+from tests.support.mcp import MemoryKeychain
 
 pytestmark = pytest.mark.integration
 
@@ -331,3 +334,35 @@ async def test_a_busy_host_in_another_folder_keeps_the_draft(
 
 async def _idle() -> None:
     return None
+
+
+async def test_an_agent_a_script_holds_says_who_holds_it(
+    start_host: StartHost,
+) -> None:
+    harness = await start_host()
+    await harness.create_agent()
+    await harness.http.post("/v1/agents/sales/close")
+    script = await Agent.open(
+        "sales",
+        root=harness.root,
+        workspace=host_workspace(harness),
+        keychain=MemoryKeychain(),
+    )
+    app = _app(harness, agent_name="sales")
+    shown: list[SelectionScreen] = []
+
+    async def await_modal(screen: SelectionScreen) -> None:
+        shown.append(screen)
+
+    app._await_modal = await_modal  # type: ignore[method-assign]
+    try:
+        await app._bootstrap_inner()
+    finally:
+        await app.controller.close()
+        await script.close()
+
+    (picker,) = shown
+    assert picker._initial_error == (
+        f"sales: In use by a Python script (pid {os.getpid()})."
+    )
+    assert app._startup_error is None

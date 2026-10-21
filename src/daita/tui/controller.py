@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shlex
 import subprocess
@@ -48,7 +49,10 @@ from daita.artifacts import (
     ArtifactRef,
 )
 from daita.errors import StateCompatibilityError
+from daita.host import service
 from daita.host.client import RemoteAgent
+from daita.host.paths import host_paths
+from daita.host.settings import read_setting, write_setting
 from daita.jobs import (
     GraphBoardProjection,
     GraphInspection,
@@ -63,6 +67,7 @@ from daita.llm.models import ToolCall, ToolResultBlock
 from daita.llm.provider_definitions import SUBSCRIPTION_CLIENTS
 from daita.memory.capabilities import MEMORY_SET_TOOL_NAME
 from daita.observation import AgentObserver
+from daita.routines.capabilities import ROUTINE_CREATE_CAPABILITY_ID
 from daita.security import SecretReference
 from daita.semantics import SEMANTIC_SAVE_TOOL_NAME
 from daita.skills import Skill, validate_skill_name
@@ -1671,6 +1676,35 @@ class PresentationController:
             and not output.is_error
             for call, output in await self.require_agent().tool_evidence(run_id)
         )
+
+    async def created_routine(self, run_id: str) -> bool:
+        """Whether a run committed a new routine."""
+
+        return any(
+            output is not None
+            and not output.is_error
+            and output.capability_id == ROUTINE_CREATE_CAPABILITY_ID
+            for _call, output in await self.require_agent().tool_evidence(run_id)
+        )
+
+    def background_offer_due(self) -> bool:
+        """Offer the login service once, and only while it is not installed."""
+
+        try:
+            return not service.installed() and read_setting(
+                host_paths(self.root), "background_offer"
+            )
+        except ValueError:
+            return False  # a malformed host.toml is never rewritten
+
+    async def answer_background_offer(self, accepted: bool) -> list[str]:
+        """Never ask again; with yes, install and start the login service."""
+
+        paths = host_paths(self.root)
+        write_setting(paths, "background_offer", False)
+        if not accepted:
+            return []
+        return await asyncio.to_thread(service.install, paths)
 
     def _settings_text(self) -> str:
         agent = self.require_agent()

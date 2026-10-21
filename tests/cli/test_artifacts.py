@@ -54,7 +54,16 @@ async def test_cli_run_json_contains_refs_and_receipts_but_no_payload_or_grant_m
         lambda *args, **kwargs: (provider, _profile(provider)),
     )
     args = cli.build_parser().parse_args(
-        ["--root", str(tmp_path), "run", "agent", "create file", "--model", "x:y"]
+        [
+            "--no-host",
+            "--root",
+            str(tmp_path),
+            "run",
+            "agent",
+            "create file",
+            "--model",
+            "x:y",
+        ]
     )
     mapping = await cli._execute(args)
     assert isinstance(mapping, dict)
@@ -95,6 +104,7 @@ async def test_cli_artifact_save_uses_direct_destination_once_and_returns_struct
     monkeypatch.setattr(cli.Agent, "open", staticmethod(fake_open))
     args = cli.build_parser().parse_args(
         [
+            "--no-host",
             "--root",
             str(tmp_path),
             "artifacts",

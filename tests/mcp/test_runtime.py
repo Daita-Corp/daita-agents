@@ -678,6 +678,7 @@ async def test_cli_and_tui_expose_bounded_mcp_administration(
     monkeypatch.setattr(cli.Agent, "open", open_agent)
     arguments = cli.build_parser().parse_args(
         (
+            "--no-host",
             "--root",
             str(harness.root),
             "mcp",
@@ -1868,7 +1869,14 @@ async def test_cli_masked_bearer_setup_and_simple_selection_use_shared_admission
 
     monkeypatch.setattr(cli.Agent, "open", open_agent)
     monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: identity.bearer_token)
-    arguments = ["mcp", command, "mcp-cli-simple", identity.endpoint, "--bearer-prompt"]
+    arguments = [
+        "--no-host",
+        "mcp",
+        command,
+        "mcp-cli-simple",
+        identity.endpoint,
+        "--bearer-prompt",
+    ]
     if command == "attach":
         arguments.extend(("--tool", "query-docs", "--tool", "resolve-library-id"))
     result = await cli._execute(cli.build_parser().parse_args(arguments))

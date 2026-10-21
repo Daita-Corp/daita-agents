@@ -8,7 +8,7 @@ import re
 import shutil
 import stat
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
@@ -136,6 +136,14 @@ def _holder_message(name: str, holder: dict[str, object]) -> str:
         )
     label = _HOLDER_LABELS.get(str(holder["role"]), "another Daita process")
     return f'Agent "{name}" is in use by {label} (pid {pid}).'
+
+
+def describe_writer_holder(holder: Mapping[str, object]) -> str:
+    """Say who holds a writer lock: "In use by a Python script (pid 5530)."."""
+
+    pid = holder.get("pid") or "unknown"
+    label = _HOLDER_LABELS.get(str(holder.get("role")), "another Daita process")
+    return f"In use by {label} (pid {pid})."
 
 
 def _admit_agent_home(

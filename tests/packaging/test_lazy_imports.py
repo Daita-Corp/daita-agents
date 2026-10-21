@@ -111,14 +111,18 @@ server_libraries = {"sse_starlette", "starlette", "uvicorn"}
 def loaded(libraries=server_libraries):
     return sorted(name for name in sys.modules if name.split(".")[0] in libraries)
 
+client_libraries = {"anyio", "httpx", *server_libraries}
 import daita
 import daita.cli
 import daita.host.client
+import daita.host.notify
+import daita.host.service
+import daita.host.settings
 import daita.tui
 import daita.tui.app
 import daita.tui.controller
-if loaded({"httpx", *server_libraries}):
-    raise AssertionError(f"eager client imports: {loaded({'httpx', *server_libraries})}")
+if loaded(client_libraries):
+    raise AssertionError(f"eager client imports: {loaded(client_libraries)}")
 import daita.host.codec
 import daita.host.events
 import daita.host.interactions

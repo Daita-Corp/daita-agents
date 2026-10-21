@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +13,7 @@ from typing import TYPE_CHECKING, cast
 from ..agent import Agent
 from ..config import AgentConfig
 from ..errors import StateCompatibilityError
-from ..hosting.agent_home import WRITER_ROLE
+from ..hosting.agent_home import WRITER_ROLE, describe_writer_holder
 from ..hosting.errors import (
     AgentAlreadyExistsError,
     AgentHomeError,
@@ -54,6 +55,7 @@ class AgentRegistry:
         runs: RunManager,
         *,
         agent_options: Mapping[str, object] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._root = root
         self._bus = bus
@@ -61,8 +63,11 @@ class AgentRegistry:
         self._runs = runs
         # Composition the host supplies to every open, such as a model in tests.
         self._options = dict(agent_options or {})
+        self._clock = clock
         self._entries: dict[str, _Entry] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        # When each agent was last used by a client, for the idle policy (§10.7).
+        self._used: dict[str, float] = {}
 
     def open_names(self) -> tuple[str, ...]:
         return tuple(sorted(self._entries))
@@ -80,13 +85,21 @@ class AgentRegistry:
         agent without them, so a client can replace them.
         """
 
+        self._used[name] = self._clock()
         entry = self._entries.get(name)
         if entry is not None and (cwd is None or entry.workspace == self._for(cwd)):
             return entry.agent
         async with self._lock(name):
             return await self._ensure(name, cwd, recover)
 
+    def opened(self, name: str) -> Agent | None:
+        """The open agent, without counting as use by a client."""
+
+        entry = self._entries.get(name)
+        return None if entry is None else entry.agent
+
     async def create(self, name: str, cwd: Path | None) -> Agent:
+        self._used[name] = self._clock()
         async with self._lock(name):
             if name in self._entries:
                 raise AgentAlreadyExistsError(f"agent already exists: {name}")
@@ -120,6 +133,34 @@ class AgentRegistry:
     async def close_all(self) -> None:
         for name in self.open_names():
             await self.close(name)
+
+    async def close_idle(self, seconds: float) -> None:
+        """Close agents with no client, no work and no background work (§10.7)."""
+
+        for name in self.open_names():
+            agent = self.opened(name)
+            if agent is None or self._idle_for(name) < seconds:
+                continue
+            try:
+                keep = await _has_background_work(agent)
+            except Exception as error:
+                _LOGGER.warning(
+                    "idle check failed: %s (%s)", name, type(error).__name__
+                )
+                keep = True
+            if keep:
+                continue
+            async with self._lock(name):
+                # A client may have arrived while the check awaited.
+                if self._idle_for(name) >= seconds:
+                    _LOGGER.info("closing idle agent: %s", name)
+                    await self._close(name)
+
+    def _idle_for(self, name: str) -> float:
+        now = self._clock()
+        if self._bus.attached(name) or self._busy(name):
+            self._used[name] = now
+        return now - self._used.setdefault(name, now)
 
     async def open_background_agents(self) -> None:
         """Open every agent with scheduled, unfinished or unread work (§10.3)."""
@@ -210,7 +251,7 @@ class AgentRegistry:
             if type(error) is not HostActiveError:
                 raise
             raise AgentLockedError(
-                f"agent is in use by another process: {name}", holder=error.holder
+                describe_writer_holder(error.holder or {}), holder=error.holder
             ) from error
         finally:
             WRITER_ROLE.reset(token)

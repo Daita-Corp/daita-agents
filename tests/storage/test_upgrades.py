@@ -892,7 +892,7 @@ def test_headless_cli_reports_revision_status_and_safe_failures(tmp_path: Path) 
     stdout = io.StringIO()
     stderr = io.StringIO()
     with redirect_stdout(stdout), redirect_stderr(stderr):
-        code = cli.main(["--root", str(tmp_path), "sources", "status"])
+        code = cli.main(["--no-host", "--root", str(tmp_path), "sources", "status"])
 
     assert code == 1
     assert stdout.getvalue() == ""

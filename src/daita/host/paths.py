@@ -41,6 +41,10 @@ class HostPaths:
         return self.run_dir / "runs.json"
 
     @property
+    def settings(self) -> Path:
+        return self.root / "host.toml"
+
+    @property
     def log_dir(self) -> Path:
         return self.root / "logs"
 

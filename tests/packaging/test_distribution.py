@@ -535,6 +535,7 @@ factory = SDKMCPClientFactory()
 raise SystemExit(
     daita.cli.main(
         [
+            "--no-host",
             "--root",
             sys.argv[1],
             "--workspace",

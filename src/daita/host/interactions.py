@@ -62,10 +62,13 @@ class InteractionHub:
         *,
         expiry: timedelta = DEFAULT_EXPIRY,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        on_open: Callable[[str, InteractionKind], None] | None = None,
     ) -> None:
         self._bus = bus
         self._expiry = expiry
         self._clock = clock
+        # Told of every new question, for example to notify when nobody watches.
+        self._on_open = on_open
         self._open: dict[str, dict[str, Interaction]] = {}
 
     async def ask(
@@ -160,6 +163,8 @@ class InteractionHub:
         )
         self._open.setdefault(agent, {})[interaction.id] = interaction
         self._publish(interaction, "opened")
+        if self._on_open is not None:
+            self._on_open(agent, kind)
         return interaction
 
     def _pending(self, agent: str, interaction_id: str) -> Interaction:

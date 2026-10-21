@@ -467,6 +467,7 @@ async def test_headless_lifecycle_commands_require_and_honor_yes(
     detached = await cli._execute(
         parser.parse_args(
             [
+                "--no-host",
                 "--root",
                 str(tmp_path),
                 "detach",
@@ -484,6 +485,7 @@ async def test_headless_lifecycle_commands_require_and_honor_yes(
     assert await cli._execute(
         parser.parse_args(
             [
+                "--no-host",
                 "--root",
                 str(tmp_path),
                 "conversations",
@@ -494,6 +496,8 @@ async def test_headless_lifecycle_commands_require_and_honor_yes(
         )
     ) == {"name": "atlas", "cleared_runs": 0}
     assert await cli._execute(
-        parser.parse_args(["--root", str(tmp_path), "delete", "atlas", "--yes"])
+        parser.parse_args(
+            ["--no-host", "--root", str(tmp_path), "delete", "atlas", "--yes"]
+        )
     ) == {"name": "atlas", "deleted": True}
     assert not (tmp_path / "agents" / "atlas").exists()

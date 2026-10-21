@@ -37,6 +37,7 @@ from uvicorn.protocols.http.h11_impl import H11Protocol
 from .. import __version__
 from .events import EventBus
 from .interactions import DEFAULT_EXPIRY, InteractionHub
+from .notify import INTERVAL_SECONDS, Notifier, Sender
 from .paths import HostPaths
 from .protocol import (
     PROTOCOL_HEADER,
@@ -66,6 +67,8 @@ from .routes import (
     work,
 )
 from .runs import RunManager
+from .service import installed
+from .settings import read_setting
 
 _LOGGER = logging.getLogger("daita.host")
 # One module per area (§7.7); each lists its routes and the members they reach.
@@ -89,6 +92,8 @@ AREAS = (
     model,
 )
 _SIGNALS = (signal.SIGTERM, signal.SIGINT)
+IDLE_SECONDS = 30 * 60
+SWEEP_SECONDS = 15.0
 PeerUid = Callable[[Any], int]
 
 
@@ -124,15 +129,42 @@ class Host:
         interaction_expiry: timedelta = DEFAULT_EXPIRY,
         heartbeat_seconds: int = 15,
         drain_seconds: float = 30.0,
+        notify: Sender | None = None,
+        notify_interval: float = INTERVAL_SECONDS,
+        idle_seconds: float = IDLE_SECONDS,
+        sweep_seconds: float = SWEEP_SECONDS,
+        idle_exit: bool = False,
+        service_installed: Callable[[], bool] = installed,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.paths = paths
         self.heartbeat_seconds = heartbeat_seconds
         self.drain_seconds = drain_seconds
+        self.idle_seconds = idle_seconds
+        self.sweep_seconds = sweep_seconds
+        # Auto-spawned hosts exit when idle unless the service is installed.
+        self.idle_exit = idle_exit
+        self._service_installed = service_installed
+        self._clock = clock
         self.bus = EventBus()
-        self.hub = InteractionHub(self.bus, expiry=interaction_expiry)
+        self.notifier = Notifier(
+            attached=self.bus.attached,
+            enabled=lambda: read_setting(paths, "notifications"),
+            send=notify,
+            interval=notify_interval,
+            clock=clock,
+        )
+        self.hub = InteractionHub(
+            self.bus, expiry=interaction_expiry, on_open=self.notifier.interaction
+        )
         self.runs = RunManager(self.bus, paths.runs)
         self.registry = AgentRegistry(
-            paths.root, self.bus, self.hub, self.runs, agent_options=agent_options
+            paths.root,
+            self.bus,
+            self.hub,
+            self.runs,
+            agent_options=agent_options,
+            clock=clock,
         )
         self.started_at = datetime.now(UTC)
         self._started = time.monotonic()
@@ -159,6 +191,43 @@ class Host:
             self._shutdown = asyncio.create_task(self._drain())
         return self._shutdown
 
+    async def maintain(self) -> None:
+        """Every sweep: close idle agents, notify new work, exit when idle (§10.7)."""
+
+        empty_since: float | None = None
+        while True:
+            await asyncio.sleep(self.sweep_seconds)
+            try:
+                await self.registry.close_idle(self.idle_seconds)
+                await self._notify_work()
+            except Exception:
+                _LOGGER.exception("host maintenance failed")
+            self.notifier.flush()
+            if not self.idle_exit or self.registry.open_names():
+                empty_since = None
+            elif empty_since is None:
+                empty_since = self._clock()
+            elif (
+                self._clock() - empty_since >= self.idle_seconds
+                and not self._service_installed()
+            ):
+                self.request_shutdown("idle")
+                return
+
+    async def _notify_work(self) -> None:
+        for name in self.registry.open_names():
+            agent = self.registry.opened(name)
+            if agent is None or self.notifier.watched(name):
+                continue
+            try:
+                board = await agent.work_board()
+            except Exception as error:
+                _LOGGER.warning(
+                    "work check failed: %s (%s)", name, type(error).__name__
+                )
+                continue
+            self.notifier.work(name, board)
+
     async def _drain(self) -> None:
         await self.runs.drain(self.drain_seconds)
         self.hub.close()
@@ -182,6 +251,7 @@ async def serve_host(
     lock = _acquire_singleton(paths)
     sock: socket.socket | None = None
     host: Host | None = None
+    maintenance: asyncio.Task[None] | None = None
     loop = asyncio.get_running_loop()
     try:
         # After the lock: the run manager reads the previous host's run marker.
@@ -190,6 +260,7 @@ async def serve_host(
             for signum in _SIGNALS:
                 loop.add_signal_handler(signum, host.request_shutdown, "signal")
         await host.registry.open_background_agents()
+        maintenance = asyncio.create_task(host.maintain())
         sock = _bind(paths)
         server = _Server(_config(create_app(host), peer_uid))
         host._server = server
@@ -204,6 +275,9 @@ async def serve_host(
         server.on_started = started
         await server.serve(sockets=[sock])
     finally:
+        if maintenance is not None:
+            maintenance.cancel()
+            await asyncio.gather(maintenance, return_exceptions=True)
         if host is not None:
             with contextlib.suppress(Exception):
                 await host.request_shutdown("stopped")

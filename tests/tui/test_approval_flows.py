@@ -62,6 +62,7 @@ async def test_cli_routine_mutations_request_human_confirmation_before_saving(
                 await fixture.agent.propose_routine(draft)
             )
         arguments = [
+            "--no-host",
             "--root",
             str(fixture.root),
             "--workspace",
