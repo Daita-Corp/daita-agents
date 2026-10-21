@@ -79,7 +79,7 @@ ERRORS: tuple[BaseException, ...] = (
     AgentIdentityMismatchError("agent home identity does not match"),
     AgentModelConfigurationError("saved model configuration must be replaced"),
     AgentNotConfiguredError("agent has no model configured"),
-    HostActiveError("host_active: another writer owns /Users/x/.daita/agents/sales"),
+    HostActiveError('Agent "sales" is in use by a Python script (pid 5530).'),
     AgentHomeError("agent writer lock must be a regular file"),
     AgentError("Agent operation failed.", error_code="agent_closed"),
     StateCompatibilityError(

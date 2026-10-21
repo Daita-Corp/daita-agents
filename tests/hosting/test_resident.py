@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -41,8 +42,13 @@ async def test_resident_host_owns_normal_writer_lock_and_hands_off(
     admitted = await ready
     assert admitted.agent_name == "resident"
 
-    with pytest.raises(HostActiveError, match="host_active"):
+    with pytest.raises(HostActiveError) as raised:
         await Agent.open("resident", root=tmp_path, workspace=workspace)
+    assert raised.value.holder is not None
+    assert (raised.value.holder["role"], raised.value.holder["pid"]) == (
+        "script",
+        os.getpid(),
+    )
 
     stop.set()
     await task

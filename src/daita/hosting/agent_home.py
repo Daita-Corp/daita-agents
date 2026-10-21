@@ -135,7 +135,7 @@ def _holder_message(name: str, holder: dict[str, object]) -> str:
             "to use it directly in this process."
         )
     label = _HOLDER_LABELS.get(str(holder["role"]), "another Daita process")
-    return f'host_active: Agent "{name}" is in use by {label} (pid {pid}).'
+    return f'Agent "{name}" is in use by {label} (pid {pid}).'
 
 
 def _admit_agent_home(

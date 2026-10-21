@@ -12,7 +12,7 @@ import pytest
 import daita.hosting.configuration as configuration
 from daita import Agent, AgentConfig, SQLiteSource, cli
 from daita.adapters.models import SourceRegistration
-from daita.agent import AgentHomeError
+from daita.agent import AgentHomeError, HostActiveError
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -358,7 +358,7 @@ async def test_agent_delete_respects_the_active_writer_lock(tmp_path: Path) -> N
         "atlas", root=tmp_path, workspace=workspace_for(tmp_path)
     )
     try:
-        with pytest.raises(AgentHomeError, match="host_active"):
+        with pytest.raises(HostActiveError):
             await Agent.delete("atlas", root=tmp_path)
         assert agent.home.is_dir()
     finally:

@@ -11,7 +11,7 @@ import pytest
 import daita.hosting.embedded as embedded
 from daita import Agent, LoopLimits, MCPToolSelection
 from daita.adapters.mcp import MCPAdmissionError, SDKMCPClientFactory
-from daita.agent import AgentModelConfigurationError
+from daita.agent import AgentModelConfigurationError, HostActiveError
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.factory import create_model_route_provider
 from daita.llm.models import (
@@ -1285,7 +1285,7 @@ async def test_cancelled_close_keeps_writer_lock_until_admitted_configuration_fi
     closing.cancel()
     await asyncio.sleep(0)
 
-    with pytest.raises(Exception, match="host_active"):
+    with pytest.raises(HostActiveError):
         await Agent.open(
             "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
         )
