@@ -23,7 +23,8 @@ from . import (
 )
 
 TABLE = (
-    Route("POST", "/model", "configure_model"),
+    # The open agent keeps its old route until reopened, so reopen it when idle.
+    Route("POST", "/model", "configure_model", reopen=True),
     Route("GET", "/model/explicit-limits", "model_requires_explicit_limits"),
 )
 MEMBERS = frozenset(

@@ -114,6 +114,9 @@ def loaded(libraries=server_libraries):
 import daita
 import daita.cli
 import daita.host.client
+import daita.tui
+import daita.tui.app
+import daita.tui.controller
 if loaded({"httpx", *server_libraries}):
     raise AssertionError(f"eager client imports: {loaded({'httpx', *server_libraries})}")
 import daita.host.codec

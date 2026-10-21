@@ -13,6 +13,7 @@ from daita import Agent, AgentConfig, LocalWorkspace
 from daita._json import canonical_json
 from daita.loop.models import LoopLimits
 from daita.tui.app import DaitaApp
+from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.support.live_billing import subscription_billing
 
 pytestmark = pytest.mark.requires_llm
@@ -213,30 +214,25 @@ async def test_real_model_dependent_cells_and_error_correction(
         await provider.close()
 
 
-async def test_real_model_tui_python_and_broker(tmp_path, paid_case, analysis_report):
+async def test_real_model_tui_python_and_broker(
+    paid_case, analysis_report, start_host: StartHost
+):
     profile, provider, cost = paid_case
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    (workspace / "numbers.txt").write_text("10\n20\n12\n")
-    local = LocalWorkspace(workspace)
+    harness = await start_host(
+        agent_options={
+            "model": provider,
+            "model_profile": profile,
+            "config": AgentConfig(
+                limits=LoopLimits(max_estimated_cost_usd=cost, max_steps=24)
+            ),
+        }
+    )
+    # The host opens the agent with computer access to the app's folder.
+    (harness.work() / "numbers.txt").write_text("10\n20\n12\n")
     app = DaitaApp(
-        root=tmp_path / "homes",
-        start_bootstrap=False,
-        workspace=local,
-        model=provider,
-        model_profile=profile,
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
-    agent = await Agent.create(
-        "live-tui",
-        root=tmp_path / "homes",
-        workspace=local,
-        model=provider,
-        model_profile=profile,
-        observer=app._observer,
-        config=AgentConfig(
-            limits=LoopLimits(max_estimated_cost_usd=cost, max_steps=24)
-        ),
-    )
+    agent = await remote_agent(harness, "live-tui", observer=app._observer)
     app.controller.agent = agent
     try:
         async with app.run_test(size=(110, 36)) as pilot:
@@ -252,7 +248,9 @@ async def test_real_model_tui_python_and_broker(tmp_path, paid_case, analysis_re
                 runs = await agent.conversation_runs(app.controller.conversation_id)
                 result = runs[-1].result
                 assert result is not None
-                _, records = await retain_evidence(agent, result, analysis_report)
+                # analysis_evidence is not on the host surface; read the host's agent.
+                hosted = await harness.host.registry.get("live-tui")
+                _, records = await retain_evidence(hosted, result, analysis_report)
                 analysis_report["expected_sum"] = 42
                 assert any(
                     record.kind == "child" and record.facts["status"] == "succeeded"

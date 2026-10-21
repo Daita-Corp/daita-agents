@@ -6,7 +6,7 @@ import pytest
 from rich.text import Text
 from textual.widgets import OptionList, Static, Tab, Tabs
 
-from daita import Agent
+from daita import connect
 from daita.tui.app import DaitaApp
 from daita.tui.models import TranscriptBlock
 from daita.tui.screens.artifacts import ArtifactsScreen
@@ -18,7 +18,7 @@ from daita.tui.widgets.command_center import (
 )
 from daita.tui.widgets.transcript import TranscriptView
 from tests.artifacts._public_surface_support import _create_artifact_agent
-from tests.support.workspace import workspace_for
+from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.tui._support import (
     _create_sqlite_source,
     settle_until,
@@ -28,12 +28,13 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.parametrize("size", [(80, 24), (100, 24), (140, 40)])
-async def test_tabs_show_one_view_preserve_draft_and_fit_terminal(tmp_path, size):
-    agent = await Agent.create(
-        "geometry", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+async def test_tabs_show_one_view_preserve_draft_and_fit_terminal(
+    start_host: StartHost, size
+):
+    harness = await start_host()
+    agent = await remote_agent(harness, "geometry")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = agent
     async with app.run_test(size=size) as pilot:
@@ -143,17 +144,22 @@ async def test_tabs_show_one_view_preserve_draft_and_fit_terminal(tmp_path, size
 
 @pytest.mark.parametrize("section", ["sources", "artifacts"])
 async def test_projection_opens_exact_owner_item_and_restores_composer(
-    tmp_path, monkeypatch, section
+    tmp_path, start_host: StartHost, section
 ):
     # A real registered artifact keeps navigation tied to current inventory.
     downloads = tmp_path / "Downloads"
     downloads.mkdir()
-    agent, artifact = await _create_artifact_agent(tmp_path, "navigation", downloads)
+    harness = await start_host()
+    built, artifact = await _create_artifact_agent(
+        harness.root, "navigation", downloads
+    )
+    await built.close()
+    agent = await connect("navigation", cwd=harness.work(), root=harness.root)
     source_path = tmp_path / "records.sqlite"
     _create_sqlite_source(source_path, "records")
     source = await agent.attach_sqlite(source_path, name="Records")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = agent
     targets = {

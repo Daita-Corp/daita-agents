@@ -17,7 +17,6 @@ from decimal import Decimal
 import pytest
 
 from daita import (
-    Agent,
     MCPCompletionSemantics,
     MCPToolSelection,
 )
@@ -45,7 +44,7 @@ from daita.routines.models import RoutineState
 from daita.routines.owner import RoutineError
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_records import EffectResolutionDecision
-from tests.support.workspace import workspace_for
+from tests.support.host import StartHost, host_workspace, remote_agent
 
 
 @pytest.fixture
@@ -1191,16 +1190,25 @@ async def test_binding_codec_and_origin_retain_authority_but_exclude_hints(actio
         )
 
 
-async def test_guided_ui_explicit_action_permissions_reach_public_admission(tmp_path):
+async def test_guided_ui_explicit_action_permissions_reach_public_admission(
+    tmp_path, start_host: StartHost
+):
     from textual.widgets import Input, Select, SelectionList
 
     from daita.tui.app import DaitaApp
     from daita.tui.screens.mcp import MCPSetupScreen, MCPToolAdmissionScreen
 
     fixture = ActionFixture(tmp_path)
-    opened = await Agent.create("mcp-ui-action", **fixture.kwargs())
+    # The host supplies the root, workspace and approval handler itself.
+    composition = {
+        key: value
+        for key, value in fixture.kwargs().items()
+        if key not in {"root", "workspace", "approval_handler"}
+    }
+    harness = await start_host(agent_options=composition)
+    opened = await remote_agent(harness, "mcp-ui-action")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     async with app.run_test(size=(104, 42)) as pilot:

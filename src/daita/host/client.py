@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import functools
 import json
 import logging
@@ -17,7 +18,7 @@ import os
 import re
 import typing
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
@@ -212,7 +213,11 @@ class HostClient:
             await asyncio.to_thread(_ensure_host, self.paths)
 
     async def aclose(self) -> None:
-        await self._http.aclose()
+        # shortcut: anyio 4.14 raises InvalidStateError when it closes a Unix
+        # stream whose read was cancelled (macOS), after closing the socket;
+        # drop this once anyio settles a done future safely.
+        with contextlib.suppress(asyncio.InvalidStateError):
+            await self._http.aclose()
 
 
 def _ensure_host(paths: HostPaths) -> None:
@@ -296,6 +301,8 @@ class _Claim:
     respond: Callable[[Mapping[str, Any]], Awaitable[dict[str, object] | None]]
     progress: Callable[[str], None] | None = None
     interaction: str | None = None
+    # The calling task's context: its callback runs there, as it would in process.
+    context: contextvars.Context = field(default_factory=contextvars.copy_context)
 
 
 async def connect(
@@ -331,7 +338,9 @@ class RemoteAgent:
 
     Set ``on_reset`` to learn when the host could not replay missed events;
     pending interactions and run waits recover by themselves, while views of
-    transcripts and the work board must be reloaded.
+    transcripts and the work board must be reloaded. The members in
+    ``CLIENT_ONLY_MEMBERS`` report what only a host client knows: the host's
+    active runs and this client's connection to it.
     """
 
     def __init__(
@@ -358,6 +367,8 @@ class RemoteAgent:
         self._claims: list[_Claim] = []
         self._runs: dict[str, asyncio.Event] = {}
         self._tasks: set[asyncio.Task[None]] = set()
+        self._connection = "connected"
+        self._closed = False
         self.on_reset: Callable[[], None] | None = None
 
     @classmethod
@@ -447,8 +458,12 @@ class RemoteAgent:
         return typing.cast(AgentHomeStatus, await _once(root, "GET", path))
 
     async def close(self) -> None:
-        """Detach this client; the agent, its runs and schedulers stay in the host."""
+        """Detach this client; the agent, its runs and schedulers stay in the host.
 
+        A run wait cancelled after close detaches too: it never cancels the run.
+        """
+
+        self._closed = True
         tasks = [*self._handlers.values(), *self._tasks]
         if self._stream is not None:
             tasks.append(self._stream)
@@ -484,6 +499,20 @@ class RemoteAgent:
     @property
     def model_route(self) -> ModelRoute | None:
         return typing.cast("ModelRoute | None", self._status["model_route"])
+
+    @property
+    def model_configuration_requires_replacement(self) -> bool:
+        """The saved model settings could not be admitted, so the agent has no route."""
+
+        return typing.cast(
+            bool, self._status["model_configuration_requires_replacement"]
+        )
+
+    @property
+    def connection(self) -> str:
+        """This client's event stream: connected, reconnecting or stopped."""
+
+        return self._connection
 
     def model_requires_explicit_limits(self, *, provider: str, model: str) -> bool:
         # Static package data, identical in the host because versions match.
@@ -559,13 +588,33 @@ class RemoteAgent:
         submit = asyncio.ensure_future(self._request("POST", "/runs", body=body))
         try:
             ref = decode(await asyncio.shield(submit))["run_ref"]
-            view = await self._finished(ref)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await self._cancel(decode(await submit)["run_ref"])
+            raise
+        return await self.follow_run(ref)
+
+    async def active_runs(self) -> tuple[dict[str, Any], ...]:
+        """The agent's queued, running and waiting foreground runs, oldest first.
+
+        Each is the host's run view: run_ref, run_id, conversation_id, mode,
+        state, exit and error.
+        """
+
+        return typing.cast(
+            "tuple[dict[str, Any], ...]",
+            decode(await self._request("GET", "/runs", params={"active": "true"})),
+        )
+
+    async def follow_run(self, run_ref: str) -> LoopExit:
+        """Wait for one host run, as run() does; cancelling the wait cancels it."""
+
+        try:
+            view = await self._finished(run_ref)
         except asyncio.CancelledError:
             # Ctrl-C semantics: cancelling the wait cancels the host run.
             with contextlib.suppress(Exception):
-                ref = decode(await submit)["run_ref"]
-                path = f"/runs/{_segment(ref)}/cancel"
-                await self._request("POST", path, start=False)
+                await self._cancel(run_ref)
             raise
         if view["exit"] is not None:
             return typing.cast(LoopExit, view["exit"])
@@ -573,6 +622,10 @@ class RemoteAgent:
             raise error_from_envelope(view["error"].to_dict())
         # Cancelled, or interrupted by an expired or dismissed question.
         raise asyncio.CancelledError
+
+    async def _cancel(self, ref: str) -> None:
+        if not self._closed:
+            await self._request("POST", f"/runs/{_segment(ref)}/cancel", start=False)
 
     async def _finished(self, ref: str) -> dict[str, Any]:
         import httpx
@@ -686,6 +739,7 @@ class RemoteAgent:
             return
         kind = InteractionKind(view["kind"])
         respond: Callable[[Mapping[str, Any]], Awaitable[dict[str, object] | None]]
+        context = None
         if kind is InteractionKind.TOOL_APPROVAL:
             if self._approval_handler is None:
                 return
@@ -702,9 +756,9 @@ class RemoteAgent:
             if claim is None:
                 return
             claim.interaction = interaction_id
-            respond = claim.respond
+            respond, context = claim.respond, claim.context
         self._handlers[interaction_id] = asyncio.create_task(
-            self._respond(view, respond)
+            self._respond(view, respond), context=context
         )
 
     async def _respond(
@@ -751,13 +805,17 @@ class RemoteAgent:
                     self._prefix + "/events", after=self._seq
                 ) as lines:
                     delay = BACKOFF_START_SECONDS
+                    self._connection = "connected"
                     async for line in lines:
                         if line.startswith("data:"):
                             await self._dispatch(*parse_event(json.loads(line[5:])))
+                self._connection = "reconnecting"
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 _LOGGER.debug("host event stream dropped: %s", type(error).__name__)
+                # Nothing listens on the socket: the host is gone, not restarting.
+                self._connection = "stopped" if _refused(error) else "reconnecting"
             # Waiting runs re-read their state, or learn that the host is gone.
             self._wake()
             await asyncio.sleep(delay)
@@ -1396,6 +1454,12 @@ async def _answer(
     if kind is InteractionKind.SOURCE_EDIT_CONFIRMATION:
         return {"accept": await handler(request["preview"])}
     return {"decision": ApprovalDecision(await handler(request["approval"])).value}
+
+
+def _refused(error: Exception) -> bool:
+    import httpx
+
+    return isinstance(error, httpx.ConnectError)
 
 
 def _guard(callback: Callable[..., object], *arguments: object) -> None:

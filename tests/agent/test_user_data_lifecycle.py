@@ -23,6 +23,7 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.security import KeychainSecretProvider, SecretReference
 from daita.skills import Skill
 from daita.tui.controller import PresentationController
+from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.support.memory_source import (
     MEMORY_ADAPTER_ID,
     MEMORY_NOW,
@@ -372,22 +373,19 @@ async def test_keychain_delete_is_idempotent_when_the_entry_is_already_absent() 
 
 
 async def test_terminal_lifecycle_commands_require_confirmation(
-    tmp_path: Path,
+    tmp_path: Path, start_host: StartHost
 ) -> None:
     database = tmp_path / "data.sqlite"
     _database(database)
     provider = MockModelProvider((_stop("answer"),), provider_id="mock:lifecycle")
-    agent = await Agent.create(
-        "atlas",
-        root=tmp_path,
-        model=provider,
-        model_profile=_profile(provider),
-        workspace=workspace_for(tmp_path),
+    harness = await start_host(
+        model=provider, agent_options={"model_profile": _profile(provider)}
     )
+    agent = await remote_agent(harness, "atlas")
     source = await agent.attach(SQLiteSource(database, name="Warehouse"))
     result = await agent.run("Create history.")
     controller = PresentationController(
-        root=tmp_path, workspace=workspace_for(tmp_path)
+        root=harness.root, workspace=host_workspace(harness)
     )
     controller.agent = agent
     controller.conversation_id = result.conversation_id
@@ -407,22 +405,19 @@ async def test_terminal_lifecycle_commands_require_confirmation(
 
 
 async def test_terminal_can_clear_history_detach_source_and_delete_agent(
-    tmp_path: Path,
+    tmp_path: Path, start_host: StartHost
 ) -> None:
     database = tmp_path / "data.sqlite"
     _database(database)
     provider = MockModelProvider((_stop("answer"),), provider_id="mock:lifecycle")
-    agent = await Agent.create(
-        "atlas",
-        root=tmp_path,
-        model=provider,
-        model_profile=_profile(provider),
-        workspace=workspace_for(tmp_path),
+    harness = await start_host(
+        model=provider, agent_options={"model_profile": _profile(provider)}
     )
+    agent = await remote_agent(harness, "atlas")
     source = await agent.attach(SQLiteSource(database, name="Warehouse"))
     result = await agent.run("Create history.")
     controller = PresentationController(
-        root=tmp_path, workspace=workspace_for(tmp_path)
+        root=harness.root, workspace=host_workspace(harness)
     )
     controller.agent = agent
     controller.conversation_id = result.conversation_id
@@ -437,7 +432,7 @@ async def test_terminal_can_clear_history_detach_source_and_delete_agent(
 
     await controller.delete_open_agent()
     assert controller.agent is None
-    assert not (tmp_path / "agents" / "atlas").exists()
+    assert not (harness.root / "agents" / "atlas").exists()
 
 
 async def test_headless_lifecycle_commands_require_and_honor_yes(

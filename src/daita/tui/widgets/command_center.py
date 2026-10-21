@@ -17,7 +17,7 @@ from textual.widgets.option_list import Option
 from daita import WorkBoard, WorkCard, WorkColumn, WorkKind
 from daita.artifacts import ArtifactRef
 
-from ..models import source_type_label
+from ..models import HOST_GUIDANCE, source_type_label
 from ..sanitization import safe_display
 
 _WORK_COLUMNS = (
@@ -322,8 +322,7 @@ class CommandSections(ContentSwitcher):
                 )
             yield WorkBoardView()
             yield Static(
-                "Routines run while Daita is open here, or while "
-                "`daita host --agent <name>` runs after you close it.",
+                HOST_GUIDANCE,
                 classes="section-description",
                 markup=False,
             )

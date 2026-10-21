@@ -6,6 +6,7 @@ from pathlib import Path
 
 import daita
 from daita.capabilities import AccessMode, CallTargetLane, OperationalEffect
+from daita.host.protocol import CLIENT_ONLY_MEMBERS
 from daita.storage.sqlite_schema import CURRENT_SCHEMA
 from tests.support.workspace import workspace_for
 
@@ -1702,7 +1703,8 @@ def test_terminal_application_remains_a_presentation_over_the_public_agent_api()
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "agent"
     }
-    assert agent_calls <= public_methods
+    # The host client adds only the allowlisted members Agent cannot have.
+    assert agent_calls <= public_methods | CLIENT_ONLY_MEMBERS
     assert {
         "catalog_preview",
         "conversation_exists",

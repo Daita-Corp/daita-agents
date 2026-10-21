@@ -10,9 +10,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from ..agent import Agent
+from ..config import AgentConfig
 from ..errors import StateCompatibilityError
 from ..hosting.agent_home import WRITER_ROLE
-from ..hosting.errors import AgentAlreadyExistsError, AgentHomeError, HostActiveError
+from ..hosting.errors import (
+    AgentAlreadyExistsError,
+    AgentHomeError,
+    AgentModelConfigurationError,
+    HostActiveError,
+)
 from ..jobs.graph.models import TERMINAL_GRAPH_STATES, GraphState
 from ..observation import AgentEvent, AgentEventKind
 from ..routines import RoutineState
@@ -33,6 +39,8 @@ _UNFINISHED_JOBS = frozenset(GraphState) - TERMINAL_GRAPH_STATES
 class _Entry:
     agent: Agent
     workspace: LocalWorkspace
+    # Opened without its saved model settings, which this release cannot admit.
+    requires_replacement: bool = False
 
 
 class AgentRegistry:
@@ -59,14 +67,24 @@ class AgentRegistry:
     def open_names(self) -> tuple[str, ...]:
         return tuple(sorted(self._entries))
 
-    async def get(self, name: str, cwd: Path | None = None) -> Agent:
-        """Return the open agent, reopening it in the client's folder when idle."""
+    def requires_replacement(self, name: str) -> bool:
+        entry = self._entries.get(name)
+        return entry is not None and entry.requires_replacement
+
+    async def get(
+        self, name: str, cwd: Path | None = None, *, recover: bool = True
+    ) -> Agent:
+        """Return the open agent, reopening it in the client's folder when idle.
+
+        With ``recover``, saved model settings this release cannot admit open the
+        agent without them, so a client can replace them.
+        """
 
         entry = self._entries.get(name)
         if entry is not None and (cwd is None or entry.workspace == self._for(cwd)):
             return entry.agent
         async with self._lock(name):
-            return await self._ensure(name, cwd)
+            return await self._ensure(name, cwd, recover)
 
     async def create(self, name: str, cwd: Path | None) -> Agent:
         async with self._lock(name):
@@ -77,6 +95,17 @@ class AgentRegistry:
             self._entries[name] = _Entry(agent, workspace)
             self._bus.publish(name, EventType.AGENT_STATE, {"state": "opened"})
             return agent
+
+    async def reopen(self, name: str) -> None:
+        """Reopen an idle open agent so saved changes, such as its model, apply.
+
+        A busy agent keeps its current composition until its next reopen.
+        """
+
+        async with self._lock(name):
+            entry = self._entries.get(name)
+            if entry is not None and not self._busy(name):
+                await self._replace(name, entry, entry.workspace)
 
     async def delete(self, name: str) -> None:
         async with self._lock(name):
@@ -97,7 +126,8 @@ class AgentRegistry:
 
         for name in await Agent.list(root=self._root):
             try:
-                agent = await self.get(name)
+                # Unadmittable model settings wait for a person to replace them.
+                agent = await self.get(name, recover=False)
                 if not await _has_background_work(agent):
                     await self.close(name)
             except (AgentHomeError, StateCompatibilityError, ValueError) as error:
@@ -105,27 +135,51 @@ class AgentRegistry:
                     "agent skipped at startup: %s (%s)", name, type(error).__name__
                 )
 
-    async def _ensure(self, name: str, cwd: Path | None) -> Agent:
+    async def _ensure(self, name: str, cwd: Path | None, recover: bool) -> Agent:
         entry = self._entries.get(name)
         if entry is not None and cwd is None:
             return entry.agent
         workspace = self._for(cwd)
-        if entry is not None:
-            if entry.workspace == workspace:
-                return entry.agent
-            if self._runs.active(name) or self._hub.pending(name):
-                raise WorkspaceBusyError(
-                    f"Daita is busy in {entry.workspace.root}. Wait for it to "
-                    "finish, or ask without local files.",
-                    folder=entry.workspace.root,
-                )
-            # shortcut: a non-run request still in flight on the old instance
-            # fails when it closes; track in-flight calls if that shows up.
-            del self._entries[name]
-            await entry.agent.close()
-        agent = await self._compose(Agent.open, name, workspace)
-        self._entries[name] = _Entry(agent, workspace)
-        state = "opened" if entry is None else "reopened"
+        if entry is None:
+            return await self._admit(name, workspace, "opened", recover)
+        if entry.workspace == workspace:
+            return entry.agent
+        if self._busy(name):
+            raise WorkspaceBusyError(
+                f"Daita is busy in {entry.workspace.root}. Wait for it to "
+                "finish, or ask without local files.",
+                folder=entry.workspace.root,
+            )
+        return await self._replace(name, entry, workspace)
+
+    def _busy(self, name: str) -> bool:
+        return bool(self._runs.active(name) or self._hub.pending(name))
+
+    async def _replace(
+        self, name: str, entry: _Entry, workspace: LocalWorkspace
+    ) -> Agent:
+        # shortcut: a non-run request still in flight on the old instance
+        # fails when it closes; track in-flight calls if that shows up.
+        del self._entries[name]
+        await entry.agent.close()
+        return await self._admit(name, workspace, "reopened", recover=True)
+
+    async def _admit(
+        self, name: str, workspace: LocalWorkspace, state: str, recover: bool
+    ) -> Agent:
+        try:
+            agent = await self._compose(Agent.open, name, workspace)
+            requires_replacement = False
+        except AgentModelConfigurationError:
+            if not recover:
+                raise
+            # Open without the saved model settings so the user can replace them;
+            # the next reopen after configure_model reads the new ones.
+            agent = await self._compose(
+                Agent.open, name, workspace, config=AgentConfig()
+            )
+            requires_replacement = True
+        self._entries[name] = _Entry(agent, workspace, requires_replacement)
         self._bus.publish(name, EventType.AGENT_STATE, {"state": state})
         return agent
 
@@ -134,6 +188,7 @@ class AgentRegistry:
         opener: Callable[..., Awaitable[Agent]],
         name: str,
         workspace: LocalWorkspace,
+        **overrides: object,
     ) -> Agent:
         token = WRITER_ROLE.set("host")
         try:
@@ -149,7 +204,7 @@ class AgentRegistry:
                     run_ref=CURRENT_RUN.get,
                     waiting=self._runs.waiting,
                 ),
-                **self._options,
+                **{**self._options, **overrides},
             )
         except HostActiveError as error:
             if type(error) is not HostActiveError:

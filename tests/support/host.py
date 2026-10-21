@@ -8,7 +8,7 @@ import json
 import shutil
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,13 +16,16 @@ from typing import Any
 import httpx
 import pytest
 
-from daita import __version__
+from daita import LocalWorkspace, __version__
+from daita.host.client import RemoteAgent, connect
 from daita.host.codec import decode
-from daita.host.paths import HostPaths
+from daita.host.paths import HostPaths, host_paths
 from daita.host.protocol import PROTOCOL_HEADER, PROTOCOL_VERSION, VERSION_HEADER
-from daita.host.server import Host
+from daita.host.server import Host, serve_host
 from daita.llm import subscription_auth
+from daita.llm.models import ModelProfile
 from tests.llm._subscription_support import _jwt
+from tests.support.mcp import MemoryKeychain
 
 VERSION_HEADERS = {PROTOCOL_HEADER: str(PROTOCOL_VERSION), VERSION_HEADER: __version__}
 ACTIVE = frozenset({"queued", "running", "waiting_for_input"})
@@ -35,7 +38,12 @@ def short_root() -> Path:
 
 
 def remove_root(root: Path) -> None:
-    for folder in (root, *root.parent.glob(f"{root.name}-*")):
+    # Work folders sit beside the root; workspace_for() makes hidden ones there.
+    siblings = (
+        *root.parent.glob(f"{root.name}-*"),
+        *root.parent.glob(f".{root.name}-*"),
+    )
+    for folder in (root, *siblings):
         shutil.rmtree(folder, ignore_errors=True)
 
 
@@ -113,6 +121,85 @@ class HostHarness:
             await asyncio.wait_for(asyncio.shield(self.task), 60)
         finally:
             await self.http.aclose()
+
+
+StartHost = Callable[..., Awaitable[HostHarness]]
+
+
+@contextlib.asynccontextmanager
+async def hosts() -> AsyncIterator[StartHost]:
+    """Start real in-process hosts on short sockets; stop and remove each after.
+
+    ``model`` is injected into every agent the host opens, with an in-memory
+    keychain so no test touches the OS keychain.
+    """
+
+    harnesses: list[HostHarness] = []
+
+    async def start(
+        *,
+        model: object = None,
+        root: Path | None = None,
+        agent_options: Mapping[str, object] | None = None,
+        **options: object,
+    ) -> HostHarness:
+        paths = host_paths(root or short_root())
+        composed: dict[str, object] = {"keychain": MemoryKeychain()}
+        if model is not None:
+            composed["model"] = model
+            composed["model_profile"] = ModelProfile(
+                id=model.provider_id,  # type: ignore[attr-defined]
+                context_window_tokens=32_000,
+                max_output_tokens=1_000,
+                supports_tools=True,
+                supports_parallel_tools=True,
+            )
+        composed.update(agent_options or {})
+        ready: asyncio.Future[Host] = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(
+            serve_host(
+                paths,
+                on_ready=ready.set_result,
+                agent_options=composed,
+                **options,  # type: ignore[arg-type]
+            )
+        )
+
+        def stopped(done: asyncio.Task[None]) -> None:
+            if not ready.done():
+                error = done.exception() if not done.cancelled() else None
+                ready.set_exception(error or RuntimeError("the host stopped early"))
+
+        task.add_done_callback(stopped)
+        host = await asyncio.wait_for(ready, 30)
+        harness = HostHarness(host, paths, task, client(paths))
+        harnesses.append(harness)
+        return harness
+
+    try:
+        yield start
+    finally:
+        for harness in harnesses:
+            try:
+                await harness.stop()
+                assert not harness.paths.socket.exists()
+            finally:
+                remove_root(harness.root)
+
+
+async def remote_agent(
+    harness: HostHarness, name: str, **callbacks: Any
+) -> RemoteAgent:
+    """Create one agent in the harness host and attach from its work folder."""
+
+    await harness.create_agent(name)
+    return await connect(name, cwd=harness.work(), root=harness.root, **callbacks)
+
+
+def host_workspace(harness: HostHarness) -> LocalWorkspace:
+    """The app's folder: the work folder its remote agents were attached from."""
+
+    return LocalWorkspace(harness.work())
 
 
 async def bounded(
@@ -240,13 +327,17 @@ __all__ = [
     "ACTIVE",
     "EventStream",
     "HostHarness",
+    "StartHost",
     "VERSION_HEADERS",
     "bounded",
     "client",
     "error_code",
     "fake_openai_device_login",
+    "host_workspace",
+    "hosts",
     "finished_run",
     "pending_interaction",
+    "remote_agent",
     "remove_root",
     "short_root",
     "value",

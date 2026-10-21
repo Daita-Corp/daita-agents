@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 
+from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.tui._support import (
     MAX_CLIPBOARD_UTF8_BYTES,
     MAX_COMPOSER_CHARACTERS,
     UTC,
     ActivityBar,
-    Agent,
     AgentEvent,
     AgentEventKind,
     ChatScreen,
@@ -25,7 +25,6 @@ from tests.tui._support import (
     ModelResponse,
     ObserverEvent,
     Offset,
-    Path,
     Selection,
     Static,
     ToolCard,
@@ -155,7 +154,7 @@ def test_answer_summary_reports_queries_rows_steps_time_and_tokens():
 
 
 async def test_live_activity_and_exact_model_context_update_from_observation(
-    tmp_path: Path,
+    start_host: StartHost,
 ):
     provider = MockModelProvider(
         (
@@ -166,15 +165,10 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
         )
     )
     profile = _mock_profile(provider)
-    opened = await Agent.create(
-        "observed-agent",
-        root=tmp_path,
-        model=provider,
-        model_profile=profile,
-        workspace=workspace_for(tmp_path),
-    )
+    harness = await start_host(model=provider, agent_options={"model_profile": profile})
+    opened = await remote_agent(harness, "observed-agent")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:
@@ -393,15 +387,14 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
         await opened.close()
 
 
-async def test_composer_submit_runs_agent_once(tmp_path: Path):
+async def test_composer_submit_runs_agent_once(start_host: StartHost):
     from datetime import UTC, datetime
 
     from daita import LoopExit, LoopExitKind
     from daita.tui.screens.chat import ChatScreen
 
-    opened = await Agent.create(
-        "ready", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "ready")
     calls: list[str] = []
 
     async def fake_run(message: str, **_kwargs: object) -> LoopExit:
@@ -417,7 +410,7 @@ async def test_composer_submit_runs_agent_once(tmp_path: Path):
 
     opened.run = fake_run  # type: ignore[method-assign]
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:
@@ -437,7 +430,7 @@ async def test_composer_submit_runs_agent_once(tmp_path: Path):
 
 
 async def test_chat_accumulates_and_resumes_the_full_conversation_transcript(
-    tmp_path: Path,
+    start_host: StartHost,
 ):
     provider = MockModelProvider(
         (
@@ -445,15 +438,12 @@ async def test_chat_accumulates_and_resumes_the_full_conversation_transcript(
             ModelResponse(finish_reason=FinishReason.STOP, text="Second answer"),
         )
     )
-    opened = await Agent.create(
-        "conversation-transcript",
-        root=tmp_path,
-        model=provider,
-        model_profile=_mock_profile(provider),
-        workspace=workspace_for(tmp_path),
+    harness = await start_host(
+        model=provider, agent_options={"model_profile": _mock_profile(provider)}
     )
+    opened = await remote_agent(harness, "conversation-transcript")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:

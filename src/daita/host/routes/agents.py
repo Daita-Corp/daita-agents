@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route as HttpRoute
 
 from ...agent import Agent
 from . import AGENT_PREFIX, fields, guarded, host_of, read_body, request_cwd, respond
+
+if TYPE_CHECKING:
+    from ..server import Host
 
 MEMBERS = frozenset(
     {
@@ -28,7 +33,7 @@ MEMBERS = frozenset(
 )
 
 
-def status(agent: Agent) -> dict[str, object]:
+def status(host: Host, agent: Agent) -> dict[str, object]:
     return {
         "id": agent.id,
         "name": agent.name,
@@ -38,6 +43,9 @@ def status(agent: Agent) -> dict[str, object]:
         "workspace": agent.workspace,
         "session_source_id": agent.session_source_id,
         "background": agent.background_status(),
+        "model_configuration_requires_replacement": (
+            host.registry.requires_replacement(agent.name)
+        ),
     }
 
 
@@ -54,19 +62,21 @@ async def _create(request: Request) -> Response:
         await read_body(request), {"name": str, "cwd": str | None}, {"cwd": None}
     )
     cwd = request_cwd(request, values["cwd"])
-    return respond(status(await host.registry.create(values["name"], cwd)), 201)
+    agent = await host.registry.create(values["name"], cwd)
+    return respond(status(host, agent), 201)
 
 
 async def _open(request: Request) -> Response:
     host = host_of(request)
     values = fields(await read_body(request), {"cwd": str | None}, {"cwd": None})
     cwd = request_cwd(request, values["cwd"])
-    return respond(status(await host.registry.get(request.path_params["agent"], cwd)))
+    agent = await host.registry.get(request.path_params["agent"], cwd)
+    return respond(status(host, agent))
 
 
 async def _status(request: Request) -> Response:
     host = host_of(request)
-    return respond(status(await host.registry.get(request.path_params["agent"])))
+    return respond(status(host, await host.registry.get(request.path_params["agent"])))
 
 
 async def _close(request: Request) -> Response:

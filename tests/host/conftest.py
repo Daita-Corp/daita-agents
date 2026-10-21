@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -50,8 +50,6 @@ from daita.distribution.models import (
     DeliveryView,
     DistributionDestination,
 )
-from daita.host.paths import host_paths
-from daita.host.server import Host, serve_host
 from daita.hosting.home_upgrade import AgentHomeStatus
 from daita.hosting.sources import SourceEditResult
 from daita.jobs.graph.models import (
@@ -111,7 +109,7 @@ from daita.storage.sqlite_records import (
 from daita.work_board import WorkBoard
 from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.graph import GRAPH_NOW, graph_admission, task_result
-from tests.support.host import HostHarness, client, remove_root, short_root
+from tests.support.host import StartHost, hosts
 from tests.support.mcp import MemoryKeychain, conformance_identities, mock_transport
 from tests.support.toolbox_model import ToolboxAwareMockModelProvider
 from tests.support.workspace import workspace_for
@@ -661,63 +659,9 @@ def _analysis_summary() -> dict[str, object]:
     }
 
 
-StartHost = Callable[..., Awaitable[HostHarness]]
-
-
 @pytest.fixture
 async def start_host() -> AsyncIterator[StartHost]:
-    """Start real hosts on short sockets; each is stopped and removed afterwards.
+    """Start real hosts on short sockets; each is stopped and removed afterwards."""
 
-    ``model`` is injected into every agent the host opens, with an in-memory
-    keychain so no test touches the OS keychain.
-    """
-
-    harnesses: list[HostHarness] = []
-
-    async def start(
-        *,
-        model: object = None,
-        root: Path | None = None,
-        agent_options: Mapping[str, object] | None = None,
-        **options: object,
-    ) -> HostHarness:
-        paths = host_paths(root or short_root())
-        composed: dict[str, object] = {"keychain": MemoryKeychain()}
-        if model is not None:
-            composed["model"] = model
-            composed["model_profile"] = ModelProfile(
-                id=model.provider_id,  # type: ignore[attr-defined]
-                context_window_tokens=32_000,
-                max_output_tokens=1_000,
-                supports_tools=True,
-                supports_parallel_tools=True,
-            )
-        composed.update(agent_options or {})
-        ready: asyncio.Future[Host] = asyncio.get_running_loop().create_future()
-        task = asyncio.create_task(
-            serve_host(
-                paths,
-                on_ready=ready.set_result,
-                agent_options=composed,
-                **options,  # type: ignore[arg-type]
-            )
-        )
-
-        def stopped(done: asyncio.Task[None]) -> None:
-            if not ready.done():
-                error = done.exception() if not done.cancelled() else None
-                ready.set_exception(error or RuntimeError("the host stopped early"))
-
-        task.add_done_callback(stopped)
-        host = await asyncio.wait_for(ready, 30)
-        harness = HostHarness(host, paths, task, client(paths))
-        harnesses.append(harness)
-        return harness
-
-    yield start
-    for harness in harnesses:
-        try:
-            await harness.stop()
-            assert not harness.paths.socket.exists()
-        finally:
-            remove_root(harness.root)
+    async with hosts() as start:
+        yield start

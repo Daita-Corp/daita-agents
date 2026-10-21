@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.support.product_workflows import (
     ActionFixture,
     Agent,
@@ -18,13 +19,16 @@ from tests.support.product_workflows import (
 pytestmark = _pytestmark
 
 
-async def test_background_refresh_preserves_foreground_approval_state(tmp_path):
+async def test_background_refresh_preserves_foreground_approval_state(
+    start_host: StartHost,
+):
     from daita.tui.screens.chat import ChatScreen
 
-    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(tmp_path))
-    agent = await Agent.create(
-        "status-review", root=tmp_path, workspace=workspace_for(tmp_path)
+    harness = await start_host()
+    app = DaitaApp(
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
+    agent = await remote_agent(harness, "status-review")
     app.controller.agent = agent
     try:
         async with app.run_test(size=(110, 36)):

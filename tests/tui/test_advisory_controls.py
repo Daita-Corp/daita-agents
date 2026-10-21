@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.tui._support import (
-    Agent,
     DaitaApp,
     Iterator,
-    Path,
     contextmanager,
     workspace_for,
 )
@@ -36,13 +35,12 @@ def test_external_editor_runs_only_inside_textual_suspend():
 
 
 async def test_skill_and_memory_editor_flows_use_public_controller(
-    tmp_path: Path,
+    start_host: StartHost,
 ):
-    opened = await Agent.create(
-        "editors", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "editors")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:

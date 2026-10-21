@@ -43,6 +43,7 @@ from daita.host import (
 from daita.host.client import RemoteAgent
 from daita.host.codec import supports
 from daita.host.protocol import (
+    CLIENT_ONLY_MEMBERS,
     CLIENT_SIDE_ANNOTATIONS,
     REMOTE_AGENT_SURFACE,
     ConversationBusyError,
@@ -127,7 +128,8 @@ def _shape(member: object, client_side: frozenset[str]) -> list[object]:
 
 @pytest.mark.unit
 def test_remote_agent_has_exactly_the_surface_members() -> None:
-    assert _public(RemoteAgent) == REMOTE_AGENT_SURFACE
+    assert _public(RemoteAgent) == REMOTE_AGENT_SURFACE | CLIENT_ONLY_MEMBERS
+    assert not REMOTE_AGENT_SURFACE & CLIENT_ONLY_MEMBERS
 
 
 @pytest.mark.unit
@@ -933,9 +935,68 @@ async def test_an_unanswered_approval_interrupts_the_run_and_never_denies(
 
 
 @pytest.mark.integration
-async def test_configuring_the_model_refreshes_the_cached_properties(
+async def test_configuring_the_model_reopens_an_idle_agent_on_the_new_route(
     start_host: StartHost,
 ) -> None:
+    harness = await start_host(agent_options={"model_validator": _validator()})
+    await harness.create_agent()
+    agent = await daita.connect("sales", cwd=harness.work(), root=harness.root)
+    try:
+        async with harness.events("sales") as events:
+            route = await agent.configure_model(**_OPENAI)
+            await events.next("agent_state", lambda data: data["state"] == "reopened")
+        current = agent.model_route
+        live = value(await harness.http.get("/v1/agents/sales"))["model_route"]
+    finally:
+        await agent.close()
+
+    # The host reopened the idle agent, so the new route is in effect at once.
+    assert current == live == route
+    assert route.candidates[0].provider_id == "openai:test-model"
+
+
+@pytest.mark.integration
+async def test_a_busy_agent_keeps_its_route_until_its_next_reopen(
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authorized = asyncio.Event()
+    fake_openai_device_login(monkeypatch, authorized)
+    harness = await start_host(agent_options={"model_validator": _validator()})
+    await harness.create_agent()
+    agent = await daita.connect("sales", cwd=harness.work(), root=harness.root)
+    # A pending question makes the agent busy, like an active run.
+    login = asyncio.create_task(
+        harness.http.post(
+            "/v1/agents/sales/model/subscription-login", json={"provider": "codex"}
+        )
+    )
+    try:
+        await pending_interaction(harness.http, "sales")
+        route = await agent.configure_model(**_OPENAI)
+        busy = value(await harness.http.get("/v1/agents/sales"))["model_route"]
+        authorized.set()
+        await asyncio.wait_for(login, 10)
+        reopened = await harness.http.post(
+            "/v1/agents/sales/open", json={"cwd": str(harness.work("other"))}
+        )
+    finally:
+        authorized.set()
+        await agent.close()
+
+    assert busy is None
+    assert value(reopened)["model_route"] == route
+
+
+_OPENAI: dict[str, Any] = {
+    "provider": "openai",
+    "model": "test-model",
+    "api_key": "sk-test-not-real",
+    "context_window_tokens": 8_192,
+    "max_output_tokens": 1_024,
+}
+
+
+def _validator() -> MockModelProvider:
     validation = ModelResponse(
         finish_reason=FinishReason.TOOL_CALLS,
         tool_calls=(
@@ -945,31 +1006,7 @@ async def test_configuring_the_model_refreshes_the_cached_properties(
         ),
         provider_id="openai:test-model",
     )
-    validator = MockModelProvider((validation,), provider_id="openai:test-model")
-    harness = await start_host(agent_options={"model_validator": validator})
-    await harness.create_agent()
-    agent = await daita.connect("sales", cwd=harness.work(), root=harness.root)
-    try:
-        route = await agent.configure_model(
-            provider="openai",
-            model="test-model",
-            api_key="sk-test-not-real",
-            context_window_tokens=8_192,
-            max_output_tokens=1_024,
-        )
-        # Like Agent, the open agent keeps its route until it is reopened.
-        unchanged = agent.model_route
-        live = value(await harness.http.get("/v1/agents/sales"))["model_route"]
-        reopened = await harness.http.post(
-            "/v1/agents/sales/open", json={"cwd": str(harness.work("other"))}
-        )
-        await bounded(lambda: agent.model_route == route)
-    finally:
-        await agent.close()
-
-    assert (unchanged, live) == (None, None)
-    assert value(reopened)["model_route"] == route
-    assert route.candidates[0].provider_id == "openai:test-model"
+    return MockModelProvider((validation,), provider_id="openai:test-model")
 
 
 @pytest.mark.integration

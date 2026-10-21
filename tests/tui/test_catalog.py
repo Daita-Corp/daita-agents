@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.tui._support import (
-    Agent,
     Button,
     CatalogScreen,
     ChatScreen,
@@ -29,16 +29,15 @@ from tests.tui._support import (
 
 
 async def test_source_permissions_picker_remains_interactive_after_command_submit(
-    tmp_path: Path,
+    tmp_path: Path, start_host: StartHost
 ):
     database = tmp_path / "permissions.sqlite"
     _create_sqlite_source(database, "records")
-    opened = await Agent.create(
-        "permissions-picker", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "permissions-picker")
     source = await opened.attach(SQLiteSource(database, name="Records"))
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:
@@ -233,17 +232,18 @@ async def test_source_permissions_configures_exact_relational_write_scope():
         app.exit(0)
 
 
-async def test_source_edit_screen_reviews_and_switches_atomically(tmp_path: Path):
+async def test_source_edit_screen_reviews_and_switches_atomically(
+    tmp_path: Path, start_host: StartHost
+):
     current_path = tmp_path / "current.sqlite"
     edited_path = tmp_path / "edited.sqlite"
     _create_sqlite_source(current_path, "records")
     _create_sqlite_source(edited_path, "records")
-    opened = await Agent.create(
-        "source-editor", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "source-editor")
     await opened.attach(SQLiteSource(current_path, name="Warehouse"))
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:
@@ -371,18 +371,19 @@ async def test_source_edit_rejects_a_zero_resource_preview_without_confirmation(
         app.exit(0)
 
 
-async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path):
+async def test_catalog_command_opens_grouped_named_resource_tree(
+    tmp_path: Path, start_host: StartHost
+):
     first_path = tmp_path / "first.sqlite"
     second_path = tmp_path / "second.sqlite"
     _create_sqlite_source(first_path, "orders")
     _create_sqlite_source(second_path, "tickets")
-    opened = await Agent.create(
-        "catalog-browser", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "catalog-browser")
     first = await opened.attach(SQLiteSource(first_path, name="Sales"))
     await opened.attach(SQLiteSource(second_path, name="Support"))
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:
@@ -520,7 +521,9 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
         await opened.close()
 
 
-async def test_catalog_tree_graph_explores_relationship_neighborhoods(tmp_path: Path):
+async def test_catalog_tree_graph_explores_relationship_neighborhoods(
+    tmp_path: Path, start_host: StartHost
+):
     database = tmp_path / "relationships.sqlite"
     with sqlite3.connect(database) as connection:
         connection.executescript("""
@@ -534,12 +537,11 @@ async def test_catalog_tree_graph_explores_relationship_neighborhoods(tmp_path: 
             );
             """)
 
-    opened = await Agent.create(
-        "catalog-tree-graph", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "catalog-tree-graph")
     await opened.attach(SQLiteSource(database, name="Sales"))
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:
@@ -614,15 +616,16 @@ async def test_catalog_tree_graph_explores_relationship_neighborhoods(tmp_path: 
         await opened.close()
 
 
-async def test_sources_manager_routes_actions_for_the_selected_source(tmp_path: Path):
+async def test_sources_manager_routes_actions_for_the_selected_source(
+    tmp_path: Path, start_host: StartHost
+):
     database = tmp_path / "managed.sqlite"
     _create_sqlite_source(database, "records")
-    opened = await Agent.create(
-        "sources-manager", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "sources-manager")
     source = await opened.attach(SQLiteSource(database, name="Managed source"))
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:
@@ -717,16 +720,15 @@ async def test_catalog_notice_and_tree_are_ready_before_mount_completes():
 
 
 async def test_empty_catalog_refresh_opens_catalog_without_an_onboarding_loop(
-    tmp_path: Path,
+    tmp_path: Path, start_host: StartHost
 ):
     database = tmp_path / "empty.sqlite"
     sqlite3.connect(database).close()
-    opened = await Agent.create(
-        "empty-catalog-browser", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "empty-catalog-browser")
     source = await opened.attach(SQLiteSource(database, name="Empty source"))
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:

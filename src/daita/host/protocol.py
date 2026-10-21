@@ -172,6 +172,15 @@ REMOTE_AGENT_SURFACE: Final = frozenset(
         "delete_mcp_bearer",
     }
 )
+# RemoteAgent members with no Agent counterpart: facts only a host client has.
+CLIENT_ONLY_MEMBERS: Final = frozenset(
+    {
+        "active_runs",
+        "follow_run",
+        "connection",
+        "model_configuration_requires_replacement",
+    }
+)
 
 # In-process composition the host owns; "return" marks the RemoteAgent the
 # client builds itself instead of receiving one.
@@ -388,6 +397,7 @@ def _fields(payload: JsonValue, names: set[str]) -> dict[str, JsonValue]:
 
 
 __all__ = [
+    "CLIENT_ONLY_MEMBERS",
     "CLIENT_SIDE_ANNOTATIONS",
     "CWD_HEADER",
     "ERROR_CODES",

@@ -11,11 +11,13 @@ from daita.errors import StateCompatibilityCode, StateCompatibilityError
 from daita.tui.app import DaitaApp, run_daita_app
 from daita.tui.screens.onboarding import AgentCreateScreen
 from daita.tui.screens.selection import SelectionScreen
+from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.support.workspace import workspace_for
 
 
-async def test_empty_root_opens_create_screen_inside_textual(tmp_path: Path):
-    app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path))
+async def test_empty_root_opens_create_screen_inside_textual(start_host: StartHost):
+    harness = await start_host()
+    app = DaitaApp(root=harness.root, workspace=host_workspace(harness))
     async with app.run_test() as pilot:
         await pilot.pause(0.3)
         assert isinstance(app.screen, AgentCreateScreen)
@@ -25,9 +27,12 @@ async def test_empty_root_opens_create_screen_inside_textual(tmp_path: Path):
     assert app.return_value == 0
 
 
-async def test_requested_missing_agent_does_not_prompt_before_app(tmp_path: Path):
+async def test_requested_missing_agent_does_not_prompt_before_app(
+    start_host: StartHost,
+):
+    harness = await start_host()
     app = DaitaApp(
-        root=tmp_path, agent_name="missing", workspace=workspace_for(tmp_path)
+        root=harness.root, agent_name="missing", workspace=host_workspace(harness)
     )
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -108,26 +113,28 @@ async def test_tui_nonzero_exit_without_exception_is_not_reported_as_success(
 
 
 async def test_requested_conversation_is_validated_and_resumed(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, start_host: StartHost
 ):
-    opened = await Agent.create(
-        "atlas", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "atlas")
     await opened.close()
     checked: list[str] = []
 
-    async def conversation_exists(_agent: Agent, conversation_id: str) -> bool:
+    # The host route passes every wire argument, such as caller_principal_id.
+    async def conversation_exists(
+        _agent: Agent, conversation_id: str, **_kwargs: object
+    ) -> bool:
         checked.append(conversation_id)
         return True
 
-    async def conversation_runs(_agent: Agent, _conversation_id: str):
+    async def conversation_runs(_agent: Agent, _conversation_id: str, **_kwargs):
         return ()
 
     monkeypatch.setattr(Agent, "conversation_exists", conversation_exists)
     monkeypatch.setattr(Agent, "conversation_runs", conversation_runs)
     app = DaitaApp(
-        root=tmp_path,
-        workspace=workspace_for(tmp_path),
+        root=harness.root,
+        workspace=host_workspace(harness),
         agent_name="atlas",
         conversation_id="conversation-1",
         start_bootstrap=False,
@@ -147,15 +154,14 @@ async def test_requested_conversation_is_validated_and_resumed(
 
 
 async def test_unknown_requested_conversation_fails_startup(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, start_host: StartHost
 ):
-    opened = await Agent.create(
-        "atlas", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "atlas")
     await opened.close()
     app = DaitaApp(
-        root=tmp_path,
-        workspace=workspace_for(tmp_path),
+        root=harness.root,
+        workspace=host_workspace(harness),
         agent_name="atlas",
         conversation_id="conversation-missing",
         start_bootstrap=False,
@@ -177,15 +183,14 @@ async def test_unknown_requested_conversation_fails_startup(
 
 
 async def test_incompatible_agent_state_returns_to_agent_picker(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, start_host: StartHost
 ):
-    opened = await Agent.create(
-        "atlas", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "atlas")
     await opened.close()
     app = DaitaApp(
-        root=tmp_path,
-        workspace=workspace_for(tmp_path),
+        root=harness.root,
+        workspace=host_workspace(harness),
         agent_name="atlas",
         start_bootstrap=False,
     )

@@ -20,6 +20,7 @@ from daita import (
     SemanticKind,
     SemanticSubject,
 )
+from daita.host.client import connect
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
@@ -36,6 +37,7 @@ from daita.semantics import semantic_annotation_sha256
 from daita.tui.commands import SLASH_COMMAND_COMPLETIONS, learning_invocation_message
 from daita.tui.controller import PresentationController
 from tests.support.capability_runtime import execute_projected
+from tests.support.host import StartHost, host_workspace
 from tests.support.toolbox_model import (
     ToolboxAwareMockModelProvider as MockModelProvider,
 )
@@ -395,7 +397,9 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         await reopened.close()
 
 
-async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
+async def test_memory_terminal_surface_shows_semantic_states(
+    tmp_path, start_host: StartHost
+):
     database = tmp_path / "semantic-memory-surface.db"
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -405,14 +409,19 @@ async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
     provider = MockModelProvider(
         (ModelResponse(finish_reason=FinishReason.STOP, text="evidence"),)
     )
+    composition = {
+        "model": provider,
+        "model_profile": _profile(provider),
+        "limits": EAGER_LIMITS,
+        "clock": lambda: NOW,
+    }
+    harness = await start_host(agent_options=composition)
+    # Seed private semantic state in-process, then hand the host one writer.
     agent = await Agent.create(
         "semantic-memory-surface",
-        root=tmp_path,
-        model=provider,
-        model_profile=_profile(provider),
-        limits=EAGER_LIMITS,
-        clock=lambda: NOW,
-        workspace=workspace_for(tmp_path),
+        root=harness.root,
+        **composition,  # type: ignore[arg-type]
+        workspace=host_workspace(harness),
     )
     try:
         source = await agent.attach_sqlite(database)
@@ -537,8 +546,13 @@ async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
         assert conflict_maintenance["state"] == "conflicting"
         assert conflict_maintenance["usable_as_current_meaning"] is False
         assert conflict_maintenance["requires_revalidation"] is True
-        controller = PresentationController(root=None, workspace=workspace_for(None))
-        controller.agent = agent
+        await agent.close()
+        controller = PresentationController(
+            root=harness.root, workspace=host_workspace(harness)
+        )
+        controller.agent = await connect(
+            "semantic-memory-surface", cwd=harness.work(), root=harness.root
+        )
         rendered = (await controller.dispatch_command("/memory")).message
         assert "Global memory:" in rendered
         assert "Active data semantics:" in rendered
@@ -560,5 +574,6 @@ async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
             item for item in SLASH_COMMAND_COMPLETIONS if item[0] == "/memory"
         )
         assert "duplicate, stale, conflicting, and superseded" in memory_completion[2]
+        await controller.close()
     finally:
         await agent.close()

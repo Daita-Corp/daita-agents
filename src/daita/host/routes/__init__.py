@@ -69,6 +69,8 @@ class Route:
     member: str
     # Publish work_changed after success: the work board may have changed.
     work: bool = False
+    # Reopen the agent after success when idle, so saved changes take effect.
+    reopen: bool = False
     # Supplies confirmation_handler when the client sends it as true.
     callback: Callable[[Host, str], object] | None = None
 
@@ -209,6 +211,8 @@ def _endpoint(route: Route) -> Handler:
             result = await result
         if route.work:
             host.bus.publish(name, EventType.WORK_CHANGED, {"member": route.member})
+        if route.reopen:
+            await host.registry.reopen(name)
         return respond(result)
 
     return guarded(handle)

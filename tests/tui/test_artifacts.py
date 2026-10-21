@@ -11,7 +11,7 @@ from rich.color import ColorType
 from rich.console import Console, RenderableType
 from textual.widgets import Button, Collapsible, OptionList, Static
 
-from daita import Agent
+from daita import connect
 from daita.artifacts import ArtifactError, ArtifactPayload, ArtifactRef
 from daita.artifacts.models import (
     ArtifactAuthorship,
@@ -44,6 +44,7 @@ from tests.artifacts._public_surface_support import (
     artifact_delivery_messages,
     delivery_module,
 )
+from tests.support.host import StartHost, host_workspace
 from tests.support.workspace import workspace_for
 
 
@@ -196,13 +197,18 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
 
 
 @pytest.mark.integration
-async def test_artifact_command_manages_registered_files_after_history_clear(tmp_path):
+async def test_artifact_command_manages_registered_files_after_history_clear(
+    tmp_path, start_host: StartHost
+):
     downloads = tmp_path / "Downloads"
     downloads.mkdir()
-    agent, ref = await _create_artifact_agent(tmp_path, "tui-artifacts", downloads)
+    harness = await start_host(agent_options={"downloads_directory": downloads})
+    built, ref = await _create_artifact_agent(harness.root, "tui-artifacts", downloads)
+    await built.close()
+    agent = await connect("tui-artifacts", cwd=harness.work(), root=harness.root)
     await agent.clear_conversations()
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = agent
     try:
@@ -295,9 +301,9 @@ async def test_artifact_command_manages_registered_files_after_history_clear(tmp
 
     finally:
         await agent.close()
-    reopened = await Agent.open(
-        "tui-artifacts", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    # Close it in the host so the check reads the agent home afresh.
+    await harness.http.post("/v1/agents/tui-artifacts/close")
+    reopened = await connect("tui-artifacts", cwd=harness.work(), root=harness.root)
     try:
         assert await reopened.list_artifacts() == ()
     finally:
