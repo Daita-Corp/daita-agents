@@ -109,6 +109,7 @@ def test_default_distribution_contains_every_supported_production_dependency():
         "starlette>=1.3.1,<2.0.0",
         "uvicorn>=0.51.0,<1.0.0",
         "sse-starlette>=3.4.5,<4.0.0",
+        "anyio>=4.15.0,<5.0.0",
         "duckdb==1.5.5",
     }
     assert set(project["optional-dependencies"]) == {"dev", "analysis"}
@@ -497,6 +498,7 @@ import sys
 
 blocked = {
     "anthropic",
+    "anyio",
     "asyncpg",
     "google",
     "httpx",

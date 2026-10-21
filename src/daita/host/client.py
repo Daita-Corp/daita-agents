@@ -213,11 +213,7 @@ class HostClient:
             await asyncio.to_thread(_ensure_host, self.paths)
 
     async def aclose(self) -> None:
-        # shortcut: anyio 4.14 raises InvalidStateError when it closes a Unix
-        # stream whose read was cancelled (macOS), after closing the socket;
-        # drop this once anyio settles a done future safely.
-        with contextlib.suppress(asyncio.InvalidStateError):
-            await self._http.aclose()
+        await self._http.aclose()
 
 
 def _ensure_host(paths: HostPaths) -> None:
