@@ -646,6 +646,7 @@ def test_model_suggestions_remain_terminal_only_presentation_metadata():
 
 def test_public_surface_is_focused():
     assert set(daita.__all__) == {
+        "connect",
         "EffectReceipt",
         "EffectResolution",
         "EffectResolutionDecision",

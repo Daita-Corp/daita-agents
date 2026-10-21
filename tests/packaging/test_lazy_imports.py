@@ -108,11 +108,14 @@ import sys
 
 server_libraries = {"sse_starlette", "starlette", "uvicorn"}
 
-def loaded():
-    return sorted(name for name in sys.modules if name.split(".")[0] in server_libraries)
+def loaded(libraries=server_libraries):
+    return sorted(name for name in sys.modules if name.split(".")[0] in libraries)
 
 import daita
 import daita.cli
+import daita.host.client
+if loaded({"httpx", *server_libraries}):
+    raise AssertionError(f"eager client imports: {loaded({'httpx', *server_libraries})}")
 import daita.host.codec
 import daita.host.events
 import daita.host.interactions

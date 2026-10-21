@@ -50,7 +50,8 @@ CWD_HEADER: Final = "X-Daita-Cwd"
 MAX_REQUEST_BYTES: Final = 4 * 1024 * 1024
 MAX_RESPONSE_BYTES: Final = 32 * 1024 * 1024
 
-# Every Agent member that src/daita/tui/ and src/daita/cli.py use.
+# Every Agent member that src/daita/tui/ and src/daita/cli.py use, plus the
+# workspace properties RemoteAgent mirrors from the agent status.
 REMOTE_AGENT_SURFACE: Final = frozenset(
     {
         # Lifecycle and properties
@@ -65,6 +66,8 @@ REMOTE_AGENT_SURFACE: Final = frozenset(
         "home",
         "model_profile",
         "model_route",
+        "workspace",
+        "session_source_id",
         "model_requires_explicit_limits",
         # Runs and conversations
         "run",

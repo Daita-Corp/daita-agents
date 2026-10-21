@@ -67,6 +67,7 @@ from .distribution import (
     OutcomeReference,
     OutcomeState,
 )
+from .host import connect
 from .hosting.resident import ResidentReady, run_resident_host
 from .jobs import (
     GraphInspection,
@@ -135,6 +136,7 @@ __all__ = [
     "EffectOutcome",
     "EffectEvidenceBasis",
     "Agent",
+    "connect",
     "AgentConfig",
     "SourceBackendContext",
     "SourceOperation",

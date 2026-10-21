@@ -116,13 +116,15 @@ def start_host(
     )
 
 
-def stop_host(paths: HostPaths, *, timeout: float = STOP_TIMEOUT_SECONDS) -> bool:
+def stop_host(
+    paths: HostPaths, *, timeout: float = STOP_TIMEOUT_SECONDS, reason: str = "user"
+) -> bool:
     """Ask the host to drain and exit, falling back to SIGTERM; return if one ran."""
 
     import httpx
 
     try:
-        request(paths, "POST", "/v1/host/shutdown", body={"reason": "user"})
+        request(paths, "POST", "/v1/host/shutdown", body={"reason": reason})
     except (httpx.TransportError, OSError):
         pid = _lock_holder_pid(paths)
         if pid is None:

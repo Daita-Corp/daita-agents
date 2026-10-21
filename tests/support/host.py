@@ -14,12 +14,15 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 
 from daita import __version__
 from daita.host.codec import decode
 from daita.host.paths import HostPaths
 from daita.host.protocol import PROTOCOL_HEADER, PROTOCOL_VERSION, VERSION_HEADER
 from daita.host.server import Host
+from daita.llm import subscription_auth
+from tests.llm._subscription_support import _jwt
 
 VERSION_HEADERS = {PROTOCOL_HEADER: str(PROTOCOL_VERSION), VERSION_HEADER: __version__}
 ACTIVE = frozenset({"queued", "running", "waiting_for_input"})
@@ -83,6 +86,16 @@ class HostHarness:
 
         return EventStream(self.http, agent, after=self.host.bus.head(agent))
 
+    def drop_connections(self) -> int:
+        """Close every client connection from the host side, as a broken link would."""
+
+        server = self.host._server
+        assert server is not None
+        connections = list(server.server_state.connections)
+        for connection in connections:
+            connection.transport.close()
+        return len(connections)
+
     async def create_agent(self, name: str = "sales") -> dict[str, Any]:
         response = await self.http.post(
             "/v1/agents", json={"name": name, "cwd": str(self.work())}
@@ -137,6 +150,35 @@ async def pending_interaction(
         return pending[0] if pending else None
 
     return await bounded(probe, timeout=timeout)
+
+
+def fake_openai_device_login(
+    monkeypatch: pytest.MonkeyPatch, authorized: asyncio.Event
+) -> None:
+    """Fake only OpenAI's endpoints; the token poll waits for ``authorized``."""
+
+    async def post_json(url: str, _body: object) -> subscription_auth._HttpResult:
+        if url.endswith("/usercode"):
+            payload: dict[str, object] = {
+                "device_auth_id": "device-1",
+                "user_code": "ABCD-EFGH",
+                "interval": 1,
+            }
+        else:
+            await authorized.wait()
+            payload = {"authorization_code": "code-1", "code_verifier": "verifier-1"}
+        return subscription_auth._HttpResult(200, json.dumps(payload).encode())
+
+    async def post_form(_url: str, _body: object) -> subscription_auth._HttpResult:
+        tokens = {
+            "access_token": _jwt(),
+            "refresh_token": "refresh-1",
+            "expires_in": 3_600,
+        }
+        return subscription_auth._HttpResult(200, json.dumps(tokens).encode())
+
+    monkeypatch.setattr(subscription_auth, "_post_json", post_json)
+    monkeypatch.setattr(subscription_auth, "_post_form", post_form)
 
 
 @dataclass
@@ -202,6 +244,7 @@ __all__ = [
     "bounded",
     "client",
     "error_code",
+    "fake_openai_device_login",
     "finished_run",
     "pending_interaction",
     "remove_root",

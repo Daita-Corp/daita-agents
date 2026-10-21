@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import signal
 import subprocess
@@ -13,10 +14,13 @@ from typing import Any
 
 import pytest
 
+import daita
+from daita import Agent, LocalFileAccess, LocalWorkspace
 from daita.host.codec import decode
 from daita.host.paths import HostPaths, host_paths
 from daita.host.supervise import host_status, request, stop_host
-from tests.support.host import remove_root, short_root
+from tests.support.host import remove_root, short_root, work_folder
+from tests.support.mcp import MemoryKeychain
 
 pytestmark = pytest.mark.integration
 
@@ -151,3 +155,29 @@ def test_runs_of_a_killed_host_are_interrupted_never_active(paths: HostPaths) ->
     run = request(paths, "GET", f"/v1/agents/sales/runs/{run_ref}")
     assert decode(active.json()) == ()
     assert decode(run.json())["state"] == "interrupted"
+
+
+async def test_connect_starts_a_host_when_none_runs(paths: HostPaths) -> None:
+    folder = work_folder(paths.root)
+    created = await Agent.create(
+        "sales",
+        root=paths.root,
+        workspace=LocalWorkspace(folder, access=LocalFileAccess.COMPUTER),
+        keychain=MemoryKeychain(),
+    )
+    await created.close()
+    assert host_status(paths) is None
+
+    agent = await daita.connect("sales", cwd=folder, root=paths.root)
+    try:
+        status = await asyncio.to_thread(host_status, paths)
+        assert agent.workspace.root == folder
+        assert agent.name == "sales"
+    finally:
+        await agent.close()
+
+    assert status is not None
+    assert status["pid"] != os.getpid()
+    assert status["agents"] == ("sales",)
+    # Closing the client leaves the agent open in the host.
+    assert (await asyncio.to_thread(host_status, paths) or {})["agents"] == ("sales",)

@@ -343,6 +343,7 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
             ),
             dict[str, object] | None: (_analysis_summary(), None),
             LocalWorkspace | None: (workspace,),
+            LocalWorkspace: (agent.workspace,),
             SecretReference: (password,),
             MCPAuthentication
             | None: (

@@ -22,6 +22,8 @@ MEMBERS = frozenset(
         "home",
         "model_profile",
         "model_route",
+        "workspace",
+        "session_source_id",
     }
 )
 
