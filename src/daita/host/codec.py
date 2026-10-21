@@ -54,7 +54,12 @@ from ..artifacts.models import (
     DestinationAuthorization,
     DestinationAvailability,
 )
-from ..capabilities import AccessMode, AutomationEligibility, OperationalEffect
+from ..capabilities import (
+    AccessMode,
+    ApprovalRequest,
+    AutomationEligibility,
+    OperationalEffect,
+)
 from ..catalog.models import CatalogResource, CatalogSummary, ResourceKind, Sensitivity
 from ..distribution.models import (
     Delivery,
@@ -71,7 +76,7 @@ from ..distribution.models import (
 )
 from ..errors import ErrorRetryability, StateCompatibilityCode
 from ..hosting.home_upgrade import AgentHomeStatus
-from ..hosting.sources import SourceEditResult
+from ..hosting.sources import SourceEditPreview, SourceEditResult
 from ..jobs.graph.models import (
     BudgetLedger,
     GraphEvent,
@@ -105,8 +110,9 @@ from ..llm.models import (
     ToolResultBlock,
 )
 from ..llm.routing import ModelRoute, ModelRouteCandidate, RetryPolicy
+from ..llm.subscription_auth import CodexDevicePrompt
 from ..loop.models import ConversationRun, LoopExit, RunInput, Transcript
-from ..observation import AgentEvent, AgentEventKind
+from ..observation import AgentEvent, AgentEventKind, SupervisorStatus
 from ..routines.models import (
     AmbiguousTimePolicy,
     CalendarDaySelector,
@@ -291,6 +297,8 @@ def _conforms(value: object, expected: object) -> bool:
         return value is None
     origin = typing.get_origin(expected)
     arguments = typing.get_args(expected)
+    if origin is typing.Literal:
+        return any(type(value) is type(item) and value == item for item in arguments)
     if origin in (typing.Union, types.UnionType):
         return any(_conforms(value, member) for member in arguments)
     if origin is tuple:
@@ -321,6 +329,10 @@ def _supports(annotation: object, seen: set[type]) -> bool:
     if annotation in (object, None, type(None), bool, int, float, str, Path):
         return True
     origin = typing.get_origin(annotation)
+    if origin is typing.Literal:
+        return all(
+            type(item) in (bool, int, str) for item in typing.get_args(annotation)
+        )
     if origin is not None:
         return origin in (
             tuple,
@@ -643,12 +655,14 @@ _register(ArtifactDeliveryReceipt, encode_delivery_receipt, decode_delivery_rece
 for _record in (
     AgentEvent,
     AgentHomeStatus,
+    ApprovalRequest,
     ArtifactDestination,
     ArtifactPayload,
     BudgetLedger,
     CalendarSchedule,
     CatalogResource,
     CatalogSummary,
+    CodexDevicePrompt,
     ConversationRun,
     DeliveryInspection,
     DeliveryView,
@@ -688,12 +702,14 @@ for _record in (
     SemanticAnnotationView,
     Skill,
     SkillSummary,
+    SourceEditPreview,
     SourceEditResult,
     SourcePermissionResource,
     SourcePermissionState,
     SourcePermissionSummary,
     SourcePermissionsInspection,
     SourcePermissionsPreview,
+    SupervisorStatus,
     ToolCall,
     ToolResultBlock,
     Transcript,

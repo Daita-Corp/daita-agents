@@ -100,3 +100,45 @@ else:
     completed = _run(script)
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_host_server_libraries_load_only_with_the_server_module() -> None:
+    script = r"""
+import sys
+
+server_libraries = {"sse_starlette", "starlette", "uvicorn"}
+
+def loaded():
+    return sorted(name for name in sys.modules if name.split(".")[0] in server_libraries)
+
+import daita
+import daita.cli
+import daita.host.codec
+import daita.host.events
+import daita.host.interactions
+import daita.host.paths
+import daita.host.protocol
+import daita.host.registry
+import daita.host.runs
+import daita.host.supervise
+if loaded():
+    raise AssertionError(f"eager server imports: {loaded()}")
+import daita.host.server
+if set(name.split(".")[0] for name in loaded()) != server_libraries:
+    raise AssertionError(f"server did not load its libraries: {loaded()}")
+"""
+    completed = _run(script)
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_python_dash_m_daita_runs_the_cli() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "daita", "--version"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.startswith("daita ")

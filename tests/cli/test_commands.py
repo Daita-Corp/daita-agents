@@ -1310,6 +1310,15 @@ def test_cli_job_board_and_review_use_only_public_agent_surfaces(
     assert fake.close.await_count == 2
 
 
+def test_cli_host_offers_the_host_lifecycle_and_needs_a_command_or_an_agent() -> None:
+    host = _subcommands(cli.build_parser())["host"]
+    args = cli.build_parser().parse_args(["host"])
+
+    assert set(_subcommands(host)) == {"serve", "start", "stop", "status", "logs"}
+    with pytest.raises(ValueError, match="choose a host command"):
+        asyncio.run(cli._execute(args))
+
+
 def test_cli_host_dispatches_one_resident_composition(tmp_path: Path) -> None:
     args = cli.build_parser().parse_args(
         ["--root", str(tmp_path), "host", "--agent", "atlas"]

@@ -35,7 +35,13 @@ from daita.errors import (
 )
 from daita.host.protocol import (
     ERROR_CODES,
+    AgentLockedError,
+    ConversationBusyError,
     EventType,
+    HostShuttingDownError,
+    HostVersionMismatch,
+    InteractionResolvedError,
+    WorkspaceBusyError,
     error_envelope,
     error_from_envelope,
     event_envelope,
@@ -56,6 +62,17 @@ from daita.observation import AgentEvent, AgentEventKind
 pytestmark = pytest.mark.unit
 
 ERRORS: tuple[BaseException, ...] = (
+    HostVersionMismatch("the Daita host runs 1.3.0", protocol=1, version="1.3.0"),
+    ConversationBusyError(
+        "a run is already active in this conversation", conversation_id="c-1"
+    ),
+    WorkspaceBusyError("Daita is busy in /Users/x/work.", folder=Path("/Users/x/work")),
+    InteractionResolvedError("interaction is not pending: interaction-1"),
+    AgentLockedError(
+        "agent is in use by another process: sales",
+        holder={"role": "script", "pid": 5530, "started_at": "2026-10-20T09:00:00Z"},
+    ),
+    HostShuttingDownError("the Daita host is shutting down"),
     AgentNotFoundError("agent does not exist: sales"),
     AgentNameError("agent names must match [A-Za-z0-9][A-Za-z0-9_-]{0,63}"),
     AgentAlreadyExistsError("agent already exists: sales", agent_id="agent-1"),

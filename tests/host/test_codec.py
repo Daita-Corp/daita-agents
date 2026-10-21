@@ -10,10 +10,16 @@ from datetime import UTC, datetime
 
 import pytest
 
+from daita._json import FrozenJsonObject
 from daita.agent import Agent
+from daita.capabilities import ApprovalRequest
 from daita.host.codec import decode, encode, supports
 from daita.host.protocol import CLIENT_SIDE_ANNOTATIONS, REMOTE_AGENT_SURFACE
+from daita.hosting.sources import SourceEditPreview
 from daita.llm.models import ModelSensitivity
+from daita.llm.subscription_auth import CodexDevicePrompt
+from daita.observation import SupervisorStatus
+from daita.storage.sqlite_records import SourceReadMode
 
 
 def _wire_annotations() -> dict[str, object]:
@@ -114,3 +120,53 @@ def _assert_same_types(decoded: object, original: object) -> None:
                 _assert_same_types(
                     getattr(decoded, field.name), getattr(original, field.name)
                 )
+
+
+INTERACTION_PAYLOADS = (
+    ApprovalRequest(
+        run_id="run-1",
+        call_id="write",
+        tool_name="memory_set",
+        capability_id="memory.set",
+        arguments=FrozenJsonObject.from_mapping(
+            {"target": "memory", "content": "Revenue is paid subtotal."}
+        ),
+        reason="Save this definition to memory.",
+    ),
+    SourceEditPreview(
+        current_source_id="source-1",
+        replacement_source_id="source-2",
+        display_name="Orders",
+        adapter_id="sqlite",
+        resource_count=3,
+        relationship_count=1,
+        read_mode=SourceReadMode.SELECTED,
+        preserved_read_resource_count=2,
+        omitted_read_resources=("resource-3",),
+    ),
+    CodexDevicePrompt(
+        verification_url="https://auth.openai.com/codex/device",
+        user_code="ABCD-1234",
+        expires_in_seconds=900,
+    ),
+    SupervisorStatus("jobs", "retrying", consecutive_failures=2, failure_code="x"),
+)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "payload", INTERACTION_PAYLOADS, ids=lambda payload: type(payload).__name__
+)
+def test_interaction_and_status_payloads_round_trip(payload: object) -> None:
+    wire = json.loads(json.dumps(encode(payload)))
+
+    assert decode(wire, type(payload)) == payload
+
+
+@pytest.mark.unit
+def test_literal_fields_accept_only_their_listed_values() -> None:
+    wire = encode(SupervisorStatus("jobs", "running"))
+    wire["v"]["state"] = "sleeping"  # type: ignore[index, call-overload]
+
+    with pytest.raises(TypeError):
+        decode(wire, SupervisorStatus)

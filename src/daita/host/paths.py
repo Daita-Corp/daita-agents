@@ -36,6 +36,11 @@ class HostPaths:
         return self.run_dir / "host.json"
 
     @property
+    def runs(self) -> Path:
+        """Foreground runs in flight; left behind only when the host died."""
+        return self.run_dir / "runs.json"
+
+    @property
     def log_dir(self) -> Path:
         return self.root / "logs"
 

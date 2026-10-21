@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Final
 
@@ -44,6 +45,8 @@ from .codec import JsonValue, decode, encode
 PROTOCOL_VERSION: Final = 1
 PROTOCOL_HEADER: Final = "X-Daita-Protocol"
 VERSION_HEADER: Final = "X-Daita-Version"
+# The client's working directory, percent-encoded, for relative path arguments.
+CWD_HEADER: Final = "X-Daita-Cwd"
 MAX_REQUEST_BYTES: Final = 4 * 1024 * 1024
 MAX_RESPONSE_BYTES: Final = 32 * 1024 * 1024
 
@@ -211,10 +214,54 @@ CLIENT_SIDE_ANNOTATIONS: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
     }
 )
 
+
+class HostVersionMismatch(RuntimeError):
+    """The client and host run different protocol or package versions."""
+
+    def __init__(self, message: str, *, protocol: int, version: str) -> None:
+        super().__init__(message)
+        self.protocol = protocol
+        self.version = version
+
+
+class ConversationBusyError(RuntimeError):
+    """A foreground run is already active in this conversation."""
+
+    def __init__(self, message: str, *, conversation_id: str) -> None:
+        super().__init__(message)
+        self.conversation_id = conversation_id
+
+
+class WorkspaceBusyError(RuntimeError):
+    """The agent is busy in another folder, so it cannot switch to this one."""
+
+    def __init__(self, message: str, *, folder: Path) -> None:
+        super().__init__(message)
+        self.folder = folder
+
+
+class InteractionResolvedError(RuntimeError):
+    """The interaction was already answered, dismissed or expired."""
+
+
+class AgentLockedError(HostActiveError):
+    """Another process holds the agent's writer lock; the host never fights it."""
+
+
+class HostShuttingDownError(RuntimeError):
+    """The host is draining and accepts no new runs."""
+
+
 # One stable wire code per exception type. A raised subclass travels as its
 # nearest listed ancestor.
 ERROR_CODES: Final[Mapping[type[BaseException], str]] = MappingProxyType(
     {
+        HostVersionMismatch: "version_mismatch",
+        ConversationBusyError: "conversation_busy",
+        WorkspaceBusyError: "workspace_busy",
+        InteractionResolvedError: "already_resolved",
+        AgentLockedError: "agent_locked",
+        HostShuttingDownError: "shutting_down",
         AgentNotFoundError: "agent_not_found",
         AgentNameError: "agent_name_invalid",
         AgentAlreadyExistsError: "agent_already_exists",
@@ -339,6 +386,7 @@ def _fields(payload: JsonValue, names: set[str]) -> dict[str, JsonValue]:
 
 __all__ = [
     "CLIENT_SIDE_ANNOTATIONS",
+    "CWD_HEADER",
     "ERROR_CODES",
     "MAX_REQUEST_BYTES",
     "MAX_RESPONSE_BYTES",
@@ -346,7 +394,13 @@ __all__ = [
     "PROTOCOL_VERSION",
     "REMOTE_AGENT_SURFACE",
     "VERSION_HEADER",
+    "AgentLockedError",
+    "ConversationBusyError",
     "EventType",
+    "HostShuttingDownError",
+    "HostVersionMismatch",
+    "InteractionResolvedError",
+    "WorkspaceBusyError",
     "error_envelope",
     "error_from_envelope",
     "event_envelope",

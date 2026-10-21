@@ -42,6 +42,10 @@ async def run_terminal_application(
 ) -> int:
     """Start one Textual app. Extra stream arguments are ignored after cutover."""
 
+    from .hosting.agent_home import WRITER_ROLE
+
+    # Agent locks taken by this app name the in-process TUI as their holder.
+    WRITER_ROLE.set("tui-inprocess")
     run_app = _load_textual_app()
     return await run_app(
         root=root,

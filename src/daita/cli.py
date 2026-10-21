@@ -81,6 +81,7 @@ from .security import SecretReference
 from .terminal import run_terminal_application
 from .tui.projection import run_failure_notice, tool_outcome_summary
 from .work_board import work_board_projection
+from .workspace import working_directory
 
 _HOST_NOTICE = (
     "Host open for this command only. Saved assignments progress while a host is open; "
@@ -546,14 +547,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     host = commands.add_parser(
         "host",
-        help="hold one agent open so scheduled routines can make progress",
+        help="run the background Daita host that owns agents, runs and routines",
     )
-    host.add_argument("--agent", dest="host_agent", required=True)
+    host.add_argument(
+        "--agent",
+        dest="host_agent",
+        help="hold only this agent open in this process (compatibility mode)",
+    )
     host.add_argument(
         "--diagnostics-path",
         type=Path,
         help="append payload-free per-call diagnostics to this private JSONL file",
     )
+    host_commands = host.add_subparsers(dest="host_command")
+    host_serve = host_commands.add_parser("serve", help="run the host in this process")
+    host_serve.add_argument("--root", type=Path, default=argparse.SUPPRESS)
+    host_serve.add_argument(
+        "--foreground", action="store_true", help="also log to standard error"
+    )
+    host_serve.add_argument(
+        "--log-level", choices=("debug", "info", "warning", "error"), default="info"
+    )
+    # Set by `daita host start`: losing the singleton race then exits quietly.
+    host_serve.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)
+    host_commands.add_parser("start", help="start the host in the background")
+    host_commands.add_parser("stop", help="stop the host gracefully")
+    host_status = host_commands.add_parser("status", help="show whether the host runs")
+    host_status.add_argument("--json", action="store_true", dest="as_json")
+    host_logs = host_commands.add_parser("logs", help="print the host log")
+    host_logs.add_argument("-f", "--follow", action="store_true")
 
     diagnostics = commands.add_parser(
         "diagnostics",
@@ -1103,15 +1125,8 @@ def _resolve_cli_workspace(args: argparse.Namespace) -> LocalWorkspace:
         else Path(os.path.abspath(os.fspath(args.root))).resolve(strict=False)
     )
     state_root = state_root.resolve(strict=False)
-    cwd = Path.cwd().resolve(strict=True)
-    user_home = Path.home().resolve(strict=True)
-    working = (
-        user_home
-        if cwd == Path(cwd.anchor) or cwd == state_root or state_root in cwd.parents
-        else cwd
-    )
     return LocalWorkspace(
-        working,
+        working_directory(Path.cwd().resolve(strict=True), state_root),
         sensitivity=sensitivity,
         access=LocalFileAccess.COMPUTER,
     )
@@ -1398,6 +1413,10 @@ async def _execute(args: argparse.Namespace) -> object:
         finally:
             await agent.close()
     if args.command == "host":
+        if args.host_agent is None:
+            raise ValueError(
+                "choose a host command: serve, start, stop, status or logs"
+            )
         await run_resident_host(
             agent_name=args.host_agent,
             workspace=workspace,
@@ -2169,10 +2188,109 @@ def _source_from_attach_args(
     )
 
 
+def _host_command(args: argparse.Namespace) -> int:
+    from .host.paths import host_paths
+    from .host.supervise import host_status, log_tail, start_host, stop_host
+
+    paths = host_paths(args.root)
+    if args.host_command == "serve":
+        return _serve_host(args, paths)
+    if args.host_command == "start":
+        status = start_host(paths)
+        print(f"Daita host {'started' if status['started'] else 'already running'}.")
+        return 0
+    if args.host_command == "stop":
+        print(
+            "Daita host stopped." if stop_host(paths) else "Daita host is not running."
+        )
+        return 0
+    if args.host_command == "status":
+        status = host_status(paths) or {"running": False}
+        if args.as_json:
+            print(json.dumps(status, default=str, sort_keys=True))
+        elif not status["running"]:
+            print("Daita host: stopped")
+        else:
+            print(
+                f"Daita host: running (pid {status.get('pid', 'unknown')}, "
+                f"version {status['version']})"
+            )
+            if status.get("version_mismatch"):
+                print(f"This command is version {__version__}; restart the host.")
+            else:
+                print(f"Agents open: {', '.join(status['agents']) or 'none'}")  # type: ignore[arg-type]
+                print(f"Socket: {status['socket']}")
+        print(f"Log: {paths.log}")
+        return 0
+    lines = log_tail(paths)
+    print("".join(lines), end="")
+    if args.follow:
+        _follow_log(paths.log)
+    return 0
+
+
+def _serve_host(args: argparse.Namespace, paths: object) -> int:
+    import logging
+    import signal
+    from logging.handlers import RotatingFileHandler
+
+    from .host.paths import HostPaths
+    from .host.server import HostAlreadyRunning, serve_host
+
+    assert isinstance(paths, HostPaths)
+    os.makedirs(paths.log_dir, mode=0o700, exist_ok=True)
+    handler = RotatingFileHandler(paths.log, maxBytes=5 * 1024 * 1024, backupCount=5)
+    handlers: list[logging.Handler] = [handler]
+    if args.foreground:
+        handlers.append(logging.StreamHandler(sys.stderr))
+    logging.basicConfig(
+        level=args.log_level.upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+
+    def reopen_log() -> None:
+        # A FileHandler reopens its file on the next record once its stream is None.
+        handler.acquire()
+        try:
+            if handler.stream is not None:
+                handler.stream.close()
+            handler.stream = None
+        finally:
+            handler.release()
+
+    async def serve() -> None:
+        asyncio.get_running_loop().add_signal_handler(signal.SIGHUP, reopen_log)
+        await serve_host(paths, handle_signals=True)
+
+    try:
+        asyncio.run(serve())
+    except HostAlreadyRunning as error:
+        print(str(error), file=sys.stderr)
+        return 0 if args.auto else 1
+    return 0
+
+
+def _follow_log(path: Path) -> None:
+    import time
+
+    with open(path, encoding="utf-8", errors="replace") as file:
+        file.seek(0, os.SEEK_END)
+        while True:
+            line = file.readline()
+            if line:
+                print(line, end="", flush=True)
+            else:
+                time.sleep(0.5)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
         result: object
+        if args.command == "host" and args.host_command is not None:
+            return _host_command(args)
         if args.command is None:
             _require_terminal_application()
             result = asyncio.run(
