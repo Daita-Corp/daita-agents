@@ -15,8 +15,11 @@ from daita.artifacts.models import ArtifactDestination, ArtifactDestinationKind
 from daita.host.protocol import CWD_HEADER, REMOTE_AGENT_SURFACE
 from daita.host.server import AREAS
 from daita.hosting.sources import SourceEditResult
+from daita.llm import subscription_auth
 from daita.llm.models import ModelSensitivity
+from daita.llm.subscription_auth import CodexOAuthCredential
 from tests.host.conftest import StartHost
+from tests.llm._subscription_support import _jwt
 from tests.support.host import error_code, pending_interaction, value
 
 pytestmark = pytest.mark.integration
@@ -145,6 +148,103 @@ async def test_a_source_edit_waits_for_its_confirmation_interaction(
         Path(str(edited.source.configuration["path"]))
         == (folder / "orders-copy.sqlite").resolve()
     )
+
+
+def _fake_openai_device_login(
+    monkeypatch: pytest.MonkeyPatch, authorized: asyncio.Event
+) -> None:
+    """Fake only OpenAI's endpoints; the token poll waits for ``authorized``."""
+
+    async def post_json(url: str, _body: object) -> subscription_auth._HttpResult:
+        if url.endswith("/usercode"):
+            payload: dict[str, object] = {
+                "device_auth_id": "device-1",
+                "user_code": "ABCD-EFGH",
+                "interval": 1,
+            }
+        else:
+            await authorized.wait()
+            payload = {"authorization_code": "code-1", "code_verifier": "verifier-1"}
+        return subscription_auth._HttpResult(200, json.dumps(payload).encode())
+
+    async def post_form(_url: str, _body: object) -> subscription_auth._HttpResult:
+        tokens = {
+            "access_token": _jwt(),
+            "refresh_token": "refresh-1",
+            "expires_in": 3_600,
+        }
+        return subscription_auth._HttpResult(200, json.dumps(tokens).encode())
+
+    monkeypatch.setattr(subscription_auth, "_post_json", post_json)
+    monkeypatch.setattr(subscription_auth, "_post_form", post_form)
+
+
+async def test_subscription_login_shows_its_prompt_as_an_interaction(
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authorized = asyncio.Event()
+    _fake_openai_device_login(monkeypatch, authorized)
+    harness = await start_host()
+    await harness.create_agent()
+
+    async with harness.events("sales") as events:
+        login = asyncio.create_task(
+            harness.http.post(
+                "/v1/agents/sales/model/subscription-login", json={"provider": "codex"}
+            )
+        )
+        _seq, _event, opened = await events.next(
+            "interaction", lambda data: data["op"] == "opened"
+        )
+        _seq, _event, waiting = await events.next(
+            "interaction",
+            lambda data: data["interaction"]["request"]["progress"]
+            == "Waiting for ChatGPT authorization",
+        )
+        authorized.set()
+        credential = value(await asyncio.wait_for(login, 10))
+        _seq, _event, closed = await events.next(
+            "interaction", lambda data: data["op"] == "resolved"
+        )
+
+    prompt = opened["interaction"]["request"]["prompt"]
+    assert opened["interaction"]["kind"] == "model_login"
+    assert (prompt.verification_url, prompt.user_code) == (
+        "https://auth.openai.com/codex/device",
+        "ABCD-EFGH",
+    )
+    assert waiting["op"] == "updated"
+    assert closed["interaction"]["state"] == "completed"
+    assert CodexOAuthCredential.from_secret(credential).refresh_token == "refresh-1"
+    assert value(await harness.http.get("/v1/agents/sales/interactions")) == ()
+
+
+async def test_dismissing_a_subscription_login_cancels_it(
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_openai_device_login(monkeypatch, asyncio.Event())
+    harness = await start_host()
+    await harness.create_agent()
+    login = asyncio.create_task(
+        harness.http.post(
+            "/v1/agents/sales/model/subscription-login", json={"provider": "codex"}
+        )
+    )
+    interaction = await pending_interaction(harness.http, "sales")
+
+    answer = await harness.http.post(
+        f"/v1/agents/sales/interactions/{interaction['id']}",
+        json={"decision": "approve"},
+    )
+    dismissed = await harness.http.post(
+        f"/v1/agents/sales/interactions/{interaction['id']}/dismiss"
+    )
+    response = await asyncio.wait_for(login, 10)
+
+    assert error_code(answer) == "invalid_value"
+    assert value(dismissed)["state"] == "dismissed"
+    assert (response.status_code, error_code(response)) == (409, "already_resolved")
+    assert value(await harness.http.get("/v1/agents/sales/interactions")) == ()
 
 
 async def test_every_failure_is_one_error_envelope(start_host: StartHost) -> None:
