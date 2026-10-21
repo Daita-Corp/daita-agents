@@ -2305,7 +2305,9 @@ def test_agent_home_journal_and_codecs_have_one_append_only_storage_owner():
         text = path.read_text(encoding="utf-8")
         if not relative.startswith("storage/"):
             assert "storage.sqlite_migrations" not in text
-            assert "sqlite_codecs" not in text
+            # The host wire codec reuses the strict record codecs, never their storage.
+            if relative != "host/codec.py":
+                assert "sqlite_codecs" not in text
 
 
 def test_knowledge_content_cannot_redefine_data_or_execution_authority():
