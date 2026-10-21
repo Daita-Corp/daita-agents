@@ -337,15 +337,7 @@ class PresentationController:
         )
 
     async def source_summary(self) -> str:
-        agent = self.require_agent()
-        sources = tuple(
-            source for source in await agent.list_sources() if source.active
-        )
-        if not sources:
-            return "no sources"
-        if len(sources) == 1:
-            return safe_display(sources[0].display_name, fallback="source")
-        return f"{len(sources)} sources"
+        return summarize_sources(await self.require_agent().list_sources())
 
     async def configure_model(
         self,
@@ -1788,6 +1780,17 @@ class PresentationController:
         for evidence in annotation.evidence:
             lines.append(f"  {evidence.kind.value} in run {evidence.run_id}")
         return "\n".join(lines)
+
+
+def summarize_sources(sources: tuple[Any, ...]) -> str:
+    """Name the one active source, or count them, for the status bar."""
+
+    active = tuple(source for source in sources if source.active)
+    if not active:
+        return "no sources"
+    if len(active) == 1:
+        return safe_display(active[0].display_name, fallback="source")
+    return f"{len(active)} sources"
 
 
 def _configuration_text(configuration: Any, key: str) -> str:

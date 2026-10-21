@@ -183,6 +183,10 @@ class ChatScreen(Screen[None]):
         if self.is_mounted:
             self._apply_layout()
 
+    def on_screen_resume(self) -> None:
+        # Resume follows mount, on first show and after every dialog closes.
+        self.daita_app.chat_resumed.set()
+
     def _apply_layout(self) -> None:
         self.set_class(self.app.size.width < 80, "-narrow")
         # Size the strip to its labels so identity can use the remaining space.

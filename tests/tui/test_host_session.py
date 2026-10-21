@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -194,6 +195,45 @@ async def test_the_status_bar_shows_connected_reconnecting_and_stopped(
             assert "○ host stopped" in _host_status(app)
         finally:
             app.exit(0)
+
+
+async def test_quitting_cancels_a_host_refresh_waiting_on_the_host(
+    start_host: StartHost,
+) -> None:
+    harness = await start_host()
+    agent = await remote_agent(harness, "sales")
+    app = _app(harness)
+    app.controller.agent = agent
+    waiting, answered, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    work_board, close = app.controller.work_board, app.controller.close
+
+    async def slow_host() -> Any:
+        waiting.set()
+        try:
+            await answered.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return await work_board()
+
+    async def closing() -> None:
+        answered.set()  # the host answers just as the window detaches
+        await close()
+
+    async with app.run_test(size=SIZE):
+        try:
+            await app._show_chat()
+            # The two-second poll finds the host slow to answer.
+            app.controller.work_board = slow_host  # type: ignore[method-assign]
+            app.controller.close = closing  # type: ignore[method-assign]
+            await app._poll_background_status()
+            await asyncio.wait_for(waiting.wait(), 10)
+        finally:
+            app.exit(0)
+
+    # The refresh was cancelled at its host call, not resumed after quitting.
+    assert cancelled.is_set()
+    assert app._exception is None and app.return_code == 0
 
 
 async def test_a_host_reset_reloads_the_transcript_and_work_board(
