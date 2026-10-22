@@ -78,9 +78,9 @@ Runs come from two places:
 
 - **Foreground runs**: a person asks through the TUI, CLI or Python API.
   Effects need interactive approval.
-- **Machine runs**: routine occurrences, job events and graph tasks. Each carries
-  an immutable `ExecutionScope` frozen when a person approved the work, and can
-  only perform effects covered by exact standing grants.
+- **Machine runs**: routine occurrences, job events and graph tasks. Each builds
+  its `ExecutionScope` when the run starts and asks a person, through the host,
+  before every effect.
 
 ## System map
 
@@ -128,17 +128,15 @@ These protect users. Each comes with the reason it exists.
 4. **The catalog is structural truth, and SQL is validated against it before any
    source I/O.** Connector guardrails still apply during execution. *Why: model
    text cannot be trusted to name real resources or safe queries.*
-5. **External effects are approved, receipted and never replayed.** A
-   foreground effect needs approval bound to its exact arguments; a machine-run
-   effect needs an exact standing grant. A receipt is reserved before dispatch
-   and finalized with evidence. Effects are never automatically retried or
-   replayed. An uncertain outcome stays uncertain until a person resolves it.
-   *Why: duplicate or unexplained writes to a user's systems are the worst
-   failure Daita can cause.*
-6. **Machine runs cannot widen their scope.** A machine run's `ExecutionScope` is
-   immutable; payloads and model text cannot enlarge it, and revalidation
-   compares retained references rather than accepting new contracts. *Why:
-   unattended work must stay within what a person approved.*
+5. **External effects are approved at the time, receipted and never replayed.**
+   Every external effect is approved by a person at the time, bound to its exact
+   arguments, receipted before dispatch, and never retried or replayed. An
+   uncertain outcome stays uncertain until a person resolves it. A run that
+   cannot ask a person cannot perform effects. *Why: duplicate or unexplained
+   writes to a user's systems are the worst failure Daita can cause.*
+6. **A run's scope is fixed when the run starts.** Model text and tool results
+   cannot widen it during the run. *Why: unattended work must stay within what
+   the person set up, and a prompt injection must not reach new sources.*
 7. **Accounting is honest.** Every requested tool call gets exactly one result,
    in call order. Budget exhaustion is terminal. Actual usage is never clipped to
    a reservation, and unknown usage is never recorded as zero. *Why: users pay
@@ -179,12 +177,13 @@ changes*.
 - **A direct loop.** There is no verifier, repair or synthesis pass, and no
   resumable session. Clarification is ordinary model behavior, not a run state.
 - **Approval and observation through the host.** Inside a process, approval is
-  still an `ApprovalHandler` callback the loop awaits and observation a
-  best-effort callback. The host turns both into *interactions* and an event
-  stream: an approval or question is a pending interaction any connected client
-  can answer (the first answer wins; expiry interrupts and never denies), and a
-  desktop notification goes out when no client watches that agent. Interactions
-  live in host memory, not in the agent home.
+  an `ApprovalHandler` callback the loop awaits and observation a best-effort
+  callback. The host turns both into *interactions* and an event stream: an
+  approval or question is a pending interaction any connected client can answer
+  (the first answer wins; expiry interrupts and never denies), and a desktop
+  notification goes out when no client watches that agent. Scheduled and job
+  runs ask through the same interactions; the card names the routine or job
+  that asked. Interactions live in host memory, not in the agent home.
 - **One host per user owns every agent.** `daita host serve` opens every agent
   with background work, holds each writer lock (the single writer is the host),
   runs schedulers and runs, and keeps going when every window is closed. The
@@ -246,10 +245,11 @@ user's side.
    `tests/architecture` boundaries, and one public end-to-end test.
 
 ### Make a capability usable by routines
-Set `automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT`. An
-effectful capability also needs an `AutomationGrantPolicy` and an
-`EffectReceiptPolicy`, and every routine needs an exact grant for it. Check the
-scheduled-run limits in `docs/architecture/jobs-and-routines.md`.
+Nothing to do: every capability is usable by scheduled and job runs unless it is
+on the exclusion list in `capability_runtime.py` (local computer files, and
+creating, changing or running routines and jobs). An effectful capability still
+needs an `EffectReceiptPolicy`; the run asks a person before performing it.
+Check the scheduled-run limits in `docs/architecture/jobs-and-routines.md`.
 
 ### Add a source type
 1. Register a `SourceType`: built-in in `adapters/registry.py`, or passed at
@@ -525,12 +525,15 @@ protects the user in its place.
   database write or an MCP action, declared through `OperationalEffect`.
 - **Exact**: bound to specific identities, revisions or digests and rechecked
   before use. If something drifted, the operation fails rather than adapting.
-- **Foreground run / machine run**: a run a person started, versus a routine
-  occurrence, job event or graph task carrying an `ExecutionScope`.
-- **Frozen**: captured once, at run preparation or when a person approved
-  something, and unchanged afterwards.
-- **Grant**: a standing, exact permission that lets machine runs perform one
-  specific effect without interactive approval.
+- **Foreground run / machine run**: a run a person started, versus a machine
+  run: a routine occurrence, job run or sub-run, which asks a person before
+  effects.
+- **Frozen**: fixed when a run starts, or when a person confirmed a routine, and
+  unchanged afterwards.
+- **Grant**: a standing, exact permission that let machine runs perform one
+  specific effect without interactive approval. Being replaced by approval at
+  the time; machine runs no longer use grants, and the machinery is removed in
+  a later phase.
 - **Receipt**: the durable record reserved before an external effect and
   finalized with its evidence; the only truth about whether the effect happened.
 - **Sensitivity**: an information-handling classification. It never confers
