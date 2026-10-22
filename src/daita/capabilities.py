@@ -48,7 +48,8 @@ MAX_TOOL_PRESENTATION_KEYWORDS = 16
 MAX_TOOL_PRESENTATION_KEYWORD_CHARACTERS = 64
 RESERVED_TOOL_NAMES = frozenset({"toolbox_search", "toolbox_load", "toolbox_inspect"})
 TOOL_MODE_ARGUMENT = "mode"
-MAX_EXECUTION_SCOPE_IDENTITIES = 256
+# A run's scope now lists every readable resource; match EffectiveSourceScope.
+MAX_EXECUTION_SCOPE_IDENTITIES = 10_000
 MAX_EXECUTION_SCOPE_IDENTITY_CHARACTERS = 2_048
 
 
@@ -895,16 +896,7 @@ class ExecutionScope:
             grant.max_calls_per_occurrence != 1 for grant in grants
         ):
             raise ValueError("graph effect grants permit exactly one invocation")
-        granted_effects = {
-            OperationalEffect.MUTATE_DATA,
-            OperationalEffect.EXTERNAL_ACTION,
-        }
-        if self.scope_kind is ExecutionScopeKind.GRAPH_TASK and (
-            bool(effects & granted_effects) != bool(grants)
-        ):
-            raise ValueError(
-                "graph effect authority and exact grants must be present together"
-            )
+        # Effects no longer need grants: every run asks a person at the time.
         if any(
             self.contract_bindings.capability_contracts[grant.capability_id]
             != grant.capability_contract_digest
@@ -1176,6 +1168,8 @@ class ApprovalRequest:
     capability_id: str
     arguments: FrozenJsonObject
     reason: str
+    # The routine or job that asked, so the card can say so; None when a person did.
+    requester: str | None = None
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -1186,6 +1180,10 @@ class ApprovalRequest:
             (self.reason, "approval reason"),
         ):
             _text(value, name)
+        if self.requester is not None:
+            _text(self.requester, "approval requester")
+            if len(self.requester) > 256:
+                raise ValueError("approval requester must be bounded text")
         object.__setattr__(
             self,
             "arguments",
@@ -2443,6 +2441,10 @@ class CapabilityRegistry:
     @property
     def tool_names(self) -> frozenset[str]:
         return frozenset(self._views)
+
+    @property
+    def capability_ids(self) -> frozenset[str]:
+        return frozenset(self._capabilities)
 
     def tool_capability_ids(self, name: str) -> tuple[str, ...]:
         """Return every capability one tool name can execute, primary first."""

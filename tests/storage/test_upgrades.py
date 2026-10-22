@@ -365,7 +365,9 @@ async def test_populated_prior_mcp_home_preserves_binding_grant_and_receipt(
         assert len(inspection.routine.capability_grants) == len(receipts) == 1
         grant = inspection.routine.capability_grants[0]
         receipt = receipts[0]
-        assert receipt.capability_grant_digest == grant.grant_digest
+        # The routine still stores its grant, but the action was approved at
+        # the time, so its receipt names no grant.
+        assert receipt.capability_grant_digest is None
         assert receipt.routine_id == routine.routine_id
         binding = action.binding
         home = action.agent.home

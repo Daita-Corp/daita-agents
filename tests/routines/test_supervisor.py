@@ -45,13 +45,24 @@ from daita.routines.supervisor import RoutineSupervisor
 from daita.storage.errors import StorageUnavailableError
 from daita.storage.sqlite import SQLiteStateStore
 from tests.routines._supervisor_support import _ids
-from tests.support.capability_runtime import frozen_execution_bindings
+from tests.support.capability_runtime import (
+    frozen_execution_bindings,
+    machine_scope_builder,
+)
 from tests.support.distribution import (
     inbox_distribution_plan,
     no_artifact_outcome_contract,
 )
 
 NOW = datetime(2026, 8, 28, 12, tzinfo=UTC)
+_SCOPE = machine_scope_builder(
+    capability_ids=(
+        "catalog.describe",
+        "data.query",
+        "data.resource_revision_observation",
+    ),
+    resource_ids=("resource-1",),
+)
 
 
 class _Owner:
@@ -294,6 +305,7 @@ async def test_supervisor_runs_one_due_slot_and_delivers_once(
         distribution=distribution,
         artifacts=artifacts,
         execute_run=execute,
+        machine_scope=_SCOPE,
         clock=lambda: NOW,
         id_factory=_ids(),
         poll_seconds=0.02,
@@ -378,6 +390,7 @@ async def test_quota_rejection_holds_the_route_without_counting_a_failure(
         distribution=distribution,
         artifacts=artifacts,
         execute_run=execute,
+        machine_scope=_SCOPE,
         clock=lambda: NOW,
         id_factory=_ids(),
         poll_seconds=0.02,
@@ -454,6 +467,7 @@ async def test_unclaimable_past_due_routine_waits_the_poll_interval(
         distribution=distribution,
         artifacts=artifacts,
         execute_run=execute,
+        machine_scope=_SCOPE,
         clock=lambda: NOW,
         id_factory=_ids(),
         poll_seconds=1,
@@ -552,6 +566,7 @@ async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
         distribution=distribution,
         artifacts=artifacts,
         execute_run=execute,
+        machine_scope=_SCOPE,
         clock=lambda: NOW,
         id_factory=_ids(),
         poll_seconds=30,
@@ -672,6 +687,7 @@ async def test_unchanged_precheck_advances_with_zero_model_runs(tmp_path) -> Non
         distribution=distribution,
         artifacts=artifacts,
         execute_run=execute,
+        machine_scope=_SCOPE,
         clock=lambda: NOW,
         id_factory=_ids(),
         poll_seconds=0.02,
@@ -779,6 +795,7 @@ async def test_recovery_finishes_exhausted_or_unstarted_occurrence_without_repla
         distribution=DistributionOwner(agent_id="agent-1", store=store),
         artifacts=artifacts,
         execute_run=execute,
+        machine_scope=_SCOPE,
         clock=lambda: now,
         id_factory=_ids(),
     )

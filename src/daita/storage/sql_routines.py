@@ -803,16 +803,8 @@ def bind_occurrence_run(
         or execution_scope.principal_id != routine[0].owner_principal_id
         or execution_scope.grant_id
         != f"routine:{current.routine_id}:revision:{current.routine_revision}"
-        or routine[0].contract_bindings != execution_scope.contract_bindings
-        or routine[0].capability_grants != execution_scope.capability_grants
-        or routine[0].allowed_source_ids != execution_scope.allowed_source_ids
-        or routine[0].allowed_connector_binding_ids
-        != execution_scope.allowed_connector_binding_ids
-        or routine[0].allowed_resource_ids != execution_scope.allowed_resource_ids
-        or routine[0].allowed_capability_ids != execution_scope.allowed_capability_ids
-        or routine[0].allowed_access_modes != execution_scope.allowed_access_modes
-        or routine[0].allowed_operational_effects
-        != execution_scope.allowed_operational_effects
+        # What the run may read and call was fixed when it started; only the
+        # record's routes, ceiling and budgets must still match.
         or routine[0].sensitivity_ceiling != execution_scope.sensitivity_ceiling
         or routine[0].eligible_model_routes != execution_scope.eligible_model_routes
         or routine[0].per_run_max_tokens != execution_scope.per_run_max_tokens
@@ -1062,6 +1054,9 @@ def finalize_occurrence(
         receipts = tuple(decode_receipt(row[0]) for row in receipt_rows)
         effect_receipt_ids = tuple(receipt.receipt_id for receipt in receipts)
         grants = {grant.capability_id: grant for grant in routine.capability_grants}
+        scope_contracts = (
+            run_input.execution_scope.contract_bindings.capability_contracts
+        )
         successful_calls: dict[str, int] = {}
         result_blocks: dict[str, list[ToolResultBlock]] = {}
         for exchange in transcript.messages:
@@ -1080,15 +1075,22 @@ def finalize_occurrence(
             }:
                 uncertain_effect = True
             grant = grants.get(receipt.capability_id)
+            # Approved at the time: bind to the contract fixed at run start. A
+            # receipt that used a grant must still match that exact grant.
             if (
                 receipt.routine_id != current.routine_id
                 or receipt.routine_revision != current.routine_revision
                 or receipt.occurrence_id != current.occurrence_id
-                or grant is None
-                or receipt.capability_grant_digest != grant.grant_digest
                 or receipt.capability_contract_digest
-                != grant.capability_contract_digest
-                or receipt.domain_owner_id != grant.domain_owner_id
+                != scope_contracts.get(receipt.capability_id)
+                or (
+                    receipt.capability_grant_digest is not None
+                    and (
+                        grant is None
+                        or receipt.capability_grant_digest != grant.grant_digest
+                        or receipt.domain_owner_id != grant.domain_owner_id
+                    )
+                )
             ):
                 contract_failure_code = "outcome_effect_binding_invalid"
                 continue
@@ -1128,9 +1130,10 @@ def finalize_occurrence(
                 ),
                 None,
             )
+            # A write the routine never declared still counts once a person approved it.
             if (
-                requirement is None
-                or receipt.evidence_basis not in requirement.accepted_evidence_bases
+                requirement is not None
+                and receipt.evidence_basis not in requirement.accepted_evidence_bases
             ):
                 contract_failure_code = "outcome_effect_evidence_unsupported"
                 continue

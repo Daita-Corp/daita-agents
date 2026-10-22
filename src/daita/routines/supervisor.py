@@ -12,8 +12,17 @@ from hashlib import sha256
 from .._json import canonical_json
 from ..artifacts.models import ArtifactError
 from ..artifacts.store import AgentHomeArtifactStore
-from ..capabilities import ExecutionScope, ExecutionScopeKind
-from ..capability_runtime import CapabilityRuntime, InternalCapabilityRequest
+from ..capabilities import (
+    AccessMode,
+    ExecutionScope,
+    ExecutionScopeKind,
+    OperationalEffect,
+)
+from ..capability_runtime import (
+    CapabilityRuntime,
+    InternalCapabilityRequest,
+    MachineScopeBuilder,
+)
 from ..distribution import DistributionOwner, OutcomeArtifactReference
 from ..hosting.execution_governor import AdmissionClosedError
 from ..llm.errors import ProviderErrorCode
@@ -68,6 +77,7 @@ class RoutineSupervisor:
         distribution: DistributionOwner,
         artifacts: AgentHomeArtifactStore,
         execute_run: RoutineRunExecutor | None,
+        machine_scope: MachineScopeBuilder,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
         poll_seconds: float = _DEFAULT_POLL_SECONDS,
@@ -76,6 +86,8 @@ class RoutineSupervisor:
             raise ValueError("routine supervisor agent_id must be non-empty text")
         if execute_run is not None and not callable(execute_run):
             raise TypeError("routine run executor must be callable or None")
+        if not callable(machine_scope):
+            raise TypeError("routine machine scope builder must be callable")
         if not isinstance(poll_seconds, (int, float)) or not 0 < poll_seconds <= 30:
             raise ValueError("routine supervisor poll interval is outside its bound")
         self._agent_id = agent_id
@@ -85,6 +97,7 @@ class RoutineSupervisor:
         self._distribution = distribution
         self._artifacts = artifacts
         self._execute_run = execute_run
+        self._machine_scope = machine_scope
         self._clock = clock
         self._id_factory = id_factory
         self._poll_seconds = float(poll_seconds)
@@ -335,7 +348,7 @@ class RoutineSupervisor:
             ):
                 return
             await self._owner.authority_snapshot(routine)
-            scope = _execution_scope(routine, occurrence)
+            scope = await self._execution_scope(routine, occurrence)
             observation = await self._observe_precheck(routine, occurrence, scope)
             if (
                 observation is not None
@@ -562,37 +575,48 @@ class RoutineSupervisor:
             return (), "outcome_artifact_contract_failed"
         return references, None
 
+    async def _execution_scope(
+        self,
+        routine: ScheduledRoutine,
+        occurrence: RoutineOccurrence,
+    ) -> ExecutionScope:
+        """Fix the occurrence's scope now: current sources and capabilities.
 
-def _execution_scope(
-    routine: ScheduledRoutine,
-    occurrence: RoutineOccurrence,
-) -> ExecutionScope:
-    return ExecutionScope(
-        contract_bindings=routine.contract_bindings,
-        capability_grants=routine.capability_grants,
-        scope_id=f"scope:{occurrence.occurrence_id}",
-        revision=1,
-        agent_id=routine.agent_id,
-        principal_id=routine.owner_principal_id,
-        grant_id=f"routine:{routine.routine_id}:revision:{routine.revision}",
-        job_id=None,
-        job_revision=None,
-        routine_id=routine.routine_id,
-        routine_revision=routine.revision,
-        occurrence_id=occurrence.occurrence_id,
-        allowed_source_ids=routine.allowed_source_ids,
-        allowed_connector_binding_ids=routine.allowed_connector_binding_ids,
-        allowed_resource_ids=routine.allowed_resource_ids,
-        allowed_capability_ids=routine.allowed_capability_ids,
-        allowed_access_modes=routine.allowed_access_modes,
-        allowed_operational_effects=routine.allowed_operational_effects,
-        sensitivity_ceiling=routine.sensitivity_ceiling,
-        eligible_model_routes=routine.eligible_model_routes,
-        per_run_max_cost_usd=routine.per_run_max_cost_usd,
-        per_run_max_tokens=routine.per_run_max_tokens,
-        distribution_plan_digest=routine.distribution_plan.plan_digest,
-        scope_kind=ExecutionScopeKind.SCHEDULED_ROUTINE,
-    )
+        The routine's named sources narrow it; nothing else from the stored
+        contract decides what the run may read or call (invariant 6). Its
+        routes, sensitivity ceiling and budgets still come from the record.
+        """
+
+        fixed = await self._machine_scope(
+            RunOrigin.SCHEDULED_ROUTINE,
+            routine.allowed_source_ids,
+            routine.eligible_model_routes,
+        )
+        return ExecutionScope(
+            contract_bindings=fixed.contract_bindings,
+            scope_id=f"scope:{occurrence.occurrence_id}",
+            revision=1,
+            agent_id=routine.agent_id,
+            principal_id=routine.owner_principal_id,
+            grant_id=f"routine:{routine.routine_id}:revision:{routine.revision}",
+            job_id=None,
+            job_revision=None,
+            routine_id=routine.routine_id,
+            routine_revision=routine.revision,
+            occurrence_id=occurrence.occurrence_id,
+            allowed_source_ids=fixed.source_ids,
+            allowed_connector_binding_ids=fixed.connector_binding_ids,
+            allowed_resource_ids=fixed.resource_ids,
+            allowed_capability_ids=fixed.capability_ids,
+            allowed_access_modes=frozenset(AccessMode),
+            allowed_operational_effects=frozenset(OperationalEffect),
+            sensitivity_ceiling=routine.sensitivity_ceiling,
+            eligible_model_routes=routine.eligible_model_routes,
+            per_run_max_cost_usd=routine.per_run_max_cost_usd,
+            per_run_max_tokens=routine.per_run_max_tokens,
+            distribution_plan_digest=routine.distribution_plan.plan_digest,
+            scope_kind=ExecutionScopeKind.SCHEDULED_ROUTINE,
+        )
 
 
 def _run_input(

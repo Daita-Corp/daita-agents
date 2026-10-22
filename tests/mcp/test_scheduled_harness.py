@@ -412,7 +412,7 @@ async def test_scheduled_mcp_harness_measures_runtime_and_preserves_failure_evid
 
 @pytest.mark.parametrize("profile_name", ["strict", "user_flow"])
 @pytest.mark.parametrize("fail_confirmation", [False, True])
-async def test_scheduled_mcp_harness_reaches_both_occurrences_with_one_approval(
+async def test_scheduled_mcp_harness_confirms_once_then_asks_before_each_action(
     tmp_path,
     fail_confirmation,
     profile_name,
@@ -540,7 +540,13 @@ async def test_scheduled_mcp_harness_reaches_both_occurrences_with_one_approval(
         assert_completed(weekly, transcript)
         scenario.check_answer(weekly, status="server_reported", research=True)
         await assert_action(scenario, count=2)
-        assert len(scenario.approvals) == 1
+        # One routine confirmation, then each scheduled action asks at the time.
+        assert [item["tool"] for item in scenario.approvals] == [
+            "routine_save",
+            scenario.action.local_name,
+            scenario.action.local_name,
+        ]
+        assert all(item["approved"] for item in scenario.approvals)
     report = json.loads(path.read_text())
     assert report["status"] == "passed"
     assert len(report["runs"]) == 4  # one offline seed, creation, and two occurrences
@@ -788,7 +794,12 @@ async def test_independent_scheduled_live_fixture_needs_no_model_creation(tmp_pa
         weekly, transcript = await scenario.scheduled_result(2)
         assert_completed(weekly, transcript)
         await assert_action(scenario, count=2)
-        assert scenario.approvals == []
+        # No routine_save confirmation (owner-admitted), and each action asks.
+        assert [item["tool"] for item in scenario.approvals] == [
+            scenario.action.local_name,
+            scenario.action.local_name,
+        ]
+        assert all(item["approved"] for item in scenario.approvals)
         assert len(scenario.captures) == 2
     report = json.loads(path.read_text())
     assert report["setup_mode"] == "owner_admitted_fixture"

@@ -215,7 +215,7 @@ def test_nonroutine_scope_cannot_use_mcp_only_relaxation() -> None:
         )
 
 
-async def test_scheduled_catalog_projects_only_explicit_automation_direct_tools() -> (
+async def test_scheduled_catalog_projects_its_whole_fixed_scope_and_nothing_outside() -> (
     None
 ):
     scheduled = _capability(
@@ -255,7 +255,11 @@ async def test_scheduled_catalog_projects_only_explicit_automation_direct_tools(
         _scheduled_run(_scheduled_scope((scheduled.id, interactive.id), registry))
     )
 
-    assert tuple(item.capability.id for item in catalog.entries) == (scheduled.id,)
+    # Eligibility metadata no longer narrows machine runs; the run's scope does.
+    assert tuple(item.capability.id for item in catalog.entries) == (
+        interactive.id,
+        scheduled.id,
+    )
     run = _scheduled_run(_scheduled_scope((scheduled.id, interactive.id), registry))
     result = await runtime.execute_all(
         run,
@@ -285,13 +289,11 @@ async def test_scheduled_catalog_projects_only_explicit_automation_direct_tools(
     assert isinstance(search_data, Mapping)
     matches = search_data["matches"]
     assert isinstance(matches, tuple)
-    assert tuple(match["tool_name"] for match in matches) == ("tool_scheduled",)
-    denied_search_data = result.ordered_results[1].output["data"]
-    assert isinstance(denied_search_data, Mapping)
-    denied_matches = denied_search_data["matches"]
-    assert isinstance(denied_matches, tuple)
-    assert all(match["tool_name"] != "tool_interactive" for match in denied_matches)
-    assert result.ordered_results[2].is_error
+    assert {match["tool_name"] for match in matches} == {
+        "tool_interactive",
+        "tool_scheduled",
+    }
+    assert not result.ordered_results[2].is_error
     assert result.ordered_results[3].is_error
 
 

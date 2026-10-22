@@ -44,6 +44,7 @@ from .capabilities import (
     EffectObservation,
     EffectOutcome,
     ExecutionAdmissionPolicy,
+    ExecutionContractBindings,
     ExecutionContractReader,
     ExecutionPreference,
     Executor,
@@ -184,6 +185,52 @@ class EffectReceiptStore(Protocol):
         max_receipts_per_run: int = 64,
     ) -> EffectReceipt: ...
     async def finish_effect_receipt(self, receipt: EffectReceipt) -> EffectReceipt: ...
+
+
+@dataclass(frozen=True, slots=True)
+class MachineRunScope:
+    """What a machine run may use, fixed when it starts (invariant 6)."""
+
+    source_ids: tuple[str, ...]
+    resource_ids: tuple[str, ...]
+    capability_ids: tuple[str, ...]
+    connector_binding_ids: tuple[str, ...]
+    contract_bindings: ExecutionContractBindings
+
+
+# Builds the scope at run start: (origin, named source ids, model route ids).
+MachineScopeBuilder = Callable[
+    [RunOrigin, tuple[str, ...], tuple[str, ...]], Awaitable[MachineRunScope]
+]
+
+
+def machine_run_capability_ids(
+    registry: CapabilityRegistry, excluded_owners: frozenset[str]
+) -> tuple[str, ...]:
+    """Every registered capability whose owner is not excluded for this run.
+
+    The composition root owns the exclusion list (invariant 6); the runtime
+    stays free of domain identities.
+    """
+
+    return tuple(
+        sorted(
+            capability_id
+            for capability_id in registry.capability_ids
+            if registry.resolve_domain_owner(capability_id) not in excluded_owners
+        )
+    )
+
+
+def machine_run_connector_binding_ids(registry: CapabilityRegistry) -> tuple[str, ...]:
+    """Every connector binding behind a registered tool."""
+
+    bindings: set[str] = set()
+    for name in registry.tool_names:
+        presentation = registry.resolve_tool(name)[0].connector_presentation
+        if presentation is not None and isinstance(presentation.get("id"), str):
+            bindings.add(cast(str, presentation["id"]))
+    return tuple(sorted(bindings))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1337,12 +1384,6 @@ class CapabilityRuntime:
                 )
             if not task_role_allows_capability(binding.task_role, capability.id):
                 return None
-        if (
-            run.origin is RunOrigin.SCHEDULED_ROUTINE
-            and capability.automation_eligibility
-            is not AutomationEligibility.AUTOMATION_DIRECT
-        ):
-            return None
         schema_digest = _sha256_digest(capability.input_schema)
         origin_digest = view.origin_revision_digest or _sha256_digest(
             {
@@ -3791,6 +3832,7 @@ class CapabilityRuntime:
                 capability_id=capability.id,
                 arguments=plan.approval_arguments or arguments,
                 reason=plan.approval_reason,
+                requester=None if session is None else session.options.requester,
             )
             self._emit_approval_requested(
                 run,
@@ -4149,46 +4191,15 @@ class CapabilityRuntime:
         domain: CapabilityDomain,
         plan: SideEffectPlan,
     ) -> CapabilityGrant | None:
+        del run, capability, domain
         if plan.effect_intent is None:
             raise ValueError(
                 "receipt-bearing effects require a canonical domain intent"
             )
-        scope = run.start.execution_scope if run.start is not None else None
-        if scope is None:
-            if plan.capability_grant_digest is not None or not plan.approval_required:
-                raise ValueError(
-                    "foreground external effects require exact per-call approval"
-                )
-            return None
-        grants = tuple(
-            grant
-            for grant in scope.capability_grants
-            if grant.capability_id == capability.id
-        )
-        if (
-            len(grants) != 1
-            or plan.approval_required
-            or grants[0].grant_digest != plan.capability_grant_digest
-        ):
-            raise CapabilityInputError(
-                "effect_grant_required",
-                "The effect has no exact frozen standing grant.",
-            )
-        grant = grants[0]
-        if (
-            grant.domain_owner_id != domain.domain_owner_id
-            or grant.capability_contract_digest
-            != self._registry.contract_digest(capability.id)
-            or capability.automation_grant_policy is None
-            or grant.constraints_kind
-            != capability.automation_grant_policy.constraints_kind
-        ):
-            raise CapabilityInputError(
-                "effect_grant_changed",
-                "The retained effect grant contract is no longer current.",
-            )
-        self._registry.validate_grant_constraints(capability.id, grant.constraints)
-        return grant
+        # Every run, foreground or machine, asks a person at the time (invariant 5).
+        if plan.capability_grant_digest is not None or not plan.approval_required:
+            raise ValueError("external effects require exact per-call approval")
+        return None
 
     async def _execute_reserved_effect(
         self,
@@ -5861,16 +5872,6 @@ def _validate_run_execution_scope(
     scope = run.execution_scope
     if scope is None:
         return
-    if (
-        run.origin is RunOrigin.SCHEDULED_ROUTINE
-        and capability.automation_eligibility
-        is not AutomationEligibility.AUTOMATION_DIRECT
-    ):
-        raise CapabilityInputError(
-            "scheduled_capability_ineligible",
-            "The requested capability is not admitted for scheduled execution.",
-            {"capability_id": capability.id},
-        )
     source_identity_allowed = set(run.source_scope_ids) <= set(scope.allowed_source_ids)
     if (
         scope.agent_id != run.agent_id
@@ -6267,9 +6268,13 @@ __all__ = [
     "CapabilityRuntime",
     "InternalCapabilityOutcome",
     "InternalCapabilityRequest",
+    "MachineRunScope",
+    "MachineScopeBuilder",
     "RunToolCatalog",
     "RunToolCatalogEntry",
     "SideEffectPlan",
     "StepToolProjection",
     "ToolboxManifestEntry",
+    "machine_run_capability_ids",
+    "machine_run_connector_binding_ids",
 ]

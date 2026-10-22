@@ -163,21 +163,24 @@ is authoritative only for the values it returned. Model text, prior assistant
 claims, preferences, and procedures cannot establish structural or source
 facts.
 
-Machine-originated runs carry one immutable `ExecutionScope` in their
-`RunStartEnvelope`. The scope binds the agent and principal, grant, job or
-routine identity, allowed sources, resources, connector bindings,
-capabilities, access modes, operational effects, sensitivity ceiling, model
-routes, per-run budgets, and distribution-plan digest. Scheduled instructions
-are foreground-authorized content; job-event instructions are code-owned.
-Untrusted payloads and model text cannot enlarge the scope. `contract_bindings`
-retains exact capability, MCP-origin, resource-structure and model-configuration
-digests. The composition supplies one bound current-contract reader to routine
-admission, runtime checks and code-owned graph-task construction; it cannot execute
-work. Every current scope states `JOB_EVENT`, `SCHEDULED_ROUTINE` or `GRAPH_TASK`;
-only the revision-1 migration decoder may infer an omitted legacy kind. Revalidation
-compares retained references, never accepts replacement current contracts implicitly.
-Local hints and refresh timestamps are presentation/freshness facts, not execution
-authority.
+Machine-originated runs carry one `ExecutionScope` in their `RunStartEnvelope`,
+built when the run starts and fixed for that run (invariant 6). The composition
+root's `machine_run_scope` builds it: the routine's or job's named sources, or
+every current source when none are named, never the live session folder; every
+readable resource of those sources; every registered capability except the
+machine-run exclusions in `hosting/embedded.py` (creating, changing or running
+routines and jobs, and the graph task tools outside graph task runs); every
+admitted MCP binding; and all access modes and effects. The routine or job
+record still supplies the scope's model routes, sensitivity ceiling, per-run
+budgets and distribution-plan digest. Scheduled instructions are
+foreground-authorized content; job-event instructions are code-owned. Untrusted
+payloads and model text cannot enlarge the scope. `contract_bindings` retains
+the exact capability, MCP-origin, resource-structure and model-configuration
+digests read at start, so a change during the run fails the call rather than
+widening it. Every current scope states `JOB_EVENT`, `SCHEDULED_ROUTINE` or
+`GRAPH_TASK`; only the revision-1 migration decoder may infer an omitted legacy
+kind. Local hints and refresh timestamps are presentation/freshness facts, not
+execution authority.
 
 ## Capabilities and execution
 
@@ -251,12 +254,13 @@ provenance, result-bound, and observation rules. It is not a recursive model
 call or a second runtime.
 
 External native data effects and admitted external actions declare an
-`EffectReceiptPolicy`. Automation proposals also require an
-`AutomationGrantPolicy`; the runtime validates both requested and domain-normalized
-constraints. Effect-free and local management capabilities cannot use these
-external-effect policies. Unattended effects require concrete native/MCP admission
-and exact standing grants. Generic routine authority and outcome conformance alone
-do not enable them; eligibility metadata alone is not production authority.
+`EffectReceiptPolicy`. Effect-free and local management capabilities cannot use
+it. Every effect, in a foreground or a machine run, asks a person at the time
+through the agent's `ApprovalHandler`; a run with no handler refuses the effect
+with `approval_required`. Routine authoring still accepts standing grants and the
+runtime still normalizes them (`AutomationGrantPolicy`, `prepare_automation_grant`),
+but no run uses them to perform an effect; that machinery is removed in a later
+phase.
 
 The runtime reserves a unique operation and call identity in SQLite before
 external dispatch, validates the resulting observation and ordinary output, and
@@ -293,10 +297,16 @@ loop and explicit capabilities; there is no background learning agent.
 
 Operational effects use the fixed governance branch immediately before the
 effect in `CapabilityRuntime`. Approval is once-only and bound to exact frozen
-arguments; that binding is the invariant. Today approval is also in-process: the
-host calls an `ApprovalHandler` and waits, with no pending-approval record or
-resume API. A design that persists pending approvals must keep the exact-argument
-binding and the once-only decision.
+arguments; that binding is the invariant. Inside a process the runtime awaits
+an `ApprovalHandler`. In the host that handler opens an interaction
+(`host/interactions.py`) any connected client can answer, and a desktop
+notification goes out when nobody watches. Scheduled and job runs ask the same
+way; the `ApprovalRequest.requester` names the routine or job so the card can
+say what asked, while the notification text never carries titles or data. A
+denial is an ordinary tool result the model continues from. An interaction
+that expires (24 hours) or is dismissed interrupts the run: a routine
+occurrence or graph task then finishes as failed and shows as *Needs you* on
+the work board. There is no pending-approval record or resume API.
 
 Observation is one best-effort callback. It cannot direct execution. Today it is
 not persisted and is not a telemetry, tracing or replay source; durable truth

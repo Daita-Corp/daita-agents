@@ -246,7 +246,7 @@ user's side.
 
 ### Make a capability usable by routines
 Nothing to do: every capability is usable by scheduled and job runs unless it is
-on the exclusion list in `capability_runtime.py` (local computer files, and
+on the exclusion list in `hosting/embedded.py` (local computer files, and
 creating, changing or running routines and jobs). An effectful capability still
 needs an `EffectReceiptPolicy`; the run asks a person before performing it.
 Check the scheduled-run limits in `docs/architecture/jobs-and-routines.md`.

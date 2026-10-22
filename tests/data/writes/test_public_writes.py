@@ -896,8 +896,14 @@ async def test_exact_native_upsert_runs_once_as_a_preview_bound_graph_task(
             )
             == 1
         )
-        assert len(approvals) == 1
-        assert approvals[0].capability_id == "jobs.graph.start"
+        # The job's write asks at the time, naming the job that asked.
+        assert [item.capability_id for item in approvals] == [
+            "jobs.graph.start",
+            "data.upsert_rows",
+        ]
+        assert approvals[1].requester == (
+            "Apply the exact admitted company upsert once."
+        )
         assert foreground.reason == "completed"
     finally:
         await agent.close()
@@ -1218,13 +1224,8 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                     if isinstance(block, TextBlock)
                 )
                 assert "Routine authoring facts" not in system
-                if mode == "success":
-                    assert "catalog_describe" not in {
-                        tool.name for tool in request.tools
-                    }
-                    assert "Missing structure is unknown" in system
-                else:
-                    assert "catalog_describe" in {tool.name for tool in request.tools}
+                # Scope is built at run start, so every run can describe its tables.
+                assert "catalog_describe" in {tool.name for tool in request.tools}
             inspection = await agent.inspect_routine(routine.routine_id)
             assert inspection is not None
             assert (

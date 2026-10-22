@@ -103,10 +103,11 @@ inserts missing rows, updates changed rows, skips unchanged rows, and verifies e
 counts summing to the input count. Mismatches roll back the entire batch. Sequence
 allocations may leave gaps after rollback; receipts describe table-row effects.
 
-The data domain normalizes native standing grants and permits at most one native
-write capability per routine, with one invocation per occurrence and exact ceilings.
-An unchanged batch consumes its reservation and produces verified zero-mutation
-evidence. Full request sensitivity must fit the current target classification.
+A native write in a scheduled or job run asks a person at the time, exactly as a
+foreground write does; the approval card carries the routine or job title. The
+data domain still normalizes native standing grants for routine authoring, but
+no run uses them. An unchanged batch consumes its reservation and produces
+verified zero-mutation evidence. Full request sensitivity must fit the current target classification.
 Research lineage remains model-derived claims, distinct from transaction facts.
 Receipt reservation/finalization stays in CapabilityRuntime. No arbitrary SQL,
 insert-only tool, delete, DDL, chunking, automatic retry or replay is supported.
@@ -129,7 +130,7 @@ folder source:
   budget; a discovery that reaches either commits a bounded snapshot with
   `CatalogSync.truncated`. Attached folders are always contained to their root;
   hosted compositions do not register the folder type. Like any source, they
-  can be granted to scheduled routines and graph jobs.
+  are in scope for scheduled and job runs; the session folder never is.
 - The **session folder source** is built by the composition root from the
   session's `LocalWorkspace`. Its `source:workspace:sha256:` ID is stable for the agent
   and workspace, sorts after every stored source, and is never written to the

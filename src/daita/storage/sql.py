@@ -2273,23 +2273,23 @@ class SQLStateStore:
             elif graph_binding is not None:
                 if (
                     receipt.routine_id is not None
-                    or not isinstance(grant, CapabilityGrant)
-                    or grant not in scope.capability_grants
                     or task_attempt_guard is None
                     or task_attempt_guard.binding != graph_binding
                     or task_attempt_guard.claim_token == ""
                     or task_attempt_guard.run_id != receipt.run_id
+                    or graph_binding.agent_id != receipt.agent_id
                 ):
                     raise EffectReceiptConflictError(
                         "graph receipt lacks its exact frozen attempt authorization"
                     )
-                if (
-                    grant.capability_id != receipt.capability_id
+                # Approved at the time: a grant is only checked when one was used.
+                if grant is not None and (
+                    grant not in scope.capability_grants
+                    or grant.capability_id != receipt.capability_id
                     or grant.domain_owner_id != receipt.domain_owner_id
                     or grant.capability_contract_digest
                     != receipt.capability_contract_digest
                     or grant.grant_digest != receipt.capability_grant_digest
-                    or graph_binding.agent_id != receipt.agent_id
                 ):
                     raise EffectReceiptConflictError(
                         "graph receipt does not match its exact capability grant"
@@ -2344,46 +2344,44 @@ class SQLStateStore:
                         attempt.lease_expires_at is not None
                         and attempt.lease_expires_at <= now
                     )
-                    or receipt.capability_id
-                    not in task.specification.authority.capability_ids
                 ):
                     raise EffectReceiptConflictError("graph receipt attempt is stale")
-                count = required_row(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM effect_receipts WHERE agent_id = ? AND job_id = ? AND task_id = ? AND grant_digest = ?",
-                        (
-                            receipt.agent_id,
-                            graph_binding.job_id,
-                            graph_binding.task_id,
-                            grant.grant_digest,
-                        ),
-                    )
-                )[0]
-                if count >= grant.max_calls_per_occurrence:
-                    raise EffectReceiptConflictError(
-                        "the graph grant invocation ceiling is exhausted"
-                    )
+                if grant is not None:
+                    count = required_row(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM effect_receipts WHERE agent_id = ? AND job_id = ? AND task_id = ? AND grant_digest = ?",
+                            (
+                                receipt.agent_id,
+                                graph_binding.job_id,
+                                graph_binding.task_id,
+                                grant.grant_digest,
+                            ),
+                        )
+                    )[0]
+                    if count >= grant.max_calls_per_occurrence:
+                        raise EffectReceiptConflictError(
+                            "the graph grant invocation ceiling is exhausted"
+                        )
             else:
                 routine_id = receipt.routine_id
                 if routine_id is None:
                     raise EffectReceiptConflictError(
                         "machine receipt lacks routine or graph authorization"
                     )
-                if (
-                    not isinstance(grant, CapabilityGrant)
-                    or scope is None
-                    or grant not in scope.capability_grants
+                # Approved at the time: a grant is only checked when one was used.
+                if grant is not None and (
+                    grant not in scope.capability_grants
+                    or grant.capability_id != receipt.capability_id
+                    or grant.domain_owner_id != receipt.domain_owner_id
+                    or grant.capability_contract_digest
+                    != receipt.capability_contract_digest
+                    or grant.grant_digest != receipt.capability_grant_digest
                 ):
                     raise EffectReceiptConflictError(
                         "receipt lacks its exact frozen scope grant"
                     )
                 if (
-                    grant.capability_id != receipt.capability_id
-                    or grant.domain_owner_id != receipt.domain_owner_id
-                    or grant.capability_contract_digest
-                    != receipt.capability_contract_digest
-                    or grant.grant_digest != receipt.capability_grant_digest
-                    or scope.routine_id != receipt.routine_id
+                    scope.routine_id != receipt.routine_id
                     or scope.routine_revision != receipt.routine_revision
                     or scope.occurrence_id != receipt.occurrence_id
                 ):
@@ -2411,23 +2409,30 @@ class SQLStateStore:
                         or routine[0].active_occurrence_id != receipt.occurrence_id
                         or routine[0].state is not RoutineState.ACTIVE
                         or self._clock() >= routine[0].expires_at
-                        or grant not in routine[0].capability_grants
-                        or routine[0].contract_bindings != scope.contract_bindings
+                        or (
+                            grant is not None
+                            and grant not in routine[0].capability_grants
+                        )
                     )
                 ):
                     raise EffectReceiptConflictError(
                         "receipt occurrence claim is no longer current"
                     )
-                count = required_row(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM effect_receipts WHERE agent_id = ? AND occurrence_id = ? AND grant_digest = ?",
-                        (receipt.agent_id, receipt.occurrence_id, grant.grant_digest),
-                    )
-                )[0]
-                if count >= grant.max_calls_per_occurrence:
-                    raise EffectReceiptConflictError(
-                        "the grant invocation ceiling is exhausted"
-                    )
+                if grant is not None:
+                    count = required_row(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM effect_receipts WHERE agent_id = ? AND occurrence_id = ? AND grant_digest = ?",
+                            (
+                                receipt.agent_id,
+                                receipt.occurrence_id,
+                                grant.grant_digest,
+                            ),
+                        )
+                    )[0]
+                    if count >= grant.max_calls_per_occurrence:
+                        raise EffectReceiptConflictError(
+                            "the grant invocation ceiling is exhausted"
+                        )
             connection.execute(
                 "INSERT INTO effect_receipts(agent_id, id, run_id, call_id, operation_key, routine_id, occurrence_id, grant_digest, unresolved, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
                 (

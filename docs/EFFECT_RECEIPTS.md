@@ -7,6 +7,16 @@ silently repeating it. The receipt binds the exact capability, run, call, and
 normalized operation. A repeated operation in the same run or occurrence is
 not dispatched again, including after definite non-application.
 
+Every effect is approved by a person at the time, in a scheduled routine or
+job run just as in a conversation. The run pauses, the Daita host shows the
+approval card (naming the routine or job that asked) and sends a desktop
+notification when no window is open. Approve, and the receipt is reserved and
+the action dispatched once; deny, and the run continues with the refusal and
+nothing is written. If nobody answers within 24 hours the run is interrupted,
+not denied, and the routine occurrence or job shows as *Needs you*. A run
+without an approval path (library mode without an approval handler) refuses
+the effect.
+
 `SUCCEEDED / ADAPTER_VERIFIED` records native transaction evidence.
 `SUCCEEDED / SERVER_REPORTED` means the remote tool invocation returned normally;
 it does not independently verify downstream business completion. `NOT_APPLIED`

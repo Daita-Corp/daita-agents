@@ -721,12 +721,25 @@ def approval_review_document(
     capability_id: str,
     arguments_text: str | None,
     reason: str | None = None,
+    requester: str | None = None,
 ) -> tuple[str | None, bool]:
-    """Return the review document and whether it is reviewable."""
+    """Return the review document and whether it is reviewable.
+
+    ``requester`` names the routine or job that asked; a person's own run has none.
+    """
 
     if arguments_text is None:
         return None, False
-    header = (
+    asked_by = (
+        "Asked by: "
+        + sanitize_terminal_text(
+            requester, maximum=256, preserve_lines=False, fallback="a routine"
+        )
+        + "\n"
+        if requester is not None
+        else ""
+    )
+    header = asked_by + (
         f"Tool: {sanitize_terminal_text(tool_name, maximum=128, preserve_lines=False, fallback='tool')}\n"
         f"Capability: {sanitize_terminal_text(capability_id, maximum=128, preserve_lines=False, fallback='capability')}\n"
         + (

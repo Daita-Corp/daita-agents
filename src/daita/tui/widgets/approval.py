@@ -63,6 +63,7 @@ class ApprovalPanel(Vertical):
             capability_id=request.capability_id,
             arguments_text=rendered,
             reason=request.reason,
+            requester=request.requester,
         )
         self.query_one("#approval-inline-text", Static).update(
             self._document_text(document)

@@ -381,14 +381,17 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
         await migrated.close()
 
 
-async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
+async def test_scheduled_sqlite_export_rejects_a_source_the_routine_did_not_name(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "walking-resource-scope.sqlite"
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE allowed_value (value INTEGER NOT NULL)")
-        connection.execute("CREATE TABLE outside_value (value INTEGER NOT NULL)")
         connection.execute("INSERT INTO allowed_value VALUES (7)")
+    # A routine's scope is the sources it names; another readable source is outside.
+    outside_database = tmp_path / "walking-outside-scope.sqlite"
+    with sqlite3.connect(outside_database) as connection:
+        connection.execute("CREATE TABLE outside_value (value INTEGER NOT NULL)")
         connection.execute("INSERT INTO outside_value VALUES (99)")
 
     provider = ToolboxAwareMockModelProvider(
@@ -406,9 +409,11 @@ async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
     )
     try:
         source = await agent.attach(SQLiteSource(database))
+        outside = await agent.attach(SQLiteSource(outside_database))
         resources = {
             resource.name: resource
-            for resource in await agent.list_catalog_resources(source_id=source.id)
+            for source_id in (source.id, outside.id)
+            for resource in await agent.list_catalog_resources(source_id=source_id)
         }
         origin = await agent.run("Authorize only the allowed table for scheduling.")
         assert origin.conversation_id is not None
@@ -433,7 +438,7 @@ async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
                         id="outside-export",
                         name="data_query",
                         arguments={
-                            "source_id": source.id,
+                            "source_id": outside.id,
                             "resource_ids": (resources["outside_value"].id,),
                             "sql": "SELECT value FROM outside_value",
                             "output": "csv",
@@ -456,7 +461,7 @@ async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
         assert block.is_error is True
         error = block.output.get("error")
         assert isinstance(error, Mapping)
-        assert error.get("code") == "execution_scope_resource_violation"
+        assert error.get("code") == "source_scope_violation"
     finally:
         await agent.close()
 
@@ -1453,15 +1458,18 @@ async def test_scheduled_routine_reads_an_attached_folder_and_refuses_a_changed_
 
         read = await occurrence(1)
         assert not read.is_error, read.output
-        # The scheduled run is never told about routes it cannot call.
+        # Eligibility no longer narrows scheduled runs, so combined queries are
+        # offered; the live session folder's file route stays excluded.
         (scheduled_query,) = [
             tool for tool in provider.requests[-1].tools if tool.name == "data_query"
         ]
-        assert "Join sources" not in scheduled_query.description
-        assert "Folder files" not in scheduled_query.description
-        assert not {"inputs", "path_pattern"} & set(
+        properties = set(
             cast(Mapping[str, object], scheduled_query.input_schema["properties"])
         )
+        assert "Join sources" in scheduled_query.description
+        assert "inputs" in properties
+        assert "Folder files" not in scheduled_query.description
+        assert "path_pattern" not in properties
         data = cast(Mapping[str, object], read.output["data"])
         assert [dict(row) for row in cast(tuple[Any, ...], data["rows"])] == [
             {"total": 15}

@@ -58,6 +58,7 @@ from tests.capabilities._effect_runtime_support import _EffectExecutor
 from tests.routines._supervisor_support import _ids
 from tests.support.capability_runtime import (
     StaticTestDomain,
+    machine_scope_builder,
     presentation_metadata,
 )
 from tests.support.distribution import no_artifact_outcome_contract
@@ -113,32 +114,9 @@ class _StandingDomain(StaticTestDomain):
             )
         return constraints
 
-    async def prepare_call(
-        self, run, call, capability, arguments, *, request_sensitivity
-    ):
-        if run.execution_scope is not None:
-            grant = next(
-                item
-                for item in run.execution_scope.capability_grants
-                if item.capability_id == capability.id
-            )
-            if arguments["target"] != grant.constraints["target"]:
-                raise CapabilityInputError(
-                    "grant_outside_scope", "The call differs from the standing target."
-                )
-        return arguments
-
     async def side_effect_plan(self, run, call, capability, execution, fingerprint):
-        scope = run.execution_scope
-        assert scope is not None
-        grant = next(
-            item
-            for item in scope.capability_grants
-            if item.capability_id == capability.id
-        )
+        # Scheduled effects ask a person at the time, like the real domains.
         return SideEffectPlan(
-            approval_required=False,
-            capability_grant_digest=grant.grant_digest,
             effect_intent=FrozenJsonObject.from_mapping(
                 {"arguments": execution.arguments}
             ),
@@ -567,6 +545,9 @@ async def _assignment(
         distribution=distribution,
         artifacts=artifacts,
         execute_run=execute_run,
+        machine_scope=machine_scope_builder(
+            agent_id="agent-effect", registry=registry, contracts=read_contracts
+        ),
         clock=clock,
         id_factory=identity_factory,
     )
@@ -585,13 +566,17 @@ async def _assignment(
 @pytest.mark.parametrize(
     "basis", (EffectEvidenceBasis.ADAPTER_VERIFIED, EffectEvidenceBasis.SERVER_REPORTED)
 )
-async def test_routine_uses_one_standing_grant_and_authenticated_successful_receipt(
+async def test_routine_effect_asks_at_the_time_and_records_one_authenticated_receipt(
     tmp_path, basis
 ):
+    from daita.capabilities import ApprovalRequest
+
+    approvals: list[ApprovalRequest] = []
     store, owner, runtime, executor, model, inspection, proposal, supervisor = (
-        await _assignment(tmp_path, basis=basis)
+        await _assignment(tmp_path, basis=basis, approvals=approvals)
     )
     try:
+        assert [item.capability_id for item in approvals] == ["test.action"]
         occurrence = inspection.recent_occurrences[0]
         assert occurrence.disposition is RoutineOccurrenceDisposition.COMPLETED
         assert executor.calls == 1
@@ -601,10 +586,8 @@ async def test_routine_uses_one_standing_grant_and_authenticated_successful_rece
         )
         assert receipt is not None and receipt.outcome is EffectOutcome.SUCCEEDED
         assert receipt.evidence_basis is basis
-        assert (
-            receipt.capability_grant_digest
-            == inspection.routine.capability_grants[0].grant_digest
-        )
+        # Approved at the time, so no standing grant authorized the receipt.
+        assert receipt.capability_grant_digest is None
         delivery = (await store.list_deliveries("agent-effect"))[0]
         assert delivery.outcome.conclusion_state is OutcomeState.SUCCEEDED
         assert delivery.outcome.effect_receipt_ids == occurrence.effect_receipt_ids
@@ -680,30 +663,19 @@ async def test_uncertain_or_unusable_required_effect_never_reports_success(
         await store.close()
 
 
-async def test_durable_grant_ceiling_counts_a_distinct_second_operation(tmp_path):
-    from collections.abc import Mapping
+async def test_each_distinct_operation_in_an_occurrence_asks_and_is_receipted(
+    tmp_path,
+):
+    from daita.capabilities import ApprovalRequest
 
-    from daita.llm.models import ToolResultBlock
-
+    approvals: list[ApprovalRequest] = []
     store, owner, runtime, executor, model, inspection, proposal, supervisor = (
-        await _assignment(tmp_path, repeated=True)
+        await _assignment(tmp_path, repeated=True, approvals=approvals)
     )
     try:
-        occurrence = inspection.recent_occurrences[0]
-        assert executor.calls == 1
-        assert len(await store.list_effect_receipts("agent-effect")) == 1
-        assert occurrence.terminal_run_id is not None
-        transcript = await store.load(occurrence.terminal_run_id)
-        second = next(
-            block
-            for message in transcript.messages
-            for block in message.content
-            if isinstance(block, ToolResultBlock) and block.call_id == "action-two"
-        )
-        assert second.is_error
-        error = second.output["error"]
-        assert isinstance(error, Mapping)
-        assert error["code"] == "effect_reservation_conflict"
+        assert [item.call_id for item in approvals] == ["action-one", "action-two"]
+        assert executor.calls == 2
+        assert len(await store.list_effect_receipts("agent-effect")) == 2
     finally:
         await store.close()
 
@@ -873,7 +845,7 @@ async def test_existing_unrelated_routine_can_finish_while_uncertain_routine_sta
         await store.close()
 
 
-async def test_known_nonapplication_still_consumes_the_native_invocation_ceiling(
+async def test_known_nonapplication_never_satisfies_a_required_effect(
     tmp_path,
 ):
     store, owner, runtime, executor, model, inspection, proposal, supervisor = (
@@ -886,13 +858,13 @@ async def test_known_nonapplication_still_consumes_the_native_invocation_ceiling
     )
     try:
         receipts = await store.list_effect_receipts("agent-effect")
-        assert executor.calls == len(receipts) == 1
-        assert receipts[0].outcome is EffectOutcome.NOT_APPLIED
+        assert executor.calls == len(receipts) == 2
+        assert {item.outcome for item in receipts} == {EffectOutcome.NOT_APPLIED}
         assert (
             inspection.recent_occurrences[0].failure_code
             == "outcome_effect_requirement_unsatisfied"
         )
-        assert not receipts[0].unresolved
+        assert not any(item.unresolved for item in receipts)
     finally:
         await store.close()
 
@@ -1033,7 +1005,7 @@ async def test_effect_requirement_accepts_supported_alternatives_and_rejects_str
 @pytest.mark.parametrize(
     "basis", (EffectEvidenceBasis.ADAPTER_VERIFIED, EffectEvidenceBasis.SERVER_REPORTED)
 )
-async def test_immediate_assignment_uses_one_creation_approval_and_no_per_call_approval(
+async def test_immediate_assignment_confirms_creation_then_asks_before_its_effect(
     tmp_path, basis
 ):
     from daita.capabilities import ApprovalRequest
@@ -1048,8 +1020,10 @@ async def test_immediate_assignment_uses_one_creation_approval_and_no_per_call_a
         )
     )
     try:
-        assert len(approvals) == 1
-        assert approvals[0].capability_id == "routines.create"
+        assert [item.capability_id for item in approvals] == [
+            "routines.create",
+            "test.action",
+        ]
         assert (
             inspection.recent_occurrences[0].disposition
             is RoutineOccurrenceDisposition.COMPLETED

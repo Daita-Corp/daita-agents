@@ -24,6 +24,7 @@ from ...capabilities import (
     GraphTaskBinding,
     OperationalEffect,
 )
+from ...capability_runtime import MachineRunScope
 from ...loop.models import RunOrigin
 from .capabilities import REVIEW_CAPABILITY_IDS
 from .context import TaskContextBundle
@@ -308,21 +309,19 @@ def model_task_execution_scope(
     attempt: TaskAttempt,
     binding: GraphTaskBinding,
     contract: Mapping[str, object],
+    fixed: MachineRunScope,
 ) -> ExecutionScope:
+    """The task run's scope: current sources and capabilities, fixed at start.
+
+    The task's frozen authority still names its model routes, sensitivity and
+    budgets; what it may read and call comes from ``fixed`` (invariant 6), and
+    effects ask a person at the time instead of relying on grants.
+    """
+
     authority = task.specification.authority
-    bindings = execution_contract_bindings(
-        authority.contract_bindings,
-        capability_ids=authority.capability_ids,
-        resource_ids=authority.resource_ids,
-        model_route_ids=authority.model_route_ids,
-    )
     max_tokens = contract["per_run_max_tokens"]
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool):
         raise TypeError("the model graph task token budget is malformed")
-    access_modes = frozenset(
-        AccessMode(item) for item in authority.access_modes
-    ) | frozenset({AccessMode.NONE})
-    grants = graph_capability_grants(authority.contract_bindings)
     return ExecutionScope(
         scope_id=f"graph-scope:{attempt.attempt_id}",
         revision=1,
@@ -331,22 +330,25 @@ def model_task_execution_scope(
         grant_id=f"graph-attempt:{attempt.attempt_id}",
         job_id=attempt.job_id,
         job_revision=inspection.graph.revision + 1,
-        allowed_source_ids=authority.source_ids,
-        allowed_resource_ids=authority.resource_ids,
-        allowed_capability_ids=authority.capability_ids,
-        allowed_access_modes=access_modes,
+        allowed_source_ids=fixed.source_ids,
+        allowed_resource_ids=fixed.resource_ids,
+        allowed_capability_ids=fixed.capability_ids,
+        allowed_access_modes=frozenset(AccessMode),
         allowed_operational_effects=frozenset(
-            OperationalEffect(item) for item in authority.operational_effects
+            {
+                OperationalEffect.NONE,
+                OperationalEffect.MUTATE_DATA,
+                OperationalEffect.EXTERNAL_ACTION,
+            }
         ),
         sensitivity_ceiling=authority.sensitivity,
         eligible_model_routes=authority.model_route_ids,
         per_run_max_cost_usd=None,
         per_run_max_tokens=max_tokens,
         distribution_plan_digest=inspection.job.specification.distribution_plan_digest,
-        contract_bindings=bindings,
-        allowed_connector_binding_ids=authority.connector_ids,
+        contract_bindings=fixed.contract_bindings,
+        allowed_connector_binding_ids=fixed.connector_binding_ids,
         scope_kind=ExecutionScopeKind.GRAPH_TASK,
-        capability_grants=grants,
         graph_task_binding=binding,
     )
 

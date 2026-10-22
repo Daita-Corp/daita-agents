@@ -20,7 +20,11 @@ from ..artifacts.models import (
 )
 from ..artifacts.store import AgentHomeArtifactStore
 from ..capabilities import CapabilityInputError
-from ..capability_runtime import CapabilityRuntime, InternalCapabilityRequest
+from ..capability_runtime import (
+    CapabilityRuntime,
+    InternalCapabilityRequest,
+    MachineScopeBuilder,
+)
 from ..distribution.models import (
     ArtifactRequirement,
     OutcomeContract,
@@ -111,6 +115,7 @@ class JobSupervisor:
         id_factory: Callable[[str], str],
         admission_coordinator: RunAdmissionCoordinator,
         distribution: DistributionOwner,
+        machine_scope: MachineScopeBuilder,
         graph_parallelism: int = 1,
         graph_heartbeat_seconds: float = 10.0,
         graph_model_loop: AgentLoop | None = None,
@@ -120,10 +125,13 @@ class JobSupervisor:
             raise ValueError("job supervisor agent_id must be non-empty text")
         if not isinstance(poll_seconds, (int, float)) or not 0 < poll_seconds <= 1:
             raise ValueError("job supervisor poll interval is outside its bound")
+        if not callable(machine_scope):
+            raise TypeError("job supervisor machine scope builder must be callable")
         self._agent_id = agent_id
         self._store = store
         self._owner = owner
         self._runtime = runtime
+        self._machine_scope = machine_scope
         self._artifacts = artifacts
         self._clock = clock
         self._id_factory = id_factory
@@ -904,12 +912,16 @@ class JobSupervisor:
             current_attempt,
             clock=self._clock,
         )
+        authority = current_task.specification.authority
         scope = model_task_execution_scope(
             current,
             current_task,
             current_attempt,
             guard.binding,
             contract,
+            await self._machine_scope(
+                RunOrigin.JOB_TASK, authority.source_ids, authority.model_route_ids
+            ),
         )
         context = task_context_bundle(
             current,
@@ -982,12 +994,24 @@ class JobSupervisor:
             options=RunSessionOptions(
                 task_context=context,
                 task_attempt_guard=guard,
+                requester=current.job.specification.objective[:256],
             ),
             admission_lease=None,
             budget_reservations=current_attempt.reserved_budgets,
         )
         async with self._graph_model_gate:
-            exit = await self._graph_model_loop.run(session, prior_messages=())
+            try:
+                exit = await self._graph_model_loop.run(session, prior_messages=())
+            except asyncio.CancelledError:
+                executing = asyncio.current_task()
+                if executing is None or executing.cancelling():
+                    raise
+                # An unanswered approval interrupted the run; fail the attempt
+                # for a person instead of retrying the question.
+                raise CapabilityInputError(
+                    "approval_expired",
+                    "Nobody answered the approval the task asked for.",
+                ) from None
         if exit.kind is LoopExitKind.MACHINE_TERMINATED:
             settled = await self._graph_store_call(
                 lambda: self._store.inspect_graph(

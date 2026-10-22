@@ -15,6 +15,7 @@ from daita.capabilities import (
     CapabilityInputError,
     CapabilityRegistry,
     ExecutionContractBindings,
+    ExecutionContractReader,
     Executor,
     ToolboxId,
     ToolExecution,
@@ -27,10 +28,14 @@ from daita.capabilities import (
 from daita.capability_runtime import (
     CapabilityFailure,
     CapabilityRuntime,
+    MachineRunScope,
+    MachineScopeBuilder,
     RunToolCatalog,
     SideEffectPlan,
     StepToolProjection,
+    machine_run_capability_ids,
 )
+from daita.hosting.embedded import machine_run_excluded_owners
 from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -348,10 +353,63 @@ def frozen_execution_bindings(
     )
 
 
+def machine_scope_builder(
+    *,
+    agent_id: str = "agent-1",
+    registry: CapabilityRegistry | None = None,
+    contracts: ExecutionContractReader | None = None,
+    capability_ids: tuple[str, ...] = (),
+    resource_ids: tuple[str, ...] = (),
+) -> MachineScopeBuilder:
+    """A run-start scope for tests without a source catalog.
+
+    With ``registry`` the capabilities are the production machine-run set
+    (every capability but the exclusions); otherwise ``capability_ids``.
+    ``contracts`` reads the bindings as the composition root does; without it
+    the digests are synthetic. ``resource_ids`` are admitted whenever the run
+    names sources.
+    """
+
+    async def build(
+        origin, source_ids: tuple[str, ...], model_route_ids: tuple[str, ...]
+    ) -> MachineRunScope:
+        capabilities = (
+            machine_run_capability_ids(registry, machine_run_excluded_owners(origin))
+            if registry is not None
+            else capability_ids
+        )
+        resources = resource_ids if source_ids else ()
+        sources = source_ids if resources else ()
+        bindings = (
+            await contracts(
+                agent_id=agent_id,
+                source_ids=sources,
+                resource_ids=resources,
+                capability_ids=capabilities,
+                connector_binding_ids=(),
+                model_route_ids=model_route_ids,
+            )
+            if contracts is not None
+            else frozen_execution_bindings(
+                capabilities, resources, model_route_ids, registry=registry
+            )
+        )
+        return MachineRunScope(
+            source_ids=sources,
+            resource_ids=resources,
+            capability_ids=capabilities,
+            connector_binding_ids=(),
+            contract_bindings=bindings,
+        )
+
+    return build
+
+
 __all__ = [
     "ContextToolProjectionAdapter",
     "StaticTestDomain",
     "execute_projected",
+    "machine_scope_builder",
     "presentation_metadata",
     "static_registry",
 ]

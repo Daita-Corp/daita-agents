@@ -649,7 +649,7 @@ async def test_possible_dispatch_failures_are_uncertain_and_never_replayed(
 
 
 @pytest.mark.acceptance
-async def test_immediate_and_recurring_mcp_only_assignment_uses_standing_grant(action):
+async def test_immediate_and_recurring_mcp_assignment_asks_before_each_action(action):
     proposal = await action.agent.propose_routine(await action.draft())
     from daita.routines.capabilities import _spec_schema
     from daita.routines.owner import _routine_proposal_payload
@@ -702,7 +702,11 @@ async def test_immediate_and_recurring_mcp_only_assignment_uses_standing_grant(a
     delivery = await action.delivery()
     assert delivery.delivery.outcome.conclusion_state is OutcomeState.SUCCEEDED
     assert [name for name, _ in action.server.calls] == ["research", "notify"]
-    assert len(action.approvals) == 1
+    # The routine's confirmation, then the immediate action asks at the time.
+    assert [item.capability_id for item in action.approvals] == [
+        "routines.create",
+        action.tool.capability_id,
+    ]
     approval = canonical_json(action.approvals[0].arguments)
     assert '"fixed_arguments":{"destination":"fixed-room"}' in approval
     assert '"variable_argument_names":["content"]' in approval
@@ -715,7 +719,8 @@ async def test_immediate_and_recurring_mcp_only_assignment_uses_standing_grant(a
     weekly = await action.delivery(2)
     assert weekly.delivery.outcome.conclusion_state is OutcomeState.SUCCEEDED
     assert len(await action.receipts()) == 2
-    assert len(action.approvals) == 1
+    assert len(action.approvals) == 3
+    assert action.approvals[-1].requester == proposal.title
     assert action.server.calls[-1] == (
         "notify",
         {"destination": "fixed-room", "content": "Weekly content"},
@@ -764,7 +769,7 @@ async def test_server_reported_action_cannot_promise_adapter_verified_completion
 @pytest.mark.parametrize(
     "invalid", ["fixed_destination", "missing_fixed", "extra_argument", "wrong_type"]
 )
-async def test_standing_invocations_enforce_fixed_values_and_variable_names(
+async def test_scheduled_actions_show_their_exact_arguments_and_denial_sends_nothing(
     action, invalid
 ):
     proposal = await action.agent.propose_routine(await action.draft())
@@ -778,10 +783,18 @@ async def test_standing_invocations_enforce_fixed_values_and_variable_names(
     else:
         arguments["content"] = {"nested": "unapproved"}
     action.script([("invalid", arguments)])
-    routine = await action.agent.create_routine(proposal)
+    action.decision = ApprovalDecision.DENY
+    await action.agent.create_routine(proposal)
     delivery = await action.delivery()
     assert delivery.delivery.outcome.conclusion_state is OutcomeState.FAILED
     assert not action.server.calls and not await action.receipts()
+    if invalid in {"fixed_destination", "extra_argument"}:
+        # A schema-valid call asks a person, who sees exactly what would be sent.
+        (asked,) = action.approvals
+        assert asked.arguments["arguments"] == FrozenJsonObject.from_mapping(arguments)
+    else:
+        # A call the connector schema rejects never reaches a person.
+        assert action.approvals == []
 
 
 @pytest.mark.parametrize(
@@ -833,7 +846,7 @@ async def test_grant_normalization_rejects_unenforceable_or_wrong_contracts(
     assert not action.server.calls and not await action.agent.list_routines()
 
 
-async def test_fixed_nested_values_are_exact_and_scalar_call_allowance_is_durable(
+async def test_each_distinct_scheduled_action_asks_and_an_identical_repeat_never_resends(
     action,
 ):
     draft = await action.draft(ceiling=2, minimum=2)
@@ -869,11 +882,18 @@ async def test_fixed_nested_values_are_exact_and_scalar_call_allowance_is_durabl
     )
     routine = await action.agent.create_routine(proposal)
     await action.delivery()
-    assert len(action.server.calls) == len(await action.receipts()) == 2
+    # Approved at the time, so no grant ceiling applies; the repeat of an
+    # identical operation is still never dispatched again.
+    assert len(action.server.calls) == len(await action.receipts()) == 4
+    assert [arguments for _name, arguments in action.server.calls].count(
+        {**fixed, "content": "one"}
+    ) == 1
     inspection = await action.agent.inspect_routine(routine.routine_id)
     results = await action.results(inspection.recent_occurrences[0].reserved_run_id)
-    assert next(item for item in results if item.call_id == "exhausted").is_error
-    assert next(item for item in results if item.call_id == "nested-change").is_error
+    assert not next(item for item in results if item.call_id == "exhausted").is_error
+    assert not next(
+        item for item in results if item.call_id == "nested-change"
+    ).is_error
 
 
 @pytest.mark.parametrize(

@@ -414,16 +414,17 @@ class Evaluation:
         accepted = False
         arguments = request.arguments
         already_approved = any(item["approved"] for item in self.approvals)
-        if (
-            not already_approved
-            and request.capability_id == self.action.capability_id
-            and not self.routine
+        # A foreground action is approved once; a routine's scheduled actions
+        # each ask at the time, and the person approves the exact destination.
+        if request.capability_id == self.action.capability_id and (
+            self.routine or not already_approved
         ):
             values = arguments.get("arguments")
+            target, _content = self.action_argument_names
             accepted = (
                 isinstance(values, Mapping)
-                and values.get("destination") == DESTINATION
-                and set(values) == {"destination", "content"}
+                and values.get(target) == DESTINATION
+                and set(values) == set(self.action_argument_names)
             )
         if (
             not already_approved

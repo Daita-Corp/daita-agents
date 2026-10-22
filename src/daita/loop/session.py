@@ -315,12 +315,20 @@ class RunSessionOptions:
     task_context: object | None = None
     task_attempt_guard: object | None = None
     execution_preference: ExecutionPreference = ExecutionPreference.AUTO
+    # The routine or job title an approval card names; None for foreground runs.
+    requester: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.files_only, bool) or not isinstance(
             self.explicit_learning, bool
         ):
             raise TypeError("session boolean options must be bool")
+        if self.requester is not None and (
+            not isinstance(self.requester, str)
+            or not self.requester.strip()
+            or len(self.requester) > 256
+        ):
+            raise ValueError("session requester must be bounded non-empty text")
         if not isinstance(self.execution_preference, ExecutionPreference):
             raise TypeError("session execution preference is invalid")
         bindings = tuple(self.retained_skill_bindings)

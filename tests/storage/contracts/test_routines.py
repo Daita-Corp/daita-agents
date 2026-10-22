@@ -8,9 +8,6 @@ from hashlib import sha256
 
 import pytest
 
-from daita.capabilities import (
-    AccessMode,
-)
 from daita.distribution import DeliveryState, DeliverySubjectKind, OutcomeState
 from daita.llm.models import (
     CanonicalMessage,
@@ -46,16 +43,12 @@ pytestmark = [pytest.mark.integration, pytest.mark.contract]
         {"sensitivity_ceiling": ModelSensitivity.RESTRICTED},
         {"per_run_max_tokens": 6000},
         {"per_run_max_cost_usd": Decimal("0.10")},
-        {"allowed_access_modes": frozenset({AccessMode.READ, AccessMode.WRITE})},
         {"distribution_plan_digest": "sha256:" + "e" * 64},
-        {"allowed_connector_binding_ids": ("unapproved-binding",)},
     ],
 )
 async def test_run_binding_rejects_every_changed_authority_field(
     state_store: StateStore, changed
 ):
-    from daita.routines.supervisor import _execution_scope
-
     store = state_store
     routine = await store.admit_scheduled_routine(routine_record())
     claimed = await store.claim_due_routine_occurrence(
@@ -67,7 +60,7 @@ async def test_run_binding_rejects_every_changed_authority_field(
         claim_token="claim-exact",
     )
     assert claimed is not None
-    scope = _execution_scope(routine, claimed)
+    scope = execution_scope(claimed)
     bound = await store.bind_routine_occurrence_run(
         routine.agent_id,
         claimed.occurrence_id,

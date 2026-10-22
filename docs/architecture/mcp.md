@@ -23,12 +23,13 @@ and takes effect immediately. A stale, changed, revoked, unavailable, or
 authentication-failed binding yields one bounded tool error without switching
 servers or retrying the remote call.
 
-MCP selections default to reads; explicit action selections default to interactive
-approval. Locally admitted unattended actions use the shared `mcp.tool_call` grant:
-exact binding/revision/tool, fixed top-level JSON values and bounded distinct scalar
-variable names. Fix nested values in full; arbitrary variable JSON cannot enforce
-nested recipient or target restrictions. Tool and binding outbound ceilings apply
-to the full request classification. No remote annotation grants authority.
+MCP selections default to reads; explicit action selections need approval at the
+time, in foreground and in scheduled and job runs alike. The shared
+`mcp.tool_call` grant (exact binding/revision/tool, fixed top-level JSON values
+and bounded distinct scalar variable names) is still accepted by routine
+authoring but no run uses it; a later phase removes it. Tool and binding outbound
+ceilings apply to the full request classification. No remote annotation grants
+authority.
 
 The existing MCP executor preflights without dispatch, then sends exactly one
 `tools/call` after the runtime's reservation. Valid plain-text results without an

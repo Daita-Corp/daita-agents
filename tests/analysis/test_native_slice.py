@@ -128,7 +128,8 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
         "scheduled-analysis",
         root=tmp_path,
         model=model,
-        model_profile=_profile(model),
+        # A scheduled run now sees its whole run-start scope, not three tools.
+        model_profile=replace(_profile(model), context_window_tokens=64_000),
         workspace=workspace_for(tmp_path),
     )
     try:

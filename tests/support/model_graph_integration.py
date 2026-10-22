@@ -58,7 +58,7 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.loop.driver import AgentLoop
 from daita.loop.models import LoopLimits
 from daita.storage.sqlite import SQLiteStateStore
-from tests.support.capability_runtime import StaticTestDomain
+from tests.support.capability_runtime import StaticTestDomain, machine_scope_builder
 from tests.support.loop import TranscriptContext
 from tests.support.static_graph_integration import DeterministicIds
 from tests.support.toolbox_model import RefCitingMockModelProvider, result_ref
@@ -298,6 +298,9 @@ class ModelGraphIntegration:
             id_factory=ids,
             admission_coordinator=coordinator,
             distribution=distribution,
+            machine_scope=machine_scope_builder(
+                agent_id=AGENT_ID, registry=registry, contracts=contracts
+            ),
             graph_parallelism=4,
             graph_model_loop=loop,
             poll_seconds=0.005,

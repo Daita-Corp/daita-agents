@@ -771,37 +771,7 @@ class MCPCapabilityDomain:
                     "maximum_sensitivity": (binding.maximum_outbound_sensitivity.value),
                 },
             )
-        if (
-            capability.operational_effect is not OperationalEffect.NONE
-            and scope is not None
-        ):
-            grant = next(
-                (
-                    item
-                    for item in scope.capability_grants
-                    if item.capability_id == capability.id
-                ),
-                None,
-            )
-            if grant is None:
-                raise CapabilityInputError(
-                    "effect_grant_required",
-                    "The MCP action requires its exact retained standing grant.",
-                )
-            await self._validate_constraints(binding, tool, grant.constraints)
-            fixed = cast(Mapping[str, object], grant.constraints["fixed_arguments"])
-            variable = cast(
-                tuple[str, ...], grant.constraints["variable_argument_names"]
-            )
-            if not set(arguments) <= set(fixed) | set(variable) or any(
-                name not in arguments
-                or canonical_json(arguments[name]) != canonical_json(value)
-                for name, value in fixed.items()
-            ):
-                raise CapabilityInputError(
-                    "mcp_grant_arguments_invalid",
-                    "MCP arguments differ from the approved fixed values or variable names.",
-                )
+        # MCP actions in machine runs ask a person at the time, like foreground ones.
         await validate_mcp_schema_value(
             tool.raw_input_schema or tool.input_schema, arguments
         )
@@ -1003,22 +973,9 @@ class MCPCapabilityDomain:
         fingerprint: FrozenJsonObject,
     ) -> SideEffectPlan:
         del call
+        del run
         binding, tool = self._binding_by_capability[capability.id]
-        grant = (
-            None
-            if run.execution_scope is None
-            else next(
-                (
-                    item
-                    for item in run.execution_scope.capability_grants
-                    if item.capability_id == capability.id
-                ),
-                None,
-            )
-        )
         return SideEffectPlan(
-            approval_required=run.execution_scope is None,
-            capability_grant_digest=None if grant is None else grant.grant_digest,
             approval_arguments=FrozenJsonObject.from_mapping(
                 {
                     "binding_id": binding.binding_id,

@@ -36,6 +36,7 @@ from daita.jobs.owner import JobOwner
 from daita.jobs.supervisor import JobSupervisor
 from daita.loop.models import RunInput
 from daita.storage.sqlite import SQLiteStateStore
+from tests.support.capability_runtime import machine_scope_builder
 
 AGENT_ID = "agent-static-graph"
 CONVERSATION_ID = "conversation-static-graph"
@@ -302,6 +303,9 @@ class StaticGraphIntegration:
             id_factory=ids,
             admission_coordinator=coordinator,
             distribution=distribution,
+            machine_scope=machine_scope_builder(
+                agent_id=AGENT_ID, registry=runtime._registry
+            ),
             graph_parallelism=graph_parallelism,
             poll_seconds=0.005,
         )

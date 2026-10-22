@@ -83,7 +83,12 @@ from ..capabilities import (
     ExecutionContractReader,
     ToolView,
 )
-from ..capability_runtime import CapabilityRuntime
+from ..capability_runtime import (
+    CapabilityRuntime,
+    MachineRunScope,
+    machine_run_capability_ids,
+    machine_run_connector_binding_ids,
+)
 from ..catalog.capabilities import (
     catalog_declarations,
 )
@@ -161,6 +166,7 @@ from ..jobs.capabilities import (
     job_capability_declarations,
 )
 from ..jobs.graph.admission import (
+    GRAPH_ADMISSION_DOMAIN_OWNER_ID,
     GraphAdmissionBuilder,
     GraphAdmissionCapabilityDomain,
     RegistryInitialTaskProposalResolver,
@@ -220,6 +226,7 @@ from ..loop.models import (
     LoopExit,
     LoopLimits,
     RunInput,
+    RunOrigin,
     Transcript,
 )
 from ..loop.session import RunSession, RunSessionEvidence, RunSessionOptions
@@ -260,7 +267,11 @@ from ..routines.models import (
 )
 from ..routines.owner import RoutineError, RoutineOwner, routine_approval_arguments
 from ..routines.supervisor import RoutineSupervisor
-from ..scope import EffectiveSourceScope, resolve_effective_source_scope
+from ..scope import (
+    EffectiveSourceScope,
+    resolve_effective_source_scope,
+    resolve_machine_source_scope,
+)
 from ..security import (
     CredentialSession,
     KeychainSecretProvider,
@@ -471,6 +482,27 @@ def _routine_draft_values(draft: ScheduledRoutineDraft) -> _RoutineDraftValues:
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_DISCOVERED_AGENTS = 100
 _LIVE_JOB_STATES = frozenset(GraphState) - TERMINAL_GRAPH_STATES
+# Scheduled and job runs may use every capability except these owners'
+# (invariant 6): creating, changing or running routines and jobs stays with a
+# person. Local computer files are excluded by scope: no session folder.
+MACHINE_RUN_EXCLUDED_OWNERS = frozenset(
+    {
+        ROUTINE_DOMAIN_OWNER_ID,
+        JOB_DOMAIN_OWNER_ID,
+        GRAPH_ADMISSION_DOMAIN_OWNER_ID,
+        DATA_PROFILE_DOMAIN_OWNER_ID,
+    }
+)
+
+
+def machine_run_excluded_owners(origin: RunOrigin) -> frozenset[str]:
+    """The exclusions for one run; graph task tools serve graph task runs only."""
+
+    if origin is RunOrigin.JOB_TASK:
+        return MACHINE_RUN_EXCLUDED_OWNERS
+    return MACHINE_RUN_EXCLUDED_OWNERS | {GRAPH_TASK_DOMAIN_OWNER_ID}
+
+
 _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
 _RUN_ADMISSION_DRAIN_SECONDS = 30.0
 _T = TypeVar("_T")
@@ -2072,6 +2104,42 @@ class EmbeddedAgent:
                 ),
             )
         )
+
+        async def machine_run_scope(
+            origin: RunOrigin,
+            source_ids: tuple[str, ...],
+            model_route_ids: tuple[str, ...],
+        ) -> MachineRunScope:
+            """Fix what a routine or job run may use as it starts (invariant 6)."""
+
+            sources = await resolve_machine_source_scope(
+                identity.id, source_ids, data_view
+            )
+            # The scope lists sources and resources together; a source with
+            # nothing readable contributes nothing.
+            source_tuple = (
+                tuple(sorted(sources.source_ids)) if sources.resource_ids else ()
+            )
+            resource_tuple = tuple(sorted(sources.resource_ids))
+            capability_ids = machine_run_capability_ids(
+                capabilities, machine_run_excluded_owners(origin)
+            )
+            connector_ids = machine_run_connector_binding_ids(capabilities)
+            return MachineRunScope(
+                source_ids=source_tuple,
+                resource_ids=resource_tuple,
+                capability_ids=capability_ids,
+                connector_binding_ids=connector_ids,
+                contract_bindings=await read_execution_contracts(
+                    agent_id=identity.id,
+                    source_ids=source_tuple,
+                    resource_ids=resource_tuple,
+                    capability_ids=capability_ids,
+                    connector_binding_ids=connector_ids,
+                    model_route_ids=model_route_ids,
+                ),
+            )
+
         job_supervisor = JobSupervisor(
             agent_id=identity.id,
             store=store,
@@ -2082,6 +2150,7 @@ class EmbeddedAgent:
             id_factory=id_factory,
             admission_coordinator=admission_coordinator,
             distribution=distribution_owner,
+            machine_scope=machine_run_scope,
             graph_model_loop=loop,
             graph_parallelism=host_capacity.graph_parallelism,
         )
@@ -2144,7 +2213,8 @@ class EmbeddedAgent:
                         retained_skill_bindings=tuple(
                             (binding.skill_name, binding.content_digest)
                             for binding in routine.skill_bindings
-                        )
+                        ),
+                        requester=routine.title,
                     ),
                     admission_lease=lease,
                     predecessor=predecessor,
@@ -2166,10 +2236,19 @@ class EmbeddedAgent:
                 )
                 if bound is None:
                     return None
-                return await loop.run(
-                    session.with_prepared(prepared),
-                    prior_messages=prior_messages,
-                )
+                try:
+                    return await loop.run(
+                        session.with_prepared(prepared),
+                        prior_messages=prior_messages,
+                    )
+                except asyncio.CancelledError:
+                    executing = asyncio.current_task()
+                    if executing is None or executing.cancelling():
+                        raise
+                    # An unanswered approval interrupted the run, not the
+                    # supervisor: finish the occurrence from the exit the loop
+                    # recorded so it shows as Needs you.
+                    return await store.result(run_input.id)
 
         routine_supervisor = RoutineSupervisor(
             agent_id=identity.id,
@@ -2179,6 +2258,7 @@ class EmbeddedAgent:
             distribution=distribution_owner,
             artifacts=artifact_store,
             execute_run=(execute_routine_run if loop is not None else None),
+            machine_scope=machine_run_scope,
             clock=clock,
             id_factory=id_factory,
         )

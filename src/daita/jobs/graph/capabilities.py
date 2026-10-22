@@ -2082,22 +2082,24 @@ def graph_task_capability_declarations(
     )
 
 
-def _grant_backed_effect_call_id(
+def _effect_call_ids(
     transcript: Transcript,
     graph_grants: object,
-) -> str | None:
-    """Select the sole successful receipt-bearing call without model mediation."""
+) -> tuple[str, ...]:
+    """Bind the attempt's successful receipt-bearing calls without model mediation.
 
-    if not graph_grants:
-        return None
-    if not isinstance(graph_grants, Mapping):
+    Effects approved at the time are all bound. A task that still carries a
+    grant keeps the old rule: exactly one call of the granted capability.
+    """
+
+    if graph_grants is not None and not isinstance(graph_grants, Mapping):
         raise CapabilityInputError(
             "task_result_effect_unverified",
             "The task's effect-grant contract is malformed.",
         )
     granted_capability_ids = frozenset(
         capability_id
-        for capability_id in graph_grants
+        for capability_id in (graph_grants or {})
         if isinstance(capability_id, str)
     )
     candidates = tuple(
@@ -2105,16 +2107,16 @@ def _grant_backed_effect_call_id(
         for call, result in transcript.tool_pairs
         if result is not None
         and not result.is_error
-        and result.capability_id in granted_capability_ids
+        and (not graph_grants or result.capability_id in granted_capability_ids)
         and isinstance(result.output.get("effect_receipt"), Mapping)
     )
-    if len(candidates) != 1:
+    if graph_grants and len(candidates) != 1:
         raise CapabilityInputError(
             "task_result_effect_unverified",
             "Effectful graph completion requires exactly one successful current-attempt grant-backed effect call.",
             details={"matching_effect_call_count": len(candidates)},
         )
-    return candidates[0]
+    return candidates
 
 
 def _authenticate_evidence(
@@ -2238,14 +2240,9 @@ def _task_result_from_arguments(
     graph_grants = task.specification.authority.contract_bindings.get(
         "capability_grants"
     )
-    effect_call_id = _grant_backed_effect_call_id(transcript, graph_grants)
+    effect_call_ids = _effect_call_ids(transcript, graph_grants)
     evidence_ids: tuple[object, ...] = tuple(
-        dict.fromkeys(
-            (
-                *raw_evidence_ids,
-                *((effect_call_id,) if effect_call_id is not None else ()),
-            )
-        )
+        dict.fromkeys((*raw_evidence_ids, *effect_call_ids))
     )
     artifacts = tuple(sorted(str(item) for item in raw_artifact_ids))
     (
@@ -2260,10 +2257,10 @@ def _task_result_from_arguments(
             "artifact_ids must contain only artifact IDs returned by cited tool calls; receipt IDs are invalid.",
             details={"expected_reference_kind": "artifact_id"},
         )
-    if bool(graph_grants) != (len(authenticated_effects) == 1):
+    if graph_grants and len(authenticated_effects) != 1:
         raise CapabilityInputError(
             "task_result_effect_unverified",
-            "Effectful graph work requires exactly one successful cited receipt; effect-free work permits none.",
+            "Grant-backed graph work requires exactly one successful cited receipt.",
         )
     effect_receipt_ids = tuple(sorted(authenticated_effects))
     result_kind = request.arguments["result_kind"]

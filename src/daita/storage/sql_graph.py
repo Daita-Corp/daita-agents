@@ -2666,6 +2666,8 @@ def complete_attempt(
         fencing_epoch=fencing_epoch,
     )
     raw_grants = task.specification.authority.contract_bindings.get("capability_grants")
+    grant_capability_id: str | None = None
+    grant_digest: object = None
     if raw_grants:
         if not isinstance(raw_grants, Mapping) or len(raw_grants) != 1:
             raise GraphValidationError(
@@ -2675,22 +2677,27 @@ def complete_attempt(
             raise GraphValidationError(
                 "effect_receipt", "effectful task requires one receipt reference"
             )
-        capability_id, grant_entry = next(iter(raw_grants.items()))
-        if not isinstance(capability_id, str) or not isinstance(grant_entry, Mapping):
+        grant_capability_id, grant_entry = next(iter(raw_grants.items()))
+        if not isinstance(grant_capability_id, str) or not isinstance(
+            grant_entry, Mapping
+        ):
             raise GraphValidationError(
                 "effect_grant", "task effect grant binding is malformed"
             )
         grant_digest = grant_entry.get("grant_digest")
+    evidence = result.provenance.get("evidence")
+    # Every cited receipt must belong to this exact attempt. A receipt that used
+    # the task's grant must also match it; effects approved at the time carry none.
+    for receipt_id in result.effect_receipt_ids:
         row = connection.execute(
             "SELECT data, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest, grant_digest, unresolved FROM effect_receipts WHERE agent_id = ? AND id = ?",
-            (result.agent_id, result.effect_receipt_ids[0]),
+            (result.agent_id, receipt_id),
         ).fetchone()
         if row is None:
             raise GraphValidationError(
                 "effect_receipt", "task effect receipt is unavailable"
             )
         receipt = decode_receipt(_required_text(row[0], "effect receipt payload"))
-        evidence = result.provenance.get("evidence")
         matching_evidence = (
             tuple(
                 item
@@ -2712,11 +2719,23 @@ def complete_attempt(
                 fencing_epoch,
                 task.task_spec_digest,
             )
-            or row[6] != grant_digest
+            or row[6] != receipt.capability_grant_digest
             or row[7] != 0
             or receipt.run_id != result.run_id
-            or receipt.capability_id != capability_id
-            or receipt.capability_grant_digest != grant_digest
+            or (
+                grant_capability_id is not None
+                and (
+                    receipt.capability_id != grant_capability_id
+                    or (
+                        receipt.capability_grant_digest is not None
+                        and receipt.capability_grant_digest != grant_digest
+                    )
+                )
+            )
+            or (
+                grant_capability_id is None
+                and receipt.capability_grant_digest is not None
+            )
             or receipt.outcome is not EffectOutcome.SUCCEEDED
             or receipt.finished_at is None
             or receipt.finished_at > result.completed_at
@@ -2726,10 +2745,6 @@ def complete_attempt(
                 "effect_receipt",
                 "task effect receipt does not authenticate this exact attempt result",
             )
-    elif result.effect_receipt_ids:
-        raise GraphValidationError(
-            "effect_receipt", "effect-free task cannot reference an effect receipt"
-        )
     if task.role is TaskRole.FINALIZER and (
         graph.finalization_attempt_id != attempt.attempt_id
         or graph.finalization_started_revision != graph.revision

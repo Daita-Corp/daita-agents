@@ -24,7 +24,6 @@ from ...capabilities import (
     CallProvenance,
     Capability,
     CapabilityDeclarations,
-    CapabilityGrant,
     CapabilityInputError,
     CapabilityRegistry,
     OperationalEffect,
@@ -625,7 +624,6 @@ class DataCapabilityDomain:
                 intent.evidence_call_ids,
                 execution=capability.id == "data.upsert_rows",
             )
-            self._check_native_grant(run, capability, arguments, permission)
         if capability.id in _UPDATE_CAPABILITIES:
             await self._validate_relational_update_call(
                 run,
@@ -652,7 +650,6 @@ class DataCapabilityDomain:
                         "write_row_limit",
                         "The exact update exceeds its permission row ceiling.",
                     )
-                self._check_native_grant(run, capability, arguments, permission)
         return arguments
 
     prepare_session_call = prepare_call
@@ -804,65 +801,51 @@ class DataCapabilityDomain:
             or capability.operational_effect is not OperationalEffect.MUTATE_DATA
         ):
             raise ValueError("data domain received an unsupported side effect")
-        grant = (
-            None
-            if run.execution_scope is None
-            else next(
-                (
-                    item
-                    for item in run.execution_scope.capability_grants
-                    if item.capability_id == capability.id
-                ),
-                None,
-            )
-        )
-        approval_arguments = None
-        if run.execution_scope is None:
-            source_id = cast(str, execution.arguments["source_id"])
-            resource_id = cast(str, execution.arguments["resource_id"])
-            resource = next(
-                (
-                    item
-                    for item in await self._catalog.resource_schemas(
-                        run.agent_id, source_id
-                    )
-                    if item.resource_id == resource_id
-                ),
-                None,
-            )
-            source = next(
-                (
-                    item
-                    for item in await self._catalog.source_routing_facts(
-                        run.agent_id, (source_id,)
-                    )
-                    if item["source_id"] == source_id
-                ),
-                None,
-            )
-            if (
-                resource is None
-                or source is None
-                or resource.revision != fingerprint["resource_revision"]
-            ):
-                raise CapabilityInputError(
-                    "write_state_changed",
-                    "The exact review target is no longer current.",
+        source_id = cast(str, execution.arguments["source_id"])
+        resource_id = cast(str, execution.arguments["resource_id"])
+        resource = next(
+            (
+                item
+                for item in await self._catalog.resource_schemas(
+                    run.agent_id, source_id
                 )
-            approval_arguments = FrozenJsonObject.from_mapping(
-                {
-                    "arguments": execution.arguments,
-                    "target": {
-                        "source_id": source_id,
-                        "resource_id": resource_id,
-                        "name": resource.name,
-                        "aliases": resource.aliases,
-                        "source_name": source["display_name"],
-                        "revision": resource.revision,
-                    },
-                    "preview": fingerprint["review"],
-                }
+                if item.resource_id == resource_id
+            ),
+            None,
+        )
+        source = next(
+            (
+                item
+                for item in await self._catalog.source_routing_facts(
+                    run.agent_id, (source_id,)
+                )
+                if item["source_id"] == source_id
+            ),
+            None,
+        )
+        if (
+            resource is None
+            or source is None
+            or resource.revision != fingerprint["resource_revision"]
+        ):
+            raise CapabilityInputError(
+                "write_state_changed",
+                "The exact review target is no longer current.",
             )
+        approval_arguments = FrozenJsonObject.from_mapping(
+            {
+                "arguments": execution.arguments,
+                "target": {
+                    "source_id": source_id,
+                    "resource_id": resource_id,
+                    "name": resource.name,
+                    "aliases": resource.aliases,
+                    "source_name": source["display_name"],
+                    "revision": resource.revision,
+                },
+                "preview": fingerprint["review"],
+            }
+        )
         approval_reason = (
             "Review the exact batch. Execution briefly holds an EXCLUSIVE table lock; ordinary reads may continue."
             if capability.id == "data.upsert_rows"
@@ -876,8 +859,6 @@ class DataCapabilityDomain:
         ):
             approval_reason += " Identity sequence gaps can remain after rollback."
         return SideEffectPlan(
-            approval_required=run.execution_scope is None,
-            capability_grant_digest=None if grant is None else grant.grant_digest,
             approval_reason=approval_reason,
             approval_arguments=approval_arguments,
             recheck_after_approval=True,
@@ -1698,79 +1679,6 @@ class DataCapabilityDomain:
                 "write_sensitivity_denied",
                 "The request exceeds the target's current admitted classification.",
             )
-
-    def _check_native_grant(
-        self,
-        run: RunInput,
-        capability: Capability,
-        arguments: Mapping[str, object],
-        permission: RelationalWriteScope,
-    ) -> CapabilityGrant | None:
-        if run.execution_scope is None:
-            return None
-        capability_id = (
-            "data.upsert_rows"
-            if capability.id in _UPSERT_CAPABILITIES
-            else RELATIONAL_UPDATE_CAPABILITY_ID
-        )
-        grant = next(
-            (
-                item
-                for item in run.execution_scope.capability_grants
-                if item.capability_id == capability_id
-            ),
-            None,
-        )
-        if grant is None or grant.max_calls_per_occurrence != 1:
-            raise CapabilityInputError(
-                "automation_grant_scope_invalid",
-                "An exact once-per-occurrence native grant is required.",
-            )
-        c = grant.constraints
-        if (
-            c["source_id"] != arguments["source_id"]
-            or c["resource_id"] != arguments["resource_id"]
-            or c["resource_revision"] != permission.resource_revision
-        ):
-            raise CapabilityInputError(
-                "automation_grant_scope_invalid",
-                "The native target differs from its frozen grant.",
-            )
-        if capability_id == "data.upsert_rows":
-            intent = RelationalUpsertIntent.from_mapping(arguments)
-            updates, inserts, keys, count = (
-                intent.update_columns,
-                intent.insert_columns,
-                intent.key_columns,
-                len(intent.rows),
-            )
-        else:
-            update = RelationalUpdateIntent.from_mapping(
-                {
-                    key: arguments[key]
-                    for key in ("source_id", "resource_id", "where", "assignments")
-                }
-            )
-            updates, inserts, keys, count = (
-                tuple(item.column for item in update.assignments),
-                (),
-                permission.key_columns,
-                cast(int, arguments.get("expected_affected_rows", 0)),
-            )
-        if (
-            not set(updates) <= set(cast(tuple[str, ...], c["allowed_update_columns"]))
-            or not set(inserts)
-            <= set(cast(tuple[str, ...], c["allowed_insert_columns"]))
-            or set(keys) != set(cast(tuple[str, ...], c["key_columns"]))
-            or set(permission.generated_identity_columns)
-            != set(cast(tuple[str, ...], c["generated_identity_columns"]))
-            or count > cast(int, c["max_rows"])
-        ):
-            raise CapabilityInputError(
-                "automation_grant_scope_invalid",
-                "The batch exceeds its exact native grant.",
-            )
-        return grant
 
     async def _authenticate_native_lineage(
         self,
