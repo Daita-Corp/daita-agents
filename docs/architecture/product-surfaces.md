@@ -33,6 +33,16 @@ before/after state, including required read additions; it performs no source wri
 
 Receipt list, inspect and human recovery controls call the existing Agent APIs.
 Recovery never calls the model or an external executor. The original observation
-and separate immutable resolution stay owned by SQLite. Product host status must
-distinguish saved assignments, queued/running occurrences and the lifetime of the
-currently open TUI or headless command; no host means no execution progress.
+and separate immutable resolution stay owned by SQLite.
+
+## Host status
+
+The TUI and the CLI are clients of the Daita host. The TUI status bar shows the
+real host state (`● host`, `◌ reconnecting`, `○ host stopped`) from the host
+status route and `agent_state` events, never a static indicator; `/status`
+prints the connection as a `Host` line with the same guidance. `daita host
+status` reports whether the host runs, its pid, version, socket and log path,
+the agents it holds and how many clients watch them. Agent commands go
+through the host; `daita --no-host <command>` opens the agent in-process for
+one command and fails with `HostActiveError` when the host holds it. `daita`
+and `daita chat` always use the host.

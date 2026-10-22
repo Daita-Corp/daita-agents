@@ -17,7 +17,11 @@ unit/integration directory hierarchy.
   and outputs.
 - `tests/memory`, `skills`, `semantics`, `learning`, `storage`, `security`, and
   `hosting` cover advisory state, persistence, permissions, and lifecycle.
-- `tests/cli` and `tests/tui` cover their own projections and controls.
+- `tests/host` covers the background host: codec, protocol, routes, runs,
+  events, interactions, security, notifications, service files and the
+  subprocess lifecycle.
+- `tests/cli` and `tests/tui` cover their own projections and controls, as
+  clients of a real in-process host.
 - `tests/acceptance` contains selected multi-owner public journeys.
 - `tests/architecture` contains only structural ownership, import, and public
   boundary contracts.
@@ -638,6 +642,43 @@ The fully offline job concurrency soak retains its explicit enable flag:
 Do not load `.env`, enable a live gate, or spend an external resource merely to
 make validation green. Diagnose deterministic failures at their offline owner.
 
+## Host tests
+
+`tests/support/host.py` is the shared harness for everything that needs the
+Daita host. Use real components only: the real host on a real Unix socket, real
+SQLite homes and `MockModelProvider`; never mock the event bus or interactions.
+
+- `hosts()` is an async context manager yielding a `start` callable; each call
+  starts a real in-process host on a short socket and returns a `HostHarness`
+  (`root`, `paths`, `work()`, `events()`, `create_agent()`, `submit()`,
+  `stop()`). Every host is stopped and its root removed afterwards.
+- Each test directory that needs a host has one thin `start_host` fixture in
+  its own `conftest.py` that wraps `hosts()`; do not add a second harness.
+- `remote_agent(harness, name, **callbacks)` connects a `RemoteAgent`.
+  `host_workspace(harness)` is a client working directory beside the root.
+- `short_root()` makes a state root under `/tmp`, because pytest's `tmp_path`
+  can exceed the macOS socket path limit; agent homes reject symlinked paths,
+  so it is resolved. `remove_root()` cleans it and its sibling work folders.
+- `EventStream` reads one agent's server-sent events; `bounded()` waits on a
+  probe with a timeout; `finished_run()` and `pending_interaction()` wait for a
+  run to finish or an interaction to open. Every wait is bounded.
+- `fake_openai_device_login()` scripts a subscription device login so no test
+  reaches a provider.
+
+`tests/host/test_process_lifecycle.py` starts, kills and recovers a real host
+subprocess. It is marked `integration`; in a container it needs an init process
+that reaps children (`docker run --init`).
+
+CLI tests that exercise library mode pass `--no-host`; everything else goes
+through the host fixture. Tests never call `osascript`, `notify-send`,
+`launchctl` or `systemctl`: inject the notification sender (`Notifier(send=...)`)
+and the service command runner (`service.install(..., run=...)`) and assert on
+what they receive.
+
+Textual rule: a body inside `App.run_test()` that raises without calling
+`app.exit()` hangs the run. Put `app.exit()` in a `finally`, or let the pilot
+drive the app to its own exit.
+
 ## Model-surface gate
 
 Scripted models replay old behavior, so a change to what the model is shown
@@ -707,8 +748,8 @@ failure.
 
 ## Explicit entry points
 
-The resident, diagnostic, and packaging entry points are modules so their
-imports resolve from the repository root:
+The deprecated resident, diagnostic, and packaging entry points are modules so
+their imports resolve from the repository root:
 
 ```bash
 .venv/bin/python -m tests.diagnostics.live_stream_boundaries --help

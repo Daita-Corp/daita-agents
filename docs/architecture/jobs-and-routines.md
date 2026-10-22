@@ -81,8 +81,8 @@ compensate or mark the task successful.
 Agent identity is the job authorization boundary. The originating
 conversation and run are immutable provenance, not access gates. Bounded list,
 inspect, result-read, and cancellation operations can address any job owned by
-the agent. Cross-agent lookup fails without exposing metadata. Work pauses
-when no `EmbeddedAgent` host is open.
+the agent. Cross-agent lookup fails without exposing metadata. Work progresses only
+while a process holds the agent open; normally that is the Daita host.
 
 There is no current connected-executor mode, embedded single-job attempt/result
 state, autonomous-follow-up driver or selectable legacy supervisor. Finalizers
@@ -145,8 +145,12 @@ conversation inbox. Producer finalization validates committed artifacts and
 the current destination, constructs immutable references, and commits the
 producer outcome and unique deliveries atomically before any UI wake.
 
-`daita host --agent <name>` (the resident host, `hosting/resident.py`) keeps one
-ordinary `EmbeddedAgent` open so routines and jobs make progress without a TUI. It
-reuses the existing runtime and state store and is that home's only writer while
-it runs. Today it hosts one agent per process and exposes no API; a background
-host serving clients is planned and must keep those properties.
+The Daita host (`daita host serve`, `src/daita/host/`) opens every agent that
+has background work (an active or due routine, an unfinished job, an
+unacknowledged delivery) as an ordinary `EmbeddedAgent`, so routines and jobs
+progress while the host runs, whether or not a TUI is open. It reuses the
+existing runtime and state store and is each home's only writer while it holds
+the agent. Clients start it on demand; `daita host install` registers it as a
+login service (launchd or systemd) so it restarts after a crash and at login.
+`daita host --agent <name>` is deprecated: it prints a notice and runs
+`daita host serve`.
