@@ -237,7 +237,8 @@ def _cwd_header() -> dict[str, str]:
 
 
 def _segment(value: object) -> str:
-    return quote(str(value), safe="")
+    # Dots too: a bare "." or ".." segment would be resolved away in transit.
+    return quote(str(value), safe="").replace(".", "%2E")
 
 
 @functools.cache

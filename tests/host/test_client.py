@@ -78,6 +78,7 @@ from tests.support.host import (
     fake_openai_device_login,
     finished_run,
     pending_interaction,
+    remote_agent,
     remove_root,
     short_root,
     value,
@@ -771,6 +772,22 @@ async def test_host_errors_are_raised_as_the_same_exception_types(
     await bounded(
         lambda: _no_active_runs(harness),
     )
+
+
+@pytest.mark.parametrize("value", ["a/b", "Users/x/guide.md", "..", ".", "a%2Fb"])
+async def test_a_path_value_reaches_its_route_whatever_it_contains(
+    start_host: StartHost, value: str
+) -> None:
+    harness = await start_host()
+    agent = await remote_agent(harness, "sales")
+    try:
+        # The same outcome as in process: not found, or the member's own refusal.
+        assert await agent.inspect_job(value) is None
+        assert await agent.inspect_routine(value) is None
+        with pytest.raises(ValueError, match="skill name must match"):
+            await agent.read_skill(value)
+    finally:
+        await agent.close()
 
 
 async def _no_active_runs(harness: Any) -> bool:

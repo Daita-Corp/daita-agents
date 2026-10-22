@@ -86,6 +86,10 @@ def guarded(handler: Handler) -> Handler:
     """Turn every failure into the one error envelope."""
 
     async def handle(request: Request) -> Response:
+        # Routing saw the raw path (server._Handshake); decode values once.
+        request.scope["path_params"] = {
+            key: unquote(value) for key, value in request.path_params.items()
+        }
         try:
             return await handler(request)
         except Exception as error:

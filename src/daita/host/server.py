@@ -312,6 +312,11 @@ class _Handshake:
         self.state = app.state
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        raw = scope.get("raw_path") if scope["type"] == "http" else None
+        if raw is not None:
+            # Route on the path as sent, so an encoded "/" stays inside its
+            # segment; routes decode each path value once.
+            scope = {**scope, "path": raw.decode("latin-1")}
         # The client asks a mismatched host to drain, so shutdown is exempt.
         if scope["type"] == "http" and scope["path"] != "/v1/host/shutdown":
             headers = Headers(scope=scope)

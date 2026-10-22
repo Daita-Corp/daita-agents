@@ -366,3 +366,16 @@ async def test_an_agent_a_script_holds_says_who_holds_it(
         f"sales: In use by a Python script (pid {os.getpid()})."
     )
     assert app._startup_error is None
+
+
+async def test_a_message_starting_with_a_file_path_is_not_a_skill(
+    start_host: StartHost,
+) -> None:
+    harness = await start_host()
+    app = _app(harness)
+    app.controller.agent = await remote_agent(harness, "sales")
+    try:
+        message = "/Users/jendala/Desktop/guide.md summarise this"
+        assert await app.controller.skill_invocation_message(message) is None
+    finally:
+        await app.controller.close()
