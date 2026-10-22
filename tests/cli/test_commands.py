@@ -1075,7 +1075,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
 
     assert _surface(commands["host"]) == (
         (),
-        frozenset({"-h", "--help", "--agent", "--diagnostics-path"}),
+        frozenset({"-h", "--help", "--agent"}),
     )
     diagnostics = _subcommands(commands["diagnostics"])
     assert set(diagnostics) == {"summary"}
@@ -1312,17 +1312,14 @@ def test_cli_host_offers_the_host_lifecycle_and_needs_a_command_or_an_agent() ->
         asyncio.run(cli._execute(args))
 
 
-def test_cli_host_dispatches_one_resident_composition(tmp_path: Path) -> None:
-    args = cli.build_parser().parse_args(
-        ["--root", str(tmp_path), "host", "--agent", "atlas"]
-    )
-    with patch.object(cli, "run_resident_host", new=AsyncMock()) as hosted:
-        result = asyncio.run(cli._execute(args))
-    assert result == {"agent": "atlas", "host": "stopped"}
-    hosted.assert_awaited_once()
-    await_args = hosted.await_args
-    assert await_args is not None
-    assert await_args.kwargs["agent_name"] == "atlas"
+def test_cli_host_agent_warns_and_serves_every_agent(tmp_path: Path, capsys) -> None:
+    with patch.object(cli, "_host_command", return_value=0) as served:
+        code = cli.main(["--root", str(tmp_path), "host", "--agent", "atlas"])
+    assert code == 0
+    assert "daita host --agent is deprecated" in capsys.readouterr().err
+    served.assert_called_once()
+    args = served.call_args.args[0]
+    assert (args.host_command, args.root) == ("serve", tmp_path)
 
 
 def test_future_cli_4_direct_knowledge_commands_survive_reopen():
@@ -1947,7 +1944,7 @@ def test_work_show_prints_every_board_column_for_a_local_agent(
     columns = ("scheduled", "running", "needs_you", "done")
     assert board["columns"] == {column: [] for column in columns}
     assert board["truncated"] == {column: 0 for column in columns}
-    assert "Host open for this command only" in stderr
+    assert stderr == ""
 
 
 @pytest.mark.parametrize("hours", ["0", "169", "-1"])

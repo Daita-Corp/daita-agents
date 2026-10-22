@@ -46,9 +46,9 @@ _AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _MAX_AGENT_HOME_CANDIDATES = 256
 
 
-# Who holds an agent's writer lock: "host", "tui-inprocess" or "script".
+# Who holds an agent's writer lock: "host" or "script".
 WRITER_ROLE: ContextVar[str] = ContextVar("daita_writer_role", default="script")
-_HOLDER_LABELS = {"tui-inprocess": "the Daita TUI", "script": "a Python script"}
+_HOLDER_LABELS = {"script": "a Python script"}
 
 
 _LEGACY_STATE_ROOT_MARKERS = (

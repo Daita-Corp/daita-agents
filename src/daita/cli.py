@@ -47,7 +47,6 @@ from . import (
     OnceSchedule,
     PostgreSQLSource,
     ReportingMode,
-    ResidentReady,
     ResourceRevisionPrecheck,
     RoutineState,
     ScheduledRoutineDraft,
@@ -55,7 +54,6 @@ from . import (
     SQLiteSource,
     __version__,
     create_llm_provider,
-    run_resident_host,
 )
 from ._json import FrozenJsonObject
 from .artifacts.models import (
@@ -87,12 +85,6 @@ from .terminal import run_terminal_application
 from .tui.projection import run_failure_notice, tool_outcome_summary
 from .work_board import work_board_projection
 from .workspace import working_directory
-
-_HOST_NOTICE = (
-    "Host open for this command only. Saved assignments progress while a host is open; "
-    "this command closes its host on exit. For continued execution, run "
-    "daita host --agent <name>. Stop that host before reopening the same agent in the TUI."
-)
 
 
 def _graph_inspection_mapping(inspection: GraphInspection) -> dict[str, object]:
@@ -561,14 +553,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="run the background Daita host that owns agents, runs and routines",
     )
     host.add_argument(
-        "--agent",
-        dest="host_agent",
-        help="hold only this agent open in this process (compatibility mode)",
-    )
-    host.add_argument(
-        "--diagnostics-path",
-        type=Path,
-        help="append payload-free per-call diagnostics to this private JSONL file",
+        "--agent", dest="host_agent", help="deprecated; runs `daita host serve`"
     )
     host_commands = host.add_subparsers(dest="host_command")
     host_serve = host_commands.add_parser("serve", help="run the host in this process")
@@ -1231,27 +1216,6 @@ async def _deny_without_prompting(request: ApprovalRequest) -> ApprovalDecision:
     return ApprovalDecision.DENY
 
 
-def _write_resident_ready(ready: object) -> None:
-    if not isinstance(ready, ResidentReady):
-        raise TypeError("resident readiness record is invalid")
-    print(
-        json.dumps(
-            {
-                "agent_id": ready.agent_id,
-                "agent_name": ready.agent_name,
-                "agent_home": str(ready.agent_home),
-                "host": "ready",
-                "handoff": (
-                    "This process owns the agent-home writer lock. Stop it before "
-                    "opening the same agent in another CLI or TUI process."
-                ),
-            },
-            sort_keys=True,
-        ),
-        flush=True,
-    )
-
-
 def _routine_draft_from_file(path: Path) -> ScheduledRoutineDraft:
     try:
         value = json.loads(_read_input_document(str(path)))
@@ -1527,18 +1491,7 @@ async def _execute(args: argparse.Namespace) -> object:
         finally:
             await agent.close()
     if args.command == "host":
-        if args.host_agent is None:
-            raise ValueError(
-                "choose a host command: serve, start, stop, status or logs"
-            )
-        await run_resident_host(
-            agent_name=args.host_agent,
-            workspace=workspace,
-            root=args.root,
-            on_ready=_write_resident_ready,
-            diagnostics_path=_absolute_path(args.diagnostics_path),
-        )
-        return {"agent": args.host_agent, "host": "stopped"}
+        raise ValueError("choose a host command: serve, start, stop, status or logs")
     if args.command == "jobs":
         agent = await _open_agent(args, workspace, {"config": AgentConfig()})
         try:
@@ -2161,8 +2114,6 @@ async def _execute(args: argparse.Namespace) -> object:
             deleted = await agent.delete_skill(args.skill_name)
             return {"name": args.skill_name, "deleted": deleted}
         if args.command == "work":
-            if args.no_host:
-                print(_HOST_NOTICE, file=sys.stderr)
             if args.work_command == "show":
                 return work_board_projection(
                     await agent.work_board(done_window=timedelta(hours=args.done_hours))
@@ -2177,8 +2128,6 @@ async def _execute(args: argparse.Namespace) -> object:
                 raise ValueError("delivery not found")
             return delivery_view_projection(dismissed)
         if args.command == "routines":
-            if args.no_host:
-                print(_HOST_NOTICE, file=sys.stderr)
             if args.routines_command == "destinations":
                 return [
                     distribution_destination_projection(item)
@@ -2434,6 +2383,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         result: object
         if args.no_host and args.command in (None, "chat"):
             raise ValueError("the terminal app always uses the Daita host")
+        if args.command == "host" and args.host_agent is not None:
+            print(
+                "daita host --agent is deprecated; the Daita host now serves every "
+                "agent. Running daita host serve.",
+                file=sys.stderr,
+            )
+            root = [] if args.root is None else ["--root", str(args.root)]
+            args = build_parser().parse_args([*root, "host", "serve"])
         if args.command == "host" and args.host_command is not None:
             return _host_command(args)
         if args.command is None:
@@ -2444,8 +2401,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     workspace=_resolve_cli_workspace(args),
                     agent_name=args.agent,
                     conversation_id=None,
-                    input_stream=sys.stdin,
-                    output_stream=sys.stdout,
                 )
             )
         else:

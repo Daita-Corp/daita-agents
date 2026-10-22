@@ -29,18 +29,8 @@ async def run_terminal_application(
     workspace: LocalWorkspace,
     agent_name: str | None = None,
     conversation_id: str | None = None,
-    input_stream: Any = None,
-    output_stream: Any = None,
-    hidden_input: Any = None,
-    selection_input: Any = None,
-    selection_output: Any = None,
-    tui_input: Any = None,
-    tui_output: Any = None,
 ) -> int:
-    """Start one Textual app. Extra stream arguments are ignored after cutover.
-
-    The app is a client of the Daita host, which owns every agent and its lock.
-    """
+    """Start one Textual app: a client of the Daita host, which owns every agent."""
 
     run_app = _load_textual_app()
     return await run_app(

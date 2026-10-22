@@ -17,7 +17,7 @@ from tests.support.paths import REPO_ROOT
 from tests.support.workspace import workspace_for
 
 
-async def test_resident_host_owns_normal_writer_lock_and_hands_off(
+async def test_deprecated_resident_host_warns_and_owns_the_writer_lock(
     tmp_path: Path,
 ) -> None:
     workspace = workspace_for(tmp_path)
@@ -30,16 +30,16 @@ async def test_resident_host_owns_normal_writer_lock_and_hands_off(
     def on_ready(value: ResidentReady) -> None:
         ready.set_result(value)
 
-    task = asyncio.create_task(
-        run_resident_host(
+    with pytest.warns(DeprecationWarning, match="run_resident_host is deprecated"):
+        hosting = run_resident_host(
             agent_name="resident",
             root=tmp_path,
             workspace=workspace,
             stop_event=stop,
             on_ready=on_ready,
         )
-    )
-    admitted = await ready
+        task = asyncio.create_task(hosting)
+        admitted = await ready
     assert admitted.agent_name == "resident"
 
     with pytest.raises(HostActiveError) as raised:
@@ -56,7 +56,7 @@ async def test_resident_host_owns_normal_writer_lock_and_hands_off(
     await reopened.close()
 
 
-def test_host_cli_surface_requires_explicit_agent_option() -> None:
+def test_host_cli_surface_still_parses_the_deprecated_agent_option() -> None:
     args = build_parser().parse_args(["host", "--agent", "resident"])
     assert args.command == "host"
     assert args.host_agent == "resident"
