@@ -1212,6 +1212,7 @@ async def test_cli_run_executes_python_through_the_broker_in_its_own_process(
         "print({'sum': sum(int(n) for n in r['output']['data']['content'].split())})"
     )
     argv = [
+        "--no-host",
         "--root",
         str(root),
         "--workspace",

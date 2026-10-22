@@ -12,6 +12,9 @@ from ..llm.provider_definitions import (
 )
 
 MAX_COMPOSER_CHARACTERS = 16_384
+HOST_GUIDANCE = (
+    "Routines run in the background Daita host. `daita host status` shows it."
+)
 MIN_USABLE_COLUMNS = 32
 MIN_READY_ROWS = 8
 MIN_APPROVAL_ROWS = 15

@@ -8,8 +8,9 @@ import re
 import shutil
 import stat
 import tomllib
-from collections.abc import Callable
-from datetime import datetime
+from collections.abc import Callable, Mapping
+from contextvars import ContextVar
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -25,7 +26,7 @@ from ..storage.sqlite import (
     load_current_artifact_inventory,
     validate_current_state_database,
 )
-from ..workspace import LocalWorkspace
+from ..workspace import LocalFileAccess, LocalWorkspace
 from .configuration import (
     _MODEL_CONFIG_NAME,
     _read_model_configuration,
@@ -43,6 +44,11 @@ _AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 
 
 _MAX_AGENT_HOME_CANDIDATES = 256
+
+
+# Who holds an agent's writer lock: "host" or "script".
+WRITER_ROLE: ContextVar[str] = ContextVar("daita_writer_role", default="script")
+_HOLDER_LABELS = {"script": "a Python script"}
 
 
 _LEGACY_STATE_ROOT_MARKERS = (
@@ -75,12 +81,19 @@ class _WriterLock:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as error:
                 if error.errno in {errno.EACCES, errno.EAGAIN}:
+                    holder = read_writer_holder(os.pread(descriptor, 4096, 0))
                     raise HostActiveError(
-                        f"host_active: another writer owns {path.parent.parent}"
+                        _holder_message(path.parent.parent.name, holder),
+                        holder=holder,
                     ) from error
                 raise
+            started_at = datetime.now(UTC).replace(microsecond=0).isoformat()
             os.ftruncate(descriptor, 0)
-            os.write(descriptor, f"pid={os.getpid()}\n".encode("ascii"))
+            os.write(
+                descriptor,
+                f"pid={os.getpid()}\nrole={WRITER_ROLE.get()}\n"
+                f"started_at={started_at.replace('+00:00', 'Z')}\n".encode("ascii"),
+            )
             os.fsync(descriptor)
             return cls(path, descriptor)
         except BaseException:
@@ -98,6 +111,39 @@ class _WriterLock:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+
+
+def read_writer_holder(content: bytes) -> dict[str, object]:
+    """Parse writer-lock contents, including the older ``pid=``-only format."""
+
+    holder: dict[str, object] = {"role": None, "pid": None, "started_at": None}
+    for line in content.decode("ascii", "replace").splitlines():
+        key, _, value = line.partition("=")
+        if key == "pid" and value.isdigit():
+            holder["pid"] = int(value)
+        elif key in {"role", "started_at"} and value:
+            holder[key] = value
+    return holder
+
+
+def _holder_message(name: str, holder: dict[str, object]) -> str:
+    pid = "unknown" if holder["pid"] is None else holder["pid"]
+    if holder["role"] == "host":
+        return (
+            f'Agent "{name}" is run by the Daita host (pid {pid}).\n'
+            f'Use daita.connect("{name}") from a script, or run `daita host stop`\n'
+            "to use it directly in this process."
+        )
+    label = _HOLDER_LABELS.get(str(holder["role"]), "another Daita process")
+    return f'Agent "{name}" is in use by {label} (pid {pid}).'
+
+
+def describe_writer_holder(holder: Mapping[str, object]) -> str:
+    """Say who holds a writer lock: "In use by a Python script (pid 5530)."."""
+
+    pid = holder.get("pid") or "unknown"
+    label = _HOLDER_LABELS.get(str(holder.get("role")), "another Daita process")
+    return f"In use by {label} (pid {pid})."
 
 
 def _admit_agent_home(
@@ -209,6 +255,8 @@ async def _open_workspace_backend(
     if hosted:
         return None
     assert workspace is not None
+    if workspace.access is LocalFileAccess.NONE:
+        return None
     return await LocalWorkspaceBackend.open(
         workspace,
         agent_root=home.parent.parent,

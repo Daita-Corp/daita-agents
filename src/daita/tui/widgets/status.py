@@ -9,8 +9,16 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import Static, Tabs
 
+from ..models import HOST_GUIDANCE
 from ..projection import format_token_count
 from ..sanitization import sanitize_terminal_text
+
+# RemoteAgent.connection -> indicator text and style.
+HOST_STATES = {
+    "connected": ("● host", "green"),
+    "reconnecting": ("◌ reconnecting", "yellow"),
+    "stopped": ("○ host stopped", "red"),
+}
 
 
 def context_window_text(used: int | None, total: int | None) -> Text:
@@ -39,12 +47,8 @@ class StatusBar(Horizontal):
         yield Static(Text("DAITA", style="bold"), id="status-primary")
         if self._navigation is not None:
             yield self._navigation
-        host = Static(Text("● host open", style="green"), id="host-status")
-        host.tooltip = (
-            "Routines and jobs run only while a Daita host is open: this window, "
-            "or `daita host --agent <name>` after you close it. With no host open "
-            "they wait."
-        )
+        host = Static(Text(), id="host-status")
+        host.tooltip = HOST_GUIDANCE
         host.display = False
         yield host
         context = Static(context_window_text(None, None), id="context-window")
@@ -59,6 +63,7 @@ class StatusBar(Horizontal):
         agent: str,
         model: str,
         source: str,
+        host: str = "connected",
         state: str,
         context_used: int | None = None,
         context_total: int | None = None,
@@ -71,9 +76,9 @@ class StatusBar(Horizontal):
     ) -> None:
         primary = self.query_one("#status-primary", Static)
         context = self.query_one("#context-window", Static)
-        host = self.query_one("#host-status", Static)
+        indicator = self.query_one("#host-status", Static)
         if too_small:
-            host.display = False
+            indicator.display = False
             message = Text("DAITA", style="bold")
             message.append("  Terminal too small; 32x8 required", style="bold")
             primary.update(message)
@@ -83,7 +88,9 @@ class StatusBar(Horizontal):
         label = context_window_text(context_used, context_total)
         context.update(label)
         context.display = bool(label) and self.app.size.width >= 100
-        host.display = bool(scheduled or running) and self.app.size.width >= 80
+        host_text, host_style = HOST_STATES[host]
+        indicator.update(Text(host_text, style=host_style))
+        indicator.display = self.app.size.width >= 80
         safe_source = sanitize_terminal_text(
             source, maximum=48, preserve_lines=False, fallback="none"
         )

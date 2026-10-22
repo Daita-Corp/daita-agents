@@ -8,7 +8,7 @@ import os
 import shlex
 import sys
 import tempfile
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,38 +53,12 @@ from daita.llm.models import (
 )
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import SecretReference
+from tests.support.cli import (
+    invoke as _invoke,
+    json_lines as _json_lines,
+)
 from tests.support.distribution import inbox_distribution_plan
 from tests.support.workspace import workspace_for
-
-
-class _TTYBuffer(io.StringIO):
-    def isatty(self) -> bool:
-        return True
-
-
-def _invoke(
-    argv: list[str],
-    *,
-    stdin: str = "",
-    tty: bool = False,
-) -> tuple[int, str, str]:
-    input_stream = _TTYBuffer(stdin) if tty else io.StringIO(stdin)
-    stdout = _TTYBuffer() if tty else io.StringIO()
-    stderr = _TTYBuffer() if tty else io.StringIO()
-    with (
-        patch.object(sys, "stdin", input_stream),
-        redirect_stdout(stdout),
-        redirect_stderr(stderr),
-    ):
-        try:
-            code = cli.main(argv)
-        except SystemExit as error:
-            code = error.code if isinstance(error.code, int) else 1
-    return code, stdout.getvalue(), stderr.getvalue()
-
-
-def _json_lines(text: str) -> tuple[dict[str, object], ...]:
-    return tuple(json.loads(line) for line in text.splitlines() if line.strip())
 
 
 def _subcommands(
@@ -218,6 +192,7 @@ def test_current_parser_keeps_the_existing_one_shot_surface_green():
                 "--agent",
                 "--workspace",
                 "--workspace-sensitivity",
+                "--no-host",
             }
         ),
     )
@@ -306,7 +281,7 @@ def test_workspace_resolution_uses_home_without_creating_conventional_fallback(
 
 
 def test_delete_is_state_only_and_does_not_resolve_a_workspace() -> None:
-    args = cli.build_parser().parse_args(["delete", "gone", "--yes"])
+    args = cli.build_parser().parse_args(["--no-host", "delete", "gone", "--yes"])
     with (
         patch.object(
             cli,
@@ -525,7 +500,7 @@ def test_current_run_writes_exactly_one_terminal_json_record_to_stdout():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory).resolve()
         create_code, create_stdout, create_stderr = _invoke(
-            ["--root", str(root), "create", "runner"]
+            ["--no-host", "--root", str(root), "create", "runner"]
         )
         assert create_code == 0
         assert len(_json_lines(create_stdout)) == 1
@@ -539,6 +514,7 @@ def test_current_run_writes_exactly_one_terminal_json_record_to_stdout():
         ):
             code, stdout, stderr = _invoke(
                 [
+                    "--no-host",
                     "--root",
                     str(root),
                     "run",
@@ -564,7 +540,7 @@ def test_run_closes_cli_owned_provider_when_agent_open_fails():
     provider = MockModelProvider(())
     provider_close = AsyncMock()
     arguments = cli.build_parser().parse_args(
-        ["run", "runner", "question", "--model", "mock:scripted"]
+        ["--no-host", "run", "runner", "question", "--model", "mock:scripted"]
     )
 
     with (
@@ -597,7 +573,9 @@ def test_run_without_model_opens_the_persisted_route_without_injection():
     agent = AsyncMock()
     agent.run.return_value = result
     agent.analysis_usage.return_value = None
-    arguments = cli.build_parser().parse_args(["run", "runner", "use persisted route"])
+    arguments = cli.build_parser().parse_args(
+        ["--no-host", "run", "runner", "use persisted route"]
+    )
 
     with (
         patch.object(Agent, "open", new=AsyncMock(return_value=agent)) as opened,
@@ -639,11 +617,12 @@ def test_run_without_model_reports_missing_persisted_configuration():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory).resolve()
         create_code, _stdout, _stderr = _invoke(
-            ["--root", str(root), "create", "unconfigured-runner"]
+            ["--no-host", "--root", str(root), "create", "unconfigured-runner"]
         )
         assert create_code == 0
         code, stdout, stderr = _invoke(
             [
+                "--no-host",
                 "--root",
                 str(root),
                 "run",
@@ -666,6 +645,7 @@ def test_current_diagnostics_use_stderr_and_leave_stdout_empty():
         ):
             code, stdout, stderr = _invoke(
                 [
+                    "--no-host",
                     "--root",
                     directory,
                     "run",
@@ -777,6 +757,7 @@ def test_future_cli_1_run_returns_and_cold_continues_an_explicit_conversation():
         ):
             first_code, first_stdout, first_stderr = _invoke(
                 [
+                    "--no-host",
                     "--root",
                     str(root),
                     "run",
@@ -795,6 +776,7 @@ def test_future_cli_1_run_returns_and_cold_continues_an_explicit_conversation():
 
             second_code, second_stdout, second_stderr = _invoke(
                 [
+                    "--no-host",
                     "--root",
                     str(root),
                     "run",
@@ -828,6 +810,7 @@ def test_future_cli_1_requested_event_jsonl_uses_stderr_only():
         with patch.object(cli, "create_llm_provider", return_value=provider):
             code, stdout, stderr = _invoke(
                 [
+                    "--no-host",
                     "--root",
                     str(root),
                     "run",
@@ -982,6 +965,7 @@ def test_cli_3_run_still_installs_no_approval_handler():
         ):
             code, stdout, stderr = _invoke(
                 [
+                    "--no-host",
                     "--root",
                     str(root),
                     "run",
@@ -1091,7 +1075,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
 
     assert _surface(commands["host"]) == (
         (),
-        frozenset({"-h", "--help", "--agent", "--diagnostics-path"}),
+        frozenset({"-h", "--help", "--agent"}),
     )
     diagnostics = _subcommands(commands["diagnostics"])
     assert set(diagnostics) == {"summary"}
@@ -1194,7 +1178,7 @@ def test_cli_routine_list_uses_public_agent_surface(tmp_path: Path) -> None:
         close=AsyncMock(),
     )
     args = cli.build_parser().parse_args(
-        ["--root", str(tmp_path), "routines", "list", "atlas"]
+        ["--no-host", "--root", str(tmp_path), "routines", "list", "atlas"]
     )
     with patch.object(Agent, "open", new=AsyncMock(return_value=fake)):
         result = asyncio.run(cli._execute(args))
@@ -1249,10 +1233,11 @@ def test_cli_job_board_and_review_use_only_public_agent_surfaces(
         close=AsyncMock(),
     )
     board_args = cli.build_parser().parse_args(
-        ["--root", str(tmp_path), "jobs", "board", "atlas", "job-1"]
+        ["--no-host", "--root", str(tmp_path), "jobs", "board", "atlas", "job-1"]
     )
     review_args = cli.build_parser().parse_args(
         [
+            "--no-host",
             "--root",
             str(tmp_path),
             "jobs",
@@ -1310,17 +1295,31 @@ def test_cli_job_board_and_review_use_only_public_agent_surfaces(
     assert fake.close.await_count == 2
 
 
-def test_cli_host_dispatches_one_resident_composition(tmp_path: Path) -> None:
-    args = cli.build_parser().parse_args(
-        ["--root", str(tmp_path), "host", "--agent", "atlas"]
-    )
-    with patch.object(cli, "run_resident_host", new=AsyncMock()) as hosted:
-        result = asyncio.run(cli._execute(args))
-    assert result == {"agent": "atlas", "host": "stopped"}
-    hosted.assert_awaited_once()
-    await_args = hosted.await_args
-    assert await_args is not None
-    assert await_args.kwargs["agent_name"] == "atlas"
+def test_cli_host_offers_the_host_lifecycle_and_needs_a_command_or_an_agent() -> None:
+    host = _subcommands(cli.build_parser())["host"]
+    args = cli.build_parser().parse_args(["host"])
+
+    assert set(_subcommands(host)) == {
+        "serve",
+        "start",
+        "stop",
+        "status",
+        "logs",
+        "install",
+        "uninstall",
+    }
+    with pytest.raises(ValueError, match="choose a host command"):
+        asyncio.run(cli._execute(args))
+
+
+def test_cli_host_agent_warns_and_serves_every_agent(tmp_path: Path, capsys) -> None:
+    with patch.object(cli, "_host_command", return_value=0) as served:
+        code = cli.main(["--root", str(tmp_path), "host", "--agent", "atlas"])
+    assert code == 0
+    assert "daita host --agent is deprecated" in capsys.readouterr().err
+    served.assert_called_once()
+    args = served.call_args.args[0]
+    assert (args.host_command, args.root) == ("serve", tmp_path)
 
 
 def test_future_cli_4_direct_knowledge_commands_survive_reopen():
@@ -1336,6 +1335,7 @@ def test_future_cli_4_direct_knowledge_commands_survive_reopen():
 
         memory_code, _, memory_stderr = _invoke(
             [
+                "--no-host",
                 "--root",
                 str(root),
                 "memory",
@@ -1349,6 +1349,7 @@ def test_future_cli_4_direct_knowledge_commands_survive_reopen():
         )
         skill_code, _, skill_stderr = _invoke(
             [
+                "--no-host",
                 "--root",
                 str(root),
                 "skills",
@@ -1363,6 +1364,7 @@ def test_future_cli_4_direct_knowledge_commands_survive_reopen():
         )
         inspect_code, inspect_stdout, inspect_stderr = _invoke(
             [
+                "--no-host",
                 "--root",
                 str(root),
                 "memory",
@@ -1399,6 +1401,7 @@ def test_cli_4_memory_file_stdin_and_reads_preserve_complete_utf8_content():
 
         memory_code, _, memory_stderr = _invoke(
             [
+                "--no-host",
                 "--root",
                 str(root),
                 "memory",
@@ -1412,6 +1415,7 @@ def test_cli_4_memory_file_stdin_and_reads_preserve_complete_utf8_content():
         )
         user_code, _, user_stderr = _invoke(
             [
+                "--no-host",
                 "--root",
                 str(root),
                 "memory",
@@ -1425,10 +1429,11 @@ def test_cli_4_memory_file_stdin_and_reads_preserve_complete_utf8_content():
             stdin=user_text,
         )
         read_memory_code, read_memory, read_memory_stderr = _invoke(
-            ["--root", str(root), "memory", "read", "memory-io"]
+            ["--no-host", "--root", str(root), "memory", "read", "memory-io"]
         )
         read_user_code, read_user, read_user_stderr = _invoke(
             [
+                "--no-host",
                 "--root",
                 str(root),
                 "memory",
@@ -1455,6 +1460,7 @@ def test_cli_4_skill_list_show_save_stdin_and_delete_use_complete_content():
         asyncio.run(_create_agent(root, "skill-io"))
         save_code, save_stdout, save_stderr = _invoke(
             [
+                "--no-host",
                 "--root",
                 str(root),
                 "skills",
@@ -1469,10 +1475,11 @@ def test_cli_4_skill_list_show_save_stdin_and_delete_use_complete_content():
             stdin=instructions,
         )
         list_code, list_stdout, list_stderr = _invoke(
-            ["--root", str(root), "skills", "list", "skill-io"]
+            ["--no-host", "--root", str(root), "skills", "list", "skill-io"]
         )
         show_code, show_stdout, show_stderr = _invoke(
             [
+                "--no-host",
                 "--root",
                 str(root),
                 "skills",
@@ -1483,6 +1490,7 @@ def test_cli_4_skill_list_show_save_stdin_and_delete_use_complete_content():
         )
         delete_code, delete_stdout, delete_stderr = _invoke(
             [
+                "--no-host",
                 "--root",
                 str(root),
                 "skills",
@@ -1524,12 +1532,13 @@ def test_cli_4_editor_success_updates_memory_user_and_exact_skill_document():
         editor = _replacement_editor(root, edited_memory, name="memory")
         with patch.dict(os.environ, {"EDITOR": editor}, clear=True):
             memory_result = _invoke(
-                ["--root", str(root), "memory", "edit", "editor-success"]
+                ["--no-host", "--root", str(root), "memory", "edit", "editor-success"]
             )
         editor = _replacement_editor(root, edited_user, name="user")
         with patch.dict(os.environ, {"EDITOR": editor}, clear=True):
             user_result = _invoke(
                 [
+                    "--no-host",
                     "--root",
                     str(root),
                     "memory",
@@ -1543,6 +1552,7 @@ def test_cli_4_editor_success_updates_memory_user_and_exact_skill_document():
         with patch.dict(os.environ, {"EDITOR": editor}, clear=True):
             skill_result = _invoke(
                 [
+                    "--no-host",
                     "--root",
                     str(root),
                     "skills",
@@ -1600,7 +1610,7 @@ def test_cli_4_editor_configuration_failures_never_write_and_release_lock(
         environment = {} if editor is None else {"EDITOR": editor}
         with patch.dict(os.environ, environment, clear=True):
             code, stdout, stderr = _invoke(
-                ["--root", str(root), "memory", "edit", "editor-failure"]
+                ["--no-host", "--root", str(root), "memory", "edit", "editor-failure"]
             )
         knowledge = asyncio.run(_complete_knowledge(root, "editor-failure"))
         asyncio.run(_open_and_close_agent(root, "editor-failure"))
@@ -1621,7 +1631,7 @@ def test_cli_4_editor_interruption_never_writes_and_releases_lock():
             patch.object(cli.subprocess, "run", side_effect=KeyboardInterrupt),
         ):
             code, stdout, stderr = _invoke(
-                ["--root", str(root), "memory", "edit", "editor-interrupt"]
+                ["--no-host", "--root", str(root), "memory", "edit", "editor-interrupt"]
             )
         knowledge = asyncio.run(_complete_knowledge(root, "editor-interrupt"))
         asyncio.run(_open_and_close_agent(root, "editor-interrupt"))
@@ -1645,6 +1655,7 @@ def test_cli_4_malformed_skill_edit_never_partially_writes_and_releases_lock():
         with patch.dict(os.environ, {"EDITOR": editor}, clear=True):
             code, stdout, stderr = _invoke(
                 [
+                    "--no-host",
                     "--root",
                     str(root),
                     "skills",
@@ -1679,6 +1690,7 @@ def test_cli_4_file_and_public_validation_failures_preserve_prior_state():
         failures = (
             _invoke(
                 [
+                    "--no-host",
                     "--root",
                     str(root),
                     "memory",
@@ -1692,6 +1704,7 @@ def test_cli_4_file_and_public_validation_failures_preserve_prior_state():
             ),
             _invoke(
                 [
+                    "--no-host",
                     "--root",
                     str(root),
                     "memory",
@@ -1705,6 +1718,7 @@ def test_cli_4_file_and_public_validation_failures_preserve_prior_state():
             ),
             _invoke(
                 [
+                    "--no-host",
                     "--root",
                     str(root),
                     "memory",
@@ -1719,6 +1733,7 @@ def test_cli_4_file_and_public_validation_failures_preserve_prior_state():
             ),
             _invoke(
                 [
+                    "--no-host",
                     "--root",
                     str(root),
                     "skills",
@@ -1733,6 +1748,7 @@ def test_cli_4_file_and_public_validation_failures_preserve_prior_state():
             ),
             _invoke(
                 [
+                    "--no-host",
                     "--root",
                     str(root),
                     "skills",
@@ -1772,6 +1788,7 @@ def test_cli_4_shell_mutations_delegate_through_public_agent_methods_only():
     with patch.object(cli.Agent, "open", open_agent):
         memory_result = _invoke(
             [
+                "--no-host",
                 "memory",
                 "set",
                 "public-only",
@@ -1784,6 +1801,7 @@ def test_cli_4_shell_mutations_delegate_through_public_agent_methods_only():
         )
         skill_result = _invoke(
             [
+                "--no-host",
                 "skills",
                 "save",
                 "public-only",
@@ -1862,7 +1880,9 @@ def test_cli_stopped_run_retains_committed_routine_without_dumping_contract():
     agent.run.return_value = result
     agent.transcript.return_value = transcript
     agent.analysis_usage.return_value = None
-    args = cli.build_parser().parse_args(["run", "runner", "create routine"])
+    args = cli.build_parser().parse_args(
+        ["--no-host", "run", "runner", "create routine"]
+    )
     with patch.object(Agent, "open", new=AsyncMock(return_value=agent)):
         record = asyncio.run(cli._execute(args))
     assert isinstance(record, dict)
@@ -1907,7 +1927,16 @@ def test_work_show_prints_every_board_column_for_a_local_agent(
 ) -> None:
     asyncio.run(_create_agent(tmp_path, "atlas"))
     code, stdout, stderr = _invoke(
-        ["--root", str(tmp_path), "work", "show", "atlas", "--done-hours", "168"]
+        [
+            "--no-host",
+            "--root",
+            str(tmp_path),
+            "work",
+            "show",
+            "atlas",
+            "--done-hours",
+            "168",
+        ]
     )
     assert code == 0, stderr
     board = json.loads(stdout)
@@ -1915,7 +1944,7 @@ def test_work_show_prints_every_board_column_for_a_local_agent(
     columns = ("scheduled", "running", "needs_you", "done")
     assert board["columns"] == {column: [] for column in columns}
     assert board["truncated"] == {column: 0 for column in columns}
-    assert "Host open for this command only" in stderr
+    assert stderr == ""
 
 
 @pytest.mark.parametrize("hours", ["0", "169", "-1"])
@@ -1924,7 +1953,16 @@ def test_work_show_rejects_done_hours_outside_one_week(
 ) -> None:
     asyncio.run(_create_agent(tmp_path, "atlas"))
     code, stdout, stderr = _invoke(
-        ["--root", str(tmp_path), "work", "show", "atlas", "--done-hours", hours]
+        [
+            "--no-host",
+            "--root",
+            str(tmp_path),
+            "work",
+            "show",
+            "atlas",
+            "--done-hours",
+            hours,
+        ]
     )
     assert (code, stdout) == (1, "")
     assert "done window must be positive and at most seven days" in stderr
@@ -1942,7 +1980,7 @@ def test_work_inspect_and_dismiss_project_one_exact_delivery(
         close=AsyncMock(),
     )
     args = cli.build_parser().parse_args(
-        ["--root", str(tmp_path), "work", command, "atlas", "delivery-1"]
+        ["--no-host", "--root", str(tmp_path), "work", command, "atlas", "delivery-1"]
     )
     with patch.object(Agent, "open", new=AsyncMock(return_value=fake)):
         result = asyncio.run(cli._execute(args))
@@ -1967,7 +2005,15 @@ def test_work_inspect_and_dismiss_report_an_unknown_delivery(
         close=AsyncMock(),
     )
     args = cli.build_parser().parse_args(
-        ["--root", str(tmp_path), "work", command, "atlas", "delivery-missing"]
+        [
+            "--no-host",
+            "--root",
+            str(tmp_path),
+            "work",
+            command,
+            "atlas",
+            "delivery-missing",
+        ]
     )
     with patch.object(Agent, "open", new=AsyncMock(return_value=fake)):
         with pytest.raises(ValueError, match="delivery not found"):
@@ -1994,6 +2040,7 @@ def test_routines_destinations_lists_one_conversation_destination(
     )
     args = cli.build_parser().parse_args(
         [
+            "--no-host",
             "--root",
             str(tmp_path),
             "routines",

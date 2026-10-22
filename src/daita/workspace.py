@@ -17,6 +17,8 @@ class LocalFileAccess(str, Enum):
 
     WORKSPACE = "workspace"
     COMPUTER = "computer"
+    # The agent opens with no session folder source; the root grants nothing.
+    NONE = "none"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +63,17 @@ class LocalWorkspace:
             if canonical == user_home:
                 raise ValueError("the user home directory cannot be a workspace")
         object.__setattr__(self, "root", canonical)
+
+
+def working_directory(cwd: Path, state_root: Path) -> Path:
+    """Return the folder a local session starts in.
+
+    The filesystem root and private Daita state fall back to the user home.
+    """
+
+    if cwd == Path(cwd.anchor) or cwd == state_root or state_root in cwd.parents:
+        return Path.home().resolve(strict=True)
+    return cwd
 
 
 def paths_overlap(left: Path, right: Path) -> bool:
@@ -203,4 +216,5 @@ __all__ = [
     "LocalWorkspace",
     "resolve_os_downloads_directory",
     "resolve_os_known_directory",
+    "working_directory",
 ]

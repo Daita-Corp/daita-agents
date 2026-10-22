@@ -7,6 +7,7 @@ import os
 import platform
 import signal
 import time
+from collections.abc import AsyncIterator
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
@@ -14,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from daita._json import canonical_json
+from tests.support.host import StartHost, hosts
 
 _STARTED = time.monotonic()
 _RESERVED = Decimal(0)
@@ -55,6 +57,14 @@ def analysis_live_gate(request):
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, prior_handler)
+
+
+@pytest.fixture
+async def start_host() -> AsyncIterator[StartHost]:
+    """Start real hosts on short sockets; each is stopped and removed afterwards."""
+
+    async with hosts() as start:
+        yield start
 
 
 @pytest.fixture

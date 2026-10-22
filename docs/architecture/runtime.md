@@ -73,9 +73,11 @@ read-only transaction and full structural revalidation; reuse grants no authorit
 Pool configuration and resolved credentials are runtime-only; retired or uncertain
 connections are never reused or replayed.
 
-One open agent home has one writer (invariant 1 in `AGENTS.md`). Today the TUI,
-CLI and resident host each compose the agent in their own process, so they take
-turns holding that lock rather than sharing it.
+One open agent home has one writer (invariant 1 in `AGENTS.md`). Normally the
+Daita host composes the agent and holds that lock; the TUI, the CLI and
+`daita.connect()` are its clients. A script's `Agent.open()` or a
+`daita --no-host` command composes the agent in-process instead, and is refused
+with `HostActiveError` while the host holds it.
 
 ## Model loop and context
 

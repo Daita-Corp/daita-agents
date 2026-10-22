@@ -12,7 +12,7 @@ import pytest
 import daita.hosting.configuration as configuration
 from daita import Agent, AgentConfig, SQLiteSource, cli
 from daita.adapters.models import SourceRegistration
-from daita.agent import AgentHomeError
+from daita.agent import AgentHomeError, HostActiveError
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -23,6 +23,7 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.security import KeychainSecretProvider, SecretReference
 from daita.skills import Skill
 from daita.tui.controller import PresentationController
+from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.support.memory_source import (
     MEMORY_ADAPTER_ID,
     MEMORY_NOW,
@@ -358,7 +359,7 @@ async def test_agent_delete_respects_the_active_writer_lock(tmp_path: Path) -> N
         "atlas", root=tmp_path, workspace=workspace_for(tmp_path)
     )
     try:
-        with pytest.raises(AgentHomeError, match="host_active"):
+        with pytest.raises(HostActiveError):
             await Agent.delete("atlas", root=tmp_path)
         assert agent.home.is_dir()
     finally:
@@ -372,22 +373,19 @@ async def test_keychain_delete_is_idempotent_when_the_entry_is_already_absent() 
 
 
 async def test_terminal_lifecycle_commands_require_confirmation(
-    tmp_path: Path,
+    tmp_path: Path, start_host: StartHost
 ) -> None:
     database = tmp_path / "data.sqlite"
     _database(database)
     provider = MockModelProvider((_stop("answer"),), provider_id="mock:lifecycle")
-    agent = await Agent.create(
-        "atlas",
-        root=tmp_path,
-        model=provider,
-        model_profile=_profile(provider),
-        workspace=workspace_for(tmp_path),
+    harness = await start_host(
+        model=provider, agent_options={"model_profile": _profile(provider)}
     )
+    agent = await remote_agent(harness, "atlas")
     source = await agent.attach(SQLiteSource(database, name="Warehouse"))
     result = await agent.run("Create history.")
     controller = PresentationController(
-        root=tmp_path, workspace=workspace_for(tmp_path)
+        root=harness.root, workspace=host_workspace(harness)
     )
     controller.agent = agent
     controller.conversation_id = result.conversation_id
@@ -407,22 +405,19 @@ async def test_terminal_lifecycle_commands_require_confirmation(
 
 
 async def test_terminal_can_clear_history_detach_source_and_delete_agent(
-    tmp_path: Path,
+    tmp_path: Path, start_host: StartHost
 ) -> None:
     database = tmp_path / "data.sqlite"
     _database(database)
     provider = MockModelProvider((_stop("answer"),), provider_id="mock:lifecycle")
-    agent = await Agent.create(
-        "atlas",
-        root=tmp_path,
-        model=provider,
-        model_profile=_profile(provider),
-        workspace=workspace_for(tmp_path),
+    harness = await start_host(
+        model=provider, agent_options={"model_profile": _profile(provider)}
     )
+    agent = await remote_agent(harness, "atlas")
     source = await agent.attach(SQLiteSource(database, name="Warehouse"))
     result = await agent.run("Create history.")
     controller = PresentationController(
-        root=tmp_path, workspace=workspace_for(tmp_path)
+        root=harness.root, workspace=host_workspace(harness)
     )
     controller.agent = agent
     controller.conversation_id = result.conversation_id
@@ -437,7 +432,7 @@ async def test_terminal_can_clear_history_detach_source_and_delete_agent(
 
     await controller.delete_open_agent()
     assert controller.agent is None
-    assert not (tmp_path / "agents" / "atlas").exists()
+    assert not (harness.root / "agents" / "atlas").exists()
 
 
 async def test_headless_lifecycle_commands_require_and_honor_yes(
@@ -472,6 +467,7 @@ async def test_headless_lifecycle_commands_require_and_honor_yes(
     detached = await cli._execute(
         parser.parse_args(
             [
+                "--no-host",
                 "--root",
                 str(tmp_path),
                 "detach",
@@ -489,6 +485,7 @@ async def test_headless_lifecycle_commands_require_and_honor_yes(
     assert await cli._execute(
         parser.parse_args(
             [
+                "--no-host",
                 "--root",
                 str(tmp_path),
                 "conversations",
@@ -499,6 +496,8 @@ async def test_headless_lifecycle_commands_require_and_honor_yes(
         )
     ) == {"name": "atlas", "cleared_runs": 0}
     assert await cli._execute(
-        parser.parse_args(["--root", str(tmp_path), "delete", "atlas", "--yes"])
+        parser.parse_args(
+            ["--no-host", "--root", str(tmp_path), "delete", "atlas", "--yes"]
+        )
     ) == {"name": "atlas", "deleted": True}
     assert not (tmp_path / "agents" / "atlas").exists()

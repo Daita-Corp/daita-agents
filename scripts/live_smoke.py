@@ -159,6 +159,14 @@ CASES: tuple[SmokeCase, ...] = (
         {"DAITA_RUN_LIVE_ANALYSIS": "1"},
         resource="native-analysis",
     ),
+    # The terminal app asks through the Daita host, not an in-process Agent.
+    SmokeCase(
+        "analysis/tui_host",
+        "tests/live/analysis/test_public_journeys.py::"
+        "test_real_model_tui_python_and_broker",
+        {"DAITA_RUN_LIVE_ANALYSIS": "1"},
+        resource="native-analysis",
+    ),
 )
 # Every suite's private report directory points into this run's evidence.
 _REPORT_ENV = (

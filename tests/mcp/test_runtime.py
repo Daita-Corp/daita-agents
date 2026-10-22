@@ -39,6 +39,7 @@ from daita.capabilities import (
     ToolTextTrust,
 )
 from daita.errors import StateCompatibilityCode, StateCompatibilityError
+from daita.host.client import connect
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -64,6 +65,7 @@ from daita.tui.screens.mcp import (
 )
 from daita.tui.screens.selection import SelectionScreen
 from daita.tui.widgets.composer import Composer
+from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.support.mcp import (
     MappingSecretProvider,
     MCPBatchProvider,
@@ -653,15 +655,20 @@ async def test_existing_binding_identity_cannot_be_redirected_to_another_server(
         await agent.close()
 
 
-async def test_cli_and_tui_expose_bounded_mcp_administration(tmp_path, monkeypatch):
+async def test_cli_and_tui_expose_bounded_mcp_administration(
+    monkeypatch, start_host: StartHost
+):
     alpha, _beta = conformance_identities()
     factory = SDKMCPClientFactory(http_transport=mock_transport(alpha))
+    harness = await start_host(
+        agent_options={"clock": lambda: NOW, "mcp_client_factory": factory}
+    )
     agent = await Agent.create(
         "mcp-administration-surface",
-        root=tmp_path,
+        root=harness.root,
         clock=lambda: NOW,
         mcp_client_factory=factory,
-        workspace=workspace_for(tmp_path),
+        workspace=host_workspace(harness),
     )
 
     async def open_agent(*args, **kwargs):
@@ -671,8 +678,9 @@ async def test_cli_and_tui_expose_bounded_mcp_administration(tmp_path, monkeypat
     monkeypatch.setattr(cli.Agent, "open", open_agent)
     arguments = cli.build_parser().parse_args(
         (
+            "--no-host",
             "--root",
-            str(tmp_path),
+            str(harness.root),
             "mcp",
             "attach",
             "mcp-administration-surface",
@@ -693,15 +701,11 @@ async def test_cli_and_tui_expose_bounded_mcp_administration(tmp_path, monkeypat
     binding_id = mapping["binding_id"]
     assert isinstance(binding_id, str)
 
-    reopened = await Agent.open(
-        "mcp-administration-surface",
-        root=tmp_path,
-        clock=lambda: NOW,
-        mcp_client_factory=factory,
-        workspace=workspace_for(tmp_path),
+    reopened = await connect(
+        "mcp-administration-surface", cwd=harness.work(), root=harness.root
     )
     controller = PresentationController(
-        root=tmp_path, workspace=workspace_for(tmp_path)
+        root=harness.root, workspace=host_workspace(harness)
     )
     controller.agent = reopened
     try:
@@ -782,15 +786,18 @@ def test_guided_mcp_aliases_are_safe_stable_and_collision_free():
     )
 
 
-async def test_mcp_management_groups_legacy_bindings_by_server(tmp_path):
+async def test_mcp_management_groups_legacy_bindings_by_server(start_host: StartHost):
     identity = _guided_mcp_identity()
     factory = SDKMCPClientFactory(http_transport=mock_transport(identity))
+    harness = await start_host(
+        agent_options={"clock": lambda: NOW, "mcp_client_factory": factory}
+    )
     agent = await Agent.create(
         "mcp-grouped-management",
-        root=tmp_path,
+        root=harness.root,
         clock=lambda: NOW,
         mcp_client_factory=factory,
-        workspace=workspace_for(tmp_path),
+        workspace=host_workspace(harness),
     )
     first = await agent.attach_mcp_server(
         endpoint=identity.endpoint,
@@ -815,15 +822,11 @@ async def test_mcp_management_groups_legacy_bindings_by_server(tmp_path):
         ),
     )
     await agent.close()
-    reopened = await Agent.open(
-        "mcp-grouped-management",
-        root=tmp_path,
-        clock=lambda: NOW,
-        mcp_client_factory=factory,
-        workspace=workspace_for(tmp_path),
+    reopened = await connect(
+        "mcp-grouped-management", cwd=harness.work(), root=harness.root
     )
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = reopened
     async with app.run_test(size=(100, 34)) as pilot:
@@ -853,20 +856,22 @@ async def _wait_for_mcp_setup(screen: MCPSetupScreen) -> None:
 
 
 async def test_guided_mcp_setup_corrects_credentials_and_invalidates_changed_endpoint(
-    tmp_path,
+    start_host: StartHost,
 ):
     identity = _guided_mcp_identity()
     identity.bearer_token = "correct-fixture-token"
     keychain = MemoryKeychain()
-    opened = await Agent.create(
-        "mcp-correct-auth",
-        root=tmp_path,
-        keychain=keychain,
-        mcp_client_factory=SDKMCPClientFactory(http_transport=mock_transport(identity)),
-        workspace=workspace_for(tmp_path),
+    harness = await start_host(
+        agent_options={
+            "keychain": keychain,
+            "mcp_client_factory": SDKMCPClientFactory(
+                http_transport=mock_transport(identity)
+            ),
+        }
     )
+    opened = await remote_agent(harness, "mcp-correct-auth")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     async with app.run_test(size=(104, 38)) as pilot:
@@ -944,7 +949,7 @@ async def test_guided_mcp_setup_corrects_credentials_and_invalidates_changed_end
 
 @pytest.mark.parametrize("has_supported_tool", (True, False))
 async def test_guided_mcp_setup_disables_unsupported_tools_with_reasons(
-    tmp_path, has_supported_tool
+    start_host: StartHost, has_supported_tool
 ):
     identity = _guided_mcp_identity()
     if not has_supported_tool:
@@ -958,14 +963,16 @@ async def test_guided_mcp_setup_disables_unsupported_tools_with_reasons(
             },
         }
     )
-    opened = await Agent.create(
-        "mcp-unsupported-setup",
-        root=tmp_path,
-        mcp_client_factory=SDKMCPClientFactory(http_transport=mock_transport(identity)),
-        workspace=workspace_for(tmp_path),
+    harness = await start_host(
+        agent_options={
+            "mcp_client_factory": SDKMCPClientFactory(
+                http_transport=mock_transport(identity)
+            )
+        }
     )
+    opened = await remote_agent(harness, "mcp-unsupported-setup")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     async with app.run_test(size=(80, 30)) as pilot:
@@ -1016,7 +1023,7 @@ async def test_guided_mcp_setup_disables_unsupported_tools_with_reasons(
     ),
 )
 async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
-    tmp_path,
+    start_host: StartHost,
     monkeypatch,
     auth_mode,
     size,
@@ -1032,16 +1039,16 @@ async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
     if auth_mode == "keychain":
         await keychain.set(SecretReference.keychain("shared-mcp"), token)
     factory = SDKMCPClientFactory(http_transport=mock_transport(identity))
-    opened = await Agent.create(
-        "mcp-guided-setup",
-        root=tmp_path,
-        clock=lambda: NOW,
-        mcp_client_factory=factory,
-        keychain=keychain,
-        workspace=workspace_for(tmp_path),
+    harness = await start_host(
+        agent_options={
+            "clock": lambda: NOW,
+            "mcp_client_factory": factory,
+            "keychain": keychain,
+        }
     )
+    opened = await remote_agent(harness, "mcp-guided-setup")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     if activation_pending:
@@ -1052,23 +1059,13 @@ async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
 
         monkeypatch.setattr(app.controller, "attach_mcp_tools", attach_pending)
     reopen_calls: list[bool] = []
+    reopen = app.controller.reopen_agent
 
-    async def reopen_with_fixture(*, observer, approval_handler):
+    async def reopen_recorded(*, observer, approval_handler):
         reopen_calls.append(observer is not None and approval_handler is not None)
-        await app.controller.close_agent()
-        reopened = await Agent.open(
-            "mcp-guided-setup",
-            root=tmp_path,
-            clock=lambda: NOW,
-            mcp_client_factory=factory,
-            observer=observer,
-            approval_handler=approval_handler,
-            workspace=workspace_for(tmp_path),
-        )
-        app.controller.agent = reopened
-        return reopened
+        return await reopen(observer=observer, approval_handler=approval_handler)
 
-    app.controller.reopen_agent = reopen_with_fixture  # type: ignore[method-assign]
+    app.controller.reopen_agent = reopen_recorded  # type: ignore[method-assign]
     async with app.run_test(size=size) as pilot:
         await app._show_chat()
         command_task = asyncio.create_task(app._open_command_screen(entrypoint, {}))
@@ -1156,15 +1153,20 @@ async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
             app.exit(0)
 
 
-async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(tmp_path):
+async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(
+    start_host: StartHost,
+):
     identity = _guided_mcp_identity()
     factory = SDKMCPClientFactory(http_transport=mock_transport(identity))
+    harness = await start_host(
+        agent_options={"clock": lambda: NOW, "mcp_client_factory": factory}
+    )
     agent = await Agent.create(
         "mcp-guided-actions",
-        root=tmp_path,
+        root=harness.root,
         clock=lambda: NOW,
         mcp_client_factory=factory,
-        workspace=workspace_for(tmp_path),
+        workspace=host_workspace(harness),
     )
     attached = await agent.attach_mcp_server(
         endpoint=identity.endpoint,
@@ -1182,15 +1184,11 @@ async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(tmp_pa
         ),
     )
     await agent.close()
-    reopened = await Agent.open(
-        "mcp-guided-actions",
-        root=tmp_path,
-        clock=lambda: NOW,
-        mcp_client_factory=factory,
-        workspace=workspace_for(tmp_path),
+    reopened = await connect(
+        "mcp-guided-actions", cwd=harness.work(), root=harness.root
     )
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = reopened
     async with app.run_test(size=(104, 38)) as pilot:
@@ -1259,7 +1257,9 @@ async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(tmp_pa
             app.exit(0)
 
 
-async def test_tui_attach_exposes_bounded_schema_rejection_reason(tmp_path):
+async def test_tui_attach_exposes_bounded_schema_rejection_reason(
+    start_host: StartHost,
+):
     identity = MCPFixtureIdentity(
         host="unsupported-tui.fixture.test",
         server_name="unsupported-tui-fixture",
@@ -1277,15 +1277,12 @@ async def test_tui_attach_exposes_bounded_schema_rejection_reason(tmp_path):
         results={},
     )
     factory = SDKMCPClientFactory(http_transport=mock_transport(identity))
-    agent = await Agent.create(
-        "mcp-tui-schema-reason",
-        root=tmp_path,
-        clock=lambda: NOW,
-        mcp_client_factory=factory,
-        workspace=workspace_for(tmp_path),
+    harness = await start_host(
+        agent_options={"clock": lambda: NOW, "mcp_client_factory": factory}
     )
+    agent = await remote_agent(harness, "mcp-tui-schema-reason")
     controller = PresentationController(
-        root=tmp_path, workspace=workspace_for(tmp_path)
+        root=harness.root, workspace=host_workspace(harness)
     )
     controller.agent = agent
     try:
@@ -1807,21 +1804,23 @@ async def test_oversized_remote_result_becomes_one_bounded_transcript_error(tmp_
 
 @pytest.mark.parametrize("authenticated", (True, False))
 async def test_cancelled_masked_mcp_setup_deletes_unused_credential(
-    tmp_path, authenticated
+    start_host: StartHost, authenticated
 ):
     identity = _guided_mcp_identity()
     token = "tui-cancel-fixture-token"
     identity.bearer_token = token if authenticated else "different-fixture-token"
     keychain = MemoryKeychain()
-    opened = await Agent.create(
-        "mcp-cancel-setup",
-        root=tmp_path,
-        keychain=keychain,
-        mcp_client_factory=SDKMCPClientFactory(http_transport=mock_transport(identity)),
-        workspace=workspace_for(tmp_path),
+    harness = await start_host(
+        agent_options={
+            "keychain": keychain,
+            "mcp_client_factory": SDKMCPClientFactory(
+                http_transport=mock_transport(identity)
+            ),
+        }
     )
+    opened = await remote_agent(harness, "mcp-cancel-setup")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     async with app.run_test(size=(104, 38)) as pilot:
@@ -1870,7 +1869,14 @@ async def test_cli_masked_bearer_setup_and_simple_selection_use_shared_admission
 
     monkeypatch.setattr(cli.Agent, "open", open_agent)
     monkeypatch.setattr(cli.getpass, "getpass", lambda _prompt: identity.bearer_token)
-    arguments = ["mcp", command, "mcp-cli-simple", identity.endpoint, "--bearer-prompt"]
+    arguments = [
+        "--no-host",
+        "mcp",
+        command,
+        "mcp-cli-simple",
+        identity.endpoint,
+        "--bearer-prompt",
+    ]
     if command == "attach":
         arguments.extend(("--tool", "query-docs", "--tool", "resolve-library-id"))
     result = await cli._execute(cli.build_parser().parse_args(arguments))

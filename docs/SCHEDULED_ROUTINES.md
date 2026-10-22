@@ -415,29 +415,22 @@ store. The independent artifact registry owns current availability and retains
 ownership after transcripts are cleared. Explicit artifact deletion preserves the
 historical Delivery but makes its attachment unavailable.
 
-## Resident host and handoff
+## The background host
 
-Schedules make progress only while an admitted host owns the agent. To keep
-one agent open after the TUI exits:
+Routines run in the background Daita host. `daita` and the CLI start it on
+demand, and it keeps running after you close the terminal. To keep it running
+after a crash and across logins, register it as a login service:
 
 ```bash
-daita --root /absolute/daita-state \
-  --workspace /absolute/path/project \
-  host --agent atlas
+daita host install
 ```
 
-The process reports a JSON readiness record, handles `SIGINT` and `SIGTERM`,
-and closes the ordinary supervisors and agent composition before exiting. It
-uses the same writer lock as every foreground open. A TUI, CLI invocation, and
-resident host cannot own the same agent home concurrently: stop the current
-host, open the other process, then restart the resident host. The resident host
-does not add IPC, a remote API, a transparent client gateway, a multi-host
-queue, or a competing writer.
-
-A headless control command holds its host only for the command lifetime. The TUI
-shows its local host as open and identifies background reasoning separately from
-foreground activity. Both share one run lock, so one can delay the other. There is
-no continuous cloud execution or host availability service.
+`daita host status` shows whether it runs and which agents it holds;
+`daita host stop` stops it. It handles `SIGINT` and `SIGTERM`, finishes or
+cancels active runs, and closes every agent before exiting. It uses the same
+writer lock as a script's `Agent.open()`, which is refused while the host holds
+that agent. `daita host --agent <name>` is deprecated and now runs the host.
+There is no cloud execution or host availability service.
 
 If a host stops, persisted routines and occurrences remain inspectable but no
 new due work runs. On reopen, Daita fences stale claims, finalizes a run that

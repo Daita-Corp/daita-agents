@@ -106,6 +106,10 @@ def test_default_distribution_contains_every_supported_production_dependency():
         "httpx>=0.28.1,<1.0.0",
         "httpx2>=2.13.1,<3.0.0",
         "mcp==2.2.0",
+        "starlette>=1.3.1,<2.0.0",
+        "uvicorn>=0.51.0,<1.0.0",
+        "sse-starlette>=3.4.5,<4.0.0",
+        "anyio>=4.15.0,<5.0.0",
         "duckdb==1.5.5",
     }
     assert set(project["optional-dependencies"]) == {"dev", "analysis"}
@@ -494,6 +498,7 @@ import sys
 
 blocked = {
     "anthropic",
+    "anyio",
     "asyncpg",
     "google",
     "httpx",
@@ -504,8 +509,11 @@ blocked = {
     "openai",
     "prompt_toolkit",
     "rich",
+    "sse_starlette",
+    "starlette",
     "textual",
     "sqlglot",
+    "uvicorn",
     "xlsxwriter",
 }
 original = builtins.__import__
@@ -527,6 +535,7 @@ factory = SDKMCPClientFactory()
 raise SystemExit(
     daita.cli.main(
         [
+            "--no-host",
             "--root",
             sys.argv[1],
             "--workspace",

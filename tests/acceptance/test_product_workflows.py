@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from daita import connect
+from tests.support.host import StartHost, host_workspace, short_root
 from tests.support.product_workflows import (
     ActionFixture,
     ArtifactAuthorship,
@@ -22,26 +24,40 @@ from tests.support.product_workflows import (
     replace,
     response,
     timedelta,
-    workspace_for,
 )
 
 pytestmark = _pytestmark
 
 
-async def test_guided_upsert_authoring_applies_exact_preview(tmp_path, monkeypatch):
+async def test_guided_upsert_authoring_applies_exact_preview(
+    monkeypatch, start_host: StartHost
+):
+    # The fixture builds the agent in process; the host then owns it with the
+    # same model and clock, and the app connects to it.
+    root = short_root()
     (
-        agent,
-        _model,
+        built,
+        model,
         _db,
         _research,
         _binding,
         resource,
         constraints,
         _batch,
-        _clock,
+        clock,
         _approvals,
-    ) = await create_fixture(tmp_path, monkeypatch)
-    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(tmp_path))
+    ) = await create_fixture(root, monkeypatch)
+    await built.close()
+    harness = await start_host(
+        root=root,
+        agent_options={
+            "model": model,
+            "model_profile": model.model_profile,
+            "clock": lambda: clock[0],
+        },
+    )
+    agent = await connect("native-acceptance", cwd=harness.work(), root=root)
+    app = DaitaApp(root=root, start_bootstrap=False, workspace=host_workspace(harness))
     app.controller.agent = agent
     try:
         inspection = await agent.inspect_source_permissions(resource.source_id)

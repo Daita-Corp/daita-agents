@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from daita import AgentConfig, MCPToolSelection
 from daita.adapters.mcp import SDKMCPClientFactory
+from daita.host.client import RemoteAgent
 from daita.llm.models import FinishReason, ModelResponse, ToolCall
 from daita.llm.providers.mock import MockModelProvider
+from tests.support.host import StartHost, host_workspace, remote_agent, short_root
 from tests.support.mcp import MemoryKeychain, conformance_identities, mock_transport
 from tests.tui._support import (
     MIN_READY_ROWS,
@@ -16,7 +18,6 @@ from tests.tui._support import (
     ChatScreen,
     Composer,
     ConfirmScreen,
-    CredentialSession,
     DaitaApp,
     Footer,
     Input,
@@ -25,7 +26,6 @@ from tests.tui._support import (
     Path,
     PermissionsScreen,
     SecretReference,
-    SecretResolutionError,
     Select,
     SelectionScreen,
     SimpleNamespace,
@@ -60,8 +60,9 @@ def test_postgresql_url_and_redaction():
     }
 
 
-async def test_app_mounts_create_screen_and_exits_on_cancel(tmp_path: Path):
-    app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path))
+async def test_app_mounts_create_screen_and_exits_on_cancel(start_host: StartHost):
+    harness = await start_host()
+    app = DaitaApp(root=harness.root, workspace=host_workspace(harness))
     async with app.run_test() as pilot:
         await pilot.pause(0.3)
         assert isinstance(app.screen, AgentCreateScreen)
@@ -71,18 +72,15 @@ async def test_app_mounts_create_screen_and_exits_on_cancel(tmp_path: Path):
 
 
 async def test_agent_picker_create_button_routes_to_existing_creation_flow(
-    tmp_path: Path,
+    start_host: StartHost,
 ):
-    first = await Agent.create(
-        "existing-one", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    first = await remote_agent(harness, "existing-one")
     await first.close()
-    second = await Agent.create(
-        "existing-two", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    second = await remote_agent(harness, "existing-two")
     await second.close()
 
-    app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path))
+    app = DaitaApp(root=harness.root, workspace=host_workspace(harness))
     async with app.run_test(size=(90, 28)) as pilot:
         for _ in range(20):
             await pilot.pause(0.05)
@@ -126,7 +124,7 @@ async def test_agent_picker_create_button_routes_to_existing_creation_flow(
         assert app.controller.require_agent().name == "created-from-picker"
         app.exit(0)
 
-    assert await Agent.list(root=tmp_path) == (
+    assert await Agent.list(root=harness.root) == (
         "created-from-picker",
         "existing-one",
         "existing-two",
@@ -134,18 +132,15 @@ async def test_agent_picker_create_button_routes_to_existing_creation_flow(
 
 
 async def test_agent_picker_enters_delete_mode_then_confirms_typed_name(
-    tmp_path: Path,
+    start_host: StartHost,
 ):
-    first = await Agent.create(
-        "existing-one", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    first = await remote_agent(harness, "existing-one")
     await first.close()
-    second = await Agent.create(
-        "existing-two", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    second = await remote_agent(harness, "existing-two")
     await second.close()
 
-    app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path))
+    app = DaitaApp(root=harness.root, workspace=host_workspace(harness))
     async with app.run_test(size=(90, 28)) as pilot:
         for _ in range(20):
             await pilot.pause(0.05)
@@ -195,7 +190,7 @@ async def test_agent_picker_enters_delete_mode_then_confirms_typed_name(
         assert "did not match" in str(
             confirmation.query_one("#confirm-message").render()
         )
-        assert await Agent.list(root=tmp_path) == ("existing-one", "existing-two")
+        assert await Agent.list(root=harness.root) == ("existing-one", "existing-two")
 
         confirmation_input.value = "existing-two"
         await pilot.press("enter")
@@ -205,7 +200,7 @@ async def test_agent_picker_enters_delete_mode_then_confirms_typed_name(
             if isinstance(app.screen, SelectionScreen):
                 break
         assert isinstance(app.screen, SelectionScreen)
-        assert await Agent.list(root=tmp_path) == ("existing-one",)
+        assert await Agent.list(root=harness.root) == ("existing-one",)
 
         assert await pilot.click("#picker-tertiary") is True
         for _ in range(20):
@@ -237,7 +232,7 @@ async def test_agent_picker_enters_delete_mode_then_confirms_typed_name(
             if isinstance(app.screen, AgentCreateScreen):
                 break
         assert isinstance(app.screen, AgentCreateScreen)
-        assert await Agent.list(root=tmp_path) == ()
+        assert await Agent.list(root=harness.root) == ()
         await pilot.press("escape")
         await pilot.pause()
 
@@ -246,14 +241,17 @@ async def test_agent_picker_enters_delete_mode_then_confirms_typed_name(
 
 @pytest.mark.parametrize("failure", ("malformed_config", "mcp_schema"))
 async def test_agent_picker_recovers_incompatible_model_settings_for_replacement(
-    tmp_path: Path,
+    start_host: StartHost,
     failure,
 ):
+    # The agents' state is prepared in process, then the host opens it.
+    root = short_root()
     keychain = MemoryKeychain()
+    identity, _ = conformance_identities()
     legacy = await Agent.create(
         "legacy-model",
-        root=tmp_path,
-        workspace=workspace_for(tmp_path),
+        root=root,
+        workspace=workspace_for(root),
         keychain=keychain,
         model_validator=MockModelProvider(
             (
@@ -276,15 +274,12 @@ async def test_agent_picker_recovers_incompatible_model_settings_for_replacement
             max_output_tokens=1024,
         )
     await legacy.close()
-    other = await Agent.create(
-        "other-agent", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    other = await Agent.create("other-agent", root=root, workspace=workspace_for(root))
     await other.close()
-    config_path = tmp_path / "agents" / "legacy-model" / "config.json"
+    config_path = root / "agents" / "legacy-model" / "config.json"
     if failure == "malformed_config":
         config_path.write_text("{}", encoding="utf-8")
     else:
-        identity, _ = conformance_identities()
         identity.tool("lookup")["inputSchema"] = {
             "type": "object",
             "properties": {"query": {"type": ["string", "null"]}},
@@ -292,8 +287,8 @@ async def test_agent_picker_recovers_incompatible_model_settings_for_replacement
         # Reproduce an existing home admitted before model compatibility checks.
         legacy = await Agent.open(
             "legacy-model",
-            root=tmp_path,
-            workspace=workspace_for(tmp_path),
+            root=root,
+            workspace=workspace_for(root),
             config=AgentConfig(),
             keychain=keychain,
             mcp_client_factory=SDKMCPClientFactory(
@@ -309,7 +304,16 @@ async def test_agent_picker_recovers_incompatible_model_settings_for_replacement
             await legacy.close()
     before = config_path.read_bytes()
 
-    app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path), keychain=keychain)
+    harness = await start_host(
+        root=root,
+        agent_options={
+            "keychain": keychain,
+            "mcp_client_factory": SDKMCPClientFactory(
+                http_transport=mock_transport(identity)
+            ),
+        },
+    )
+    app = DaitaApp(root=harness.root, workspace=host_workspace(harness))
     async with app.run_test(size=(90, 28)) as pilot:
         # Screen selection precedes its mount handler populating the options.
         # Wait for the actual picker contents, not only the active screen type.
@@ -365,23 +369,24 @@ async def test_agent_picker_recovers_incompatible_model_settings_for_replacement
     assert config_path.read_bytes() == before
 
 
-async def test_chat_preserves_input_while_agent_reopens(tmp_path: Path, monkeypatch):
-    opened = await Agent.create(
-        "reopening", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+async def test_chat_preserves_input_while_agent_reopens(
+    start_host: StartHost, monkeypatch
+):
+    harness = await start_host()
+    opened = await remote_agent(harness, "reopening")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     entered, release = asyncio.Event(), asyncio.Event()
-    original_open = Agent.open
+    original_open = RemoteAgent.open
 
     async def gated_open(*args, **kwargs):
         entered.set()
         await release.wait()
         return await original_open(*args, **kwargs)
 
-    monkeypatch.setattr(Agent, "open", gated_open)
+    monkeypatch.setattr(RemoteAgent, "open", gated_open)
     try:
         async with app.run_test(size=(90, 28)) as pilot:
             await app._show_chat()
@@ -405,8 +410,9 @@ async def test_chat_preserves_input_while_agent_reopens(tmp_path: Path, monkeypa
         await app.controller.close()
 
 
-async def test_app_resize_and_too_small_screen(tmp_path: Path):
-    app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path))
+async def test_app_resize_and_too_small_screen(start_host: StartHost):
+    harness = await start_host()
+    app = DaitaApp(root=harness.root, workspace=host_workspace(harness))
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
         await pilot.resize_terminal(MIN_USABLE_COLUMNS - 1, MIN_READY_ROWS - 1)
@@ -415,12 +421,13 @@ async def test_app_resize_and_too_small_screen(tmp_path: Path):
         app.exit(0)
 
 
-async def test_agent_home_is_available_without_model_source_or_catalog(tmp_path: Path):
-    opened = await Agent.create(
-        "home-without-setup", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+async def test_agent_home_is_available_without_model_source_or_catalog(
+    start_host: StartHost,
+):
+    harness = await start_host()
+    opened = await remote_agent(harness, "home-without-setup")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:
@@ -535,7 +542,9 @@ async def test_wide_boot_swirls_dots_into_the_braille_logo():
         boot.exit(0)
 
 
-async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: Path):
+async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(
+    start_host: StartHost,
+):
     boot = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with boot.run_test(size=(80, 24)):
         welcome = boot.query_one("#boot", WelcomeView)
@@ -548,11 +557,10 @@ async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: P
         assert "Starting your workspace" in str(welcome.content)
         boot.exit(0)
 
-    opened = await Agent.create(
-        "welcome-agent", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "welcome-agent")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:
@@ -582,136 +590,6 @@ async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: P
             app.exit(0)
     finally:
         await opened.close()
-
-
-async def test_tui_credential_session_survives_internal_agent_reopen(tmp_path: Path):
-    class _Keychain:
-        def __init__(self) -> None:
-            self.values: dict[str, str] = {}
-            self.resolve_calls = 0
-
-        async def resolve(self, reference):
-            self.resolve_calls += 1
-            return self.values[reference.name]
-
-        async def set(self, reference, value):
-            self.values[reference.name] = value
-
-        async def delete(self, reference):
-            self.values.pop(reference.name, None)
-
-    keychain = _Keychain()
-    reference = SecretReference.keychain("agent:postgresql:session-test")
-    keychain.values[reference.name] = "session-secret"
-    app = DaitaApp(
-        root=tmp_path,
-        keychain=keychain,
-        start_bootstrap=False,
-        workspace=workspace_for(tmp_path),
-    )
-    session = app.controller.keychain
-    assert isinstance(session, CredentialSession)
-    assert await session.resolve(reference) == "session-secret"
-    assert keychain.resolve_calls == 1
-
-    created = await app.controller.create_agent(
-        "credential-session",
-        observer=None,
-        approval_handler=None,
-    )
-    assert created._embedded._keychain is session
-
-    reopened = await app.controller.reopen_agent(
-        observer=None,
-        approval_handler=None,
-    )
-    assert reopened._embedded._keychain is session
-    assert await session.resolve(reference) == "session-secret"
-    assert keychain.resolve_calls == 1
-    await app.controller.close()
-    with pytest.raises(SecretResolutionError, match="credential session is closed"):
-        await session.resolve(reference)
-
-
-async def test_tui_preloads_active_credentials_before_accepting_queries(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    class _Keychain:
-        def __init__(self) -> None:
-            self.values: dict[str, str] = {}
-            self.resolve_calls: list[SecretReference] = []
-
-        async def resolve(self, reference):
-            self.resolve_calls.append(reference)
-            return self.values[reference.name]
-
-        async def set(self, reference, value):
-            self.values[reference.name] = value
-
-        async def delete(self, reference):
-            self.values.pop(reference.name, None)
-
-    model_reference = SecretReference.keychain("agent:codex:active")
-    database_reference = SecretReference.keychain("agent:postgresql:active")
-    inactive_reference = SecretReference.keychain("agent:postgresql:inactive")
-    keychain = _Keychain()
-    keychain.values.update(
-        {
-            model_reference.name: "model-secret",
-            database_reference.name: "database-secret",
-            inactive_reference.name: "inactive-secret",
-        }
-    )
-
-    class _OpenedAgent:
-        model_route = SimpleNamespace(
-            candidates=(SimpleNamespace(secret_reference=model_reference),)
-        )
-
-        async def list_sources(self):
-            return (
-                SimpleNamespace(
-                    active=True,
-                    configuration={"credential_ref": database_reference.to_uri()},
-                ),
-                SimpleNamespace(
-                    active=False,
-                    configuration={"credential_ref": inactive_reference.to_uri()},
-                ),
-            )
-
-        async def close(self):
-            return None
-
-    opened = _OpenedAgent()
-
-    async def open_agent(*args, **kwargs):
-        return opened
-
-    monkeypatch.setattr("daita.tui.controller.Agent.open", open_agent)
-    app = DaitaApp(
-        root=tmp_path,
-        keychain=keychain,
-        start_bootstrap=False,
-        workspace=workspace_for(tmp_path),
-    )
-
-    assert (
-        await app.controller.open_agent(
-            "credential-preload",
-            observer=None,
-            approval_handler=None,
-        )
-        is opened
-    )
-    assert keychain.resolve_calls == [model_reference, database_reference]
-
-    session = app.controller.keychain
-    assert await session.resolve(model_reference) == "model-secret"
-    assert await session.resolve(database_reference) == "database-secret"
-    assert keychain.resolve_calls == [model_reference, database_reference]
-    await app.controller.close()
 
 
 @pytest.mark.parametrize(

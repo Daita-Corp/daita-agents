@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from daita.jobs import ControlKind, ControlState
 from daita.tui.screens.jobs import JobControlScreen
+from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.tui._support import (
     SLASH_COMMAND_COMPLETIONS,
     UTC,
     ActivityBar,
-    Agent,
     AgentEvent,
     AgentEventKind,
     Button,
@@ -20,7 +20,6 @@ from tests.tui._support import (
     JobsScreen,
     ObserverEvent,
     OptionList,
-    Path,
     SimpleNamespace,
     Static,
     Text,
@@ -56,13 +55,12 @@ async def test_jobs_command_opens_interactive_manager_without_model_calls():
 
 
 async def test_machine_origin_observations_do_not_project_into_foreground_chat(
-    tmp_path: Path,
+    start_host: StartHost,
 ):
-    opened = await Agent.create(
-        "origin-isolation-agent", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "origin-isolation-agent")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     observed = datetime.now(UTC)

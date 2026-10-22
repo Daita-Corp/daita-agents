@@ -246,6 +246,7 @@ asyncio.run(main())
         _run(
             [
                 str(launcher),
+                "--no-host",
                 "--root",
                 str(agent_root),
                 "--workspace",
@@ -319,6 +320,7 @@ asyncio.run(main())
         _run(
             [
                 str(launcher),
+                "--no-host",
                 "--root",
                 str(agent_root),
                 "--workspace",

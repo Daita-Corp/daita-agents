@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import traceback
+from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +22,8 @@ from daita import (
     WorkKind,
 )
 from daita.errors import StateCompatibilityError
+from daita.host.protocol import AgentLockedError, WorkspaceBusyError
 from daita.observation import AgentEventKind
-from daita.security import KeychainStore
 
 from .clipboard import deliver_clipboard
 from .commands import (
@@ -35,7 +36,7 @@ from .commands import (
     source_override_completions,
     suggested_questions,
 )
-from .controller import PresentationController
+from .controller import PresentationController, summarize_sources
 from .models import (
     MAX_COMPOSER_CHARACTERS,
     MIN_READY_ROWS,
@@ -130,29 +131,24 @@ class DaitaApp(App[int]):
         workspace: LocalWorkspace,
         agent_name: str | None = None,
         conversation_id: str | None = None,
-        keychain: KeychainStore | None = None,
-        model_validator: Any = None,
-        model: Any = None,
-        model_profile: Any = None,
         start_bootstrap: bool = True,
     ) -> None:
         super().__init__(ansi_color=True)
         self.register_theme(DAITA_THEME)
         self.theme = DAITA_THEME.name
-        self.controller = PresentationController(
-            root=root,
-            workspace=workspace,
-            keychain=keychain,
-            model_validator=model_validator,
-        )
-        self.controller.model = model
-        self.controller.model_profile = model_profile
+        self.controller = PresentationController(root=root, workspace=workspace)
+        self.controller.on_reset = self._on_host_reset
         self._requested_agent = agent_name
         self._requested_conversation_id = conversation_id
         self._observer = RunObserver(self)
         self._run_task: asyncio.Task[None] | None = None
         self._foreground_run_id: str | None = None
         self._foreground_tools: dict[str, str] = {}
+        # Host questions arrive from any run at any time; review one at a time.
+        self._approval_lock = asyncio.Lock()
+        # Set by ChatScreen whenever it becomes the shown, mounted screen.
+        self.chat_resumed = asyncio.Event()
+        self._pending_draft = ""
         self._pending_user_identity: str | None = None
         self._pending_question: str | None = None
         self._partial_identity = "assistant.partial"
@@ -168,6 +164,7 @@ class DaitaApp(App[int]):
         self._work_counts: dict[WorkColumn, int] = {}
         self._foreground_state = "ready"
         self._source_count = 0
+        self._source_summary: str | None = None
         self._autonomous_run_ids: set[str] = set()
         # Needs-you and Done card keys from the last refresh, for notifications.
         self._known_work: dict[WorkColumn, set[tuple[WorkKind, str]]] | None = None
@@ -217,6 +214,9 @@ class DaitaApp(App[int]):
             return
         self._shutting_down = True
         self._observer.close()
+        # Detach first: open questions stay pending and runs keep going in the
+        # host, so closing the panels and the run wait below cancels nothing.
+        await self.controller.close()
         for screen in self.screen_stack:
             for panel in screen.query(ApprovalPanel):
                 panel.action_cancel()
@@ -224,7 +224,6 @@ class DaitaApp(App[int]):
         if pending is not None and not pending.done():
             pending.set_result(None)
         await self._settle_run()
-        await self.controller.close()
 
     async def _settle_run(self) -> None:
         task = self._run_task
@@ -239,12 +238,15 @@ class DaitaApp(App[int]):
     async def handle_approval(self, request: ApprovalRequest) -> ApprovalDecision:
         if self._shutting_down:
             raise asyncio.CancelledError
-        if self.size.height < 15:
-            raise RuntimeError("terminal is too small to review this change")
-        screen = self.chat()
-        if screen is None:
-            raise RuntimeError("chat view is unavailable for approval review")
-        decision = await screen.request_approval(request)
+        async with self._approval_lock:
+            # A question opened before the chat (or behind a dialog) waits for it;
+            # another window may answer meanwhile, which cancels this wait.
+            while (screen := self.chat()) is None or not screen.is_mounted:
+                self.chat_resumed.clear()
+                await self.chat_resumed.wait()
+            if self.size.height < 15:
+                raise RuntimeError("terminal is too small to review this change")
+            decision = await screen.request_approval(request)
         if decision is None:
             raise asyncio.CancelledError
         return decision
@@ -371,6 +373,9 @@ class DaitaApp(App[int]):
         except StateCompatibilityError as error:
             unavailable.add(name)
             return f"{name}: {error}"
+        except AgentLockedError as error:
+            # Held by a script: "In use by a Python script (pid 5530)."
+            return f"{name}: {error}"
         unavailable.discard(name)
         return ""
 
@@ -450,18 +455,111 @@ class DaitaApp(App[int]):
             await boot.intro_finished()
         await self.push_screen(ChatScreen())
         await self._replace_conversation_transcript()
+        await self._rejoin_active_run()
+        await self._reload_sources()
         await self._refresh_status()
         await self._show_home_guidance()
+        await self.refresh_background_status(notify_new=False)
+
+    async def _rejoin_active_run(self) -> None:
+        """Show a foreground run that outlived the window that started it.
+
+        With no conversation requested, the newest active run's conversation
+        becomes this window's conversation.
+        """
+
+        screen = self.chat()
+        if screen is None or self._run_task is not None:
+            return
+        agent = self.controller.require_agent()
+        wanted = self.controller.conversation_id
+        runs = [
+            run
+            for run in await agent.active_runs()
+            if run["conversation_id"] is not None
+            and wanted in (None, run["conversation_id"])
+        ]
+        if not runs:
+            return
+        run = runs[-1]
+        if wanted is None:
+            self.controller.conversation_id = run["conversation_id"]
+            self._reset_context_usage()
+            await self._replace_conversation_transcript()
+        screen.set_submitting(True)
+        screen.set_activity("Working", restart=True)
+        self._partial_text = ""
+        self._foreground_tools.clear()
+        self._foreground_run_id = run["run_id"]
+        self._run_task = asyncio.create_task(
+            self._execute_run(
+                agent.follow_run(run["run_ref"]), learning=run["mode"] == "learn"
+            ),
+            name="daita-agent-rejoin",
+        )
+        await self._refresh_status(running=True, state="working")
+
+    def _on_host_reset(self) -> None:
+        # Missed events cannot be replayed: re-read what they would have changed.
+        self.run_worker(self._reload_after_reset(), group="host-reset", exclusive=True)
+
+    async def _reload_after_reset(self) -> None:
+        if self._shutting_down or self.controller.agent is None:
+            return
+        # An active run replaces the transcript itself when it settles.
+        if self._run_task is None or self._run_task.done():
+            await self._replace_conversation_transcript()
         await self.refresh_background_status(notify_new=False)
 
     def _reset_background_status(self) -> None:
         self._work_counts = {}
         self._source_count = 0
+        self._source_summary = None
         self._autonomous_run_ids.clear()
         self._known_work = None
 
     async def _poll_background_status(self) -> None:
-        await self.refresh_background_status(notify_new=True)
+        self._schedule_background_refresh(notify_new=True)
+
+    def _schedule_background_refresh(self, *, notify_new: bool) -> None:
+        # A worker: Textual cancels app workers when the app stops, before
+        # unmount detaches the agent, so a refresh never runs on past quitting.
+        async def refresh() -> None:
+            await self.refresh_background_status(notify_new=notify_new)
+
+        # A function, not a coroutine: nothing is left unawaited if the worker
+        # never starts because the app is closing. Textual's WorkType stub wants
+        # Coroutine[None, None, T], which no async def matches for mypy.
+        self.run_worker(
+            refresh,  # type: ignore[arg-type]
+            group="background-refresh",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _reload_sources(self) -> None:
+        """Re-read sources for the status bar and Sources section.
+
+        Called by the background refresh and after source changes, never per
+        event, so a status refresh makes no host call.
+        """
+
+        agent = self.controller.agent
+        if agent is None or agent.connection != "connected":
+            return
+        try:
+            sources = await self.controller.list_sources()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return  # the host is unreachable for now: keep the last view
+        self._source_count = sum(item.active for item in sources)
+        self._source_summary = summarize_sources(sources)
+        screen = self.chat()
+        if screen is not None:
+            screen.query_one(CommandSections).update_sources(
+                sources, self.controller.source_types()
+            )
 
     async def refresh_background_status(self, *, notify_new: bool) -> None:
         """Refresh bounded read-only background indicators for the open TUI."""
@@ -471,6 +569,11 @@ class DaitaApp(App[int]):
             or self.controller.agent is None
             or self._background_refresh_lock.locked()
         ):
+            return
+        if self.controller.agent.connection != "connected":
+            # Polling must not restart a host someone stopped, or race its
+            # restart; show the connection instead and wait for the stream.
+            await self._refresh_status()
             return
         async with self._background_refresh_lock:
             screen = self.chat()
@@ -499,17 +602,8 @@ class DaitaApp(App[int]):
                         for column, keys in current.items()
                     }
                 self._known_work = current
+            await self._reload_sources()
             if screen is not None:
-                try:
-                    sources = await self.controller.list_sources()
-                    self._source_count = sum(item.active for item in sources)
-                    screen.query_one(CommandSections).update_sources(
-                        sources, self.controller.source_types()
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
                 sections = screen.query_one(CommandSections)
                 if screen.section == "artifacts":
                     try:
@@ -617,11 +711,14 @@ class DaitaApp(App[int]):
             self.size.width < MIN_USABLE_COLUMNS or self.size.height < MIN_READY_ROWS
         )
         self._too_small = too_small
-        profile = self.controller.require_agent().model_profile
+        # No host call here: status refreshes run on every run event.
+        agent = self.controller.require_agent()
+        profile = agent.model_profile
         screen.set_status(
-            agent=self.controller.require_agent().name,
+            agent=agent.name,
             model=self.controller.model_label(),
-            source=await self.controller.source_summary(),
+            host=agent.connection,
+            source=self._source_summary or "unavailable",
             state=(
                 "queued behind background"
                 if running and self._autonomous_run_ids
@@ -849,6 +946,7 @@ class DaitaApp(App[int]):
             return
         if screen_name == "source_setup":
             await self._await_modal(SourceSetupScreen())
+            await self._reload_sources()
             await self._refresh_status()
             await self._show_home_guidance()
             return
@@ -872,6 +970,7 @@ class DaitaApp(App[int]):
                     chat.show_notice(notice)
             else:
                 await self._show_home_guidance()
+            await self._reload_sources()
             await self._refresh_status()
             return
         if screen_name == "model_setup":
@@ -962,6 +1061,7 @@ class DaitaApp(App[int]):
                 self.controller.conversation_id = None
                 self._reset_context_usage()
                 await self._replace_conversation_transcript()
+                await self._reload_sources()
             await self._refresh_status()
             return
         if screen_name == "confirm_revoke_mcp":
@@ -1047,6 +1147,7 @@ class DaitaApp(App[int]):
             if action.kind == "add":
                 if await self._await_modal(SourceSetupScreen()):
                     notice = "Source attached."
+                    await self._reload_sources()
                     await self._refresh_status()
                 continue
 
@@ -1106,6 +1207,7 @@ class DaitaApp(App[int]):
                     self._reset_context_usage()
                     await self._replace_conversation_transcript()
                     notice = "Source connection updated. Started a new conversation."
+                    await self._reload_sources()
                     await self._refresh_status()
                 continue
 
@@ -1141,6 +1243,7 @@ class DaitaApp(App[int]):
                         + " detached. Started a new conversation."
                     )
                     selected_source_id = None
+                    await self._reload_sources()
                     await self._refresh_status()
                 continue
 
@@ -1270,6 +1373,7 @@ class DaitaApp(App[int]):
             return
         screen.show_next_steps(False)
         self._pending_question = question
+        self._pending_draft = display or message
         pending_user_identity = f"user-{id(message)}"
         self._pending_user_identity = pending_user_identity
         screen.append_block(
@@ -1291,53 +1395,58 @@ class DaitaApp(App[int]):
         self._partial_text = ""
         self._foreground_run_id = None
         self._foreground_tools.clear()
-        self._run_task = asyncio.create_task(
-            self._execute_run(
+        agent = self.controller.require_agent()
+        scope = () if source_id is None else (source_id,)
+        learning = isinstance(message, LearningInvocation)
+        # /learn needs the explicit-learning run so semantic_save is offered.
+        call = (
+            agent.learn(
                 message,
-                source_id=source_id,
+                conversation_id=self.controller.conversation_id,
+                source_scope_ids=scope,
+            )
+            if learning
+            else agent.run(
+                message,
+                conversation_id=self.controller.conversation_id,
+                source_scope_ids=scope,
                 files_only=files_only,
-            ),
-            name="daita-agent-run",
+            )
+        )
+        self._run_task = asyncio.create_task(
+            self._execute_run(call, learning=learning), name="daita-agent-run"
         )
         self._run_task.add_done_callback(self._on_run_done)
         await self._refresh_status(running=True, state="thinking")
 
-    async def _execute_run(
-        self,
-        message: str,
-        *,
-        source_id: str | None,
-        files_only: bool = False,
-    ) -> None:
-        agent = self.controller.require_agent()
+    async def _execute_run(self, call: Awaitable[LoopExit], *, learning: bool) -> None:
         try:
-            scope = () if source_id is None else (source_id,)
-            # /learn needs the explicit-learning run so semantic_save is offered.
-            result = await (
-                agent.learn(
-                    message,
-                    conversation_id=self.controller.conversation_id,
-                    source_scope_ids=scope,
-                )
-                if isinstance(message, LearningInvocation)
-                else agent.run(
-                    message,
-                    conversation_id=self.controller.conversation_id,
-                    source_scope_ids=scope,
-                    files_only=files_only,
-                )
-            )
-            await self._settle_result(
-                result, learning=isinstance(message, LearningInvocation)
-            )
+            await self._settle_result(await call, learning=learning)
         except asyncio.CancelledError:
             screen = self.chat()
-            if screen is not None:
+            if screen is not None and not self._shutting_down:
                 screen.remove_block(self._partial_identity)
                 screen.clear_activity()
                 await self._replace_conversation_transcript()
                 screen.show_notice("Run cancelled.")
             raise
+        except WorkspaceBusyError as error:
+            # The host is busy in another folder: nothing ran, so keep the draft.
+            screen = self.chat()
+            if screen is not None:
+                screen.clear_activity()
+                if self._pending_user_identity is not None:
+                    screen.remove_block(self._pending_user_identity)
+                    self._pending_user_identity = None
+                screen.composer().load_text(self._pending_draft)
+                screen.show_notice(
+                    sanitize_terminal_text(
+                        str(error),
+                        maximum=512,
+                        preserve_lines=False,
+                        fallback="Daita is busy in another folder.",
+                    )
+                )
         except Exception as error:
             screen = self.chat()
             if screen is not None:
@@ -1424,6 +1533,39 @@ class DaitaApp(App[int]):
                     f"Python cleanup incomplete: {'; '.join(cleanup_issues)}.",
                 )
             )
+        await self._offer_background_host(result.run_id)
+
+    async def _offer_background_host(self, run_id: str) -> None:
+        """Once, after a run creates a routine, offer the login service (§12.2)."""
+
+        if not self.controller.background_offer_due():
+            return
+        if not await self.controller.created_routine(run_id):
+            return
+        accepted = await self._await_modal(
+            ConfirmScreen(
+                "Keep Daita running in the background after you close this "
+                "window?\nRoutines then run while no window is open "
+                "(daita host install). You won't be asked again."
+            )
+        )
+        try:
+            # No polling meanwhile: a poll could start a host while the
+            # service takes over.
+            async with self._background_refresh_lock:
+                notes = await self.controller.answer_background_offer(accepted)
+        except (ValueError, RuntimeError, OSError) as error:
+            notes = [f"Could not install the Daita host service: {error}"]
+        screen = self.chat()
+        if screen is not None and notes:
+            screen.show_notice(
+                sanitize_terminal_text(
+                    " ".join(notes),
+                    maximum=512,
+                    preserve_lines=False,
+                    fallback="Daita host service installed.",
+                )
+            )
 
     async def on_observer_event(self, message: ObserverEvent) -> None:
         if self._shutting_down:
@@ -1436,7 +1578,7 @@ class DaitaApp(App[int]):
             elif event.kind is AgentEventKind.RUN_COMPLETED:
                 self._autonomous_run_ids.discard(event.run_id)
                 await self._refresh_status()
-                await self.refresh_background_status(notify_new=True)
+                self._schedule_background_refresh(notify_new=True)
             return
         if event.kind is AgentEventKind.RUN_STARTED:
             if self._run_task is not None and not self._run_task.done():
@@ -1582,12 +1724,7 @@ class DaitaApp(App[int]):
         )
 
     async def _request_exit(self) -> None:
-        if self._run_task is not None and not self._run_task.done():
-            accepted = await self._await_modal(
-                ConfirmScreen("Cancel the active run and exit?")
-            )
-            if not accepted:
-                return
+        # An active run keeps going in the host; reopening Daita shows it.
         self.exit(self._exit_code)
 
     async def action_quit(self) -> None:
@@ -1600,16 +1737,12 @@ async def run_daita_app(
     workspace: LocalWorkspace,
     agent_name: str | None = None,
     conversation_id: str | None = None,
-    keychain: KeychainStore | None = None,
-    model_validator: Any = None,
 ) -> int:
     app = DaitaApp(
         root=root,
         workspace=workspace,
         agent_name=agent_name,
         conversation_id=conversation_id,
-        keychain=keychain,
-        model_validator=model_validator,
     )
     result = await app.run_async()
     if app._startup_error is not None:

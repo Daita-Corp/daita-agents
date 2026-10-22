@@ -18,8 +18,8 @@ access, budgets, and actions you authorize.
 - **Answer across systems.** Query admitted databases, local CSV, TSV, JSON,
   NDJSON, and Parquet files, and remote MCP tools using current source evidence.
 - **Carry work forward.** Run durable task graphs or set assignments to run
-  once or regularly. Follow them and review results on the Work tab while a Daita
-  host is open.
+  once or regularly. The background Daita host runs them while your terminal
+  is closed; follow them and review results on the Work tab.
 - **Improve with use.** Keep conversations, approved business knowledge,
   meanings tied to specific sources, and reusable Markdown procedures. Teach
   them with `/learn`; every change waits for your approval.
@@ -42,6 +42,18 @@ curl -fsSL https://daita-tech.io/install.sh | bash
 
 The installer supplies its own Python runtime and starts onboarding when run
 in a terminal. Run `daita` in a new terminal to return later.
+
+With pipx instead:
+
+```bash
+pipx install daita-agents
+daita
+daita host install
+```
+
+`daita` starts the background Daita host on demand. `daita host install` keeps
+it running after you close the terminal and after login, so scheduled work and
+approvals continue; `daita host status` shows it.
 
 The first launch guides you through creating an agent, configuring a model, and
 optionally attaching a data source for reading. The launch directory becomes
@@ -73,9 +85,6 @@ arrow keys move between and within columns, `Enter` opens a card, and `d` dismis
 a result. Opening a card shows its existing detail screen; closing it returns to
 your chat draft. `F1` shows the full controls.
 Approvals bring Chat into focus and stay above the composer until resolved.
-
-Scheduled work progresses only while the terminal or `daita host --agent <name>`
-keeps that agent open. One host can open an agent home at a time.
 
 ## Authority stays explicit
 
@@ -112,8 +121,8 @@ See [relational writes](docs/RELATIONAL_WRITES.md),
 
 ## Upgrade or uninstall
 
-Close any running Daita terminal or host first. Run the Quick start command
-again to upgrade a managed installation. To remove it, run:
+Run the Quick start command again to upgrade a managed installation. To remove
+it, run `daita host stop` first, then:
 
 ```bash
 curl -fsSL https://daita-tech.io/install.sh | bash -s -- --uninstall

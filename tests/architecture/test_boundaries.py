@@ -6,6 +6,7 @@ from pathlib import Path
 
 import daita
 from daita.capabilities import AccessMode, CallTargetLane, OperationalEffect
+from daita.host.protocol import CLIENT_ONLY_MEMBERS
 from daita.storage.sqlite_schema import CURRENT_SCHEMA
 from tests.support.workspace import workspace_for
 
@@ -646,6 +647,7 @@ def test_model_suggestions_remain_terminal_only_presentation_metadata():
 
 def test_public_surface_is_focused():
     assert set(daita.__all__) == {
+        "connect",
         "EffectReceipt",
         "EffectResolution",
         "EffectResolutionDecision",
@@ -1701,7 +1703,8 @@ def test_terminal_application_remains_a_presentation_over_the_public_agent_api()
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "agent"
     }
-    assert agent_calls <= public_methods
+    # The host client adds only the allowlisted members Agent cannot have.
+    assert agent_calls <= public_methods | CLIENT_ONLY_MEMBERS
     assert {
         "catalog_preview",
         "conversation_exists",
@@ -2305,7 +2308,9 @@ def test_agent_home_journal_and_codecs_have_one_append_only_storage_owner():
         text = path.read_text(encoding="utf-8")
         if not relative.startswith("storage/"):
             assert "storage.sqlite_migrations" not in text
-            assert "sqlite_codecs" not in text
+            # The host wire codec reuses the strict record codecs, never their storage.
+            if relative != "host/codec.py":
+                assert "sqlite_codecs" not in text
 
 
 def test_knowledge_content_cannot_redefine_data_or_execution_authority():

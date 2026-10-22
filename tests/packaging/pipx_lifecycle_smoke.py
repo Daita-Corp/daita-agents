@@ -233,6 +233,7 @@ def main() -> int:
         _run(
             [
                 str(command),
+                "--no-host",
                 "--root",
                 str(separate_agent_home),
                 "--workspace",
@@ -774,6 +775,7 @@ assert any(item.startswith("XlsxWriter") for item in requirements)
         _run(
             [
                 str(command),
+                "--no-host",
                 "--root",
                 str(separate_agent_home),
                 "--workspace",

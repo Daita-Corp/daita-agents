@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shlex
 import subprocess
@@ -11,13 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from daita import (
-    Agent,
-    AgentConfig,
     ApprovalHandler,
     ConversationRun,
     DeliveryInspection,
     DeliveryView,
     FolderSource,
+    LocalFileAccess,
     LocalWorkspace,
     LoopExit,
     MCPAdmissionError,
@@ -49,6 +49,10 @@ from daita.artifacts import (
     ArtifactRef,
 )
 from daita.errors import StateCompatibilityError
+from daita.host import service
+from daita.host.client import RemoteAgent
+from daita.host.paths import host_paths
+from daita.host.settings import read_setting, write_setting
 from daita.jobs import (
     GraphBoardProjection,
     GraphInspection,
@@ -63,12 +67,8 @@ from daita.llm.models import ToolCall, ToolResultBlock
 from daita.llm.provider_definitions import SUBSCRIPTION_CLIENTS
 from daita.memory.capabilities import MEMORY_SET_TOOL_NAME
 from daita.observation import AgentObserver
-from daita.security import (
-    CredentialSession,
-    KeychainSecretProvider,
-    KeychainStore,
-    SecretReference,
-)
+from daita.routines.capabilities import ROUTINE_CREATE_CAPABILITY_ID
+from daita.security import SecretReference
 from daita.semantics import SEMANTIC_SAVE_TOOL_NAME
 from daita.skills import Skill, validate_skill_name
 from daita.skills.capabilities import SKILL_SAVE_TOOL_NAME
@@ -79,6 +79,7 @@ from .commands import (
     parse_source_override,
 )
 from .models import (
+    HOST_GUIDANCE,
     PROVIDERS,
     CommandOutcome,
     UserInputError,
@@ -183,55 +184,60 @@ SOURCE_REFRESH_ERRORS = {
 
 
 class PresentationController:
-    """Thin adapter from UI actions to public Agent methods."""
+    """Thin adapter from UI actions to the agent the Daita host owns."""
 
     def __init__(
         self,
         *,
         root: str | Path | None,
         workspace: LocalWorkspace,
-        keychain: KeychainStore | None = None,
-        model_validator: Any = None,
     ) -> None:
         self.root = root
         if not isinstance(workspace, LocalWorkspace):
             raise TypeError("workspace must be LocalWorkspace")
         self.workspace = workspace
-        if isinstance(keychain, CredentialSession):
-            self.keychain = keychain
-            self._owns_credential_session = False
-        else:
-            self.keychain = CredentialSession(keychain or KeychainSecretProvider())
-            self._owns_credential_session = True
-        self.model_validator = model_validator
-        self.model: Any = None
-        self.model_profile: Any = None
-        self.agent: Agent | None = None
+        self.agent: RemoteAgent | None = None
+        # Called when the host could not replay missed events (RemoteAgent.on_reset).
+        self.on_reset: Callable[[], None] | None = None
         self.conversation_id: str | None = None
         # (conversation_id, run_id, question) of the latest answered question.
         self.last_answer: tuple[str, str, str] | None = None
         self.validated_model = False
-        self.model_configuration_requires_replacement = False
 
-    def require_agent(self) -> Agent:
+    @property
+    def model_configuration_requires_replacement(self) -> bool:
+        return (
+            self.agent is not None
+            and self.agent.model_configuration_requires_replacement
+        )
+
+    def require_agent(self) -> RemoteAgent:
         if self.agent is None:
             raise RuntimeError("no agent is open")
         return self.agent
 
     async def list_agents(self) -> tuple[str, ...]:
-        return await Agent.list(root=self.root)
+        return await RemoteAgent.list(root=self.root)
 
     async def close_agent(self) -> None:
+        """Detach from the agent; its runs and schedulers keep going in the host."""
+
         agent = self.agent
         self.agent = None
-        self.model_configuration_requires_replacement = False
         if agent is not None:
             await agent.close()
 
     async def close(self) -> None:
         await self.close_agent()
-        if self._owns_credential_session:
-            await self.keychain.close()
+
+    def _host_workspace(self) -> LocalWorkspace:
+        # The terminal works in its folder with computer access; the host refuses
+        # any other sensitivity rather than silently lowering it.
+        return LocalWorkspace(
+            self.workspace.root,
+            sensitivity=self.workspace.sensitivity,
+            access=LocalFileAccess.COMPUTER,
+        )
 
     async def open_agent(
         self,
@@ -239,66 +245,18 @@ class PresentationController:
         *,
         observer: AgentObserver | None,
         approval_handler: ApprovalHandler | None,
-    ) -> Agent:
+    ) -> RemoteAgent:
         await self.close_agent()
-        requires_replacement = False
-        try:
-            opened = await Agent.open(
-                name,
-                workspace=self.workspace,
-                root=self.root,
-                model=self.model,
-                model_profile=self.model_profile,
-                keychain=self.keychain,
-                model_validator=self.model_validator,
-                observer=observer,
-                approval_handler=approval_handler,
-            )
-        except AgentModelConfigurationError:
-            opened = await Agent.open(
-                name,
-                workspace=self.workspace,
-                root=self.root,
-                config=AgentConfig(),
-                model=self.model,
-                model_profile=self.model_profile,
-                keychain=self.keychain,
-                model_validator=self.model_validator,
-                observer=observer,
-                approval_handler=approval_handler,
-            )
-            requires_replacement = True
-        try:
-            await self._preload_active_credentials(opened)
-        except BaseException:
-            await opened.close()
-            raise
+        opened = await RemoteAgent.open(
+            name,
+            workspace=self._host_workspace(),
+            root=self.root,
+            observer=observer,
+            approval_handler=approval_handler,
+        )
+        opened.on_reset = self.on_reset
         self.agent = opened
-        self.model_configuration_requires_replacement = requires_replacement
         return opened
-
-    async def _preload_active_credentials(self, agent: Agent) -> None:
-        """Move native secret authorization out of the query hot path."""
-
-        references: list[SecretReference] = []
-        route = agent.model_route
-        if route is not None:
-            references.extend(
-                reference
-                for candidate in route.candidates
-                if (reference := candidate.secret_reference) is not None
-                and reference.scheme == "keychain"
-            )
-        for source in await agent.list_sources():
-            if not source.active:
-                continue
-            raw_reference = source.configuration.get("credential_ref")
-            if not isinstance(raw_reference, str):
-                continue
-            reference = SecretReference.parse(raw_reference)
-            if reference.scheme == "keychain":
-                references.append(reference)
-        await self.keychain.preload(references)
 
     async def create_agent(
         self,
@@ -306,22 +264,19 @@ class PresentationController:
         *,
         observer: AgentObserver | None,
         approval_handler: ApprovalHandler | None,
-    ) -> Agent:
+    ) -> RemoteAgent:
         await self.close_agent()
         try:
-            created = await Agent.create(
+            created = await RemoteAgent.create(
                 name,
-                workspace=self.workspace,
+                workspace=self._host_workspace(),
                 root=self.root,
-                model=self.model,
-                model_profile=self.model_profile,
-                keychain=self.keychain,
-                model_validator=self.model_validator,
                 observer=observer,
                 approval_handler=approval_handler,
             )
         except (AgentAlreadyExistsError, AgentNameError, ValueError) as error:
             raise UserInputError(str(error)) from error
+        created.on_reset = self.on_reset
         self.agent = created
         return created
 
@@ -332,10 +287,10 @@ class PresentationController:
         await self.delete_agent(name)
 
     async def delete_agent(self, name: str) -> None:
-        """Delete one closed agent through the public lifecycle boundary."""
+        """Delete one agent through the host, which closes it first."""
 
         try:
-            await Agent.delete(name, root=self.root, keychain=self.keychain)
+            await RemoteAgent.delete(name, root=self.root)
         except HostActiveError as error:
             raise UserInputError(
                 "That agent is active in another Daita process. Close it, then retry."
@@ -348,7 +303,7 @@ class PresentationController:
         *,
         observer: AgentObserver | None,
         approval_handler: ApprovalHandler | None,
-    ) -> Agent:
+    ) -> RemoteAgent:
         agent = self.require_agent()
         name = agent.name
         return await self.open_agent(
@@ -387,15 +342,7 @@ class PresentationController:
         )
 
     async def source_summary(self) -> str:
-        agent = self.require_agent()
-        sources = tuple(
-            source for source in await agent.list_sources() if source.active
-        )
-        if not sources:
-            return "no sources"
-        if len(sources) == 1:
-            return safe_display(sources[0].display_name, fallback="source")
-        return f"{len(sources)} sources"
+        return summarize_sources(await self.require_agent().list_sources())
 
     async def configure_model(
         self,
@@ -1730,6 +1677,35 @@ class PresentationController:
             for call, output in await self.require_agent().tool_evidence(run_id)
         )
 
+    async def created_routine(self, run_id: str) -> bool:
+        """Whether a run committed a new routine."""
+
+        return any(
+            output is not None
+            and not output.is_error
+            and output.capability_id == ROUTINE_CREATE_CAPABILITY_ID
+            for _call, output in await self.require_agent().tool_evidence(run_id)
+        )
+
+    def background_offer_due(self) -> bool:
+        """Offer the login service once, and only while it is not installed."""
+
+        try:
+            return not service.installed() and read_setting(
+                host_paths(self.root), "background_offer"
+            )
+        except ValueError:
+            return False  # a malformed host.toml is never rewritten
+
+    async def answer_background_offer(self, accepted: bool) -> list[str]:
+        """Never ask again; with yes, install and start the login service."""
+
+        paths = host_paths(self.root)
+        write_setting(paths, "background_offer", False)
+        if not accepted:
+            return []
+        return await asyncio.to_thread(service.install, paths)
+
     def _settings_text(self) -> str:
         agent = self.require_agent()
         route = agent.model_route
@@ -1769,9 +1745,7 @@ class PresentationController:
             f"Agent      {safe_display(agent.name, fallback='agent')}\n"
             f"Model      {safe_display(self.model_label(), fallback='model')}\n"
             f"Sources    {source}\n"
-            "Host       this window. Routines and jobs run while it is open.\n"
-            "Closing    run daita host --agent <name> to keep them running; "
-            "with no host open they wait.\n"
+            f"Host       {agent.connection}. {HOST_GUIDANCE}\n"
             f"Working dir  {safe_display(str(self.workspace.root), fallback='admitted')} "
             f"[{self.workspace.access.value} access; {self.workspace.sensitivity.value}]\n"
             "Conversation  " + safe_display(self.conversation_id, fallback="new")
@@ -1840,6 +1814,17 @@ class PresentationController:
         for evidence in annotation.evidence:
             lines.append(f"  {evidence.kind.value} in run {evidence.run_id}")
         return "\n".join(lines)
+
+
+def summarize_sources(sources: tuple[Any, ...]) -> str:
+    """Name the one active source, or count them, for the status bar."""
+
+    active = tuple(source for source in sources if source.active)
+    if not active:
+        return "no sources"
+    if len(active) == 1:
+        return safe_display(active[0].display_name, fallback="source")
+    return f"{len(active)} sources"
 
 
 def _configuration_text(configuration: Any, key: str) -> str:

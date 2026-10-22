@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from ._installation import repair_guidance
-from .security import KeychainStore
 from .workspace import LocalWorkspace
 
 
@@ -30,17 +29,8 @@ async def run_terminal_application(
     workspace: LocalWorkspace,
     agent_name: str | None = None,
     conversation_id: str | None = None,
-    keychain: KeychainStore | None = None,
-    model_validator: Any = None,
-    input_stream: Any = None,
-    output_stream: Any = None,
-    hidden_input: Any = None,
-    selection_input: Any = None,
-    selection_output: Any = None,
-    tui_input: Any = None,
-    tui_output: Any = None,
 ) -> int:
-    """Start one Textual app. Extra stream arguments are ignored after cutover."""
+    """Start one Textual app: a client of the Daita host, which owns every agent."""
 
     run_app = _load_textual_app()
     return await run_app(
@@ -48,8 +38,6 @@ async def run_terminal_application(
         workspace=workspace,
         agent_name=agent_name,
         conversation_id=conversation_id,
-        keychain=keychain,
-        model_validator=model_validator,
     )
 
 

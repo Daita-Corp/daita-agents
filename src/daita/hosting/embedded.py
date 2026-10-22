@@ -2248,7 +2248,8 @@ class EmbeddedAgent:
             raise
         return embedded
 
-    def model_requires_explicit_limits(self, *, provider: str, model: str) -> bool:
+    @staticmethod
+    def model_requires_explicit_limits(*, provider: str, model: str) -> bool:
         """Project exact release-reviewed profile admission through the facade."""
 
         if not isinstance(provider, str) or not provider:

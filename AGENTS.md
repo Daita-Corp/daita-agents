@@ -104,8 +104,9 @@ Runs come from two places:
 | Models | Canonical records, routing and retries, provider adapters | `llm/` |
 | State | Shared SQL operations, schema, strict codecs, home migrations | `storage/` |
 | Secrets | Secret references and lazy resolution | `security/` |
-| Product surfaces | CLI and Textual TUI over the public API | `cli.py`, `tui/` |
-| Resident host | `daita host --agent <name>`: keeps one agent open for background work | `hosting/resident.py` |
+| Product surfaces | CLI and Textual TUI, clients of the host | `cli.py`, `tui/` |
+| Host | One background process per user that opens every agent and serves clients over an owner-only Unix socket | `host/` |
+| Resident host (deprecated) | `daita host --agent <name>`: now a deprecation notice plus `daita host serve` | `hosting/resident.py` |
 
 ## Invariants
 
@@ -177,12 +178,22 @@ changes*.
   dynamic plugin or executor registry.
 - **A direct loop.** There is no verifier, repair or synthesis pass, and no
   resumable session. Clarification is ordinary model behavior, not a run state.
-- **In-process approval and observation.** Approval is an `ApprovalHandler`
-  callback the host awaits, with no pending-approval record. Observation is a
-  best-effort callback, not a durable event log.
-- **Process-local hosting.** The process that opens an agent hosts it: the TUI,
-  the CLI, a Python script or `daita host`. There is no background service or
-  local API yet; a local agent host is planned.
+- **Approval and observation through the host.** Inside a process, approval is
+  still an `ApprovalHandler` callback the loop awaits and observation a
+  best-effort callback. The host turns both into *interactions* and an event
+  stream: an approval or question is a pending interaction any connected client
+  can answer (the first answer wins; expiry interrupts and never denies), and a
+  desktop notification goes out when no client watches that agent. Interactions
+  live in host memory, not in the agent home.
+- **One host per user owns every agent.** `daita host serve` opens every agent
+  with background work, holds each writer lock (the single writer is the host),
+  runs schedulers and runs, and keeps going when every window is closed. The
+  TUI, the CLI and `daita.connect()` are clients that reach it over an
+  owner-only Unix socket under `~/.daita/run/`; there is no TCP listener. Clients
+  auto-spawn the host when it is not running, and `daita host install` registers
+  it as a login service. Library mode (`Agent.open()`, `daita --no-host`) still
+  composes the agent in-process, and is refused with `HostActiveError` while
+  the host holds that agent.
 - **Routines and graph jobs are separate systems**, with no routine-to-graph
   bridge.
 - **The only distribution destination** is the originating conversation's inbox.
@@ -296,6 +307,19 @@ The full release policy is in `docs/architecture/persistence.md`.
 Add the parser in `build_parser()` and its branch in the command dispatch in
 `cli.py`. Use only the public `Agent` API, and format output through
 `cli_text.py`. Add tests in `tests/cli/`.
+
+### Add a host route
+1. Add the member to the `Agent` facade first; the host adds no behaviour of its
+   own.
+2. Declare one `Route` in the area's module under `host/routes/` (one module per
+   area: `sources.py`, `jobs.py`, `routines.py`, …). Handlers are the shared
+   decode-call-encode endpoint; set `work=True` when the result can change the
+   work board and `reopen=True` when the agent must reopen idle afterwards.
+3. Add the member to `REMOTE_AGENT_SURFACE` in `host/protocol.py` and mirror it
+   on `RemoteAgent` in `host/client.py`. Every parameter and return type must
+   round-trip through `host/codec.py`; add a codec case for a new record type.
+4. Run `tests/host`: the surface guard, the codec round-trip and the route
+   reachability tests fail until all three agree.
 
 ### Add a TUI command or screen
 1. Add the slash command to the right group in `COMMAND_GROUPS` in
@@ -525,7 +549,21 @@ protects the user in its place.
 | `src/daita/hosting/embedded.py` | composition and agent-home admission |
 | `src/daita/hosting/agent_home.py` | agent-home directories and the writer lock |
 | `src/daita/hosting/execution_governor.py` | execution admission and resource permits |
-| `src/daita/hosting/resident.py` | `daita host` resident process |
+| `src/daita/hosting/resident.py` | deprecated one-agent resident process; warns and is removed in a later release |
+| `src/daita/host/server.py` | the host process: singleton lock, socket, app, graceful shutdown |
+| `src/daita/host/registry.py` | opens and closes agents inside the host, idle policy |
+| `src/daita/host/runs.py` | run submission, cancellation and completion |
+| `src/daita/host/interactions.py` | approvals and questions a client answers |
+| `src/daita/host/events.py` | per-agent event stream with bounded replay |
+| `src/daita/host/notify.py` | desktop notifications when no client watches |
+| `src/daita/host/service.py` | launchd and systemd login-service files |
+| `src/daita/host/settings.py` | `~/.daita/host.toml` user settings |
+| `src/daita/host/client.py` | `RemoteAgent` and `daita.connect()` |
+| `src/daita/host/supervise.py` | start, stop and status of the host process |
+| `src/daita/host/paths.py` | root, socket, lock and log paths |
+| `src/daita/host/protocol.py` | protocol version, `REMOTE_AGENT_SURFACE`, error codes |
+| `src/daita/host/codec.py` | wire encoding of every surface type |
+| `src/daita/host/routes/` | one thin decode-call-encode route module per area |
 | `src/daita/loop/driver.py` | direct model/tool progression |
 | `src/daita/loop/models.py` | run, transcript, limits, and exit records |
 | `src/daita/capabilities.py` | declarations and registry |

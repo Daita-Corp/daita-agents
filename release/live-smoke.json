@@ -1,9 +1,10 @@
 {
   "surface_digest": "sha256:d4a3de81712484b34c54f86cf7ad77b8740e7058e385a353ae5136b40be8937d",
-  "recorded_on": "2026-10-20",
+  "recorded_on": "2026-10-21",
   "cases": {
     "tests/live/acceptance/test_result_refs.py::test_l8_graph_task_complete_cites_its_read[0]": "passed",
     "tests/live/analysis/test_public_journeys.py::test_real_model_dependent_cells_and_error_correction": "passed",
+    "tests/live/analysis/test_public_journeys.py::test_real_model_tui_python_and_broker": "passed",
     "tests/live/artifacts/test_lifecycle.py::test_live_model_artifact_creation_reuse_and_deletion_survive_reopen": "passed",
     "tests/live/benchmarks/test_catalog_scale.py::test_immediate_target_survives_catalog_distractors[64]": "passed",
     "tests/live/benchmarks/test_paraphrases.py::test_paraphrased_immediate_reads_do_not_create_jobs[quick-lookup]": "passed",

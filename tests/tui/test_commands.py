@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.tui._support import (
     BUILTIN_SLASH_COMMAND_ROOTS,
     BUILTIN_SLASH_COMMANDS,
     MIN_READY_ROWS,
     MIN_USABLE_COLUMNS,
     SLASH_COMMAND_COMPLETIONS,
-    Agent,
     App,
     Button,
     CatalogScreen,
@@ -26,7 +26,6 @@ from tests.tui._support import (
     _create_sqlite_source,
     parse_source_override,
     pytest,
-    workspace_for,
 )
 
 
@@ -51,13 +50,12 @@ def test_every_advertised_slash_root_is_the_recognized_builtin_set():
 
 
 async def test_typed_command_palette_navigates_and_inserts_without_submitting(
-    tmp_path: Path,
+    start_host: StartHost,
 ):
-    opened = await Agent.create(
-        "palette-agent", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "palette-agent")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:
@@ -148,12 +146,13 @@ async def test_typed_command_palette_navigates_and_inserts_without_submitting(
         await opened.close()
 
 
-async def test_skill_and_source_completions_are_plain_and_selectable(tmp_path: Path):
+async def test_skill_and_source_completions_are_plain_and_selectable(
+    tmp_path: Path, start_host: StartHost
+):
     database = tmp_path / "completion.sqlite"
     _create_sqlite_source(database, "records")
-    opened = await Agent.create(
-        "completion-agent", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    harness = await start_host()
+    opened = await remote_agent(harness, "completion-agent")
     await opened.attach(SQLiteSource(database, name="North [bold]"))
     await opened.save_skill(
         "audit",
@@ -161,7 +160,7 @@ async def test_skill_and_source_completions_are_plain_and_selectable(tmp_path: P
         "Check each recorded total against its source.",
     )
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:

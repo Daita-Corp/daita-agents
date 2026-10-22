@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from daita.llm.errors import ProviderFailureDiagnostic, ProviderFailurePhase
 from daita.llm.models import ModelUsage
+from tests.support.host import (
+    StartHost,
+    host_workspace,
+    remote_agent,
+    remove_root,
+    short_root,
+)
 from tests.tui._support import (
     UTC,
-    Agent,
     ApprovalDecision,
     ApprovalRequest,
     ChatScreen,
@@ -82,10 +88,9 @@ async def test_one_interactive_run_path_is_unique():
     assert text.count("agent.run(") == 1
 
 
-async def test_active_run_cancellation_does_not_retry_agent(tmp_path: Path):
-    opened = await Agent.create(
-        "cancel-once", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+async def test_active_run_cancellation_does_not_retry_agent(start_host: StartHost):
+    harness = await start_host()
+    opened = await remote_agent(harness, "cancel-once")
     calls: list[str] = []
     started = asyncio.Event()
 
@@ -96,7 +101,7 @@ async def test_active_run_cancellation_does_not_retry_agent(tmp_path: Path):
 
     opened.run = wait_forever  # type: ignore[method-assign]
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:
@@ -117,10 +122,9 @@ async def test_active_run_cancellation_does_not_retry_agent(tmp_path: Path):
         await opened.close()
 
 
-async def test_learn_command_runs_explicit_learning(tmp_path: Path):
-    opened = await Agent.create(
-        "learn-route", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+async def test_learn_command_runs_explicit_learning(start_host: StartHost):
+    harness = await start_host()
+    opened = await remote_agent(harness, "learn-route")
     calls: list[tuple[str, str]] = []
     called = asyncio.Event()
 
@@ -135,7 +139,7 @@ async def test_learn_command_runs_explicit_learning(tmp_path: Path):
     opened.run = record("run")  # type: ignore[method-assign]
     opened.learn = record("learn")  # type: ignore[method-assign]
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = opened
     try:
@@ -179,7 +183,7 @@ async def test_approval_presentation_failure_is_not_converted_to_denial():
 
 
 @pytest.mark.skipif(os.name != "posix", reason="real PTY certification is POSIX-only")
-def test_real_pty_normal_exit_restores_alternate_screen(tmp_path: Path):
+def test_real_pty_normal_exit_restores_alternate_screen():
     import fcntl
     import pty
     import select
@@ -189,6 +193,13 @@ def test_real_pty_normal_exit_restores_alternate_screen(tmp_path: Path):
     import termios
     import time
 
+    from daita.host.paths import host_paths
+    from daita.host.supervise import start_host, stop_host
+
+    # The app is a client of a background host on a short state root; start it
+    # first so the app reaches its first screen as quickly as before.
+    root = short_root()
+    start_host(host_paths(root))
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     environment = dict(os.environ)
@@ -202,7 +213,7 @@ def test_real_pty_normal_exit_restores_alternate_screen(tmp_path: Path):
             "-m",
             "daita.cli",
             "--root",
-            str(tmp_path),
+            str(root),
         ],
         stdin=slave,
         stdout=slave,
@@ -226,7 +237,13 @@ def test_real_pty_normal_exit_restores_alternate_screen(tmp_path: Path):
                 if not chunk:
                     break
                 output.extend(chunk)
-            if not escape_sent and b"\x1b[?1049h" in output:
+            # Escape once the first screen is drawn: the app reaches it through
+            # the host, so the alternate screen alone appears too early.
+            if (
+                not escape_sent
+                and b"\x1b[?1049h" in output
+                and b"Create an agent" in output
+            ):
                 os.write(master, b"\x1b")
                 escape_sent = True
         return_code = process.wait(timeout=3)
@@ -250,6 +267,8 @@ def test_real_pty_normal_exit_restores_alternate_screen(tmp_path: Path):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
+        stop_host(host_paths(root))
+        remove_root(root)
 
     assert escape_sent
     assert return_code == 0

@@ -38,6 +38,7 @@ async def test_receipt_recovery_controls_preserve_observation_and_dispatch_nothi
 
         args = cli.build_parser().parse_args(
             [
+                "--no-host",
                 "--root",
                 str(fixture.root),
                 "--workspace",

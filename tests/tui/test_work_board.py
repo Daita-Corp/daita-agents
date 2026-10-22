@@ -4,14 +4,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import MappingProxyType
 
 import pytest
 from textual.widgets import Button, OptionList, Static, Tab
 
 from daita import (
-    Agent,
     DeliveryInspection,
     DeliveryState,
     DeliverySubjectKind,
@@ -27,6 +25,7 @@ from daita import (
 )
 from daita.distribution import delivery_view
 from daita.distribution.owner import construct_logical_delivery
+from daita.host.client import RemoteAgent
 from daita.llm.models import ModelSensitivity
 from daita.routines.models import ScheduleKind
 from daita.tui.app import DaitaApp
@@ -37,7 +36,7 @@ from daita.tui.screens.routines import RoutinesScreen
 from daita.tui.widgets.command_center import WorkBoardView
 from daita.tui.widgets.transcript import TranscriptView
 from tests.support.distribution import inbox_distribution_plan
-from tests.support.workspace import workspace_for
+from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.tui._support import _tui_delivery_view, _tui_job_summary
 
 NOW = datetime(2026, 10, 18, 12, tzinfo=UTC)
@@ -116,13 +115,12 @@ def _result_inspection(delivery_id: str = "delivery-1") -> DeliveryInspection:
 
 
 async def _app_with_board(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boards: list[WorkBoard]
-) -> tuple[DaitaApp, Agent]:
-    agent = await Agent.create(
-        "work-board-tui", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch, boards: list[WorkBoard]
+) -> tuple[DaitaApp, RemoteAgent]:
+    harness = await start_host()
+    agent = await remote_agent(harness, "work-board-tui")
     app = DaitaApp(
-        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
     )
     app.controller.agent = agent
 
@@ -138,7 +136,7 @@ def _option_ids(listing: OptionList) -> list[str | None]:
 
 
 async def test_work_command_routes_to_the_work_tab_without_a_model_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     assert (
         "/work",
@@ -146,7 +144,7 @@ async def test_work_command_routes_to_the_work_tab_without_a_model_call(
         "See scheduled, running, waiting and finished work",
     ) in SLASH_COMMAND_COMPLETIONS
     assert not any(item[0].startswith("/inbox") for item in SLASH_COMMAND_COMPLETIONS)
-    app, agent = await _app_with_board(tmp_path, monkeypatch, [_board()])
+    app, agent = await _app_with_board(start_host, monkeypatch, [_board()])
     outcome = await app.controller.dispatch_command("/work")
     assert (outcome.kind, outcome.screen) == ("screen", "work")
     malformed = await app.controller.dispatch_command("/work extra")
@@ -175,7 +173,7 @@ async def test_work_command_routes_to_the_work_tab_without_a_model_call(
 
 
 async def test_board_shows_four_columns_with_counts_truncation_and_empty_states(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     board = _board(
         _card(WorkKind.JOB, "job-running", WorkColumn.RUNNING, started_at=NOW),
@@ -196,7 +194,7 @@ async def test_board_shows_four_columns_with_counts_truncation_and_empty_states(
         ),
         truncated={WorkColumn.NEEDS_YOU: 3},
     )
-    app, agent = await _app_with_board(tmp_path, monkeypatch, [board])
+    app, agent = await _app_with_board(start_host, monkeypatch, [board])
     try:
         async with app.run_test(size=(140, 36)) as pilot:
             await app._show_chat()
@@ -251,9 +249,9 @@ async def test_board_shows_four_columns_with_counts_truncation_and_empty_states(
 
 @pytest.mark.parametrize("width,narrow", [(140, False), (90, True)])
 async def test_board_uses_a_two_by_two_grid_on_narrow_terminals(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, width: int, narrow: bool
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch, width: int, narrow: bool
 ) -> None:
-    app, agent = await _app_with_board(tmp_path, monkeypatch, [_board()])
+    app, agent = await _app_with_board(start_host, monkeypatch, [_board()])
     try:
         async with app.run_test(size=(width, 36)) as pilot:
             await app._show_chat()
@@ -326,14 +324,14 @@ async def test_board_uses_a_two_by_two_grid_on_narrow_terminals(
     ],
 )
 async def test_enter_opens_each_card_kind_in_its_owner_screen(
-    tmp_path: Path,
+    start_host: StartHost,
     monkeypatch: pytest.MonkeyPatch,
     card: WorkCard,
     screen_type: type,
     selector: str | None,
     expected_id: str,
 ) -> None:
-    app, agent = await _app_with_board(tmp_path, monkeypatch, [_board(card)])
+    app, agent = await _app_with_board(start_host, monkeypatch, [_board(card)])
     job = _tui_job_summary("job-target", GraphState.ACTIVE, result_available=False)
     routine = ScheduledRoutineSummary(
         routine_id="routine-target",
@@ -404,7 +402,7 @@ async def test_enter_opens_each_card_kind_in_its_owner_screen(
 
 
 async def test_d_dismisses_only_cards_that_carry_a_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     result = _card(
         WorkKind.ROUTINE_RUN,
@@ -423,7 +421,7 @@ async def test_d_dismisses_only_cards_that_carry_a_result(
         boards.append(_board(job))
         return _tui_delivery_view(delivery_id)
 
-    app, agent = await _app_with_board(tmp_path, monkeypatch, boards)
+    app, agent = await _app_with_board(start_host, monkeypatch, boards)
     monkeypatch.setattr(app.controller, "acknowledge_delivery", acknowledge_delivery)
     try:
         async with app.run_test(size=(140, 36)) as pilot:
@@ -462,7 +460,7 @@ async def test_d_dismisses_only_cards_that_carry_a_result(
 
 
 async def test_selection_survives_refresh_and_card_text_is_sanitized(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     first = _card(
         WorkKind.JOB,
@@ -474,7 +472,7 @@ async def test_selection_survives_refresh_and_card_text_is_sanitized(
     )
     second = _card(WorkKind.JOB, "job-two", WorkColumn.SCHEDULED, status="queued")
     boards = [_board(first, second)]
-    app, agent = await _app_with_board(tmp_path, monkeypatch, boards)
+    app, agent = await _app_with_board(start_host, monkeypatch, boards)
     try:
         async with app.run_test(size=(140, 36)) as pilot:
             await app._show_chat()
@@ -509,11 +507,11 @@ async def test_selection_survives_refresh_and_card_text_is_sanitized(
 
 
 async def test_new_needs_you_or_done_cards_notify_once_per_batch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     waiting = _card(WorkKind.JOB, "job-waiting", WorkColumn.NEEDS_YOU, status="blocked")
     boards = [_board(waiting)]
-    app, agent = await _app_with_board(tmp_path, monkeypatch, boards)
+    app, agent = await _app_with_board(start_host, monkeypatch, boards)
     notifications: list[tuple[str, str | None]] = []
 
     def notify(message: str, *, title: str | None = None, **_kwargs: object) -> None:
@@ -562,9 +560,9 @@ async def test_new_needs_you_or_done_cards_notify_once_per_batch(
 
 
 async def test_result_screen_shows_a_sanitized_result_and_dismisses_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app, agent = await _app_with_board(tmp_path, monkeypatch, [_board()])
+    app, agent = await _app_with_board(start_host, monkeypatch, [_board()])
     inspection = _result_inspection()
     dismissed: list[str] = []
 

@@ -76,9 +76,8 @@ daita effects resolve atlas <receipt-id> \
 Use `--decision allow_future_work` for the other decision. Optional repeatable
 `--evidence <id>` accepts exact agent-owned terminal receipt or artifact references.
 There is no `--yes` shortcut: resolution presents the exact document for approval.
-Stop any resident host before using these commands or reopening the TUI. The
-command's host closes on exit; use `daita host --agent atlas` to continue scheduled
-work after the command finishes.
+These commands go through the background Daita host, so scheduled work keeps
+running while you use them.
 
 Uncertainty stays in the original receipt even after recovery. Future authorized
 work may still duplicate an action whose original result was lost. Native and MCP

@@ -47,6 +47,7 @@ from daita.storage.schema_contract import require_healthy, require_schema
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_schema import CURRENT_SCHEMA
 from tests.support.home_revisions import undo_revision_4_schema
+from tests.support.host import StartHost, host_workspace
 from tests.support.mcp_actions import ActionFixture
 from tests.support.paths import REPO_ROOT
 from tests.support.workspace import workspace_for
@@ -891,7 +892,7 @@ def test_headless_cli_reports_revision_status_and_safe_failures(tmp_path: Path) 
     stdout = io.StringIO()
     stderr = io.StringIO()
     with redirect_stdout(stdout), redirect_stderr(stderr):
-        code = cli.main(["--root", str(tmp_path), "sources", "status"])
+        code = cli.main(["--no-host", "--root", str(tmp_path), "sources", "status"])
 
     assert code == 1
     assert stdout.getvalue() == ""
@@ -904,13 +905,14 @@ def test_headless_cli_reports_revision_status_and_safe_failures(tmp_path: Path) 
 
 
 async def test_interactive_tui_lists_unopenable_home_with_human_safe_diagnostic(
-    tmp_path: Path,
+    start_host: StartHost,
 ) -> None:
     from daita.tui.app import DaitaApp
     from daita.tui.screens.selection import SelectionScreen
 
+    harness = await start_host()
     created = await Agent.create(
-        "unsupported", root=tmp_path, workspace=workspace_for(tmp_path)
+        "unsupported", root=harness.root, workspace=host_workspace(harness)
     )
     path = created.home / "state.db"
     await created.close()
@@ -921,8 +923,8 @@ async def test_interactive_tui_lists_unopenable_home_with_human_safe_diagnostic(
         )
     before = path.read_bytes()
     app = DaitaApp(
-        root=tmp_path,
-        workspace=workspace_for(tmp_path),
+        root=harness.root,
+        workspace=host_workspace(harness),
         agent_name="unsupported",
         start_bootstrap=False,
     )
