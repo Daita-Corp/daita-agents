@@ -439,8 +439,10 @@ async def test_graph_task_run_reaches_the_host_sink_without_an_observer(tmp_path
         for r in task
         if r["kind"] == "tool.completed" and r["data"]["tool_name"] == "data_query"
     )
+    # The model rendering replaces each stored ID with its name, so the two
+    # sizes are both recorded and differ.
     assert query["result_bytes"]["stored"] > 0
-    assert query["result_bytes"]["model"] > query["result_bytes"]["stored"]
+    assert 0 < query["result_bytes"]["model"] < query["result_bytes"]["stored"]
     assert "SELECT" not in path.read_text()
     origins = {item["run_origin"] for item in summarize_diagnostics(path)}
     assert origins >= {"user", "job_task"}

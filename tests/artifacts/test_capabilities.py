@@ -1176,6 +1176,9 @@ class _Catalog:
     async def readable_resource_ids(self, agent_id, source_ids=()):
         return frozenset(())
 
+    async def resource_names(self, agent_id, source_ids=()):
+        return {}
+
     async def admitted_model_sensitivity(
         self, agent_id: str, source_ids: tuple[str, ...] = ()
     ) -> ModelSensitivity:

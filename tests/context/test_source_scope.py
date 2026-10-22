@@ -261,12 +261,15 @@ async def test_one_run_filter_narrows_sources_and_preserves_classified_history(
         first_system = repr(provider.requests[0].messages[0])
         override_system = repr(provider.requests[1].messages[0])
         follow_up_system = repr(provider.requests[2].messages[0])
-        assert first_source.id in first_system
-        assert second_source.id in first_system
-        assert second_source.id in override_system
-        assert first_source.id not in override_system
-        assert first_source.id in follow_up_system
-        assert second_source.id in follow_up_system
+        # The prompt names sources by display name and never by ID.
+        for system in (first_system, override_system):
+            assert "source:sha256" not in system and "catalog-resource:" not in system
+        assert first_source.display_name in first_system
+        assert second_source.display_name in first_system
+        assert second_source.display_name in override_system
+        assert first_source.display_name not in override_system
+        assert first_source.display_name in follow_up_system
+        assert second_source.display_name in follow_up_system
         assert follow_up.conversation_id == first.conversation_id
     finally:
         await agent.close()

@@ -125,8 +125,8 @@ _RESOURCE_ARGUMENT_CAPABILITIES = frozenset(
 )
 _RESOURCE_LIST_ARGUMENT_CAPABILITIES = _RELATIONAL_READ_CAPABILITIES
 _RESOURCE_READ_DENIED_MESSAGE = (
-    "The requested resource is not available for reading in this run. Copy exact "
-    "current catalog IDs without shortening them; do not guess or substitute another resource."
+    "The requested table is not available for reading in this run. Use the exact "
+    "table names the catalog shows; do not guess or substitute another table."
 )
 # The source operation a source's registered type must declare for each capability.
 _CAPABILITY_OPERATIONS = {
@@ -170,7 +170,7 @@ def _validate_describe_arguments(arguments: Mapping[str, object]) -> None:
         raise CapabilityInputError(
             "catalog_invalid_describe",
             "catalog_describe needs resource_ids or a query; detail=identity can "
-            "instead take only an exact source_id to list every admitted table.",
+            "instead take only a source to list every admitted table.",
             {"detail": detail.value},
         )
     if cursor is not None and not identity:
@@ -223,12 +223,12 @@ def _sql_statements(
 
 _COPY_CATALOG_IDS = ToolRecovery(
     RecoveryKind.CORRECT_ARGUMENTS,
-    "Use exact resource IDs from this run's catalog; a resource outside it "
+    "Use exact table names from this run's catalog; a table outside it "
     "cannot be read in this run.",
 )
 _CORRECT_SQL = ToolRecovery(
     RecoveryKind.CORRECT_ARGUMENTS,
-    "Fix every reported issue in the SQL or its source and resource IDs; "
+    "Fix every reported issue in the SQL or its source and table names; "
     "the same call will be refused again.",
 )
 _WRITE_PERMISSION_REQUIRED = ToolRecovery(
@@ -1114,7 +1114,8 @@ class DataCapabilityDomain:
                 {"source_id": source_id},
                 recovery=ToolRecovery(
                     RecoveryKind.CORRECT_ARGUMENTS,
-                    "Query this source with resource_ids from its catalog.",
+                    "Query an attached folder with data_query source and sql over "
+                    "the relation data; path_pattern applies to the live folder only.",
                 ),
             )
         if adapter_id is None or not self._source_types.supports(
@@ -1274,20 +1275,13 @@ class DataCapabilityDomain:
         bind_revisions: bool = False,
     ) -> FrozenJsonObject:
         source_id = arguments.get("source_id")
-        requested_resource_ids = arguments.get("resource_ids")
         statements = _sql_statements(arguments)
-        if (
-            not isinstance(source_id, str)
-            or not isinstance(requested_resource_ids, tuple)
-            or not requested_resource_ids
-            or any(not isinstance(item, str) for item in requested_resource_ids)
-            or statements is None
-        ):
+        if not isinstance(source_id, str) or statements is None:
             raise CapabilityInputError(
                 "sql_invalid_input",
-                "SQL reads require an exact source_id, one or more resource_ids, "
-                "and either non-empty sql with an array of parameters or a "
-                "statements array of {sql, parameters}, not both.",
+                "SQL reads require a source and either non-empty sql with an "
+                "array of parameters or a statements array of {sql, parameters}, "
+                "not both.",
                 recovery=_CORRECT_SQL,
             )
         adapter_id = await self._catalog.source_adapter_id(
@@ -1310,21 +1304,6 @@ class DataCapabilityDomain:
                 "The selected source does not support relational SQL reads.",
                 {"source_id": source_id},
             )
-        for resource_id in requested_resource_ids:
-            identity = await self._catalog.resource_identity(run.agent_id, resource_id)
-            if identity is None:
-                raise CapabilityInputError(
-                    "resource_read_not_allowed",
-                    _RESOURCE_READ_DENIED_MESSAGE,
-                    recovery=_COPY_CATALOG_IDS,
-                )
-            if identity[0] != source_id:
-                raise CapabilityInputError(
-                    "sql_resource_source_mismatch",
-                    "Every requested resource must belong to the selected source.",
-                    {"resource_id": resource_id, "source_id": source_id},
-                    recovery=_CORRECT_SQL,
-                )
         resources = await self._catalog.resource_schemas(run.agent_id, source_id)
         try:
             readable = await self._catalog.readable_resource_ids(
@@ -1340,6 +1319,22 @@ class DataCapabilityDomain:
             readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
+        # The tables a read touches come from the SQL. A folder's files are not
+        # named in SQL (it reads the relation ``data``), so an attached folder
+        # reads every readable cataloged file.
+        # shortcut: a folder above the per-call table bound is refused by the
+        # executor schema; Phase 2 names files by path in the SQL instead.
+        requested_resource_ids: tuple[str, ...] = (
+            tuple(
+                sorted(
+                    item.resource_id
+                    for item in resources
+                    if item.source_id == source_id and item.resource_id in readable
+                )
+            )
+            if source_type is not None and source_type.sql_dialect == "duckdb"
+            else ()
+        )
         referenced: set[str] = set()
         revisions: dict[str, str] = {}
         for index, (sql, parameters) in enumerate(statements):
@@ -1383,19 +1378,10 @@ class DataCapabilityDomain:
                 )
             referenced.update(result.resource_ids)
             revisions.update(result.resource_revisions)
-        if referenced != frozenset(requested_resource_ids):
-            raise CapabilityInputError(
-                "sql_resource_target_mismatch",
-                "The SQL statements must reference exactly the selected catalog "
-                "resources.",
-                {
-                    "source_id": source_id,
-                    "requested_resource_ids": requested_resource_ids,
-                },
-                recovery=_CORRECT_SQL,
-            )
         prepared = dict(arguments)
         prepared["_adapter_id"] = adapter_id
+        # The executor and the admission policy read the touched tables here.
+        prepared["resource_ids"] = tuple(sorted(referenced))
         if bind_revisions and len(revisions) == len(referenced):
             # The executor rechecks these exact catalog revisions before every
             # statement reaches the source.
@@ -1429,10 +1415,11 @@ class DataCapabilityDomain:
             read = FrozenJsonObject.from_mapping(
                 {
                     "source_id": item["source_id"],
-                    "resource_ids": (
-                        (item["resource_id"],) if tabular else item["resource_ids"]
+                    **(
+                        {"resource_ids": (item["resource_id"],)}
+                        if tabular
+                        else {"sql": item["sql"]}
                     ),
-                    **({} if tabular else {"sql": item["sql"]}),
                 }
             )
             try:
@@ -1455,7 +1442,7 @@ class DataCapabilityDomain:
                         "catalog_provenance_missing",
                         "A resource has no current catalog revision; refresh "
                         "the source.",
-                        {"resource_ids": read["resource_ids"]},
+                        {"resource_ids": validated.get("resource_ids", ())},
                     )
             except CapabilityInputError as error:
                 raise CapabilityInputError(
@@ -1594,7 +1581,7 @@ class DataCapabilityDomain:
             if not resource_ids:
                 raise CapabilityInputError(
                     "execution_scope_resource_violation",
-                    "This autonomous run requires exact catalog resource IDs.",
+                    "This autonomous run requires exact table names.",
                 )
         allowed = frozenset(scope.allowed_resource_ids)
         if any(

@@ -191,12 +191,12 @@ def catalog_declarations(
         id=CATALOG_SEARCH_CAPABILITY_ID,
         description=(
             "Find catalog tables or fields by name or meaning when the target is "
-            "missing or ambiguous. Returns ranked IDs and match_outcome (unique, "
+            "missing or ambiguous. Returns ranked names and match_outcome (unique, "
             "ambiguous or no_match), computed over every candidate before paging; "
             "a hit is a candidate, not authorization. Limits: metadata only, no "
             "rows; up to 50 per page. "
             'Example: {"query": "customer invoices"}. '
-            "Mistakes: searching again for exact IDs already supplied; querying a "
+            "Mistakes: searching again for exact names already supplied; querying a "
             "hit before catalog_describe confirms its columns."
         ),
         input_schema={
@@ -239,12 +239,12 @@ def catalog_declarations(
         id=CATALOG_DESCRIBE_CAPABILITY_ID,
         description=(
             "Describe catalog structure before SQL, without touching the source. "
-            "detail=identity with only an exact source_id lists every admitted "
-            "table (IDs, names, labeled row estimates, no columns). detail=schema "
+            "detail=identity with only a source lists every admitted "
+            "table (names, labeled row estimates, no columns). detail=schema "
             "(default) adds columns, keys and join paths; detail=relationships "
             "returns only join paths, multi-hop resolved in code. Reports coverage "
             "and truncation; page with cursor. "
-            'Example: {"source_id": "...", "resource_ids": ["..."]}. '
+            'Example: {"source": "Shop", "tables": ["main.orders"]}. '
             "Mistakes: joining on matching names; repeating it when current "
             "evidence suffices; reading estimates as exact counts."
         ),

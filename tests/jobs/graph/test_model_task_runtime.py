@@ -310,10 +310,10 @@ async def test_job_worker_sees_and_is_held_to_the_graph_target_bound(
         request = integration.provider.requests[0]
         system = request.messages[0].content[0]
         assert isinstance(system, TextBlock)
-        assert "Per-call limits: graph_read at most 16 resource_ids." in system.text
-        assert "at most 4 resource_ids" not in system.text
+        assert "Per-call limits: graph_read at most 16 tables." in system.text
+        assert "at most 4 tables" not in system.text
         read = next(tool for tool in request.tools if tool.name == "graph_read")
-        assert read.description.endswith("Limits: at most 16 resource_ids per call.")
+        assert read.description.endswith("Limits: at most 16 tables per call.")
         # The five-resource call the inline bound would refuse is admitted.
         assert [
             call.arguments["resource_ids"] for call in integration.reader.calls

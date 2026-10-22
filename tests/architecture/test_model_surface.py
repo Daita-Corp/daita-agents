@@ -9,17 +9,21 @@ the subscription before merge. See docs/TESTING.md, "Model-surface gate".
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from daita._json import canonical_json
+from daita.llm.models import TextBlock, ToolResultBlock, model_tool_result
 from scripts import live_smoke
 from tests.support.model_surface import (
     DIGEST_PATH,
     SNAPSHOT_PATH,
     UPDATE_COMMAND,
+    capture_requests,
     committed_digest,
     compute_surface_text,
     describe_changes,
@@ -47,6 +51,53 @@ def test_model_surface_snapshot_is_current() -> None:
     assert committed_digest() == digest_text(
         committed
     ), f"{DIGEST_PATH.name} does not match the snapshot; run {UPDATE_COMMAND}"
+
+
+# A resource ID, a source ID, or a run-local handle as a JSON string value.
+_IDENTITY_TEXT = re.compile(
+    r'catalog-resource:sha256:|source:(?:workspace:)?sha256:|"[st][1-9][0-9]{0,4}"'
+)
+
+
+def test_model_never_sees_an_id_or_a_handle() -> None:
+    """Sources are named by display name, tables and files by native name.
+
+    Every tool definition, instruction paragraph and rendered tool result of
+    the fixture run (including toolbox_inspect contracts and the catalog
+    context) is free of IDs and handles; the resolver maps names back.
+    """
+
+    requests, definitions = capture_requests()
+    shown: list[str] = [
+        canonical_json({"d": item.description, "s": item.input_schema})
+        for item in definitions
+    ]
+    for request in requests:
+        shown.extend(
+            canonical_json({"d": item.description, "s": item.input_schema})
+            for item in request.tools
+        )
+        for message in request.messages:
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    shown.append(block.text)
+                elif isinstance(block, ToolResultBlock):
+                    shown.append(
+                        canonical_json(
+                            model_tool_result(
+                                block,
+                                request.tool_result_refs.get(block.call_id),
+                                request.scope_names,
+                            )
+                        )
+                    )
+    assert len(requests) >= 4 and any("toolbox_inspect" in text for text in shown)
+    offending = [
+        text[max(0, match.start() - 80) : match.end() + 20]
+        for text in shown
+        for match in _IDENTITY_TEXT.finditer(text)
+    ]
+    assert offending == []
 
 
 def test_live_smoke_record_covers_the_current_surface() -> None:

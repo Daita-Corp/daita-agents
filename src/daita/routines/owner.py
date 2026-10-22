@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -24,7 +23,6 @@ from ..capabilities import (
     ExecutionContractBindings,
     ExecutionContractReader,
     OperationalEffect,
-    RecoveryKind,
     ToolRecovery,
     recovery_details,
 )
@@ -46,7 +44,6 @@ from ..loop.models import (
     Transcript,
     validate_completed_transcript,
 )
-from ..scope import scope_refs
 from ..skills import Skill
 from ..skills.capabilities import SKILL_VIEW_CAPABILITY_ID
 from .models import (
@@ -76,8 +73,6 @@ from .models import (
     validate_reporting_precheck,
 )
 from .schedule import forecast_slots, validate_schedule
-
-_SCOPE_REF_TOKEN = re.compile(r"\b[st][1-9][0-9]*\b")
 
 
 class RoutineError(DaitaError):
@@ -488,7 +483,6 @@ class RoutineOwner:
         run_immediately: bool = False,
     ) -> ScheduledRoutine:
         origin = await self._owned_run(run_id, conversation_id, sensitivity_ceiling)
-        _reject_scope_refs(authorized_instruction, origin)
         if allowed_connector_binding_ids is None:
             allowed_connector_binding_ids = self._connector_binding_ids(
                 allowed_capability_ids
@@ -675,7 +669,6 @@ class RoutineOwner:
         run_immediately: bool = False,
     ) -> ScheduledRoutine:
         origin = await self._owned_run(run_id, conversation_id, sensitivity_ceiling)
-        _reject_scope_refs(authorized_instruction, origin)
         if current.conversation_id != conversation_id:
             raise RoutineError(
                 "routine_conversation_mismatch",
@@ -1888,25 +1881,3 @@ __all__ = [
     "RoutineStore",
     "schedule_preview",
 ]
-
-
-def _reject_scope_refs(instruction: str, origin: Transcript) -> None:
-    """Refuse run-local s#/t# handles that a later scheduled run would renumber."""
-
-    issued = scope_refs(origin.run.resolved_source_scope).ids
-    named = sorted(
-        {item for item in _SCOPE_REF_TOKEN.findall(instruction) if item in issued}
-    )
-    if named:
-        raise RoutineError(
-            "routine_instruction_scope_ref",
-            f"authorized_instruction names this run's handles {', '.join(named)}, "
-            "which later runs number differently.",
-            ToolRecovery(
-                RecoveryKind.CORRECT_ARGUMENTS,
-                "Name each source or resource in authorized_instruction by its "
-                "catalog name or full id: "
-                + "; ".join(f"{item} is {issued[item]}" for item in named)
-                + ".",
-            ),
-        )

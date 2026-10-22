@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from daita.adapters.analytical_workspace.runtime import runtime_status
+from daita.capabilities import model_identity_schema
 from tests.capabilities._toolbox_support import (
     NOW,
     TOOLBOX_DEFINITIONS,
@@ -376,7 +377,9 @@ async def test_contract_schema_survives_replacement_in_real_request(
         )
         contract = cast(Mapping[str, Any], _data(retained))["value"]
         view, primary = runtime._registry.resolve_tool(first)
-        assert contract["input_schema"] == primary.input_schema
+        assert canonical_json(contract["input_schema"]) == canonical_json(
+            model_identity_schema(primary.input_schema)
+        )
         if view.mode_capability_ids:
             assert contract["route_argument"] == view.mode_argument
             assert [
@@ -386,7 +389,11 @@ async def test_contract_schema_survives_replacement_in_real_request(
                 # Each route is stated as changes to the top-level schema, and
                 # applying them restores that route's exact input schema.
                 assert _route_schema(contract["input_schema"], route) == _plain(
-                    runtime._registry.capability(route["capability_id"]).input_schema
+                    model_identity_schema(
+                        runtime._registry.capability(
+                            route["capability_id"]
+                        ).input_schema
+                    )
                 )
         assert contract["complete"] is True
         assert contract["input_schema_digest"]

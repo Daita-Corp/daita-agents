@@ -550,7 +550,7 @@ class OpenAIResponsesProvider:
                 request.messages,
                 self.provider_id,
                 request.tool_result_refs,
-                request.scope_refs,
+                request.scope_names,
             ),
             "include": ["reasoning.encrypted_content"],
             "service_tier": self._service_tier,

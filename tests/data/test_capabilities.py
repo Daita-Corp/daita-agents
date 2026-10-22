@@ -69,11 +69,9 @@ def test_data_query_is_one_backend_neutral_model_tool() -> None:
         "parameters",
         "statements",
     }
-    # Exactly one of sql or statements is enforced by the data domain.
-    assert set(cast(list[str], capability.input_schema["required"])) == {
-        "source_id",
-        "resource_ids",
-    }
+    # Exactly one of sql or statements is enforced by the data domain, which
+    # also derives resource_ids from the SQL.
+    assert set(cast(list[str], capability.input_schema["required"])) == {"source_id"}
     assert set(properties).isdisjoint(
         {"adapter", "adapter_id", "backend", "connection", "executor_id"}
     )
@@ -99,9 +97,9 @@ def test_data_export_is_one_backend_neutral_model_tool() -> None:
         "output",
         "filename",
     }
+    # The data domain derives resource_ids from the SQL.
     assert set(cast(list[str], capability.input_schema["required"])) == {
         "source_id",
-        "resource_ids",
         "sql",
         "output",
     }
@@ -530,16 +528,6 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
 
     assert sqlite["_adapter_id"] == "sqlite"
     assert postgresql["_adapter_id"] == "postgresql"
-    with pytest.raises(CapabilityInputError, match="belong to the selected source"):
-        await domain._validate_sql(
-            _run(),
-            operation=SourceOperation.SQL_READ,
-            arguments={
-                "source_id": "source-sqlite",
-                "resource_ids": ("resource-postgresql",),
-                "sql": "SELECT id FROM items",
-            },
-        )
     with pytest.raises(CapabilityInputError, match="does not support relational"):
         await domain._validate_sql(
             _run(),
@@ -561,28 +549,18 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
             },
         )
     assert unknown_source.value.code == "sql_source_not_available"
+    # The tables a read touches come from the SQL; one the catalog lacks is
+    # refused before any source I/O.
     with pytest.raises(CapabilityInputError) as unknown_resource:
         await domain._validate_sql(
             _run(),
             operation=SourceOperation.SQL_READ,
             arguments={
                 "source_id": "source-sqlite",
-                "resource_ids": ("resource-missing",),
-                "sql": "SELECT id FROM items",
+                "sql": "SELECT id FROM missing_items",
             },
         )
     assert unknown_resource.value.code == "resource_read_not_allowed"
-    with pytest.raises(CapabilityInputError) as target_mismatch:
-        await domain._validate_sql(
-            _run(),
-            operation=SourceOperation.SQL_READ,
-            arguments={
-                "source_id": "source-sqlite",
-                "resource_ids": ("resource-sqlite",),
-                "sql": "SELECT id FROM other_items",
-            },
-        )
-    assert target_mismatch.value.code == "sql_resource_target_mismatch"
 
 
 class _ReadBackend:

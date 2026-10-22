@@ -345,8 +345,8 @@ async def test_runtime_denies_guessed_and_multi_resource_reads_before_io(
                 "execution_disposition": "not_dispatched",
                 "recovery": {
                     "kind": "correct_arguments",
-                    "constraint": "Use exact resource IDs from this run's catalog; "
-                    "a resource outside it cannot be read in this run.",
+                    "constraint": "Use exact table names from this run's catalog; "
+                    "a table outside it cannot be read in this run.",
                 },
             }
             for error in errors

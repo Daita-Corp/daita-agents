@@ -3046,6 +3046,7 @@ def _tabular_export_capability(
                     "minItems": 1,
                     "maxItems": 64,
                     "uniqueItems": True,
+                    "readOnly": True,
                 },
                 "sql": {
                     "type": "string",
@@ -3060,7 +3061,7 @@ def _tabular_export_capability(
                 "output": {"type": "string", "enum": formats},
                 "filename": {"type": "string", "minLength": 1, "maxLength": 120},
             },
-            "required": ["source_id", "resource_ids", "sql", "output"],
+            "required": ["source_id", "sql", "output"],
             "additionalProperties": False,
         },
         output_kind=TABULAR_EXPORT_OUTPUT_KIND,

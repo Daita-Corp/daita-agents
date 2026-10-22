@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
@@ -18,6 +18,13 @@ class EffectiveSourceScope:
 
     source_ids: frozenset[str]
     resource_ids: frozenset[str]
+    # source ID -> (display name, adapter id): the model addresses a source by
+    # its display name, and stored transcripts resolve those names later from
+    # this frozen record. Resources need no index: their ID is the hash of
+    # (source, kind, native name).
+    source_labels: Mapping[str, tuple[str, str]] = field(
+        default_factory=dict, hash=False
+    )
 
     def __post_init__(self) -> None:
         for name, maximum in (("source_ids", 256), ("resource_ids", 10_000)):
@@ -30,12 +37,40 @@ class EffectiveSourceScope:
             object.__setattr__(self, name, values)
         if self.resource_ids and not self.source_ids:
             raise ValueError("effective resources require an admitted source")
+        labels = {
+            source_id: (str(label[0]), str(label[1]))
+            for source_id, label in self.source_labels.items()
+        }
+        if any(
+            source_id not in self.source_ids or not label[0] or len(label[0]) > 2_048
+            for source_id, label in labels.items()
+        ):
+            raise ValueError("source labels must name admitted sources")
+        object.__setattr__(self, "source_labels", MappingProxyType(labels))
 
     def to_mapping(self) -> dict[str, object]:
-        return {
+        mapping: dict[str, object] = {
             "source_ids": tuple(sorted(self.source_ids)),
             "resource_ids": tuple(sorted(self.resource_ids)),
         }
+        if self.source_labels:
+            mapping["source_labels"] = {
+                source_id: list(self.source_labels[source_id])
+                for source_id in sorted(self.source_labels)
+            }
+        return mapping
+
+    def sources_named(self, name: str) -> tuple[str, ...]:
+        """Return the IDs of every admitted source whose display name is ``name``."""
+
+        folded = name.strip().casefold()
+        return tuple(
+            sorted(
+                source_id
+                for source_id, (display_name, _) in self.source_labels.items()
+                if display_name.casefold() == folded
+            )
+        )
 
 
 SOURCE_REF_PREFIX = "s"
@@ -158,4 +193,15 @@ async def resolve_effective_source_scope(
         resources &= frozenset(ceiling.allowed_resource_ids)
     if prepared is not None:
         resources &= prepared.resource_ids
-    return EffectiveSourceScope(sources, resources)
+    return EffectiveSourceScope(
+        sources,
+        resources,
+        {
+            source_id: (display_name, str(fact.get("adapter_id", "")))
+            for fact in facts
+            if isinstance(source_id := fact.get("source_id"), str)
+            and source_id in sources
+            and isinstance(display_name := fact.get("display_name"), str)
+            and display_name
+        },
+    )

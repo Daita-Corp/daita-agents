@@ -602,7 +602,7 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         # Each route keeps its own required arguments; the merged provider
         # schema lists them all.
         for capability_id, required in (
-            ("data.query", {"source_id", "resource_ids"}),
+            ("data.query", {"source_id"}),
             ("data.query_combined", {"inputs", "sql"}),
             ("data.query_files", {"source_id", "path_pattern", "sql"}),
         ):
@@ -613,14 +613,11 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
             assert required <= set(route_required)
         query_properties = query_schema.get("properties")
         assert isinstance(query_properties, Mapping)
-        assert {
-            "source_id",
-            "resource_ids",
-            "sql",
-            "statements",
-            "inputs",
-            "path_pattern",
-        } <= set(query_properties)
+        # The model names the source; the tables a read touches come from its SQL.
+        assert {"source", "sql", "statements", "inputs", "path_pattern"} <= set(
+            query_properties
+        )
+        assert not {"source_id", "resource_ids", "tables"} & set(query_properties)
     finally:
         await agent.close()
 

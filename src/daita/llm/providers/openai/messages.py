@@ -19,7 +19,7 @@ def _response_input(
     messages: tuple[CanonicalMessage, ...],
     provider_id: str,
     result_refs: Mapping[str, str] | None = None,
-    scope_refs: Mapping[str, str] | None = None,
+    scope_names: Mapping[str, str] | None = None,
 ) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
     provider_call_ids: dict[str, str] = {}
@@ -75,7 +75,7 @@ def _response_input(
                             model_tool_result(
                                 block,
                                 (result_refs or {}).get(block.call_id),
-                                scope_refs,
+                                scope_names,
                             )
                         ),
                     }

@@ -369,10 +369,12 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
             "minLength": 1,
             "maxLength": CATALOG_TOOL_QUERY_MAX_CHARACTERS,
         }
-        # The model may pass the full ID or the run-scoped handle shown beside it.
+        # The model passes the source's display name, never an ID.
         source_rule = {
             "type": "string",
-            "pattern": "^(source:(?:workspace:)?sha256:[0-9a-f]{64}|s[1-9][0-9]{0,4})$",
+            "minLength": 1,
+            "maxLength": 2_048,
+            "description": "Source display name, as shown in the catalog context.",
         }
         limit_rule = {
             "type": "integer",
@@ -381,7 +383,7 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
             "default": CATALOG_TOOL_DEFAULT_LIMIT,
         }
         assert canonical_json(search_properties["query"]) == canonical_json(query_rule)
-        assert canonical_json(search_properties["source_id"]) == canonical_json(
+        assert canonical_json(search_properties["source"]) == canonical_json(
             source_rule
         )
         assert canonical_json(search_properties["limit"]) == canonical_json(limit_rule)
@@ -403,8 +405,8 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
             "detail",
             "limit",
             "query",
-            "resource_ids",
-            "source_id",
+            "source",
+            "tables",
         }
         assert canonical_json(describe_properties["detail"]) == canonical_json(
             {
@@ -416,21 +418,21 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
         assert canonical_json(describe_properties["query"]) == canonical_json(
             query_rule
         )
-        assert canonical_json(describe_properties["source_id"]) == canonical_json(
+        assert canonical_json(describe_properties["source"]) == canonical_json(
             source_rule
         )
         describe_limit = _mapping(describe_properties["limit"])
         assert describe_limit["minimum"] == 1
         assert describe_limit["maximum"] == CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT
         assert "default" not in describe_limit
-        assert canonical_json(describe_properties["resource_ids"]) == canonical_json(
+        assert canonical_json(describe_properties["tables"]) == canonical_json(
             {
                 "type": "array",
                 "items": {
                     "type": "string",
-                    "pattern": (
-                        "^(catalog-resource:sha256:[0-9a-f]{64}|t[1-9][0-9]{0,4})$"
-                    ),
+                    "minLength": 1,
+                    "maxLength": 2_048,
+                    "description": "Exact table, view or file name as the catalog shows it.",
                 },
                 "maxItems": CATALOG_SCHEMA_MAX_RESOURCE_IDS,
                 "uniqueItems": True,

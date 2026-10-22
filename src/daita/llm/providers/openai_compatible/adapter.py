@@ -332,7 +332,7 @@ class OpenAICompatibleProvider:
                     request.messages,
                     self.provider_id,
                     request.tool_result_refs,
-                    request.scope_refs,
+                    request.scope_names,
                 ),
                 "model": self.model,
             }

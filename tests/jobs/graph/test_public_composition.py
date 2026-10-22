@@ -49,10 +49,10 @@ class _ProductionGraphProvider(MockModelProvider):
         *,
         source_id: str,
         resources: tuple[tuple[str, str], ...],
-        use_handles: bool = False,
+        use_names: bool = False,
     ) -> None:
         super().__init__((), provider_id="mock:production-graph", complete_pricing=True)
-        self._use_handles = use_handles
+        self._use_names = use_names
         self._source_id = source_id
         self._resource_ids = tuple(resource_id for _name, resource_id in resources)
         self._sql = "SELECT " + ", ".join(
@@ -65,13 +65,31 @@ class _ProductionGraphProvider(MockModelProvider):
     def requests(self) -> tuple[ModelRequest, ...]:
         return tuple(self._captured)
 
-    def _ids(self, request: ModelRequest) -> tuple[str, tuple[str, ...]]:
-        """Name the source and resources as this request's run renders them."""
+    def _identities(self, request: ModelRequest) -> dict[str, dict[str, object]]:
+        """Name the source (and retained tables) as this request's run shows them.
 
-        if not self._use_handles:
-            return self._source_id, self._resource_ids
-        refs = request.scope_refs
-        return refs[self._source_id], tuple(refs[item] for item in self._resource_ids)
+        By name, the model passes the source's display name under ``source`` and
+        retains tables by native name; the read's tables come from its SQL. The
+        canonical form passes full IDs through unchanged.
+        """
+
+        if not self._use_names:
+            return {
+                "query": {
+                    "source_id": self._source_id,
+                    "resource_ids": self._resource_ids,
+                },
+                "retained": {
+                    "source_ids": (self._source_id,),
+                    "resource_ids": self._resource_ids,
+                },
+            }
+        names = request.scope_names
+        tables = tuple(names[item] for item in self._resource_ids)
+        return {
+            "query": {"source": names[self._source_id]},
+            "retained": {"sources": (names[self._source_id],), "tables": tables},
+        }
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self._captured.append(request)
@@ -83,7 +101,7 @@ class _ProductionGraphProvider(MockModelProvider):
             if isinstance(block, ToolResultBlock)
         }
         usage = ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0")))
-        source_id, resource_ids = self._ids(request)
+        identities = self._identities(request)
         if "task_complete" in tool_names:
             if "graph-data-query" not in result_call_ids:
                 return ModelResponse(
@@ -93,8 +111,7 @@ class _ProductionGraphProvider(MockModelProvider):
                             id="graph-data-query",
                             name=DATA_QUERY_TOOL_NAME,
                             arguments={
-                                "source_id": source_id,
-                                "resource_ids": resource_ids,
+                                **identities["query"],
                                 "sql": self._sql,
                                 "parameters": (),
                             },
@@ -145,8 +162,7 @@ class _ProductionGraphProvider(MockModelProvider):
                             "initial_task": {
                                 "capability_id": DATA_QUERY_CAPABILITY_ID,
                                 "arguments": {
-                                    "source_id": source_id,
-                                    "resource_ids": resource_ids,
+                                    **identities["query"],
                                     "sql": self._sql,
                                     "parameters": (),
                                 },
@@ -154,8 +170,7 @@ class _ProductionGraphProvider(MockModelProvider):
                                     "result_kind": DATA_QUERY_EVIDENCE_KIND
                                 },
                                 "retained_references": {
-                                    "source_ids": (source_id,),
-                                    "resource_ids": resource_ids,
+                                    **identities["retained"],
                                     "connector_binding_ids": (),
                                 },
                             },
@@ -194,9 +209,9 @@ async def _wait_terminal(agent: Agent, job_id: str) -> GraphInspection:
     raise AssertionError("production graph did not reach a terminal state")
 
 
-@pytest.mark.parametrize("use_handles", [False, True])
+@pytest.mark.parametrize("use_names", [False, True])
 async def test_public_agent_executes_graph_model_task_in_current_home(
-    tmp_path: Path, use_handles: bool
+    tmp_path: Path, use_names: bool
 ) -> None:
     home = await create_probe_home(
         tmp_path, "public-production-graph", distractor_tables=3
@@ -205,7 +220,7 @@ async def test_public_agent_executes_graph_model_task_in_current_home(
     provider = _ProductionGraphProvider(
         source_id=home.source_id,
         resources=resources,
-        use_handles=use_handles,
+        use_names=use_names,
     )
     agent = await Agent.open(
         home.name,
@@ -278,7 +293,11 @@ async def test_public_agent_executes_graph_model_task_in_current_home(
         retained = initial_call["arguments"]
         assert isinstance(retained, Mapping)
         assert retained["source_id"] == home.source_id
-        assert tuple(retained["resource_ids"]) == full_ids
+        if use_names:
+            # The read's tables come from its SQL when the task runs.
+            assert "resource_ids" not in retained
+        else:
+            assert tuple(retained["resource_ids"]) == full_ids
         assert initial.authority.source_ids == (home.source_id,)
         assert set(initial.authority.resource_ids) == set(full_ids)
         sent = next(
@@ -291,13 +310,14 @@ async def test_public_agent_executes_graph_model_task_in_current_home(
         assert isinstance(sent_task, Mapping)
         sent_arguments = sent_task["arguments"]
         assert isinstance(sent_arguments, Mapping)
-        if use_handles:
+        if use_names:
             # The transcript keeps the call as sent, and the request showed
-            # that handle beside the full ID it names.
+            # the display name in place of the ID it names.
             first = provider.requests[0]
-            handle = first.scope_refs[home.source_id]
-            assert sent_arguments["source_id"] == handle
-            assert f'"ref":"{handle}"' in str(first.messages[0].content[0])
+            name = first.scope_names[home.source_id]
+            assert sent_arguments["source"] == name
+            system = str(first.messages[0].content[0])
+            assert name in system and home.source_id not in system
         else:
             assert sent_arguments["source_id"] == home.source_id
     finally:

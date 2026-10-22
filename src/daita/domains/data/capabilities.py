@@ -79,19 +79,19 @@ RELATIONAL_UPSERT_TOOL_NAME = "data_upsert_rows"
 # The data.query capability description is part of its contract digest, which
 # retained routine and graph bindings revalidate; the model reads the view's.
 _DATA_QUERY_CAPABILITY_DESCRIPTION = (
-    "Run read-only SQL on exact catalog resources of one source. Use sql, or "
-    "statements for up to 8 reads in one call; resource_ids must list every "
-    "table read. Returns columns, rows, tables_touched, truncation "
+    "Run read-only SQL on the cataloged tables of one source, named by its "
+    "display name. Use sql, or statements for up to 8 reads in one call. "
+    "Returns columns, rows, tables_touched, truncation "
     "and timing. Limits: 5s per statement, 15s total, 100 rows and 16 KB "
     "shared by all statements. "
-    'Example: {"source_id": "...", "resource_ids": ["..."], '
+    'Example: {"source": "Shop", '
     '"sql": "SELECT region, sum(total) FROM orders GROUP BY region"}. '
     "Mistakes: columns absent from catalog evidence; joining on matching "
     "names alone; treating truncated rows as complete."
 )
 DATA_QUERY_DESCRIPTION = (
-    "Read-only SQL on exact catalog resources of one source; list every table "
-    "read in resource_ids. Use sql, or statements for up to 8 reads. "
+    "Read-only SQL on the cataloged tables of one source, named by its display "
+    "name. Use sql, or statements for up to 8 reads. "
     "Limits: 5s per statement, 15s "
     "total, 100 rows and 16 KB shared."
 )
@@ -112,14 +112,14 @@ _DATA_QUERY_COMBINED_CAPABILITY_DESCRIPTION = (
     "completely refuses the call, so aggregate or filter inside each input."
 )
 _DATA_QUERY_COMBINED_USAGE = (
-    " Join sources: inputs is 2-4 {alias, source_id, resource_ids, sql} in each "
-    "source's dialect, or {alias, source_id, resource_id, columns, filters} for "
+    " Join sources: inputs is 2-4 {alias, source, sql} in each "
+    "source's dialect, or {alias, source, table, columns, filters} for "
     "a source without SQL; sql is one DuckDB SELECT or UNION over the aliases "
     "(8 KiB). Aggregate or filter in each input: one too large refuses the call."
 )
 _DATA_QUERY_PATH_USAGE = (
-    " Folder files: query relation data by path_pattern (live folder) or "
-    "resource_ids (attached folder)."
+    " Folder files: query relation data by path_pattern (live folder); an "
+    "attached folder reads its cataloged files as relation data."
 )
 
 
@@ -1439,7 +1439,7 @@ def data_query_capability_declarations(
                 else "Run one bounded validated read-only relational query."
             ),
             when_to_use=(
-                "Use exact source/resource IDs and columns from current catalog evidence; "
+                "Use exact source, table and column names from current catalog evidence; "
                 "obtain missing structure only through admitted, callable tools."
                 + (
                     " Exports cover all database rows the query selects."
@@ -1712,12 +1712,16 @@ def _query_declarations(
             "type": "object",
             "properties": {
                 "source_id": source_id_schema(),
+                # The tables a read touches come from the SQL; the controller
+                # records them here for the executor. readOnly keeps the
+                # argument out of the model-facing schema.
                 "resource_ids": {
                     "type": "array",
                     "items": resource_id_schema(),
                     "minItems": 1,
                     "maxItems": DATA_QUERY_MAX_RESOURCES,
                     "uniqueItems": True,
+                    "readOnly": True,
                 },
                 "sql": sql_rule,
                 "parameters": parameters_rule,
@@ -1737,7 +1741,7 @@ def _query_declarations(
                     "description": "Use instead of sql to run several reads in one call.",
                 },
             },
-            "required": ["source_id", "resource_ids"],
+            "required": ["source_id"],
             "additionalProperties": False,
         },
         output_kind=DATA_QUERY_EVIDENCE_KIND,
@@ -1762,6 +1766,7 @@ def _query_declarations(
         "minItems": 1,
         "maxItems": DATA_QUERY_MAX_RESOURCES,
         "uniqueItems": True,
+        "readOnly": True,
     }
     combined_capability = Capability(
         id=DATA_QUERY_COMBINED_CAPABILITY_ID,
@@ -1786,7 +1791,6 @@ def _query_declarations(
                                 "required": [
                                     "alias",
                                     "source_id",
-                                    "resource_ids",
                                     "sql",
                                 ],
                                 "additionalProperties": False,

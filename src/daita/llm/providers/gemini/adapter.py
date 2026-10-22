@@ -361,7 +361,7 @@ class GeminiProvider:
                 request.messages,
                 self.provider_id,
                 request.tool_result_refs,
-                request.scope_refs,
+                request.scope_names,
             )
             config: dict[str, object] = {
                 "max_output_tokens": self._max_output_tokens,

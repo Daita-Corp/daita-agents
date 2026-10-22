@@ -189,7 +189,8 @@ class ExecutionAdmissionPolicy:
         ceiling = self.call_target_ceiling(lane)
         if ceiling is None:
             return None
-        return f"Limits: at most {ceiling} {self.target_count_argument} per call."
+        argument = model_identity_key(cast(str, self.target_count_argument))
+        return f"Limits: at most {ceiling} {argument} per call."
 
     def target_count(self, arguments: Mapping[str, object]) -> int:
         if self.target_count_argument is None:
@@ -197,7 +198,9 @@ class ExecutionAdmissionPolicy:
         value = arguments.get(self.target_count_argument)
         if isinstance(value, (tuple, list)):
             return len(value)
-        return 0
+        # The owning domain derives an absent target list (the tables a SQL
+        # read touches) during preparation; until then it stands for one read.
+        return 0 if self.target_count_argument in arguments else 1
 
     def admission_error(
         self,
@@ -1350,35 +1353,59 @@ _RESULT_REF_PATH = re.compile(
 )
 
 # Canonical persisted identities. Capability contracts validate these exact
-# forms; model-facing schemas additionally admit the run-scoped short handle,
-# which the runtime replaces with the full ID before validation.
-# Stored sources are source:sha256:...; the live session folder is
-# source:workspace:sha256:..., which sorts after every stored source.
+# forms; the model never sees them. Model-facing schemas take the source's
+# display name and a table's or file's exact native name under renamed keys
+# (``source``, ``table``, ``tables``...), which the runtime resolves to full IDs
+# before validation. Stored sources are source:sha256:...; the live session
+# folder is source:workspace:sha256:..., which sorts after every stored source.
 SOURCE_ID_PATTERN = r"^source:(?:workspace:)?sha256:[0-9a-f]{64}$"
 RESOURCE_ID_PATTERN = r"^catalog-resource:sha256:[0-9a-f]{64}$"
-# Canonical pattern -> (family, handle prefix, handle-admitting model pattern).
+# Canonical pattern -> (family, handle prefix, model-facing description).
 _IDENTITY_REFS: Mapping[str, tuple[str, str, str]] = MappingProxyType(
     {
-        pattern: (family, prefix, f"^({pattern[1:-1]}|{prefix}[1-9][0-9]{{0,4}})$")
-        for pattern, family, prefix in (
-            (SOURCE_ID_PATTERN, "source", SOURCE_REF_PREFIX),
-            (RESOURCE_ID_PATTERN, "resource", RESOURCE_REF_PREFIX),
-        )
+        SOURCE_ID_PATTERN: (
+            "source",
+            SOURCE_REF_PREFIX,
+            "Source display name, as shown in the catalog context.",
+        ),
+        RESOURCE_ID_PATTERN: (
+            "resource",
+            RESOURCE_REF_PREFIX,
+            "Exact table, view or file name as the catalog shows it.",
+        ),
     }
 )
+_IDENTITY_PATTERNS = {pattern: re.compile(pattern) for pattern in _IDENTITY_REFS}
+# Older stored transcripts name sources and resources by run-local handles.
 _IDENTITY_HANDLE = re.compile(r"[st][1-9][0-9]{0,4}\Z")
+# Canonical argument key suffix -> the key the model sees and sends.
+_MODEL_KEYS = (
+    ("source_ids", "sources"),
+    ("source_id", "source"),
+    ("resource_ids", "tables"),
+    ("resource_id", "table"),
+)
 _DELEGATED_KINDS = frozenset({"input", "grant"})
 _Leaf = Callable[[object, str], object]
 
 
+def model_identity_key(key: str) -> str:
+    """``source_id`` -> ``source``; ``allowed_resource_ids`` -> ``allowed_tables``."""
+
+    for suffix, replacement in _MODEL_KEYS:
+        if key == suffix or key.endswith("_" + suffix):
+            return key[: -len(suffix)] + replacement
+    return key
+
+
 def source_id_schema() -> dict[str, object]:
-    """One canonical source ID argument; the model may pass its ``s`` handle."""
+    """One canonical source ID argument; the model passes the display name."""
 
     return {"type": "string", "pattern": SOURCE_ID_PATTERN}
 
 
 def resource_id_schema() -> dict[str, object]:
-    """One canonical resource ID argument; the model may pass its ``t`` handle."""
+    """One canonical resource ID argument; the model passes the native name."""
 
     return {"type": "string", "pattern": RESOURCE_ID_PATTERN}
 
@@ -1420,15 +1447,68 @@ def identity_ref_paths(schema: Mapping[str, object]) -> tuple[tuple[str, str], .
     return tuple(found)
 
 
+def _identity_pattern(rule: object) -> str | None:
+    """Return the canonical identity pattern a property rule (or its items) declares."""
+
+    if not isinstance(rule, Mapping):
+        return None
+    pattern = rule.get("pattern")
+    if isinstance(pattern, str) and pattern in _IDENTITY_REFS:
+        return pattern
+    return _identity_pattern(rule.get("items"))
+
+
 def model_identity_schema(schema: Mapping[str, object]) -> Mapping[str, object]:
-    """Project canonical identity patterns to their handle-admitting form."""
+    """Project canonical identity rules to the names-only form the model sees.
+
+    An identity property is renamed (``source_id`` -> ``source``,
+    ``resource_ids`` -> ``tables``), its ID pattern replaced by a bounded
+    string rule and a description. A ``readOnly`` property is one the owning
+    domain derives (the tables a SQL read touches) and is omitted. ``required``
+    follows both.
+    """
 
     def project(rule: object) -> object:
         if isinstance(rule, Mapping):
             pattern = rule.get("pattern")
             if isinstance(pattern, str) and pattern in _IDENTITY_REFS:
-                return {**rule, "pattern": _IDENTITY_REFS[pattern][2]}
-            return {key: project(value) for key, value in rule.items()}
+                return {
+                    **{key: value for key, value in rule.items() if key != "pattern"},
+                    "minLength": 1,
+                    "maxLength": 2_048,
+                    "description": _IDENTITY_REFS[pattern][2],
+                }
+            properties = rule.get("properties")
+            renamed: dict[str, str] = {}
+            derived: set[str] = set()
+            if isinstance(properties, Mapping):
+                renamed = {
+                    str(name): model_identity_key(str(name))
+                    for name, child in properties.items()
+                    if _identity_pattern(child) is not None
+                }
+                derived = {
+                    str(name)
+                    for name, child in properties.items()
+                    if isinstance(child, Mapping) and child.get("readOnly") is True
+                }
+            projected: dict[str, object] = {}
+            for key, value in rule.items():
+                if key == "properties" and isinstance(value, Mapping):
+                    projected[key] = {
+                        renamed.get(str(name), name): project(child)
+                        for name, child in value.items()
+                        if str(name) not in derived
+                    }
+                elif key == "required" and isinstance(value, (list, tuple)):
+                    projected[key] = [
+                        renamed.get(str(name), name)
+                        for name in value
+                        if str(name) not in derived
+                    ]
+                else:
+                    projected[key] = project(value)
+            return projected
         if isinstance(rule, (list, tuple)):
             return [project(item) for item in rule]
         return rule
@@ -1526,52 +1606,201 @@ def resolve_result_refs(
     )
 
 
+def _source_names(scope: EffectiveSourceScope | None) -> str:
+    names = sorted(
+        {label[0] for label in (scope.source_labels.values() if scope else ())}
+    )
+    return ", ".join(repr(name) for name in names) if names else "none"
+
+
+def _resolve_source_name(
+    value: object, path: str, scope: EffectiveSourceScope | None, refs: ScopeRefs
+) -> object:
+    """Return the full ID a source display name (or stored handle) names."""
+
+    if not isinstance(value, str) or _IDENTITY_PATTERNS[SOURCE_ID_PATTERN].fullmatch(
+        value
+    ):
+        return value
+    resolved = refs.resolve(SOURCE_REF_PREFIX, value)
+    if resolved is not None:
+        return resolved
+    matches = () if scope is None else scope.sources_named(value)
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise _ref_invalid(
+            "source_unknown",
+            f"No source in this run is named {value!r}.",
+            path,
+            value,
+            f"Use one of this run's source names: {_source_names(scope)}.",
+        )
+    assert scope is not None
+    raise CapabilityInputError(
+        "source_ambiguous",
+        f"{len(matches)} sources in this run are named {value!r}.",
+        {
+            "name": path,
+            "value": value,
+            "candidates": [
+                {
+                    "display_name": scope.source_labels[item][0],
+                    "adapter": scope.source_labels[item][1],
+                }
+                for item in matches
+            ],
+        },
+        recovery=ToolRecovery(
+            RecoveryKind.REQUIRES_HUMAN_PERMISSION,
+            "Sources are addressed by display name; ask the person to rename "
+            "one of these sources before continuing.",
+        ),
+    )
+
+
+def _resolve_resource_name(
+    value: object,
+    path: str,
+    scope: EffectiveSourceScope | None,
+    refs: ScopeRefs,
+    source_ids: Iterable[str],
+) -> object:
+    """Return the full ID a native table or file name names within ``source_ids``.
+
+    A resource ID is the hash of (source, kind, native name), so a name resolves
+    without an index: the first kind that yields a readable ID wins, tables
+    before views.
+    """
+
+    if not isinstance(value, str) or _IDENTITY_PATTERNS[RESOURCE_ID_PATTERN].fullmatch(
+        value
+    ):
+        return value
+    resolved = refs.resolve(RESOURCE_REF_PREFIX, value)
+    if resolved is not None:
+        return resolved
+    from .catalog.models import ResourceKind, catalog_resource_id
+
+    kinds = (ResourceKind.TABLE, ResourceKind.VIEW, ResourceKind.FILE) + tuple(
+        kind
+        for kind in ResourceKind
+        if kind not in (ResourceKind.TABLE, ResourceKind.VIEW, ResourceKind.FILE)
+    )
+    hits: list[tuple[str, str]] = []
+    if scope is not None and value.strip() == value and 0 < len(value) <= 512:
+        for source_id in sorted(source_ids):
+            for kind in kinds:
+                resource_id = catalog_resource_id(source_id, kind, value)
+                if resource_id in scope.resource_ids:
+                    hits.append((source_id, resource_id))
+                    break
+    if len(hits) == 1:
+        return hits[0][1]
+    if not hits:
+        raise _ref_invalid(
+            "table_unknown",
+            f"No readable table, view or file named {value!r} is in this run's scope.",
+            path,
+            value,
+            "Use the exact name the catalog shows (catalog_search or "
+            "catalog_describe), including its schema prefix where shown; a "
+            "table outside this run's scope cannot be read in this run.",
+        )
+    assert scope is not None
+    raise _ref_invalid(
+        "table_ambiguous",
+        f"{len(hits)} sources in this run have a table named {value!r}.",
+        path,
+        value,
+        "Name the source too: "
+        + ", ".join(repr(scope.source_labels.get(item, (item,))[0]) for item, _ in hits)
+        + ".",
+    )
+
+
 def resolve_identity_refs(
     schema: Mapping[str, object],
     arguments: Mapping[str, object],
-    refs: ScopeRefs,
+    scope: EffectiveSourceScope | None,
     *,
     base: str = "",
 ) -> Mapping[str, object]:
-    """Replace run-scoped handles at ``schema``'s identity paths with full IDs.
+    """Replace the names at ``schema``'s identity paths with full IDs.
 
-    Full IDs and other values pass through for schema validation. A
-    handle-shaped value this run did not issue fails before dispatch.
+    The model sends a source display name and native table or file names under
+    the model-facing keys (``source``, ``table``, ``tables``...); each is renamed
+    back to its canonical key and resolved against the run's frozen scope. Full
+    IDs, and the run-local handles older stored transcripts carry, resolve as
+    before; other values are left for schema validation. A name outside the
+    scope fails before dispatch, so a machine run cannot widen its scope.
     """
 
-    def leaf_for(family: str, prefix: str) -> _Leaf:
-        def leaf(value: object, path: str) -> object:
-            if not isinstance(value, str) or _IDENTITY_HANDLE.match(value) is None:
-                return value
-            resolved = refs.resolve(prefix, value)
-            if resolved is not None:
-                return resolved
-            issued = sum(1 for handle in refs.ids if handle.startswith(prefix))
-            raise _ref_invalid(
-                f"{family}_ref_invalid",
-                f"{value} is not a {family} ref issued in this run.",
-                path,
-                value,
-                (
-                    f"Use a {family}_ref ({prefix}1-{prefix}{issued}) shown "
-                    f"beside its {family}_id in this run, or the exact full "
-                    f"{family}_id."
-                    if issued
-                    else f"This run issued no {family} refs; use the exact "
-                    f"full {family}_id."
-                ),
+    refs = scope_refs(scope)
+    by_parent: dict[str, list[tuple[str, str]]] = {}
+    for path, pattern in identity_ref_paths(schema):
+        parent, _, key = path.rpartition(".")
+        by_parent.setdefault(parent, []).append((key, pattern))
+
+    def resolve_each(
+        value: object, path: str, resolve: Callable[[object, str], object]
+    ) -> object:
+        if isinstance(value, (list, tuple)):
+            return type(value)(
+                resolve(item, f"{path}[{index}]") for index, item in enumerate(value)
             )
+        return resolve(value, path)
+
+    def leaf_for(keys: list[tuple[str, str]]) -> _Leaf:
+        def leaf(value: object, path: str) -> object:
+            if not isinstance(value, Mapping):
+                return value
+            resolved = dict(value)
+            for spec, _ in keys:
+                key = spec.removesuffix("[]")
+                model_key = model_identity_key(key)
+                if model_key != key and model_key in resolved and key not in resolved:
+                    resolved[key] = resolved.pop(model_key)
+            prefix = f"{path}." if path else ""
+            named_sources: set[str] = set()
+            for spec, pattern in keys:
+                key = spec.removesuffix("[]")
+                if pattern != SOURCE_ID_PATTERN or key not in resolved:
+                    continue
+                resolved[key] = resolve_each(
+                    resolved[key],
+                    prefix + model_identity_key(key),
+                    lambda item, at: _resolve_source_name(item, at, scope, refs),
+                )
+                items = resolved[key]
+                for item in items if isinstance(items, (list, tuple)) else (items,):
+                    if isinstance(item, str) and item in (
+                        scope.source_ids if scope else ()
+                    ):
+                        named_sources.add(item)
+            candidates = named_sources or (scope.source_ids if scope else frozenset())
+            for spec, pattern in keys:
+                key = spec.removesuffix("[]")
+                if pattern != RESOURCE_ID_PATTERN or key not in resolved:
+                    continue
+                resolved[key] = resolve_each(
+                    resolved[key],
+                    prefix + model_identity_key(key),
+                    lambda item, at: _resolve_resource_name(
+                        item, at, scope, refs, candidates
+                    ),
+                )
+            return value if resolved == dict(value) else resolved
 
         return leaf
 
-    return _map_paths(
-        arguments,
-        (
-            (path, leaf_for(*_IDENTITY_REFS[pattern][:2]))
-            for path, pattern in identity_ref_paths(schema)
-        ),
-        base,
-    )
+    for parent, keys in by_parent.items():
+        leaf = leaf_for(keys)
+        if parent:
+            arguments = _map_paths(arguments, ((parent, leaf),), base)
+        else:
+            arguments = cast(Mapping[str, object], leaf(arguments, base))
+    return arguments
 
 
 @dataclass(frozen=True, slots=True)
@@ -2639,9 +2868,7 @@ class CapabilityRegistry:
         arguments: Mapping[str, object],
         source_scope: EffectiveSourceScope | None,
     ) -> Mapping[str, object]:
-        """Replace source/resource handles in one call with their full IDs."""
-
-        refs = scope_refs(source_scope)
+        """Replace source and resource names in one call with their full IDs."""
 
         def delegated(member: str, kind: str) -> _Leaf:
             def leaf(value: object, path: str) -> object:
@@ -2662,14 +2889,14 @@ class CapabilityRegistry:
                 def nested(inner: object, at: str) -> object:
                     if not isinstance(inner, Mapping):
                         return inner
-                    return resolve_identity_refs(schema, inner, refs, base=at)
+                    return resolve_identity_refs(schema, inner, source_scope, base=at)
 
                 return _map_paths(value, ((member, nested),), path)
 
             return leaf
 
         return _map_paths(
-            resolve_identity_refs(capability.input_schema, arguments, refs),
+            resolve_identity_refs(capability.input_schema, arguments, source_scope),
             (
                 (container, delegated(member, kind))
                 for container, member, kind in capability.delegated_arguments
@@ -3095,11 +3322,14 @@ def tool_route_unknown_arguments(
     properties = capability.input_schema.get("properties", {})
     if not isinstance(properties, Mapping):
         return ()
+    # The model names identities by their model-facing keys (``source``,
+    # ``allowed_tables``...), which the resolver maps back before validation.
+    accepted = set(properties) | {model_identity_key(str(name)) for name in properties}
     return tuple(
         sorted(
             name
             for name in tool_route_arguments(view, capability, arguments)
-            if name not in properties
+            if name not in accepted
         )
     )
 
@@ -3542,6 +3772,7 @@ __all__ = [
     "resolve_identity_refs",
     "identity_ref_paths",
     "model_identity_schema",
+    "model_identity_key",
     "RESOURCE_ID_PATTERN",
     "SOURCE_ID_PATTERN",
     "resource_id_schema",
