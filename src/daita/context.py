@@ -712,7 +712,8 @@ class AgentContextBuilder:
                 one_time_grants=session_options.one_time_artifact_destinations,
             )
         )
-        catalog_query = run.message[:CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS]
+        discovery_query = _discovery_query(run)
+        catalog_query = discovery_query[:CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS]
         prior_catalog_query = _latest_prior_user_query(prior_turns)
         catalog = (
             self._catalog.empty_catalog_context(prior_query=prior_catalog_query)
@@ -736,7 +737,7 @@ class AgentContextBuilder:
             else ()
         )
         catalog_payload["connector_directory"] = _connector_directory(
-            run.message,
+            discovery_query,
             source_presentations,
             tool_context,
             skill_summaries,
@@ -2568,6 +2569,21 @@ def _split_working_messages(
         working[current_user_position:],
         upstream_omitted,
     )
+
+
+def _discovery_query(run: RunInput) -> str:
+    """The text the catalog and connector directory are matched against.
+
+    A job run's message is its code-owned instruction; its objective or goal is
+    payload data, which is safe here because matching only ranks hints.
+    """
+
+    if run.start is not None and run.origin in JOB_ORIGINS:
+        for key in ("objective", "goal"):
+            text = run.start.untrusted_payload.get(key)
+            if isinstance(text, str) and text.strip():
+                return text
+    return run.message
 
 
 def _latest_prior_user_query(
