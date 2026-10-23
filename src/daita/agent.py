@@ -66,22 +66,7 @@ from .hosting.embedded import (
 )
 from .hosting.execution_governor import CoordinatorDiagnostics
 from .hosting.home_upgrade import AgentHomeStatus
-from .jobs.graph.models import (
-    GraphAdmission,
-    GraphInspection,
-    GraphJob,
-    GraphMutation,
-    GraphState,
-    GraphTask,
-    TaskAttempt,
-    TaskCheckpoint,
-    TaskControl,
-    TaskDependency,
-    TaskResult,
-    TaskState,
-)
-from .jobs.owner import GraphBlockerProjection
-from .jobs.projections import GraphBoardProjection, GraphTimelinePage
+from .jobs.models import Job, JobState
 from .llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
 from .llm.protocols import ModelProvider
 from .llm.routing import ModelRoute
@@ -570,9 +555,9 @@ class Agent:
     async def list_jobs(
         self,
         *,
-        states: frozenset[GraphState] = frozenset(),
+        states: frozenset[JobState] = frozenset(),
         limit: int = 50,
-    ) -> tuple[GraphJob, ...]:
+    ) -> tuple[Job, ...]:
         return await self._embedded.list_jobs(states=states, limit=limit)
 
     async def inspect_effect(
@@ -619,33 +604,6 @@ class Agent:
             caller_principal_id=caller_principal_id,
         )
 
-    async def inspect_job(self, job_id: str) -> GraphInspection | None:
-        return await self._embedded.inspect_job(job_id)
-
-    async def list_job_tasks(
-        self,
-        job_id: str,
-        *,
-        states: frozenset[TaskState] = frozenset(),
-        limit: int = 64,
-    ) -> tuple[GraphTask, ...]:
-        return await self._embedded.list_job_tasks(job_id, states=states, limit=limit)
-
-    async def inspect_job_task(self, job_id: str, task_id: str) -> GraphTask | None:
-        return await self._embedded.inspect_job_task(job_id, task_id)
-
-    async def list_job_dependencies(
-        self, job_id: str, *, task_id: str | None = None, limit: int = 100
-    ) -> tuple[TaskDependency, ...]:
-        return await self._embedded.list_job_dependencies(
-            job_id, task_id=task_id, limit=limit
-        )
-
-    async def list_task_attempts(
-        self, job_id: str, task_id: str, *, limit: int = 3
-    ) -> tuple[TaskAttempt, ...]:
-        return await self._embedded.list_task_attempts(job_id, task_id, limit=limit)
-
     async def analysis_evidence(
         self, run_id: str, *, caller_principal_id: str | None = None
     ) -> tuple[AnalysisEvidence, ...]:
@@ -674,212 +632,32 @@ class Agent:
             run_id, caller_principal_id=caller_principal_id
         )
 
-    async def read_task_result(self, job_id: str, task_id: str) -> TaskResult | None:
-        return await self._embedded.read_task_result(job_id, task_id)
-
-    async def list_task_checkpoints(
-        self, job_id: str, task_id: str, *, limit: int = 8
-    ) -> tuple[TaskCheckpoint, ...]:
-        return await self._embedded.list_task_checkpoints(job_id, task_id, limit=limit)
-
-    async def list_task_artifacts(
-        self, job_id: str, *, task_id: str | None = None, limit: int = 64
-    ) -> tuple[str, ...]:
-        return await self._embedded.list_task_artifacts(
-            job_id, task_id=task_id, limit=limit
-        )
-
-    async def list_task_controls(
-        self, job_id: str, task_id: str, *, limit: int = 8
-    ) -> tuple[TaskControl, ...]:
-        """Return bounded typed controls, including effect uncertainty."""
-
-        return await self._embedded.list_task_controls(job_id, task_id, limit=limit)
-
-    async def job_timeline(
+    async def start_job(
         self,
-        job_id: str,
+        objective: str,
+        sources: tuple[str, ...] | None = None,
         *,
-        after_event_id: int = 0,
-        limit: int = 100,
-        task_id: str | None = None,
-    ) -> GraphTimelinePage | None:
-        return await self._embedded.job_timeline(
-            job_id,
-            after_event_id=after_event_id,
-            limit=limit,
-            task_id=task_id,
+        conversation_id: str | None = None,
+    ) -> Job:
+        """Start a background job that keeps going in the host.
+
+        The job plans with a checklist, hands pieces to sub-runs, asks when it
+        needs you and delivers its result to the conversation's Inbox (a new
+        conversation when none is given). ``sources`` are names or ids.
+        """
+        return await self._embedded.start_job(
+            objective, sources=sources, conversation_id=conversation_id
         )
 
-    async def job_board(self, job_id: str) -> GraphBoardProjection | None:
-        return await self._embedded.job_board(job_id)
+    async def inspect_job(self, job_id: str) -> Job | None:
+        return await self._embedded.inspect_job(job_id)
 
-    async def read_job_result(self, job_id: str) -> TaskResult | None:
-        return await self._embedded.read_job_result(job_id)
+    async def answer_job(self, job_id: str, text: str) -> Job:
+        """Answer a waiting job's question, or raise the limits it stopped at."""
+        return await self._embedded.answer_job(job_id, text)
 
-    async def cancel_job(self, job_id: str) -> GraphJob | None:
+    async def cancel_job(self, job_id: str) -> Job | None:
         return await self._embedded.cancel_job(job_id)
-
-    async def graph_blockers(self, job_id: str) -> GraphBlockerProjection | None:
-        """Return the bounded current blockers for one exact graph job."""
-
-        return await self._embedded.graph_blockers(job_id)
-
-    async def answer_task_input(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        answer: Mapping[str, object],
-        idempotency_key: str | None = None,
-    ) -> TaskControl | None:
-        """Resolve one exact open graph input request with typed principal input."""
-
-        return await self._embedded.answer_task_input(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=principal_id,
-            answer=answer,
-            idempotency_key=idempotency_key,
-        )
-
-    async def accept_task_review(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        rationale: str,
-        idempotency_key: str,
-    ) -> TaskResult:
-        """Accept one exact immutable review candidate through the owner path."""
-
-        return await self._embedded.accept_task_review(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=principal_id,
-            rationale=rationale,
-            idempotency_key=idempotency_key,
-        )
-
-    async def request_task_review_changes(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        rationale: str,
-        replacement_guidance: str,
-        idempotency_key: str,
-    ) -> TaskControl:
-        """Reject a candidate and open the typed replacement-only control."""
-
-        return await self._embedded.request_task_review_changes(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=principal_id,
-            rationale=rationale,
-            replacement_guidance=replacement_guidance,
-            idempotency_key=idempotency_key,
-        )
-
-    async def retry_task_control(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        advisory_note: str,
-        idempotency_key: str,
-    ) -> TaskControl | None:
-        """Resolve one retryable attention control without changing authority."""
-
-        return await self._embedded.retry_task_control(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=principal_id,
-            advisory_note=advisory_note,
-            idempotency_key=idempotency_key,
-        )
-
-    async def reject_task_control(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        reason: str,
-        idempotency_key: str | None = None,
-    ) -> TaskControl | None:
-        """Reject one exact open graph control without creating executable work."""
-
-        return await self._embedded.reject_task_control(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=principal_id,
-            reason=reason,
-            idempotency_key=idempotency_key,
-        )
-
-    async def cancel_graph_job(
-        self, job_id: str, *, principal_id: str
-    ) -> GraphJob | None:
-        """Cancel one exact graph and conservatively settle active attempts."""
-
-        return await self._embedded.cancel_graph_job(job_id, principal_id=principal_id)
-
-    async def replace_graph_task_by_policy(
-        self,
-        job_id: str,
-        task_id: str,
-        *,
-        principal_id: str,
-        advisory_note: str,
-        idempotency_key: str,
-        expected_revision: int,
-    ) -> GraphMutation:
-        """Create only the policy-derived replacement for blocked graph work."""
-
-        return await self._embedded.replace_graph_task_by_policy(
-            job_id,
-            task_id,
-            principal_id=principal_id,
-            advisory_note=advisory_note,
-            idempotency_key=idempotency_key,
-            expected_revision=expected_revision,
-        )
-
-    async def start_authorized_replacement_job(
-        self,
-        admission: GraphAdmission,
-        *,
-        replaces_job_id: str,
-        principal_id: str,
-        replaces_task_id: str | None = None,
-        control_id: str | None = None,
-        idempotency_key: str | None = None,
-    ) -> GraphJob:
-        """Admit a separate already-authorized replacement without widening a job."""
-
-        return await self._embedded.start_authorized_replacement_job(
-            admission,
-            replaces_job_id=replaces_job_id,
-            principal_id=principal_id,
-            replaces_task_id=replaces_task_id,
-            control_id=control_id,
-            idempotency_key=idempotency_key,
-        )
 
     async def create_routine(
         self,
@@ -1608,12 +1386,10 @@ __all__ = [
     "AgentNotFoundError",
     "CatalogSummary",
     "DeliveryView",
-    "GraphInspection",
-    "GraphJob",
-    "GraphState",
     "HostActiveError",
+    "Job",
+    "JobState",
     "PostgreSQLProbeResult",
     "PostgreSQLSourceError",
     "SourceRefreshError",
-    "TaskResult",
 ]

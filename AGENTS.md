@@ -78,7 +78,7 @@ Runs come from two places:
 
 - **Foreground runs**: a person asks through the TUI, CLI or Python API.
   Effects need interactive approval.
-- **Machine runs**: routine occurrences, job events and graph tasks. Each builds
+- **Machine runs**: routine occurrences, job runs and job sub-runs. Each builds
   its `ExecutionScope` when the run starts and asks a person, through the host,
   before every effect.
 
@@ -98,7 +98,7 @@ Runs come from two places:
 | Catalog | Source and resource truth: schemas, relationships, declared links, freshness | `catalog/` |
 | Adapters / source types | Source admission, discovery and bounded I/O | `adapters/`, `adapters/registry.py` |
 | Artifacts | Committed artifact bytes, manifests, renderers, delivery | `artifacts/` |
-| Jobs | Durable graph jobs: `JobOwner`, `JobSupervisor` | `jobs/` |
+| Jobs | Background jobs: one `Job` record (checklist, delegations, answers); `JobOwner`, `JobSupervisor` | `jobs/` |
 | Routines | Scheduled routines: `RoutineOwner`, `RoutineSupervisor` | `routines/` |
 | Distribution | Outcomes, destinations, deliveries | `distribution/`, `work_board.py` |
 | Models | Canonical records, routing and retries, provider adapters | `llm/` |
@@ -170,12 +170,14 @@ changes*.
 
 - **One of each core owner:** one `AgentLoop` implementation, one
   `CapabilityRuntime`, one capability registry, one catalog, one artifact store,
-  one graph-aware jobs supervisor, one routines supervisor and one SQLite state
-  boundary. Features extend these owners rather than adding parallel ones.
+  one jobs supervisor that runs checklist jobs, one routines supervisor and one
+  SQLite state boundary. Features extend these owners rather than adding
+  parallel ones.
 - **Statically composed capability domains** in `EmbeddedAgent`; there is no
   dynamic plugin or executor registry.
 - **A direct loop.** There is no verifier, repair or synthesis pass, and no
-  resumable session. Clarification is ordinary model behavior, not a run state.
+  resumable session: a job continues in a new run, never a resumed one.
+  Clarification is ordinary model behavior, not a run state.
 - **Approval and observation through the host.** Inside a process, approval is
   an `ApprovalHandler` callback the loop awaits and observation a best-effort
   callback. The host turns both into *interactions* and an event stream: an
@@ -193,8 +195,14 @@ changes*.
   it as a login service. Library mode (`Agent.open()`, `daita --no-host`) still
   composes the agent in-process, and is refused with `HostActiveError` while
   the host holds that agent.
-- **Routines and graph jobs are separate systems**, with no routine-to-graph
-  bridge.
+- **Routines and jobs are separate systems**, with no routine-to-job bridge.
+- **A background job is an ordinary agent run that keeps going in the host.**
+  Its main run plans with `checklist_write`, hands independent pieces to
+  sub-runs with `delegate` (several at once run in parallel; sub-runs cannot
+  delegate further) and asks with `ask_user`. A job continues by starting a
+  *new* main run from its saved record after a restart, a full context or an
+  answer; no run is resumed. Code owns its state, run-count and token limits
+  and the job lane's concurrency; the model owns the plan.
 - **A routine is a title, a prompt and a schedule**, optionally limited to named
   sources, with one `RoutineIntent` shape for the tool, CLI, Python API and
   host. Creating or changing one shows one confirm card. Everything else is a
@@ -222,7 +230,7 @@ before changing that area.
 | Runtime | Composition, the loop, context building, budgets, source scope, capability execution, approval and observation | [`runtime.md`](docs/architecture/runtime.md) |
 | Data and files | Source types and operations, catalog and declared links, SQL validation, combined queries, relational writes, folders, artifacts | [`data-and-files.md`](docs/architecture/data-and-files.md) |
 | MCP | Admitted bindings, call-time rechecks, actions and grants | [`mcp.md`](docs/architecture/mcp.md) |
-| Jobs and routines | Graph job boundaries, supervision, routine schedules, scheduled-run limits, outcomes and deliveries | [`jobs-and-routines.md`](docs/architecture/jobs-and-routines.md) |
+| Jobs and routines | Checklist jobs, supervision, routine schedules, machine-run limits, outcomes and deliveries | [`jobs-and-routines.md`](docs/architecture/jobs-and-routines.md) |
 | Persistence | State boundary, home revisions, migrations, upgrades, release contract | [`persistence.md`](docs/architecture/persistence.md) |
 | Models | Canonical records, routing and retries, call policy, provider lifecycle | [`models.md`](docs/architecture/models.md) |
 | Product surfaces | CLI and TUI rules over the public API | [`product-surfaces.md`](docs/architecture/product-surfaces.md) |
@@ -585,7 +593,7 @@ protects the user in its place.
 | `src/daita/domains/data/sql/` | catalog-scoped SQL validation |
 | `src/daita/domains/analysis/` | local Python analysis |
 | `src/daita/domains/mcp.py` | MCP projection and call-time rechecks |
-| `src/daita/jobs/` | durable job records and supervision |
+| `src/daita/jobs/` | checklist job records (`models.py`), owner, supervisor and the job tools |
 | `src/daita/routines/` | scheduled routine records and supervision |
 | `src/daita/distribution/` | outcomes, destinations, and deliveries |
 | `src/daita/work_board.py` | work board projection over jobs, routines and deliveries |

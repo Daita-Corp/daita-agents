@@ -11,7 +11,7 @@ from hashlib import sha256
 from threading import Lock
 
 from .._json import canonical_json
-from ..capabilities import ExecutionPreference, GraphTaskBinding, RecoveryKind
+from ..capabilities import ExecutionPreference, RecoveryKind
 from ..llm.models import ToolCall, ToolResultBlock
 from .models import RunInput, RunOrigin
 from .transcripts import ConversationPredecessor, RunSessionWriter
@@ -312,11 +312,12 @@ class RunSessionOptions:
     explicit_learning: bool = False
     retained_skill_bindings: tuple[tuple[str, str], ...] = ()
     one_time_artifact_destinations: tuple[object, ...] = ()
-    task_context: object | None = None
-    task_attempt_guard: object | None = None
     execution_preference: ExecutionPreference = ExecutionPreference.AUTO
     # The routine or job title an approval card names; None for foreground runs.
     requester: str | None = None
+    # A job's main run ends after the step whose request passed this many input
+    # tokens; the job continues in a new run. None leaves the run unbounded here.
+    stop_after_input_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.files_only, bool) or not isinstance(
@@ -331,6 +332,12 @@ class RunSessionOptions:
             raise ValueError("session requester must be bounded non-empty text")
         if not isinstance(self.execution_preference, ExecutionPreference):
             raise TypeError("session execution preference is invalid")
+        if self.stop_after_input_tokens is not None and (
+            not isinstance(self.stop_after_input_tokens, int)
+            or isinstance(self.stop_after_input_tokens, bool)
+            or self.stop_after_input_tokens < 1
+        ):
+            raise ValueError("session input-token stop must be a positive integer")
         bindings = tuple(self.retained_skill_bindings)
         if any(
             not isinstance(item, tuple)
@@ -347,13 +354,6 @@ class RunSessionOptions:
             "one_time_artifact_destinations",
             tuple(self.one_time_artifact_destinations),
         )
-        if (self.task_context is None) != (self.task_attempt_guard is None):
-            raise ValueError("task context and attempt guard must be present together")
-        if self.task_context is not None:
-            binding = getattr(self.task_context, "binding", None)
-            guarded = getattr(self.task_attempt_guard, "binding", None)
-            if not isinstance(binding, GraphTaskBinding) or guarded != binding:
-                raise ValueError("task context and guard must share one exact binding")
 
 
 class _SingleUse:
@@ -387,7 +387,6 @@ class RunSession:
     admission_lease: object | None = None
     predecessor: ConversationPredecessor | None = None
     prepared: object | None = None
-    budget_reservations: tuple[object, ...] = ()
     cleanup_handles: tuple[object, ...] = ()
     evidence: RunSessionEvidence = field(default_factory=RunSessionEvidence)
     _single_use: _SingleUse = field(
@@ -414,18 +413,7 @@ class RunSession:
         if not isinstance(self.evidence, RunSessionEvidence):
             raise TypeError("run session evidence is invalid")
         if self.run.origin is RunOrigin.JOB_TASK:
-            scope = self.run.execution_scope
-            binding = None if scope is None else scope.graph_task_binding
-            if (
-                binding is None
-                or self.options.task_context is None
-                or getattr(self.options.task_context, "binding", None) != binding
-            ):
-                raise ValueError(
-                    "job-task sessions require one exact bound task context and guard"
-                )
-        elif self.options.task_context is not None:
-            raise ValueError("only job-task sessions may carry task context")
+            raise ValueError("graph task runs are no longer executed")
         if self.admission_lease is not None and (
             getattr(self.admission_lease, "cancellation", None) is not self.cancellation
             or float(getattr(self.admission_lease, "absolute_deadline", -math.inf))
@@ -433,7 +421,6 @@ class RunSession:
         ):
             raise ValueError("run session differs from its admission lease")
         object.__setattr__(self, "absolute_deadline", float(self.absolute_deadline))
-        object.__setattr__(self, "budget_reservations", tuple(self.budget_reservations))
         object.__setattr__(self, "cleanup_handles", tuple(self.cleanup_handles))
 
     @property

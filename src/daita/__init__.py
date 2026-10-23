@@ -69,10 +69,12 @@ from .distribution import (
 from .host import connect
 from .hosting.resident import ResidentReady, run_resident_host
 from .jobs import (
-    GraphInspection,
-    GraphJob,
-    GraphState,
-    TaskResult,
+    ChecklistItem,
+    ChecklistStatus,
+    Delegation,
+    DelegationState,
+    Job,
+    JobState,
 )
 from .llm import (
     ModelRoute,
@@ -166,11 +168,13 @@ __all__ = [
     "DeliveryView",
     "DistributionPlan",
     "DistributionTargetBinding",
-    "GraphInspection",
-    "GraphJob",
-    "GraphState",
     "IntervalSchedule",
-    "TaskResult",
+    "ChecklistItem",
+    "ChecklistStatus",
+    "Delegation",
+    "DelegationState",
+    "Job",
+    "JobState",
     "LoopExit",
     "LoopExitKind",
     "LoopLimits",

@@ -90,15 +90,15 @@ class ExecutionScopeKind(str, Enum):
 
     JOB_EVENT = "job_event"
     SCHEDULED_ROUTINE = "scheduled_routine"
+    # Decoded from stored graph-task runs only; no new run uses it.
     GRAPH_TASK = "graph_task"
+    JOB = "job"
 
 
 class MachineRunDirectiveKind(str, Enum):
-    """Exclusive terminal transition emitted by a machine lifecycle tool."""
+    """A tool call that ends the machine run it was made in."""
 
-    COMPLETE = "task_completed"
-    BLOCK = "task_blocked"
-    REQUEST_REVIEW = "task_review_requested"
+    ASK_USER = "job_waiting_for_you"
 
 
 class ExecutionPreference(str, Enum):
@@ -111,12 +111,13 @@ class ExecutionPreference(str, Enum):
 class CallTargetLane(str, Enum):
     """Which enforced per-call target ceiling governs one run's calls.
 
-    Foreground user calls are bounded by the inline ceiling; graph task workers
-    by the graph ceiling. The runtime maps each run origin to at most one lane.
+    Foreground user calls are bounded by the inline ceiling; job runs and
+    sub-runs by the job ceiling (the policy's ``graph_*`` fields). The runtime
+    maps each run origin to at most one lane.
     """
 
     FOREGROUND = "foreground"
-    GRAPH_TASK = "graph_task"
+    JOB = "job"
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,56 +323,15 @@ class GraphTaskBinding:
 
 @dataclass(frozen=True, slots=True)
 class MachineRunDirective:
-    """Authenticated exclusive termination from one lifecycle capability."""
+    """The one call that ended a machine run, made alone in its step."""
 
     kind: MachineRunDirectiveKind
     tool_call_id: str
-    binding_digest: str
-    record_id: str
-    job_id: str
-    task_id: str
-    attempt_id: str
-    fencing_epoch: int
-    committed_task_revision: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, MachineRunDirectiveKind):
             raise TypeError("machine run directive kind is invalid")
-        for value, name in (
-            (self.tool_call_id, "machine directive tool call_id"),
-            (self.record_id, "machine directive record_id"),
-            (self.job_id, "machine directive job_id"),
-            (self.task_id, "machine directive task_id"),
-            (self.attempt_id, "machine directive attempt_id"),
-        ):
-            _text(value, name)
-        if re.fullmatch(r"sha256:[0-9a-f]{64}", self.binding_digest) is None:
-            raise ValueError("machine directive binding digest is invalid")
-        for numeric_value, name in (
-            (self.fencing_epoch, "machine directive fencing epoch"),
-            (self.committed_task_revision, "machine directive task revision"),
-        ):
-            if (
-                not isinstance(numeric_value, int)
-                or isinstance(numeric_value, bool)
-                or numeric_value < 1
-            ):
-                raise ValueError(f"{name} is invalid")
-
-
-class TaskAttemptGuard(Protocol):
-    """Revalidate one exact graph attempt immediately before meaningful work."""
-
-    @property
-    def binding(self) -> GraphTaskBinding: ...
-
-    @property
-    def claim_token(self) -> str: ...
-
-    @property
-    def run_id(self) -> str: ...
-
-    async def revalidate(self, *, capability_id: str, point: str) -> None: ...
+        _text(self.tool_call_id, "machine directive tool call_id")
 
 
 class EffectOutcome(str, Enum):
@@ -703,7 +663,7 @@ class ExecutionScope:
     allowed_operational_effects: frozenset[OperationalEffect]
     sensitivity_ceiling: ModelSensitivity
     eligible_model_routes: tuple[str, ...]
-    # Graph tasks and routines may omit it; steps, tokens and attempts still bound them.
+    # Routines and jobs may omit it; steps and tokens still bound them.
     per_run_max_cost_usd: Decimal | None
     per_run_max_tokens: int
     distribution_plan_digest: str
@@ -817,6 +777,9 @@ class ExecutionScope:
         elif self.scope_kind is ExecutionScopeKind.SCHEDULED_ROUTINE:
             if self.routine_id is None:
                 raise ValueError("scheduled scope requires routine identity")
+        elif self.scope_kind is ExecutionScopeKind.JOB:
+            if self.job_id is None or self.routine_id is not None:
+                raise ValueError("job scope requires only its job identity")
         elif self.routine_id is not None:
             raise ValueError("routine identity requires a scheduled scope")
         if self.scope_kind is ExecutionScopeKind.JOB_EVENT:
@@ -825,10 +788,13 @@ class ExecutionScope:
                     "non-routine execution scope requires source/resource ceilings "
                     "and cannot contain connector bindings"
                 )
-        elif self.scope_kind is ExecutionScopeKind.SCHEDULED_ROUTINE:
+        elif self.scope_kind in {
+            ExecutionScopeKind.SCHEDULED_ROUTINE,
+            ExecutionScopeKind.JOB,
+        }:
             if bool(sources) != bool(resources):
                 raise ValueError(
-                    "scheduled source and resource ceilings must be present together"
+                    "machine source and resource ceilings must be present together"
                 )
         if not isinstance(self.contract_bindings, ExecutionContractBindings):
             raise TypeError(
@@ -2035,7 +2001,6 @@ class ToolExecution:
     request_sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
     effect_receipt_id: str | None = None
     one_time_artifact_destinations: tuple[object, ...] = ()
-    task_attempt_guard: TaskAttemptGuard | None = None
     caller_principal_id: str | None = None
     execution_scope: ExecutionScope | None = None
     caller_principal_verified: bool = True
@@ -2068,10 +2033,6 @@ class ToolExecution:
             is None
         ):
             raise ValueError("tool effect receipt ID is invalid")
-        if self.task_attempt_guard is not None:
-            binding = getattr(self.task_attempt_guard, "binding", None)
-            if not isinstance(binding, GraphTaskBinding):
-                raise TypeError("tool task-attempt guard is invalid")
         object.__setattr__(
             self, "arguments", FrozenJsonObject.from_mapping(self.arguments)
         )
@@ -2866,21 +2827,6 @@ class CapabilityRegistry:
             return self._contract_digests[capability_id]
         except KeyError as error:
             raise KeyError(f"unknown capability: {capability_id}") from error
-
-    def resolve_internal_execution(
-        self,
-        capability_id: str,
-        contract_digest: str,
-    ) -> tuple[Capability, Executor, str]:
-        capability, executor = self.resolve_execution(capability_id)
-        if any(capability_id in self.tool_capability_ids(name) for name in self._views):
-            raise ValueError(
-                "trusted internal execution requires an internal-only capability"
-            )
-        expected = self.contract_digest(capability_id)
-        if contract_digest != expected:
-            raise ValueError("internal execution capability contract changed")
-        return capability, executor, self.resolve_domain_owner(capability_id)
 
     def validate_output(self, capability_id: str, output: object) -> ToolOutput:
         capability = self._capabilities[capability_id]

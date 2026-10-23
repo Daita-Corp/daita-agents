@@ -381,9 +381,11 @@ class AnalysisCapabilityDomain:
             return run.execution_scope is None
         scope = run.execution_scope
         return (
-            run.origin is RunOrigin.SCHEDULED_ROUTINE
+            run.origin
+            in {RunOrigin.SCHEDULED_ROUTINE, RunOrigin.JOB, RunOrigin.JOB_SUBRUN}
             and scope is not None
-            and scope.scope_kind is ExecutionScopeKind.SCHEDULED_ROUTINE
+            and scope.scope_kind
+            in {ExecutionScopeKind.SCHEDULED_ROUTINE, ExecutionScopeKind.JOB}
             and scope.agent_id == run.agent_id
             and scope.allows(self.declarations.capabilities[0])
         )

@@ -48,13 +48,11 @@ from .capabilities import (
     ExecutionContractReader,
     ExecutionPreference,
     Executor,
-    GraphTaskBinding,
     MachineRunDirective,
     MachineRunDirectiveKind,
     OperationalEffect,
     RecoveryKind,
     SideEffectExecutor,
-    TaskAttemptGuard,
     ToolboxId,
     ToolExecution,
     ToolLoadMode,
@@ -142,30 +140,6 @@ class CapabilityEffectCoordinator(Protocol):
     ) -> AdmissionPermit: ...
 
 
-@dataclass(frozen=True, slots=True)
-class _ContractValidatingAttemptGuard:
-    """Join current attempt authority with exact current contract authority."""
-
-    delegate: TaskAttemptGuard
-    validate_contracts: Callable[[], Awaitable[None]]
-
-    @property
-    def binding(self) -> GraphTaskBinding:
-        return self.delegate.binding
-
-    @property
-    def claim_token(self) -> str:
-        return self.delegate.claim_token
-
-    @property
-    def run_id(self) -> str:
-        return self.delegate.run_id
-
-    async def revalidate(self, *, capability_id: str, point: str) -> None:
-        await self.delegate.revalidate(capability_id=capability_id, point=point)
-        await self.validate_contracts()
-
-
 class EffectReceiptStore(Protocol):
     async def require_effects_unblocked(
         self, agent_id: str, *, run_id: str | None = None, routine_id: str | None = None
@@ -181,7 +155,6 @@ class EffectReceiptStore(Protocol):
         receipt: EffectReceipt,
         *,
         grant: CapabilityGrant | None = None,
-        task_attempt_guard: TaskAttemptGuard | None = None,
         max_receipts_per_run: int = 64,
     ) -> EffectReceipt: ...
     async def finish_effect_receipt(self, receipt: EffectReceipt) -> EffectReceipt: ...
@@ -293,78 +266,6 @@ class SideEffectPlan:
                 )
             if len(canonical_json(self.effect_intent).encode("utf-8")) > 32 * 1024:
                 raise ValueError("side-effect intent exceeds its byte bound")
-
-
-@dataclass(frozen=True, slots=True)
-class InternalCapabilityRequest:
-    """Trusted code-owned execution request for one internal-only capability."""
-
-    run: RunInput
-    call_id: str
-    capability_id: str
-    contract_digest: str
-    arguments: Mapping[str, object]
-    sensitivity: ModelSensitivity
-    observation_origin: RunOrigin | None = None
-    reserved_artifact_id: str | None = None
-    task_attempt_guard: TaskAttemptGuard | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.run, RunInput):
-            raise TypeError("internal request run must be RunInput")
-        for value, name in (
-            (self.call_id, "internal call_id"),
-            (self.capability_id, "internal capability_id"),
-            (self.contract_digest, "internal contract_digest"),
-        ):
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError(f"{name} must be non-empty text")
-        if re.fullmatch(r"sha256:[0-9a-f]{64}", self.contract_digest) is None:
-            raise ValueError("internal contract_digest must use sha256")
-        if not isinstance(self.sensitivity, ModelSensitivity):
-            raise TypeError("internal request sensitivity must be ModelSensitivity")
-        if self.observation_origin is not None and not isinstance(
-            self.observation_origin, RunOrigin
-        ):
-            raise TypeError("internal request observation_origin must be RunOrigin")
-        if self.reserved_artifact_id is not None and (
-            not isinstance(self.reserved_artifact_id, str)
-            or not self.reserved_artifact_id.strip()
-        ):
-            raise ValueError("reserved_artifact_id must be non-empty text or None")
-        if self.task_attempt_guard is not None:
-            binding = getattr(self.task_attempt_guard, "binding", None)
-            scope = self.run.execution_scope
-            if scope is not None and scope.graph_task_binding != binding:
-                raise ValueError(
-                    "internal task guard must match the run graph-task binding"
-                )
-        object.__setattr__(
-            self,
-            "arguments",
-            FrozenJsonObject.from_mapping(self.arguments),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class InternalCapabilityOutcome:
-    output: ToolOutput
-    artifact_ref: ArtifactRef | None = None
-    additional_artifact_refs: tuple[ArtifactRef, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.output, ToolOutput):
-            raise TypeError("internal outcome output must be ToolOutput")
-        if self.artifact_ref is not None and not isinstance(
-            self.artifact_ref, ArtifactRef
-        ):
-            raise TypeError("internal outcome artifact_ref must be ArtifactRef or None")
-        additional = tuple(self.additional_artifact_refs)
-        if any(not isinstance(ref, ArtifactRef) for ref in additional):
-            raise TypeError("additional_artifact_refs must contain ArtifactRef values")
-        if additional and self.artifact_ref is None:
-            raise ValueError("additional_artifact_refs require a primary artifact")
-        object.__setattr__(self, "additional_artifact_refs", additional)
 
 
 class CapabilityDomain(Protocol):
@@ -645,14 +546,14 @@ def call_target_lane(origin: RunOrigin) -> CallTargetLane | None:
 
     Enforcement and every model-facing limit text read the lane through this
     one mapping, so a run is shown exactly the ceiling that admits its calls.
-    Foreground user calls use the inline ceiling, graph task workers the graph
+    Foreground user calls use the inline ceiling, job runs and sub-runs the job
     ceiling; other machine origins carry no per-call target ceiling.
     """
 
     if origin is RunOrigin.USER:
         return CallTargetLane.FOREGROUND
-    if origin is RunOrigin.JOB_TASK:
-        return CallTargetLane.GRAPH_TASK
+    if origin in {RunOrigin.JOB, RunOrigin.JOB_SUBRUN}:
+        return CallTargetLane.JOB
     return None
 
 
@@ -1065,144 +966,6 @@ class CapabilityRuntime:
             run, resolved_source_scope=await self._source_scope_resolver(run)
         )
 
-    async def execute_internal(
-        self,
-        request: InternalCapabilityRequest,
-    ) -> InternalCapabilityOutcome:
-        """Execute one exact internal-only capability through ordinary owners."""
-
-        if not isinstance(request, InternalCapabilityRequest):
-            raise TypeError("request must be InternalCapabilityRequest")
-        if self._source_scope_resolver is not None:
-            request = replace(
-                request,
-                run=replace(
-                    request.run,
-                    resolved_source_scope=await self._source_scope_resolver(
-                        request.run
-                    ),
-                ),
-            )
-        capability, executor, owner_id = self._registry.resolve_internal_execution(
-            request.capability_id,
-            request.contract_digest,
-        )
-        if capability.operational_effect is not OperationalEffect.NONE:
-            raise ValueError(
-                "internal execution cannot bypass operational-effect governance"
-            )
-        domain = self._domains[owner_id]
-        attempt_guard = (
-            None
-            if request.task_attempt_guard is None
-            else _ContractValidatingAttemptGuard(
-                request.task_attempt_guard,
-                lambda: self._validate_execution_contracts(request.run),
-            )
-        )
-        call = ToolCall(
-            id=request.call_id,
-            name=f"internal:{capability.id}",
-            arguments=request.arguments,
-        )
-        started = (
-            asyncio.get_running_loop().time() if self._observer is not None else None
-        )
-        self._emit_tool_started(
-            request.run,
-            call,
-            capability,
-            catalog_entry=None,
-            run_origin=request.observation_origin,
-        )
-        try:
-            await _guard_attempt(
-                attempt_guard,
-                capability.id,
-                "internal_batch_start",
-            )
-            await self._validate_execution_contracts(request.run)
-            normalized = domain.normalize_arguments(capability, request.arguments)
-            arguments = await self._registry.validate_arguments_async(
-                capability.id, normalized
-            )
-            arguments = await domain.prepare_call(
-                request.run,
-                call,
-                capability,
-                arguments,
-                request_sensitivity=request.sensitivity,
-            )
-            await _guard_attempt(
-                attempt_guard,
-                capability.id,
-                "internal_after_binding",
-            )
-            current, current_executor, current_owner = (
-                self._registry.resolve_internal_execution(
-                    request.capability_id,
-                    request.contract_digest,
-                )
-            )
-            if (
-                current != capability
-                or current_executor is not executor
-                or current_owner != owner_id
-            ):
-                raise ValueError("internal execution identity changed")
-            output, artifact_refs = await self._execute_no_effect(
-                request.run,
-                call,
-                capability,
-                executor,
-                arguments,
-                domain,
-                sensitivity=request.sensitivity,
-                reserved_artifact_id=request.reserved_artifact_id,
-                task_attempt_guard=attempt_guard,
-            )
-            result = _bounded_tool_result(
-                call,
-                _classified_success(call, output, artifact_refs=artifact_refs),
-                self._limits,
-            )
-            if result.is_error:
-                raise ToolOutputValidationError(
-                    "internal capability output exceeded the ordinary runtime result contract"
-                )
-        except asyncio.CancelledError:
-            raise
-        except BaseException as error:
-            result = _bounded_tool_result(
-                call,
-                self._exception_result(call, error, domain),
-                self._limits,
-            )
-            self._emit_tool_completed(
-                request.run,
-                call,
-                result,
-                started,
-                capability=capability,
-                catalog_entry=None,
-                run_origin=request.observation_origin,
-            )
-            raise
-        self._emit_tool_completed(
-            request.run,
-            call,
-            result,
-            started,
-            capability=capability,
-            catalog_entry=None,
-            run_origin=request.observation_origin,
-        )
-        return InternalCapabilityOutcome(
-            output=output,
-            artifact_ref=artifact_refs[0] if artifact_refs else None,
-            additional_artifact_refs=artifact_refs[1:],
-        )
-
     async def prepare_run(self, run: RunInput) -> RunToolCatalog:
         """Prepare the complete immutable applicable catalog exactly once."""
 
@@ -1372,18 +1135,6 @@ class CapabilityRuntime:
             capability
         ):
             return None
-        if run.origin is RunOrigin.JOB_TASK:
-            from .jobs.graph.execution import task_role_allows_capability
-
-            context = None if session is None else session.options.task_context
-            binding = getattr(context, "binding", None)
-            if not isinstance(binding, GraphTaskBinding):
-                raise CapabilityInputError(
-                    "task_context_invalid",
-                    "The code-owned graph task binding is unavailable.",
-                )
-            if not task_role_allows_capability(binding.task_role, capability.id):
-                return None
         schema_digest = _sha256_digest(capability.input_schema)
         origin_digest = view.origin_revision_digest or _sha256_digest(
             {
@@ -1625,21 +1376,13 @@ class CapabilityRuntime:
                         _error(
                             resolved.outer_call,
                             "machine_termination_not_exclusive",
-                            "A task lifecycle terminator must be the sole call in its tool batch.",
+                            "A call that ends the run must be the only call in its step.",
                         ),
                         self._limits,
                     )
                     for resolved in resolved_calls
                 )
             )
-        guard = None if session is None else session.options.task_attempt_guard
-        for resolved in resolved_calls:
-            if resolved.entry is not None:
-                await _guard_attempt(
-                    cast(TaskAttemptGuard | None, guard),
-                    resolved.entry.capability.id,
-                    "batch_start",
-                )
         results: list[ToolResultBlock | None] = [None] * len(calls)
         started = [False] * len(calls)
         reads: list[tuple[int, _ResolvedCall]] = []
@@ -1785,53 +1528,11 @@ class CapabilityRuntime:
         )
         directive: MachineRunDirective | None = None
         if terminators and not bounded[0].is_error:
-            binding = (
-                None
-                if run.execution_scope is None
-                else run.execution_scope.graph_task_binding
-            )
-            if binding is None:
-                raise RuntimeError(
-                    "machine terminator executed outside a graph-task scope"
-                )
-            data = bounded[0].output.get("data")
-            record_id = data.get("record_id") if isinstance(data, Mapping) else None
-            if not isinstance(record_id, str) or not record_id:
-                raise ToolOutputValidationError(
-                    "machine lifecycle output omitted its authenticated record identity"
-                )
-            if not isinstance(data, Mapping):
-                raise ToolOutputValidationError(
-                    "machine lifecycle output omitted its committed task identity"
-                )
-            committed_revision = data.get("committed_task_revision")
-            if (
-                data.get("job_id") != binding.job_id
-                or data.get("task_id") != binding.task_id
-                or data.get("attempt_id") != binding.attempt_id
-                or data.get("fencing_epoch") != binding.fencing_epoch
-                or not isinstance(committed_revision, int)
-                or isinstance(committed_revision, bool)
-                or committed_revision < binding.task_revision + 1
-            ):
-                raise ToolOutputValidationError(
-                    "machine lifecycle output differs from its committed task identity"
-                )
             terminator_entry = terminators[0].entry
             assert terminator_entry is not None
             kind = terminator_entry.capability.machine_run_directive_kind
             assert isinstance(kind, MachineRunDirectiveKind)
-            directive = MachineRunDirective(
-                kind=kind,
-                tool_call_id=bounded[0].call_id,
-                binding_digest=binding.digest,
-                record_id=record_id,
-                job_id=binding.job_id,
-                task_id=binding.task_id,
-                attempt_id=binding.attempt_id,
-                fencing_epoch=binding.fencing_epoch,
-                committed_task_revision=committed_revision,
-            )
+            directive = MachineRunDirective(kind=kind, tool_call_id=bounded[0].call_id)
         return ToolBatchOutcome(bounded, machine_run_directive=directive)
 
     def _resolve_calls(
@@ -3266,23 +2967,6 @@ class CapabilityRuntime:
                 raise ValueError("tool catalog execution identity changed")
             capability = resolved
             _validate_run_execution_scope(run, capability, sensitivity)
-            raw_guard = (
-                None
-                if session is None
-                else cast(
-                    TaskAttemptGuard | None,
-                    session.options.task_attempt_guard,
-                )
-            )
-            guard = (
-                None
-                if raw_guard is None
-                else _ContractValidatingAttemptGuard(
-                    raw_guard,
-                    lambda: self._validate_execution_contracts(run),
-                )
-            )
-            await _guard_attempt(guard, capability.id, "before_binding")
             await self._validate_execution_contracts(run)
             domain = self._domains[owner_id]
             if validated_arguments is None:
@@ -3303,15 +2987,6 @@ class CapabilityRuntime:
                 )
             else:
                 arguments = validated_arguments
-            if run.origin is RunOrigin.JOB_TASK:
-                from .jobs.graph.execution import validate_graph_task_arguments
-
-                validate_graph_task_arguments(
-                    origin=run.origin,
-                    context=(None if session is None else session.options.task_context),
-                    capability_id=capability.id,
-                    arguments=arguments,
-                )
             preference = (
                 ExecutionPreference.AUTO
                 if session is None
@@ -3336,7 +3011,7 @@ class CapabilityRuntime:
                 ):
                     raise CapabilityInputError(
                         "execution_not_supported_for_requested_shape",
-                        "This capability is direct-only and cannot be forced into graph V1.",
+                        "This capability is direct-only and cannot run as a job.",
                         recovery=ToolRecovery(
                             RecoveryKind.TERMINAL,
                             "This tool runs only in the foreground; durable "
@@ -3361,7 +3036,6 @@ class CapabilityRuntime:
             provenance = await _domain_call_provenance(
                 domain, run, call, capability, arguments, session=session
             )
-            await _guard_attempt(guard, capability.id, "after_binding")
             resolved_capability, executor = self._registry.resolve_execution(
                 capability.id
             )
@@ -3387,7 +3061,6 @@ class CapabilityRuntime:
                     if session is None
                     else session.options.one_time_artifact_destinations
                 ),
-                task_attempt_guard=guard,
                 provenance=provenance,
             )
             if capability.operational_effect is not OperationalEffect.NONE:
@@ -3418,7 +3091,6 @@ class CapabilityRuntime:
                     domain,
                     sensitivity=sensitivity,
                     session=session,
-                    task_attempt_guard=guard,
                     catalog_entry=entry,
                     dispatch_hook=mark_dispatch,
                     provenance=provenance,
@@ -3551,9 +3223,7 @@ class CapabilityRuntime:
         domain: CapabilityDomain,
         *,
         sensitivity: ModelSensitivity,
-        reserved_artifact_id: str | None = None,
         session: RunSession | None = None,
-        task_attempt_guard: TaskAttemptGuard | None = None,
         catalog_entry: RunToolCatalogEntry | None = None,
         dispatch_hook: Callable[[], Awaitable[None]] | None = None,
         provenance: CallProvenance = CallProvenance(),
@@ -3576,7 +3246,6 @@ class CapabilityRuntime:
                 if session is None
                 else session.options.one_time_artifact_destinations
             ),
-            task_attempt_guard=task_attempt_guard,
             provenance=provenance,
         )
         permit = await self._call_io_permit(
@@ -3587,7 +3256,6 @@ class CapabilityRuntime:
             session=session,
         )
         if permit is None:
-            await _guard_attempt(task_attempt_guard, capability.id, "before_dispatch")
             if dispatch_hook is not None:
                 await dispatch_hook()
             elif session is not None:
@@ -3595,9 +3263,6 @@ class CapabilityRuntime:
             candidate = await executor.execute(execution)
         else:
             async with permit:
-                await _guard_attempt(
-                    task_attempt_guard, capability.id, "before_io_dispatch"
-                )
                 if dispatch_hook is not None:
                     await dispatch_hook()
                 elif session is not None:
@@ -3605,10 +3270,6 @@ class CapabilityRuntime:
                 candidate = await executor.execute(execution)
         if not isinstance(candidate, ToolOutput):
             raise ToolOutputValidationError("executor did not return ToolOutput")
-        if capability.machine_run_directive_kind is None:
-            await _guard_attempt(
-                task_attempt_guard, capability.id, "before_semantic_write"
-            )
         output = await _domain_finalize_output(
             domain,
             run,
@@ -3621,10 +3282,6 @@ class CapabilityRuntime:
         )
         output = self._registry.validate_output(capability.id, output)
         _validate_output_execution_scope(run, capability, output)
-        if capability.machine_run_directive_kind is None:
-            await _guard_attempt(
-                task_attempt_guard, capability.id, "before_artifact_commit"
-            )
         drafts = (
             () if output.artifact is None else (output.artifact,)
         ) + output.additional_artifacts
@@ -3641,10 +3298,6 @@ class CapabilityRuntime:
                 raise ToolOutputValidationError(
                     "artifact drafts exceed the per-call byte allowance"
                 )
-            if reserved_artifact_id is not None and len(drafts) != 1:
-                raise ToolOutputValidationError(
-                    "one reserved artifact cannot authorize multiple publications"
-                )
             for draft in drafts:
                 self._validate_artifact_draft(capability, draft)
         refs: list[ArtifactRef] = []
@@ -3657,7 +3310,6 @@ class CapabilityRuntime:
                     call,
                     capability,
                     replace(output, artifact=draft, additional_artifacts=()),
-                    reserved_artifact_id=reserved_artifact_id,
                 )
                 assert ref is not None
                 refs.append(ref)
@@ -3956,11 +3608,6 @@ class CapabilityRuntime:
             arguments=arguments,
             catalog_entry=catalog_entry,
         ):
-            await _guard_attempt(
-                execution.task_attempt_guard,
-                capability.id,
-                "after_approval_before_effect",
-            )
             await self._validate_execution_contracts(run)
             if capability.effect_receipt_policy is not None:
                 current_arguments = await _domain_prepare_call(
@@ -4049,11 +3696,6 @@ class CapabilityRuntime:
                         ToolBatchCertainty.DEFINITE,
                     )
             if capability.effect_receipt_policy is not None:
-                await _guard_attempt(
-                    execution.task_attempt_guard,
-                    capability.id,
-                    "before_effect_reservation",
-                )
                 if dispatch is not None:
                     # Reservation starts the receipt-owned effect boundary.
                     dispatch.started = True
@@ -4284,7 +3926,6 @@ class CapabilityRuntime:
         await store.start_effect_receipt(
             receipt,
             grant=grant,
-            task_attempt_guard=execution.task_attempt_guard,
             max_receipts_per_run=min(self._limits.max_tool_calls_per_run, 256),
         )
         execution = replace(execution, effect_receipt_id=receipt.receipt_id)
@@ -4294,43 +3935,11 @@ class CapabilityRuntime:
         # Storage failures still reach the execution owner, but only after the
         # reserved receipt is finished so it cannot stay STARTED in-process.
         storage_error: StorageError | None = None
-        reservation_guard_error: BaseException | None = None
-        try:
-            await _guard_attempt(
-                execution.task_attempt_guard,
-                capability.id,
-                "after_effect_reservation_before_dispatch",
-            )
-        except BaseException as error:
-            reservation_guard_error = error
-        if reservation_guard_error is not None and not isinstance(
-            reservation_guard_error, asyncio.CancelledError
-        ):
-            observation = EffectObservation(
-                EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
-            )
-            if isinstance(reservation_guard_error, StorageError):
-                storage_error = reservation_guard_error
-                result = _error(
-                    call,
-                    "effect_not_dispatched",
-                    "The effect attempt could not be revalidated before dispatch.",
-                    {"execution_disposition": "not_dispatched"},
-                )
-            else:
-                result = _with_execution_disposition(
-                    self._exception_result(call, reservation_guard_error, domain),
-                    "not_dispatched",
-                )
-        elif reservation_guard_error is not None or (
+        if (
             active_task is not None
             and active_task.cancelling() > cancellations_before_reservation
         ):
-            interruption = (
-                _cancel_interruption(reservation_guard_error)
-                if isinstance(reservation_guard_error, asyncio.CancelledError)
-                else ToolBatchInterruption.CANCELLED
-            )
+            interruption = ToolBatchInterruption.CANCELLED
             observation = EffectObservation(
                 EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
             )
@@ -6036,15 +5645,6 @@ def _classified_success(
     )
 
 
-async def _guard_attempt(
-    guard: TaskAttemptGuard | None,
-    capability_id: str,
-    point: str,
-) -> None:
-    if guard is not None:
-        await guard.revalidate(capability_id=capability_id, point=point)
-
-
 def _with_execution_lineage(
     result: ToolResultBlock,
     capability: Capability,
@@ -6266,8 +5866,6 @@ __all__ = [
     "CapabilityDomain",
     "CapabilityFailure",
     "CapabilityRuntime",
-    "InternalCapabilityOutcome",
-    "InternalCapabilityRequest",
     "MachineRunScope",
     "MachineScopeBuilder",
     "RunToolCatalog",

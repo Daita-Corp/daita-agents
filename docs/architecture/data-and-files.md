@@ -73,7 +73,7 @@ and `data_query` is offered only while a source with `SQL_READ` is in scope.
 A run withholds the `data_query` routes no in-scope source can serve: export
 needs a `TABULAR_EXPORT` source and `path_pattern` needs the session folder.
 A tool definition describes only the routes its run admits, so scheduled and
-graph runs never read about combined or live-folder queries.
+job runs never read about combined or live-folder queries.
 Inputs read at most an internal, model-invisible
 ceiling (`COMBINED_QUERY_INPUT_MAX_ROWS`/`_BYTES`); an input that reaches it
 refuses the whole call with `combined_input_truncated`, so no join ever sees
@@ -111,7 +111,7 @@ verified zero-mutation evidence. Full request sensitivity must fit the current t
 Research lineage remains model-derived claims, distinct from transaction facts.
 Receipt reservation/finalization stays in CapabilityRuntime. No arbitrary SQL,
 insert-only tool, delete, DDL, chunking, automatic retry or replay is supported.
-Native graph release is limited to these same PostgreSQL update/upsert contracts.
+Machine runs use these same PostgreSQL update/upsert contracts, asking at the time.
 
 ## Local computer files and artifacts
 

@@ -33,7 +33,7 @@ from ..scope import EffectiveSourceScope
 _MIN_TOOL_RESULT_BYTES = 128
 _MIN_TOOL_RESULT_DEPTH = 3
 _MAX_MACHINE_INSTRUCTION_CHARACTERS = 8 * 1_024
-_MAX_MACHINE_PAYLOAD_BYTES = 16 * 1_024
+_MAX_MACHINE_PAYLOAD_BYTES = 64 * 1_024
 
 
 def _required_text(value: str, field_name: str) -> None:
@@ -52,9 +52,17 @@ def _aware(value: datetime, field_name: str) -> None:
 
 class RunOrigin(str, Enum):
     USER = "user"
+    # JOB_EVENT and JOB_TASK are decoded from stored runs only; no new run uses them.
     JOB_EVENT = "job_event"
     JOB_TASK = "job_task"
     SCHEDULED_ROUTINE = "scheduled_routine"
+    JOB = "job"
+    JOB_SUBRUN = "job_subrun"
+
+
+JOB_ORIGINS = frozenset({RunOrigin.JOB, RunOrigin.JOB_SUBRUN})
+# A machine-terminated job run whose context passed the job's threshold.
+CONTEXT_THRESHOLD_REASON = "context_threshold_reached"
 
 
 class InstructionAuthority(str, Enum):
@@ -124,10 +132,10 @@ class RunStartEnvelope:
             ):
                 raise ValueError("job event requires code-owned instruction")
             if (
-                self.origin is RunOrigin.JOB_TASK
+                self.origin in {RunOrigin.JOB_TASK, *JOB_ORIGINS}
                 and self.instruction_authority is not InstructionAuthority.CODE_OWNED
             ):
-                raise ValueError("job task requires code-owned instruction")
+                raise ValueError("job runs require a code-owned instruction")
             for value, name in (
                 (self.trusted_instruction_id, "trusted_instruction_id"),
                 (self.trusted_instruction, "trusted_instruction"),
@@ -157,6 +165,10 @@ class RunStartEnvelope:
                 and self.execution_scope.scope_kind is ExecutionScopeKind.GRAPH_TASK
             ):
                 raise ValueError("graph-task scope is exclusive to job-task runs")
+            if (self.origin in JOB_ORIGINS) != (
+                self.execution_scope.scope_kind is ExecutionScopeKind.JOB
+            ):
+                raise ValueError("a job scope belongs exactly to job runs")
         object.__setattr__(self, "untrusted_payload", payload)
 
     @classmethod
@@ -188,6 +200,8 @@ class RunStartEnvelope:
             RunOrigin.SCHEDULED_ROUTINE: "untrusted_scheduled_routine_payload",
             RunOrigin.JOB_TASK: "untrusted_graph_task_payload",
             RunOrigin.JOB_EVENT: "untrusted_job_event_payload",
+            RunOrigin.JOB: "untrusted_job_payload",
+            RunOrigin.JOB_SUBRUN: "untrusted_job_subrun_payload",
         }[self.origin]
         return CanonicalMessage(
             role=MessageRole.SYSTEM,

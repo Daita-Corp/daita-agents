@@ -142,7 +142,7 @@ writer epoch. Every mutation must validate current ownership in the same short
 transaction as its state change. A stale owner must fail even after a process
 pause, lease expiration, connection replacement, or network partition. Reads by
 run/artifact ID must also remain confined to the admitted agent. Application
-filters, graph-attempt fences, and a connection-pool session lock do not provide
+filters, job revision checks, and a connection-pool session lock do not provide
 these guarantees. Recover only after a successful ownership takeover; connecting
 another worker is not evidence that its predecessor stopped.
 
@@ -168,12 +168,10 @@ starts must settle or expose an unknown outcome before releasing its resources.
 
 Backends must not translate every transport exception into a retryable error.
 SQLite maps busy/locked failures only after a failed read or a completed rollback.
-Graph conflict/budget exceptions retain their old SQLite import aliases.
 
 Supervisors retry known non-commits with capped backoff. Unreconciled unknown
 commits, lost ownership, and unexpected failures stop their driver and cancel
-remaining workers. Existing graph claim/completion paths may reconcile an exact
-persisted result before deciding whether an operation failed. Storage errors must
+remaining workers. Storage errors must
 not become ordinary executor failures eligible for automatic replay.
 `Agent.background_status()` exposes payload-free running/retrying/failed/stopped
 status and code-owned failure codes. Logs and status never include driver error
@@ -182,9 +180,8 @@ host close/open and ownership admission; `wake()` cannot bypass it.
 
 | Operation family | Atomic boundary and replay rules |
 | --- | --- |
-| Graph claim | One winner; attempt token/epoch, active slot and budget reservation agree |
-| Graph completion/mutation | Exact replay is accepted, conflicting content rejected; budgets settle once |
-| Graph finalization | Accepted result, terminal state, budget settlement and delivery commit together |
+| Job update | Compare-and-set on the job's revision; a conflicting writer re-reads and retries |
+| Job finish | Terminal state and the Done delivery commit together |
 | Routine claim/finalization | Occurrence, routine revision, reservation/settlement and delivery stay consistent; stale claim tokens fail |
 | Transcript start | Explicit `predecessor=None` asserts an empty conversation; a supplied predecessor is checked atomically; omission preserves legacy unchecked continuation |
 | Transcript append/completion | Exact ordered positions; final assistant text and terminal result commit together; completion is not an idempotent replay API |
@@ -192,20 +189,17 @@ host close/open and ownership admission; `wake()` cannot bypass it.
 | Effects | Receipt reservation precedes dispatch; terminal observation is immutable; recovery records uncertainty without executing effects |
 | Artifacts | Registry lifecycle transitions use current state; immutable bytes are published before a ready reference; byte I/O occurs outside the transaction |
 
-Graph models, validators, reducers, codecs and the existing domain owners remain
-the semantic authorities. Completion-authority and finalizer-delivery checks now
-live in `jobs/graph/validation.py`. A second backend should reuse these decisions
-and extract remaining pure decisions from transaction code as needed. It must
+Job models, codecs and the existing domain owners remain the semantic
+authorities. A second backend should reuse these decisions and extract
+remaining pure decisions from transaction code as needed. It must
 not copy the SQLite scheduler or introduce a second execution engine. Keep
 cross-domain atomic operations intact when narrowing consumer interfaces.
 
 ## Bounded access
 
-- Graph polling backs off from its responsive interval to one second when no wake
-  arrives. Submissions and worker completion wake it immediately. Error backoff
-  is separate and capped at five seconds, including worker-originated failures.
-- Attempt guards read one consistent job/task/attempt authority snapshot. They
-  do not load graph history, results, events, budgets or unrelated attempts.
+- Job polling runs once a second when no wake arrives. Starting, answering and
+  a finished run wake it immediately. Error backoff is separate and capped at
+  five seconds.
 - `conversation_run_page` returns 1–100 ascending turns after an exclusive
   `after_turn_index` cursor. Continue after the final returned index; an empty
   page ends traversal. Each page uses one read snapshot and batches its messages.
@@ -244,7 +238,7 @@ is SQLite. Downstream pytest plugins can indirectly parameterize
 cases; see [testing](TESTING.md). The cases use logical operations rather than
 concrete store internals. Missing adapter prerequisites must fail qualification.
 
-Coverage includes graph claims/fences/budgets/replay/finalizers, identity and
+Coverage includes job records, identity and
 transcript recovery, passive connection setup, scoped effect recovery, transcript
 pages/access, artifact lifecycle/cursors, and routine authority/claims/budgets/
 recovery/delivery, catalog/permission detach, semantic digest CAS, learning review
@@ -274,9 +268,10 @@ implementation and qualification work.
 
 ## Test reconciliation
 
-The original 31 graph cases moved into the portable suite with all 24 topology
-seeds and assertions retained. SQLite read-snapshot fault injection stays in its
-original suite. Three identity/transcript cases were added in the initial slice.
+The graph transaction cases left with graph jobs; checklist jobs are covered by
+the job-record cases in the portable suite. SQLite read-snapshot fault injection
+stays in its original suite. Three identity/transcript cases were added in the
+initial slice.
 
 Nine existing routine test functions moved into `contracts/test_routines.py`,
 retaining their assertions and all changed-authority parameter values. Their

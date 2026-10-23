@@ -1658,10 +1658,7 @@ def artifact_capability_declarations(
                 load_mode=ToolLoadMode.PINNED,
                 text_trust=ToolTextTrust.CODE,
                 summary="Read a bounded safe preview of one exact agent-owned artifact.",
-                when_to_use=(
-                    "Use with an exact known artifact ID, including one returned by "
-                    "job_read_results."
-                ),
+                when_to_use=("Use with an exact known artifact ID."),
                 keywords=("artifact", "read", "preview", "file"),
             ),
         ),

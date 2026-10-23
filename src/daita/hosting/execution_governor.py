@@ -84,18 +84,18 @@ class WorkloadClass(str, Enum):
     FOREGROUND = "foreground"
     SYSTEM = "system"
     ROUTINE = "routine"
-    GRAPH = "graph"
+    JOB = "job"
 
 
 _BACKGROUND_CLASSES = (
     WorkloadClass.SYSTEM,
     WorkloadClass.ROUTINE,
-    WorkloadClass.GRAPH,
+    WorkloadClass.JOB,
 )
 _BACKGROUND_WEIGHTS = {
     WorkloadClass.SYSTEM: 8,
     WorkloadClass.ROUTINE: 3,
-    WorkloadClass.GRAPH: 2,
+    WorkloadClass.JOB: 2,
 }
 _AGING_QUANTUM_SECONDS = 30.0
 _MAX_AGING_QUANTA = 4

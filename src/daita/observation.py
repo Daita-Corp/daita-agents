@@ -156,7 +156,7 @@ class PrivateDiagnosticSink:
     """Append payload-free run diagnostics to one private local JSONL file.
 
     The host enables it with one explicit path and attaches it where it builds
-    the loop and runtime, so foreground, routine and graph-task runs all reach
+    the loop and runtime, so foreground, routine and job runs all reach
     it. It is an observer: it cannot affect execution, and its failures are
     swallowed like any observer's. Records are never stored in the agent home.
     """

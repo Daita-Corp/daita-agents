@@ -29,9 +29,9 @@ foreground external effects. Read-only investigation and receipt inspection
 remain available. If terminal evidence cannot be persisted, the current host
 blocks further effects; reopen the agent to recover the reserved receipt.
 
-An uncertain routine effect pauses the routine. In a graph job, an effect that
-cannot be joined to an accepted task result opens an `effect_uncertain` control
-and blocks that task and its descendants. Neither path replays the action.
+An uncertain routine effect pauses the routine. An uncertain job effect holds
+the job as Needs you; resolving its last uncertain receipt lets it continue.
+Neither path replays the action.
 
 The Python control plane provides bounded inspection and explicit recovery:
 

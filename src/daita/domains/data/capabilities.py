@@ -711,7 +711,7 @@ class RelationalUpdateDeclarations:
 
 
 DATA_QUERY_MAX_STATEMENTS = 8
-# Resource safety ceiling for one foreground read; graph tasks keep their own.
+# Resource safety ceiling for one foreground read; job runs keep their own.
 DATA_QUERY_MAX_RESOURCES = 64
 DATA_QUERY_MAX_ROWS = 100
 DATA_QUERY_MAX_BYTES = 16_384

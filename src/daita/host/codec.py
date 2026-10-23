@@ -75,31 +75,7 @@ from ..distribution.models import (
 from ..errors import ErrorRetryability, StateCompatibilityCode
 from ..hosting.home_upgrade import AgentHomeStatus
 from ..hosting.sources import SourceEditPreview, SourceEditResult
-from ..jobs.graph.models import (
-    BudgetLedger,
-    GraphEvent,
-    GraphInspection,
-    GraphJob,
-    GraphMutation,
-    GraphState,
-    GraphTask,
-    JobGraph,
-    TaskAttempt,
-    TaskCheckpoint,
-    TaskComment,
-    TaskControl,
-    TaskDependency,
-    TaskResult,
-    TaskState,
-)
-from ..jobs.owner import GraphBlockerProjection
-from ..jobs.projections import (
-    DependencyProjection,
-    GraphBoardProjection,
-    GraphDiagnostics,
-    GraphTimelinePage,
-    KanbanColumn,
-)
+from ..jobs.models import Job, JobState
 from ..llm.models import (
     CanonicalMessage,
     ModelProfile,
@@ -169,28 +145,7 @@ from ..storage.sqlite_codecs.artifacts import (
     encode_delivery_receipt,
 )
 from ..storage.sqlite_codecs.common import JsonValue, dump_payload, load_payload
-from ..storage.sqlite_codecs.graph import (
-    decode_graph_job,
-    decode_graph_mutation,
-    decode_graph_task,
-    decode_job_graph,
-    decode_task_attempt,
-    decode_task_checkpoint,
-    decode_task_comment,
-    decode_task_control,
-    decode_task_dependency,
-    decode_task_result,
-    encode_graph_job,
-    encode_graph_mutation,
-    encode_graph_task,
-    encode_job_graph,
-    encode_task_attempt,
-    encode_task_checkpoint,
-    encode_task_comment,
-    encode_task_control,
-    encode_task_dependency,
-    encode_task_result,
-)
+from ..storage.sqlite_codecs.jobs import decode_job, encode_job
 from ..storage.sqlite_records import (
     EffectReceipt,
     EffectResolutionDecision,
@@ -564,7 +519,7 @@ for _enum in (
     DestinationAvailability,
     EffectResolutionDecision,
     ErrorRetryability,
-    GraphState,
+    JobState,
     LocalFileAccess,
     MCPAuthenticationMode,
     MCPCompletionSemantics,
@@ -581,7 +536,6 @@ for _enum in (
     Sensitivity,
     SourceReadMode,
     StateCompatibilityCode,
-    TaskState,
     WorkColumn,
     WorkKind,
 ):
@@ -595,16 +549,7 @@ _register_stored(EffectReceipt, encode_receipt, decode_receipt)
 _register_stored(
     SemanticAnnotation, encode_semantic_annotation, decode_semantic_annotation
 )
-_register_stored(GraphJob, encode_graph_job, decode_graph_job)
-_register_stored(JobGraph, encode_job_graph, decode_job_graph)
-_register_stored(GraphTask, encode_graph_task, decode_graph_task)
-_register_stored(TaskDependency, encode_task_dependency, decode_task_dependency)
-_register_stored(TaskAttempt, encode_task_attempt, decode_task_attempt)
-_register_stored(TaskResult, encode_task_result, decode_task_result)
-_register_stored(TaskCheckpoint, encode_task_checkpoint, decode_task_checkpoint)
-_register_stored(TaskComment, encode_task_comment, decode_task_comment)
-_register_stored(TaskControl, encode_task_control, decode_task_control)
-_register_stored(GraphMutation, encode_graph_mutation, decode_graph_mutation)
+_register_stored(Job, encode_job, decode_job)
 _register_stored(
     ScheduledRoutine,
     encode_scheduled_routine,
@@ -649,7 +594,6 @@ for _record in (
     ApprovalRequest,
     ArtifactDestination,
     ArtifactPayload,
-    BudgetLedger,
     CalendarSchedule,
     CatalogResource,
     CatalogSummary,
@@ -657,16 +601,8 @@ for _record in (
     ConversationRun,
     DeliveryInspection,
     DeliveryView,
-    DependencyProjection,
     FolderSource,
-    GraphBlockerProjection,
-    GraphBoardProjection,
-    GraphDiagnostics,
-    GraphEvent,
-    GraphInspection,
-    GraphTimelinePage,
     IntervalSchedule,
-    KanbanColumn,
     LocalWorkspace,
     MCPAuthentication,
     MCPBindingStatus,

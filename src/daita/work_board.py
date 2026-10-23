@@ -14,7 +14,7 @@ from .distribution.models import (
     DeliveryView,
     OutcomeState,
 )
-from .jobs.graph.models import GraphJob, GraphState
+from .jobs.models import Job, JobState
 from .routines.models import (
     ACTIVE_OCCURRENCE_DISPOSITIONS,
     RoutineOccurrence,
@@ -140,30 +140,38 @@ class WorkBoard:
         _utc(self.generated_at, "work board generated_at")
 
 
-def _job_card(job: GraphJob, now: datetime, done_window: timedelta) -> WorkCard | None:
+def _job_card(job: Job, now: datetime, done_window: timedelta) -> WorkCard | None:
+    done, total = job.progress
+    progress = f"{done} of {total} done" if total else ""
     started_at: datetime | None = None
-    summary = ""
-    if job.state is GraphState.QUEUED:
-        column = WorkColumn.SCHEDULED
-    elif job.state in {GraphState.ACTIVE, GraphState.CANCEL_REQUESTED}:
+    if job.state is JobState.RUNNING:
         column, started_at = WorkColumn.RUNNING, job.created_at
-    elif job.state is GraphState.BLOCKED:
-        column, summary = WorkColumn.NEEDS_YOU, "Waiting for you"
-    elif job.state is GraphState.NEEDS_ATTENTION:
-        column, summary = WorkColumn.NEEDS_YOU, "Needs your attention"
-    elif job.state is GraphState.FAILED:
-        if now - (job.terminal_at or job.updated_at) > FAILED_JOB_WINDOW:
+        running = len(job.running_delegations)
+        activity = f"{running} sub-run{'s' if running != 1 else ''} running"
+        summary = " · ".join(
+            item for item in (progress, activity if running else "") if item
+        )
+    elif job.state is JobState.WAITING_FOR_YOU:
+        column, summary = WorkColumn.NEEDS_YOU, job.question or ""
+    elif job.state is JobState.FAILED:
+        if now - job.updated_at > FAILED_JOB_WINDOW:
             return None
-        column, summary = WorkColumn.NEEDS_YOU, job.failure_code or ""
+        column = WorkColumn.NEEDS_YOU
+        summary = (
+            job.final_summary
+            if job.failure_code == "job_upgraded" and job.final_summary
+            else job.failure_code or ""
+        )
     else:
-        if now - (job.terminal_at or job.updated_at) > done_window:
+        if now - job.updated_at > done_window:
             return None
         column = WorkColumn.DONE
+        summary = job.final_summary or progress
     return WorkCard(
         kind=WorkKind.JOB,
         id=job.job_id,
         column=column,
-        title=_bounded(job.specification.objective, MAX_WORK_CARD_TITLE_CHARACTERS),
+        title=_bounded(job.objective, MAX_WORK_CARD_TITLE_CHARACTERS),
         status=job.state.value,
         summary=_bounded(summary, MAX_WORK_CARD_SUMMARY_CHARACTERS),
         updated_at=job.updated_at,
@@ -241,7 +249,7 @@ def _sort_key(card: WorkCard) -> tuple[object, ...]:
 
 def project_work_board(
     *,
-    jobs: Iterable[GraphJob],
+    jobs: Iterable[Job],
     routines: Iterable[ScheduledRoutineSummary],
     active_occurrences: Iterable[RoutineOccurrence],
     result_occurrences: Iterable[RoutineOccurrence],
@@ -255,7 +263,7 @@ def project_work_board(
     if not isinstance(done_window, timedelta) or done_window <= timedelta(0):
         raise ValueError("work board done window must be positive")
 
-    latest_jobs: dict[str, GraphJob] = {}
+    latest_jobs: dict[str, Job] = {}
     for job in jobs:
         current = latest_jobs.get(job.job_id)
         if current is None or job.updated_at > current.updated_at:

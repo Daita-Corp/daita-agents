@@ -22,7 +22,8 @@ class HostCapacityLimits:
     foreground_execution_reserve: int = 1
     provider_capacity: int = 2
     foreground_provider_reserve: int = 1
-    graph_parallelism: int = 1
+    # Sub-runs of one agent's jobs that execute at once.
+    job_parallelism: int = 2
     postgresql_read_capacity: int = 2
     sqlite_pressure_capacity: int = 4
 
@@ -30,7 +31,7 @@ class HostCapacityLimits:
         for name, ceiling in (
             ("execution_capacity", 16),
             ("provider_capacity", 8),
-            ("graph_parallelism", 4),
+            ("job_parallelism", 4),
             ("postgresql_read_capacity", 8),
             ("sqlite_pressure_capacity", 4),
         ):

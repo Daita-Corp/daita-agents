@@ -69,8 +69,8 @@ For bounded mode, the workspace and agent-state roots must not overlap in either
 direction, and filesystem root/home cannot be the workspace. Computer mode can
 use home or a directory that contains private state, but direct state access is
 rejected and broad searches prune state subtrees. Hosted compositions have no
-session folder source and no folder source type, and scheduled routines, graph
-tasks, and other machine-originated runs never receive the session folder
+session folder source and no folder source type, and scheduled routines, job
+runs, and other machine-originated runs never receive the session folder
 source.
 
 `Agent.session_source_id` is the session folder source's stable ID. It is never
@@ -184,7 +184,7 @@ session folder. Discovery is bounded; a folder with more data files than the
 limit, or too slow to finish within the discovery budget, is cataloged up to it
 and its catalog sync is marked truncated. `catalog_search` finds files by name
 or column, and declared catalog links can join a file to a database table.
-Scheduled routines and graph jobs can read an attached folder they are granted.
+Scheduled routines and background jobs can read an attached folder in their scope.
 
 An attached folder answers only for its readable cataloged files. `file_search`
 and `file_read` reach them by root-relative path; `data_query` takes their

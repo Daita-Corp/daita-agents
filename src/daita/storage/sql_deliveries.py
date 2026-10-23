@@ -5,21 +5,11 @@ from __future__ import annotations
 from ..distribution.models import MAX_DELIVERIES_PER_AGENT, DeliveryState
 from .sql_connection import SQLConnection
 
-# Oldest first. Job records stay authoritative for job results and for notices
-# on jobs no longer waiting on the user; unacknowledged routine results stay.
+# Oldest first. A job's record keeps its result, so its Done delivery can go
+# before an unacknowledged routine result.
 _RECLAIMABLE_DELIVERIES: tuple[tuple[str, tuple[object, ...]], ...] = (
     ("state = ?", (DeliveryState.ACKNOWLEDGED.value,)),
-    ("subject_kind = 'graph_job'", ()),
-    (
-        """subject_kind = 'graph_attention' AND NOT EXISTS (
-               SELECT 1 FROM job_runs
-               WHERE job_runs.agent_id = deliveries.agent_id
-                 AND substr(deliveries.subject_id, 1, length(job_runs.job_id) + 1)
-                     = job_runs.job_id || '/'
-                 AND job_runs.state IN ('blocked', 'needs_attention')
-           )""",
-        (),
-    ),
+    ("subject_kind = 'job'", ()),
 )
 
 

@@ -37,7 +37,7 @@ unit/integration directory hierarchy.
 
 The bounded public-composition campaign uses controlled model responses, three
 local SQLite fixtures and the real native Python worker when its pinned runtime
-is available. It checks values, artifact hashes, conversation order, graph
+is available. It checks values, artifact hashes, conversation order, run
 completion and native cleanup independently of the scripted answer. Scripted
 models establish execution behavior; they provide no model-quality evidence.
 
@@ -74,7 +74,7 @@ with the composition; no telemetry or agent-home format change is introduced.
 Per-call diagnostics show where a run's tokens went. Pass `diagnostics_path` to
 `Agent.create`, `Agent.open` or `Agent.from_storage` (or `--diagnostics-path` to
 `daita run` and `daita host`) to append payload-free JSONL records for foreground,
-routine and graph-task runs. The path must be absolute and outside any directory
+routine and job runs. The path must be absolute and outside any directory
 holding a `pyproject.toml`; the file is created `0600` and never followed through a
 symlink. `model.completed` and `model.failed` carry one record per physical router
 attempt (outcome, retry, duration, usage or an explicit unavailable reason such as
@@ -240,6 +240,13 @@ asks a real model for the example one-time routine and checks one
 `DAITA_CONTRACT_MODEL_ID` and, under API billing, its key with
 `DAITA_CONTRACT_LLM_API_KEY`.
 
+The background-job cases (`tests/live/jobs/test_jobs.py`) show a real model
+finishing a two-part job through `checklist_write` and `delegate`, a job that
+resumes after a restart, and a job that performs one approved write against
+the simulated PostgreSQL fixture. Enable them with `DAITA_RUN_LIVE_JOBS=1`;
+choose the model with `DAITA_LIVE_JOBS_MODEL_ID` and, under API billing, its key
+with `DAITA_LIVE_JOBS_LLM_API_KEY`.
+
 ### Subscription-billed live runs
 
 Live suites bill API keys by default. Every live model suite can instead run its
@@ -266,10 +273,10 @@ A missing login fails the run; it never falls back to API billing.
 Subscription responses are unpriced, and Daita refuses unpriced requests under a
 dollar cap, so subscription runs drop only the dollar cap and keep their step,
 token and wall-time limits. Token limits are checked after each returned
-response, so a run can exceed its token limit by at most one response. Graph
-tasks, background jobs and routines run too: graph tasks are bounded by turns,
-tokens, time and attempts, and subscription routines are admitted without dollar
-ceilings. Dollar-cost assertions run only under API billing; pricing arithmetic
+response, so a run can exceed its token limit by at most one response.
+Background jobs and routines run too: each job run keeps its turn, token and time
+limits and a job its run-count and total-token limits, and subscription routines
+and jobs are admitted without dollar ceilings. Dollar-cost assertions run only under API billing; pricing arithmetic
 and dollar-cap admission are covered by the deterministic `tests/llm` suite.
 
 Reports from subscription runs record `api_equivalent_cost`: reported tokens

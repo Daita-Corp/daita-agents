@@ -1,45 +1,23 @@
-"""Export the current durable adaptive task-graph records."""
+"""Background jobs: ordinary agent runs that keep going from a saved checklist."""
 
-from .graph.models import (
-    ControlKind,
-    ControlState,
-    GraphInspection,
-    GraphJob,
-    GraphState,
-    GraphTask,
-    TaskAttempt,
-    TaskCheckpoint,
-    TaskControl,
-    TaskDependency,
-    TaskResult,
-    TaskRole,
-    TaskState,
-)
-from .projections import (
-    DependencyProjection,
-    GraphBoardProjection,
-    GraphDiagnostics,
-    GraphTimelinePage,
-    KanbanColumn,
+from .models import (
+    ChecklistItem,
+    ChecklistStatus,
+    Delegation,
+    DelegationState,
+    Job,
+    JobError,
+    JobState,
+    UserAnswer,
 )
 
 __all__ = [
-    "ControlKind",
-    "ControlState",
-    "DependencyProjection",
-    "GraphBoardProjection",
-    "GraphDiagnostics",
-    "GraphInspection",
-    "GraphJob",
-    "GraphState",
-    "GraphTask",
-    "GraphTimelinePage",
-    "KanbanColumn",
-    "TaskAttempt",
-    "TaskCheckpoint",
-    "TaskControl",
-    "TaskDependency",
-    "TaskResult",
-    "TaskRole",
-    "TaskState",
+    "ChecklistItem",
+    "ChecklistStatus",
+    "Delegation",
+    "DelegationState",
+    "Job",
+    "JobError",
+    "JobState",
+    "UserAnswer",
 ]

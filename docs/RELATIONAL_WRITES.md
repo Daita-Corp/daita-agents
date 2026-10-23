@@ -43,8 +43,8 @@ Four independent controls must all permit an update:
    pass Daita's non-mutating checks.
 4. **Exact authority:** foreground writes need approval of the current-run
    previewed call. Routines need an approved revision with one native write
-   grant and one invocation per occurrence. An effectful graph job needs
-   foreground approval and an exact grant for its initial task.
+   grant and one invocation per occurrence. A background job's write asks a
+   person at the time, like any machine-run write.
 
 The model cannot enable source permissions, grant database privileges, or
 approve its own update.

@@ -53,15 +53,7 @@ from daita.host import service
 from daita.host.client import RemoteAgent
 from daita.host.paths import host_paths
 from daita.host.settings import read_setting, write_setting
-from daita.jobs import (
-    GraphBoardProjection,
-    GraphInspection,
-    GraphJob,
-    GraphTask,
-    GraphTimelinePage,
-    TaskControl,
-    TaskResult,
-)
+from daita.jobs import Job
 from daita.llm import ModelSensitivity
 from daita.llm.models import ToolCall, ToolResultBlock
 from daita.llm.provider_definitions import SUBSCRIPTION_CLIENTS
@@ -620,7 +612,7 @@ class PresentationController:
         # Matches this controller's AgentConfig(): built-in types only.
         return SourceTypeRegistry().types()
 
-    async def list_jobs(self) -> tuple[GraphJob, ...]:
+    async def list_jobs(self) -> tuple[Job, ...]:
         return await self.require_agent().list_jobs(limit=50)
 
     async def work_board(self) -> WorkBoard:
@@ -654,155 +646,14 @@ class PresentationController:
     async def acknowledge_delivery(self, delivery_id: str) -> DeliveryView | None:
         return await self.require_agent().acknowledge_delivery(delivery_id)
 
-    async def inspect_job(self, job_id: str) -> GraphInspection | None:
+    async def inspect_job(self, job_id: str) -> Job | None:
         return await self.require_agent().inspect_job(job_id)
 
-    async def job_board(self, job_id: str) -> GraphBoardProjection | None:
-        return await self.require_agent().job_board(job_id)
+    async def answer_job(self, job_id: str, text: str) -> Job:
+        return await self.require_agent().answer_job(job_id, text)
 
-    async def job_timeline(
-        self,
-        job_id: str,
-        *,
-        after_event_id: int = 0,
-        limit: int = 100,
-    ) -> GraphTimelinePage | None:
-        return await self.require_agent().job_timeline(
-            job_id,
-            after_event_id=after_event_id,
-            limit=limit,
-        )
-
-    async def inspect_job_task(self, job_id: str, task_id: str) -> GraphTask | None:
-        return await self.require_agent().inspect_job_task(job_id, task_id)
-
-    async def read_job_result(self, job_id: str) -> TaskResult | None:
-        return await self.require_agent().read_job_result(job_id)
-
-    async def cancel_job(self, job_id: str) -> GraphJob | None:
+    async def cancel_job(self, job_id: str) -> Job | None:
         return await self.require_agent().cancel_job(job_id)
-
-    async def answer_job_input(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        answer: dict[str, object],
-        idempotency_key: str,
-    ) -> TaskControl | None:
-        inspection = await self._owned_job(job_id)
-        return await self.require_agent().answer_task_input(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=inspection.job.specification.principal_id,
-            answer=answer,
-            idempotency_key=idempotency_key,
-        )
-
-    async def accept_job_review(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        rationale: str,
-        idempotency_key: str,
-    ) -> TaskResult:
-        inspection = await self._owned_job(job_id)
-        return await self.require_agent().accept_task_review(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=inspection.job.specification.principal_id,
-            rationale=rationale,
-            idempotency_key=idempotency_key,
-        )
-
-    async def request_job_review_changes(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        rationale: str,
-        replacement_guidance: str,
-        idempotency_key: str,
-    ) -> TaskControl:
-        inspection = await self._owned_job(job_id)
-        return await self.require_agent().request_task_review_changes(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=inspection.job.specification.principal_id,
-            rationale=rationale,
-            replacement_guidance=replacement_guidance,
-            idempotency_key=idempotency_key,
-        )
-
-    async def retry_job_control(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        advisory_note: str,
-        idempotency_key: str,
-    ) -> TaskControl | None:
-        inspection = await self._owned_job(job_id)
-        return await self.require_agent().retry_task_control(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=inspection.job.specification.principal_id,
-            advisory_note=advisory_note,
-            idempotency_key=idempotency_key,
-        )
-
-    async def reject_job_control(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        reason: str,
-        idempotency_key: str,
-    ) -> TaskControl | None:
-        inspection = await self._owned_job(job_id)
-        return await self.require_agent().reject_task_control(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=inspection.job.specification.principal_id,
-            reason=reason,
-            idempotency_key=idempotency_key,
-        )
-
-    async def replace_job_task(
-        self,
-        job_id: str,
-        task_id: str,
-        *,
-        advisory_note: str,
-        idempotency_key: str,
-        expected_revision: int,
-    ) -> object:
-        inspection = await self._owned_job(job_id)
-        return await self.require_agent().replace_graph_task_by_policy(
-            job_id,
-            task_id,
-            principal_id=inspection.job.specification.principal_id,
-            advisory_note=advisory_note,
-            idempotency_key=idempotency_key,
-            expected_revision=expected_revision,
-        )
-
-    async def _owned_job(self, job_id: str) -> GraphInspection:
-        inspection = await self.require_agent().inspect_job(job_id)
-        if inspection is None:
-            raise ValueError("No durable job with that ID belongs to this agent.")
-        return inspection
 
     async def list_routines(self) -> tuple[ScheduledRoutineSummary, ...]:
         return await self.require_agent().list_routines(limit=50)

@@ -26,7 +26,7 @@ from ..catalog.protocols import CatalogStore
 from ..distribution.owner import DistributionStore
 from ..domains.data.catalog import CatalogPermissionStore
 from ..domains.mcp import MCPBindingStore
-from ..jobs.owner import GraphJobStore, GraphSupervisorStore
+from ..jobs.owner import JobStore
 from ..loop.driver import TranscriptStore
 from ..routines.owner import RoutineStore, RoutineSupervisorStore
 from ..semantics import SemanticStore
@@ -41,10 +41,6 @@ if TYPE_CHECKING:
         SourceCatalogSnapshot,
     )
     from ..identity import AgentIdentity
-    from ..jobs.graph.models import (
-        AttemptBudgetReservation,
-        BudgetLedger,
-    )
     from ..loop.analysis import AnalysisEvidence
     from ..loop.models import ConversationRun, LoopExit
     from ..routines.models import RoutineOccurrence
@@ -63,11 +59,10 @@ class StateStore(
     DistributionStore,
     CatalogPermissionStore,
     MCPBindingStore,
-    GraphJobStore,
+    JobStore,
     TranscriptStore,
     RoutineStore,
     SemanticStore,
-    GraphSupervisorStore,
     RoutineSupervisorStore,
     Protocol,
 ):
@@ -89,14 +84,6 @@ class StateStore(
         *,
         proof_disposed: bool = False,
     ) -> AnalysisEvidence: ...
-
-    async def list_graph_budget_ledgers(
-        self, agent_id: str, job_id: str
-    ) -> tuple[BudgetLedger, ...]: ...
-
-    async def list_graph_attempt_reservations(
-        self, agent_id: str, job_id: str, task_id: str, attempt_id: str
-    ) -> tuple[AttemptBudgetReservation, ...]: ...
 
     async def close(self) -> None: ...
 
@@ -165,10 +152,6 @@ class StateStore(
         limit: int = ...,
         offset: int = ...,
         caller_principal_id: str | None = ...,
-    ) -> tuple[EffectReceipt, ...]: ...
-
-    async def list_effect_receipts_for_graph_attempt(
-        self, agent_id: str, job_id: str, task_id: str, attempt_id: str
     ) -> tuple[EffectReceipt, ...]: ...
 
     async def resolve_effect_receipt(

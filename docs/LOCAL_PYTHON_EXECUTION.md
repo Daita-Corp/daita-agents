@@ -34,7 +34,7 @@ there is one computation permit and one separately reserved parser permit. Each
 resident worker retains its finite memory and scratch reservation while suspended;
 parsers have an independent reservation and cannot be crowded out by residency.
 Changing any capacity requires the host to drain and reopen. Computation remains
-run-local, and raising host capacity does not admit Python into graph jobs.
+run-local; job runs use the same per-run lifecycle as routines.
 
 ## Cells and read tools
 
@@ -309,7 +309,7 @@ Reopen joins those facts to the abandoned run, removes only authenticated owned
 remnants and terminalizes once without replay. Unknown termination, changed
 remnant identity or failed deletion prevents successful acceptance and replacement.
 Exactly admitted local routines share this lifecycle and their frozen read scope.
-Graph tasks, hosted or remote execution and cross-run interpreter caches remain
+Hosted or remote execution and cross-run interpreter caches remain
 unavailable.
 
 See [testing instructions](TESTING.md#local-python-live-acceptance) for the

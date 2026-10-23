@@ -16,8 +16,9 @@ sole current runnable format; legacy decoders remain migration-only.
 
 ## State boundary, migrations and releases
 
-`daita.storage.sql.SQLStateStore` owns shared state operations and `sql_graph`
-owns graph transactions. The default SQLite adapter implements the supported
+`daita.storage.sql.SQLStateStore` owns shared state operations; `sql_jobs`
+and `sql_routines` hold the job and routine transitions it runs inside its
+transactions. The default SQLite adapter implements the supported
 `SQLDatabase` connection boundary. Custom adapters reuse these operations and
 strict codecs, with no copied state-transition logic. `run_sql_transaction` is
 the shared cancellation-safe transaction owner for adapter administrative writes.
@@ -108,7 +109,9 @@ scopes, and detach revokes both scope families atomically.
 All state mutation must be atomic and cancellation-safe, and there is never a
 second writer around an agent's SQLite state (invariants in `AGENTS.md`). Today
 there is no event sourcing, replay projection or second state abstraction; adding
-one is an architecture change. The normalized graph records, bounded task
-checkpoints and comments, and the audit event cursor in the current schema are
-current state, not an event-sourced replay system, and they stay behind
-`SQLiteStateStore`.
+one is an architecture change. A job is one row in the `jobs` table: its
+checklist, delegations and answers live in the record, which is current state
+compared-and-set by revision, not an event log, and it stays behind
+`SQLiteStateStore`. Revision 4 replaced the task-graph tables with it; the
+frozen graph records and `storage/sqlite_graph.py` remain only because the
+released revision-2 conversion imports them.

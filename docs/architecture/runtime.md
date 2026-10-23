@@ -96,8 +96,9 @@ one `RunSessionWriter`; the writer alone starts, appends to and terminates that 
 transcript with exact ordering and conversation-predecessor binding. The coordinator
 owns bounded execution admission, keyed conversation ordering, provider admission
 and shutdown drain. Compatibility defaults are five executions, two provider
-requests, strict foreground reserves of one, one graph task, two PostgreSQL reads
-per source and four SQLite-pressure permits. Host capacity is runtime configuration,
+requests, strict foreground reserves of one, two job sub-runs per agent, two
+PostgreSQL reads per source and four SQLite-pressure permits. Job main runs take
+a `WorkloadClass.JOB` lease; their sub-runs run inside it. Host capacity is runtime configuration,
 not execution authority. SQLite sources and MCP bindings remain capacity one;
 analysis retains one computation lane and an independent parser lane. A
 combined `data_query` holds each distinct input source's permit once, acquired
@@ -169,17 +170,20 @@ root's `machine_run_scope` builds it: the routine's or job's named sources, or
 every current source when none are named, never the live session folder; every
 readable resource of those sources; every registered capability except the
 machine-run exclusions in `hosting/embedded.py` (creating, changing or running
-routines and jobs, and the graph task tools outside graph task runs); every
-admitted MCP binding; and all access modes and effects. The routine or job
-record still supplies the scope's model routes, sensitivity ceiling, per-run
-budgets and distribution-plan digest. Scheduled instructions are
-foreground-authorized content; job-event instructions are code-owned. Untrusted
+routines and jobs, and the job-run tools outside a job's main run); every
+admitted MCP binding; and all access modes and effects. The agent's current
+model routes and normal run limits bound it. A job sub-run's scope is its main
+run's, narrowed to the sources it names and without the job-run tools.
+Scheduled instructions are foreground-authorized content; job instructions are
+code-owned. Untrusted
 payloads and model text cannot enlarge the scope. `contract_bindings` retains
 the exact capability, MCP-origin, resource-structure and model-configuration
 digests read at start, so a change during the run fails the call rather than
-widening it. Every current scope states `JOB_EVENT`, `SCHEDULED_ROUTINE` or
-`GRAPH_TASK`; only the revision-1 migration decoder may infer an omitted legacy
-kind. Local hints and refresh timestamps are presentation/freshness facts, not
+widening it. New scopes state `SCHEDULED_ROUTINE` or `JOB`; `JOB_EVENT` and
+`GRAPH_TASK` (with its task binding) are decoded from stored runs only, and
+only the revision-1 migration decoder may infer an omitted legacy kind. Job
+runs and sub-runs are held to the job lane's per-call target ceiling (the
+policy's `graph_*` fields). Local hints and refresh timestamps are presentation/freshness facts, not
 execution authority.
 
 ## Capabilities and execution
@@ -241,17 +245,10 @@ between model tool calls and execution. For each call it:
 `EmbeddedAgent` statically composes these domains: `DataCapabilityDomain`,
 `ArtifactCapabilityDomain`, `AnalysisCapabilityDomain`, `MemoryCapabilityDomain`,
 `SkillCapabilityDomain`, `SemanticCapabilityDomain`, `JobCapabilityDomain`,
-`GraphTaskCapabilityDomain`, `GraphAdmissionCapabilityDomain`,
-`DataProfileCapabilityDomain`, `RoutineCapabilityDomain`,
+`JobRunCapabilityDomain`, `RoutineCapabilityDomain`,
 `DistributionCapabilityDomain`, and the admitted `MCPCapabilityDomain`. The
 composition in `hosting/embedded.py` is the authoritative list. Applicability and current-state checks remain in the concrete
 domain.
-
-`CapabilityRuntime.execute_internal` is the typed code-owned path used by the
-job and routine supervisors. It resolves the same immutable registry contract
-and applies the ordinary validation, execution, artifact, sensitivity,
-provenance, result-bound, and observation rules. It is not a recursive model
-call or a second runtime.
 
 External native data effects and admitted external actions declare an
 `EffectReceiptPolicy`. Effect-free and local management capabilities cannot use
@@ -305,8 +302,8 @@ way; the `ApprovalRequest.requester` names the routine or job so the card can
 say what asked, while the notification text never carries titles or data. A
 denial is an ordinary tool result the model continues from. An interaction
 that expires (24 hours) or is dismissed interrupts the run: a routine
-occurrence or graph task then finishes as failed and shows as *Needs you* on
-the work board. There is no pending-approval record or resume API.
+occurrence then finishes as failed, and a job waits; both show as *Needs you*
+on the work board. There is no pending-approval record or resume API.
 
 Observation is one best-effort callback. It cannot direct execution. Today it is
 not persisted and is not a telemetry, tracing or replay source; durable truth

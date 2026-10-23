@@ -52,21 +52,7 @@ from ..hosting.embedded import (
     SourceEditResult,
 )
 from ..hosting.home_upgrade import AgentHomeStatus
-from ..jobs.graph.models import (
-    GraphInspection,
-    GraphJob,
-    GraphMutation,
-    GraphState,
-    GraphTask,
-    TaskAttempt,
-    TaskCheckpoint,
-    TaskControl,
-    TaskDependency,
-    TaskResult,
-    TaskState,
-)
-from ..jobs.owner import GraphBlockerProjection
-from ..jobs.projections import GraphBoardProjection, GraphTimelinePage
+from ..jobs.models import Job, JobState
 from ..llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
 from ..llm.routing import ModelRoute
 from ..llm.subscription_auth import CodexDevicePrompt
@@ -910,9 +896,9 @@ class RemoteAgent:
     async def list_jobs(
         self,
         *,
-        states: frozenset[GraphState] = frozenset(),
+        states: frozenset[JobState] = frozenset(),
         limit: int = 50,
-    ) -> tuple[GraphJob, ...]:
+    ) -> tuple[Job, ...]:
         return await self._call("list_jobs", locals())
 
     async def inspect_effect(
@@ -942,148 +928,28 @@ class RemoteAgent:
     ) -> EffectReceipt:
         return await self._call("resolve_effect", locals())
 
-    async def inspect_job(self, job_id: str) -> GraphInspection | None:
-        return await self._call("inspect_job", locals())
-
-    async def list_job_tasks(
-        self,
-        job_id: str,
-        *,
-        states: frozenset[TaskState] = frozenset(),
-        limit: int = 64,
-    ) -> tuple[GraphTask, ...]:
-        return await self._call("list_job_tasks", locals())
-
-    async def inspect_job_task(self, job_id: str, task_id: str) -> GraphTask | None:
-        return await self._call("inspect_job_task", locals())
-
-    async def list_job_dependencies(
-        self, job_id: str, *, task_id: str | None = None, limit: int = 100
-    ) -> tuple[TaskDependency, ...]:
-        return await self._call("list_job_dependencies", locals())
-
-    async def list_task_attempts(
-        self, job_id: str, task_id: str, *, limit: int = 3
-    ) -> tuple[TaskAttempt, ...]:
-        return await self._call("list_task_attempts", locals())
-
     async def analysis_usage(
         self, run_id: str, *, caller_principal_id: str | None = None
     ) -> dict[str, object] | None:
         return await self._call("analysis_usage", locals())
 
-    async def read_task_result(self, job_id: str, task_id: str) -> TaskResult | None:
-        return await self._call("read_task_result", locals())
-
-    async def list_task_checkpoints(
-        self, job_id: str, task_id: str, *, limit: int = 8
-    ) -> tuple[TaskCheckpoint, ...]:
-        return await self._call("list_task_checkpoints", locals())
-
-    async def list_task_artifacts(
-        self, job_id: str, *, task_id: str | None = None, limit: int = 64
-    ) -> tuple[str, ...]:
-        return await self._call("list_task_artifacts", locals())
-
-    async def job_timeline(
+    async def start_job(
         self,
-        job_id: str,
+        objective: str,
+        sources: tuple[str, ...] | None = None,
         *,
-        after_event_id: int = 0,
-        limit: int = 100,
-        task_id: str | None = None,
-    ) -> GraphTimelinePage | None:
-        return await self._call("job_timeline", locals())
+        conversation_id: str | None = None,
+    ) -> Job:
+        return await self._call("start_job", locals())
 
-    async def job_board(self, job_id: str) -> GraphBoardProjection | None:
-        return await self._call("job_board", locals())
+    async def inspect_job(self, job_id: str) -> Job | None:
+        return await self._call("inspect_job", locals())
 
-    async def read_job_result(self, job_id: str) -> TaskResult | None:
-        return await self._call("read_job_result", locals())
+    async def answer_job(self, job_id: str, text: str) -> Job:
+        return await self._call("answer_job", locals())
 
-    async def cancel_job(self, job_id: str) -> GraphJob | None:
+    async def cancel_job(self, job_id: str) -> Job | None:
         return await self._call("cancel_job", locals())
-
-    async def graph_blockers(self, job_id: str) -> GraphBlockerProjection | None:
-        return await self._call("graph_blockers", locals())
-
-    async def answer_task_input(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        answer: Mapping[str, object],
-        idempotency_key: str | None = None,
-    ) -> TaskControl | None:
-        return await self._call("answer_task_input", locals())
-
-    async def accept_task_review(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        rationale: str,
-        idempotency_key: str,
-    ) -> TaskResult:
-        return await self._call("accept_task_review", locals())
-
-    async def request_task_review_changes(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        rationale: str,
-        replacement_guidance: str,
-        idempotency_key: str,
-    ) -> TaskControl:
-        return await self._call("request_task_review_changes", locals())
-
-    async def retry_task_control(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        advisory_note: str,
-        idempotency_key: str,
-    ) -> TaskControl | None:
-        return await self._call("retry_task_control", locals())
-
-    async def reject_task_control(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        reason: str,
-        idempotency_key: str | None = None,
-    ) -> TaskControl | None:
-        return await self._call("reject_task_control", locals())
-
-    async def cancel_graph_job(
-        self, job_id: str, *, principal_id: str
-    ) -> GraphJob | None:
-        return await self._call("cancel_graph_job", locals())
-
-    async def replace_graph_task_by_policy(
-        self,
-        job_id: str,
-        task_id: str,
-        *,
-        principal_id: str,
-        advisory_note: str,
-        idempotency_key: str,
-        expected_revision: int,
-    ) -> GraphMutation:
-        return await self._call("replace_graph_task_by_policy", locals())
 
     async def create_routine(
         self,

@@ -80,6 +80,7 @@ from ..capabilities import (
     EffectOutcome,
     ExecutionContractBindings,
     ExecutionContractReader,
+    ExecutionScope,
     ToolView,
 )
 from ..capability_runtime import (
@@ -143,12 +144,6 @@ from ..domains.data import (
 )
 from ..domains.data.catalog import RELATIONAL_WRITE_OPERATIONS
 from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
-from ..domains.data.profile_jobs import (
-    DATA_PROFILE_DOMAIN_OWNER_ID,
-    DataProfileAdmission,
-    DataProfileCapabilityDomain,
-    data_profile_declarations,
-)
 from ..domains.mcp import (
     MCP_DOMAIN_OWNER_ID,
     MCPActivatedBinding,
@@ -158,40 +153,15 @@ from ..domains.mcp import (
 from ..identity import AgentIdentity
 from ..jobs.capabilities import (
     JOB_DOMAIN_OWNER_ID,
+    JOB_RUN_DOMAIN_OWNER_ID,
     JobCapabilityDomain,
+    JobRunCapabilityDomain,
     job_capability_declarations,
+    job_run_capability_declarations,
 )
-from ..jobs.graph.admission import (
-    GRAPH_ADMISSION_DOMAIN_OWNER_ID,
-    GraphAdmissionBuilder,
-    GraphAdmissionCapabilityDomain,
-    RegistryInitialTaskProposalResolver,
-    graph_admission_declarations,
-)
-from ..jobs.graph.capabilities import (
-    GRAPH_TASK_DOMAIN_OWNER_ID,
-    GraphTaskCapabilityDomain,
-    graph_task_capability_declarations,
-)
-from ..jobs.graph.models import (
-    MAX_MODEL_REQUESTS_PER_ATTEMPT,
-    TERMINAL_GRAPH_STATES,
-    GraphAdmission,
-    GraphInspection,
-    GraphJob,
-    GraphMutation,
-    GraphState,
-    GraphTask,
-    TaskAttempt,
-    TaskCheckpoint,
-    TaskControl,
-    TaskDependency,
-    TaskResult,
-    TaskState,
-)
-from ..jobs.owner import GraphBlockerProjection, JobOwner
-from ..jobs.projections import GraphBoardProjection, GraphTimelinePage
-from ..jobs.supervisor import JobSupervisor
+from ..jobs.models import LIVE_JOB_STATES, TERMINAL_JOB_STATES, Job, JobState
+from ..jobs.owner import JobOwner
+from ..jobs.supervisor import JobRunExecutor, JobSupervisor
 from ..llm.models import (
     CanonicalMessage,
     ModelCallPolicy,
@@ -225,7 +195,12 @@ from ..loop.models import (
     RunOrigin,
     Transcript,
 )
-from ..loop.session import RunSession, RunSessionEvidence, RunSessionOptions
+from ..loop.session import (
+    RunCancellationToken,
+    RunSession,
+    RunSessionEvidence,
+    RunSessionOptions,
+)
 from ..loop.transcripts import ConversationPredecessor, RunSessionWriter
 from ..memory import MemoryStore
 from ..memory.capabilities import (
@@ -357,6 +332,7 @@ from .errors import (
 )
 from .execution_governor import (
     AdmissionClosedError,
+    AdmissionLease,
     CoordinatorDiagnostics,
     RunAdmissionCoordinator,
     WorkloadClass,
@@ -413,26 +389,18 @@ async def _relational_upsert_readiness(
 
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_DISCOVERED_AGENTS = 100
-_LIVE_JOB_STATES = frozenset(GraphState) - TERMINAL_GRAPH_STATES
 # Scheduled and job runs may use every capability except these owners'
 # (invariant 6): creating, changing or running routines and jobs stays with a
 # person. Local computer files are excluded by scope: no session folder.
-MACHINE_RUN_EXCLUDED_OWNERS = frozenset(
-    {
-        ROUTINE_DOMAIN_OWNER_ID,
-        JOB_DOMAIN_OWNER_ID,
-        GRAPH_ADMISSION_DOMAIN_OWNER_ID,
-        DATA_PROFILE_DOMAIN_OWNER_ID,
-    }
-)
+MACHINE_RUN_EXCLUDED_OWNERS = frozenset({ROUTINE_DOMAIN_OWNER_ID, JOB_DOMAIN_OWNER_ID})
 
 
 def machine_run_excluded_owners(origin: RunOrigin) -> frozenset[str]:
-    """The exclusions for one run; graph task tools serve graph task runs only."""
+    """The exclusions for one run; only a job's main run gets the job-run tools."""
 
-    if origin is RunOrigin.JOB_TASK:
+    if origin is RunOrigin.JOB:
         return MACHINE_RUN_EXCLUDED_OWNERS
-    return MACHINE_RUN_EXCLUDED_OWNERS | {GRAPH_TASK_DOMAIN_OWNER_ID}
+    return MACHINE_RUN_EXCLUDED_OWNERS | {JOB_RUN_DOMAIN_OWNER_ID}
 
 
 _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
@@ -574,9 +542,7 @@ class EmbeddedAgent:
         routine_owner: RoutineOwner,
         routine_supervisor: RoutineSupervisor,
         job_supervisor: JobSupervisor,
-        data_profile_admission: DataProfileAdmission,
         execution_contract_reader: ExecutionContractReader,
-        data_profile_job_domain: DataProfileCapabilityDomain,
         semantic_domain: SemanticCapabilityDomain,
         memory_store: MemoryStore,
         skill_store: SkillStore,
@@ -645,9 +611,7 @@ class EmbeddedAgent:
         self._routine_owner = routine_owner
         self._routine_supervisor = routine_supervisor
         self._job_supervisor = job_supervisor
-        self._data_profile_admission = data_profile_admission
         self._execution_contract_reader = execution_contract_reader
-        self._data_profile_job_domain = data_profile_job_domain
         self._semantic_domain = semantic_domain
         self._memory_store = memory_store
         self._skill_store = skill_store
@@ -1569,24 +1533,11 @@ class EmbeddedAgent:
             store=store,
             clock=clock,
             id_factory=id_factory,
+            per_run_max_tokens=limits.max_total_tokens,
         )
         job_lifecycle = job_capability_declarations(job_owner)
-        graph_task_lifecycle = graph_task_capability_declarations(
-            job_owner,
-            store,
-            clock=clock,
-            id_factory=id_factory,
-        )
-        data_profile_jobs, data_profile_admission = data_profile_declarations(
-            agent_id=identity.id,
-            catalog=data_view,
-            owner=job_owner,
-            backends=source_backends[SourceOperation.PROFILE],
-            source_types=registry,
-            artifacts=artifact_store,
-            distribution=distribution_owner,
-            clock=clock,
-            id_factory=id_factory,
+        job_run_lifecycle, delegate_executor = job_run_capability_declarations(
+            job_owner
         )
         data_declarations = _domain_declarations(
             DATA_DOMAIN_OWNER_ID,
@@ -1611,11 +1562,8 @@ class EmbeddedAgent:
         job_declaration_bundle = _domain_declarations(
             JOB_DOMAIN_OWNER_ID, job_lifecycle
         )
-        graph_task_declaration_bundle = _domain_declarations(
-            GRAPH_TASK_DOMAIN_OWNER_ID, graph_task_lifecycle
-        )
-        data_profile_declaration_bundle = _domain_declarations(
-            DATA_PROFILE_DOMAIN_OWNER_ID, data_profile_jobs
+        job_run_declaration_bundle = _domain_declarations(
+            JOB_RUN_DOMAIN_OWNER_ID, job_run_lifecycle
         )
         data_domain = DataCapabilityDomain(
             data_declarations,
@@ -1659,14 +1607,7 @@ class EmbeddedAgent:
             )
         )
         job_domain = JobCapabilityDomain(job_declaration_bundle, job_owner)
-        graph_task_domain = GraphTaskCapabilityDomain(
-            graph_task_declaration_bundle,
-            job_owner,
-        )
-        data_profile_job_domain = DataProfileCapabilityDomain(
-            data_profile_declaration_bundle,
-            admission=data_profile_admission,
-        )
+        job_run_domain = JobRunCapabilityDomain(job_run_declaration_bundle, job_owner)
         if model is not None and context_builder is None:
             assert model_profile is not None
             if not model_profile.supports_tools:
@@ -1723,8 +1664,7 @@ class EmbeddedAgent:
             skill_domain,
             semantic_domain,
             job_domain,
-            graph_task_domain,
-            data_profile_job_domain,
+            job_run_domain,
             *((artifact_domain,) if artifact_domain is not None else ()),
             *((mcp_domain,) if mcp_domain is not None else ()),
         )
@@ -1741,8 +1681,7 @@ class EmbeddedAgent:
             *skills.executors,
             *semantics.executors,
             *job_lifecycle.executors,
-            *graph_task_lifecycle.executors,
-            *data_profile_jobs.executors,
+            *job_run_lifecycle.executors,
             *(artifacts.executors if artifacts is not None else ()),
             *mcp_executors,
         )
@@ -1783,7 +1722,7 @@ class EmbeddedAgent:
                 model_route_ids=model_route_ids,
             )
 
-        graph_routes = _stage_c_model_routes(declared_model, model_route)
+        model_routes = _stage_c_model_routes(declared_model, model_route)
         routine_owner = RoutineOwner(agent_id=identity.id, store=store, clock=clock)
         routine_lifecycle = routine_capability_declarations(routine_owner)
         routine_declaration_bundle = _domain_declarations(
@@ -1799,43 +1738,6 @@ class EmbeddedAgent:
             *distribution_lifecycle.executors,
             *routine_lifecycle.executors,
         )
-        graph_builder: GraphAdmissionBuilder | None = None
-        graph_resolver: RegistryInitialTaskProposalResolver | None = None
-        if graph_routes:
-            graph_prerequisite_registry = CapabilityRegistry(
-                declarations=tuple(domain.declarations for domain in domains),
-                executors=registered_executors,
-            )
-            graph_resolver = RegistryInitialTaskProposalResolver(
-                agent_id=identity.id,
-                registry=graph_prerequisite_registry,
-                contract_reader=read_execution_contracts,
-                model_route_id=graph_routes[0],
-                max_steps=min(limits.max_steps, MAX_MODEL_REQUESTS_PER_ATTEMPT),
-                per_run_max_tokens=limits.max_total_tokens,
-            )
-            graph_builder = GraphAdmissionBuilder(
-                agent_id=identity.id,
-                registry=graph_prerequisite_registry,
-                distribution=distribution_owner,
-                clock=clock,
-                id_factory=id_factory,
-            )
-            graph_admission_bundle, graph_admission_executors = (
-                graph_admission_declarations(
-                    owner=job_owner,
-                    resolver=graph_resolver,
-                    builder=graph_builder,
-                )
-            )
-            domains = (
-                *domains,
-                GraphAdmissionCapabilityDomain(graph_admission_bundle),
-            )
-            registered_executors = (
-                *registered_executors,
-                *graph_admission_executors,
-            )
         if hosted:
             declared_capability_ids = {
                 capability.id
@@ -1869,12 +1771,11 @@ class EmbeddedAgent:
         if artifact_domain is not None:
             artifact_domain.bind_capability_registry(capabilities)
         data_domain.bind_capability_registry(capabilities)
-        graph_task_lifecycle.bind_capability_registry(capabilities)
 
         async def resolve_run_sources(run: RunInput):
             return await resolve_effective_source_scope(run, data_view)
 
-        # The one loop and runtime serve foreground, routine and graph-task runs,
+        # The one loop and runtime serve foreground, routine and job runs,
         # so the host diagnostic sink sees every origin beside the caller observer.
         run_observer = observe_all(observer, diagnostics)
 
@@ -1896,10 +1797,6 @@ class EmbeddedAgent:
             artifacts=artifact_store,
             limits=limits,
         )
-        if graph_builder is not None:
-            graph_builder.bind_grant_preparer(
-                capability_runtime.prepare_automation_grant
-            )
         native_domains = tuple(
             domain
             for domain in domains
@@ -1945,11 +1842,6 @@ class EmbeddedAgent:
                 data_domain.bind_capability_registry(next_registry)
                 if artifact_domain is not None:
                     artifact_domain.bind_capability_registry(next_registry)
-                graph_task_lifecycle.bind_capability_registry(next_registry)
-                if graph_resolver is not None:
-                    graph_resolver.bind_capability_registry(next_registry)
-                if graph_builder is not None:
-                    graph_builder.bind_capability_registry(next_registry)
                 capabilities = next_registry
                 embedded._capabilities = next_registry
                 embedded._mcp_activated_bindings = {
@@ -2050,21 +1942,147 @@ class EmbeddedAgent:
                 ),
             )
 
+        async def subrun_scope(
+            parent: ExecutionScope, source_ids: tuple[str, ...], scope_id: str
+        ) -> ExecutionScope:
+            """A sub-run's scope: its main run's, narrowed, never widened."""
+
+            excluded = machine_run_excluded_owners(RunOrigin.JOB_SUBRUN)
+            capability_ids = tuple(
+                capability_id
+                for capability_id in parent.allowed_capability_ids
+                if capability_id in capabilities.capability_ids
+                and capabilities.resolve_domain_owner(capability_id) not in excluded
+            )
+            sources = parent.allowed_source_ids
+            resources = parent.allowed_resource_ids
+            if source_ids:
+                sources = tuple(sorted(set(sources) & set(source_ids)))
+                kept: list[str] = []
+                for resource_id in resources:
+                    resource = await store.load_resource(identity.id, resource_id)
+                    if resource is not None and resource.source_id in sources:
+                        kept.append(resource_id)
+                resources = tuple(kept)
+                if not resources:
+                    sources = ()
+            bindings = parent.contract_bindings
+            return replace(
+                parent,
+                scope_id=scope_id,
+                allowed_capability_ids=capability_ids,
+                allowed_source_ids=sources,
+                allowed_resource_ids=resources,
+                contract_bindings=ExecutionContractBindings(
+                    capability_contracts={
+                        key: value
+                        for key, value in bindings.capability_contracts.items()
+                        if key in capability_ids
+                    },
+                    tool_origins={
+                        key: value
+                        for key, value in bindings.tool_origins.items()
+                        if key in capability_ids
+                    },
+                    resource_revisions={
+                        key: value
+                        for key, value in bindings.resource_revisions.items()
+                        if key in resources
+                    },
+                    model_routes=dict(bindings.model_routes),
+                ),
+            )
+
+        async def execute_job_run(
+            run_input: RunInput,
+            *,
+            requester: str,
+            stop_after_input_tokens: int | None,
+            main: bool,
+        ) -> LoopExit | None:
+            if loop is None:
+                return None
+            run_input = await capability_runtime.freeze_source_scope(run_input)
+            conversation_id = run_input.conversation_id or run_input.id
+            predecessor_run = await store.latest_terminal_conversation_run(
+                identity.id, conversation_id
+            )
+            predecessor = (
+                None
+                if predecessor_run is None
+                else ConversationPredecessor.from_run(predecessor_run)
+            )
+            options = RunSessionOptions(
+                requester=requester, stop_after_input_tokens=stop_after_input_tokens
+            )
+            deadline = asyncio.get_running_loop().time() + limits.max_wall_time_seconds
+
+            async def execute(
+                lease: AdmissionLease | None, until: float
+            ) -> LoopExit | None:
+                assert loop is not None
+                session = RunSession(
+                    run=run_input,
+                    writer=RunSessionWriter(store, run_input, predecessor=predecessor),
+                    absolute_deadline=until,
+                    cancellation=(
+                        RunCancellationToken() if lease is None else lease.cancellation
+                    ),
+                    options=options,
+                    admission_lease=lease,
+                    predecessor=predecessor,
+                )
+                prepared = await loop.prepare(session)
+                try:
+                    return await loop.run(session.with_prepared(prepared))
+                except asyncio.CancelledError:
+                    executing = asyncio.current_task()
+                    if executing is None or executing.cancelling():
+                        raise
+                    # An unanswered approval interrupted the run, not the job:
+                    # the supervisor reads the exit the loop recorded.
+                    return await store.result(run_input.id)
+
+            if not main:
+                # A sub-run runs inside its main run's admission and deadline.
+                parent = admission_coordinator.current_deadline()
+                return await execute(
+                    None, deadline if parent is None else min(deadline, parent)
+                )
+            lease = await admission_coordinator.admit_execution(
+                WorkloadClass.JOB,
+                run_input.id,
+                conversation_id=conversation_id,
+                absolute_deadline=deadline,
+            )
+            async with lease:
+                return await execute(lease, deadline)
+
+        job_executor: JobRunExecutor | None = (
+            execute_job_run if loop is not None else None
+        )
         job_supervisor = JobSupervisor(
             agent_id=identity.id,
-            store=store,
             owner=job_owner,
-            runtime=capability_runtime,
-            artifacts=artifact_store,
+            execute_run=job_executor,
+            machine_scope=machine_run_scope,
+            subrun_scope=subrun_scope,
+            load_transcript=store.load,
+            model_routes=model_routes,
+            per_run_max_tokens=limits.max_total_tokens,
+            per_run_max_cost_usd=limits.max_estimated_cost_usd,
+            context_window_tokens=(
+                None if model_profile is None else model_profile.maximum_input_tokens
+            ),
             clock=clock,
             id_factory=id_factory,
-            admission_coordinator=admission_coordinator,
-            distribution=distribution_owner,
-            machine_scope=machine_run_scope,
-            graph_model_loop=loop,
-            graph_parallelism=host_capacity.graph_parallelism,
+            admission=admission_coordinator,
+            subrun_parallelism=host_capacity.job_parallelism,
         )
-        job_owner.bind_wake(job_supervisor.wake)
+        job_owner.bind_supervisor(
+            wake=job_supervisor.wake, cancel=job_supervisor.cancel
+        )
+        delegate_executor.bind_supervisor(job_supervisor)
 
         async def execute_routine_run(
             occurrence: RoutineOccurrence,
@@ -2152,7 +2170,7 @@ class EmbeddedAgent:
             artifacts=artifact_store,
             execute_run=(execute_routine_run if loop is not None else None),
             machine_scope=machine_run_scope,
-            model_routes=graph_routes,
+            model_routes=model_routes,
             per_run_max_tokens=limits.max_total_tokens,
             per_run_max_cost_usd=limits.max_estimated_cost_usd,
             clock=clock,
@@ -2178,9 +2196,7 @@ class EmbeddedAgent:
             routine_owner=routine_owner,
             routine_supervisor=routine_supervisor,
             job_supervisor=job_supervisor,
-            data_profile_admission=data_profile_admission,
             execution_contract_reader=read_execution_contracts,
-            data_profile_job_domain=data_profile_job_domain,
             semantic_domain=semantic_domain,
             memory_store=memory_store,
             skill_store=skill_store,
@@ -2755,10 +2771,8 @@ class EmbeddedAgent:
         ):
             raise ValueError("done window must be positive and at most seven days")
         now = self._clock()
-        live_jobs = await self._job_owner.list(states=_LIVE_JOB_STATES, limit=100)
-        finished_jobs = await self._job_owner.list(
-            states=TERMINAL_GRAPH_STATES, limit=100
-        )
+        live_jobs = await self._job_owner.list(states=LIVE_JOB_STATES)
+        finished_jobs = await self._job_owner.list(states=TERMINAL_JOB_STATES)
         routines = await self._routine_owner.list(limit=MAX_ROUTINE_LIST_PAGE_SIZE)
         active = await self._routine_owner.list_active_occurrences(limit=100)
         deliveries = await self._distribution_owner.list()
@@ -2849,10 +2863,10 @@ class EmbeddedAgent:
     async def list_jobs(
         self,
         *,
-        states: frozenset[GraphState] = frozenset(),
+        states: frozenset[JobState] = frozenset(),
         limit: int = 50,
-    ) -> tuple[GraphJob, ...]:
-        """Return the bounded current projection of this agent's durable jobs."""
+    ) -> tuple[Job, ...]:
+        """Return this agent's jobs, most recently changed first."""
 
         self._require_open()
         return await self._job_owner.list(states=states, limit=limit)
@@ -3021,258 +3035,39 @@ class EmbeddedAgent:
                 )
         return tuple(evidence)
 
-    async def inspect_job(self, job_id: str) -> GraphInspection | None:
+    async def start_job(
+        self,
+        objective: str,
+        *,
+        sources: tuple[str, ...] | None = None,
+        conversation_id: str | None = None,
+    ) -> Job:
+        """Start a background job; its result goes to the conversation's Inbox.
+
+        Without a conversation, the job delivers to a new conversation of its own.
+        """
+
+        self._require_open()
+        if conversation_id is None:
+            conversation_id = self._id_factory("conversation")
+        _validate_conversation_id(conversation_id)
+        return await self._job_owner.start(
+            objective, conversation_id=conversation_id, sources=sources or ()
+        )
+
+    async def inspect_job(self, job_id: str) -> Job | None:
         self._require_open()
         return await self._job_owner.inspect(job_id)
 
-    async def list_job_tasks(
-        self,
-        job_id: str,
-        *,
-        states: frozenset[TaskState] = frozenset(),
-        limit: int = 64,
-    ) -> tuple[GraphTask, ...]:
-        self._require_open()
-        return await self._job_owner.list_graph_tasks(
-            job_id, states=states, limit=limit
-        )
+    async def answer_job(self, job_id: str, text: str) -> Job:
+        """Answer a job's question, or raise the limits it stopped at; it resumes."""
 
-    async def inspect_job_task(self, job_id: str, task_id: str) -> GraphTask | None:
         self._require_open()
-        return await self._job_owner.inspect_graph_task(job_id, task_id)
+        return await self._job_owner.answer(job_id, text)
 
-    async def list_job_dependencies(
-        self, job_id: str, *, task_id: str | None = None, limit: int = 100
-    ) -> tuple[TaskDependency, ...]:
-        self._require_open()
-        return await self._job_owner.list_graph_dependencies(
-            job_id, task_id=task_id, limit=limit
-        )
-
-    async def list_task_attempts(
-        self, job_id: str, task_id: str, *, limit: int = 3
-    ) -> tuple[TaskAttempt, ...]:
-        self._require_open()
-        return await self._job_owner.list_graph_task_attempts(
-            job_id, task_id, limit=limit
-        )
-
-    async def read_task_result(self, job_id: str, task_id: str) -> TaskResult | None:
-        self._require_open()
-        return await self._job_owner.read_graph_task_result(job_id, task_id)
-
-    async def list_task_checkpoints(
-        self, job_id: str, task_id: str, *, limit: int = 8
-    ) -> tuple[TaskCheckpoint, ...]:
-        self._require_open()
-        return await self._job_owner.list_graph_task_checkpoints(
-            job_id, task_id, limit=limit
-        )
-
-    async def list_task_artifacts(
-        self, job_id: str, *, task_id: str | None = None, limit: int = 64
-    ) -> tuple[str, ...]:
-        self._require_open()
-        artifact_ids = await self._job_owner.list_graph_task_artifacts(
-            job_id, task_id=task_id, limit=limit
-        )
-        return tuple(
-            [
-                artifact_id
-                for artifact_id in artifact_ids
-                if (record := await self._store.get_artifact_record(artifact_id))
-                is not None
-                and record.state is ArtifactState.READY
-            ]
-        )
-
-    async def list_task_controls(
-        self, job_id: str, task_id: str, *, limit: int = 8
-    ) -> tuple[TaskControl, ...]:
-        self._require_open()
-        return await self._job_owner.list_graph_task_controls(
-            job_id, task_id, limit=limit
-        )
-
-    async def job_timeline(
-        self,
-        job_id: str,
-        *,
-        after_event_id: int = 0,
-        limit: int = 100,
-        task_id: str | None = None,
-    ) -> GraphTimelinePage | None:
-        self._require_open()
-        return await self._job_owner.graph_timeline(
-            job_id,
-            after_event_id=after_event_id,
-            limit=limit,
-            task_id=task_id,
-        )
-
-    async def job_board(self, job_id: str) -> GraphBoardProjection | None:
-        self._require_open()
-        return await self._job_owner.graph_board(job_id)
-
-    async def read_job_result(self, job_id: str) -> TaskResult | None:
-        self._require_open()
-        return await self._job_owner.read_result(job_id)
-
-    async def cancel_job(self, job_id: str) -> GraphJob | None:
+    async def cancel_job(self, job_id: str) -> Job | None:
         self._require_open()
         return await self._job_owner.cancel(job_id)
-
-    async def graph_blockers(self, job_id: str) -> GraphBlockerProjection | None:
-        self._require_open()
-        return await self._job_owner.graph_blockers(job_id)
-
-    async def answer_task_input(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        answer: Mapping[str, object],
-        idempotency_key: str | None = None,
-    ) -> TaskControl | None:
-        self._require_open()
-        return await self._job_owner.answer_graph_task_input(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=principal_id,
-            answer=answer,
-            idempotency_key=idempotency_key,
-        )
-
-    async def accept_task_review(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        rationale: str,
-        idempotency_key: str,
-    ) -> TaskResult:
-        self._require_open()
-        return await self._job_owner.accept_graph_task_review_by_principal(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=principal_id,
-            rationale=rationale,
-            idempotency_key=idempotency_key,
-        )
-
-    async def request_task_review_changes(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        rationale: str,
-        replacement_guidance: str,
-        idempotency_key: str,
-    ) -> TaskControl:
-        self._require_open()
-        return await self._job_owner.request_graph_task_review_changes_by_principal(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=principal_id,
-            rationale=rationale,
-            replacement_guidance=replacement_guidance,
-            idempotency_key=idempotency_key,
-        )
-
-    async def retry_task_control(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        advisory_note: str,
-        idempotency_key: str,
-    ) -> TaskControl | None:
-        self._require_open()
-        return await self._job_owner.retry_graph_task_control(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=principal_id,
-            advisory_note=advisory_note,
-            idempotency_key=idempotency_key,
-        )
-
-    async def reject_task_control(
-        self,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        principal_id: str,
-        reason: str,
-        idempotency_key: str | None = None,
-    ) -> TaskControl | None:
-        self._require_open()
-        return await self._job_owner.reject_graph_task_control(
-            job_id,
-            task_id,
-            control_id,
-            principal_id=principal_id,
-            reason=reason,
-            idempotency_key=idempotency_key,
-        )
-
-    async def cancel_graph_job(
-        self, job_id: str, *, principal_id: str
-    ) -> GraphJob | None:
-        self._require_open()
-        return await self._job_owner.cancel_graph_job(job_id, principal_id=principal_id)
-
-    async def replace_graph_task_by_policy(
-        self,
-        job_id: str,
-        task_id: str,
-        *,
-        principal_id: str,
-        advisory_note: str,
-        idempotency_key: str,
-        expected_revision: int,
-    ) -> GraphMutation:
-        self._require_open()
-        return await self._job_owner.replace_graph_task_by_policy(
-            job_id,
-            task_id,
-            principal_id=principal_id,
-            advisory_note=advisory_note,
-            idempotency_key=idempotency_key,
-            expected_revision=expected_revision,
-        )
-
-    async def start_authorized_replacement_job(
-        self,
-        admission: GraphAdmission,
-        *,
-        replaces_job_id: str,
-        principal_id: str,
-        replaces_task_id: str | None = None,
-        control_id: str | None = None,
-        idempotency_key: str | None = None,
-    ) -> GraphJob:
-        self._require_open()
-        return await self._job_owner.admit_authorized_replacement_graph(
-            admission,
-            replaces_job_id=replaces_job_id,
-            principal_id=principal_id,
-            replaces_task_id=replaces_task_id,
-            control_id=control_id,
-            idempotency_key=idempotency_key,
-        )
 
     async def create_routine(
         self,

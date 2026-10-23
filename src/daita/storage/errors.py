@@ -29,6 +29,10 @@ class StorageOwnershipLostError(StorageError):
     code = "storage_ownership_lost"
 
 
+class JobStoreConflictError(RuntimeError):
+    """A job revision precondition did not match; read the job again."""
+
+
 class GraphStoreConflictError(RuntimeError):
     """A graph CAS or idempotency precondition did not match."""
 

@@ -705,7 +705,7 @@ class OutcomeReference:
 
 class DeliverySubjectKind(str, Enum):
     ROUTINE_OCCURRENCE = "routine_occurrence"
-    GRAPH_ATTENTION = "graph_attention"
+    JOB = "job"
 
 
 class DeliveryState(str, Enum):

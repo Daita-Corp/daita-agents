@@ -112,7 +112,7 @@ await agent.run("Look up the requested reference.")
 
 Attachment and successful refresh activate in the same open Agent. The host
 stages one new immutable catalog under its existing system admission lease,
-then publishes it to runtime, routine and graph admission, and contract readers
+then publishes it to runtime, routine and job admission, and contract readers
 between runs. In-flight runs keep their frozen catalog; changed binding revisions
 invalidate old grants. Failed staging preserves the prior admission. Open still
 reconstructs accepted declarations without network I/O. SDK clients are lazy,
@@ -399,7 +399,7 @@ status = await agent.attach_mcp_server(
 ```
 
 Action selections default to `INTERACTIVE_ONLY` when eligibility is omitted.
-Setting `AUTOMATION_DIRECT` permits a routine or eligible graph job proposal;
+Setting `AUTOMATION_DIRECT` permits a routine proposal;
 it grants no standing authority by itself. Each foreground invocation still
 requires exact approval through the ordinary runtime. The public typed
 admission API is a local operator control and must not be delegated to
@@ -483,9 +483,8 @@ Unresolved effects block potentially duplicating work across restart, future slo
 run-now, resume, changed arguments, revision and new effectful clones. Exact human
 recovery records a receipt-linked decision without invoking anything. See
 [effect receipts and recovery](EFFECT_RECEIPTS.md) and
-[scheduled assignments](SCHEDULED_ROUTINES.md). Graph jobs admit only an exact,
-foreground-approved synchronous MCP action as their initial effectful task; an
-uncertain receipt blocks that task and its descendants. This implementation and
+[scheduled assignments](SCHEDULED_ROUTINES.md). A background job's MCP action
+asks a person at the time; an uncertain receipt holds the job. This implementation and
 its deterministic fake-I/O acceptance are not production release approval.
 
 The [offline assignment and recovery walkthrough](../examples/03_offline_assignments_and_recovery.py)

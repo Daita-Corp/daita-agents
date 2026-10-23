@@ -37,3 +37,46 @@ recurring routine pauses as Needs you after 3 consecutive failures.
 - **Existing homes.** Upgrading rewrites stored routines to the new shape; they
   keep their schedule, prompt, named sources and state, keep running, and their
   writes now ask.
+
+### Background jobs are checklist runs
+
+A background job is now an ordinary agent run that keeps going in the host. It
+plans with a checklist, hands independent pieces to sub-runs (several at once),
+asks you when it needs you, and delivers its final answer to the
+conversation's Inbox. Writes ask a person at the time. A job survives restarts
+by starting a new run from its saved checklist, and also continues in a new
+run when its context fills up or you answer its question. It stops as failed
+after 20 runs or ten times the per-run token limit in total; answering raises
+the limits and continues it. This replaces the task-graph job system.
+
+- **Python API.** `Agent.start_job(objective, sources=None, *,
+  conversation_id=None)`, `list_jobs`, `inspect_job` (now a `Job`),
+  `answer_job(job_id, text)` and `cancel_job`. `Job`, `JobState`,
+  `ChecklistItem`, `ChecklistStatus`, `Delegation` and `DelegationState` are
+  exported. `HostCapacityLimits.graph_parallelism` is now `job_parallelism`
+  (sub-runs at once per agent, default 2).
+- **Removed from the public API:** `GraphJob`, `GraphState`,
+  `GraphInspection`, `TaskResult` and the graph job methods
+  (`list_job_tasks`, `inspect_job_task`, `list_job_dependencies`,
+  `list_task_attempts`, `read_task_result`, `list_task_checkpoints`,
+  `list_task_artifacts`, `list_task_controls`, `job_timeline`, `job_board`,
+  `read_job_result`, `graph_blockers`, `answer_task_input`,
+  `accept_task_review`, `request_task_review_changes`, `retry_task_control`,
+  `reject_task_control`, `cancel_graph_job`, `replace_graph_task_by_policy`,
+  `start_authorized_replacement_job`).
+- **CLI.** `daita jobs list | inspect | answer | cancel`. The graph and review
+  job commands (`tasks`, `dependencies`, `attempts`, `result`, `checkpoints`,
+  `artifacts`, `timeline`, `board`, `blockers`, `accept-review`,
+  `request-changes`, `retry-control`, `reject`, `cancel-graph`,
+  `replace-task`) are removed.
+- **Model tools.** `job_start`, `job_list`, `job_inspect` and `job_cancel` in
+  conversations; `checklist_write`, `delegate` and `ask_user` in a job's own
+  run. `start_graph_job`, `job_read_results` (folded into `job_inspect`) and the
+  graph task tools are removed, and so is the internal data-profile job.
+- **Host.** The job routes and `RemoteAgent` follow the Python API; the graph
+  task and control routes are removed.
+- **Existing homes.** Upgrading converts graph jobs: finished ones keep their
+  accepted result, unfinished ones (including profile jobs) fail with "Created
+  by an older version of Daita; start it again.", result deliveries and
+  receipts keep their job, graph attention notices are dropped, and the graph
+  tables are removed.

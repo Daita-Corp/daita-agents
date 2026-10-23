@@ -7,7 +7,7 @@ import re
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 from typing import TypeVar, cast
@@ -39,7 +39,7 @@ from ..capabilities import (
     EffectEvidenceBasis,
     EffectObservation,
     ExecutionScope,
-    TaskAttemptGuard,
+    ExecutionScopeKind,
 )
 from ..catalog.models import (
     CATALOG_MAX_LINKS,
@@ -62,38 +62,10 @@ from ..distribution.models import (
     Delivery,
     DeliveryState,
     DeliverySubjectKind,
-    GraphJobDelivery,
     OutcomeArtifactReference,
-    distribution_plan_digest,
 )
 from ..identity import AgentIdentity, AgentIdentityConflictError
-from ..jobs.graph.guard import GraphAttemptAuthority
-from ..jobs.graph.models import (
-    ACTIVE_ATTEMPT_STATES,
-    AttemptBudgetReservation,
-    AttemptState,
-    BudgetAmount,
-    BudgetLedger,
-    ControlKind,
-    ControlState,
-    GraphAdmission,
-    GraphDesiredState,
-    GraphEventPage,
-    GraphInspection,
-    GraphJob,
-    GraphMutation,
-    GraphMutationRequest,
-    GraphState,
-    GraphTask,
-    TaskAttempt,
-    TaskCheckpoint,
-    TaskComment,
-    TaskControl,
-    TaskResult,
-    TaskState,
-    canonical_digest,
-    reserved_artifact_id,
-)
+from ..jobs.models import LIVE_JOB_STATES, MAX_JOB_LIST_PAGE_SIZE, Job, JobState
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -133,7 +105,7 @@ from ..semantics import (
     SemanticValidationError,
     semantic_annotation_sha256,
 )
-from . import sql_graph as _graph_store, sql_routines as _routine_store
+from . import sql_jobs as _job_store, sql_routines as _routine_store
 from .sql_connection import (
     SQLConnection,
     SQLDatabase,
@@ -186,11 +158,7 @@ from .sqlite_codecs.artifacts import (
     decode_artifact_record,
     encode_artifact_record,
 )
-from .sqlite_codecs.graph import (
-    decode_graph_event,
-    decode_graph_job,
-    decode_graph_job_delivery,
-)
+from .sqlite_codecs.jobs import decode_job
 from .sqlite_codecs.mcp_bindings import decode_mcp_credential_reference_for_deletion
 from .sqlite_records import (
     EffectOutcome,
@@ -415,572 +383,68 @@ class SQLStateStore:
             ),
         )
 
-    async def admit_graph(self, admission: GraphAdmission) -> GraphJob:
-        if not isinstance(admission, GraphAdmission):
-            raise TypeError("graph admission must be GraphAdmission")
+    async def admit_job(self, job: Job) -> Job:
+        if not isinstance(job, Job):
+            raise TypeError("job admission requires Job")
         return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.admit_graph(connection, admission),
+            self._database, lambda connection: _job_store.insert_job(connection, job)
         )
 
-    async def admit_replacement_graph(
-        self,
-        admission: GraphAdmission,
-        *,
-        replaced_job_id: str,
-        replaced_task_id: str,
-        control_id: str,
-        principal_id: str,
-        idempotency_key: str,
-        resolved_at: datetime,
-        expected_control_digest: str,
-        expected_task_revision: int,
-    ) -> GraphJob:
-        if not isinstance(admission, GraphAdmission):
-            raise TypeError("replacement graph admission must be GraphAdmission")
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.admit_replacement_graph(
-                connection,
-                admission,
-                replaced_job_id=replaced_job_id,
-                replaced_task_id=replaced_task_id,
-                control_id=control_id,
-                principal_id=principal_id,
-                idempotency_key=idempotency_key,
-                resolved_at=resolved_at,
-                expected_control_digest=expected_control_digest,
-                expected_task_revision=expected_task_revision,
-            ),
-        )
+    async def load_job(self, agent_id: str, job_id: str) -> Job | None:
+        def read() -> Job | None:
+            with _connect_read_only(self._database) as connection:
+                return _job_store.load_job(connection, agent_id, job_id)
 
-    async def read_graph_attempt_authority(
-        self, agent_id: str, job_id: str, task_id: str, attempt_id: str
-    ) -> GraphAttemptAuthority | None:
-        return await _run_graph_read(
-            self._database,
-            lambda connection: _graph_store.read_graph_attempt_authority(
-                connection, agent_id, job_id, task_id, attempt_id
-            ),
-        )
+        return await settled_thread(read)
 
-    async def inspect_graph(self, agent_id: str, job_id: str) -> GraphInspection | None:
-        return await _run_graph_read(
-            self._database,
-            lambda connection: _graph_store.inspect_graph(connection, agent_id, job_id),
-        )
-
-    async def list_graph_jobs(
+    async def list_jobs(
         self,
         agent_id: str,
         *,
-        states: frozenset[GraphState] = frozenset(),
-        limit: int = 50,
-    ) -> tuple[GraphJob, ...]:
-        return await _run_graph_read(
-            self._database,
-            lambda connection: _graph_store.list_graph_jobs(
-                connection,
-                agent_id,
-                states=states,
-                limit=limit,
-            ),
+        states: frozenset[JobState] = frozenset(),
+        limit: int = MAX_JOB_LIST_PAGE_SIZE,
+    ) -> tuple[Job, ...]:
+        if not 1 <= limit <= MAX_JOB_LIST_PAGE_SIZE:
+            raise ValueError("job list limit is outside its bound")
+
+        def read() -> tuple[Job, ...]:
+            with _connect_read_only(self._database) as connection:
+                return _job_store.list_jobs(
+                    connection, agent_id, states=states, limit=limit
+                )
+
+        return await settled_thread(read)
+
+    async def replace_job(self, job: Job) -> Job:
+        if not isinstance(job, Job):
+            raise TypeError("job replacement requires Job")
+        return await run_sql_transaction(
+            self._database, lambda connection: _job_store.replace_job(connection, job)
         )
 
-    async def apply_graph_mutation(
-        self, request: GraphMutationRequest
-    ) -> GraphMutation:
-        if not isinstance(request, GraphMutationRequest):
-            raise TypeError("graph mutation must be GraphMutationRequest")
+    async def finish_job(self, job: Job, delivery: Delivery | None) -> Job:
+        if not isinstance(job, Job):
+            raise TypeError("job finish requires Job")
         return await run_sql_transaction(
             self._database,
-            lambda connection: _graph_store.apply_mutation(connection, request),
+            lambda connection: _job_store.finish_job(connection, job, delivery),
         )
 
-    async def request_graph_cancel(
-        self,
-        agent_id: str,
-        job_id: str,
-        *,
-        requested_at: datetime,
-        requested_by_id: str,
-    ) -> GraphJob | None:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.request_cancel(
-                connection,
-                agent_id=agent_id,
-                job_id=job_id,
-                requested_at=requested_at,
-                requested_by_id=requested_by_id,
-            ),
-        )
-
-    async def list_ready_graph_tasks(
-        self,
-        agent_id: str,
-        *,
-        now: datetime,
-        limit: int = 64,
-    ) -> tuple[GraphTask, ...]:
-        return await _run_graph_read(
-            self._database,
-            lambda connection: _graph_store.list_ready_tasks(
-                connection, agent_id, now=now, limit=limit
-            ),
-        )
-
-    async def expire_due_graphs(
-        self,
-        agent_id: str,
-        *,
-        expired_at: datetime,
-        limit: int = 64,
-    ) -> tuple[GraphJob, ...]:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.expire_due_graphs(
-                connection,
-                agent_id,
-                expired_at=expired_at,
-                limit=limit,
-            ),
-        )
-
-    async def list_stale_graph_attempts(
-        self,
-        agent_id: str,
-        *,
-        now: datetime,
-        limit: int = 64,
-    ) -> tuple[TaskAttempt, ...]:
-        return await _run_graph_read(
-            self._database,
-            lambda connection: _graph_store.list_stale_attempts(
-                connection, agent_id, now=now, limit=limit
-            ),
-        )
-
-    async def list_active_graph_attempts(
-        self,
-        agent_id: str,
-        *,
-        limit: int = 64,
-    ) -> tuple[TaskAttempt, ...]:
-        return await _run_graph_read(
-            self._database,
-            lambda connection: _graph_store.list_active_attempts(
-                connection, agent_id, limit=limit
-            ),
-        )
-
-    async def claim_graph_task(
-        self,
-        agent_id: str,
-        job_id: str,
-        task_id: str,
-        *,
-        attempt_id: str,
-        claim_token: str,
-        run_id: str,
-        executor_id: str,
-        claimed_at: datetime,
-        lease_seconds: int,
-        absolute_deadline_at: datetime,
-        budget_reservations: tuple[BudgetAmount, ...],
-    ) -> TaskAttempt | None:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.claim_task(
-                connection,
-                agent_id=agent_id,
-                job_id=job_id,
-                task_id=task_id,
-                attempt_id=attempt_id,
-                claim_token=claim_token,
-                run_id=run_id,
-                executor_id=executor_id,
-                claimed_at=claimed_at,
-                lease_seconds=lease_seconds,
-                absolute_deadline_at=absolute_deadline_at,
-                budget_reservations=budget_reservations,
-            ),
-        )
-
-    async def start_graph_attempt(
-        self,
-        agent_id: str,
-        job_id: str,
-        task_id: str,
-        attempt_id: str,
-        *,
-        claim_token: str,
-        fencing_epoch: int,
-        started_at: datetime,
-    ) -> TaskAttempt | None:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.start_attempt(
-                connection,
-                agent_id=agent_id,
-                job_id=job_id,
-                task_id=task_id,
-                attempt_id=attempt_id,
-                claim_token=claim_token,
-                fencing_epoch=fencing_epoch,
-                started_at=started_at,
-            ),
-        )
-
-    async def heartbeat_graph_attempt(
-        self,
-        agent_id: str,
-        job_id: str,
-        task_id: str,
-        attempt_id: str,
-        *,
-        claim_token: str,
-        fencing_epoch: int,
-        heartbeat_at: datetime,
-        lease_seconds: int = 30,
-    ) -> TaskAttempt | None:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.heartbeat_attempt(
-                connection,
-                agent_id=agent_id,
-                job_id=job_id,
-                task_id=task_id,
-                attempt_id=attempt_id,
-                claim_token=claim_token,
-                fencing_epoch=fencing_epoch,
-                heartbeat_at=heartbeat_at,
-                lease_seconds=lease_seconds,
-            ),
-        )
-
-    async def checkpoint_graph_attempt(
-        self, checkpoint: TaskCheckpoint, *, claim_token: str
-    ) -> TaskCheckpoint:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.checkpoint_attempt(
-                connection, checkpoint, claim_token=claim_token
-            ),
-        )
-
-    async def add_graph_comment(
-        self,
-        comment: TaskComment,
-        *,
-        attempt_id: str | None = None,
-        claim_token: str | None = None,
-        fencing_epoch: int | None = None,
-    ) -> TaskComment:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.add_comment(
-                connection,
-                comment,
-                attempt_id=attempt_id,
-                claim_token=claim_token,
-                fencing_epoch=fencing_epoch,
-            ),
-        )
-
-    async def complete_graph_attempt(
-        self,
-        result: TaskResult,
-        *,
-        claim_token: str,
-        fencing_epoch: int,
-        usage: tuple[BudgetAmount, ...] | None,
-    ) -> TaskResult:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.complete_attempt(
-                connection,
-                result,
-                claim_token=claim_token,
-                fencing_epoch=fencing_epoch,
-                usage=usage,
-            ),
-        )
-
-    async def finalize_graph_attempt(
-        self,
-        result: TaskResult,
-        delivery: GraphJobDelivery,
-        *,
-        claim_token: str,
-        fencing_epoch: int,
-        usage: tuple[BudgetAmount, ...] | None,
-    ) -> TaskResult:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.complete_attempt(
-                connection,
-                result,
-                claim_token=claim_token,
-                fencing_epoch=fencing_epoch,
-                usage=usage,
-                delivery=delivery,
-            ),
-        )
-
-    async def list_graph_deliveries(
-        self,
-        agent_id: str,
-        *,
-        job_id: str | None = None,
-        limit: int = 100,
-    ) -> tuple[GraphJobDelivery, ...]:
-        return await _run_graph_read(
-            self._database,
-            lambda connection: _graph_store.list_graph_deliveries(
-                connection,
-                agent_id,
-                job_id=job_id,
-                limit=limit,
-            ),
-        )
-
-    async def fence_graph_attempt(
-        self,
-        agent_id: str,
-        job_id: str,
-        task_id: str,
-        attempt_id: str,
-        *,
-        fencing_epoch: int,
-        fenced_at: datetime,
-        requeue: bool,
-        reason_code: str,
-    ) -> TaskAttempt | None:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.fence_attempt(
-                connection,
-                agent_id=agent_id,
-                job_id=job_id,
-                task_id=task_id,
-                attempt_id=attempt_id,
-                fencing_epoch=fencing_epoch,
-                fenced_at=fenced_at,
-                requeue=requeue,
-                reason_code=reason_code,
-            ),
-        )
-
-    async def fail_graph_attempt(
-        self,
-        agent_id: str,
-        job_id: str,
-        task_id: str,
-        attempt_id: str,
-        *,
-        claim_token: str,
-        fencing_epoch: int,
-        failed_at: datetime,
-        retryable: bool,
-        reason_code: str,
-        attempt_state: AttemptState = AttemptState.FAILED,
-    ) -> TaskAttempt | None:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.fail_attempt(
-                connection,
-                agent_id=agent_id,
-                job_id=job_id,
-                task_id=task_id,
-                attempt_id=attempt_id,
-                claim_token=claim_token,
-                fencing_epoch=fencing_epoch,
-                failed_at=failed_at,
-                retryable=retryable,
-                reason_code=reason_code,
-                attempt_state=attempt_state,
-            ),
-        )
-
-    async def open_graph_control(
-        self,
-        control: TaskControl,
-        *,
-        claim_token: str,
-        fencing_epoch: int,
-        replan_task: GraphTask | None = None,
-        reviewer_task: GraphTask | None = None,
-    ) -> TaskControl:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.open_control(
-                connection,
-                control,
-                claim_token=claim_token,
-                fencing_epoch=fencing_epoch,
-                replan_task=replan_task,
-                reviewer_task=reviewer_task,
-            ),
-        )
-
-    async def resolve_graph_control(
-        self,
-        agent_id: str,
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        state: ControlState,
-        resolved_at: datetime,
-        resolved_by_kind: str,
-        resolved_by_id: str,
-        resolution: dict[str, object],
-        make_ready: bool,
-        expected_control_digest: str | None = None,
-        expected_task_revision: int | None = None,
-    ) -> TaskControl | None:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.resolve_control(
-                connection,
-                agent_id=agent_id,
-                job_id=job_id,
-                task_id=task_id,
-                control_id=control_id,
-                state=state,
-                resolved_at=resolved_at,
-                resolved_by_kind=resolved_by_kind,
-                resolved_by_id=resolved_by_id,
-                resolution=resolution,
-                make_ready=make_ready,
-                expected_control_digest=expected_control_digest,
-                expected_task_revision=expected_task_revision,
-            ),
-        )
-
-    async def accept_graph_review(
-        self,
-        *,
-        agent_id: str,
-        job_id: str,
-        subject_task_id: str,
-        control_id: str,
-        reviewer_task_id: str,
-        resolved_at: datetime,
-        resolved_by_kind: str,
-        resolved_by_id: str,
-        rationale: str,
-        idempotency_key: str,
-        expected_control_digest: str,
-        expected_subject_revision: int,
-        reviewer_result: TaskResult | None = None,
-        claim_token: str | None = None,
-        fencing_epoch: int | None = None,
-    ) -> TaskResult:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.accept_review(
-                connection,
-                agent_id=agent_id,
-                job_id=job_id,
-                subject_task_id=subject_task_id,
-                control_id=control_id,
-                reviewer_task_id=reviewer_task_id,
-                resolved_at=resolved_at,
-                resolved_by_kind=resolved_by_kind,
-                resolved_by_id=resolved_by_id,
-                rationale=rationale,
-                idempotency_key=idempotency_key,
-                expected_control_digest=expected_control_digest,
-                expected_subject_revision=expected_subject_revision,
-                reviewer_result=reviewer_result,
-                claim_token=claim_token,
-                fencing_epoch=fencing_epoch,
-            ),
-        )
-
-    async def request_graph_review_changes(
-        self,
-        *,
-        changes_control: TaskControl,
-        review_control_id: str,
-        reviewer_task_id: str,
-        resolved_at: datetime,
-        resolved_by_kind: str,
-        resolved_by_id: str,
-        rationale: str,
-        idempotency_key: str,
-        expected_control_digest: str,
-        expected_subject_revision: int,
-        reviewer_result: TaskResult | None = None,
-        claim_token: str | None = None,
-        fencing_epoch: int | None = None,
-    ) -> TaskControl:
-        return await run_sql_transaction(
-            self._database,
-            lambda connection: _graph_store.request_review_changes(
-                connection,
-                changes_control=changes_control,
-                review_control_id=review_control_id,
-                reviewer_task_id=reviewer_task_id,
-                resolved_at=resolved_at,
-                resolved_by_kind=resolved_by_kind,
-                resolved_by_id=resolved_by_id,
-                rationale=rationale,
-                idempotency_key=idempotency_key,
-                expected_control_digest=expected_control_digest,
-                expected_subject_revision=expected_subject_revision,
-                reviewer_result=reviewer_result,
-                claim_token=claim_token,
-                fencing_epoch=fencing_epoch,
-            ),
-        )
-
-    async def list_graph_events(
-        self,
-        agent_id: str,
-        job_id: str,
-        *,
-        after_event_id: int = 0,
-        limit: int = 100,
-        task_id: str | None = None,
-    ) -> GraphEventPage:
-        return await _run_graph_read(
-            self._database,
-            lambda connection: _graph_store.list_graph_events(
-                connection,
-                agent_id,
-                job_id,
-                after_event_id=after_event_id,
-                limit=limit,
-                task_id=task_id,
-            ),
-        )
-
-    async def list_graph_budget_ledgers(
+    async def job_effect_receipts(
         self, agent_id: str, job_id: str
-    ) -> tuple[BudgetLedger, ...]:
-        return await _run_graph_read(
-            self._database,
-            lambda connection: _graph_store.list_budget_ledgers(
-                connection, agent_id, job_id
-            ),
-        )
+    ) -> tuple[EffectReceipt, ...]:
+        """Every receipt a job's runs reserved, in reservation order."""
 
-    async def list_graph_attempt_reservations(
-        self,
-        agent_id: str,
-        job_id: str,
-        task_id: str,
-        attempt_id: str,
-    ) -> tuple[AttemptBudgetReservation, ...]:
-        return await _run_graph_read(
-            self._database,
-            lambda connection: _graph_store.list_attempt_reservations(
-                connection, agent_id, job_id, task_id, attempt_id
-            ),
-        )
+        def read() -> tuple[EffectReceipt, ...]:
+            with _connect_read_only(self._database) as connection:
+                rows = connection.execute(
+                    "SELECT data FROM effect_receipts "
+                    "WHERE agent_id = ? AND job_id = ? ORDER BY rowid LIMIT 257",
+                    (agent_id, job_id),
+                ).fetchall()
+            return tuple(decode_receipt(row[0]) for row in rows[:256])
+
+        return await settled_thread(read)
 
     async def initialize_identity(self, identity: AgentIdentity) -> AgentIdentity:
         def write(connection: SQLConnection) -> AgentIdentity:
@@ -1702,7 +1166,7 @@ class SQLStateStore:
             raise ValueError("delivery list limit is outside its bound")
 
         def read() -> tuple[Delivery, ...]:
-            clauses = ["agent_id = ?", "subject_kind != 'graph_job'"]
+            clauses = ["agent_id = ?"]
             parameters: list[object] = [agent_id]
             if conversation_id is not None:
                 clauses.append("conversation_id = ?")
@@ -2197,7 +1661,6 @@ class SQLStateStore:
         receipt: EffectReceipt,
         *,
         grant: CapabilityGrant | None = None,
-        task_attempt_guard: TaskAttemptGuard | None = None,
         max_receipts_per_run: int = 64,
     ) -> EffectReceipt:
         if (
@@ -2260,109 +1723,32 @@ class SQLStateStore:
                     "the run receipt reservation bound is exhausted"
                 )
             scope = run.start.execution_scope if run.start is not None else None
-            graph_binding = None if scope is None else scope.graph_task_binding
+            job_id = (
+                scope.job_id
+                if scope is not None and scope.scope_kind is ExecutionScopeKind.JOB
+                else None
+            )
             if scope is None:
-                if grant is not None or task_attempt_guard is not None:
+                if grant is not None:
                     raise EffectReceiptConflictError(
                         "foreground receipt cannot carry machine authorization"
                     )
-            elif graph_binding is not None:
+            elif job_id is not None:
+                job = _job_store.load_job(connection, receipt.agent_id, job_id)
                 if (
                     receipt.routine_id is not None
-                    or task_attempt_guard is None
-                    or task_attempt_guard.binding != graph_binding
-                    or task_attempt_guard.claim_token == ""
-                    or task_attempt_guard.run_id != receipt.run_id
-                    or graph_binding.agent_id != receipt.agent_id
+                    or grant is not None
+                    or job is None
+                    or job.state is not JobState.RUNNING
                 ):
                     raise EffectReceiptConflictError(
-                        "graph receipt lacks its exact frozen attempt authorization"
+                        "job receipt requires its running job"
                     )
-                # Approved at the time: a grant is only checked when one was used.
-                if grant is not None and (
-                    grant not in scope.capability_grants
-                    or grant.capability_id != receipt.capability_id
-                    or grant.domain_owner_id != receipt.domain_owner_id
-                    or grant.capability_contract_digest
-                    != receipt.capability_contract_digest
-                    or grant.grant_digest != receipt.capability_grant_digest
-                ):
-                    raise EffectReceiptConflictError(
-                        "graph receipt does not match its exact capability grant"
-                    )
-                loaded_job = _graph_store._load_job(
-                    connection, receipt.agent_id, graph_binding.job_id
-                )
-                loaded_task = _graph_store._load_task(
-                    connection,
-                    receipt.agent_id,
-                    graph_binding.job_id,
-                    graph_binding.task_id,
-                )
-                loaded_attempt = _graph_store._load_attempt(
-                    connection,
-                    receipt.agent_id,
-                    graph_binding.job_id,
-                    graph_binding.task_id,
-                    graph_binding.attempt_id,
-                )
-                if loaded_job is None or loaded_task is None or loaded_attempt is None:
-                    raise EffectReceiptConflictError(
-                        "graph receipt attempt is unavailable"
-                    )
-                job = loaded_job[0]
-                task = loaded_task[0]
-                attempt = loaded_attempt[0]
-                now = self._clock()
-                claim_digest = (
-                    "sha256:" + sha256(attempt.claim_token.encode("utf-8")).hexdigest()
-                )
-                if (
-                    job.specification.authority.digest
-                    != graph_binding.root_authority_digest
-                    or job.state not in {GraphState.QUEUED, GraphState.ACTIVE}
-                    or job.desired_state is not GraphDesiredState.RUN
-                    or job.deadline_at <= now
-                    or task.state is not TaskState.RUNNING
-                    or task.current_attempt_id != graph_binding.attempt_id
-                    or task.task_revision < graph_binding.task_revision
-                    or task.task_spec_digest != graph_binding.task_spec_digest
-                    or task.task_scope_digest != graph_binding.task_scope_digest
-                    or task.fencing_epoch != graph_binding.fencing_epoch
-                    or attempt.state not in ACTIVE_ATTEMPT_STATES
-                    or attempt.run_id != receipt.run_id
-                    or attempt.fencing_epoch != graph_binding.fencing_epoch
-                    or attempt.claim_token != task_attempt_guard.claim_token
-                    or claim_digest != graph_binding.claim_token_digest
-                    or attempt.absolute_deadline_at != graph_binding.task_deadline_at
-                    or attempt.absolute_deadline_at <= now
-                    or (
-                        attempt.lease_expires_at is not None
-                        and attempt.lease_expires_at <= now
-                    )
-                ):
-                    raise EffectReceiptConflictError("graph receipt attempt is stale")
-                if grant is not None:
-                    count = required_row(
-                        connection.execute(
-                            "SELECT COUNT(*) FROM effect_receipts WHERE agent_id = ? AND job_id = ? AND task_id = ? AND grant_digest = ?",
-                            (
-                                receipt.agent_id,
-                                graph_binding.job_id,
-                                graph_binding.task_id,
-                                grant.grant_digest,
-                            ),
-                        )
-                    )[0]
-                    if count >= grant.max_calls_per_occurrence:
-                        raise EffectReceiptConflictError(
-                            "the graph grant invocation ceiling is exhausted"
-                        )
             else:
                 routine_id = receipt.routine_id
                 if routine_id is None:
                     raise EffectReceiptConflictError(
-                        "machine receipt lacks routine or graph authorization"
+                        "machine receipt lacks routine or job authorization"
                     )
                 # Approved at the time: a grant is only checked when one was used.
                 if grant is not None and (
@@ -2425,7 +1811,7 @@ class SQLStateStore:
                             "the grant invocation ceiling is exhausted"
                         )
             connection.execute(
-                "INSERT INTO effect_receipts(agent_id, id, run_id, call_id, operation_key, routine_id, occurrence_id, grant_digest, unresolved, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO effect_receipts(agent_id, id, run_id, call_id, operation_key, routine_id, occurrence_id, grant_digest, unresolved, job_id, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
                 (
                     receipt.agent_id,
                     receipt.receipt_id,
@@ -2435,11 +1821,7 @@ class SQLStateStore:
                     receipt.routine_id,
                     receipt.occurrence_id,
                     receipt.capability_grant_digest,
-                    None if graph_binding is None else graph_binding.job_id,
-                    None if graph_binding is None else graph_binding.task_id,
-                    None if graph_binding is None else graph_binding.attempt_id,
-                    None if graph_binding is None else graph_binding.fencing_epoch,
-                    None if graph_binding is None else graph_binding.task_spec_digest,
+                    job_id,
                     encode_receipt(receipt),
                 ),
             )
@@ -2459,7 +1841,7 @@ class SQLStateStore:
 
         def write(connection: SQLConnection) -> EffectReceipt:
             row = connection.execute(
-                "SELECT data, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest FROM effect_receipts WHERE agent_id = ? AND id = ?",
+                "SELECT data, job_id FROM effect_receipts WHERE agent_id = ? AND id = ?",
                 (receipt.agent_id, receipt.receipt_id),
             ).fetchone()
             if row is None:
@@ -2487,66 +1869,13 @@ class SQLStateStore:
                     connection, receipt, receipt.finished_at or self._clock()
                 )
                 if row[1] is not None:
-                    _open_graph_effect_uncertain_control(
+                    _job_store.wait_for_uncertain_write(
                         connection,
-                        receipt=receipt,
-                        job_id=str(row[1]),
-                        task_id=str(row[2]),
-                        attempt_id=str(row[3]),
-                        fencing_epoch=int(row[4]),
-                        task_spec_digest=str(row[5]),
-                        opened_at=receipt.finished_at or self._clock(),
+                        receipt.agent_id,
+                        str(row[1]),
+                        receipt.finished_at or self._clock(),
                     )
             return receipt
-
-        return await run_sql_transaction(self._database, write)
-
-    async def list_effect_receipts_for_graph_attempt(
-        self,
-        agent_id: str,
-        job_id: str,
-        task_id: str,
-        attempt_id: str,
-    ) -> tuple[EffectReceipt, ...]:
-        def read() -> tuple[EffectReceipt, ...]:
-            with _connect_read_only(self._database) as connection:
-                rows = connection.execute(
-                    "SELECT data FROM effect_receipts WHERE agent_id = ? AND job_id = ? AND task_id = ? AND task_attempt_id = ? ORDER BY id",
-                    (agent_id, job_id, task_id, attempt_id),
-                )
-                return tuple(decode_receipt(row[0]) for row in rows)
-
-        return await settled_thread(read)
-
-    async def reconcile_graph_effect_attempt(
-        self,
-        agent_id: str,
-        job_id: str,
-        task_id: str,
-        attempt_id: str,
-    ) -> bool:
-        def write(connection: SQLConnection) -> bool:
-            row = connection.execute(
-                "SELECT data, fencing_epoch, task_spec_digest FROM effect_receipts WHERE agent_id = ? AND job_id = ? AND task_id = ? AND task_attempt_id = ? ORDER BY id LIMIT 1",
-                (agent_id, job_id, task_id, attempt_id),
-            ).fetchone()
-            if row is None:
-                return False
-            receipt = decode_receipt(row[0])
-            _open_graph_effect_uncertain_control(
-                connection,
-                receipt=receipt,
-                job_id=job_id,
-                task_id=task_id,
-                attempt_id=attempt_id,
-                fencing_epoch=int(row[1]),
-                task_spec_digest=str(row[2]),
-                opened_at=max(
-                    receipt.finished_at or receipt.started_at,
-                    self._clock(),
-                ),
-            )
-            return True
 
         return await run_sql_transaction(self._database, write)
 
@@ -2558,7 +1887,7 @@ class SQLStateStore:
 
         def write(connection: SQLConnection) -> EffectReceipt:
             row = connection.execute(
-                "SELECT data FROM effect_receipts WHERE agent_id = ? AND id = ?",
+                "SELECT data, job_id FROM effect_receipts WHERE agent_id = ? AND id = ?",
                 (agent_id, resolution.receipt_id),
             ).fetchone()
             if row is None:
@@ -2602,6 +1931,10 @@ class SQLStateStore:
                     connection,
                     data,
                     replace(routine, state=state, updated_at=resolution.resolved_at),
+                )
+            if row[1] is not None:
+                _job_store.release_uncertain_write(
+                    connection, agent_id, str(row[1]), resolution.resolved_at
                 )
             return resolved
 
@@ -3811,27 +3144,13 @@ class SQLStateStore:
                     "Artifact identity is already registered.",
                     {"stage": "identity"},
                 )
-            attempt_row = connection.execute(
-                "SELECT a.attempt_id, a.state, j.data FROM job_task_attempts AS a "
-                "JOIN job_runs AS j ON j.agent_id = a.agent_id AND j.job_id = a.job_id "
-                "WHERE a.agent_id = ? AND a.run_id = ?",
-                (record.agent_id, record.ref.run_id),
-            ).fetchone()
-            if reserved and not _active_artifact_reservation(connection, record):
+            if reserved:
+                # Only graph task attempts reserved artifact identities.
                 raise ArtifactError(
                     "artifact_storage_failed",
                     "Artifact reservation is no longer active.",
                     {"stage": "reservation"},
                 )
-            if attempt_row is not None:
-                job = decode_graph_job(attempt_row[2])
-                if (
-                    job.specification.principal_id != record.caller_principal_id
-                    or job.conversation_id != record.ref.conversation_id
-                ):
-                    raise ArtifactError(
-                        "artifact_missing", "Artifact job ownership differs.", {}
-                    )
             rows = tuple(
                 connection.execute(
                     "SELECT run_id, byte_size FROM artifacts WHERE agent_id = ?",
@@ -3889,16 +3208,6 @@ class SQLStateStore:
         updated = replace(record, state=state)
 
         def write(connection: SQLConnection) -> ArtifactRecord:
-            if (
-                record.state is ArtifactState.READY
-                and state is ArtifactState.DELETING
-                and _active_artifact_reservation(connection, record)
-            ):
-                raise ArtifactError(
-                    "artifact_busy",
-                    "An active job still owns this artifact reservation.",
-                    {},
-                )
             changed = connection.execute(
                 "UPDATE artifacts SET state = ?, data = ? WHERE artifact_id = ? AND data = ?",
                 (
@@ -4270,12 +3579,26 @@ class SQLStateStore:
             raise ValueError("agent_id must be a non-empty string")
 
         def write(connection: SQLConnection) -> int:
+            # A live job's runs and running sub-runs are its working state.
+            live_job_conversations = {
+                conversation_id
+                for job in _job_store.list_jobs(
+                    connection,
+                    agent_id,
+                    states=LIVE_JOB_STATES,
+                    limit=MAX_JOB_LIST_PAGE_SIZE,
+                )
+                for conversation_id in (
+                    job.job_id,
+                    *(item.id for item in job.running_delegations),
+                )
+            }
             protected_run_ids = {
                 str(row[0])
+                for conversation_id in live_job_conversations
                 for row in connection.execute(
-                    "SELECT run_id FROM job_task_attempts "
-                    "WHERE agent_id = ? AND state IN ('claimed', 'running')",
-                    (agent_id,),
+                    "SELECT id FROM runs WHERE agent_id = ? AND conversation_id = ?",
+                    (agent_id, conversation_id),
                 )
             }
             protected_run_ids.update(
@@ -4903,20 +4226,6 @@ def _validate_current_mcp_binding_bounds(connection: SQLConnection) -> None:
                 )
 
 
-def _active_artifact_reservation(
-    connection: SQLConnection, record: ArtifactRecord
-) -> bool:
-    row = connection.execute(
-        "SELECT attempt_id, state FROM job_task_attempts WHERE agent_id = ? AND run_id = ?",
-        (record.agent_id, record.ref.run_id),
-    ).fetchone()
-    return (
-        row is not None
-        and row[1] in {"claimed", "running"}
-        and reserved_artifact_id(row[0]) == record.ref.artifact_id
-    )
-
-
 def _artifact_record_row(record: ArtifactRecord) -> tuple[object, ...]:
     ref = record.ref
     return (
@@ -5208,90 +4517,22 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
         if identity is not None and link.agent_id != identity.id:
             raise ValueError("stored catalog link belongs to another agent")
 
-    # Keep only job records: later checks need nothing else, so history size
-    # does not bound how many jobs an agent may have.
-    graph_jobs: dict[tuple[str, str], GraphJob] = {}
-    for agent_id, job_id in connection.execute("SELECT agent_id, job_id FROM job_runs"):
-        inspection = _graph_store.inspect_graph(connection, agent_id, job_id)
-        if inspection is None:
-            raise ValueError("stored graph job is unavailable")
-        if identity is not None and inspection.job.agent_id != identity.id:
-            raise ValueError("stored graph job belongs to another agent")
-        graph_jobs[(agent_id, job_id)] = inspection.job
-
-    graph_attention_producers: dict[tuple[str, str], tuple[GraphJob, str, datetime]] = (
-        {}
-    )
-    for (
-        event_id,
-        agent_id,
-        job_id,
-        task_id,
-        attempt_id,
-        kind,
-        created_at_us,
-        data,
-    ) in connection.execute(
-        """SELECT event_id, agent_id, job_id, task_id, attempt_id, kind,
-                  created_at_us, data
-           FROM job_graph_events
-           WHERE kind IN (
-               'task_control_opened',
-               'task_retry_circuit_opened',
-               'task_review_changes_requested'
-           )"""
+    jobs: dict[tuple[str, str], Job] = {}
+    for agent_id, job_id, conversation_id, state, revision, data in connection.execute(
+        "SELECT agent_id, job_id, conversation_id, state, revision, data FROM jobs"
     ):
-        graph_job = graph_jobs.get((agent_id, job_id))
-        if graph_job is None:
-            raise ValueError("stored graph attention event has no owned job")
-        created_at = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(
-            microseconds=int(created_at_us)
-        )
-        event = decode_graph_event(
-            data,
-            event_id=int(event_id),
-            agent_id=agent_id,
-            job_id=job_id,
-            task_id=task_id,
-            attempt_id=attempt_id,
-            kind=kind,
-            created_at=created_at,
-        )
-        transition_kind: str
-        transition_identity: object
-        if event.kind == "task_control_opened":
-            control_kind = event.payload.get("kind")
-            if control_kind in {
-                ControlKind.NEEDS_REPLAN.value,
-                ControlKind.REVIEW_REQUESTED.value,
-            }:
-                continue
-            transition_kind = "control_opened"
-            transition_identity = event.payload.get("control_id")
-        elif event.kind == "task_retry_circuit_opened":
-            transition_kind = "retry_circuit_open"
-            transition_identity = event.payload.get("control_id")
-        else:
-            transition_kind = "review_changes_requested"
-            transition_identity = event.payload.get("changes_control_id")
-        if not isinstance(transition_identity, str) or not transition_identity:
-            raise ValueError("stored graph attention event identity is invalid")
-        subject = (
-            f"{event.job_id}/event/{event.event_id}/{transition_kind}/"
-            f"{transition_identity}"
-        )
-        digest = canonical_digest(
-            {
-                "job_id": event.job_id,
-                "event_id": event.event_id,
-                "transition_kind": transition_kind,
-                "transition_identity": transition_identity,
-            }
-        )
-        key = (event.agent_id, subject)
-        if key in graph_attention_producers:
-            raise ValueError("stored graph attention producer identity is duplicated")
-        graph_attention_producers[key] = (graph_job, digest, created_at)
+        job = decode_job(data)
+        if (
+            job.agent_id != agent_id
+            or job.job_id != job_id
+            or job.conversation_id != conversation_id
+            or job.state.value != state
+            or job.revision != revision
+        ):
+            raise ValueError("stored job projection is invalid")
+        if identity is not None and job.agent_id != identity.id:
+            raise ValueError("stored job belongs to another agent")
+        jobs[(agent_id, job_id)] = job
 
     routines: dict[tuple[str, str], ScheduledRoutine] = {}
     routine_counts: dict[str, int] = {}
@@ -5397,29 +4638,6 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
                   state, created_at_us, data
            FROM deliveries"""
     ):
-        if subject_kind == "graph_job":
-            graph_delivery = decode_graph_job_delivery(
-                data,
-                agent_id=agent_id,
-                delivery_id=delivery_id,
-                conversation_id=conversation_id,
-                subject_kind=subject_kind,
-                subject_id=subject_id,
-                logical_key=logical_key,
-                state=state,
-            )
-            if not isinstance(graph_delivery, GraphJobDelivery):
-                raise TypeError("current graph delivery did not decode to its record")
-            if (
-                graph_delivery.target.target_fingerprint != target_fingerprint_value
-                or _datetime_us(graph_delivery.created_at) != created_at_us
-                or (agent_id, subject_id) not in graph_jobs
-            ):
-                raise ValueError("stored graph delivery projection is invalid")
-            delivery_counts[agent_id] = delivery_counts.get(agent_id, 0) + 1
-            if delivery_counts[agent_id] > MAX_DELIVERIES_PER_AGENT:
-                raise ValueError("stored delivery count exceeds its fixed bound")
-            continue
         delivery = decode_delivery(data, agent_id=agent_id, delivery_id=delivery_id)
         if (
             delivery.conversation_id != conversation_id
@@ -5439,26 +4657,11 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
             producer_references_delivery = (
                 producer is not None and delivery_id in producer.delivery_ids
             )
-        elif delivery.subject_kind is DeliverySubjectKind.GRAPH_ATTENTION:
-            attention = graph_attention_producers.get((agent_id, subject_id))
-            if attention is None:
-                raise ValueError("stored graph attention producer is invalid")
-            attention_job, transition_digest, transition_at = attention
+        elif delivery.subject_kind is DeliverySubjectKind.JOB:
+            producing_job = jobs.get((agent_id, subject_id))
             producer_references_delivery = (
-                delivery.conversation_id == attention_job.conversation_id
-                and delivery.outcome.conclusion_id == subject_id
-                and delivery.outcome.conclusion_digest == transition_digest
-                and delivery.outcome.provenance_digest == transition_digest
-                and delivery.outcome.observed_at == transition_at
-                and delivery.outcome.resulting_run_id is None
-                and not delivery.outcome.artifact_references
-                and not delivery.outcome.effect_receipt_ids
-                and delivery.delivery_id
-                == "delivery-" + sha256(subject_id.encode()).hexdigest()[:32]
-                and attention_job.specification.distribution_plan_digest
-                == distribution_plan_digest(
-                    targets=(delivery.target,), required_target_count=1
-                )
+                producing_job is not None
+                and producing_job.conversation_id == delivery.conversation_id
             )
         else:
             raise ValueError("stored delivery retained a legacy producer")
@@ -5490,128 +4693,21 @@ def _pause_effect_routine(
     )
 
 
-def _open_graph_effect_uncertain_control(
-    connection: SQLConnection,
-    *,
-    receipt: EffectReceipt,
-    job_id: str,
-    task_id: str,
-    attempt_id: str,
-    fencing_epoch: int,
-    task_spec_digest: str,
-    opened_at: datetime,
-) -> TaskControl | None:
-    loaded_task = _graph_store._load_task(connection, receipt.agent_id, job_id, task_id)
-    loaded_attempt = _graph_store._load_attempt(
-        connection, receipt.agent_id, job_id, task_id, attempt_id
-    )
-    if loaded_task is None or loaded_attempt is None:
-        return None
-    task = loaded_task[0]
-    attempt = loaded_attempt[0]
-    if (
-        task.state is not TaskState.RUNNING
-        or task.current_attempt_id != attempt_id
-        or task.task_spec_digest != task_spec_digest
-        or task.fencing_epoch != fencing_epoch
-        or attempt.state not in ACTIVE_ATTEMPT_STATES
-        or attempt.fencing_epoch != fencing_epoch
-    ):
-        return None
-    control_id = (
-        "control-"
-        + sha256(f"{receipt.receipt_id}:effect-uncertain".encode()).hexdigest()[:32]
-    )
-    existing = connection.execute(
-        "SELECT data FROM job_task_controls WHERE agent_id = ? AND job_id = ? AND task_id = ? AND control_id = ?",
-        (receipt.agent_id, job_id, task_id, control_id),
-    ).fetchone()
-    if existing is not None:
-        return None
-    if receipt.outcome is EffectOutcome.SUCCEEDED:
-        message = (
-            "The external operation succeeded, but its graph result was not committed; "
-            "the operation will not be replayed."
-        )
-    elif receipt.outcome is EffectOutcome.NOT_APPLIED:
-        message = "The reserved external operation was not applied and will not be replayed automatically."
-    else:
-        message = (
-            "The external operation outcome is uncertain and will not be replayed."
-        )
-    payload = {
-        "message": message,
-        "details": {
-            "receipt_id": receipt.receipt_id,
-            "receipt_digest": receipt.receipt_digest,
-            "outcome": receipt.outcome.value,
-            "evidence_basis": receipt.evidence_basis.value,
-            "resolution_does_not_retry": True,
-            "resolution_does_not_mark_success": True,
-        },
-    }
-    control = TaskControl(
-        agent_id=receipt.agent_id,
-        job_id=job_id,
-        task_id=task_id,
-        control_id=control_id,
-        kind=ControlKind.EFFECT_UNCERTAIN,
-        state=ControlState.OPEN,
-        requesting_attempt_id=attempt_id,
-        payload=payload,
-        created_at=opened_at,
-        payload_digest=canonical_digest(payload),
-    )
-    return _graph_store.open_control(
-        connection,
-        control,
-        claim_token=attempt.claim_token,
-        fencing_epoch=fencing_epoch,
-    )
-
-
 def _recover_started_effect_receipts(
     connection: SQLConnection, agent_id: str, completed_at: datetime
 ) -> None:
     rows = tuple(
         connection.execute(
-            "SELECT agent_id, id, data, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest FROM effect_receipts WHERE agent_id = ?",
+            "SELECT agent_id, id, data, job_id FROM effect_receipts WHERE agent_id = ?",
             (agent_id,),
         )
     )
     started = tuple(
-        (
-            agent_id,
-            receipt_id,
-            receipt,
-            job_id,
-            task_id,
-            attempt_id,
-            fencing_epoch,
-            task_spec_digest,
-        )
-        for (
-            agent_id,
-            receipt_id,
-            data,
-            job_id,
-            task_id,
-            attempt_id,
-            fencing_epoch,
-            task_spec_digest,
-        ) in rows
+        (agent_id, receipt_id, receipt, job_id)
+        for (agent_id, receipt_id, data, job_id) in rows
         if (receipt := decode_receipt(data)).outcome is EffectOutcome.STARTED
     )
-    for (
-        agent_id,
-        receipt_id,
-        receipt,
-        job_id,
-        task_id,
-        attempt_id,
-        fencing_epoch,
-        task_spec_digest,
-    ) in started:
+    for agent_id, receipt_id, receipt, job_id in started:
         recovered = receipt.finish(
             EffectObservation(EffectOutcome.UNCERTAIN, EffectEvidenceBasis.UNKNOWN),
             finished_at=completed_at,
@@ -5630,15 +4726,8 @@ def _recover_started_effect_receipts(
             raise RuntimeError("effect receipt changed during startup recovery")
         _pause_effect_routine(connection, recovered, completed_at)
         if job_id is not None:
-            _open_graph_effect_uncertain_control(
-                connection,
-                receipt=recovered,
-                job_id=str(job_id),
-                task_id=str(task_id),
-                attempt_id=str(attempt_id),
-                fencing_epoch=int(fencing_epoch),
-                task_spec_digest=str(task_spec_digest),
-                opened_at=completed_at,
+            _job_store.wait_for_uncertain_write(
+                connection, agent_id, str(job_id), completed_at
             )
 
 

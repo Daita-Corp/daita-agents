@@ -25,7 +25,7 @@ or privileges.
 
 `AgentConfig.host_capacity` is an immutable `HostCapacityLimits` for one open
 composition. Defaults remain five executions, two simultaneous provider requests,
-one strictly reserved foreground slot in each, one graph task, two PostgreSQL
+one strictly reserved foreground slot in each, two job sub-runs, two PostgreSQL
 reads per source and four SQLite state-pressure permits. SQLite source reads and
 MCP binding calls remain capacity one. Capacity never grants a capability or
 widens a frozen execution scope.
@@ -39,7 +39,7 @@ config = AgentConfig(
         foreground_execution_reserve=1,
         provider_capacity=4,
         foreground_provider_reserve=1,
-        graph_parallelism=4,
+        job_parallelism=4,
         postgresql_read_capacity=4,
     ),
 )
@@ -48,8 +48,8 @@ config = AgentConfig(
 Supply the configuration with the existing model route or injected provider to
 `Agent.create`, `Agent.open` or `Agent.from_storage`. These capacity settings are
 runtime-only and must be supplied on each open. Drain and reopen to change them.
-The initial opt-in ceilings are 16 executions, eight provider requests, four graph
-tasks and eight PostgreSQL reads per source. They are qualification bounds, not
+The initial opt-in ceilings are 16 executions, eight provider requests, four job
+sub-runs at once and eight PostgreSQL reads per source. They are qualification bounds, not
 published safe operating levels. Reserves must be integers below capacity; zero
 explicitly permits full background utilization. Reserved slots are never borrowed.
 Independent conversations can overlap; turns within a conversation remain FIFO.

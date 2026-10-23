@@ -5,90 +5,109 @@
 > The invariants in `AGENTS.md` are the hard rules. Everything else here can
 > change through *Proposing architecture changes* in `AGENTS.md`.
 
-Machine-originated work: graph jobs, time-triggered routines, outcomes and deliveries.
+Machine-originated work: background jobs, time-triggered routines, outcomes and
+deliveries.
 
-## Job graph boundaries
+## Checklist jobs
 
-The job graph, introduced in home revision 2, keeps these boundaries. Changing
-one is an architecture change:
+A background job is an ordinary agent run that keeps going in the host. It
+plans with a checklist, hands independent pieces to sub-runs and asks a person
+when it needs one. These boundaries hold; changing one is an architecture
+change:
 
-- the adaptive task graph is owned inside `jobs`; `JobOwner` owns commands and one
-  graph-aware `JobSupervisor` owns graph-local selection, claims and recovery;
-- there is still one reentrant `AgentLoop` semantic implementation and one
-  `CapabilityRuntime`; each model task attempt has a fresh isolated `RunSession`,
-  exact transcript and one `RunSessionWriter`;
-- `RunAdmissionCoordinator` owns host workload admission, lifecycle drain and keyed
-  provider/source/MCP/SQLite/effect permits; it does not own graph transitions,
-  model routing or capability semantics;
-- root authority, outcome, distribution, deadlines and total budgets are immutable;
-  planner-created task scope is a validated subset and model text never grants
-  authority;
-- graph effects are narrowly released only for preview-bound PostgreSQL update/upsert
-  and specifically admitted synchronous MCP actions under exact code-owned grants;
-  all other graph work remains effect-free and the existing receipt boundary remains
-  the only effect truth;
-- graph transactions are short indexed SQLite CAS operations. Provider, source, MCP,
-  artifact and effect I/O never occurs beneath a graph transaction or broad host
-  lock;
-- normalized tasks, edges, attempts, accepted results, controls, mutations, budget
-  ledgers and bounded audit events are current graph state/evidence. Events are never
-  event-sourced authority;
-- routines remain the separate time-triggered occurrence system; a routine is not a
-  graph task and no routine-to-graph bridge is part of graph V1;
-- revision 2 is one atomic conversion/cutover. Current runtime codecs contain only
-  the graph shape afterward; revision-1 decoders remain migration-only; the old
-  single-job, connected-executor and autonomous-follow-up paths are deleted at the
-  specified gates rather than retained as a selectable compatibility engine.
+- one durable `Job` record per job, in the `jobs` table (strict codec, one
+  row): objective, optional `source_ids`, state (`running`, `waiting_for_you`,
+  `done`, `failed`, `cancelled`), the model's checklist (at most 64 items with
+  `pending`/`in_progress`/`done`/`cancelled` status and optional `after` ids),
+  delegations (sub-runs and their bounded summaries), the open question and the
+  person's answers, run and token counts and limits, and the final summary;
+- `JobOwner` is the one writer of job records in a process. It serializes
+  changes and compare-and-sets the record's revision, so a receipt that holds a
+  job for a person is never overwritten. `JobSupervisor` runs one main run at a
+  time per job and the sub-runs it delegates;
+- every run is an ordinary `AgentLoop` run through the one `CapabilityRuntime`.
+  A job continues by starting a **new** main run from its saved record; no run
+  is ever resumed;
+- model-written text (checklist titles and notes, goals, summaries, questions)
+  is stored sanitized and bounded, is labeled untrusted when shown to a model,
+  and grants nothing. The record carries a sensitivity floor: the highest
+  sensitivity any of its runs or sub-runs saw, applied to later runs and to
+  tool outputs that repeat its text.
 
-## Durable graph jobs
+### Tools
 
-`GraphJob`, `JobGraph`, normalized tasks, dependencies, attempts, accepted results,
-controls, mutations, bounded events and budget ledgers are the sole current durable
-job records. `JobOwner` owns admission and bounded lifecycle commands. One
-graph-aware `JobSupervisor` owns graph-local selection, claims, fencing, recovery,
-fairness and finalization; all capability work still executes through the one
-`CapabilityRuntime`, and every model task uses the one `AgentLoop` implementation.
+Foreground runs get `job_start(objective, sources?)` (on demand, no confirm
+card: the job shows on the Work board at once and can be cancelled),
+`job_list`, `job_inspect` (checklist, delegations, question and final result)
+and `job_cancel` (on demand). A job's main run, and only it, gets:
 
-No model tool starts a profile job: models profile data with `data_query`
-aggregates. The static effect-free profile graph keeps its internal executor and
-finalizer (`jobs.data_profile.execute`/`.finalize`) so migrated revision-2 profile
-jobs still run. `start_graph_job`
-admits one code-resolved graph-eligible initial task and internal finalizer when a
-model route is configured. Graph work is bounded by per-task steps, the host
-per-run token ceiling, wall time and `work_units` attempts; graph contracts and
-graph-task scopes carry no dollar ceiling, and only graph-task scopes may omit
-one. Planner-created work is a validated immutable-authority subset. Unmappable
-migrated work is `needs_attention`; no legacy executor can run it.
+- `checklist_write(items, merge?)`: replace the checklist or merge by id;
+  returns the full list. Starting or finishing an item before every item it
+  comes `after` is `done` is refused, naming them; unknown `after` ids and
+  cycles are refused; a cancelled item does not satisfy its dependants;
+- `delegate(goal, context, item?, sources?)`: start a sub-run with only that
+  goal and context, wait for it and return its bounded summary. Several calls in
+  one step run in parallel. With `item`, code marks the item `in_progress`, then
+  `done`, or `pending` again if the sub-run fails. `sources` narrow the main
+  run's fixed scope and can never widen it;
+- `ask_user(question)`: must be the only call in its step; the run ends with a
+  machine directive, the job waits as **Needs you**, and the answer starts a new
+  run that sees it.
 
-An effectful initial task additionally requires foreground approval and one
-code-normalized exact grant. Native grants bind the exact PostgreSQL source,
-resource revision, operation, columns, keys, identity generation and row ceiling;
-the task must execute its frozen preview before applying it once. MCP grants bind
-the exact active binding revision, remote tool and fixed nested JSON, with only
-explicit top-level scalar variables, `AUTOMATION_DIRECT`, `DIRECT_RESULT`, no
-required asynchronous task support and one call. Effect execution holds the global
-`effect:v1:global` lane plus `relwrite:<source>:<resource>` or
-`mcp:<agent>:<binding>`.
+Sub-runs (`JOB_SUBRUN`) are flat: they have none of the job tools. Routine runs
+have neither job-run tools nor the foreground job tools; the one exclusion list
+is in `hosting/embedded.py`.
 
-Receipt reservation atomically authenticates the live job, task, attempt, claim,
-fencing epoch, task-spec digest and grant before dispatch. A task result may retain
-only its authenticated successful receipt reference. Any reserved operation that
-cannot be joined to an accepted task result blocks the task and descendants through
-a typed `effect_uncertain` control; startup and cancellation reconciliation never
-replay it. Human receipt resolution remains immutable evidence and does not retry,
-compensate or mark the task successful.
+### Runs and resuming
 
-Agent identity is the job authorization boundary. The originating
-conversation and run are immutable provenance, not access gates. Bounded list,
-inspect, result-read, and cancellation operations can address any job owned by
-the agent. Cross-agent lookup fails without exposing metadata. Work progresses only
-while a process holds the agent open; normally that is the Daita host.
+A main run (`RunOrigin.JOB`) is a machine run: its scope is fixed at start from
+the job's sources (or every current source) and every capability except the
+exclusions, its limits are the agent's normal run limits, and writes ask a
+person at the time. Its start is a code-owned instruction plus an untrusted
+payload: the objective, checklist, delegation summaries, answers, the writes
+already committed (from receipts) and the previous run's last assistant
+message, shrunk oldest-first to fit its bound. Main runs live in a conversation
+named after the job; each sub-run has its own. Neither imports conversation
+history.
 
-There is no current connected-executor mode, embedded single-job attempt/result
-state, autonomous-follow-up driver or selectable legacy supervisor. Finalizers
-authenticate accepted task results and publish through the existing delivery
-boundary. Revision-1 terminal follow-up/delivery provenance is preserved only by
-migration-owned conversion.
+A job continues in a new run when the host restarts while it is running, when a
+main run's last request passed 60% of the model's input window (the run ends
+after that step as `context_threshold_reached`), when the person answers its
+question, and after a run stopped at one of its own step, time, token or
+tool-call limits. Sub-runs that were running at a restart are marked failed
+with "Interrupted by restart."; the model sees that and can delegate again. A
+run that ends with final text finishes the job: that text is its result,
+delivered to the originating conversation's Inbox as a Done card. An
+unanswered approval interrupts the run and holds the job as **Needs you**; any
+other run failure fails the job.
+
+### Limits, writes and cancellation
+
+A job stops as `failed` after 20 runs or ten times the per-run token limit in
+total (sub-runs count), whichever comes first; answering a job stopped at a
+limit raises both by the same amount and continues it. Main runs take a
+`WorkloadClass.JOB` execution lease from `RunAdmissionCoordinator`; sub-runs run
+inside their main run's lease and deadline, at most `HostCapacityLimits.
+job_parallelism` (default 2) per agent at once. A provider quota rejection
+holds the job for five minutes instead of failing it.
+
+A receipt is reserved only after approval, and a job receipt requires its job
+to be running. A write waiting for approval at a restart was never dispatched:
+the resumed run sees it is not committed and asks again. An uncertain receipt
+holds the job as **Needs you** until a person resolves it, and resolving the
+job's last uncertain write lets it continue.
+
+`job_cancel` stops the main run and its sub-runs at once; a cancelled job never
+restarts. Agent identity is the job authorization boundary; the originating
+conversation is provenance, not an access gate.
+
+Revision 4 converted the task graph: finished graph jobs became `done`,
+`failed` or `cancelled` jobs keeping their accepted result, unfinished ones
+became `failed` with "Created by an older version of Daita; start it again.",
+result deliveries and receipts kept their job id, graph attention notices were
+dropped, and the graph tables went. The revision-2 conversion still imports the
+frozen graph records (`jobs/graph/models.py`, `validation.py`), their codec and
+`storage/sqlite_graph.py`; nothing at runtime uses them.
 
 ## Scheduled routines and deliveries
 
@@ -137,8 +156,7 @@ host's interactions, is receipted before dispatch and is never replayed. An
 uncertain receipt pauses the routine until a person resolves it.
 
 Routine occurrences validate committed artifacts against one fixed code
-outcome (any artifacts within the shared delivery bounds); graph jobs keep
-their `OutcomeContract`. `DistributionPlan` freezes ordered target bindings. `Delivery` is the sole
+outcome (any artifacts within the shared delivery bounds). `DistributionPlan` freezes ordered target bindings. `Delivery` is the sole
 durable representation of a logical delivery; the Inbox is a bounded product
 view over deliveries. The only distribution destination is the originating
 conversation inbox. Producer finalization validates committed artifacts and
