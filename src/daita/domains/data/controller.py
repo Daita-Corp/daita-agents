@@ -49,7 +49,6 @@ from ...loop.models import RunInput, RunOrigin, Transcript
 from ...loop.session import RunSession
 from ...scope import EffectiveSourceScope, resolve_effective_source_scope
 from ...storage.sqlite_records import RelationalWriteScope, SourcePermissionStateError
-from .routine_precheck import RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID
 from .sql import (
     DuckDBReadValidationError,
     RelationalUpdateCommand,
@@ -90,7 +89,6 @@ _CATALOG_CAPABILITIES = frozenset(
     {
         CATALOG_SEARCH_CAPABILITY_ID,
         CATALOG_DESCRIBE_CAPABILITY_ID,
-        RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID,
     }
 )
 _RELATIONAL_READ_CAPABILITIES = frozenset(
@@ -117,7 +115,6 @@ def native_preview_capability(capability_id: str) -> str:
 _RESOURCE_ARGUMENT_CAPABILITIES = frozenset(
     {
         *_UPSERT_CAPABILITIES,
-        RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID,
         RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
         RELATIONAL_UPDATE_CAPABILITY_ID,
     }

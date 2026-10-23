@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import httpx2 as httpx
@@ -23,25 +23,17 @@ from daita import (
     ApprovalDecision,
     CalendarDaySelector,
     CalendarSchedule,
-    EffectRequirement,
     EffectResolutionDecision,
     LocalWorkspace,
     MCPToolSelection,
-    MisfirePolicy,
-    ReportingMode,
-    RequestedCapabilityGrant,
-    ScheduledRoutineDraft,
+    RoutineIntent,
 )
-from daita._json import FrozenJsonObject
 from daita.adapters.mcp import MCPClientFactory, SDKMCPClientFactory
-from daita.artifacts.models import ArtifactAuthorship
 from daita.capabilities import (
     AccessMode,
     AutomationEligibility,
-    EffectEvidenceBasis,
     OperationalEffect,
 )
-from daita.distribution import ArtifactRequirement, OutcomeContract
 from daita.llm.models import ModelSensitivity, ModelUsage
 from daita.llm.pricing import CostEstimate
 
@@ -164,6 +156,7 @@ async def run() -> None:
 
         async def approve(request):
             # Auto-approval is restricted to this entirely simulated walkthrough.
+            # Scheduled runs ask here too, before each notification.
             document = request.render_arguments_for_review()
             assert document is not None
             print(f"Offline approval: {request.tool_name}\n{document}")
@@ -205,12 +198,6 @@ async def run() -> None:
                 "Research status, create a briefing and notify demo-room now and every Monday."
             )
             assert origin.conversation_id is not None
-            destination = (
-                await agent.distribution_destinations(
-                    origin.conversation_id,
-                    sensitivity_ceiling=ModelSensitivity.INTERNAL,
-                )
-            )[0]
 
             def script():
                 model.extend(
@@ -253,88 +240,21 @@ async def run() -> None:
                 )
 
             script()
-            outcome = OutcomeContract(
-                require_terminal_conclusion=True,
-                artifact_requirements=(
-                    ArtifactRequirement(
-                        required=True,
-                        minimum_count=1,
-                        maximum_count=1,
-                        allowed_media_types=("text/markdown",),
-                        allowed_authorships=(
-                            ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
-                        ),
-                        allowed_producer_capability_ids=("artifact.create_document",),
-                        maximum_artifact_bytes=4096,
-                        maximum_total_bytes=4096,
-                        maximum_sensitivity=ModelSensitivity.INTERNAL,
-                    ),
-                ),
-                maximum_total_artifact_bytes=4096,
-                maximum_effective_sensitivity=ModelSensitivity.INTERNAL,
-                require_current_run_provenance=True,
-                require_exact_source_bindings=False,
-                effect_requirements=(
-                    EffectRequirement(
-                        tools["notify"].capability_id,
-                        1,
-                        frozenset({EffectEvidenceBasis.SERVER_REPORTED}),
-                    ),
-                ),
-            )
-            draft = ScheduledRoutineDraft(
-                origin_run_id=origin.run_id,
-                title="Weekly example briefing",
-                authorized_instruction="Read cited example research, create a Markdown briefing, and invoke the notification tool for demo-room. Report incomplete coverage and invocation evidence only.",
-                schedule=CalendarSchedule(
-                    timezone="America/Chicago",
-                    hour=9,
-                    minute=0,
-                    day_selector=CalendarDaySelector.WEEKDAYS,
-                    weekdays=(1,),
-                ),
-                misfire_policy=MisfirePolicy.LATEST_ONLY,
-                reporting_mode=ReportingMode.ALWAYS,
-                precheck=None,
-                allowed_source_ids=(),
-                allowed_resource_ids=(),
-                allowed_connector_binding_ids=(status.binding.binding_id,),
-                allowed_capability_ids=(
-                    tools["research"].capability_id,
-                    tools["notify"].capability_id,
-                    "artifact.create_document",
-                ),
-                sensitivity_ceiling=ModelSensitivity.INTERNAL,
-                outcome_contract=outcome,
-                distribution_destination_id=destination.destination_id,
-                eligible_model_routes=(model.provider_id,),
-                per_run_max_tokens=8000,
-                per_run_max_cost_usd=Decimal("1"),
-                cumulative_max_tokens=24000,
-                cumulative_max_cost_usd=Decimal("3"),
-                cumulative_max_attempts=3,
-                cumulative_max_occurrences=3,
-                maximum_consecutive_failures=2,
-                expires_at=now[0] + timedelta(days=30),
-                run_immediately=True,
-                requested_capability_grants=(
-                    RequestedCapabilityGrant(
-                        tools["notify"].capability_id,
-                        FrozenJsonObject.from_mapping(
-                            {
-                                "binding_id": status.binding.binding_id,
-                                "binding_revision": status.binding.revision,
-                                "remote_tool_name": "notify",
-                                "fixed_arguments": {"destination": "demo-room"},
-                                "variable_argument_names": ("content",),
-                            }
-                        ),
-                        1,
-                    ),
-                ),
-            )
             routine = await agent.create_routine(
-                await agent.propose_routine(draft), confirmation_handler=approve
+                RoutineIntent(
+                    title="Weekly example briefing",
+                    prompt="Read cited example research, create a Markdown briefing, and invoke the notification tool for demo-room. Report incomplete coverage and invocation evidence only.",
+                    schedule=CalendarSchedule(
+                        timezone="America/Chicago",
+                        hour=9,
+                        minute=0,
+                        day_selector=CalendarDaySelector.WEEKDAYS,
+                        weekdays=(1,),
+                    ),
+                    run_immediately=True,
+                ),
+                conversation_id=origin.conversation_id,
+                confirmation_handler=approve,
             )
 
             async def wait_for_deliveries(count):
@@ -350,7 +270,7 @@ async def run() -> None:
             first = await wait_for_deliveries(1)
             assert first[0].conclusion_state.value == "succeeded"
             print(
-                "Immediate assignment succeeded with one server-reported invocation and an artifact."
+                "Immediate assignment succeeded with one approved, server-reported invocation and an artifact."
             )
             await agent.close()
             now[0] = datetime(2026, 9, 7, 14, tzinfo=UTC)

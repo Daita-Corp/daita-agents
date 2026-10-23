@@ -233,11 +233,12 @@ estimated cost cap per agent run in both evaluation profiles. Configure it with
 `DAITA_PHASE_F_LIVE_MAX_COST_USD`; it must remain finite and positive. These
 suites use real model providers with simulated MCP servers.
 
-The routine contract-authoring comparison
-(`tests/live/routines/test_contract_authoring.py`) uses the same harness, so it
-needs `DAITA_RUN_LIVE_PHASE_F_MCP=1` and a `DAITA_PHASE_F_LIVE_PROFILE` (for
-example `user_flow`) in addition to its own `DAITA_RUN_CONTRACT_QUALIFICATION=1`
-gate. Choose its model with `DAITA_CONTRACT_MODEL_ID`.
+The routine creation case (`tests/live/routines/test_contract_authoring.py`)
+asks a real model for the example one-time routine and checks one
+`routine_save` call and one confirm. Enable it with
+`DAITA_RUN_CONTRACT_QUALIFICATION=1`; choose its model with
+`DAITA_CONTRACT_MODEL_ID` and, under API billing, its key with
+`DAITA_CONTRACT_LLM_API_KEY`.
 
 ### Subscription-billed live runs
 

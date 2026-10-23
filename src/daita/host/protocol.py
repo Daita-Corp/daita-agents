@@ -111,7 +111,6 @@ REMOTE_AGENT_SURFACE: Final = frozenset(
         "reset_export_destination",
         "inspect_delivery",
         "acknowledge_delivery",
-        "distribution_destinations",
         "work_board",
         # Routines
         "list_routines",
@@ -120,8 +119,6 @@ REMOTE_AGENT_SURFACE: Final = frozenset(
         "resume_routine",
         "disable_routine",
         "run_routine_now",
-        "propose_routine",
-        "promote_routine",
         "create_routine",
         "update_routine",
         # Jobs

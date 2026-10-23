@@ -115,7 +115,6 @@ from ..routines.models import (
     MAX_ROUTINE_HISTORY_PAGE_SIZE,
     MAX_ROUTINE_LIST_PAGE_SIZE,
     MAX_SCHEDULED_ROUTINES_PER_AGENT,
-    ResourceRevisionObservation,
     RoutineOccurrence,
     RoutineOccurrenceDisposition,
     RoutineState,
@@ -1321,8 +1320,11 @@ class SQLStateStore:
     async def admit_scheduled_routine(
         self,
         routine: ScheduledRoutine,
+        *,
+        run_immediately: bool = False,
     ) -> ScheduledRoutine:
-        """Atomically admit one pristine bounded routine and its first due slot."""
+        """Atomically admit one pristine routine, its first due slot and, when
+        asked, one immediate occurrence."""
 
         if not isinstance(routine, ScheduledRoutine):
             raise TypeError("routine must be ScheduledRoutine")
@@ -1331,8 +1333,6 @@ class SQLStateStore:
             or routine.active_occurrence_id is not None
             or routine.last_occurrence_id is not None
             or bool(routine.last_delivery_ids)
-            or routine.reserved_tokens != 0
-            or routine.reserved_cost_usd != Decimal("0")
             or routine.charged_tokens != 0
             or routine.charged_cost_usd != Decimal("0")
             or routine.attempt_count != 0
@@ -1346,19 +1346,19 @@ class SQLStateStore:
         validate_schedule(routine.schedule)
         next_due = None
         if routine.state is RoutineState.ACTIVE:
-            next_due = first_slot(
-                routine.schedule,
-                not_before=routine.created_at,
-                expires_at=routine.expires_at,
-            )
+            next_due = first_slot(routine.schedule, not_before=routine.created_at)
             if next_due is None:
-                raise ValueError("routine_schedule_expired")
+                raise ValueError("routine_schedule_passed")
         normalized = replace(routine, next_due_at=next_due)
         encoded = encode_scheduled_routine(normalized)
         return await run_sql_transaction(
             self._database,
             lambda connection: _routine_store.admit_routine(
-                connection, normalized, encoded, clock=self._clock
+                connection,
+                normalized,
+                encoded,
+                clock=self._clock,
+                run_immediately=run_immediately,
             ),
         )
 
@@ -1592,7 +1592,6 @@ class SQLStateStore:
         run_id: str,
         execution_scope: ExecutionScope,
         bound_at: datetime,
-        precheck_observation: ResourceRevisionObservation | None = None,
     ) -> RoutineOccurrence | None:
         if not isinstance(execution_scope, ExecutionScope):
             raise TypeError("routine execution scope is invalid")
@@ -1607,7 +1606,6 @@ class SQLStateStore:
                 run_id=run_id,
                 execution_scope=execution_scope,
                 bound_at=bound_at,
-                precheck_observation=precheck_observation,
             ),
         )
 
@@ -1638,12 +1636,11 @@ class SQLStateStore:
         *,
         delivery_id: str,
         finalized_at: datetime,
-        skipped_no_change_observation: ResourceRevisionObservation | None = None,
         failure_code: str | None = None,
         artifact_references: tuple[OutcomeArtifactReference, ...] = (),
         outcome_contract_failure_code: str | None = None,
     ) -> tuple[RoutineOccurrence, Delivery | None] | None:
-        """Converge one occurrence, routine budget, slot, and logical delivery."""
+        """Converge one occurrence, routine counters, slot, and logical delivery."""
 
         _datetime_us(finalized_at)
         return await run_sql_transaction(
@@ -1654,7 +1651,6 @@ class SQLStateStore:
                 occurrence_id,
                 delivery_id=delivery_id,
                 finalized_at=finalized_at,
-                skipped_no_change_observation=skipped_no_change_observation,
                 failure_code=failure_code,
                 artifact_references=artifact_references,
                 outcome_contract_failure_code=outcome_contract_failure_code,
@@ -2408,11 +2404,6 @@ class SQLStateStore:
                         or routine[0].revision != receipt.routine_revision
                         or routine[0].active_occurrence_id != receipt.occurrence_id
                         or routine[0].state is not RoutineState.ACTIVE
-                        or self._clock() >= routine[0].expires_at
-                        or (
-                            grant is not None
-                            and grant not in routine[0].capability_grants
-                        )
                     )
                 ):
                     raise EffectReceiptConflictError(
@@ -4317,7 +4308,6 @@ class SQLStateStore:
                 and occurrence.disposition
                 in {
                     RoutineOccurrenceDisposition.CLAIMED,
-                    RoutineOccurrenceDisposition.PRECHECKING,
                     RoutineOccurrenceDisposition.RUNNING,
                     (RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION),
                     RoutineOccurrenceDisposition.RETRYABLE,
@@ -5348,7 +5338,6 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
         raise ValueError("stored active routine count exceeds its fixed bound")
 
     occurrences: dict[tuple[str, str], RoutineOccurrence] = {}
-    occurrence_counts: dict[tuple[str, str], int] = {}
     for (
         agent_id,
         occurrence_id_value,
@@ -5382,10 +5371,6 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
         ):
             raise ValueError("stored routine occurrence projection is invalid")
         occurrences[(agent_id, occurrence_id_value)] = occurrence
-        owner_key = (agent_id, routine_id)
-        occurrence_counts[owner_key] = occurrence_counts.get(owner_key, 0) + 1
-        if occurrence_counts[owner_key] > owning_routine.cumulative_max_occurrences:
-            raise ValueError("stored routine occurrence count exceeds its ceiling")
     for routine in routines.values():
         if routine.active_occurrence_id is None:
             continue

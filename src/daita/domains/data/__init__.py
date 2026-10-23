@@ -88,13 +88,6 @@ from .export_capabilities import (
     exact_export_outputs,
 )
 from .results import BoundedResultProjection, project_result_rows
-from .routine_precheck import (
-    RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID,
-    RESOURCE_REVISION_OBSERVATION_EXECUTOR_ID,
-    RESOURCE_REVISION_OBSERVATION_OUTPUT_KIND,
-    ResourceRevisionObservationDeclarations,
-    resource_revision_observation_declarations,
-)
 from .source_files import (
     FILE_SEARCH_EXECUTOR_ID,
     PATH_QUERY_EXECUTOR_ID,
@@ -202,9 +195,6 @@ __all__ = [
     "RelationalUpdateBackend",
     "RelationalWriteCatalogReader",
     "ReadScopedCatalogReader",
-    "RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID",
-    "RESOURCE_REVISION_OBSERVATION_EXECUTOR_ID",
-    "RESOURCE_REVISION_OBSERVATION_OUTPUT_KIND",
     "ResourceRevisionObservationDeclarations",
     "RelationalUpdateCommand",
     "RelationalUpdateFilter",
@@ -245,7 +235,6 @@ __all__ = [
     "relational_update_declarations",
     "relational_update_capability_declarations",
     "project_result_rows",
-    "resource_revision_observation_declarations",
     "render_relational_update_statement",
     "sqlite_declared_type_affinity",
     "sqlite_identifier_key",

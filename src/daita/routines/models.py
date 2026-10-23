@@ -3,25 +3,22 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
-from typing import TypeAlias
+from typing import TypeAlias, cast
 
-from .._json import FrozenJsonObject, canonical_json
-from ..capabilities import (
-    AccessMode,
-    CapabilityGrant,
-    ExecutionContractBindings,
-    ExecutionScope,
-    OperationalEffect,
-)
+from .._json import FrozenJsonObject
+from ..capabilities import ExecutionScope
 from ..distribution.models import (
     MAX_DISTRIBUTION_TARGETS,
-    DistributionPlan,
+    MAX_OUTCOME_ARTIFACT_BYTES,
+    MAX_OUTCOME_ARTIFACT_REFERENCES,
+    MAX_OUTCOME_TOTAL_ARTIFACT_BYTES,
+    ArtifactRequirement,
     OutcomeContract,
 )
 from ..llm.models import ModelSensitivity
@@ -32,6 +29,9 @@ MAX_SCHEDULED_ROUTINES_PER_AGENT = 128
 MAX_ACTIVE_ROUTINES_PER_AGENT = 32
 MAX_ROUTINE_OCCURRENCES = 10_000
 MAX_ROUTINE_ATTEMPTS = 3
+# Code defaults: a recurring routine pauses as Needs you after this many
+# consecutive failures; the counter's stored bound admits older records.
+ROUTINE_FAILURE_LIMIT = 3
 MAX_ROUTINE_CONSECUTIVE_FAILURES = 10
 MAX_ROUTINE_LIST_PAGE_SIZE = 50
 MAX_ROUTINE_HISTORY_PAGE_SIZE = 100
@@ -39,16 +39,34 @@ MAX_ROUTINE_INSTRUCTION_BYTES = 16 * 1024
 MAX_ROUTINE_TITLE_CHARACTERS = 256
 MAX_ROUTINE_IDENTITY_ITEMS = 64
 MAX_ROUTINE_IDENTITY_CHARACTERS = 1_024
-MAX_ROUTINE_SKILL_BINDINGS = 8
-MAX_ROUTINE_LIFETIME = timedelta(days=366 * 5)
 MIN_ROUTINE_INTERVAL_SECONDS = 60
-MAX_ROUTINE_INTERVAL_SECONDS = int(MAX_ROUTINE_LIFETIME.total_seconds())
+MAX_ROUTINE_INTERVAL_SECONDS = 366 * 5 * 24 * 60 * 60
 MAX_SCHEDULE_LOOKAHEAD_DAYS = 366 * 8
-MAX_ROUTINE_PER_RUN_TOKENS = 1_000_000
-MAX_ROUTINE_CUMULATIVE_TOKENS = 100_000_000
-MAX_ROUTINE_PER_RUN_COST_USD = Decimal("1000")
-MAX_ROUTINE_CUMULATIVE_COST_USD = Decimal("100000")
 ROUTINE_CLAIM_LEASE_SECONDS = 30.0
+# Code defaults for every occurrence: delivery to the conversation's Inbox with
+# no sensitivity ceiling, and any artifacts the run commits within the shared
+# delivery bounds. Nothing about them is chosen per routine.
+ROUTINE_INBOX_SENSITIVITY = ModelSensitivity.RESTRICTED
+ROUTINE_OUTCOME = OutcomeContract(
+    require_terminal_conclusion=True,
+    artifact_requirements=(
+        ArtifactRequirement(
+            required=False,
+            minimum_count=0,
+            maximum_count=MAX_OUTCOME_ARTIFACT_REFERENCES,
+            allowed_media_types=(),
+            allowed_authorships=(),
+            allowed_producer_capability_ids=(),
+            maximum_artifact_bytes=MAX_OUTCOME_ARTIFACT_BYTES,
+            maximum_total_bytes=MAX_OUTCOME_TOTAL_ARTIFACT_BYTES,
+            maximum_sensitivity=ROUTINE_INBOX_SENSITIVITY,
+        ),
+    ),
+    maximum_total_artifact_bytes=MAX_OUTCOME_TOTAL_ARTIFACT_BYTES,
+    maximum_effective_sensitivity=ROUTINE_INBOX_SENSITIVITY,
+    require_current_run_provenance=True,
+    require_exact_source_bindings=False,
+)
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _FAILURE_CODE = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
@@ -115,11 +133,6 @@ def _money(value: Decimal, name: str, *, maximum: Decimal | None) -> None:
         raise ValueError(f"{name} must be a bounded non-negative Decimal")
 
 
-def _optional_money(value: Decimal | None, name: str, *, maximum: Decimal) -> None:
-    if value is not None:
-        _money(value, name, maximum=maximum)
-
-
 def _identities(
     values: Iterable[str],
     name: str,
@@ -178,16 +191,6 @@ class AmbiguousTimePolicy(str, Enum):
     SECOND = "second"
 
 
-class MisfirePolicy(str, Enum):
-    SKIP = "skip"
-    LATEST_ONLY = "latest_only"
-
-
-class ReportingMode(str, Enum):
-    ALWAYS = "always"
-    CHANGES_ONLY = "changes_only"
-
-
 class RoutineState(str, Enum):
     ACTIVE = "active"
     PAUSED = "paused"
@@ -204,10 +207,8 @@ class RoutineSlotKind(str, Enum):
 
 class RoutineOccurrenceDisposition(str, Enum):
     CLAIMED = "claimed"
-    PRECHECKING = "prechecking"
     RUNNING = "running"
     RUN_TERMINAL_PENDING_FINALIZATION = "run_terminal_pending_finalization"
-    SKIPPED_NO_CHANGE = "skipped_no_change"
     COMPLETED = "completed"
     RETRYABLE = "retryable"
     TERMINAL_FAILED = "terminal_failed"
@@ -216,7 +217,6 @@ class RoutineOccurrenceDisposition(str, Enum):
 ACTIVE_OCCURRENCE_DISPOSITIONS = frozenset(
     {
         RoutineOccurrenceDisposition.CLAIMED,
-        RoutineOccurrenceDisposition.PRECHECKING,
         RoutineOccurrenceDisposition.RUNNING,
         RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION,
         RoutineOccurrenceDisposition.RETRYABLE,
@@ -344,322 +344,87 @@ class CalendarSchedule:
 RoutineSchedule: TypeAlias = OnceSchedule | IntervalSchedule | CalendarSchedule
 
 
-def validate_budget_relationships(
-    per_run_max_tokens: int,
-    cumulative_max_tokens: int,
-    per_run_max_cost_usd: Decimal | None,
-    cumulative_max_cost_usd: Decimal | None,
-) -> None:
-    """Share the per-run/cumulative invariant across proposals and retained records.
+@dataclass(frozen=True, slots=True)
+class RoutineIntent:
+    """What a person asks a routine to do: the one shape every surface uses.
 
-    Dollar ceilings are optional and travel together; tokens, attempts and
-    occurrences always bound a routine.
+    ``schedule`` is a typed schedule or its JSON shape, which may use relative
+    timing that the owner resolves when the routine is saved. On update an
+    omitted (``None``) field keeps its stored value.
     """
-    if (per_run_max_cost_usd is None) != (cumulative_max_cost_usd is None):
-        raise ValueError(
-            "per_run_max_cost_usd and cumulative_max_cost_usd must be set together "
-            "or both omitted."
-        )
-    budgets: list[tuple[int | Decimal, int | Decimal, str]] = [
-        (per_run_max_tokens, cumulative_max_tokens, "tokens")
-    ]
-    if per_run_max_cost_usd is not None and cumulative_max_cost_usd is not None:
-        budgets.append((per_run_max_cost_usd, cumulative_max_cost_usd, "cost_usd"))
-    for per_run, cumulative, field in budgets:
-        if per_run > cumulative:
-            raise ValueError(
-                f"per_run_max_{field} must not exceed cumulative_max_{field}. "
-                "Resubmit the exact user-authorized budgets; do not automatically increase a ceiling."
-            )
 
-
-def validate_reporting_precheck(
-    reporting_mode: ReportingMode, precheck: ResourceRevisionPrecheck | None
-) -> None:
-    """One invariant shared by authoring admission, drafts and stored records."""
-    if reporting_mode is ReportingMode.ALWAYS and precheck is not None:
-        raise ValueError("reporting_mode=always requires omitting precheck.")
-    if reporting_mode is ReportingMode.CHANGES_ONLY and not isinstance(
-        precheck, ResourceRevisionPrecheck
-    ):
-        raise ValueError("reporting_mode=changes_only requires an exact precheck.")
-
-
-@dataclass(frozen=True, slots=True)
-class ResourceRevisionPrecheck:
-    """Opt in to skipping solely on one structural catalog/resource revision."""
-
-    capability_id: str
-    contract_digest: str
-    source_id: str
-    resource_id: str
-
-    def __post_init__(self) -> None:
-        for value, name in (
-            (self.capability_id, "precheck capability_id"),
-            (self.source_id, "precheck source_id"),
-            (self.resource_id, "precheck resource_id"),
-        ):
-            _text(value, name)
-        _digest(self.contract_digest, "precheck contract_digest")
-
-
-@dataclass(frozen=True, slots=True)
-class RequestedCapabilityGrant:
-    """Secret-free requested constraints; contains no standing authorization."""
-
-    capability_id: str
-    constraints: FrozenJsonObject
-    max_calls_per_occurrence: int
-
-    def __post_init__(self) -> None:
-        _text(self.capability_id, "requested grant capability_id")
-        if not isinstance(self.constraints, FrozenJsonObject):
-            raise TypeError("requested grant constraints must be frozen JSON")
-        if len(canonical_json(self.constraints).encode("utf-8")) > 32_768:
-            raise ValueError("requested grant constraints exceed their byte bound")
-        _bounded_count(
-            self.max_calls_per_occurrence, "requested grant call ceiling", maximum=256
-        )
-        if self.max_calls_per_occurrence == 0:
-            raise ValueError("requested grant call ceiling must be positive")
-
-
-@dataclass(frozen=True, slots=True)
-class ScheduledRoutineDraft:
-    """Bounded user-facing input for proposing or revising one routine."""
-
-    origin_run_id: str
-    title: str
-    authorized_instruction: str
-    schedule: RoutineSchedule
-    misfire_policy: MisfirePolicy
-    reporting_mode: ReportingMode
-    precheck: ResourceRevisionPrecheck | None
-    allowed_source_ids: tuple[str, ...]
-    allowed_connector_binding_ids: tuple[str, ...]
-    allowed_resource_ids: tuple[str, ...]
-    allowed_capability_ids: tuple[str, ...]
-    sensitivity_ceiling: ModelSensitivity
-    outcome_contract: OutcomeContract
-    distribution_destination_id: str
-    eligible_model_routes: tuple[str, ...]
-    per_run_max_tokens: int
-    per_run_max_cost_usd: Decimal | None
-    cumulative_max_tokens: int
-    cumulative_max_cost_usd: Decimal | None
-    cumulative_max_attempts: int
-    cumulative_max_occurrences: int
-    maximum_consecutive_failures: int
-    expires_at: datetime
-    skill_names: tuple[str, ...] = ()
-    requested_capability_grants: tuple[RequestedCapabilityGrant, ...] = ()
+    title: str | None = None
+    prompt: str | None = None
+    schedule: RoutineSchedule | FrozenJsonObject | None = None
+    sources: tuple[str, ...] | None = None
     run_immediately: bool = False
 
     def __post_init__(self) -> None:
-        _text(self.origin_run_id, "routine draft origin_run_id")
-        _text(self.title, "routine draft title", maximum=MAX_ROUTINE_TITLE_CHARACTERS)
-        _text(
-            self.authorized_instruction,
-            "routine draft authorized_instruction",
-            maximum=MAX_ROUTINE_INSTRUCTION_BYTES,
-            single_line=False,
-        )
-        if (
-            len(self.authorized_instruction.encode("utf-8"))
-            > MAX_ROUTINE_INSTRUCTION_BYTES
-        ):
-            raise ValueError("routine draft authorized_instruction exceeds its bound")
-        if not isinstance(
-            self.schedule, (OnceSchedule, IntervalSchedule, CalendarSchedule)
-        ):
-            raise TypeError("routine draft schedule is invalid")
-        if not isinstance(self.misfire_policy, MisfirePolicy):
-            raise TypeError("routine draft misfire policy is invalid")
-        if not isinstance(self.reporting_mode, ReportingMode):
-            raise TypeError("routine draft reporting mode is invalid")
-        validate_reporting_precheck(self.reporting_mode, self.precheck)
-        sources = _identities(self.allowed_source_ids, "draft allowed_source_ids")
-        bindings = _identities(
-            self.allowed_connector_binding_ids,
-            "draft allowed_connector_binding_ids",
-        )
-        resources = _identities(self.allowed_resource_ids, "draft allowed_resource_ids")
-        capabilities = _identities(
-            self.allowed_capability_ids,
-            "draft allowed_capability_ids",
-            allow_empty=False,
-        )
-        routes = _identities(
-            self.eligible_model_routes,
-            "draft eligible_model_routes",
-            allow_empty=False,
-        )
-        requested = tuple(self.requested_capability_grants)
-        if len(requested) > MAX_ROUTINE_IDENTITY_ITEMS or any(
-            not isinstance(item, RequestedCapabilityGrant) for item in requested
-        ):
-            raise ValueError(
-                "requested routine grants are invalid or exceed their bound"
+        if self.title is not None:
+            _text(self.title, "routine title", maximum=MAX_ROUTINE_TITLE_CHARACTERS)
+        if self.prompt is not None:
+            _text(
+                self.prompt,
+                "routine prompt",
+                maximum=MAX_ROUTINE_INSTRUCTION_BYTES,
+                single_line=False,
             )
-        if len({item.capability_id for item in requested}) != len(requested) or any(
-            item.capability_id not in capabilities for item in requested
+            if len(self.prompt.encode("utf-8")) > MAX_ROUTINE_INSTRUCTION_BYTES:
+                raise ValueError("routine prompt exceeds its bound")
+        schedule = self.schedule
+        if isinstance(schedule, Mapping) and not isinstance(schedule, FrozenJsonObject):
+            schedule = FrozenJsonObject.from_mapping(schedule)
+        if schedule is not None and not isinstance(
+            schedule,
+            (OnceSchedule, IntervalSchedule, CalendarSchedule, FrozenJsonObject),
         ):
+            raise TypeError("routine schedule must be a schedule or its JSON shape")
+        sources = self.sources
+        if sources is not None:
+            if isinstance(sources, (str, bytes)):
+                raise TypeError("routine sources must be a sequence")
+            sources = tuple(sources)
+            if len(sources) > MAX_ROUTINE_IDENTITY_ITEMS or len(set(sources)) != len(
+                sources
+            ):
+                raise ValueError("routine sources are duplicated or exceed their bound")
+            for item in sources:
+                _text(item, "routine source")
+        if type(self.run_immediately) is not bool:
+            raise TypeError("run_immediately must be a boolean")
+        object.__setattr__(self, "schedule", schedule)
+        object.__setattr__(self, "sources", sources)
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> RoutineIntent:
+        """Parse a tool call, CLI spec or flags; unknown keys are refused."""
+
+        unknown = set(value) - set(_INTENT_FIELDS)
+        if unknown:
             raise ValueError(
-                "requested grants must uniquely narrow the capability ceiling"
+                "unknown routine fields: " + ", ".join(sorted(map(str, unknown)))
             )
-        object.__setattr__(
-            self,
-            "requested_capability_grants",
-            tuple(sorted(requested, key=lambda item: item.capability_id)),
-        )
-        if type(self.run_immediately) is not bool or (
-            self.run_immediately and isinstance(self.schedule, OnceSchedule)
-        ):
-            raise ValueError(
-                "run_immediately requires an interval or calendar schedule"
-            )
-        skills = _identities(self.skill_names, "draft skill_names")
-        if len(skills) > MAX_ROUTINE_SKILL_BINDINGS:
-            raise ValueError("routine draft skill bindings exceed their bound")
-        if bool(sources) != bool(resources):
-            raise ValueError(
-                "routine draft source and resource ceilings must be present together"
-            )
-        if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
-            raise TypeError("routine draft sensitivity ceiling is invalid")
-        if not isinstance(self.outcome_contract, OutcomeContract):
-            raise TypeError("routine draft outcome contract is invalid")
-        _text(
-            self.distribution_destination_id,
-            "routine draft distribution_destination_id",
-        )
-        if (
-            self.outcome_contract.maximum_effective_sensitivity.routing_rank
-            > self.sensitivity_ceiling.routing_rank
-        ):
-            raise ValueError("routine draft outcome sensitivity exceeds its ceiling")
-        for value, name, maximum in (
-            (
-                self.per_run_max_tokens,
-                "draft per-run tokens",
-                MAX_ROUTINE_PER_RUN_TOKENS,
+        sources = value.get("sources")
+        schedule = value.get("schedule")
+        if schedule is not None and not isinstance(schedule, Mapping):
+            raise TypeError("routine schedule must be an object")
+        for name in ("title", "prompt"):
+            if value.get(name) is not None and not isinstance(value[name], str):
+                raise TypeError(f"routine {name} must be text")
+        if sources is not None and not isinstance(sources, (list, tuple)):
+            raise TypeError("routine sources must be a list")
+        return cls(
+            title=cast(str | None, value.get("title")),
+            prompt=cast(str | None, value.get("prompt")),
+            schedule=(
+                None if schedule is None else FrozenJsonObject.from_mapping(schedule)
             ),
-            (
-                self.cumulative_max_tokens,
-                "draft cumulative tokens",
-                MAX_ROUTINE_CUMULATIVE_TOKENS,
-            ),
-            (
-                self.cumulative_max_attempts,
-                "draft cumulative attempts",
-                MAX_ROUTINE_OCCURRENCES * MAX_ROUTINE_ATTEMPTS,
-            ),
-            (
-                self.cumulative_max_occurrences,
-                "draft cumulative occurrences",
-                MAX_ROUTINE_OCCURRENCES,
-            ),
-            (
-                self.maximum_consecutive_failures,
-                "draft maximum consecutive failures",
-                MAX_ROUTINE_CONSECUTIVE_FAILURES,
-            ),
-        ):
-            _bounded_count(value, name, maximum=maximum)
-            if value == 0:
-                raise ValueError(f"{name} must be positive")
-        _optional_money(
-            self.per_run_max_cost_usd,
-            "draft per-run cost",
-            maximum=MAX_ROUTINE_PER_RUN_COST_USD,
-        )
-        _optional_money(
-            self.cumulative_max_cost_usd,
-            "draft cumulative cost",
-            maximum=MAX_ROUTINE_CUMULATIVE_COST_USD,
-        )
-        validate_budget_relationships(
-            self.per_run_max_tokens,
-            self.cumulative_max_tokens,
-            self.per_run_max_cost_usd,
-            self.cumulative_max_cost_usd,
-        )
-        _utc(self.expires_at, "routine draft expires_at")
-        object.__setattr__(self, "allowed_source_ids", sources)
-        object.__setattr__(self, "allowed_connector_binding_ids", bindings)
-        object.__setattr__(self, "allowed_resource_ids", resources)
-        object.__setattr__(self, "allowed_capability_ids", capabilities)
-        object.__setattr__(self, "eligible_model_routes", routes)
-        object.__setattr__(self, "skill_names", skills)
-
-
-@dataclass(frozen=True, slots=True)
-class ResourceRevisionObservation:
-    source_id: str
-    resource_id: str
-    resource_revision: str
-    catalog_revision: str
-    observed_at: datetime
-
-    def __post_init__(self) -> None:
-        for value, name in (
-            (self.source_id, "observation source_id"),
-            (self.resource_id, "observation resource_id"),
-        ):
-            _text(value, name)
-        _digest(self.resource_revision, "observation resource_revision")
-        _digest(self.catalog_revision, "observation catalog_revision")
-        _utc(self.observed_at, "observation observed_at")
-
-    @property
-    def digest(self) -> str:
-        return (
-            "sha256:"
-            + sha256(
-                canonical_json(
-                    {
-                        "source_id": self.source_id,
-                        "resource_id": self.resource_id,
-                        "resource_revision": self.resource_revision,
-                        "catalog_revision": self.catalog_revision,
-                    }
-                ).encode("utf-8")
-            ).hexdigest()
+            sources=None if sources is None else tuple(cast(Iterable[str], sources)),
+            run_immediately=cast(bool, value.get("run_immediately", False)),
         )
 
 
-@dataclass(frozen=True, slots=True)
-class RoutineSkillBinding:
-    skill_name: str
-    skill_revision: int
-    content_digest: str
-    attached_by_principal: str
-    attached_at: datetime
-
-    def __post_init__(self) -> None:
-        _text(self.skill_name, "routine skill_name", maximum=128)
-        _positive_revision(self.skill_revision, "routine skill_revision")
-        _digest(self.content_digest, "routine skill content_digest")
-        _text(self.attached_by_principal, "routine skill principal")
-        _utc(self.attached_at, "routine skill attached_at")
-
-
-@dataclass(frozen=True, slots=True)
-class RoutinePromotionEvidence:
-    basis_run_id: str
-    terminal_result_digest: str
-    executed_capability_ids: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        _text(self.basis_run_id, "routine basis_run_id")
-        _digest(self.terminal_result_digest, "routine terminal result digest")
-        capabilities = _identities(
-            self.executed_capability_ids,
-            "routine executed capability_ids",
-            allow_empty=False,
-        )
-        object.__setattr__(self, "executed_capability_ids", capabilities)
+_INTENT_FIELDS = ("title", "prompt", "schedule", "sources", "run_immediately")
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,48 +438,20 @@ class ScheduledRoutine:
     instruction_digest: str
     schedule: RoutineSchedule
     schedule_interpreter_revision: int
-    misfire_policy: MisfirePolicy
-    reporting_mode: ReportingMode
-    precheck: ResourceRevisionPrecheck | None
-    last_acknowledged_precheck_observation: ResourceRevisionObservation | None
-    allowed_source_ids: tuple[str, ...]
-    allowed_connector_binding_ids: tuple[str, ...]
-    allowed_resource_ids: tuple[str, ...]
-    allowed_capability_ids: tuple[str, ...]
-    allowed_access_modes: frozenset[AccessMode]
-    allowed_operational_effects: frozenset[OperationalEffect]
-    sensitivity_ceiling: ModelSensitivity
-    eligible_model_routes: tuple[str, ...]
-    skill_bindings: tuple[RoutineSkillBinding, ...]
-    outcome_contract: OutcomeContract
-    distribution_plan: DistributionPlan
-    per_run_max_tokens: int
-    per_run_max_cost_usd: Decimal | None
-    cumulative_max_tokens: int
-    cumulative_max_cost_usd: Decimal | None
-    cumulative_max_attempts: int
-    cumulative_max_occurrences: int
-    reserved_tokens: int
-    reserved_cost_usd: Decimal
+    source_ids: tuple[str, ...]
     charged_tokens: int
     charged_cost_usd: Decimal
     attempt_count: int
     occurrence_count: int
-    maximum_consecutive_failures: int
     consecutive_failures: int
-    expires_at: datetime
     next_due_at: datetime | None
     active_occurrence_id: str | None
     last_occurrence_id: str | None
     last_delivery_ids: tuple[str, ...]
-    promotion_evidence: RoutinePromotionEvidence | None
     state: RoutineState
     revision: int
     created_at: datetime
     updated_at: datetime
-    contract_bindings: ExecutionContractBindings
-    capability_grants: tuple[CapabilityGrant, ...] = ()
-    run_immediately: bool = False
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -745,275 +482,24 @@ class ScheduledRoutine:
             raise TypeError("routine schedule is invalid")
         if self.schedule_interpreter_revision != SCHEDULE_INTERPRETER_REVISION:
             raise ValueError("routine schedule interpreter revision is unsupported")
-        if not isinstance(self.misfire_policy, MisfirePolicy):
-            raise TypeError("routine misfire policy is invalid")
-        if not isinstance(self.reporting_mode, ReportingMode):
-            raise TypeError("routine reporting mode is invalid")
-        validate_reporting_precheck(self.reporting_mode, self.precheck)
-        if (
-            self.last_acknowledged_precheck_observation is not None
-            and self.precheck is None
-        ):
-            raise ValueError("routine observation requires a precheck")
-        sources = _identities(self.allowed_source_ids, "routine allowed_source_ids")
-        bindings = _identities(
-            self.allowed_connector_binding_ids,
-            "routine allowed_connector_binding_ids",
-        )
-        resources = _identities(
-            self.allowed_resource_ids, "routine allowed_resource_ids"
-        )
-        capabilities = _identities(
-            self.allowed_capability_ids,
-            "routine allowed_capability_ids",
-            allow_empty=False,
-        )
-        routes = _identities(
-            self.eligible_model_routes,
-            "routine eligible_model_routes",
-            allow_empty=False,
-        )
-        if not isinstance(self.contract_bindings, ExecutionContractBindings):
-            raise TypeError("routine requires frozen execution contract bindings")
-        self.contract_bindings.validate_coverage(
-            capability_ids=capabilities,
-            resource_ids=resources,
-            route_ids=routes,
-            mcp_capability_ids=self.contract_bindings.tool_origins,
-        )
-        grants = tuple(self.capability_grants)
-        if any(not isinstance(grant, CapabilityGrant) for grant in grants):
-            raise TypeError("routine capability grants are invalid")
-        if len({grant.capability_id for grant in grants}) != len(grants):
-            raise ValueError("routine permits only one grant per capability")
-        if any(
-            self.contract_bindings.capability_contracts.get(grant.capability_id)
-            != grant.capability_contract_digest
-            for grant in grants
-        ):
-            raise ValueError(
-                "routine grants must match its frozen capability contracts"
-            )
-        object.__setattr__(
-            self,
-            "capability_grants",
-            tuple(sorted(grants, key=lambda grant: grant.capability_id)),
-        )
-        if bool(sources) != bool(resources):
-            raise ValueError(
-                "routine source and resource ceilings must be present together"
-            )
-        access_modes = frozenset(self.allowed_access_modes)
-        if not access_modes or any(
-            not isinstance(item, AccessMode) for item in access_modes
-        ):
-            raise ValueError("routine access ceilings are invalid")
-        effects = frozenset(self.allowed_operational_effects)
-        if not effects or not effects <= {
-            OperationalEffect.NONE,
-            OperationalEffect.MUTATE_DATA,
-            OperationalEffect.EXTERNAL_ACTION,
-        }:
-            raise ValueError("routine effect ceilings contain an unsupported operation")
-        if not isinstance(self.outcome_contract, OutcomeContract):
-            raise TypeError("routine outcome contract is invalid")
-        requirements = {
-            item.capability_id: item
-            for item in self.outcome_contract.effect_requirements
-        }
-        if (
-            set(requirements) != {grant.capability_id for grant in grants}
-            or bool(grants) != bool(effects - {OperationalEffect.NONE})
-            or any(
-                requirements[grant.capability_id].minimum_successful_calls
-                > grant.max_calls_per_occurrence
-                for grant in grants
-            )
-        ):
-            raise ValueError(
-                "routine effect grants and completion requirements must cover the same bounded actions"
-            )
-        if self.precheck is not None:
-            # This is the one concrete supported revision observer, not a
-            # generic freshness or data-value dependency expression.
-            revision_tools = {
-                "data.resource_revision_observation",
-                "catalog.describe",
-                "catalog.search",
-                "artifact.create_document",
-                "artifact.snapshot_result",
-                "skill.view",
-            }
-            if (
-                self.precheck.capability_id != "data.resource_revision_observation"
-                or self.precheck.capability_id not in capabilities
-                or sources != (self.precheck.source_id,)
-                or resources != (self.precheck.resource_id,)
-                or bindings
-                or effects != frozenset({OperationalEffect.NONE})
-                or not set(capabilities) <= revision_tools
-            ):
-                raise ValueError(
-                    "revision prechecks support only one exact structural catalog resource; "
-                    "data-value, effectful, MCP, and broader assignments require ordinary execution"
-                )
-        if type(self.run_immediately) is not bool or (
-            self.run_immediately and isinstance(self.schedule, OnceSchedule)
-        ):
-            raise ValueError(
-                "run_immediately requires an interval or calendar schedule"
-            )
-        if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
-            raise TypeError("routine sensitivity ceiling is invalid")
-        skill_bindings = tuple(self.skill_bindings)
-        if len(skill_bindings) > MAX_ROUTINE_SKILL_BINDINGS:
-            raise ValueError("routine skill bindings exceed their bound")
-        if any(not isinstance(item, RoutineSkillBinding) for item in skill_bindings):
-            raise TypeError("routine skill bindings are invalid")
-        if (
-            tuple(sorted(skill_bindings, key=lambda item: item.skill_name))
-            != skill_bindings
-        ):
-            raise ValueError("routine skill bindings must be sorted")
-        if len({item.skill_name for item in skill_bindings}) != len(skill_bindings):
-            raise ValueError("routine skill bindings cannot duplicate a skill")
-        if not isinstance(self.outcome_contract, OutcomeContract):
-            raise TypeError("routine outcome contract is invalid")
-        if not isinstance(self.distribution_plan, DistributionPlan):
-            raise TypeError("routine distribution plan is invalid")
-        if any(
-            target.conversation_id != self.conversation_id
-            for target in self.distribution_plan.targets
-        ):
-            raise ValueError(
-                "routine distribution plan belongs to another conversation"
-            )
-        if (
-            self.outcome_contract.maximum_effective_sensitivity.routing_rank
-            > self.sensitivity_ceiling.routing_rank
-        ):
-            raise ValueError("routine outcome sensitivity exceeds its ceiling")
-        for count_value, count_name, maximum, require_positive in (
+        sources = _identities(self.source_ids, "routine source_ids")
+        for count_value, count_name, maximum in (
+            (self.charged_tokens, "charged token amount", None),
+            (self.attempt_count, "routine attempt count", None),
+            (self.occurrence_count, "routine occurrence count", None),
             (
-                self.per_run_max_tokens,
-                "per-run token ceiling",
-                MAX_ROUTINE_PER_RUN_TOKENS,
-                True,
-            ),
-            (
-                self.cumulative_max_tokens,
-                "cumulative token ceiling",
-                MAX_ROUTINE_CUMULATIVE_TOKENS,
-                True,
-            ),
-            (
-                self.reserved_tokens,
-                "reserved token amount",
-                MAX_ROUTINE_CUMULATIVE_TOKENS,
-                False,
-            ),
-            (
-                self.charged_tokens,
-                "charged token amount",
-                None,
-                False,
-            ),
-            (
-                self.attempt_count,
-                "routine attempt count",
-                MAX_ROUTINE_OCCURRENCES * MAX_ROUTINE_ATTEMPTS,
-                False,
-            ),
-            (
-                self.occurrence_count,
-                "routine occurrence count",
-                MAX_ROUTINE_OCCURRENCES,
-                False,
-            ),
-        ):
-            _bounded_count(count_value, count_name, maximum=maximum)
-            if require_positive and count_value == 0:
-                raise ValueError(f"{count_name} must be positive")
-        _optional_money(
-            self.per_run_max_cost_usd,
-            "per-run cost ceiling",
-            maximum=MAX_ROUTINE_PER_RUN_COST_USD,
-        )
-        _optional_money(
-            self.cumulative_max_cost_usd,
-            "cumulative cost ceiling",
-            maximum=MAX_ROUTINE_CUMULATIVE_COST_USD,
-        )
-        _money(
-            self.reserved_cost_usd,
-            "reserved cost amount",
-            maximum=MAX_ROUTINE_CUMULATIVE_COST_USD,
-        )
-        _money(
-            self.charged_cost_usd,
-            "charged cost amount",
-            maximum=None,
-        )
-        validate_budget_relationships(
-            self.per_run_max_tokens,
-            self.cumulative_max_tokens,
-            self.per_run_max_cost_usd,
-            self.cumulative_max_cost_usd,
-        )
-        if (
-            self.reserved_tokens
-            and self.reserved_tokens + self.charged_tokens > self.cumulative_max_tokens
-        ):
-            raise ValueError("routine token budget is oversubscribed")
-        if self.reserved_cost_usd and (
-            self.cumulative_max_cost_usd is None
-            or self.reserved_cost_usd + self.charged_cost_usd
-            > self.cumulative_max_cost_usd
-        ):
-            raise ValueError("routine cost budget is oversubscribed")
-        for ceiling_value, ceiling_name, maximum in (
-            (
-                self.cumulative_max_attempts,
-                "cumulative attempt ceiling",
-                MAX_ROUTINE_OCCURRENCES * MAX_ROUTINE_ATTEMPTS,
-            ),
-            (
-                self.cumulative_max_occurrences,
-                "cumulative occurrence ceiling",
-                MAX_ROUTINE_OCCURRENCES,
-            ),
-            (
-                self.maximum_consecutive_failures,
-                "maximum consecutive failures",
+                self.consecutive_failures,
+                "consecutive failures",
                 MAX_ROUTINE_CONSECUTIVE_FAILURES,
             ),
         ):
-            _bounded_count(ceiling_value, ceiling_name, maximum=maximum)
-            if ceiling_value == 0:
-                raise ValueError(f"{ceiling_name} must be positive")
-        _bounded_count(
-            self.consecutive_failures,
-            "consecutive failures",
-            maximum=self.maximum_consecutive_failures,
-        )
-        if self.attempt_count > self.cumulative_max_attempts:
-            raise ValueError("routine attempt ceiling is exhausted inconsistently")
-        if self.occurrence_count > self.cumulative_max_occurrences:
-            raise ValueError("routine occurrence ceiling is exhausted inconsistently")
+            _bounded_count(count_value, count_name, maximum=maximum)
+        _money(self.charged_cost_usd, "charged cost amount", maximum=None)
         _utc(self.created_at, "routine created_at")
         _utc(self.updated_at, "routine updated_at")
-        _utc(self.expires_at, "routine expires_at")
         _optional_utc(self.next_due_at, "routine next_due_at")
         if self.updated_at < self.created_at:
             raise ValueError("routine updated_at precedes created_at")
-        if (
-            not self.created_at
-            < self.expires_at
-            <= self.created_at + MAX_ROUTINE_LIFETIME
-        ):
-            raise ValueError("routine expiration is outside its finite lifetime")
-        if self.next_due_at is not None and self.next_due_at > self.expires_at:
-            raise ValueError("routine next due instant exceeds expiration")
         for optional_identity, identity_name in (
             (self.active_occurrence_id, "active occurrence_id"),
             (self.last_occurrence_id, "last occurrence_id"),
@@ -1027,37 +513,8 @@ class ScheduledRoutine:
         if not isinstance(self.state, RoutineState):
             raise TypeError("routine state is invalid")
         _positive_revision(self.revision, "routine revision")
-        object.__setattr__(self, "allowed_source_ids", sources)
-        object.__setattr__(self, "allowed_connector_binding_ids", bindings)
-        object.__setattr__(self, "allowed_resource_ids", resources)
-        object.__setattr__(self, "allowed_capability_ids", capabilities)
-        object.__setattr__(self, "eligible_model_routes", routes)
-        object.__setattr__(self, "allowed_access_modes", access_modes)
-        object.__setattr__(self, "allowed_operational_effects", effects)
-        object.__setattr__(self, "skill_bindings", skill_bindings)
+        object.__setattr__(self, "source_ids", sources)
         object.__setattr__(self, "last_delivery_ids", last_delivery_ids)
-
-    @property
-    def occurrence_allowance_exhausted(self) -> bool:
-        return (
-            self.attempt_count >= self.cumulative_max_attempts
-            or self.occurrence_count >= self.cumulative_max_occurrences
-        )
-
-    @property
-    def model_budget_exhausted(self) -> bool:
-        """Consumption is a fact; only a new reservation is capped by authority."""
-        if (
-            self.reserved_tokens + self.charged_tokens + self.per_run_max_tokens
-            > self.cumulative_max_tokens
-        ):
-            return True
-        if self.per_run_max_cost_usd is None or self.cumulative_max_cost_usd is None:
-            return False
-        return (
-            self.reserved_cost_usd + self.charged_cost_usd + self.per_run_max_cost_usd
-            > self.cumulative_max_cost_usd
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1072,12 +529,9 @@ class RoutineOccurrence:
     claimed_at: datetime | None
     claim_token: str | None
     lease_expires_at: datetime | None
-    precheck_observation: ResourceRevisionObservation | None
     execution_scope: ExecutionScope | None
     execution_scope_digest: str | None
     reserved_run_id: str | None
-    reserved_tokens: int
-    reserved_cost_usd: Decimal
     charged_tokens: int
     charged_cost_usd: Decimal
     run_bound_at: datetime | None
@@ -1156,11 +610,6 @@ class RoutineOccurrence:
             _digest(self.conclusion_digest, "occurrence conclusion_digest")
         for count_value, count_name, maximum in (
             (
-                self.reserved_tokens,
-                "occurrence reserved tokens",
-                MAX_ROUTINE_PER_RUN_TOKENS,
-            ),
-            (
                 self.charged_tokens,
                 "occurrence charged tokens",
                 None,
@@ -1168,11 +617,6 @@ class RoutineOccurrence:
             (self.attempt_count, "occurrence attempt count", MAX_ROUTINE_ATTEMPTS),
         ):
             _bounded_count(count_value, count_name, maximum=maximum)
-        _money(
-            self.reserved_cost_usd,
-            "occurrence reserved cost",
-            maximum=MAX_ROUTINE_PER_RUN_COST_USD,
-        )
         _money(
             self.charged_cost_usd,
             "occurrence charged cost",
@@ -1216,11 +660,8 @@ class ScheduledRoutineSummary:
     revision: int
     occurrence_count: int
     consecutive_failures: int
-    sensitivity_ceiling: ModelSensitivity
 
     def __post_init__(self) -> None:
-        if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
-            raise TypeError("routine summary sensitivity is invalid")
         _text(self.routine_id, "routine summary routine_id")
         _text(self.title, "routine summary title", maximum=MAX_ROUTINE_TITLE_CHARACTERS)
         if not isinstance(self.state, RoutineState):
@@ -1230,9 +671,7 @@ class ScheduledRoutineSummary:
         _optional_utc(self.next_due_at, "routine summary next_due_at")
         _positive_revision(self.revision, "routine summary revision")
         _bounded_count(
-            self.occurrence_count,
-            "routine summary occurrence count",
-            maximum=MAX_ROUTINE_OCCURRENCES,
+            self.occurrence_count, "routine summary occurrence count", maximum=None
         )
         _bounded_count(
             self.consecutive_failures,

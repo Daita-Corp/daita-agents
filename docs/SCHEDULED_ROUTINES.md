@@ -1,384 +1,176 @@
-# Scheduled assignments and outcomes
+# Scheduled routines
 
-Daita can carry out an approved assignment once or on a recurring schedule.
-Each routine keeps its instruction, access, budget, and delivery destination
-fixed until you approve a revision. Results appear in the originating
-conversation's inbox. An agent host must remain open for scheduled work to
-progress.
+A routine is a title, a prompt and a schedule. Optionally it names the sources
+to use. Each time it is due, Daita runs the agent on the prompt exactly as if
+you had asked it, with the agent's current model, and puts the answer in the
+conversation's Inbox. Reads just run; any write or external action asks you at
+the time. The background host must be running for routines to progress (see
+[The background host](#the-background-host)).
 
-Each occurrence uses the same model loop and capability checks as other Daita
-work. Its terminal outcome and inbox delivery are recorded together.
+## What a routine holds
 
-## Supported schedules
+| Field | Meaning |
+| --- | --- |
+| `title` | A short name shown on the work board and approval cards. |
+| `prompt` | A self-contained instruction for each run. Name sources and tables by their catalog names, not by a run's `s1`/`t1` handles. |
+| `schedule` | When it runs (below). |
+| `sources` | Optional source names or ids. Omitted means every current source. |
+| `run_immediately` | Creation only: also run once now. Interval and calendar schedules only. |
 
-A routine uses one typed schedule:
+Everything else is a fixed default, with no option to change it:
 
-- `once` at one exact UTC instant;
-- `interval` anchored to one exact instant, with intervals from 60 seconds up
-  to five years; or
-- `calendar` at an exact local hour and minute in an IANA timezone.
+- **Delivery:** the routine's conversation Inbox. A routine created outside a
+  conversation (from the CLI or Python without `conversation_id`) gets a new
+  conversation of its own, which appears with its first result.
+- **Missed slots are skipped.** One late slot still runs when the host wakes;
+  a backlog of several missed slots does not, and the routine waits for its
+  next future slot.
+- **Run limits:** each run has the agent's normal step, time, token and cost
+  limits and uses the agent's current model routes.
+- **Failures:** a recurring routine pauses as **Needs you** after 3
+  consecutive failed runs. Resuming it clears the count.
+- **Lifetime:** a one-time routine ends (`completed`) after it runs; a
+  recurring routine runs until you pause or disable it.
 
-The model-facing `routine_save` tool creates a routine when `routine_id` is
-absent (`routines.create`) and replaces one exact revision when `routine_id`
-and `expected_revision` are both given (`routines.update`); a stale
-`expected_revision` fails with `routine_revision_changed`. Its schedule is one
-flat object whose `kind` decides which keys are accepted; the owner rejects
-keys that belong to another kind. Optional arguments default to the narrowest
-contract: `misfire_policy="skip"`, no requested grants, skills, precheck or
-dollar ceilings, and no immediate run. An omitted `distribution_destination_id`
-selects the conversation Inbox when it is the only selectable destination, and
-omitted `allowed_connector_binding_ids` are the bindings of the allowed connector
-capabilities; explicit values are validated as before. The provider schema
-summarizes the rarely used `requested_capability_grants`, `precheck`,
-`allowed_connector_binding_ids`, dollar ceilings and `basis_run_id`; their full
-rules are in the `routine_save` contract that `toolbox_inspect` returns, and
-every call is validated against that full contract. Sharing one schema changes
-the `routines.create` and `routines.update` contract digests; both are
-interactive-only, so no retained routine binds them.
+A routine has no budget, expiry date, grant or outcome contract of its own.
 
-Creation also accepts bounded creation-time timing:
-`once` with `after_seconds`, `interval` with `anchor_after_seconds`, and
-`once_next_weekday` with an IANA timezone, ISO weekday (Monday=1), hour and
-minute. Relative delays are 1 second through 30 days. Creation can use
-`expires_after_seconds` instead of an absolute `expires_at`. The routine owner
-resolves these inputs to the existing exact UTC schedule and finite expiration;
-stored routines and the supervisor have no relative-time execution mode.
+## Schedules
 
-In a local foreground session, Daita supplies the code-owned UTC time at run
-start and detected IANA local timezone to the model. Explicit user
-timezones take precedence. A hosted session without a reliable user timezone
-reports it as unknown, so an unqualified wall-clock request needs clarification.
-The database clock and source queries are not scheduling time sources.
+A schedule is one of:
 
-Calendar definitions reject ambiguous abbreviations such as `CST`. They retain
-an explicit daylight-saving gap policy (`skip` or `next_valid`) and overlap
-policy (`first` or `second`). Missed schedules use bounded `skip` or
-`latest_only` handling; Daita never replays an unbounded backlog. Scheduled and
-manual run-now slots have stable occurrence identities, so duplicate ticks and
-host restarts converge on the existing occurrence.
+- `once`: `exact_at` (ISO 8601 with an offset), or `after_seconds` from when
+  it is saved;
+- `interval`: `interval_seconds` (60 seconds to five years) from `anchor_at`,
+  or from `anchor_after_seconds` after it is saved;
+- `once_next_weekday`: the next `weekday` (Monday=1) at `hour`:`minute` in an
+  IANA `timezone`;
+- `calendar`: `hour`:`minute` in an IANA `timezone`, every day or on
+  `weekdays` or `month_days`, optionally limited to `months`. Daylight-saving
+  gaps are skipped and repeated hours use the first occurrence by default
+  (`nonexistent_time_policy`, `ambiguous_time_policy`).
 
-## Frozen authority
+Relative timing is 1 second to 30 days. Daita turns it into exact UTC times
+when the routine is saved; nothing about a stored routine is relative. Cron and
+RRULE strings are not accepted. Calendar timezones must be exact IANA names;
+abbreviations such as `CST` are refused.
 
-`toolbox_search` exposes exact capability IDs, automation eligibility, and the
-domain-owned `automation_contract` for tools requiring grants: constraints schemas,
-connector references, and evidence bases. `requires_automation_grant` refers to
-scheduled execution; foreground actions request exact approval when invoked.
-Load an execution tool when its exact argument schema is needed to author fixed
-or variable grant arguments. The generic grant schema alone does not define an
-MCP action's argument names or types. If a contract exceeds the bounded discovery
-page, `automation_contract_omitted` directs the model to `toolbox_load` for its
-complete declaration. Load also returns these contracts for selected tools.
-These declarations support proposal authoring; they do not grant execution
-authority. Reads need capability inclusion, without
-an effect grant. The routine tool declares the finite once, interval, and calendar
-schedule shapes, including calendar day selectors and daylight-saving policies.
-Cron and RRULE strings are not accepted schedule alternatives. Resource prechecks
-require exact capability, contract, source, and resource references; an MCP binding
-revision is not a resource precheck.
+In the TUI, the model is given the code-owned time at run start and your
+detected local timezone, so "8 minutes from now" or "every weekday at 9" need
+no clock lookup. A timezone you name explicitly wins.
 
-`always` reporting requires omitting the precheck; `changes_only` requires one.
-Prechecks track structural revisions, not changing row values, and cannot skip
-effectful or MCP assignments. Creation and revision validate these rules before
-grant preparation or execution-contract binding and return actionable errors.
-Admission rechecks the same rules; drafts and persisted records share their
-reporting/precheck invariant.
+## Creating and changing a routine
 
-Token, attempt and occurrence ceilings always bound a routine. Dollar ceilings
-are optional: omit both `per_run_max_cost_usd` and `cumulative_max_cost_usd` for
-a turn- and token-bounded routine (the only way an unpriced subscription route,
-such as Codex, can run it), or set both together. Per-run ceilings must not
-exceed their corresponding cumulative ceilings. Drafts and stored routines share
-that invariant. Removing a dollar ceiling in a revision widens authority like
-raising one. The routine
-owner rejects inconsistent create/revision proposals with `routine_budget_invalid`
-before grant preparation, connector readiness, contract binding, approval or
-mutation. The error names both fields so the next ordinary model step can submit
-the user's exact authorized budgets. Daita never repairs or enlarges them. The
-remaining foreground allowance is distinct from a future routine's budgets.
+Ask for it in a conversation, for example: "Create a one-time routine 8 minutes
+from now that writes a two-sentence note on why data quality matters." The
+model calls `routine_save` once and Daita shows one confirm card with the
+title, the schedule in your local time, the prompt and the sources. Approve it
+and the routine is saved; the receipt shows its id, revision, state, schedule
+and next run. Relative timing on the card is marked "timed from approval": it
+counts from the moment you approve.
 
-Admission validates and retains the exact agent, conversation, source,
-resource, MCP binding, capability contract, model route, sensitivity, budget,
-expiration, typed outcome contract, and immutable inbox distribution plan. Only
-capabilities statically declared
-`automation_direct` can enter the ceiling. Effectful capabilities additionally
-require a domain-normalized `CapabilityGrant`, an exact call ceiling, a receipt
-policy and an `EffectRequirement`. Routine-management capabilities remain
-interactive-only. Source-free assignments use empty source/resource/binding
-ceilings; those empty machine ceilings never mean all currently admitted sources.
-Native update/upsert and explicitly admitted direct-result MCP actions have concrete
-domain grant contracts; the common routine contract does not confer connector
-authority. MCP grants fix exact top-level arguments and allow only named scalar
-variables, with 1 to 256 reserved calls per occurrence, further narrowed by
-run limits.
-MCP completion evidence is server-reported invocation only. See
-[MCP admission and actions](MCP_CONNECTIVITY.md) for the supported subset.
+To change a routine, pass its `routine_id` with only what changes; omitted
+fields keep their stored values. `expected_revision` is optional and defaults
+to the current revision; when given and stale, the save is refused with
+`routine_revision_changed`. A change shows the same confirm card. `routine_control`
+pauses, resumes, runs now, or disables one routine.
 
-Capability contracts are revalidated by exact digest. The catalog-search output
-now includes its catalog-owned `match_outcome`, so this schema addition changes the
-`catalog.search` contract digest. A retained routine bound to the previous digest
-fails closed and must be recreated or revised and approved again from the
-foreground. There is no compatibility decoder, digest bridge, or implicit
-acceptance of the replacement contract.
+A foreground run that stops after a routine was saved does not undo the save;
+the terminal shows the saved receipt beside the stopped-run notice.
 
-The model-facing Python tool is `python_execute`; its internal capability ID
-remains `analysis.execute`. Its updated description changes the exact capability
-contract digest, so routines retaining the previous binding require foreground
-review and approval of a revised proposal.
+## Writes ask at the time
 
-The scheduled-analysis addition changes the `analysis.execute` contract, and
-the positional-binding guidance changes the `data.query` contract. Routines
-retaining older bindings fail closed and require foreground review and approval
-of a revised proposal. Existing bindings are never upgraded implicitly.
+A scheduled run can read the routine's sources and use every capability except
+local computer files and creating, changing or running routines and jobs. Its
+scope is fixed when the run starts: a source added later is seen by the next
+run, not the current one.
 
-The tool consolidation removed `data_export_tabular`, the four artifact
-creation tools, `routine_create`, `routine_update`, `skill_delete`,
-`semantic_list`, `semantic_delete` and `start_data_profile` without aliases.
-Routines bind capability IDs and contract digests, never tool names, so the
-renames alone break no binding. Two automation-eligible contracts did change:
-`data.export_tabular` (now reached through `data_query` with `output`, its
-`format` argument renamed `output`) and `analysis.execute` (its shorter
-description). A retained routine bound to either previous digest fails closed
-at revalidation and needs a revised, approved proposal. The changed
-`routines.*`, `semantic.save` contracts and the removed
-`jobs.data_profile.start` were interactive-only, so no routine retains them.
+When a run wants to write (a PostgreSQL update or upsert, an admitted MCP
+action), it pauses and the host opens an approval naming the routine. A desktop
+notification appears if no window is watching; opening `daita` shows the card.
+Approve and the run continues; deny and the model gets the refusal and carries
+on. If nobody answers within 24 hours, the run is interrupted (not denied) and
+the occurrence shows as Needs you. Every write is receipted before dispatch and
+never retried or replayed. An uncertain outcome pauses the routine until you
+resolve it; see [Effect receipts and recovery](EFFECT_RECEIPTS.md). Resume and
+run-now are refused while such a receipt is unresolved.
 
-If an artifact is required, admission also proves that at least one allowed
-producer can satisfy its media type, authorship, exact-source, sensitivity, and
-byte bounds. Impossible contracts fail before the routine is created.
-
-The certified scheduled artifact surface is deliberately small:
-
-- `artifact.create_document` for model-authored text or Markdown;
-- `data.export_tabular` for exact source-data CSV or XLSX;
-- `artifact.snapshot_result` for canonical JSON from an exact earlier
-  successful result in the current scheduled run;
-- `analysis.execute` for bounded computed datasets and charts on the existing
-  local macOS ARM64 runtime. Its read broker enforces the frozen routine source,
-  resource and capability scope. Local file access and retained artifact inputs
-  are unavailable; artifact publication uses the same outcome contract.
-
-Artifact inventory, reading, conversion, editing, local publication, and
-export-location capabilities remain interactive-only.
-
-An optional `changes_only` resource-revision precheck runs through the ordinary
-trusted runtime request. It is restricted to one exact structural catalog/resource
-revision and the supported catalog/report tools. It cannot skip row-value research,
-effects, MCP calls, source-free work or broader resource assignments. When its canonical observation is unchanged, the
-occurrence advances with zero model calls and one no-change Delivery. `always`
-routines do not use that precheck.
-
-Failures before a model run starts release the reserved occurrence budget and
-advance the routine without inventing a run record. When consecutive failures
-reach the configured threshold, the routine moves to `needs_attention` and the
-same atomic finalization inserts one escalation in the conversation inbox. The
-item explicitly reports that no model run started. Terminal-run failures use
-their existing conclusion as the one escalation, so an occurrence never
-creates separate report and escalation deliveries.
-
-Finalization records all known consumption, even when it exceeds a reservation.
-Incomplete usage conservatively consumes at least the full reservation, while the
-run retains its partial or unavailable estimate. Such a run cannot produce a
-successful outcome. A routine without dollar ceilings reserves no dollars, and an
-unpriced route that reported its tokens counts as complete usage.
-
-A provider quota rejection (`rate_limit_error`) fails that occurrence without
-counting toward `maximum_consecutive_failures`. The supervisor then leaves due
-slots on that model route unclaimed for a hold window that starts at five
-minutes, doubles on each repeat up to one hour, and clears after a completed
-run. The hold lives in the open host only; the misfire policy decides which
-missed slots run afterward. A routine without enough cumulative allowance for another run
-moves to `needs_attention`; resume and run-now cannot bypass that budget. There is
-no extra model call after the run reaches a step, token, or cost limit.
-
-Skills are optional and exact. Admission copies the current validated
-`SKILL.md` bytes into the existing SkillStore's bounded content-addressed
-retention area. Later edits or deletion of the current skill do not change the
-routine; missing or digest-mismatched retained bytes fail closed. Skill text,
-source values, MCP metadata and output, precheck observations, and prior
-transcript content remain untrusted data and cannot expand authority.
-
-Scheduled execution cannot start or cancel a durable job, manage another routine,
-publish local files, deliver through an external Distribution destination, run
-shell commands, or submit a graph. An admitted effect capability uses its existing
-domain and the common runtime, within an exact standing grant.
-
-## Immediate execution and effect outcomes
-
-For an interval or calendar schedule, `run_immediately=true` creates one immediate
-occurrence in the same SQLite transaction as the assignment. That occurrence uses
-the ordinary supervisor, run budget and action limits. The original calendar or
-interval anchor retains its next future slot. Approval covers this one assignment;
-there is no separate foreground write and no second immediate occurrence on a
-retry with the same creation identity. Revisions use explicit run-now instead.
-
-Model-authored creation must explicitly supply `run_immediately`: `false` means
-scheduled-only (and is required for a one-time schedule). Omitting the choice
-fails validation. Model-authored revisions may omit it or supply `false`; `true`
-is rejected. Typed Python owner inputs keep their default of `false`. Review the
-actual saved schedule and immediate choice; explicit syntax alone cannot verify
-that the model understood the requested timing.
-
-For relative creation, approval shows the bounded timing intent. Its displayed
-absolute times are estimates: the delay begins when approval completes and the
-routine is created. A named one-time local instant is frozen for approval and
-fails if it passes before creation. The committed receipt shows the exact stored
-UTC schedule. Routine revisions still require exact timestamps.
-
-Every permitted effect has one completion requirement. A positive minimum requires
-that many unique successful, validated invocations; zero explicitly permits no
-action. Approval retains the accepted evidence bases and rejects stronger evidence
-than the capability can produce. Server-reported invocation evidence does not
-establish a downstream business result. A persuasive answer or artifact cannot
-substitute for a required action.
-
-The finalizer loads authoritative receipts for the exact run, occurrence, grant
-and capability contract and authenticates their successful tool results. It keeps
-valid partial artifacts if another action or artifact minimum fails. An uncertain
-or started effect forces failure even on an optional path. The work board then shows a
-code-authored failure notice with receipt and artifact references, rather than
-presenting the model's completion claim as success.
-
-Uncertainty immediately pauses the originating routine. Resume, run-now, changed
-arguments, revised grants and new effectful clones cannot bypass its durable block.
-Previously approved unrelated routines and read-only work can continue. Exact
-foreground recovery records a separate immutable resolution and never dispatches
-an action: close-without-retry disables the routine; allow-future-work leaves it
-paused until explicitly resumed. A delayed finalizer preserves that stop decision.
-See [Effect receipts and recovery](EFFECT_RECEIPTS.md).
-
-## Creation receipts and stopped model runs
-
-The model-facing create, update, and control tools return a compact, validated
-receipt for the committed mutation: action, routine ID/revision/state, typed
-schedule, next due time, and reservation counts. Reservation counts record admitted
-occurrences and attempts; they do not establish execution success. Full instructions,
-grants, contract bindings, budgets, and distribution remain available through
-`Agent.inspect_routine` and `routine_inspect` and remain the enforcement records.
-
-A foreground model run can stop after a routine was committed. Its failed or
-interrupted status does not roll back creation or disable the routine. The terminal
-retains this distinction, including after reopening the conversation, and displays
-recorded receipt facts alongside the stopped-run notice. Headless `daita run` output
-includes bounded tool-result summaries and call IDs without repeating tool arguments
-or full authorization records. The public `Transcript.tool_pairs` projection exposes
-the original ordered call/result evidence; a missing result remains unknown.
-Scheduled execution outcomes appear separately on the work board.
+A provider quota rejection fails that occurrence without counting toward the 3
+failures, and the host leaves due slots unclaimed for a hold that starts at
+five minutes, doubles up to one hour, and clears after a completed run.
 
 ## Terminal use
 
-Open the record-backed manager in the Textual app:
+In the TUI:
 
 ```text
 /routines
-/routines create <self-contained instruction>
-/routines promote <basis-run-id> <self-contained instruction>
-/routines update <routine-id> <self-contained instruction>
+/routines create <what to do and when>
+/routines update <routine-id> <what to change>
 ```
 
-The manager lists at most 50 routines and shows the exact schedule, instruction
-digest and preview, scope, pinned skills, budget use, next due time, recent
-occurrences, failures, expiration, revision, and lifecycle state. Its pause,
-resume, run-now, and disable controls call the public `Agent` methods directly.
-Create and update use the normal foreground routine tools and existing approval
-card. The status bar counts saved assignments separately from active background
-reasoning. A saved or queued assignment is not completed work. Receipt-linked
-failures require separate operator recovery, which never performs an action.
+`/routines` opens the manager: the list, each routine's schedule, prompt,
+sources, usage and recent runs, and pause, resume, run-now and disable
+controls.
 
-The headless CLI exposes the same record-owned lifecycle:
+From the CLI:
 
 ```bash
 daita routines list atlas
 daita routines inspect atlas <routine-id>
+daita routines create atlas --title "Data quality note" \
+  --prompt "Write a two-sentence note on why data quality matters." \
+  --schedule '{"kind": "once", "after_seconds": 480}'
+daita routines create atlas --spec /absolute/path/routine.json
+daita routines update atlas <routine-id> \
+  --schedule '{"kind": "calendar", "timezone": "America/Chicago", "hour": 9, "minute": 0, "weekdays": [1, 2, 3, 4, 5]}'
 daita routines pause atlas <routine-id> <revision>
 daita routines resume atlas <routine-id> <revision>
 daita routines run-now atlas <routine-id> <revision>
 daita routines disable atlas <routine-id> <revision>
-daita routines create atlas --spec /absolute/path/routine.json
-daita routines promote atlas --spec /absolute/path/routine.json \
-  --basis-run-id <completed-run-id>
-daita routines update atlas <routine-id> <revision> \
-  --spec /absolute/path/routine.json
-daita routines destinations atlas <conversation-id>
 ```
 
-`routines destinations` lists the destinations a routine in that conversation
-can deliver to.
-
-The JSON specification contains the foreground origin run and complete frozen
-definition. For example:
+`create` and `update` accept `--title`, `--prompt`, `--schedule` (JSON),
+repeated `--source`, and `--spec` (a JSON file with the same fields; flags
+override it). `create` also takes `--run-immediately`, and `update` takes
+`--expected-revision`. Both show the confirm card and ask before saving. A spec
+file looks like:
 
 ```json
 {
-  "origin_run_id": "run-...",
   "title": "Daily paid revenue",
-  "authorized_instruction": "Read the exact admitted revenue resource and report paid revenue by region.",
-  "schedule": {
-    "kind": "calendar",
-    "timezone": "America/Chicago",
-    "hour": 9,
-    "minute": 0,
-    "day_selector": "weekdays",
-    "weekdays": [1, 2, 3, 4, 5],
-    "month_days": [],
-    "months": [],
-    "nonexistent_time_policy": "next_valid",
-    "ambiguous_time_policy": "first"
-  },
-  "misfire_policy": "latest_only",
-  "reporting_mode": "always",
-  "precheck": null,
-  "allowed_source_ids": ["source:..."],
-  "allowed_connector_binding_ids": [],
-  "allowed_resource_ids": ["catalog-resource:..."],
-  "allowed_capability_ids": ["catalog.describe", "data.query"],
-  "sensitivity_ceiling": "internal",
-  "outcome_contract": {
-    "require_terminal_conclusion": true,
-    "artifact_requirements": [],
-    "maximum_total_artifact_bytes": 0,
-    "maximum_effective_sensitivity": "internal",
-    "require_current_run_provenance": true,
-    "require_exact_source_bindings": false,
-    "effect_requirements": []
-  },
-  "distribution_destination_id": "conversation_inbox:conversation-...",
-  "eligible_model_routes": ["openai"],
-  "per_run_max_tokens": 4000,
-  "cumulative_max_tokens": 120000,
-  "cumulative_max_attempts": 30,
-  "cumulative_max_occurrences": 30,
-  "maximum_consecutive_failures": 3,
-  "expires_at": "2027-08-28T00:00:00+00:00",
-  "skill_names": []
+  "prompt": "Report paid revenue by region from the revenue table.",
+  "schedule": {"kind": "calendar", "timezone": "America/Chicago", "hour": 9, "minute": 0, "weekdays": [1, 2, 3, 4, 5]},
+  "sources": ["warehouse"]
 }
 ```
 
-The IDs and model routes must already be admitted to that agent. Create and
-update fail closed if any identity, capability contract, sensitivity, route,
-pricing, outcome, destination, or skill binding is unavailable. Use
-`daita routines --help` for the command surface. CLI creation, promotion and
-revision present the exact validated proposal before saving it. Python callers
-can pass `confirmation_handler=` to create/update for that review. Without this
-explicit confirmation callback, typed Python create/update calls are already
-owner-authorized control operations. Model-originated changes always use the
-runtime approval handler.
+From Python, the same shape is `RoutineIntent`:
 
-The review summarizes the instruction, schedule, immediate occurrence, budgets,
-permissions and completion requirements, followed by the complete validated
-authority snapshot. Connector names are presentation; exact identities and
-digests remain visible. The review and the `routine_save` receipt list the first
-scheduled runs, computed by the schedule owner, in UTC and as schedule-local
-weekday time. A schedule whose first run is after `expires_at` is rejected with
-`routine_expiration_before_schedule`, and a `cumulative_max_occurrences` that
-cannot be reached before expiration is flagged as a warning. Connector tool
-arguments and report delivery are shown as separate lines. An approval cannot add a connector permission or promise
-stronger evidence than the selected producer supports. Model cost ceilings do not
-cap third-party service fees.
+```python
+from daita import Agent, RoutineIntent
+
+agent = await Agent.open("atlas")
+routine = await agent.create_routine(
+    RoutineIntent(
+        title="Daily paid revenue",
+        prompt="Report paid revenue by region from the revenue table.",
+        schedule={"kind": "calendar", "timezone": "America/Chicago", "hour": 9, "minute": 0},
+        sources=("warehouse",),
+    ),
+    conversation_id=None,  # or a conversation whose Inbox should receive results
+)
+await agent.update_routine(routine.routine_id, RoutineIntent(prompt="Also list refunds."))
+```
+
+`schedule` takes the JSON shape above or a typed `OnceSchedule`,
+`IntervalSchedule` or `CalendarSchedule`. Pass `confirmation_handler=` to review
+the confirm card before saving; without it, a typed Python call is the owner's
+own decision.
 
 ## Results on the work board
 
 The TUI's Work tab (`Ctrl+3` or `/work`) is a board over jobs, routines and their
-results. A routine's successful or skipped result sits in Done for 24 hours, then
+results. A routine's successful result sits in Done for 24 hours, then
 ages off the board. A failed or withheld result stays in Needs you until you
 dismiss it. Press `Enter` on a result to read it, and `d` (or the result's
 Dismiss button) to dismiss it. Dismissing acknowledges the delivery; it never
@@ -401,6 +193,8 @@ conversation's results and already acknowledged history.
 `Agent.work_board()` shows them beside jobs and routines in Scheduled, Running,
 Needs you and Done columns; it is not yet available to hosted callers.
 
+A failed run's Inbox item is a code-written notice with its failure code and
+any receipt and artifact references, never the model's own claim of success.
 Acknowledgment is idempotent. Unacknowledged routine results are never evicted.
 When the fixed per-agent Delivery bound is full, a producer's finalization
 transaction reclaims the oldest acknowledged Delivery first, then the oldest job
@@ -437,47 +231,12 @@ new due work runs. On reopen, Daita fences stale claims, finalizes a run that
 was already durably terminal without rerunning it, and preserves exactly one
 logical inbox delivery.
 
-Each approved revision retains `contract_bindings`: exact capability contracts,
-MCP execution origins, structural resource revisions and non-secret model route
-configuration digests. The occurrence copies those references into its immutable
-scope. Claim and call checks compare current facts with those retained references.
-A structural or execution contract change requires a new approved revision; row
-values, catalog refresh time and editable discovery hints do not change authority.
+## Routines from earlier versions
 
-
-## Native update and upsert assignments
-
-The data domain supports exact native update/upsert grants, initially backed by
-PostgreSQL. One routine may contain one native write capability, with exactly one
-invocation per occurrence and explicit resource, structural revision, key, column,
-identity and row ceilings. Update authority never grants insertion. Read the
-[relational write contract](RELATIONAL_WRITES.md) before configuring an assignment.
-
-Immediate-first creation produces one immediate occurrence while retaining the
-approved interval/calendar schedule. Required effects are checked against current-run
-validated results and authenticated receipts. An unchanged upsert consumes the call
-and reports zero row changes. Missing effects, transaction failures and uncertainty
-cannot become a successful outcome through model text. Unknown commits block further
-potentially duplicating work, including future slots and run-now, pending explicit
-foreground recovery. No automatic replay or chunking is supported.
-
-This native path is a development implementation with deterministic acceptance;
-production release gates and the separate shared MCP external-action work remain.
-
-Authoring and revision validate exact eligible model routes before connector
-readiness or contract binding. Invalid choices return a structured error; current
-contract and approval rechecks still reject drift. The model sees complete local
-route choices and host budget ceilings while an authoring tool is callable.
-
-Native write admission requires the corresponding read-only preview capability in
-the same proposal: `data.preview_update_rows` for `data.update_rows`, or
-`data.preview_upsert_rows` for `data.upsert_rows`. Admission does not perform or
-authorize a future preview; every occurrence must obtain its own authenticated
-preview. Structural discovery is separate. A natural assignment that needs table
-structure must explicitly request bounded `catalog.describe` access to its approved
-source/table. Daita never adds that permission automatically.
-
-Compatibility: `catalog.schema`, `catalog.inspect` and `catalog.traverse` were
-replaced by `catalog.describe` without aliases. A retained routine or job whose
-allowed capabilities or precheck name a removed capability fails ordinary
-revalidation; save it again with `catalog.describe`.
+Upgrading a home rewrites each stored routine to this shape. It keeps its
+title, prompt, schedule, state, counters and named sources (its former source
+ceiling; an empty one now means every current source) and keeps running. Its
+frozen access, grants, model routes, sensitivity ceiling, budgets, expiry,
+outcome contract, precheck, pinned skills and promotion evidence are dropped,
+and any write it makes now asks at the time. An occurrence that was mid-precheck
+continues as an ordinary claim; one skipped as unchanged counts as completed.

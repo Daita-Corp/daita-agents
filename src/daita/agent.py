@@ -49,7 +49,7 @@ from .catalog.models import (
     CatalogSummary,
 )
 from .config import AgentConfig
-from .distribution import DeliveryInspection, DeliveryView, DistributionDestination
+from .distribution import DeliveryInspection, DeliveryView
 from .hosting.embedded import (
     AgentAlreadyExistsError,
     AgentHomeError,
@@ -90,9 +90,9 @@ from .loop.analysis import AnalysisEvidence
 from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
 from .observation import AgentObserver, SupervisorStatus
 from .routines import (
+    RoutineIntent,
     RoutineState,
     ScheduledRoutine,
-    ScheduledRoutineDraft,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
 )
@@ -495,21 +495,6 @@ class Agent:
             caller_principal_id=caller_principal_id,
         )
 
-    async def distribution_destinations(
-        self,
-        conversation_id: str,
-        *,
-        sensitivity_ceiling: ModelSensitivity = ModelSensitivity.RESTRICTED,
-        caller_principal_id: str | None = None,
-    ) -> tuple[DistributionDestination, ...]:
-        """List exact destinations currently selectable for one conversation."""
-
-        return await self._embedded.distribution_destinations(
-            conversation_id,
-            sensitivity_ceiling=sensitivity_ceiling,
-            caller_principal_id=caller_principal_id,
-        )
-
     async def inspect_delivery(
         self,
         delivery_id: str,
@@ -896,29 +881,23 @@ class Agent:
             idempotency_key=idempotency_key,
         )
 
-    async def propose_routine(self, draft: ScheduledRoutineDraft) -> ScheduledRoutine:
-        return await self._embedded.propose_routine(draft)
-
-    async def promote_routine(
-        self,
-        draft: ScheduledRoutineDraft,
-        *,
-        basis_run_id: str,
-    ) -> ScheduledRoutine:
-        return await self._embedded.promote_routine(
-            draft,
-            basis_run_id=basis_run_id,
-        )
-
     async def create_routine(
         self,
-        proposal: ScheduledRoutine,
+        intent: RoutineIntent,
         *,
+        conversation_id: str | None = None,
         confirmation_handler: ApprovalHandler | None = None,
     ) -> ScheduledRoutine:
-        """Authorize an exact owner proposal, optionally reviewing it before admission."""
+        """Save a routine: a title, a prompt and a schedule, optionally named sources.
+
+        Each occurrence runs the agent normally and delivers to the
+        conversation's Inbox (a new conversation when none is given). A
+        confirmation handler sees the routine before it is saved.
+        """
         return await self._embedded.create_routine(
-            proposal, confirmation_handler=confirmation_handler
+            intent,
+            conversation_id=conversation_id,
+            confirmation_handler=confirmation_handler,
         )
 
     async def list_routines(
@@ -937,17 +916,16 @@ class Agent:
     async def update_routine(
         self,
         routine_id: str,
+        intent: RoutineIntent,
         *,
-        expected_revision: int,
-        draft: ScheduledRoutineDraft,
-        basis_run_id: str | None = None,
+        expected_revision: int | None = None,
         confirmation_handler: ApprovalHandler | None = None,
     ) -> ScheduledRoutine:
+        """Change a routine; fields the intent omits keep their stored values."""
         return await self._embedded.update_routine(
             routine_id,
+            intent,
             expected_revision=expected_revision,
-            draft=draft,
-            basis_run_id=basis_run_id,
             confirmation_handler=confirmation_handler,
         )
 

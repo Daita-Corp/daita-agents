@@ -18,6 +18,7 @@ from ..capabilities import ExecutionScope
 from ..distribution.models import (
     Delivery,
     DeliverySubjectKind,
+    DistributionPlan,
     OutcomeArtifactReference,
     OutcomeConclusionKind,
     OutcomeState,
@@ -25,18 +26,21 @@ from ..distribution.models import (
     outcome_artifact_reference,
     validate_outcome_artifact_references,
 )
-from ..distribution.owner import construct_logical_delivery
+from ..distribution.owner import construct_logical_delivery, conversation_inbox_plan
 from ..llm.errors import ProviderErrorCode
-from ..llm.models import MessageRole, ToolResultBlock
+from ..llm.models import MessageRole, ModelSensitivity, ToolResultBlock
 from ..llm.pricing import STALL_USAGE_UNREPORTED, CostEstimateStatus
 from ..loop.models import LoopExitKind, RunOrigin, Transcript
 from ..routines.models import (
     ACTIVE_OCCURRENCE_DISPOSITIONS,
     MAX_ACTIVE_ROUTINES_PER_AGENT,
     MAX_ROUTINE_ATTEMPTS,
+    MAX_ROUTINE_CONSECUTIVE_FAILURES,
     MAX_SCHEDULED_ROUTINES_PER_AGENT,
     ROUTINE_CLAIM_LEASE_SECONDS,
-    ResourceRevisionObservation,
+    ROUTINE_FAILURE_LIMIT,
+    ROUTINE_INBOX_SENSITIVITY,
+    ROUTINE_OUTCOME,
     RoutineOccurrence,
     RoutineOccurrenceDisposition,
     RoutineSlotKind,
@@ -227,13 +231,6 @@ _UNPRICED_COST_CODES = frozenset(
 )
 
 
-def _cost_ceiling_widened(proposed: Decimal | None, current: Decimal | None) -> bool:
-    """A removed dollar ceiling widens authority just as a larger one does."""
-    if current is None:
-        return False
-    return proposed is None or proposed > current
-
-
 def _require_effects_unblocked(
     connection: SQLConnection,
     agent_id: str,
@@ -258,9 +255,8 @@ def admit_routine(
     encoded: str,
     *,
     clock: Callable[[], datetime],
+    run_immediately: bool,
 ) -> ScheduledRoutine:
-    if normalized.capability_grants:
-        _require_effects_unblocked(connection, normalized.agent_id)
     row = connection.execute(
         "SELECT 1 FROM scheduled_routines WHERE agent_id = ? AND routine_id = ?",
         (normalized.agent_id, normalized.routine_id),
@@ -298,17 +294,11 @@ def admit_routine(
             encoded,
         ),
     )
-    if normalized.run_immediately:
+    if run_immediately:
         if normalized.state is not RoutineState.ACTIVE:
             raise ValueError("routine_immediate_requires_active_creation")
         claimed_at = clock()
-        if claimed_at >= normalized.expires_at:
-            raise ValueError("routine_expired")
-        following = next_slot(
-            normalized.schedule,
-            after=claimed_at,
-            expires_at=normalized.expires_at,
-        )
+        following = next_slot(normalized.schedule, after=claimed_at)
         immediate = replace(normalized, next_due_at=following)
         _replace_routine_row(connection, encoded, immediate)
         immediate_encoded = encode_scheduled_routine(immediate)
@@ -435,42 +425,6 @@ def revise_routine(
     if loaded is None:
         return None
     current, encoded = loaded
-    if routine.capability_grants:
-        _require_effects_unblocked(
-            connection, routine.agent_id, routine_id=routine.routine_id
-        )
-        if (
-            routine.capability_grants != current.capability_grants
-            or routine.contract_bindings != current.contract_bindings
-            or routine.allowed_source_ids != current.allowed_source_ids
-            or routine.allowed_resource_ids != current.allowed_resource_ids
-            or routine.allowed_connector_binding_ids
-            != current.allowed_connector_binding_ids
-            or routine.allowed_capability_ids != current.allowed_capability_ids
-            or routine.sensitivity_ceiling != current.sensitivity_ceiling
-            or routine.instruction_digest != current.instruction_digest
-            or routine.schedule != current.schedule
-            or routine.misfire_policy != current.misfire_policy
-            or routine.skill_bindings != current.skill_bindings
-            or routine.eligible_model_routes != current.eligible_model_routes
-            or routine.outcome_contract != current.outcome_contract
-            or routine.distribution_plan != current.distribution_plan
-            or routine.expires_at > current.expires_at
-            or routine.per_run_max_tokens > current.per_run_max_tokens
-            or _cost_ceiling_widened(
-                routine.per_run_max_cost_usd, current.per_run_max_cost_usd
-            )
-            or routine.cumulative_max_tokens > current.cumulative_max_tokens
-            or _cost_ceiling_widened(
-                routine.cumulative_max_cost_usd,
-                current.cumulative_max_cost_usd,
-            )
-            or routine.cumulative_max_attempts > current.cumulative_max_attempts
-            or routine.cumulative_max_occurrences > current.cumulative_max_occurrences
-            or routine.maximum_consecutive_failures
-            > current.maximum_consecutive_failures
-        ):
-            _require_effects_unblocked(connection, routine.agent_id)
     if current.revision != expected_revision:
         return None
     if current.active_occurrence_id is not None:
@@ -482,8 +436,6 @@ def revise_routine(
         or routine.conversation_id != current.conversation_id
         or routine.owner_principal_id != current.owner_principal_id
         or routine.created_at != current.created_at
-        or routine.reserved_tokens != current.reserved_tokens
-        or routine.reserved_cost_usd != current.reserved_cost_usd
         or routine.charged_tokens != current.charged_tokens
         or routine.charged_cost_usd != current.charged_cost_usd
         or routine.attempt_count != current.attempt_count
@@ -491,13 +443,9 @@ def revise_routine(
     ):
         raise ValueError("routine revision changed immutable lifecycle state")
     if routine.state is RoutineState.ACTIVE:
-        due = first_slot(
-            routine.schedule,
-            not_before=routine.updated_at,
-            expires_at=routine.expires_at,
-        )
+        due = first_slot(routine.schedule, not_before=routine.updated_at)
         if due is None:
-            raise ValueError("routine_schedule_expired")
+            raise ValueError("routine_schedule_passed")
     else:
         due = None
     normalized = replace(
@@ -526,28 +474,19 @@ def transition_routine(
         return None
     if current.active_occurrence_id is not None:
         raise ValueError("routine_has_active_occurrence")
+    failures = current.consecutive_failures
     if state is RoutineState.ACTIVE:
-        if current.model_budget_exhausted:
-            raise ValueError("routine_model_budget_exhausted")
-        if current.occurrence_allowance_exhausted:
-            raise ValueError("routine_occurrence_budget_exhausted")
-        if current.capability_grants:
-            _require_effects_unblocked(connection, agent_id, routine_id=routine_id)
-        due = next_slot(
-            current.schedule,
-            after=transitioned_at,
-            expires_at=current.expires_at,
-        )
-        if due is None:
-            state_value = RoutineState.EXPIRED
-            due = None
-        else:
-            state_value = RoutineState.ACTIVE
+        _require_effects_unblocked(connection, agent_id, routine_id=routine_id)
+        due = next_slot(current.schedule, after=transitioned_at)
+        # A person resumed it: the failure count starts again.
+        failures = 0
+        state_value = RoutineState.ACTIVE if due is not None else RoutineState.COMPLETED
     else:
         state_value = state
         due = None
     updated = replace(
         current,
+        consecutive_failures=failures,
         state=state_value,
         next_due_at=due,
         revision=current.revision + 1,
@@ -609,8 +548,6 @@ def claim_due_occurrence(
         current.schedule,
         materialized_due_at=expected_due_at,
         now=claimed_at,
-        expires_at=current.expires_at,
-        misfire_policy=current.misfire_policy,
     )
     if selection.selected_at is None:
         skipped = replace(
@@ -620,7 +557,7 @@ def claim_due_occurrence(
             state=(
                 RoutineState.ACTIVE
                 if selection.next_due_at is not None
-                else RoutineState.EXPIRED
+                else RoutineState.COMPLETED
             ),
         )
         _replace_routine_row(connection, encoded, skipped)
@@ -667,13 +604,11 @@ def claim_manual_occurrence(
     if loaded is None:
         return None
     current, encoded = loaded
-    if current.capability_grants:
-        _require_effects_unblocked(connection, agent_id, routine_id=routine_id)
+    _require_effects_unblocked(connection, agent_id, routine_id=routine_id)
     if (
         current.revision != expected_revision
         or current.state is not RoutineState.ACTIVE
         or current.active_occurrence_id is not None
-        or claimed_at >= current.expires_at
     ):
         return None
     return _claim_routine_slot(
@@ -699,14 +634,6 @@ def _claim_routine_slot(
     claimed_at: datetime,
     claim_token: str,
 ) -> RoutineOccurrence:
-    if current.capability_grants:
-        _require_effects_unblocked(
-            connection, current.agent_id, routine_id=current.routine_id
-        )
-    if current.occurrence_allowance_exhausted:
-        raise ValueError("routine_occurrence_budget_exhausted")
-    if current.model_budget_exhausted:
-        raise ValueError("routine_model_budget_exhausted")
     identity = routine_occurrence_id(current.routine_id, slot_key)
     occurrence = RoutineOccurrence(
         occurrence_id=identity,
@@ -719,12 +646,9 @@ def _claim_routine_slot(
         claimed_at=claimed_at,
         claim_token=claim_token,
         lease_expires_at=claimed_at + timedelta(seconds=ROUTINE_CLAIM_LEASE_SECONDS),
-        precheck_observation=None,
         execution_scope=None,
         execution_scope_digest=None,
         reserved_run_id=None,
-        reserved_tokens=current.per_run_max_tokens,
-        reserved_cost_usd=current.per_run_max_cost_usd or Decimal("0"),
         charged_tokens=0,
         charged_cost_usd=Decimal("0"),
         run_bound_at=None,
@@ -743,10 +667,6 @@ def _claim_routine_slot(
     updated = replace(
         current,
         active_occurrence_id=identity,
-        reserved_tokens=current.reserved_tokens + current.per_run_max_tokens,
-        reserved_cost_usd=(
-            current.reserved_cost_usd + (current.per_run_max_cost_usd or Decimal("0"))
-        ),
         attempt_count=current.attempt_count + 1,
         occurrence_count=current.occurrence_count + 1,
         updated_at=claimed_at,
@@ -764,7 +684,6 @@ def bind_occurrence_run(
     run_id: str,
     execution_scope: ExecutionScope,
     bound_at: datetime,
-    precheck_observation: ResourceRevisionObservation | None,
 ) -> RoutineOccurrence | None:
     loaded = _load_routine_occurrence_row(connection, agent_id, occurrence_id)
     if loaded is None:
@@ -797,35 +716,17 @@ def bind_occurrence_run(
     if (
         routine[0].revision != execution_scope.routine_revision
         or routine[0].state is not RoutineState.ACTIVE
-        or bound_at >= routine[0].expires_at
         or execution_scope.scope_id != f"scope:{occurrence_id}"
         or execution_scope.revision != 1
         or execution_scope.principal_id != routine[0].owner_principal_id
         or execution_scope.grant_id
         != f"routine:{current.routine_id}:revision:{current.routine_revision}"
-        # What the run may read and call was fixed when it started; only the
-        # record's routes, ceiling and budgets must still match.
-        or routine[0].sensitivity_ceiling != execution_scope.sensitivity_ceiling
-        or routine[0].eligible_model_routes != execution_scope.eligible_model_routes
-        or routine[0].per_run_max_tokens != execution_scope.per_run_max_tokens
-        or routine[0].per_run_max_cost_usd != execution_scope.per_run_max_cost_usd
-        or routine[0].distribution_plan.plan_digest
-        != execution_scope.distribution_plan_digest
+        or execution_scope.distribution_plan_digest
+        != _inbox_plan(routine[0].conversation_id).plan_digest
     ):
         return None
-    precheck = routine[0].precheck
-    if (precheck is None) != (precheck_observation is None):
-        return None
-    if precheck is not None:
-        assert precheck_observation is not None
-        if (
-            precheck.source_id != precheck_observation.source_id
-            or precheck.resource_id != precheck_observation.resource_id
-        ):
-            return None
     updated = replace(
         current,
-        precheck_observation=precheck_observation,
         execution_scope=execution_scope,
         execution_scope_digest=execution_scope.digest,
         reserved_run_id=run_id,
@@ -887,7 +788,6 @@ def finalize_occurrence(
     *,
     delivery_id: str,
     finalized_at: datetime,
-    skipped_no_change_observation: ResourceRevisionObservation | None,
     failure_code: str | None,
     artifact_references: tuple[OutcomeArtifactReference, ...],
     outcome_contract_failure_code: str | None,
@@ -896,8 +796,6 @@ def finalize_occurrence(
     if loaded is None:
         return None
     current, occurrence_data = loaded
-    if skipped_no_change_observation is not None and failure_code is not None:
-        raise ValueError("routine finalization outcomes are mutually exclusive")
     if outcome_contract_failure_code is not None and not re.fullmatch(
         r"[a-z][a-z0-9_]{0,127}", outcome_contract_failure_code
     ):
@@ -911,7 +809,7 @@ def finalize_occurrence(
     if routine_loaded is None:
         return None
     routine, routine_data = routine_loaded
-    target = routine.distribution_plan.targets[0]
+    target = _inbox_plan(routine.conversation_id).targets[0]
     existing_row = connection.execute(
         "SELECT delivery_id, data FROM deliveries "
         "WHERE agent_id = ? AND subject_kind = ? AND subject_id = ? "
@@ -932,9 +830,7 @@ def finalize_occurrence(
         return current, existing_delivery
     if routine.active_occurrence_id != occurrence_id:
         return None
-    pre_run_outcome = (
-        skipped_no_change_observation is not None or failure_code is not None
-    )
+    pre_run_outcome = failure_code is not None
     if pre_run_outcome:
         bound_without_transcript = (
             failure_code == "routine_run_not_started"
@@ -946,19 +842,10 @@ def finalize_occurrence(
             ).fetchone()
             is None
         )
-        expected_disposition = (
-            RoutineOccurrenceDisposition.SKIPPED_NO_CHANGE
-            if skipped_no_change_observation is not None
-            else RoutineOccurrenceDisposition.TERMINAL_FAILED
-        )
-        if current.disposition is expected_disposition:
+        if current.disposition is RoutineOccurrenceDisposition.TERMINAL_FAILED:
             return current, None
         if not bound_without_transcript and (
-            current.disposition
-            not in {
-                RoutineOccurrenceDisposition.CLAIMED,
-                RoutineOccurrenceDisposition.PRECHECKING,
-            }
+            current.disposition is not RoutineOccurrenceDisposition.CLAIMED
             or current.reserved_run_id is not None
         ):
             return None
@@ -969,11 +856,10 @@ def finalize_occurrence(
     ):
         return None
 
-    occurrence_observation = current.precheck_observation
     resulting_run_id: str | None = None
     charged_tokens = 0
     charged_cost = Decimal("0")
-    sensitivity = routine.sensitivity_ceiling
+    sensitivity = ModelSensitivity.PUBLIC
     report_digest: str | None = None
     report_preview: str | None = None
     report_truncated = False
@@ -982,33 +868,11 @@ def finalize_occurrence(
     uncertain_effect = False
     rate_limited = False
     if pre_run_outcome:
-        occurrence_observation = skipped_no_change_observation
-        successful = occurrence_observation is not None
+        successful = False
         terminal_failure_code = failure_code
-        disposition = (
-            RoutineOccurrenceDisposition.SKIPPED_NO_CHANGE
-            if successful
-            else RoutineOccurrenceDisposition.TERMINAL_FAILED
-        )
-        outcome = "skipped_no_change" if successful else "failed"
-        reason = "resource_revision_unchanged" if successful else terminal_failure_code
-        if occurrence_observation is not None:
-            precheck = routine.precheck
-            if (
-                precheck is None
-                or occurrence_observation.source_id != precheck.source_id
-                or occurrence_observation.resource_id != precheck.resource_id
-            ):
-                raise ValueError("routine precheck observation is out of scope")
-        if successful and any(
-            requirement.minimum_count > 0
-            for requirement in routine.outcome_contract.artifact_requirements
-        ):
-            successful = False
-            terminal_failure_code = "outcome_artifact_contract_failed"
-            disposition = RoutineOccurrenceDisposition.TERMINAL_FAILED
-            outcome = "failed"
-            reason = terminal_failure_code
+        disposition = RoutineOccurrenceDisposition.TERMINAL_FAILED
+        outcome = "failed"
+        reason = terminal_failure_code
     else:
         assert current.reserved_run_id is not None
         run_row = connection.execute(
@@ -1026,7 +890,7 @@ def finalize_occurrence(
             or run_input.execution_scope.routine_revision != current.routine_revision
             or run_input.execution_scope.occurrence_id != current.occurrence_id
             or run_input.execution_scope.distribution_plan_digest
-            != routine.distribution_plan.plan_digest
+            != _inbox_plan(routine.conversation_id).plan_digest
             or result.run_id != current.reserved_run_id
         ):
             raise ValueError("routine terminal run scope is invalid")
@@ -1053,11 +917,12 @@ def finalize_occurrence(
             raise ValueError("routine effect receipt references exceed their bound")
         receipts = tuple(decode_receipt(row[0]) for row in receipt_rows)
         effect_receipt_ids = tuple(receipt.receipt_id for receipt in receipts)
-        grants = {grant.capability_id: grant for grant in routine.capability_grants}
-        scope_contracts = (
-            run_input.execution_scope.contract_bindings.capability_contracts
-        )
-        successful_calls: dict[str, int] = {}
+        scope = run_input.execution_scope
+        assert scope is not None
+        # Approved at the time; a receipt from older data that used a standing
+        # grant still verifies against the grant its run's scope carried.
+        grants = {grant.capability_id: grant for grant in scope.capability_grants}
+        scope_contracts = scope.contract_bindings.capability_contracts
         result_blocks: dict[str, list[ToolResultBlock]] = {}
         for exchange in transcript.messages:
             if exchange.role is MessageRole.TOOL:
@@ -1075,8 +940,6 @@ def finalize_occurrence(
             }:
                 uncertain_effect = True
             grant = grants.get(receipt.capability_id)
-            # Approved at the time: bind to the contract fixed at run start. A
-            # receipt that used a grant must still match that exact grant.
             if (
                 receipt.routine_id != current.routine_id
                 or receipt.routine_revision != current.routine_revision
@@ -1122,31 +985,6 @@ def finalize_occurrence(
             ):
                 contract_failure_code = "outcome_effect_result_invalid"
                 continue
-            requirement = next(
-                (
-                    item
-                    for item in routine.outcome_contract.effect_requirements
-                    if item.capability_id == receipt.capability_id
-                ),
-                None,
-            )
-            # A write the routine never declared still counts once a person approved it.
-            if (
-                requirement is not None
-                and receipt.evidence_basis not in requirement.accepted_evidence_bases
-            ):
-                contract_failure_code = "outcome_effect_evidence_unsupported"
-                continue
-            successful_calls[receipt.capability_id] = (
-                successful_calls.get(receipt.capability_id, 0) + 1
-            )
-        if any(
-            successful_calls.get(item.capability_id, 0) < item.minimum_successful_calls
-            for item in routine.outcome_contract.effect_requirements
-        ):
-            contract_failure_code = (
-                contract_failure_code or "outcome_effect_requirement_unsatisfied"
-            )
         if uncertain_effect:
             contract_failure_code = "outcome_effect_uncertain"
         if contract_failure_code is not None:
@@ -1159,16 +997,10 @@ def finalize_occurrence(
                     and block.sensitivity.routing_rank > sensitivity.routing_rank
                 ):
                     sensitivity = block.sensitivity
-        if (
-            sensitivity.routing_rank
-            > routine.outcome_contract.maximum_effective_sensitivity.routing_rank
-        ):
-            successful = False
-            contract_failure_code = "outcome_sensitivity_contract_failed"
         estimate = result.usage.cost_estimate
         charged_tokens = result.usage.total_tokens
         charged_cost = estimate.amount_usd or Decimal("0")
-        dollar_capped = routine.per_run_max_cost_usd is not None
+        dollar_capped = scope.per_run_max_cost_usd is not None
         # A provider quota rejection bills nothing for the rejected request.
         rate_limited = (
             result.kind is LoopExitKind.FAILED
@@ -1186,10 +1018,10 @@ def finalize_occurrence(
             and estimate.code != "no_model_attempts"
             and not unpriced_with_known_tokens
         ):
-            # Unknown consumption retains the reservation as a conservative
-            # charge, without discarding a larger known partial amount.
-            charged_cost = max(charged_cost, current.reserved_cost_usd)
-            charged_tokens = max(charged_tokens, current.reserved_tokens)
+            # Unknown consumption is charged the run's own limits, without
+            # discarding a larger known partial amount.
+            charged_cost = max(charged_cost, scope.per_run_max_cost_usd or Decimal("0"))
+            charged_tokens = max(charged_tokens, scope.per_run_max_tokens)
             # A token-only run whose unknown is a replayed stall's
             # unreported attempt is bounded by that charge and keeps its
             # outcome. Other unknown consumption fails the run.
@@ -1204,8 +1036,9 @@ def finalize_occurrence(
                         contract_failure_code or "routine_run_usage_incomplete"
                     )
                 successful = False
-        if result.usage.total_tokens > current.reserved_tokens or (
-            dollar_capped and charged_cost > current.reserved_cost_usd
+        if result.usage.total_tokens > scope.per_run_max_tokens or (
+            scope.per_run_max_cost_usd is not None
+            and charged_cost > scope.per_run_max_cost_usd
         ):
             contract_failure_code = (
                 contract_failure_code or "routine_run_budget_exceeded"
@@ -1222,7 +1055,7 @@ def finalize_occurrence(
             )
             validated_artifact_references = validate_outcome_artifact_references(
                 artifact_references,
-                contract=routine.outcome_contract,
+                contract=ROUTINE_OUTCOME,
                 resulting_run_id=current.reserved_run_id,
                 require_minimum_counts=False,
             )
@@ -1238,7 +1071,7 @@ def finalize_occurrence(
             try:
                 validate_outcome_artifact_references(
                     validated_artifact_references,
-                    contract=routine.outcome_contract,
+                    contract=ROUTINE_OUTCOME,
                     resulting_run_id=current.reserved_run_id,
                 )
             except (TypeError, ValueError):
@@ -1249,14 +1082,6 @@ def finalize_occurrence(
         if result.final_text is not None:
             report_digest, report_preview, report_truncated = (
                 conclusion_preview_projection(result.final_text)
-            )
-        if successful and routine.outcome_contract.effect_requirements and not receipts:
-            report_digest, report_preview, report_truncated = (
-                conclusion_preview_projection(
-                    "No external action was taken in this occurrence. "
-                    "The approved optional action path was used.\n\n"
-                    + (result.final_text or "")
-                )
             )
         resulting_run_id = current.reserved_run_id
         terminal_failure_code = (
@@ -1274,51 +1099,30 @@ def finalize_occurrence(
 
     accounted_routine = replace(
         routine,
-        reserved_tokens=routine.reserved_tokens - current.reserved_tokens,
-        reserved_cost_usd=routine.reserved_cost_usd - current.reserved_cost_usd,
         charged_tokens=routine.charged_tokens + charged_tokens,
         charged_cost_usd=routine.charged_cost_usd + charged_cost,
     )
     if current.slot_kind is RoutineSlotKind.MANUAL:
         following = routine.next_due_at
     else:
-        following = next_slot(
-            routine.schedule,
-            after=current.scheduled_for,
-            expires_at=routine.expires_at,
-        )
+        following = next_slot(routine.schedule, after=current.scheduled_for)
         while following is not None and following <= finalized_at:
-            following = next_slot(
-                routine.schedule,
-                after=following,
-                expires_at=routine.expires_at,
-            )
+            following = next_slot(routine.schedule, after=following)
     # A quota rejection is the provider's pause, not the routine failing;
     # the supervisor holds new claims until the quota window passes.
     failures = (
         0 if successful else routine.consecutive_failures + (0 if rate_limited else 1)
     )
     if successful:
+        # A one-time routine ends after it runs; a recurring one keeps going.
         next_state = (
-            RoutineState.ACTIVE
-            if following is not None
-            else (
-                RoutineState.EXPIRED
-                if finalized_at >= routine.expires_at
-                else RoutineState.COMPLETED
-            )
+            RoutineState.ACTIVE if following is not None else RoutineState.COMPLETED
         )
-    elif failures >= routine.maximum_consecutive_failures or following is None:
+    elif failures >= ROUTINE_FAILURE_LIMIT or following is None:
         next_state = RoutineState.NEEDS_ATTENTION
         following = None
     else:
         next_state = RoutineState.ACTIVE
-    if next_state is RoutineState.ACTIVE and (
-        accounted_routine.model_budget_exhausted
-        or accounted_routine.occurrence_allowance_exhausted
-    ):
-        next_state = RoutineState.NEEDS_ATTENTION
-        following = None
     if uncertain_effect:
         next_state = RoutineState.PAUSED
         following = None
@@ -1348,9 +1152,6 @@ def finalize_occurrence(
         "reason": reason,
         "escalation": escalation,
         "routine_state": next_state.value,
-        "observation_digest": (
-            None if occurrence_observation is None else occurrence_observation.digest
-        ),
         "report_digest": report_digest,
         "report_preview": report_preview,
         "report_truncated": report_truncated,
@@ -1372,9 +1173,7 @@ def finalize_occurrence(
         target=target,
         conclusion_kind=conclusion_kind,
         conclusion_state=(
-            OutcomeState.SKIPPED_NO_CHANGE
-            if disposition is RoutineOccurrenceDisposition.SKIPPED_NO_CHANGE
-            else (OutcomeState.SUCCEEDED if successful else OutcomeState.FAILED)
+            OutcomeState.SUCCEEDED if successful else OutcomeState.FAILED
         ),
         conclusion_id=resulting_run_id or occurrence_id,
         conclusion_digest=(
@@ -1387,15 +1186,7 @@ def finalize_occurrence(
             validated_artifact_references if resulting_run_id is not None else ()
         ),
         effective_sensitivity=sensitivity,
-        provenance_digest=(
-            current.execution_scope_digest
-            or (
-                None
-                if occurrence_observation is None
-                else occurrence_observation.digest
-            )
-            or conclusion_digest
-        ),
+        provenance_digest=current.execution_scope_digest or conclusion_digest,
         failure_code=terminal_failure_code,
         observed_at=finalized_at,
         effect_receipt_ids=effect_receipt_ids,
@@ -1404,9 +1195,6 @@ def finalize_occurrence(
 
     completed_occurrence = replace(
         current,
-        precheck_observation=occurrence_observation,
-        reserved_tokens=0,
-        reserved_cost_usd=Decimal("0"),
         charged_tokens=charged_tokens,
         charged_cost_usd=charged_cost,
         conclusion_digest=conclusion_digest,
@@ -1417,13 +1205,9 @@ def finalize_occurrence(
         disposition=disposition,
         updated_at=finalized_at,
     )
-    acknowledged_observation = routine.last_acknowledged_precheck_observation
-    if successful and occurrence_observation is not None:
-        acknowledged_observation = occurrence_observation
     completed_routine = replace(
         accounted_routine,
-        consecutive_failures=failures,
-        last_acknowledged_precheck_observation=acknowledged_observation,
+        consecutive_failures=min(failures, MAX_ROUTINE_CONSECUTIVE_FAILURES),
         active_occurrence_id=None,
         last_occurrence_id=current.occurrence_id,
         last_delivery_ids=(delivery.delivery_id,),
@@ -1440,6 +1224,12 @@ def finalize_occurrence(
     return completed_occurrence, delivery
 
 
+def _inbox_plan(conversation_id: str) -> DistributionPlan:
+    return conversation_inbox_plan(
+        conversation_id, sensitivity_ceiling=ROUTINE_INBOX_SENSITIVITY
+    )
+
+
 def recover_stale_occurrences(
     connection: SQLConnection,
     agent_id: str,
@@ -1453,7 +1243,7 @@ def recover_stale_occurrences(
             """SELECT occurrence_id, data FROM routine_occurrences
                WHERE agent_id = ?
                  AND (state = ?
-                      OR (state IN (?, ?, ?)
+                      OR (state IN (?, ?)
                           AND (lease_expires_at_us IS NULL
                                OR lease_expires_at_us <= ?)))
                ORDER BY COALESCE(lease_expires_at_us, 0), occurrence_id""",
@@ -1461,7 +1251,6 @@ def recover_stale_occurrences(
                 agent_id,
                 (RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION.value),
                 RoutineOccurrenceDisposition.CLAIMED.value,
-                RoutineOccurrenceDisposition.PRECHECKING.value,
                 RoutineOccurrenceDisposition.RUNNING.value,
                 recovered_us,
             ),
@@ -1482,7 +1271,6 @@ def recover_stale_occurrences(
             continue
         if current.disposition not in {
             RoutineOccurrenceDisposition.CLAIMED,
-            RoutineOccurrenceDisposition.PRECHECKING,
             RoutineOccurrenceDisposition.RUNNING,
         }:
             continue
@@ -1525,10 +1313,7 @@ def recover_stale_occurrences(
         routine, routine_data = routine_loaded
         if routine.active_occurrence_id != current.occurrence_id:
             continue
-        if (
-            current.attempt_count >= MAX_ROUTINE_ATTEMPTS
-            or routine.attempt_count >= routine.cumulative_max_attempts
-        ):
+        if current.attempt_count >= MAX_ROUTINE_ATTEMPTS:
             # Return the expired claim for atomic failure/delivery,
             # without consuming another attempt or renewing its lease.
             recovered.append(current)

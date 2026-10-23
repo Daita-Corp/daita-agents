@@ -55,10 +55,6 @@ _TOOL_ERROR_HEADINGS = {
 }
 
 
-def _dollar_ceiling(value: object) -> str:
-    return "no dollar cap" if value is None else f"${value} estimated model cost"
-
-
 def redact_presentation_value(value: object, *, key: str = "") -> object:
     normalized_key = key.casefold().replace("-", "_")
     if key and any(part in normalized_key for part in SENSITIVE_KEY_PARTS):
@@ -761,8 +757,6 @@ def approval_review_document(
             approval_summary(arguments_text, capability_id)
             if capability_id
             in {
-                "routines.create",
-                "routines.update",
                 "control.resolve_effect",
                 "data.update_rows",
                 "data.upsert_rows",
@@ -882,168 +876,6 @@ def approval_summary(arguments_text: str, capability_id: str) -> str:
                 maximum=12000,
                 preserve_lines=True,
                 fallback="Native write review",
-            )
-            + "\n\n"
-        )
-    routine = document.get("proposal")
-    if isinstance(routine, dict):
-        schedule = routine.get("schedule", {})
-        if not isinstance(schedule, dict):
-            return ""
-        kind = schedule.get("kind")
-        when = (
-            f"Once at {schedule.get('exact_at')}"
-            if kind == "once"
-            else (
-                f"Every {schedule.get('interval_seconds')} seconds from {schedule.get('anchor_at')}"
-                if kind == "interval"
-                else f"Calendar {schedule.get('hour')}:{str(schedule.get('minute')).zfill(2)} "
-                f"in {schedule.get('timezone')}; {schedule.get('day_selector')}; "
-                f"weekdays {schedule.get('weekdays')}, month days {schedule.get('month_days')}, "
-                f"months {schedule.get('months')}; DST gap {schedule.get('nonexistent_time_policy')}, "
-                f"overlap {schedule.get('ambiguous_time_policy')}"
-            )
-        )
-        lines = [
-            f"Assignment: {routine.get('title')} · revision {routine.get('revision')}",
-            f"Instruction: {routine.get('authorized_instruction')}",
-            f"Schedule: {when}; missed slots: {routine.get('misfire_policy')}",
-            "Immediate occurrence: "
-            + (
-                "one, within the same limits"
-                if routine.get("run_immediately")
-                else "none"
-            ),
-            f"Per run: {routine.get('per_run_max_tokens')} tokens, {_dollar_ceiling(routine.get('per_run_max_cost_usd'))}.",
-            f"Total: {routine.get('cumulative_max_tokens')} tokens, {_dollar_ceiling(routine.get('cumulative_max_cost_usd'))}; "
-            f"{routine.get('cumulative_max_attempts')} attempts, {routine.get('cumulative_max_occurrences')} occurrences; "
-            f"expires {routine.get('expires_at')}.",
-            f"Sensitivity ceiling: {routine.get('sensitivity_ceiling')}; model routes: {routine.get('eligible_model_routes')}.",
-            "Connections, exact resources, operations, columns, keys, argument restrictions, call ceilings, "
-            "retained skills and required effects/artifacts are listed below.",
-            "Report delivery: "
-            + _delivery_targets(routine.get("distribution_plan"))
-            + ". Execution requires an open host and shares its run lock.",
-            "This revision grants no missing connector permissions. Uncertain actions pause work; actions are never automatically replayed.",
-            "Model-cost limits do not cap third-party service fees.",
-        ]
-        preview = document.get("schedule_preview")
-        if isinstance(preview, dict):
-            runs = [
-                f"{item.get('local')} ({item.get('at')})"
-                for item in preview.get("first_occurrences", ())
-                if isinstance(item, dict)
-            ]
-            if preview.get("immediate_first_run"):
-                runs.insert(0, "immediately after approval")
-            lines.insert(
-                3,
-                "First runs: "
-                + ("; ".join(runs) if runs else "none before expiry")
-                + f"; {preview.get('occurrences_before_expiry')} run(s) fit before expiry.",
-            )
-            for warning in preview.get("warnings", ()):
-                lines.insert(4, f"Warning: {warning}")
-        timing = document.get("timing_intent")
-        if isinstance(timing, dict):
-            requested = timing.get("schedule")
-            if isinstance(requested, dict):
-                if "after_seconds" in requested:
-                    lines.insert(
-                        3,
-                        f"Requested delay: {requested['after_seconds']} seconds after approval.",
-                    )
-                elif "anchor_after_seconds" in requested:
-                    lines.insert(
-                        3,
-                        f"First scheduled slot: {requested['anchor_after_seconds']} seconds after approval.",
-                    )
-                elif requested.get("kind") == "once_next_weekday":
-                    lines.insert(
-                        3,
-                        "Requested local time: next ISO weekday "
-                        f"{requested.get('weekday')} at "
-                        f"{requested.get('hour')}:{str(requested.get('minute')).zfill(2)} "
-                        f"in {requested.get('timezone')}.",
-                    )
-            if timing.get("expires_after_seconds") is not None:
-                lines.insert(
-                    4,
-                    f"Requested lifetime: {timing['expires_after_seconds']} seconds after approval.",
-                )
-            note = document.get("timing_note")
-            if isinstance(note, str):
-                lines.insert(5, note)
-        authority = document.get("authority", {})
-        if isinstance(authority, dict):
-            for resource in authority.get("resources", ()):
-                if isinstance(resource, dict):
-                    lines.append(
-                        f"Table: {resource.get('display_name', resource.get('resource_id'))} [{resource.get('sensitivity')}]."
-                    )
-            for binding in authority.get("bindings", ()):
-                if isinstance(binding, dict):
-                    lines.append(
-                        f"Connection: {binding.get('display_name', binding.get('binding_id'))}; outbound ceiling {binding.get('maximum_outbound_sensitivity')}."
-                    )
-        for grant in routine.get("capability_grants", ()):
-            if not isinstance(grant, dict):
-                continue
-            lines.append(
-                f"Action: {grant.get('capability_id')}; at most {grant.get('max_calls_per_occurrence')} call(s) per occurrence."
-            )
-            constraints = grant.get("constraints", {})
-            if not isinstance(constraints, dict):
-                continue
-            if "allowed_operations" in constraints:
-                lines.append(
-                    f"Native operations {constraints.get('allowed_operations')}; keys {constraints.get('key_columns')}; "
-                    f"insert {constraints.get('allowed_insert_columns')}; update {constraints.get('allowed_update_columns')}; "
-                    f"generated identities {constraints.get('generated_identity_columns')}; maximum rows {constraints.get('max_rows')}."
-                )
-            if "fixed_arguments" in constraints:
-                lines.append(
-                    f"Connector tool arguments for {constraints.get('remote_tool_name')} "
-                    f"(binding {constraints.get('binding_id')}, revision "
-                    f"{constraints.get('binding_revision')}): fixed "
-                    + json.dumps(
-                        constraints["fixed_arguments"],
-                        ensure_ascii=True,
-                        sort_keys=True,
-                    )
-                    + "; variable scalar arguments: "
-                    + str(constraints.get("variable_argument_names"))
-                    + ". These go to the connector, separate from report delivery."
-                )
-        outcome = routine.get("outcome_contract", {})
-        if isinstance(outcome, dict):
-            for effect in outcome.get("effect_requirements", ()):
-                if isinstance(effect, dict):
-                    minimum = effect.get("minimum_successful_calls")
-                    lines.append(
-                        f"Completion: {effect.get('capability_id')} requires {minimum} successful call(s) "
-                        f"with evidence {effect.get('accepted_evidence_bases')}. "
-                        + (
-                            "An approved no-action path may succeed."
-                            if minimum == 0
-                            else "No findings or a final answer alone cannot satisfy this action requirement."
-                        )
-                    )
-            for artifact in outcome.get("artifact_requirements", ()):
-                if isinstance(artifact, dict):
-                    lines.append(
-                        f"Artifact: {'required' if artifact.get('required') else 'optional'}; "
-                        f"formats {artifact.get('allowed_media_types')}; count {artifact.get('minimum_count')}–{artifact.get('maximum_count')}."
-                    )
-        lines.append(
-            "Server-reported evidence confirms invocation, not verified downstream delivery or business completion. Configured step and wall-time limits also apply."
-        )
-        return (
-            sanitize_terminal_text(
-                "\n".join(lines),
-                maximum=12000,
-                preserve_lines=True,
-                fallback="Assignment review",
             )
             + "\n\n"
         )

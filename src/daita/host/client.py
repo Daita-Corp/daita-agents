@@ -45,7 +45,7 @@ from ..artifacts.models import (
 )
 from ..capabilities import ApprovalDecision, ApprovalHandler
 from ..catalog.models import CatalogResource, CatalogSummary
-from ..distribution import DeliveryInspection, DeliveryView, DistributionDestination
+from ..distribution import DeliveryInspection, DeliveryView
 from ..hosting.embedded import (
     EmbeddedAgent,
     SourceEditConfirmationHandler,
@@ -73,9 +73,9 @@ from ..llm.subscription_auth import CodexDevicePrompt
 from ..loop.models import ConversationRun, LoopExit, Transcript
 from ..observation import AgentObserver
 from ..routines import (
+    RoutineIntent,
     RoutineState,
     ScheduledRoutine,
-    ScheduledRoutineDraft,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
 )
@@ -873,15 +873,6 @@ class RemoteAgent:
     ) -> tuple[tuple[ToolCall, ToolResultBlock | None], ...]:
         return await self._call("tool_evidence", locals())
 
-    async def distribution_destinations(
-        self,
-        conversation_id: str,
-        *,
-        sensitivity_ceiling: ModelSensitivity = ModelSensitivity.RESTRICTED,
-        caller_principal_id: str | None = None,
-    ) -> tuple[DistributionDestination, ...]:
-        return await self._call("distribution_destinations", locals())
-
     async def inspect_delivery(
         self,
         delivery_id: str,
@@ -1094,21 +1085,11 @@ class RemoteAgent:
     ) -> GraphMutation:
         return await self._call("replace_graph_task_by_policy", locals())
 
-    async def propose_routine(self, draft: ScheduledRoutineDraft) -> ScheduledRoutine:
-        return await self._call("propose_routine", locals())
-
-    async def promote_routine(
-        self,
-        draft: ScheduledRoutineDraft,
-        *,
-        basis_run_id: str,
-    ) -> ScheduledRoutine:
-        return await self._call("promote_routine", locals())
-
     async def create_routine(
         self,
-        proposal: ScheduledRoutine,
+        intent: RoutineIntent,
         *,
+        conversation_id: str | None = None,
         confirmation_handler: ApprovalHandler | None = None,
     ) -> ScheduledRoutine:
         return await self._call("create_routine", locals())
@@ -1129,10 +1110,9 @@ class RemoteAgent:
     async def update_routine(
         self,
         routine_id: str,
+        intent: RoutineIntent,
         *,
-        expected_revision: int,
-        draft: ScheduledRoutineDraft,
-        basis_run_id: str | None = None,
+        expected_revision: int | None = None,
         confirmation_handler: ApprovalHandler | None = None,
     ) -> ScheduledRoutine:
         return await self._call("update_routine", locals())

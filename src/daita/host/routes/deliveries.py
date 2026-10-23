@@ -12,11 +12,6 @@ TABLE = (
         "acknowledge_delivery",
         work=True,
     ),
-    Route(
-        "GET",
-        "/conversations/{conversation_id}/destinations",
-        "distribution_destinations",
-    ),
 )
 MEMBERS = frozenset(route.member for route in TABLE)
 

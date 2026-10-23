@@ -16,8 +16,6 @@ from .models import (
     DeliveryState,
     DeliverySubjectKind,
     DeliveryView,
-    DistributionDestination,
-    DistributionDestinationState,
     DistributionPlan,
     GraphJobDelivery,
     OutcomeArtifactReference,
@@ -225,6 +223,45 @@ def construct_graph_attention_delivery(
     )
 
 
+def conversation_inbox_target(
+    conversation_id: str,
+    *,
+    sensitivity_ceiling: ModelSensitivity,
+) -> ConversationInboxTarget:
+    """The one destination: the conversation's own Inbox."""
+
+    destination_id = conversation_inbox_destination_id(conversation_id)
+    return ConversationInboxTarget(
+        conversation_id=conversation_id,
+        destination_id=destination_id,
+        destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
+        sensitivity_ceiling=sensitivity_ceiling,
+        target_fingerprint=target_fingerprint(
+            conversation_id=conversation_id,
+            destination_id=destination_id,
+            destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
+            sensitivity_ceiling=sensitivity_ceiling,
+        ),
+    )
+
+
+def conversation_inbox_plan(
+    conversation_id: str,
+    *,
+    sensitivity_ceiling: ModelSensitivity,
+) -> DistributionPlan:
+    targets = (
+        conversation_inbox_target(
+            conversation_id, sensitivity_ceiling=sensitivity_ceiling
+        ),
+    )
+    return DistributionPlan(
+        targets=targets,
+        required_target_count=1,
+        plan_digest=distribution_plan_digest(targets=targets, required_target_count=1),
+    )
+
+
 class DistributionStore(Protocol):
     async def conversation_exists(
         self,
@@ -279,66 +316,8 @@ class DistributionOwner:
         *,
         sensitivity_ceiling: ModelSensitivity,
     ) -> ConversationInboxTarget:
-        destination_id = conversation_inbox_destination_id(conversation_id)
-        fingerprint = target_fingerprint(
-            conversation_id=conversation_id,
-            destination_id=destination_id,
-            destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
-            sensitivity_ceiling=sensitivity_ceiling,
-        )
-        return ConversationInboxTarget(
-            conversation_id=conversation_id,
-            destination_id=destination_id,
-            destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
-            sensitivity_ceiling=sensitivity_ceiling,
-            target_fingerprint=fingerprint,
-        )
-
-    def list_destinations(
-        self,
-        conversation_id: str,
-        *,
-        sensitivity_ceiling: ModelSensitivity,
-    ) -> tuple[DistributionDestination, ...]:
-        target = self.resolve_conversation_inbox(
-            conversation_id,
-            sensitivity_ceiling=sensitivity_ceiling,
-        )
-        return (
-            DistributionDestination(
-                destination_id=target.destination_id,
-                kind="conversation_inbox",
-                label="Current conversation Inbox",
-                state=DistributionDestinationState.AVAILABLE,
-                revision=target.destination_revision,
-                sensitivity_ceiling=target.sensitivity_ceiling,
-                supported_outcome_media=(
-                    "application/json",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    "text/csv",
-                    "text/markdown",
-                    "text/plain",
-                ),
-                selectable=True,
-            ),
-        )
-
-    async def discover_destinations(
-        self,
-        conversation_id: str,
-        *,
-        sensitivity_ceiling: ModelSensitivity,
-    ) -> tuple[DistributionDestination, ...]:
-        """Return destinations only for one current agent-owned conversation."""
-
-        if not await self._store.conversation_exists(
-            self._agent_id,
-            conversation_id,
-        ):
-            return ()
-        return self.list_destinations(
-            conversation_id,
-            sensitivity_ceiling=sensitivity_ceiling,
+        return conversation_inbox_target(
+            conversation_id, sensitivity_ceiling=sensitivity_ceiling
         )
 
     def resolve_plan(
@@ -350,21 +329,12 @@ class DistributionOwner:
     ) -> DistributionPlan:
         """Resolve the exact currently selectable distribution plan."""
 
-        target = self.resolve_conversation_inbox(
-            conversation_id,
-            sensitivity_ceiling=sensitivity_ceiling,
+        plan = conversation_inbox_plan(
+            conversation_id, sensitivity_ceiling=sensitivity_ceiling
         )
-        if destination_id != target.destination_id:
+        if destination_id != plan.targets[0].destination_id:
             raise ValueError("distribution destination is not currently selectable")
-        targets = (target,)
-        return DistributionPlan(
-            targets=targets,
-            required_target_count=1,
-            plan_digest=distribution_plan_digest(
-                targets=targets,
-                required_target_count=1,
-            ),
-        )
+        return plan
 
     async def list(
         self,
@@ -459,5 +429,7 @@ __all__ = [
     "construct_graph_attention_delivery",
     "construct_graph_job_delivery",
     "construct_logical_delivery",
+    "conversation_inbox_plan",
+    "conversation_inbox_target",
     "delivery_view",
 ]

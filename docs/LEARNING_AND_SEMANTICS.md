@@ -50,7 +50,6 @@ Saved text is classified for information handling and treated
 as untrusted advice. It cannot override current schema, access permissions,
 model limits, or approval.
 
-Scheduled routines retain their own approved instructions and exact skill
-versions. Later changes to general memory or skills do not silently alter an
-already authorized routine. See [context and source scope](CONTEXT_AND_SCOPE.md)
+Scheduled routines retain their own approved prompt. Each run reads current
+skills and semantic notes like any other run; a routine pins no skill versions. See [context and source scope](CONTEXT_AND_SCOPE.md)
 for the detailed retention and sensitivity rules.

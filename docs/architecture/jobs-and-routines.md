@@ -92,53 +92,53 @@ migration-owned conversion.
 
 ## Scheduled routines and deliveries
 
-Routine mutation tools return compact identity/revision/state, schedule and reservation
-receipts; full contracts remain in inspection and enforcement. Stopped model runs
-retain completed tool evidence and do not roll back committed routines. Terminal
-notices and CLI summaries project that evidence without creating another durable
-outcome or synthesizing a model answer.
+A routine is a title, a prompt and a schedule, optionally limited to named
+sources. `RoutineIntent` is its one shape for the `routine_save` tool, the CLI,
+`Agent.create_routine`/`update_routine` and the host routes, and
+`RoutineIntent.from_mapping` is the one parser. A save shows one confirm card
+(title, schedule in local time, prompt, sources); it is the commitment to
+future runs and model spend. An update keeps omitted fields, and its expected
+revision defaults to the current one.
 
 `ScheduledRoutine` and `RoutineOccurrence` are the only scheduled-work records.
-`RoutineOwner` admits exact foreground-authorized, self-contained instructions
-and implements bounded create, list, inspect, update, pause, resume, run-now,
-disable, expiry, budget, and lifecycle transitions. `RoutineSupervisor`
-computes due slots, conditionally claims occurrences, fences stale work,
-reserves one run, invokes `AgentLoop`, and atomically finalizes the occurrence
-and its logical deliveries.
+A routine keeps its identity, conversation, title, prompt
+(`authorized_instruction`), schedule, optional `source_ids`, state, revision,
+counters and timestamps; it freezes no access, grants, routes, sensitivity,
+budgets, expiry or outcome. `RoutineOwner` validates saves (resolving source
+names to ids and relative timing to instants) and owns list, inspect, update,
+pause, resume, run-now and disable. `RoutineSupervisor` computes due slots,
+conditionally claims occurrences, fences stale work, fixes each run's scope at
+start, invokes `AgentLoop`, and atomically finalizes the occurrence and its
+delivery. Mutation tools return a compact identity, revision, state and
+schedule receipt; inspection shows the full record.
 
 Routines support exact one-time, anchored interval, and IANA-timezone calendar
-schedules with explicit daylight-saving gap/overlap behavior and bounded
-`skip` or `latest_only` misfire handling. A routine freezes its exact source,
-resource, MCP binding, capability, model-route, sensitivity, outcome,
-distribution, budget, expiry, and optional retained skill-content contracts.
-Raw prompt text never determines whether a time slot is due.
+schedules with explicit daylight-saving gap/overlap behavior; relative timing
+(`after_seconds`, `anchor_after_seconds`, the next named local weekday) is
+resolved when the routine is saved. Raw prompt text never determines whether a
+time slot is due. Fixed code defaults, with no options:
 
-Scheduled execution permits statically declared `automation_direct` capabilities.
-Native effects additionally require exact data-owned grants and runtime receipts;
-effect-free operations retain read/none access. It can
-create only these artifacts:
+- delivery to the routine's conversation Inbox (a routine created outside a
+  conversation gets a new one of its own);
+- missed slots are skipped: a single late slot still runs, an accumulated
+  backlog does not;
+- each run has the agent's current model and normal run limits, and a routine
+  has no sensitivity ceiling of its own; its prompt counts as internal;
+- a recurring routine runs until paused or disabled, and pauses as Needs you
+  after 3 consecutive failures; resuming clears the count;
+- a one-time routine ends after it runs.
 
-- `artifact.create_document`;
-- `data.export_tabular`;
-- `artifact.snapshot_result`;
-- `analysis.execute` in the existing local macOS ARM64 composition, using the
-  exact routine read scope and the same bounded native worker and artifact store.
-  Its brokered reads own source permits; the interpreter holds no source permit.
-  Scheduled analysis cannot use local computer files or retained artifact inputs.
+Scheduled runs build their scope when they start: the named sources (or every
+current source, never the session folder), their readable resources, and every
+capability except the machine-run exclusions in `hosting/embedded.py` (local
+computer files, and creating, changing or running routines and jobs). Reads
+just run; every write or external action asks a person at the time through the
+host's interactions, is receipted before dispatch and is never replayed. An
+uncertain receipt pauses the routine until a person resolves it.
 
-`artifact.snapshot_result` produces bounded canonical `application/json` from
-an exact earlier successful result in the same run. It performs no source I/O
-or format projection.
-
-Scheduled runs can perform one explicitly granted native update/upsert and admitted
-MCP actions within their exact per-occurrence grants. They
-cannot start or cancel jobs, manage routines, call
-unadmitted remote actions, publish local files, deliver through external distribution destinations, run shell
-commands, or submit workflows or execution graphs. An exact resource-revision
-precheck may complete an unchanged occurrence without a model call.
-
-`OutcomeContract` validates terminal conclusions and required artifacts.
-`DistributionPlan` freezes ordered target bindings. `Delivery` is the sole
+Routine occurrences validate committed artifacts against one fixed code
+outcome (any artifacts within the shared delivery bounds); graph jobs keep
+their `OutcomeContract`. `DistributionPlan` freezes ordered target bindings. `Delivery` is the sole
 durable representation of a logical delivery; the Inbox is a bounded product
 view over deliveries. The only distribution destination is the originating
 conversation inbox. Producer finalization validates committed artifacts and

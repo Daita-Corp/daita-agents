@@ -11,9 +11,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, Self, TypedDict, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Protocol, Self, TypeVar, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
@@ -117,9 +116,7 @@ from ..distribution import (
     DeliverySubjectKind,
     DeliveryView,
     DistributionCapabilityDomain,
-    DistributionDestination,
     DistributionOwner,
-    OutcomeContract,
     distribution_capability_declarations,
 )
 from ..domains.analysis import AnalysisCapabilityDomain
@@ -142,7 +139,6 @@ from ..domains.data import (
     relational_update_declarations,
     relational_update_preview_declarations,
     relational_upsert_declarations,
-    resource_revision_observation_declarations,
     source_file_declarations,
 )
 from ..domains.data.catalog import RELATIONAL_WRITE_OPERATIONS
@@ -251,21 +247,15 @@ from ..routines.capabilities import (
 )
 from ..routines.models import (
     MAX_ROUTINE_LIST_PAGE_SIZE,
-    MisfirePolicy,
-    ReportingMode,
-    RequestedCapabilityGrant,
-    ResourceRevisionObservation,
-    ResourceRevisionPrecheck,
     RoutineControlAction,
+    RoutineIntent,
     RoutineOccurrence,
-    RoutineSchedule,
     RoutineState,
     ScheduledRoutine,
-    ScheduledRoutineDraft,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
 )
-from ..routines.owner import RoutineError, RoutineOwner, routine_approval_arguments
+from ..routines.owner import PreparedRoutine, RoutineOwner
 from ..routines.supervisor import RoutineSupervisor
 from ..scope import (
     EffectiveSourceScope,
@@ -419,64 +409,6 @@ async def _relational_upsert_readiness(
             "Explicit current upsert permission is required.",
         )
     return cast(FrozenJsonObject, await backend.upsert_readiness(agent_id, constraints))
-
-
-class _RoutineDraftValues(TypedDict):
-    title: str
-    authorized_instruction: str
-    schedule: RoutineSchedule
-    misfire_policy: MisfirePolicy
-    reporting_mode: ReportingMode
-    precheck: ResourceRevisionPrecheck | None
-    allowed_source_ids: tuple[str, ...]
-    allowed_connector_binding_ids: tuple[str, ...]
-    allowed_resource_ids: tuple[str, ...]
-    allowed_capability_ids: tuple[str, ...]
-    sensitivity_ceiling: ModelSensitivity
-    outcome_contract: OutcomeContract
-    distribution_destination_id: str
-    eligible_model_routes: tuple[str, ...]
-    per_run_max_tokens: int
-    per_run_max_cost_usd: Decimal | None
-    cumulative_max_tokens: int
-    cumulative_max_cost_usd: Decimal | None
-    cumulative_max_attempts: int
-    cumulative_max_occurrences: int
-    maximum_consecutive_failures: int
-    expires_at: datetime
-    skill_names: tuple[str, ...]
-    requested_capability_grants: tuple[RequestedCapabilityGrant, ...]
-    run_immediately: bool
-
-
-def _routine_draft_values(draft: ScheduledRoutineDraft) -> _RoutineDraftValues:
-    return {
-        "title": draft.title,
-        "authorized_instruction": draft.authorized_instruction,
-        "schedule": draft.schedule,
-        "misfire_policy": draft.misfire_policy,
-        "reporting_mode": draft.reporting_mode,
-        "precheck": draft.precheck,
-        "allowed_source_ids": draft.allowed_source_ids,
-        "allowed_connector_binding_ids": draft.allowed_connector_binding_ids,
-        "allowed_resource_ids": draft.allowed_resource_ids,
-        "allowed_capability_ids": draft.allowed_capability_ids,
-        "sensitivity_ceiling": draft.sensitivity_ceiling,
-        "outcome_contract": draft.outcome_contract,
-        "distribution_destination_id": draft.distribution_destination_id,
-        "eligible_model_routes": draft.eligible_model_routes,
-        "per_run_max_tokens": draft.per_run_max_tokens,
-        "per_run_max_cost_usd": draft.per_run_max_cost_usd,
-        "cumulative_max_tokens": draft.cumulative_max_tokens,
-        "cumulative_max_cost_usd": draft.cumulative_max_cost_usd,
-        "cumulative_max_attempts": draft.cumulative_max_attempts,
-        "cumulative_max_occurrences": draft.cumulative_max_occurrences,
-        "maximum_consecutive_failures": draft.maximum_consecutive_failures,
-        "expires_at": draft.expires_at,
-        "skill_names": draft.skill_names,
-        "requested_capability_grants": draft.requested_capability_grants,
-        "run_immediately": draft.run_immediately,
-    }
 
 
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -1547,11 +1479,6 @@ class EmbeddedAgent:
             source_backends[SourceOperation.RELATIONAL_UPSERT],
             data_view.source_adapter_id,
         )
-        routine_precheck = resource_revision_observation_declarations(
-            agent_id=identity.id,
-            catalog=data_view,
-            clock=clock,
-        )
         if hosted != (workspace is None and workspace_backend is None):
             raise AgentHomeError("workspace composition is inconsistent")
         if hosted != (artifact_delivery is None):
@@ -1669,7 +1596,6 @@ class EmbeddedAgent:
             relational_update_preview,
             relational_update,
             relational_upsert,
-            routine_precheck,
             source_files,
         )
         memory_declarations = _domain_declarations(MEMORY_DOMAIN_OWNER_ID, memory)
@@ -1810,7 +1736,6 @@ class EmbeddedAgent:
             *relational_update_preview.executors,
             *relational_update.executors,
             *relational_upsert.executors,
-            *routine_precheck.executors,
             *(source_files.executors if source_files is not None else ()),
             *memory.executors,
             *skills.executors,
@@ -1859,18 +1784,7 @@ class EmbeddedAgent:
             )
 
         graph_routes = _stage_c_model_routes(declared_model, model_route)
-        routine_owner = RoutineOwner(
-            execution_contract_reader=read_execution_contracts,
-            agent_id=identity.id,
-            store=store,
-            catalog=data_view,
-            distribution=distribution_owner,
-            skills=skill_store,
-            eligible_model_routes=graph_routes,
-            maximum_per_run_tokens=limits.max_total_tokens,
-            maximum_per_run_cost_usd=limits.max_estimated_cost_usd,
-            clock=clock,
-        )
+        routine_owner = RoutineOwner(agent_id=identity.id, store=store, clock=clock)
         routine_lifecycle = routine_capability_declarations(routine_owner)
         routine_declaration_bundle = _domain_declarations(
             ROUTINE_DOMAIN_OWNER_ID, routine_lifecycle
@@ -1955,7 +1869,6 @@ class EmbeddedAgent:
         if artifact_domain is not None:
             artifact_domain.bind_capability_registry(capabilities)
         data_domain.bind_capability_registry(capabilities)
-        routine_owner.bind_capability_registry(capabilities)
         graph_task_lifecycle.bind_capability_registry(capabilities)
 
         async def resolve_run_sources(run: RunInput):
@@ -1983,7 +1896,6 @@ class EmbeddedAgent:
             artifacts=artifact_store,
             limits=limits,
         )
-        routine_owner.bind_grant_preparer(capability_runtime.prepare_automation_grant)
         if graph_builder is not None:
             graph_builder.bind_grant_preparer(
                 capability_runtime.prepare_automation_grant
@@ -2033,7 +1945,6 @@ class EmbeddedAgent:
                 data_domain.bind_capability_registry(next_registry)
                 if artifact_domain is not None:
                     artifact_domain.bind_capability_registry(next_registry)
-                routine_owner.bind_capability_registry(next_registry)
                 graph_task_lifecycle.bind_capability_registry(next_registry)
                 if graph_resolver is not None:
                     graph_resolver.bind_capability_registry(next_registry)
@@ -2055,7 +1966,6 @@ class EmbeddedAgent:
                 data_view,
                 profile=model_profile,
                 user_timezone=(lambda: None) if hosted else None,
-                routine_authoring_facts=routine_owner.authoring_facts,
                 effect_receipts=store,
                 memory=memory_store,
                 skills=skill_store,
@@ -2159,7 +2069,6 @@ class EmbeddedAgent:
         async def execute_routine_run(
             occurrence: RoutineOccurrence,
             run_input: RunInput,
-            observation: ResourceRevisionObservation | None,
         ) -> LoopExit | None:
             if loop is None:
                 return None
@@ -2178,18 +2087,9 @@ class EmbeddedAgent:
                 absolute_deadline=deadline,
             )
             async with lease:
-                (
-                    conversation_exists,
-                    _conversation,
-                    _older_history_exists,
-                ) = await store.completed_conversation_tail(
-                    identity.id,
-                    run_input.conversation_id or run_input.id,
-                )
-                if not conversation_exists:
-                    raise ValueError("routine_destination_conversation_missing")
-                # An approved routine is self-contained. The conversation
-                # owns its inbox destination, not its reasoning context.
+                # A routine is self-contained. The conversation owns its inbox
+                # destination, not its reasoning context; a routine made outside
+                # a conversation starts its own with its first run.
                 prior_messages: tuple[CanonicalMessage, ...] = ()
                 predecessor_run = await store.latest_terminal_conversation_run(
                     identity.id,
@@ -2209,13 +2109,7 @@ class EmbeddedAgent:
                     ),
                     absolute_deadline=deadline,
                     cancellation=lease.cancellation,
-                    options=RunSessionOptions(
-                        retained_skill_bindings=tuple(
-                            (binding.skill_name, binding.content_digest)
-                            for binding in routine.skill_bindings
-                        ),
-                        requester=routine.title,
-                    ),
+                    options=RunSessionOptions(requester=routine.title),
                     admission_lease=lease,
                     predecessor=predecessor,
                 )
@@ -2232,7 +2126,6 @@ class EmbeddedAgent:
                     run_id=run_input.id,
                     execution_scope=run_input.execution_scope,
                     bound_at=clock(),
-                    precheck_observation=observation,
                 )
                 if bound is None:
                     return None
@@ -2259,6 +2152,9 @@ class EmbeddedAgent:
             artifacts=artifact_store,
             execute_run=(execute_routine_run if loop is not None else None),
             machine_scope=machine_run_scope,
+            model_routes=graph_routes,
+            per_run_max_tokens=limits.max_total_tokens,
+            per_run_max_cost_usd=limits.max_estimated_cost_usd,
             clock=clock,
             id_factory=id_factory,
         )
@@ -2800,27 +2696,6 @@ class EmbeddedAgent:
             limit=limit,
         )
         return items
-
-    async def distribution_destinations(
-        self,
-        conversation_id: str,
-        *,
-        sensitivity_ceiling: ModelSensitivity,
-        caller_principal_id: str | None = None,
-    ) -> tuple[DistributionDestination, ...]:
-        """Discover exact current destinations for one owned conversation."""
-
-        self._require_open()
-        _validate_conversation_id(conversation_id)
-        await self._require_conversation_caller(
-            conversation_id, self._resolve_caller_principal(caller_principal_id)
-        )
-        if not isinstance(sensitivity_ceiling, ModelSensitivity):
-            raise TypeError("sensitivity_ceiling must be ModelSensitivity")
-        return await self._distribution_owner.discover_destinations(
-            conversation_id,
-            sensitivity_ceiling=sensitivity_ceiling,
-        )
 
     async def inspect_delivery(
         self,
@@ -3399,63 +3274,30 @@ class EmbeddedAgent:
             idempotency_key=idempotency_key,
         )
 
-    async def propose_routine(self, draft: ScheduledRoutineDraft) -> ScheduledRoutine:
-        """Build and revalidate one non-persisted exact routine proposal."""
-
-        self._require_open()
-        return await self._prepare_routine_proposal(draft, basis_run_id=None)
-
-    async def promote_routine(
-        self,
-        draft: ScheduledRoutineDraft,
-        *,
-        basis_run_id: str,
-    ) -> ScheduledRoutine:
-        """Build a proposal with exact evidence from one completed prior run."""
-
-        self._require_open()
-        return await self._prepare_routine_proposal(
-            draft,
-            basis_run_id=basis_run_id,
-        )
-
     async def create_routine(
         self,
-        proposal: ScheduledRoutine,
+        intent: RoutineIntent,
         *,
+        conversation_id: str | None = None,
         confirmation_handler: ApprovalHandler | None = None,
     ) -> ScheduledRoutine:
-        """Persist one exact proposal, presenting it to an explicit human confirmation handler."""
+        """Save one routine; a confirmation handler sees its card first.
+
+        Results go to ``conversation_id``'s Inbox; without one, the routine
+        delivers to a new conversation of its own.
+        """
 
         self._require_open()
-        if proposal.agent_id != self.identity.id:
-            raise ValueError("routine proposal belongs to another agent")
-        authority = await self._routine_owner.proposal_authority_snapshot(proposal)
-        if confirmation_handler is not None:
-            control_id = self._id_factory("routine-approval")
-            request = ApprovalRequest(
-                run_id=control_id,
-                call_id=control_id,
-                tool_name=ROUTINE_SAVE_TOOL_NAME,
-                capability_id="routines.create",
-                arguments=routine_approval_arguments(authority),
-                reason="Approve this exact saved assignment, its standing actions, and its schedule?",
-            )
-            if (
-                request.render_arguments_for_review() is None
-                or await confirmation_handler(request) is not ApprovalDecision.APPROVE
-            ):
-                raise PermissionError("the routine creation was not approved")
-        async with self._routine_management_lock:
-            self._require_open()
-            if (
-                await self._routine_owner.proposal_authority_snapshot(proposal)
-                != authority
-            ):
-                raise ValueError(
-                    "routine authority changed during approval; propose again"
-                )
-            return await self._routine_owner.admit(proposal)
+        if conversation_id is None:
+            conversation_id = self._id_factory("conversation")
+        _validate_conversation_id(conversation_id)
+        return await self._save_routine(
+            intent,
+            "routines.create",
+            confirmation_handler,
+            conversation_id=conversation_id,
+            identity=self._id_factory("routine"),
+        )
 
     async def list_routines(
         self,
@@ -3475,52 +3317,65 @@ class EmbeddedAgent:
     async def update_routine(
         self,
         routine_id: str,
+        intent: RoutineIntent,
         *,
-        expected_revision: int,
-        draft: ScheduledRoutineDraft,
-        basis_run_id: str | None = None,
+        expected_revision: int | None = None,
         confirmation_handler: ApprovalHandler | None = None,
     ) -> ScheduledRoutine:
-        """Prepare, review and conditionally replace one exact routine revision."""
+        """Change one routine; omitted intent fields keep their stored values."""
 
         self._require_open()
         inspection = await self._routine_owner.inspect(routine_id)
-        if inspection is None or inspection.routine.revision != expected_revision:
-            raise RoutineError(
-                "routine_revision_changed",
-                "The routine changed or is no longer owned by this agent.",
-            )
-        proposal = await self._prepare_routine_revision(
-            inspection.routine, draft, basis_run_id=basis_run_id
+        return await self._save_routine(
+            intent,
+            "routines.update",
+            confirmation_handler,
+            conversation_id=(
+                "" if inspection is None else inspection.routine.conversation_id
+            ),
+            identity=routine_id,
+            routine_id=routine_id,
+            expected_revision=expected_revision,
         )
-        authority = await self._routine_owner.proposal_authority_snapshot(proposal)
+
+    async def _save_routine(
+        self,
+        intent: RoutineIntent,
+        capability_id: str,
+        confirmation_handler: ApprovalHandler | None,
+        **target: Any,
+    ) -> ScheduledRoutine:
+        shown_at = self._routine_owner.current_time()
+        prepared: PreparedRoutine = await self._routine_owner.prepare(
+            intent, reference_at=shown_at, **target
+        )
         if confirmation_handler is not None:
             control_id = self._id_factory("routine-approval")
             request = ApprovalRequest(
                 run_id=control_id,
                 call_id=control_id,
                 tool_name=ROUTINE_SAVE_TOOL_NAME,
-                capability_id="routines.update",
-                arguments=routine_approval_arguments(authority),
-                reason="Replace this saved assignment with the exact proposed revision?",
+                capability_id=capability_id,
+                arguments=prepared.card,
+                reason="Save this routine? Each run uses the agent's current model "
+                "and asks before any write.",
             )
             if (
                 request.render_arguments_for_review() is None
                 or await confirmation_handler(request) is not ApprovalDecision.APPROVE
             ):
-                raise PermissionError("the routine revision was not approved")
+                raise PermissionError("the routine was not approved")
+            # As for the tool: a named local time keeps the card's instant and
+            # relative delays count from approval.
+            prepared = await self._routine_owner.prepare(
+                intent,
+                reference_at=shown_at,
+                relative_at=self._routine_owner.current_time(),
+                **target,
+            )
         async with self._routine_management_lock:
             self._require_open()
-            if (
-                await self._routine_owner.proposal_authority_snapshot(proposal)
-                != authority
-            ):
-                raise ValueError(
-                    "routine authority changed during approval; propose again"
-                )
-            return await self._routine_owner.revise(
-                proposal, expected_revision=expected_revision
-            )
+            return await self._routine_owner.save(prepared)
 
     async def pause_routine(
         self, routine_id: str, *, expected_revision: int
@@ -3557,69 +3412,6 @@ class EmbeddedAgent:
             expected_revision=expected_revision,
             action=RoutineControlAction.DISABLE,
         )
-
-    async def _prepare_routine_proposal(
-        self,
-        draft: ScheduledRoutineDraft,
-        *,
-        basis_run_id: str | None,
-    ) -> ScheduledRoutine:
-        if not isinstance(draft, ScheduledRoutineDraft):
-            raise TypeError("draft must be ScheduledRoutineDraft")
-        transcript = await self._store.load(draft.origin_run_id)
-        if transcript.run.conversation_id is None:
-            raise ValueError("routine origin run has no conversation")
-        self._validate_routine_draft_distribution(
-            draft,
-            transcript.run.conversation_id,
-        )
-        return await self._routine_owner.prepare_create(
-            run_id=draft.origin_run_id,
-            conversation_id=transcript.run.conversation_id,
-            call_id=self._id_factory("routine-proposal"),
-            basis_run_id=basis_run_id,
-            **_routine_draft_values(draft),
-        )
-
-    async def _prepare_routine_revision(
-        self,
-        current: ScheduledRoutine,
-        draft: ScheduledRoutineDraft,
-        *,
-        basis_run_id: str | None,
-    ) -> ScheduledRoutine:
-        if not isinstance(draft, ScheduledRoutineDraft):
-            raise TypeError("draft must be ScheduledRoutineDraft")
-        transcript = await self._store.load(draft.origin_run_id)
-        if transcript.run.conversation_id is None:
-            raise ValueError("routine origin run has no conversation")
-        self._validate_routine_draft_distribution(
-            draft,
-            transcript.run.conversation_id,
-        )
-        return await self._routine_owner.prepare_revision(
-            current,
-            run_id=draft.origin_run_id,
-            conversation_id=transcript.run.conversation_id,
-            basis_run_id=basis_run_id,
-            **_routine_draft_values(draft),
-        )
-
-    def _validate_routine_draft_distribution(
-        self,
-        draft: ScheduledRoutineDraft,
-        conversation_id: str,
-    ) -> None:
-        try:
-            self._distribution_owner.resolve_plan(
-                conversation_id,
-                destination_id=draft.distribution_destination_id,
-                sensitivity_ceiling=draft.sensitivity_ceiling,
-            )
-        except ValueError as error:
-            raise ValueError(
-                "routine distribution destination is not currently selectable"
-            ) from error
 
     async def _control_routine(
         self,

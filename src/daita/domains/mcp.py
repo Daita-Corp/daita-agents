@@ -119,8 +119,8 @@ MCP_GRANT_POLICY = AutomationGrantPolicy(
                 "description": (
                     "Exact values for the connector tool's own input arguments, "
                     "keyed by its input schema property names. A Daita Inbox "
-                    "destination is not a connector argument; report delivery "
-                    "uses distribution_destination_id."
+                    "destination is not a connector argument; a routine reports "
+                    "to its conversation's Inbox."
                 ),
             },
             "variable_argument_names": {
@@ -1311,8 +1311,7 @@ def _reject_delivery_destination_arguments(
             },
             recovery=ToolRecovery(
                 RecoveryKind.CORRECT_ARGUMENTS,
-                "Report delivery is separate: a routine takes the Inbox in "
-                "distribution_destination_id, and omitting it selects this "
+                "Report delivery is separate: a routine reports to its "
                 "conversation's Inbox. Fix these arguments to the connector "
                 "tool's own target values from the user's request.",
             ),

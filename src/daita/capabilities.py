@@ -1070,7 +1070,7 @@ TOOLBOX_DEFINITIONS = (
     ToolboxDefinition(
         ToolboxId.ROUTINES,
         "Routines",
-        "Scheduled assignments and grants.",
+        "Scheduled routines and their results.",
     ),
     ToolboxDefinition(
         ToolboxId.ANALYSIS, "Analysis", "Python computation, data analysis and charts."

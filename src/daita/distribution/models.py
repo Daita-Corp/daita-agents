@@ -985,54 +985,6 @@ class DeliveryInspection:
             raise TypeError("delivery inspection requires a Delivery")
 
 
-class DistributionDestinationState(str, Enum):
-    AVAILABLE = "available"
-    UNAVAILABLE = "unavailable"
-
-
-@dataclass(frozen=True, slots=True)
-class DistributionDestination:
-    """Bounded safe destination discovery metadata."""
-
-    destination_id: str
-    kind: str
-    label: str
-    state: DistributionDestinationState
-    revision: int
-    sensitivity_ceiling: ModelSensitivity
-    supported_outcome_media: tuple[str, ...]
-    selectable: bool
-
-    def __post_init__(self) -> None:
-        _text(self.destination_id, "distribution destination_id")
-        _text(self.kind, "distribution destination kind", maximum=64)
-        if self.kind != "conversation_inbox":
-            raise ValueError("only conversation inbox destinations are supported")
-        _text(
-            self.label,
-            "distribution destination label",
-            maximum=MAX_DISTRIBUTION_LABEL_CHARACTERS,
-        )
-        if not isinstance(self.state, DistributionDestinationState):
-            raise TypeError("distribution destination state is invalid")
-        if (
-            not isinstance(self.revision, int)
-            or isinstance(self.revision, bool)
-            or self.revision < 1
-        ):
-            raise ValueError("distribution destination revision must be positive")
-        _sensitivity_mapping(self.sensitivity_ceiling)
-        media = _media_types(
-            self.supported_outcome_media,
-            "distribution destination supported media",
-        )
-        if not isinstance(self.selectable, bool):
-            raise TypeError("distribution destination selectable must be a boolean")
-        if self.selectable != (self.state is DistributionDestinationState.AVAILABLE):
-            raise ValueError("distribution destination selectability is inconsistent")
-        object.__setattr__(self, "supported_outcome_media", media)
-
-
 def _artifact_requirement_mapping(value: ArtifactRequirement) -> dict[str, object]:
     return {
         "required": value.required,
@@ -1100,25 +1052,6 @@ def distribution_plan_projection(value: DistributionPlan) -> dict[str, object]:
         "targets": [_target_mapping(target) for target in value.targets],
         "required_target_count": value.required_target_count,
         "plan_digest": value.plan_digest,
-    }
-
-
-def distribution_destination_projection(
-    value: DistributionDestination,
-) -> dict[str, object]:
-    """Return bounded safe discovery metadata for one destination."""
-
-    if not isinstance(value, DistributionDestination):
-        raise TypeError("destination projection requires DistributionDestination")
-    return {
-        "destination_id": value.destination_id,
-        "kind": value.kind,
-        "label": value.label,
-        "state": value.state.value,
-        "revision": value.revision,
-        "sensitivity_ceiling": value.sensitivity_ceiling.value,
-        "supported_outcome_media": list(value.supported_outcome_media),
-        "selectable": value.selectable,
     }
 
 

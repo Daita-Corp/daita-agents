@@ -17,6 +17,7 @@ from .artifacts.models import ArtifactDestination, artifact_destination_to_mappi
 from .capabilities import (
     AccessMode,
     CapabilityRegistry,
+    ExecutionScopeKind,
     OperationalEffect,
     ToolLoadMode,
 )
@@ -240,14 +241,9 @@ class RunContextSnapshot:
     static_context_sha256: str
     max_context_evidence_bytes: int
     artifact_destinations: tuple[ArtifactDestination, ...]
-    routine_authoring_facts: FrozenJsonObject | None = None
     local_file_context: FrozenJsonObject | None = None
 
     def __post_init__(self) -> None:
-        if self.routine_authoring_facts is not None and not isinstance(
-            self.routine_authoring_facts, FrozenJsonObject
-        ):
-            raise TypeError("routine authoring facts must be immutable")
         if self.local_file_context is not None and not isinstance(
             self.local_file_context, FrozenJsonObject
         ):
@@ -309,7 +305,6 @@ class RunContextSnapshot:
         return FrozenJsonObject.from_mapping(
             {
                 "run_id": self.run_id,
-                "routine_authoring_facts": self.routine_authoring_facts,
                 "local_file_context": self.local_file_context,
                 "model_profile_id": self.profile.id,
                 "registry_digest": self.registry_digest,
@@ -341,7 +336,6 @@ class AgentContextBuilder:
         skills: SkillContextReader | None = None,
         semantics: SemanticContextReader | None = None,
         artifact_destinations: ArtifactDestinationContextReader | None = None,
-        routine_authoring_facts: Callable[[], FrozenJsonObject] | None = None,
         effect_receipts: EffectReceiptStore | None = None,
         workspace_id: str | None = None,
         workspace_sensitivity: ModelSensitivity | None = None,
@@ -439,11 +433,6 @@ class AgentContextBuilder:
             else None
         )
         self._profile = profile
-        if routine_authoring_facts is not None and not callable(
-            routine_authoring_facts
-        ):
-            raise TypeError("routine authoring facts reader must be callable")
-        self._routine_authoring_facts = routine_authoring_facts
         self._effect_receipts = effect_receipts
         self._catalog_limit = catalog_limit
         self._max_context_evidence_bytes = max_context_evidence_bytes
@@ -526,16 +515,6 @@ class AgentContextBuilder:
                 + canonical_json(task_context.material())
                 + "\n</code_owned_task_context>"
             )
-        authoring_facts = (
-            self._routine_authoring_facts()
-            if self._routine_authoring_facts is not None
-            and run.origin is RunOrigin.USER
-            and any(
-                entry.capability.id in {"routines.create", "routines.update"}
-                for entry in tool_context.entries
-            )
-            else None
-        )
         capability_ids = frozenset(
             capability.id
             for entry in tool_context.entries
@@ -589,7 +568,7 @@ class AgentContextBuilder:
             ),
             key=lambda item: item.routing_rank,
         )
-        if authoring_facts is not None or effect_context:
+        if effect_context:
             sensitivity = max(
                 sensitivity,
                 ModelSensitivity.INTERNAL,
@@ -626,10 +605,16 @@ class AgentContextBuilder:
         execution_scope = run.execution_scope
         if execution_scope is not None:
             # Retained machine instructions/payloads have no independent public
-            # classification. Their approved ceiling is the conservative floor.
+            # classification. A graph task's approved ceiling is the conservative
+            # floor; a routine has no ceiling, and its prompt counts as internal.
             sensitivity = max(
                 sensitivity,
-                execution_scope.sensitivity_ceiling,
+                (
+                    ModelSensitivity.INTERNAL
+                    if execution_scope.scope_kind
+                    is ExecutionScopeKind.SCHEDULED_ROUTINE
+                    else execution_scope.sensitivity_ceiling
+                ),
                 key=lambda item: item.routing_rank,
             )
         source_scope = tool_context.source_scope
@@ -990,7 +975,6 @@ class AgentContextBuilder:
             *initial.messages[1:-1],
         )
         static_material = {
-            "routine_authoring_facts": authoring_facts,
             "run_id": run.id,
             "run_origin": run.origin.value,
             "execution_scope_digest": (
@@ -1023,7 +1007,6 @@ class AgentContextBuilder:
             static_context_sha256=digest,
             max_context_evidence_bytes=self._max_context_evidence_bytes,
             artifact_destinations=artifact_destinations,
-            routine_authoring_facts=authoring_facts,
             local_file_context=local_file_context,
         )
 
@@ -1110,18 +1093,6 @@ class AgentContextBuilder:
         ):
             raise ValueError("remaining context allowance must be non-negative")
         core = cast(TextBlock, snapshot.static_messages[0].content[0]).text
-        if snapshot.routine_authoring_facts is not None and any(
-            entry.capability.id in {"routines.create", "routines.update"}
-            for entry in tool_context.callable_entries
-        ):
-            core += (
-                "\n\nRoutine authoring choices (local configuration, not approval or remaining budget):\n"
-                + canonical_json(snapshot.routine_authoring_facts)
-                + "\nSelect exact eligible_model_routes from these data values. No current-model alias exists. "
-                "If multiple choices leave the intended route ambiguous, clarify. A null host cost ceiling means "
-                "no host cost ceiling. Token, attempt and occurrence ceilings always bound a routine; omit both "
-                "dollar ceilings unless the user asks for one, and they are required together when set."
-            )
         # Per-request status changes on every step. It follows the transcript so
         # the system prompt and the history before it stay a stable, cacheable
         # prefix; adapters that hoist system text keep it after the fixed prompt.
@@ -3295,23 +3266,7 @@ def _tool_guidance(
                 "absolute paths."
             )
     if capability_ids & {"routines.create", "routines.update"}:
-        instructions.append(
-            "For scheduled work, use toolbox_search automation_contract for grant "
-            "schemas and connector references. Use toolbox_inspect for exact argument schemas "
-            "and contracts marked automation_contract_omitted, without changing the working set; "
-            "it also gives the full routine_save rules for grants, precheck, connector bindings "
-            "and dollar ceilings. "
-            "Fixed/variable grant arguments must use the declared input names and types; "
-            "load tools to invoke them. Effect-free "
-            "reads need no requested_capability_grants; include their IDs in allowed_capability_ids."
-            " For a foreground update now and one later, answer now and create one "
-            "relative once schedule. For recurring now-and-later work, use one "
-            "run_immediately interval with its first scheduled anchor after one interval. "
-            "Use relative timing instead of querying a data source for the clock. "
-            "Routine approval cannot grant missing connector or native write permission. "
-            "Report the saved assignment and its host-dependent status, not completion. "
-            "Uncertain action receipts require human operator recovery; never replay an action."
-        )
+        instructions.append("Scheduled runs ask a person before any write.")
     if JOB_READ_RESULTS_CAPABILITY_ID in capability_ids:
         instructions.append(
             "Durable jobs are owned by this agent across conversations; an "

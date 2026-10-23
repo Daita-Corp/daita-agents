@@ -14,8 +14,8 @@ import sys
 import tempfile
 import typing
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from . import (
@@ -24,17 +24,13 @@ from . import (
     AgentEvent,
     AgentEventKind,
     AgentObserver,
-    AmbiguousTimePolicy,
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
     ArtifactError,
-    CalendarDaySelector,
-    CalendarSchedule,
     EffectReceipt,
     EffectResolutionDecision,
     FolderSource,
-    IntervalSchedule,
     LocalFileAccess,
     LocalWorkspace,
     LoopLimits,
@@ -42,14 +38,9 @@ from . import (
     MCPBindingStatus,
     MCPServerInspection,
     MCPToolSelection,
-    MisfirePolicy,
-    NonexistentTimePolicy,
-    OnceSchedule,
     PostgreSQLSource,
-    ReportingMode,
-    ResourceRevisionPrecheck,
+    RoutineIntent,
     RoutineState,
-    ScheduledRoutineDraft,
     SourceTypeRegistry,
     SQLiteSource,
     __version__,
@@ -57,18 +48,11 @@ from . import (
 )
 from ._json import FrozenJsonObject
 from .artifacts.models import (
-    ArtifactAuthorship,
     artifact_delivery_receipt_to_mapping,
     artifact_destination_to_mapping,
     artifact_ref_to_mapping,
 )
-from .distribution import (
-    ArtifactRequirement,
-    OutcomeContract,
-    delivery_inspection_projection,
-    delivery_view_projection,
-    distribution_destination_projection,
-)
+from .distribution import delivery_inspection_projection, delivery_view_projection
 from .errors import StateCompatibilityError
 from .jobs.graph.models import GraphInspection, GraphState, TaskState
 from .jobs.owner import GraphBlockerProjection
@@ -771,48 +755,79 @@ def build_parser() -> argparse.ArgumentParser:
 
     routines = commands.add_parser(
         "routines",
-        help="inspect and manage saved assignments (execution requires an open host)",
+        help=(
+            "scheduled routines: a title, a prompt and a schedule; each run asks "
+            "before any write (execution requires an open host)"
+        ),
     )
     routine_commands = routines.add_subparsers(
         dest="routines_command",
         required=True,
     )
-    routine_list = routine_commands.add_parser("list")
+    routine_list = routine_commands.add_parser("list", help="list routines")
     routine_list.add_argument("name")
     routine_list.add_argument(
         "--state",
         action="append",
         choices=tuple(item.value for item in RoutineState),
     )
-    routine_inspect = routine_commands.add_parser("inspect")
+    routine_inspect = routine_commands.add_parser(
+        "inspect", help="show a routine and its recent occurrences"
+    )
     routine_inspect.add_argument("name")
     routine_inspect.add_argument("routine_id")
-    for command in ("create", "promote"):
-        action = routine_commands.add_parser(command)
+    for command in ("create", "update"):
+        action = routine_commands.add_parser(
+            command,
+            help=(
+                "save a new routine after confirmation; results go to a new "
+                "conversation's Inbox"
+                if command == "create"
+                else "change a routine after confirmation; omitted fields keep "
+                "their values"
+            ),
+        )
         action.add_argument("name")
-        action.add_argument("--spec", type=Path, required=True)
-        if command == "promote":
-            action.add_argument("--basis-run-id", required=True)
-    routine_revision_parser = routine_commands.add_parser("update")
-    routine_revision_parser.add_argument("name")
-    routine_revision_parser.add_argument("routine_id")
-    routine_revision_parser.add_argument("expected_revision", type=int)
-    routine_revision_parser.add_argument("--spec", type=Path, required=True)
-    routine_revision_parser.add_argument("--basis-run-id")
+        if command == "update":
+            action.add_argument("routine_id")
+            action.add_argument(
+                "--expected-revision",
+                type=int,
+                help="refuse the change if the routine moved past this revision",
+            )
+        action.add_argument("--title")
+        action.add_argument("--prompt", help="what each run should do")
+        action.add_argument(
+            "--schedule",
+            help=(
+                'JSON schedule, e.g. \'{"kind": "once", "after_seconds": 480}\', '
+                '\'{"kind": "interval", "interval_seconds": 3600, '
+                '"anchor_after_seconds": 60}\' or \'{"kind": "calendar", '
+                '"timezone": "America/Chicago", "hour": 9, "minute": 0}\''
+            ),
+        )
+        action.add_argument(
+            "--source",
+            action="append",
+            help="source name or id to use; repeat for more (default: all sources)",
+        )
+        action.add_argument(
+            "--spec",
+            type=Path,
+            help="JSON file with title, prompt, schedule, sources and "
+            "run_immediately; flags override it",
+        )
+        if command == "create":
+            action.add_argument(
+                "--run-immediately",
+                action="store_true",
+                help="also run once now (interval and calendar schedules)",
+            )
     for command in ("pause", "resume", "run-now", "disable"):
-        action = routine_commands.add_parser(command)
+        action = routine_commands.add_parser(command, help=f"{command} a routine")
         action.add_argument("name")
         action.add_argument("routine_id")
         action.add_argument("expected_revision", type=int)
-
-    routine_destinations = routine_commands.add_parser("destinations")
-    routine_destinations.add_argument("name")
-    routine_destinations.add_argument("conversation_id")
-    routine_destinations.add_argument(
-        "--sensitivity-ceiling",
-        choices=tuple(item.value for item in ModelSensitivity),
-        default=ModelSensitivity.RESTRICTED.value,
-    )
 
     work = commands.add_parser(
         "work",
@@ -1216,238 +1231,35 @@ async def _deny_without_prompting(request: ApprovalRequest) -> ApprovalDecision:
     return ApprovalDecision.DENY
 
 
-def _routine_draft_from_file(path: Path) -> ScheduledRoutineDraft:
-    try:
-        value = json.loads(_read_input_document(str(path)))
-    except json.JSONDecodeError as error:
-        raise ValueError(f"routine spec is not valid JSON: {error.msg}") from error
-    document = _object_mapping(value, "routine spec")
-    schedule_document = _object_mapping(document.get("schedule"), "routine schedule")
-    schedule_kind = _required_text(schedule_document, "kind")
-    schedule: OnceSchedule | IntervalSchedule | CalendarSchedule
-    if schedule_kind == "once":
-        schedule = OnceSchedule(
-            _routine_datetime(_required_text(schedule_document, "exact_at"))
-        )
-    elif schedule_kind == "interval":
-        schedule = IntervalSchedule(
-            _required_integer(schedule_document, "interval_seconds"),
-            _routine_datetime(_required_text(schedule_document, "anchor_at")),
-        )
-    elif schedule_kind == "calendar":
-        schedule = CalendarSchedule(
-            timezone=_required_text(schedule_document, "timezone"),
-            hour=_required_integer(schedule_document, "hour"),
-            minute=_required_integer(schedule_document, "minute"),
-            day_selector=CalendarDaySelector(
-                _required_text(schedule_document, "day_selector")
-            ),
-            weekdays=_integer_tuple(schedule_document.get("weekdays", ()), "weekdays"),
-            month_days=_integer_tuple(
-                schedule_document.get("month_days", ()), "month_days"
-            ),
-            months=_integer_tuple(schedule_document.get("months", ()), "months"),
-            nonexistent_time_policy=NonexistentTimePolicy(
-                str(schedule_document.get("nonexistent_time_policy", "skip"))
-            ),
-            ambiguous_time_policy=AmbiguousTimePolicy(
-                str(schedule_document.get("ambiguous_time_policy", "first"))
-            ),
-        )
-    else:
-        raise ValueError("routine schedule kind must be once, interval, or calendar")
-    precheck_value = document.get("precheck")
-    precheck = (
-        None
-        if precheck_value is None
-        else _routine_precheck(_object_mapping(precheck_value, "routine precheck"))
-    )
-    return ScheduledRoutineDraft(
-        origin_run_id=_required_text(document, "origin_run_id"),
-        title=_required_text(document, "title"),
-        authorized_instruction=_required_text(document, "authorized_instruction"),
-        schedule=schedule,
-        misfire_policy=MisfirePolicy(_required_text(document, "misfire_policy")),
-        reporting_mode=ReportingMode(_required_text(document, "reporting_mode")),
-        precheck=precheck,
-        allowed_source_ids=_string_tuple(document, "allowed_source_ids"),
-        allowed_connector_binding_ids=_string_tuple(
-            document, "allowed_connector_binding_ids"
-        ),
-        allowed_resource_ids=_string_tuple(document, "allowed_resource_ids"),
-        allowed_capability_ids=_string_tuple(document, "allowed_capability_ids"),
-        sensitivity_ceiling=ModelSensitivity(
-            _required_text(document, "sensitivity_ceiling")
-        ),
-        outcome_contract=_routine_outcome_contract(
-            _object_mapping(document.get("outcome_contract"), "outcome contract")
-        ),
-        distribution_destination_id=_required_text(
-            document,
-            "distribution_destination_id",
-        ),
-        eligible_model_routes=_string_tuple(document, "eligible_model_routes"),
-        per_run_max_tokens=_required_integer(document, "per_run_max_tokens"),
-        per_run_max_cost_usd=_optional_routine_decimal(
-            document, "per_run_max_cost_usd"
-        ),
-        cumulative_max_tokens=_required_integer(document, "cumulative_max_tokens"),
-        cumulative_max_cost_usd=_optional_routine_decimal(
-            document, "cumulative_max_cost_usd"
-        ),
-        cumulative_max_attempts=_required_integer(document, "cumulative_max_attempts"),
-        cumulative_max_occurrences=_required_integer(
-            document, "cumulative_max_occurrences"
-        ),
-        maximum_consecutive_failures=_required_integer(
-            document, "maximum_consecutive_failures"
-        ),
-        expires_at=_routine_datetime(_required_text(document, "expires_at")),
-        skill_names=_string_tuple(document, "skill_names", default=()),
-    )
+def _routine_intent(args: argparse.Namespace) -> RoutineIntent:
+    """Read one routine from a small spec file and flags; flags win."""
 
-
-def _routine_precheck(value: Mapping[str, object]) -> ResourceRevisionPrecheck:
-    return ResourceRevisionPrecheck(
-        capability_id=_required_text(value, "capability_id"),
-        contract_digest=_required_text(value, "contract_digest"),
-        source_id=_required_text(value, "source_id"),
-        resource_id=_required_text(value, "resource_id"),
-    )
-
-
-def _routine_outcome_contract(value: Mapping[str, object]) -> OutcomeContract:
-    raw_requirements = value.get("artifact_requirements")
-    if not isinstance(raw_requirements, (list, tuple)):
-        raise ValueError("artifact_requirements must be an array")
-    requirements: list[ArtifactRequirement] = []
-    for raw_requirement in raw_requirements:
-        requirement = _object_mapping(raw_requirement, "artifact requirement")
-        requirements.append(
-            ArtifactRequirement(
-                required=_required_boolean(requirement, "required"),
-                minimum_count=_required_integer(requirement, "minimum_count"),
-                maximum_count=_required_integer(requirement, "maximum_count"),
-                allowed_media_types=_string_tuple(
-                    requirement,
-                    "allowed_media_types",
-                ),
-                allowed_authorships=tuple(
-                    ArtifactAuthorship(item)
-                    for item in _string_tuple(
-                        requirement,
-                        "allowed_authorships",
-                    )
-                ),
-                allowed_producer_capability_ids=_string_tuple(
-                    requirement,
-                    "allowed_producer_capability_ids",
-                ),
-                maximum_artifact_bytes=_required_integer(
-                    requirement,
-                    "maximum_artifact_bytes",
-                ),
-                maximum_total_bytes=_required_integer(
-                    requirement,
-                    "maximum_total_bytes",
-                ),
-                maximum_sensitivity=ModelSensitivity(
-                    _required_text(requirement, "maximum_sensitivity")
-                ),
-            )
-        )
-    return OutcomeContract(
-        require_terminal_conclusion=_required_boolean(
-            value,
-            "require_terminal_conclusion",
-        ),
-        artifact_requirements=tuple(requirements),
-        maximum_total_artifact_bytes=_required_integer(
-            value,
-            "maximum_total_artifact_bytes",
-        ),
-        maximum_effective_sensitivity=ModelSensitivity(
-            _required_text(value, "maximum_effective_sensitivity")
-        ),
-        require_current_run_provenance=_required_boolean(
-            value,
-            "require_current_run_provenance",
-        ),
-        require_exact_source_bindings=_required_boolean(
-            value,
-            "require_exact_source_bindings",
-        ),
-    )
+    document: dict[str, object] = {}
+    if args.spec is not None:
+        try:
+            value = json.loads(args.spec.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise ValueError(f"routine spec is not valid JSON: {error.msg}") from error
+        document.update(_object_mapping(value, "routine spec"))
+    if args.schedule is not None:
+        try:
+            document["schedule"] = json.loads(args.schedule)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"--schedule is not valid JSON: {error.msg}") from error
+    for name in ("title", "prompt"):
+        if getattr(args, name) is not None:
+            document[name] = getattr(args, name)
+    if args.source:
+        document["sources"] = args.source
+    if getattr(args, "run_immediately", False):
+        document["run_immediately"] = True
+    return RoutineIntent.from_mapping(document)
 
 
 def _object_mapping(value: object, name: str) -> Mapping[str, object]:
     if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
         raise ValueError(f"{name} must be a JSON object")
     return value
-
-
-def _required_text(value: Mapping[str, object], name: str) -> str:
-    item = value.get(name)
-    if not isinstance(item, str) or not item.strip():
-        raise ValueError(f"{name} must be non-empty text")
-    return item
-
-
-def _required_integer(value: Mapping[str, object], name: str) -> int:
-    item = value.get(name)
-    if not isinstance(item, int) or isinstance(item, bool):
-        raise ValueError(f"{name} must be an integer")
-    return item
-
-
-def _required_boolean(value: Mapping[str, object], name: str) -> bool:
-    item = value.get(name)
-    if not isinstance(item, bool):
-        raise ValueError(f"{name} must be a boolean")
-    return item
-
-
-def _string_tuple(
-    value: Mapping[str, object],
-    name: str,
-    *,
-    default: tuple[str, ...] | None = None,
-) -> tuple[str, ...]:
-    item = value.get(name, default)
-    if not isinstance(item, (list, tuple)) or any(
-        not isinstance(entry, str) for entry in item
-    ):
-        raise ValueError(f"{name} must be an array of strings")
-    return tuple(item)
-
-
-def _integer_tuple(value: object, name: str) -> tuple[int, ...]:
-    if not isinstance(value, (list, tuple)) or any(
-        not isinstance(entry, int) or isinstance(entry, bool) for entry in value
-    ):
-        raise ValueError(f"{name} must be an array of integers")
-    return tuple(value)
-
-
-def _routine_decimal(value: Mapping[str, object], name: str) -> Decimal:
-    item = value.get(name)
-    if isinstance(item, bool) or not isinstance(item, (str, int, float)):
-        raise ValueError(f"{name} must be a decimal string or number")
-    try:
-        return Decimal(str(item))
-    except InvalidOperation as error:
-        raise ValueError(f"{name} is not a decimal") from error
-
-
-def _optional_routine_decimal(value: Mapping[str, object], name: str) -> Decimal | None:
-    return None if value.get(name) is None else _routine_decimal(value, name)
-
-
-def _routine_datetime(value: str) -> datetime:
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as error:
-        raise ValueError("routine datetime must be ISO 8601") from error
 
 
 async def _execute(args: argparse.Namespace) -> object:
@@ -2128,14 +1940,6 @@ async def _execute(args: argparse.Namespace) -> object:
                 raise ValueError("delivery not found")
             return delivery_view_projection(dismissed)
         if args.command == "routines":
-            if args.routines_command == "destinations":
-                return [
-                    distribution_destination_projection(item)
-                    for item in await agent.distribution_destinations(
-                        args.conversation_id,
-                        sensitivity_ceiling=ModelSensitivity(args.sensitivity_ceiling),
-                    )
-                ]
             if args.routines_command == "list":
                 states = frozenset(RoutineState(item) for item in (args.state or ()))
                 return [
@@ -2160,28 +1964,19 @@ async def _execute(args: argparse.Namespace) -> object:
                 if routine_inspection is None:
                     raise ValueError("routine not found")
                 return routine_inspection_projection(routine_inspection)
-            if args.routines_command in {"create", "promote"}:
-                draft = _routine_draft_from_file(args.spec)
-                proposal = (
-                    await agent.promote_routine(
-                        draft,
-                        basis_run_id=args.basis_run_id,
-                    )
-                    if args.routines_command == "promote"
-                    else await agent.propose_routine(draft)
-                )
+            if args.routines_command == "create":
                 return routine_projection(
                     await agent.create_routine(
-                        proposal, confirmation_handler=_prompt_for_exact_approval
+                        _routine_intent(args),
+                        confirmation_handler=_prompt_for_exact_approval,
                     )
                 )
             if args.routines_command == "update":
                 return routine_projection(
                     await agent.update_routine(
                         args.routine_id,
+                        _routine_intent(args),
                         expected_revision=args.expected_revision,
-                        draft=_routine_draft_from_file(args.spec),
-                        basis_run_id=args.basis_run_id,
                         confirmation_handler=_prompt_for_exact_approval,
                     )
                 )

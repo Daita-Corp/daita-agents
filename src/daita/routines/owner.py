@@ -1,83 +1,67 @@
-"""Own foreground admission and lifecycle views for scheduled routines."""
+"""Own routine saves, controls and views for one agent."""
 
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import replace
-from datetime import UTC, datetime
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta, tzinfo
 from decimal import Decimal
 from hashlib import sha256
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from .._json import FrozenJsonObject, canonical_json
-from ..adapters.mcp import MCPBindingState, MCPServerBinding
-from ..artifacts.models import ArtifactAuthorship
-from ..capabilities import (
-    RESERVED_TOOL_NAMES,
-    AccessMode,
-    AutomationEligibility,
-    AutomationScopeProposal,
-    CapabilityGrant,
-    CapabilityRegistry,
-    ExecutionContractBindings,
-    ExecutionContractReader,
-    OperationalEffect,
-    RecoveryKind,
-    ToolRecovery,
-    recovery_details,
-)
-from ..catalog.models import CatalogResource, Sensitivity
-from ..distribution import (
-    Delivery,
-    DistributionOwner,
-    OutcomeArtifactReference,
-    OutcomeContract,
-    distribution_plan_projection,
-    outcome_contract_projection,
-)
+from .._json import FrozenJsonObject
+from ..adapters.models import SourceRegistration
+from ..capabilities import RecoveryKind, ToolRecovery, recovery_details
+from ..distribution import Delivery, OutcomeArtifactReference
 from ..errors import DaitaError, ErrorRetryability
-from ..llm.models import ModelSensitivity
-from ..loop.models import (
-    LoopExit,
-    LoopExitKind,
-    RunOrigin,
-    Transcript,
-    validate_completed_transcript,
-)
-from ..scope import scope_refs
-from ..skills import Skill
-from ..skills.capabilities import SKILL_VIEW_CAPABILITY_ID
+from ..loop.models import LoopExit, Transcript
+from ..scope import SOURCE_REF_PREFIX, ScopeRefs, scope_refs
 from .models import (
     MAX_ROUTINE_HISTORY_PAGE_SIZE,
-    MAX_ROUTINE_IDENTITY_ITEMS,
     MAX_ROUTINE_LIST_PAGE_SIZE,
     SCHEDULE_INTERPRETER_REVISION,
+    AmbiguousTimePolicy,
+    CalendarDaySelector,
     CalendarSchedule,
     IntervalSchedule,
-    MisfirePolicy,
+    NonexistentTimePolicy,
     OnceSchedule,
-    ReportingMode,
-    RequestedCapabilityGrant,
-    ResourceRevisionObservation,
-    ResourceRevisionPrecheck,
     RoutineControlAction,
+    RoutineIntent,
     RoutineOccurrence,
-    RoutinePromotionEvidence,
     RoutineSchedule,
-    RoutineSkillBinding,
     RoutineState,
     ScheduledRoutine,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
     text_digest,
-    validate_budget_relationships,
-    validate_reporting_precheck,
 )
-from .schedule import forecast_slots, validate_schedule
+from .schedule import validate_schedule
+from .temporal import next_weekday_utc, system_user_timezone
 
 _SCOPE_REF_TOKEN = re.compile(r"\b[st][1-9][0-9]*\b")
+MAX_RELATIVE_SCHEDULE_SECONDS = 30 * 24 * 60 * 60
+SCHEDULE_KEYS = {
+    "once": frozenset({"exact_at", "after_seconds"}),
+    "interval": frozenset({"interval_seconds", "anchor_at", "anchor_after_seconds"}),
+    "once_next_weekday": frozenset({"timezone", "weekday", "hour", "minute"}),
+    "calendar": frozenset(
+        {
+            "timezone",
+            "hour",
+            "minute",
+            "day_selector",
+            "weekdays",
+            "month_days",
+            "months",
+            "nonexistent_time_policy",
+            "ambiguous_time_policy",
+        }
+    ),
+}
+_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
 class RoutineError(DaitaError):
@@ -99,7 +83,7 @@ class RoutineStore(Protocol):
     ) -> None: ...
 
     async def admit_scheduled_routine(
-        self, routine: ScheduledRoutine
+        self, routine: ScheduledRoutine, *, run_immediately: bool = False
     ) -> ScheduledRoutine: ...
 
     async def load_scheduled_routine(
@@ -161,39 +145,9 @@ class RoutineStore(Protocol):
         claim_token: str,
     ) -> RoutineOccurrence | None: ...
 
-    async def conversation_exists(
-        self, agent_id: str, conversation_id: str
-    ) -> bool: ...
+    async def list_sources(self, agent_id: str) -> tuple[SourceRegistration, ...]: ...
 
     async def load(self, run_id: str) -> Transcript: ...
-
-    async def result(self, run_id: str) -> LoopExit | None: ...
-
-    async def load_resource(
-        self, agent_id: str, resource_id: str
-    ) -> CatalogResource | None: ...
-
-    async def load_mcp_binding(
-        self, agent_id: str, binding_id: str
-    ) -> MCPServerBinding | None: ...
-
-
-class RoutineCatalog(Protocol):
-    async def readable_resource_ids(
-        self,
-        agent_id: str,
-        source_ids: tuple[str, ...] = (),
-    ) -> frozenset[str]: ...
-
-
-class RoutineSkillStore(Protocol):
-    async def read_skill_with_digest(self, name: str) -> tuple[Skill | None, str]: ...
-
-    async def retain_current_skill(self, name: str, content_digest: str) -> Skill: ...
-
-    async def read_retained_skill(
-        self, name: str, content_digest: str
-    ) -> Skill | None: ...
 
 
 class RoutineSupervisorStore(Protocol):
@@ -217,7 +171,6 @@ class RoutineSupervisorStore(Protocol):
         *,
         delivery_id: str,
         finalized_at: datetime,
-        skipped_no_change_observation: ResourceRevisionObservation | None = ...,
         failure_code: str | None = ...,
         artifact_references: tuple[OutcomeArtifactReference, ...] = ...,
         outcome_contract_failure_code: str | None = ...,
@@ -252,195 +205,34 @@ class RoutineSupervisorStore(Protocol):
     async def result(self, run_id: str) -> LoopExit | None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedRoutine:
+    """One validated routine save, not yet stored, and its confirm card."""
+
+    routine: ScheduledRoutine
+    expected_revision: int | None
+    run_immediately: bool
+    card: FrozenJsonObject
+
+
 class RoutineOwner:
-    """Validate exact routine authority and own agent-scoped transitions."""
+    """Validate routine saves and own agent-scoped routine transitions."""
 
     def __init__(
         self,
         *,
         agent_id: str,
         store: RoutineStore,
-        catalog: RoutineCatalog,
-        distribution: DistributionOwner,
-        skills: RoutineSkillStore | None,
-        eligible_model_routes: tuple[str, ...],
-        maximum_per_run_tokens: int,
-        maximum_per_run_cost_usd: Decimal | None,
         clock: Callable[[], datetime],
-        execution_contract_reader: ExecutionContractReader,
     ) -> None:
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("routine owner agent_id must be non-empty text")
         if not callable(clock):
             raise TypeError("routine owner clock must be callable")
-        routes = tuple(sorted(set(eligible_model_routes)))
-        if len(routes) > MAX_ROUTINE_IDENTITY_ITEMS or any(
-            not isinstance(item, str) or not item or len(item) > 256 for item in routes
-        ):
-            raise ValueError("routine owner model routes are invalid")
-        if maximum_per_run_tokens < 1:
-            raise ValueError("routine owner token limit must be positive")
-        if maximum_per_run_cost_usd is not None and (
-            not maximum_per_run_cost_usd.is_finite() or maximum_per_run_cost_usd < 0
-        ):
-            raise ValueError("routine owner cost limit is invalid")
         self.agent_id = agent_id
         self._store = store
-        self._catalog = catalog
-        self._distribution = distribution
-        self._capabilities: CapabilityRegistry | None = None
-        self._skills = skills
-        self._eligible_model_routes = routes
-        self._maximum_per_run_tokens = maximum_per_run_tokens
-        self._maximum_per_run_cost_usd = maximum_per_run_cost_usd
         self._clock = clock
-        self._execution_contract_reader = execution_contract_reader
         self._wake: Callable[[], None] | None = None
-        self._grant_preparer: (
-            Callable[
-                [str, Mapping[str, object], int, AutomationScopeProposal],
-                Awaitable[CapabilityGrant],
-            ]
-            | None
-        ) = None
-
-    def authoring_facts(self) -> FrozenJsonObject:
-        """Read complete bounded local choices without readiness or secret I/O."""
-        return FrozenJsonObject.from_mapping(
-            {
-                "eligible_model_routes": self._eligible_model_routes,
-                "maximum_per_run_tokens": self._maximum_per_run_tokens,
-                "maximum_per_run_cost_usd": (
-                    None
-                    if self._maximum_per_run_cost_usd is None
-                    else str(self._maximum_per_run_cost_usd)
-                ),
-            }
-        )
-
-    def _validate_model_routes(self, routes: tuple[str, ...]) -> None:
-        if not routes or not set(routes) <= set(self._eligible_model_routes):
-            choices = canonical_json(self._eligible_model_routes)
-            detail = (
-                f" Eligible choices: {choices}."
-                if len(choices) <= 512
-                else " Consult the complete routine authoring choices."
-            )
-            raise RoutineError(
-                "routine_model_route_revoked",
-                "Select exact currently eligible model route IDs; aliases are unsupported."
-                + detail,
-            )
-
-    @staticmethod
-    def _validate_budgets(
-        per_run_max_tokens: int,
-        cumulative_max_tokens: int,
-        per_run_max_cost_usd: Decimal | None,
-        cumulative_max_cost_usd: Decimal | None,
-    ) -> None:
-        try:
-            validate_budget_relationships(
-                per_run_max_tokens,
-                cumulative_max_tokens,
-                per_run_max_cost_usd,
-                cumulative_max_cost_usd,
-            )
-        except ValueError as error:
-            raise RoutineError("routine_budget_invalid", str(error)) from error
-
-    async def _bind_contracts(
-        self,
-        *,
-        agent_id: str,
-        source_ids: tuple[str, ...],
-        resource_ids: tuple[str, ...],
-        capability_ids: tuple[str, ...],
-        connector_binding_ids: tuple[str, ...],
-        model_route_ids: tuple[str, ...],
-    ) -> ExecutionContractBindings:
-        try:
-            return await self._execution_contract_reader(
-                agent_id=agent_id,
-                source_ids=source_ids,
-                resource_ids=resource_ids,
-                capability_ids=capability_ids,
-                connector_binding_ids=connector_binding_ids,
-                model_route_ids=model_route_ids,
-            )
-        except (KeyError, ValueError) as error:
-            raise RoutineError(
-                "routine_execution_contract_unavailable",
-                "An exact requested execution contract is unavailable.",
-            ) from error
-
-    def _connector_binding_ids(
-        self, capability_ids: tuple[str, ...]
-    ) -> tuple[str, ...]:
-        """Derive the connector bindings that the exact capabilities belong to.
-
-        The registry's connector identity is code-owned by the connector domain.
-        Contract binding still loads each binding and checks every capability's
-        exact origin, so a derived binding is verified like an explicit one.
-        """
-
-        registry = self._require_capability_registry()
-        wanted = set(capability_ids)
-        found: set[str] = set()
-        for name in registry.tool_names:
-            view, _capability = registry.resolve_tool(name)
-            connector = view.connector_presentation
-            if (
-                view.capability_id in wanted
-                and connector is not None
-                and connector.get("kind") == "mcp_binding"
-                and isinstance(connector.get("id"), str)
-            ):
-                found.add(str(connector["id"]))
-        return tuple(sorted(found))
-
-    def _distribution_destination_id(
-        self,
-        conversation_id: str,
-        destination_id: str | None,
-        sensitivity_ceiling: ModelSensitivity,
-    ) -> str:
-        """Default report delivery to the one selectable destination."""
-
-        if destination_id is not None:
-            return destination_id
-        selectable = tuple(
-            item
-            for item in self._distribution.list_destinations(
-                conversation_id, sensitivity_ceiling=sensitivity_ceiling
-            )
-            if item.selectable
-        )
-        if len(selectable) != 1:
-            raise RoutineError(
-                "routine_distribution_destination_required",
-                "Choose distribution_destination_id from distribution_destination_list.",
-            )
-        return selectable[0].destination_id
-
-    def bind_capability_registry(self, capabilities: CapabilityRegistry) -> None:
-        """Bind the host's complete immutable registry between executions."""
-        if not isinstance(capabilities, CapabilityRegistry):
-            raise TypeError("routine owner requires CapabilityRegistry")
-        self._capabilities = capabilities
-
-    def bind_grant_preparer(
-        self,
-        preparer: Callable[
-            [str, Mapping[str, object], int, AutomationScopeProposal],
-            Awaitable[CapabilityGrant],
-        ],
-    ) -> None:
-        if self._grant_preparer is not None:
-            raise RuntimeError("routine grant preparer is already bound")
-        if not callable(preparer):
-            raise TypeError("routine grant preparer must be callable")
-        self._grant_preparer = preparer
 
     def bind_wake(self, wake: Callable[[], None]) -> None:
         if self._wake is not None:
@@ -454,382 +246,194 @@ class RoutineOwner:
 
         return self._clock()
 
-    async def prepare_create(
+    async def prepare(
         self,
+        intent: RoutineIntent,
         *,
-        run_id: str,
         conversation_id: str,
-        call_id: str,
-        title: str,
-        authorized_instruction: str,
-        schedule: RoutineSchedule,
-        misfire_policy: MisfirePolicy,
-        reporting_mode: ReportingMode,
-        precheck: ResourceRevisionPrecheck | None,
-        allowed_source_ids: tuple[str, ...],
-        allowed_connector_binding_ids: tuple[str, ...] | None,
-        allowed_resource_ids: tuple[str, ...],
-        allowed_capability_ids: tuple[str, ...],
-        sensitivity_ceiling: ModelSensitivity,
-        outcome_contract: OutcomeContract,
-        distribution_destination_id: str | None,
-        eligible_model_routes: tuple[str, ...],
-        per_run_max_tokens: int,
-        per_run_max_cost_usd: Decimal | None,
-        cumulative_max_tokens: int,
-        cumulative_max_cost_usd: Decimal | None,
-        cumulative_max_attempts: int,
-        cumulative_max_occurrences: int,
-        maximum_consecutive_failures: int,
-        expires_at: datetime,
-        skill_names: tuple[str, ...],
-        basis_run_id: str | None,
-        requested_capability_grants: tuple[RequestedCapabilityGrant, ...] = (),
-        run_immediately: bool = False,
-    ) -> ScheduledRoutine:
-        origin = await self._owned_run(run_id, conversation_id, sensitivity_ceiling)
-        _reject_scope_refs(authorized_instruction, origin)
-        if allowed_connector_binding_ids is None:
-            allowed_connector_binding_ids = self._connector_binding_ids(
-                allowed_capability_ids
-            )
-        distribution_destination_id = self._distribution_destination_id(
-            conversation_id, distribution_destination_id, sensitivity_ceiling
-        )
-        self._validate_budgets(
-            per_run_max_tokens,
-            cumulative_max_tokens,
-            per_run_max_cost_usd,
-            cumulative_max_cost_usd,
-        )
-        self._validate_model_routes(eligible_model_routes)
-        self._validate_precheck(
-            reporting_mode,
-            precheck,
-            allowed_source_ids,
-            allowed_resource_ids,
-            allowed_connector_binding_ids,
-            allowed_capability_ids,
-        )
-        promotion = (
-            None
-            if basis_run_id is None
-            else await self._promotion_evidence(
-                basis_run_id,
-                conversation_id=conversation_id,
-                instruction=authorized_instruction,
-                allowed_capability_ids=allowed_capability_ids,
-            )
-        )
-        routine_hash = sha256(
-            f"{self.agent_id}\x00{run_id}\x00{call_id}".encode("utf-8")
-        ).hexdigest()[:32]
-        access_modes = self._access_modes(allowed_capability_ids)
-        skill_bindings = await self._prepare_skill_bindings(
-            skill_names,
-            attached_at=origin.run.created_at,
-        )
-        try:
-            distribution_plan = self._distribution.resolve_plan(
-                conversation_id,
-                destination_id=distribution_destination_id,
-                sensitivity_ceiling=sensitivity_ceiling,
-            )
-        except ValueError as error:
-            raise RoutineError(
-                "routine_distribution_destination_invalid",
-                "The exact distribution destination is not currently selectable.",
-            ) from error
-        if requested_capability_grants:
-            await self._store.require_effects_unblocked(self.agent_id)
-        record = ScheduledRoutine(
-            capability_grants=await self._prepare_requested_grants(
-                AutomationScopeProposal(
-                    agent_id=self.agent_id,
-                    principal_id=f"agent:{self.agent_id}",
-                    allowed_source_ids=allowed_source_ids,
-                    allowed_resource_ids=allowed_resource_ids,
-                    allowed_connector_binding_ids=allowed_connector_binding_ids,
-                    allowed_capability_ids=allowed_capability_ids,
-                    allowed_access_modes=self._access_modes(allowed_capability_ids),
-                    allowed_operational_effects=frozenset(
-                        self._require_capability_registry()
-                        .capability(item)
-                        .operational_effect
-                        for item in allowed_capability_ids
-                    ),
-                    sensitivity_ceiling=sensitivity_ceiling,
-                    eligible_model_routes=eligible_model_routes,
-                    per_run_max_cost_usd=per_run_max_cost_usd,
-                    per_run_max_tokens=per_run_max_tokens,
-                    expires_at=expires_at,
-                    distribution_plan_digest=distribution_plan.plan_digest,
-                ),
-                requested_capability_grants,
-            ),
-            run_immediately=run_immediately,
-            contract_bindings=await self._bind_contracts(
-                agent_id=self.agent_id,
-                source_ids=allowed_source_ids,
-                resource_ids=allowed_resource_ids,
-                capability_ids=allowed_capability_ids,
-                connector_binding_ids=allowed_connector_binding_ids,
-                model_route_ids=eligible_model_routes,
-            ),
-            routine_id=f"routine-{routine_hash}",
-            agent_id=self.agent_id,
-            conversation_id=conversation_id,
-            owner_principal_id=f"agent:{self.agent_id}",
-            title=title,
-            authorized_instruction=authorized_instruction,
-            instruction_digest=text_digest(authorized_instruction),
-            schedule=schedule,
-            schedule_interpreter_revision=SCHEDULE_INTERPRETER_REVISION,
-            misfire_policy=misfire_policy,
-            reporting_mode=reporting_mode,
-            precheck=precheck,
-            last_acknowledged_precheck_observation=None,
-            allowed_source_ids=allowed_source_ids,
-            allowed_connector_binding_ids=allowed_connector_binding_ids,
-            allowed_resource_ids=allowed_resource_ids,
-            allowed_capability_ids=allowed_capability_ids,
-            allowed_access_modes=access_modes,
-            allowed_operational_effects=frozenset(
-                self._require_capability_registry().capability(item).operational_effect
-                for item in allowed_capability_ids
-            ),
-            sensitivity_ceiling=sensitivity_ceiling,
-            outcome_contract=outcome_contract,
-            distribution_plan=distribution_plan,
-            eligible_model_routes=eligible_model_routes,
-            skill_bindings=skill_bindings,
-            per_run_max_tokens=per_run_max_tokens,
-            per_run_max_cost_usd=per_run_max_cost_usd,
-            cumulative_max_tokens=cumulative_max_tokens,
-            cumulative_max_cost_usd=cumulative_max_cost_usd,
-            cumulative_max_attempts=cumulative_max_attempts,
-            cumulative_max_occurrences=cumulative_max_occurrences,
-            reserved_tokens=0,
-            reserved_cost_usd=Decimal("0"),
-            charged_tokens=0,
-            charged_cost_usd=Decimal("0"),
-            attempt_count=0,
-            occurrence_count=0,
-            maximum_consecutive_failures=maximum_consecutive_failures,
-            consecutive_failures=0,
-            expires_at=expires_at,
-            next_due_at=None,
-            active_occurrence_id=None,
-            last_occurrence_id=None,
-            last_delivery_ids=(),
-            promotion_evidence=promotion,
-            state=RoutineState.ACTIVE,
-            revision=1,
-            created_at=origin.run.created_at,
-            updated_at=origin.run.created_at,
-        )
-        await self.proposal_authority_snapshot(record)
-        return record
+        identity: str,
+        routine_id: str | None = None,
+        expected_revision: int | None = None,
+        origin_run_id: str | None = None,
+        reference_at: datetime | None = None,
+        relative_at: datetime | None = None,
+    ) -> PreparedRoutine:
+        """Validate one create (no ``routine_id``) or update and build its card.
 
-    async def admit(self, routine: ScheduledRoutine) -> ScheduledRoutine:
-        await self._retain_bindings(routine.skill_bindings)
-        await self.authority_snapshot(routine)
-        try:
-            stored = await self._store.admit_scheduled_routine(routine)
-        except ValueError as error:
-            raise self._store_error(error, "routine_admission_failed") from error
-        self._notify()
-        return stored
+        A named local instant resolves at ``reference_at`` (default: now), when
+        the card was shown, so approval never moves it to a later week.
+        Relative delays count from ``relative_at`` (default: ``reference_at``):
+        the save after approval passes the moment it commits.
+        """
 
-    async def prepare_revision(
-        self,
-        current: ScheduledRoutine,
-        *,
-        run_id: str,
-        conversation_id: str,
-        title: str,
-        authorized_instruction: str,
-        schedule: RoutineSchedule,
-        misfire_policy: MisfirePolicy,
-        reporting_mode: ReportingMode,
-        precheck: ResourceRevisionPrecheck | None,
-        allowed_source_ids: tuple[str, ...],
-        allowed_connector_binding_ids: tuple[str, ...] | None,
-        allowed_resource_ids: tuple[str, ...],
-        allowed_capability_ids: tuple[str, ...],
-        sensitivity_ceiling: ModelSensitivity,
-        outcome_contract: OutcomeContract,
-        distribution_destination_id: str | None,
-        eligible_model_routes: tuple[str, ...],
-        per_run_max_tokens: int,
-        per_run_max_cost_usd: Decimal | None,
-        cumulative_max_tokens: int,
-        cumulative_max_cost_usd: Decimal | None,
-        cumulative_max_attempts: int,
-        cumulative_max_occurrences: int,
-        maximum_consecutive_failures: int,
-        expires_at: datetime,
-        skill_names: tuple[str, ...],
-        basis_run_id: str | None,
-        requested_capability_grants: tuple[RequestedCapabilityGrant, ...] = (),
-        run_immediately: bool = False,
-    ) -> ScheduledRoutine:
-        origin = await self._owned_run(run_id, conversation_id, sensitivity_ceiling)
-        _reject_scope_refs(authorized_instruction, origin)
-        if current.conversation_id != conversation_id:
-            raise RoutineError(
-                "routine_conversation_mismatch",
-                "The routine belongs to another conversation.",
-            )
-        if origin.run.created_at < current.updated_at:
-            raise RoutineError(
-                "routine_revision_changed",
-                "The routine changed after this foreground run began.",
-            )
-        if allowed_connector_binding_ids is None:
-            allowed_connector_binding_ids = self._connector_binding_ids(
-                allowed_capability_ids
-            )
-        distribution_destination_id = self._distribution_destination_id(
-            conversation_id, distribution_destination_id, sensitivity_ceiling
-        )
-        self._validate_budgets(
-            per_run_max_tokens,
-            cumulative_max_tokens,
-            per_run_max_cost_usd,
-            cumulative_max_cost_usd,
-        )
-        self._validate_model_routes(eligible_model_routes)
-        self._validate_precheck(
-            reporting_mode,
-            precheck,
-            allowed_source_ids,
-            allowed_resource_ids,
-            allowed_connector_binding_ids,
-            allowed_capability_ids,
-        )
-        promotion = (
-            current.promotion_evidence
-            if basis_run_id is None
-            else await self._promotion_evidence(
-                basis_run_id,
-                conversation_id=conversation_id,
-                instruction=authorized_instruction,
-                allowed_capability_ids=allowed_capability_ids,
-            )
-        )
-        skill_bindings = await self._prepare_skill_bindings(
-            skill_names,
-            attached_at=origin.run.created_at,
-        )
-        try:
-            distribution_plan = self._distribution.resolve_plan(
-                conversation_id,
-                destination_id=distribution_destination_id,
-                sensitivity_ceiling=sensitivity_ceiling,
-            )
-        except ValueError as error:
-            raise RoutineError(
-                "routine_distribution_destination_invalid",
-                "The exact distribution destination is not currently selectable.",
-            ) from error
-        if run_immediately:
-            raise RoutineError(
-                "routine_immediate_creation_only",
-                "Immediate-first execution belongs to creation; use run-now for an existing routine.",
-            )
-        revised = replace(
-            current,
-            run_immediately=False,
-            capability_grants=await self._prepare_requested_grants(
-                AutomationScopeProposal(
-                    agent_id=self.agent_id,
-                    principal_id=f"agent:{self.agent_id}",
-                    allowed_source_ids=allowed_source_ids,
-                    allowed_resource_ids=allowed_resource_ids,
-                    allowed_connector_binding_ids=allowed_connector_binding_ids,
-                    allowed_capability_ids=allowed_capability_ids,
-                    allowed_access_modes=self._access_modes(allowed_capability_ids),
-                    allowed_operational_effects=frozenset(
-                        self._require_capability_registry()
-                        .capability(item)
-                        .operational_effect
-                        for item in allowed_capability_ids
-                    ),
-                    sensitivity_ceiling=sensitivity_ceiling,
-                    eligible_model_routes=eligible_model_routes,
-                    per_run_max_cost_usd=per_run_max_cost_usd,
-                    per_run_max_tokens=per_run_max_tokens,
-                    expires_at=expires_at,
-                    distribution_plan_digest=distribution_plan.plan_digest,
-                ),
-                requested_capability_grants,
-            ),
-            contract_bindings=await self._bind_contracts(
-                agent_id=self.agent_id,
-                source_ids=allowed_source_ids,
-                resource_ids=allowed_resource_ids,
-                capability_ids=allowed_capability_ids,
-                connector_binding_ids=allowed_connector_binding_ids,
-                model_route_ids=eligible_model_routes,
-            ),
-            title=title,
-            authorized_instruction=authorized_instruction,
-            instruction_digest=text_digest(authorized_instruction),
-            schedule=schedule,
-            misfire_policy=misfire_policy,
-            reporting_mode=reporting_mode,
-            precheck=precheck,
-            last_acknowledged_precheck_observation=None,
-            allowed_source_ids=allowed_source_ids,
-            allowed_connector_binding_ids=allowed_connector_binding_ids,
-            allowed_resource_ids=allowed_resource_ids,
-            allowed_capability_ids=allowed_capability_ids,
-            allowed_access_modes=self._access_modes(allowed_capability_ids),
-            allowed_operational_effects=frozenset(
-                self._require_capability_registry().capability(item).operational_effect
-                for item in allowed_capability_ids
-            ),
-            sensitivity_ceiling=sensitivity_ceiling,
-            outcome_contract=outcome_contract,
-            distribution_plan=distribution_plan,
-            eligible_model_routes=eligible_model_routes,
-            skill_bindings=skill_bindings,
-            per_run_max_tokens=per_run_max_tokens,
-            per_run_max_cost_usd=per_run_max_cost_usd,
-            cumulative_max_tokens=cumulative_max_tokens,
-            cumulative_max_cost_usd=cumulative_max_cost_usd,
-            cumulative_max_attempts=cumulative_max_attempts,
-            cumulative_max_occurrences=cumulative_max_occurrences,
-            maximum_consecutive_failures=maximum_consecutive_failures,
-            expires_at=expires_at,
-            promotion_evidence=promotion,
-            revision=current.revision + 1,
-            updated_at=origin.run.created_at,
-        )
-        await self.proposal_authority_snapshot(revised)
-        return revised
-
-    async def revise(
-        self,
-        routine: ScheduledRoutine,
-        *,
-        expected_revision: int,
-    ) -> ScheduledRoutine:
-        await self._retain_bindings(routine.skill_bindings)
-        await self.authority_snapshot(routine)
-        try:
-            stored = await self._store.revise_scheduled_routine(
-                routine,
-                expected_revision=expected_revision,
-            )
-        except ValueError as error:
-            raise self._store_error(error, "routine_revision_failed") from error
-        if stored is None:
+        if not isinstance(intent, RoutineIntent):
+            raise TypeError("routine intent must be RoutineIntent")
+        now = self._clock()
+        timing_at = reference_at or now
+        saving_at = relative_at or timing_at
+        current = None if routine_id is None else await self._load_owned(routine_id)
+        if routine_id is not None and (
+            current is None
+            or (expected_revision is not None and current.revision != expected_revision)
+        ):
             raise RoutineError(
                 "routine_revision_changed",
                 "The routine changed or is no longer owned by this agent.",
             )
+        if current is None:
+            missing = [
+                name
+                for name in ("title", "prompt", "schedule")
+                if getattr(intent, name) is None
+            ]
+            if missing:
+                raise RoutineError(
+                    "routine_argument_missing",
+                    "A new routine needs " + ", ".join(missing) + ".",
+                )
+        elif intent.run_immediately:
+            raise RoutineError(
+                "routine_immediate_creation_only",
+                "run_immediately is for creation; use run_now for an existing routine.",
+            )
+        prompt = (
+            intent.prompt
+            if intent.prompt is not None
+            else current.authorized_instruction if current is not None else ""
+        )
+        refs: ScopeRefs | None = None
+        if origin_run_id is not None:
+            origin = await self._store.load(origin_run_id)
+            _reject_scope_refs(prompt, origin)
+            # The model names sources by the s# handles its own run shows it.
+            refs = scope_refs(origin.run.resolved_source_scope)
+        relative = isinstance(intent.schedule, FrozenJsonObject) and bool(
+            {"after_seconds", "anchor_after_seconds"} & set(intent.schedule)
+        )
+        if isinstance(intent.schedule, FrozenJsonObject):
+            schedule = parse_schedule(
+                intent.schedule, reference_at=timing_at, relative_at=saving_at
+            )
+        elif intent.schedule is not None:
+            schedule = intent.schedule
+        else:
+            assert current is not None
+            schedule = current.schedule
+        try:
+            validate_schedule(schedule)
+        except ValueError as error:
+            raise RoutineError("routine_schedule_invalid", str(error)) from error
+        if intent.run_immediately and isinstance(schedule, OnceSchedule):
+            raise RoutineError(
+                "routine_schedule_invalid",
+                "run_immediately needs an interval or calendar schedule.",
+            )
+        if (
+            intent.schedule is not None
+            and isinstance(schedule, OnceSchedule)
+            and schedule.exact_at <= saving_at
+        ):
+            raise RoutineError(
+                "routine_schedule_passed",
+                "The schedule's time passed before creation; choose a later time.",
+            )
+        registrations = tuple(
+            item
+            for item in await self._store.list_sources(self.agent_id)
+            if item.active
+        )
+        source_ids = (
+            _resolve_sources(intent.sources, registrations, refs)
+            if intent.sources is not None
+            else current.source_ids if current is not None else ()
+        )
+        title = (
+            intent.title
+            if intent.title is not None
+            else current.title if current is not None else ""
+        )
+        if current is None:
+            routine = ScheduledRoutine(
+                routine_id="routine-"
+                + sha256(f"{self.agent_id}\x00{identity}".encode()).hexdigest()[:32],
+                agent_id=self.agent_id,
+                conversation_id=conversation_id,
+                owner_principal_id=f"agent:{self.agent_id}",
+                title=title,
+                authorized_instruction=prompt,
+                instruction_digest=text_digest(prompt),
+                schedule=schedule,
+                schedule_interpreter_revision=SCHEDULE_INTERPRETER_REVISION,
+                source_ids=source_ids,
+                charged_tokens=0,
+                charged_cost_usd=Decimal("0"),
+                attempt_count=0,
+                occurrence_count=0,
+                consecutive_failures=0,
+                next_due_at=None,
+                active_occurrence_id=None,
+                last_occurrence_id=None,
+                last_delivery_ids=(),
+                state=RoutineState.ACTIVE,
+                revision=1,
+                created_at=now,
+                updated_at=now,
+            )
+        else:
+            routine = replace(
+                current,
+                title=title,
+                authorized_instruction=prompt,
+                instruction_digest=text_digest(prompt),
+                schedule=schedule,
+                source_ids=source_ids,
+                revision=current.revision + 1,
+                updated_at=max(now, current.updated_at),
+            )
+        names = {item.id: item.display_name for item in registrations}
+        card = FrozenJsonObject.from_mapping(
+            {
+                "title": routine.title,
+                "schedule": schedule_text(
+                    schedule,
+                    run_immediately=intent.run_immediately,
+                    from_approval=relative,
+                ),
+                "prompt": routine.authorized_instruction,
+                "sources": (
+                    tuple(names.get(item, item) for item in routine.source_ids)
+                    if routine.source_ids
+                    else "All current sources"
+                ),
+            }
+        )
+        return PreparedRoutine(
+            routine=routine,
+            expected_revision=None if current is None else current.revision,
+            run_immediately=intent.run_immediately,
+            card=card,
+        )
+
+    async def save(self, prepared: PreparedRoutine) -> ScheduledRoutine:
+        """Store one prepared create or update."""
+
+        try:
+            if prepared.expected_revision is None:
+                stored = await self._store.admit_scheduled_routine(
+                    prepared.routine, run_immediately=prepared.run_immediately
+                )
+            else:
+                revised = await self._store.revise_scheduled_routine(
+                    prepared.routine, expected_revision=prepared.expected_revision
+                )
+                if revised is None:
+                    raise RoutineError(
+                        "routine_revision_changed",
+                        "The routine changed or is no longer owned by this agent.",
+                    )
+                stored = revised
+        except ValueError as error:
+            raise self._store_error(error, "routine_save_failed") from error
         self._notify()
         return stored
 
@@ -888,10 +492,8 @@ class RoutineOwner:
                 "The routine changed or is no longer owned by this agent.",
             )
         now = self._clock()
-        if current.capability_grants and action in {
-            RoutineControlAction.RUN_NOW,
-            RoutineControlAction.RESUME,
-        }:
+        if action in {RoutineControlAction.RUN_NOW, RoutineControlAction.RESUME}:
+            # An uncertain write stays unresolved until a person decides.
             await self._store.require_effects_unblocked(
                 self.agent_id, routine_id=routine_id
             )
@@ -900,7 +502,6 @@ class RoutineOwner:
                 raise RoutineError(
                     "routine_not_active", "Only an active routine can run now."
                 )
-            await self.authority_snapshot(current)
             claim_hash = sha256(
                 f"{self.agent_id}\x00{routine_id}\x00{authorized_control_call_id}".encode(
                     "utf-8"
@@ -950,8 +551,6 @@ class RoutineOwner:
             RoutineState.EXPIRED,
         }:
             raise RoutineError("routine_terminal", "This routine is already terminal.")
-        if target is RoutineState.ACTIVE:
-            await self.authority_snapshot(current)
         try:
             updated = await self._store.transition_scheduled_routine(
                 self.agent_id,
@@ -968,672 +567,6 @@ class RoutineOwner:
             )
         self._notify()
         return updated
-
-    async def authority_snapshot(self, routine: ScheduledRoutine) -> FrozenJsonObject:
-        """Revalidate the complete retained routine contract."""
-
-        return await self._authority_snapshot(
-            routine,
-            allow_unretained_skills=False,
-        )
-
-    async def proposal_authority_snapshot(
-        self, routine: ScheduledRoutine
-    ) -> FrozenJsonObject:
-        """Revalidate a proposal before its exact skill bytes are retained.
-
-        The snapshot also carries the code-computed first occurrences, so the
-        approval shows real dates instead of asking anyone to derive them.
-        """
-
-        preview = schedule_preview(
-            routine, not_before=routine.updated_at, pending_immediate=True
-        )
-        snapshot = await self._authority_snapshot(
-            routine,
-            allow_unretained_skills=True,
-        )
-        return FrozenJsonObject.from_mapping({**snapshot, "schedule_preview": preview})
-
-    async def _authority_snapshot(
-        self,
-        routine: ScheduledRoutine,
-        *,
-        allow_unretained_skills: bool,
-    ) -> FrozenJsonObject:
-        """Revalidate current authority and return its bounded fingerprint."""
-
-        if routine.agent_id != self.agent_id:
-            raise RoutineError("routine_owner_mismatch", "The routine owner changed.")
-        self._validate_precheck(
-            routine.reporting_mode,
-            routine.precheck,
-            routine.allowed_source_ids,
-            routine.allowed_resource_ids,
-            routine.allowed_connector_binding_ids,
-            routine.allowed_capability_ids,
-        )
-        validate_schedule(routine.schedule)
-        if self._clock() >= routine.expires_at:
-            raise RoutineError("routine_expired", "The routine has expired.")
-        if not await self._store.conversation_exists(
-            self.agent_id, routine.conversation_id
-        ):
-            raise RoutineError(
-                "routine_conversation_missing",
-                "The exact destination conversation is unavailable.",
-            )
-        target = routine.distribution_plan.targets[0]
-        try:
-            current_plan = self._distribution.resolve_plan(
-                routine.conversation_id,
-                destination_id=target.destination_id,
-                sensitivity_ceiling=target.sensitivity_ceiling,
-            )
-        except ValueError as error:
-            raise RoutineError(
-                "routine_distribution_destination_revoked",
-                "The exact distribution destination is no longer eligible.",
-            ) from error
-        if current_plan != routine.distribution_plan:
-            raise RoutineError(
-                "routine_distribution_destination_changed",
-                "The exact distribution destination revision changed.",
-            )
-        self._validate_model_routes(routine.eligible_model_routes)
-        if routine.per_run_max_tokens > self._maximum_per_run_tokens:
-            raise RoutineError(
-                "routine_token_budget_exceeded",
-                "The routine per-run token ceiling exceeds the host ceiling.",
-            )
-        if (
-            self._maximum_per_run_cost_usd is not None
-            and routine.per_run_max_cost_usd is not None
-            and routine.per_run_max_cost_usd > self._maximum_per_run_cost_usd
-        ):
-            raise RoutineError(
-                "routine_cost_budget_exceeded",
-                "The routine per-run cost ceiling exceeds the host ceiling.",
-            )
-        capabilities = self._require_capability_registry()
-        try:
-            capability_ids = capabilities.validate_execution_scope_grant(
-                routine.allowed_capability_ids,
-                allowed_access_modes=routine.allowed_access_modes,
-                allowed_operational_effects=routine.allowed_operational_effects,
-            )
-        except (KeyError, ValueError) as error:
-            raise RoutineError(
-                "routine_capability_invalid",
-                "The exact capability ceiling is no longer admitted.",
-            ) from error
-        current_contracts = await self._bind_contracts(
-            agent_id=self.agent_id,
-            source_ids=routine.allowed_source_ids,
-            resource_ids=routine.allowed_resource_ids,
-            capability_ids=routine.allowed_capability_ids,
-            connector_binding_ids=routine.allowed_connector_binding_ids,
-            model_route_ids=routine.eligible_model_routes,
-        )
-        if routine.capability_grants:
-            await self._store.require_effects_unblocked(
-                self.agent_id, routine_id=routine.routine_id
-            )
-        if current_contracts != routine.contract_bindings:
-            raise RoutineError(
-                "routine_execution_contract_changed",
-                "An approved execution contract changed; a foreground-approved revision is required.",
-            )
-        declared = tuple(capabilities.capability(item) for item in capability_ids)
-        if routine.allowed_access_modes != frozenset(
-            item.access_mode for item in declared
-        ) or routine.allowed_operational_effects != frozenset(
-            item.operational_effect for item in declared
-        ):
-            raise RoutineError(
-                "routine_ceiling_invalid",
-                "Access and effect ceilings must exactly match the approved capabilities.",
-            )
-        effectful = {
-            item.id: item
-            for item in declared
-            if item.operational_effect is not OperationalEffect.NONE
-        }
-        grants = {item.capability_id: item for item in routine.capability_grants}
-        requirements = {
-            item.capability_id: item
-            for item in routine.outcome_contract.effect_requirements
-        }
-        if set(grants) != set(effectful) or set(requirements) != set(effectful):
-            raise RoutineError(
-                "routine_effect_contract_invalid",
-                "Each allowed effect requires one exact grant and an explicit mandatory or optional completion requirement.",
-            )
-        for capability_id, capability in effectful.items():
-            grant = grants[capability_id]
-            effect_requirement = requirements[capability_id]
-            if (
-                capability.automation_grant_policy is None
-                or capability.effect_receipt_policy is None
-            ):
-                raise RoutineError(
-                    "routine_effect_contract_invalid",
-                    "The effect does not support a standing grant and receipt.",
-                )
-            if (
-                grant.domain_owner_id
-                != capabilities.resolve_domain_owner(capability_id)
-                or grant.constraints_kind
-                != capability.automation_grant_policy.constraints_kind
-            ):
-                raise RoutineError(
-                    "routine_effect_contract_invalid",
-                    "The grant does not match its exact owning capability.",
-                )
-            capabilities.validate_grant_constraints(capability_id, grant.constraints)
-            if (
-                effect_requirement.minimum_successful_calls
-                > grant.max_calls_per_occurrence
-                or capability.effect_receipt_policy.success_evidence_basis
-                not in effect_requirement.accepted_evidence_bases
-            ):
-                raise RoutineError(
-                    "routine_effect_requirement_unsupported",
-                    "The requested completion evidence or call count cannot be established by this producer.",
-                )
-        capability_facts: list[dict[str, object]] = []
-        mcp_capability_ids: set[str] = set()
-        for capability_id in capability_ids:
-            capability = capabilities.capability(capability_id)
-            if (
-                capability.automation_eligibility
-                is not AutomationEligibility.AUTOMATION_DIRECT
-            ):
-                raise RoutineError(
-                    "routine_capability_interactive_only",
-                    "A requested capability is not eligible for scheduled execution.",
-                )
-            owner_id = capabilities.resolve_domain_owner(capability_id)
-            if owner_id == "mcp":
-                mcp_capability_ids.add(capability_id)
-            capability_facts.append(
-                {
-                    "capability_id": capability_id,
-                    "contract_digest": capabilities.contract_digest(capability_id),
-                }
-            )
-        for requirement in routine.outcome_contract.artifact_requirements:
-            producer_ids = requirement.allowed_producer_capability_ids or capability_ids
-            candidates = []
-            for producer_id in producer_ids:
-                if producer_id not in capability_ids:
-                    raise RoutineError(
-                        "routine_outcome_capability_outside_scope",
-                        "An outcome artifact producer is outside the capability ceiling.",
-                    )
-                producer = capabilities.capability(producer_id)
-                policy = producer.artifact_policy
-                if policy is None:
-                    continue
-                media_matches = not requirement.allowed_media_types or bool(
-                    set(requirement.allowed_media_types)
-                    & set(policy.allowed_media_types)
-                )
-                authorships = set(requirement.allowed_authorships)
-                if routine.outcome_contract.require_exact_source_bindings:
-                    authorships = (
-                        authorships & {ArtifactAuthorship.EXACT_SOURCE_DATA}
-                        if authorships
-                        else {ArtifactAuthorship.EXACT_SOURCE_DATA}
-                    )
-                authorship_matches = not authorships or bool(
-                    authorships & set(policy.allowed_authorships)
-                )
-                if media_matches and authorship_matches:
-                    candidates.append(producer_id)
-            if requirement.required and not candidates:
-                raise RoutineError(
-                    "routine_outcome_artifact_contract_invalid",
-                    "An outcome artifact requirement cannot be satisfied by its producers.",
-                )
-        if bool(routine.skill_bindings) != (SKILL_VIEW_CAPABILITY_ID in capability_ids):
-            raise RoutineError(
-                "routine_skill_capability_invalid",
-                "Pinned skills and the exact skill-view capability must be present together.",
-            )
-        readable = (
-            await self._catalog.readable_resource_ids(
-                self.agent_id, routine.allowed_source_ids
-            )
-            if routine.allowed_source_ids
-            else frozenset()
-        )
-        if not set(routine.allowed_resource_ids) <= readable:
-            raise RoutineError(
-                "routine_resource_revoked",
-                "One or more exact resources are no longer readable.",
-            )
-        resource_facts: list[dict[str, object]] = []
-        for resource_id in routine.allowed_resource_ids:
-            resource = await self._store.load_resource(self.agent_id, resource_id)
-            if (
-                resource is None
-                or resource.agent_id != self.agent_id
-                or resource.source_id not in routine.allowed_source_ids
-            ):
-                raise RoutineError(
-                    "routine_resource_identity_changed",
-                    "An exact resource identity or source binding changed.",
-                )
-            sensitivity = _model_sensitivity(resource.sensitivity)
-            if sensitivity.routing_rank > routine.sensitivity_ceiling.routing_rank:
-                raise RoutineError(
-                    "routine_sensitivity_exceeded",
-                    "The resource sensitivity exceeds the routine ceiling.",
-                )
-            resource_facts.append(
-                {
-                    "resource_id": resource.id,
-                    "display_name": resource.native_identity,
-                    "source_id": resource.source_id,
-                    "revision": resource.current_revision,
-                    "sensitivity": resource.sensitivity.value,
-                }
-            )
-        binding_facts: list[dict[str, object]] = []
-        admitted_mcp_capabilities: set[str] = set()
-        for binding_id in routine.allowed_connector_binding_ids:
-            binding = await self._store.load_mcp_binding(self.agent_id, binding_id)
-            if binding is None or binding.state is not MCPBindingState.ACTIVE:
-                raise RoutineError(
-                    "routine_mcp_binding_revoked",
-                    "An exact MCP binding is not currently active.",
-                )
-            selected_tools = tuple(
-                tool
-                for tool in binding.tools
-                if tool.capability_id in routine.allowed_capability_ids
-            )
-            admitted_mcp_capabilities.update(
-                tool.capability_id for tool in selected_tools
-            )
-            for tool in selected_tools:
-                if (
-                    tool.result_sensitivity.routing_rank
-                    > routine.sensitivity_ceiling.routing_rank
-                ):
-                    raise RoutineError(
-                        "routine_sensitivity_exceeded",
-                        "An MCP result sensitivity exceeds the routine ceiling.",
-                    )
-            binding_facts.append(
-                {
-                    "binding_id": binding.binding_id,
-                    "revision": binding.revision,
-                    "endpoint": binding.endpoint,
-                    "display_name": binding.local_label,
-                    "server_name": binding.server_name,
-                    "maximum_outbound_sensitivity": binding.maximum_outbound_sensitivity.value,
-                    "tools": tuple(
-                        {
-                            "capability_id": tool.capability_id,
-                            "remote_tool_name": tool.remote_name,
-                            "maximum_outbound_sensitivity": tool.maximum_outbound_sensitivity.value,
-                            "result_sensitivity": tool.result_sensitivity.value,
-                            "input_schema_digest": tool.input_schema_digest,
-                            "output_schema_digest": tool.output_schema_digest,
-                        }
-                        for tool in selected_tools
-                    ),
-                }
-            )
-        if mcp_capability_ids != admitted_mcp_capabilities:
-            raise RoutineError(
-                "routine_mcp_capability_unbound",
-                "The exact MCP capability ceiling is not bound by the retained servers.",
-            )
-        skill_facts: list[dict[str, object]] = []
-        for skill_binding in routine.skill_bindings:
-            if self._skills is None:
-                raise RoutineError(
-                    "routine_skill_store_unavailable",
-                    "Pinned skill content is unavailable.",
-                )
-            retained = await self._skills.read_retained_skill(
-                skill_binding.skill_name,
-                skill_binding.content_digest,
-            )
-            if retained is None and allow_unretained_skills:
-                current, digest = await self._skills.read_skill_with_digest(
-                    skill_binding.skill_name
-                )
-                if (
-                    current is not None
-                    and f"sha256:{digest}" == skill_binding.content_digest
-                ):
-                    retained = current
-            if retained is None:
-                raise RoutineError(
-                    "routine_skill_content_missing",
-                    "Exact retained skill content is missing or changed.",
-                )
-            if (
-                retained.sensitivity.routing_rank
-                > routine.sensitivity_ceiling.routing_rank
-            ):
-                raise RoutineError(
-                    "routine_skill_sensitivity_exceeded",
-                    "The retained skill exceeds the routine sensitivity ceiling.",
-                )
-            skill_facts.append(
-                {
-                    "skill_name": skill_binding.skill_name,
-                    "content_digest": skill_binding.content_digest,
-                    "sensitivity": retained.sensitivity.value,
-                }
-            )
-        return FrozenJsonObject.from_mapping(
-            {
-                "routine": _routine_proposal_payload(routine),
-                "authority": {
-                    "capabilities": tuple(capability_facts),
-                    "resources": tuple(resource_facts),
-                    "bindings": tuple(binding_facts),
-                    "skills": tuple(skill_facts),
-                    "outcome_contract_digest": routine.outcome_contract.digest,
-                    "distribution_plan_digest": routine.distribution_plan.plan_digest,
-                    "eligible_model_routes": self._eligible_model_routes,
-                },
-            }
-        )
-
-    async def _owned_run(
-        self, run_id: str, conversation_id: str, sensitivity_ceiling: ModelSensitivity
-    ) -> Transcript:
-        try:
-            transcript = await self._store.load(run_id)
-        except KeyError as error:
-            raise RoutineError(
-                "routine_origin_run_missing", "The origin run is unknown."
-            ) from error
-        if (
-            transcript.run.agent_id != self.agent_id
-            or transcript.run.conversation_id != conversation_id
-            or transcript.run.start is None
-            or transcript.run.start.origin is not RunOrigin.USER
-        ):
-            raise RoutineError(
-                "routine_origin_run_mismatch",
-                "Routine management requires this exact foreground conversation run.",
-            )
-        result = await self._store.result(run_id)
-        floor = max(
-            transcript.run.history_sensitivity,
-            result.sensitivity if result is not None else ModelSensitivity.PUBLIC,
-            key=lambda item: item.routing_rank,
-        )
-        if floor.routing_rank > sensitivity_ceiling.routing_rank:
-            raise RoutineError(
-                "routine_instruction_sensitivity_exceeded",
-                "The saved instruction must retain its originating request sensitivity.",
-            )
-        return transcript
-
-    async def _promotion_evidence(
-        self,
-        basis_run_id: str,
-        *,
-        conversation_id: str,
-        instruction: str,
-        allowed_capability_ids: tuple[str, ...],
-    ) -> RoutinePromotionEvidence:
-        if _contains_reference_marker(instruction):
-            raise RoutineError(
-                "routine_instruction_not_self_contained",
-                "The authorized instruction contains a run-bound reference marker.",
-            )
-        try:
-            transcript = await self._store.load(basis_run_id)
-            result = await self._store.result(basis_run_id)
-        except KeyError as error:
-            raise RoutineError(
-                "routine_basis_run_missing", "The basis run is unknown."
-            ) from error
-        if (
-            transcript.run.agent_id != self.agent_id
-            or transcript.run.conversation_id != conversation_id
-            or result is None
-            or result.kind is not LoopExitKind.COMPLETED
-            or result.conversation_id != conversation_id
-        ):
-            raise RoutineError(
-                "routine_basis_run_invalid",
-                "The basis run is not a completed run in this exact conversation.",
-            )
-        try:
-            validate_completed_transcript(transcript, result)
-        except ValueError as error:
-            raise RoutineError(
-                "routine_basis_run_invalid",
-                "The basis run transcript is not a valid completed run.",
-            ) from error
-        capabilities = self._require_capability_registry()
-        executed: set[str] = set()
-        # Lineage reads each call as it executed: run-scoped refs and handles
-        # are replaced by the identities they named in the basis run.
-        for call, _ in capabilities.executed_tool_pairs(transcript):
-            if _contains_reference_marker(call.arguments):
-                raise RoutineError(
-                    "routine_basis_run_has_tool_ref",
-                    "The basis run used a run-bound tool reference.",
-                )
-            if call.name in RESERVED_TOOL_NAMES:
-                continue
-            try:
-                capability = capabilities.call_capability(call.name, call.arguments)
-            except KeyError as error:
-                raise RoutineError(
-                    "routine_basis_lineage_unknown",
-                    "The basis run contains unknown capability lineage.",
-                ) from error
-            executed.add(capability.id)
-        if not executed or not executed <= set(allowed_capability_ids):
-            raise RoutineError(
-                "routine_basis_lineage_outside_scope",
-                "The basis run capability lineage is not contained by the routine.",
-            )
-        terminal_material = canonical_json(
-            {
-                "run_id": result.run_id,
-                "conversation_id": result.conversation_id,
-                "kind": result.kind.value,
-                "reason": result.reason,
-                "created_at": result.created_at.isoformat(),
-                "final_text": result.final_text,
-                "steps": result.steps,
-                "input_tokens": result.usage.input_tokens,
-                "output_tokens": result.usage.output_tokens,
-            }
-        )
-        return RoutinePromotionEvidence(
-            basis_run_id=basis_run_id,
-            terminal_result_digest=(
-                "sha256:" + sha256(terminal_material.encode("utf-8")).hexdigest()
-            ),
-            executed_capability_ids=tuple(sorted(executed)),
-        )
-
-    async def _prepare_skill_bindings(
-        self,
-        skill_names: tuple[str, ...],
-        *,
-        attached_at: datetime,
-    ) -> tuple[RoutineSkillBinding, ...]:
-        names = tuple(sorted(skill_names))
-        if len(names) != len(set(names)):
-            raise RoutineError(
-                "routine_skill_binding_invalid",
-                "Routine skill names cannot be duplicated.",
-            )
-        if names and self._skills is None:
-            raise RoutineError(
-                "routine_skill_store_unavailable",
-                "Pinned skill content is unavailable.",
-            )
-        bindings: list[RoutineSkillBinding] = []
-        for name in names:
-            assert self._skills is not None
-            skill, digest = await self._skills.read_skill_with_digest(name)
-            if skill is None:
-                raise RoutineError(
-                    "routine_skill_not_found",
-                    "A requested skill is not currently available.",
-                )
-            bindings.append(
-                RoutineSkillBinding(
-                    skill_name=name,
-                    skill_revision=1,
-                    content_digest=f"sha256:{digest}",
-                    attached_by_principal=f"agent:{self.agent_id}",
-                    attached_at=attached_at,
-                )
-            )
-        return tuple(bindings)
-
-    async def _retain_bindings(
-        self,
-        bindings: tuple[RoutineSkillBinding, ...],
-    ) -> None:
-        if bindings and self._skills is None:
-            raise RoutineError(
-                "routine_skill_store_unavailable",
-                "Pinned skill content is unavailable.",
-            )
-        for binding in bindings:
-            assert self._skills is not None
-            try:
-                await self._skills.retain_current_skill(
-                    binding.skill_name,
-                    binding.content_digest,
-                )
-            except Exception as error:
-                raise RoutineError(
-                    "routine_skill_retention_failed",
-                    "Exact skill content could not be retained.",
-                ) from error
-
-    async def _prepare_requested_grants(
-        self,
-        proposal: AutomationScopeProposal,
-        requested: tuple[RequestedCapabilityGrant, ...],
-    ) -> tuple[CapabilityGrant, ...]:
-        if not requested:
-            return ()
-        if (
-            len(requested) > MAX_ROUTINE_IDENTITY_ITEMS
-            or any(not isinstance(item, RequestedCapabilityGrant) for item in requested)
-            or len({item.capability_id for item in requested}) != len(requested)
-        ):
-            raise RoutineError(
-                "routine_grant_request_invalid",
-                "Requested grants must be bounded and unique by capability.",
-            )
-        if self._grant_preparer is None:
-            raise RoutineError(
-                "automation_grant_unsupported",
-                "The grant preparation boundary is unavailable.",
-            )
-        grants = []
-        for item in requested:
-            if not isinstance(item, RequestedCapabilityGrant):
-                raise RoutineError(
-                    "routine_grant_request_invalid", "A requested grant is invalid."
-                )
-            grants.append(
-                await self._grant_preparer(
-                    item.capability_id,
-                    item.constraints,
-                    item.max_calls_per_occurrence,
-                    proposal,
-                )
-            )
-        return tuple(grants)
-
-    def _validate_precheck(
-        self,
-        reporting_mode: ReportingMode,
-        precheck: ResourceRevisionPrecheck | None,
-        source_ids: tuple[str, ...],
-        resource_ids: tuple[str, ...],
-        binding_ids: tuple[str, ...],
-        capability_ids: tuple[str, ...],
-    ) -> None:
-        """Check local proposal facts before binding; recheck the same rules at admission."""
-        try:
-            validate_reporting_precheck(reporting_mode, precheck)
-        except ValueError as error:
-            raise RoutineError("routine_precheck_invalid", str(error)) from error
-        if precheck is None:
-            return
-        capabilities = self._require_capability_registry()
-        try:
-            effectful = any(
-                capabilities.capability(item).operational_effect
-                is not OperationalEffect.NONE
-                for item in capability_ids
-            )
-        except KeyError as error:
-            raise RoutineError(
-                "routine_capability_invalid", "A requested capability is unknown."
-            ) from error
-        if effectful:
-            raise RoutineError(
-                "routine_precheck_scope_invalid",
-                "An effectful assignment cannot skip work based on a resource revision. Use reporting_mode=always and omit precheck.",
-            )
-        if not source_ids or binding_ids:
-            raise RoutineError(
-                "routine_precheck_scope_invalid",
-                "Unchanged prechecks require an exact source-only assignment about its structural catalog revision.",
-            )
-        if (
-            precheck.source_id not in source_ids
-            or precheck.resource_id not in resource_ids
-        ):
-            raise RoutineError(
-                "routine_precheck_scope_invalid",
-                "The precheck is outside the exact resource ceiling.",
-            )
-        try:
-            expected = capabilities.contract_digest(precheck.capability_id)
-        except KeyError as error:
-            raise RoutineError(
-                "routine_precheck_unavailable",
-                "The exact precheck capability is unavailable.",
-            ) from error
-        if expected != precheck.contract_digest:
-            raise RoutineError(
-                "routine_precheck_contract_changed",
-                "The exact precheck capability changed. Use its capability contract digest, not a resource revision.",
-            )
-
-    def _access_modes(self, capability_ids: tuple[str, ...]) -> frozenset[AccessMode]:
-        capabilities = self._require_capability_registry()
-        try:
-            modes = frozenset(
-                capabilities.capability(item).access_mode for item in capability_ids
-            )
-        except KeyError as error:
-            raise RoutineError(
-                "routine_capability_invalid", "A requested capability is unknown."
-            ) from error
-        return modes
-
-    def _require_capability_registry(self) -> CapabilityRegistry:
-        capabilities = self._capabilities
-        if capabilities is None:
-            raise RuntimeError("routine owner capability registry is not bound")
-        return capabilities
 
     async def _load_owned(self, routine_id: str) -> ScheduledRoutine | None:
         if not isinstance(routine_id, str) or not routine_id:
@@ -1652,46 +585,146 @@ class RoutineOwner:
             self._wake()
 
 
-def _summary(routine: ScheduledRoutine) -> ScheduledRoutineSummary:
-    return ScheduledRoutineSummary(
-        sensitivity_ceiling=routine.sensitivity_ceiling,
-        routine_id=routine.routine_id,
-        title=routine.title,
-        state=routine.state,
-        schedule_kind=routine.schedule.kind,
-        next_due_at=routine.next_due_at,
-        revision=routine.revision,
-        occurrence_count=routine.occurrence_count,
-        consecutive_failures=routine.consecutive_failures,
-    )
+def parse_schedule(
+    value: Mapping[str, object],
+    *,
+    reference_at: datetime,
+    relative_at: datetime | None = None,
+) -> RoutineSchedule:
+    """Turn the JSON schedule shape into a typed schedule.
 
+    A named next local weekday resolves from ``reference_at``; relative
+    timing (``after_seconds``, ``anchor_after_seconds``) counts from
+    ``relative_at``, which defaults to ``reference_at``.
+    """
 
-def _model_sensitivity(value: Sensitivity) -> ModelSensitivity:
-    if value is Sensitivity.UNKNOWN:
+    relative_at = relative_at or reference_at
+
+    kind = value.get("kind")
+    if not isinstance(kind, str) or kind not in SCHEDULE_KEYS:
         raise RoutineError(
-            "routine_sensitivity_unknown",
-            "A resource has unknown sensitivity and cannot be scheduled.",
+            "routine_schedule_invalid",
+            "Schedule kind must be once, interval, once_next_weekday, or calendar.",
         )
-    return ModelSensitivity(value.value)
-
-
-def _contains_reference_marker(value: object) -> bool:
-    if isinstance(value, str):
-        folded = value.casefold()
-        return (
-            "tool_ref" in folded or "conversation_ref" in folded or "run_ref" in folded
+    unexpected = set(value) - {"kind"} - SCHEDULE_KEYS[kind]
+    if unexpected:
+        raise RoutineError(
+            "routine_schedule_invalid",
+            f"Schedule kind {kind!r} does not accept: {', '.join(sorted(unexpected))}.",
         )
-    if isinstance(value, dict) or isinstance(value, FrozenJsonObject):
-        return any(
-            _contains_reference_marker(key) or _contains_reference_marker(item)
-            for key, item in value.items()
+    if kind == "once" and ("exact_at" in value) == ("after_seconds" in value):
+        raise RoutineError(
+            "routine_schedule_invalid",
+            "A once schedule needs exact_at or after_seconds.",
         )
-    if isinstance(value, (tuple, list)):
-        return any(_contains_reference_marker(item) for item in value)
-    return False
+    if kind == "interval" and ("anchor_at" in value) == (
+        "anchor_after_seconds" in value
+    ):
+        raise RoutineError(
+            "routine_schedule_invalid",
+            "An interval schedule needs anchor_at or anchor_after_seconds.",
+        )
+    try:
+        if kind == "once":
+            return OnceSchedule(
+                _relative(value, "after_seconds", relative_at)
+                if "after_seconds" in value
+                else _instant(value, "exact_at")
+            )
+        if kind == "interval":
+            return IntervalSchedule(
+                _integer(value, "interval_seconds"),
+                (
+                    _relative(value, "anchor_after_seconds", relative_at)
+                    if "anchor_after_seconds" in value
+                    else _instant(value, "anchor_at")
+                ),
+            )
+        if kind == "once_next_weekday":
+            return OnceSchedule(
+                next_weekday_utc(
+                    now=reference_at,
+                    timezone=_string(value, "timezone"),
+                    weekday=_integer(value, "weekday"),
+                    hour=_integer(value, "hour"),
+                    minute=_integer(value, "minute"),
+                )
+            )
+        weekdays = _integers(value, "weekdays")
+        month_days = _integers(value, "month_days")
+        if "day_selector" in value:
+            selector = CalendarDaySelector(_string(value, "day_selector"))
+        elif weekdays and not month_days:
+            selector = CalendarDaySelector.WEEKDAYS
+        elif month_days and not weekdays:
+            selector = CalendarDaySelector.MONTH_DAYS
+        else:
+            selector = CalendarDaySelector.EVERY_DAY
+        return CalendarSchedule(
+            timezone=_string(value, "timezone"),
+            hour=_integer(value, "hour"),
+            minute=_integer(value, "minute"),
+            day_selector=selector,
+            weekdays=weekdays,
+            month_days=month_days,
+            months=_integers(value, "months"),
+            nonexistent_time_policy=NonexistentTimePolicy(
+                str(value.get("nonexistent_time_policy", "skip"))
+            ),
+            ambiguous_time_policy=AmbiguousTimePolicy(
+                str(value.get("ambiguous_time_policy", "first"))
+            ),
+        )
+    except RoutineError:
+        raise
+    except (TypeError, ValueError) as error:
+        message = str(error)
+        if kind == "calendar":
+            message += (
+                ". Correct the schedule: day_selector weekdays takes weekdays, "
+                "month_days takes month_days, every_day takes neither."
+            )
+        raise RoutineError("routine_schedule_invalid", message) from error
 
 
-def _schedule_payload(schedule: RoutineSchedule) -> dict[str, object]:
+def schedule_text(
+    schedule: RoutineSchedule,
+    *,
+    run_immediately: bool = False,
+    from_approval: bool = False,
+) -> str:
+    """Describe a schedule in the person's local time."""
+
+    zone_name = system_user_timezone()
+    zone: tzinfo = UTC if zone_name is None else ZoneInfo(zone_name)
+    if isinstance(schedule, OnceSchedule):
+        text = "Once at " + _local(schedule.exact_at, zone)
+    elif isinstance(schedule, IntervalSchedule):
+        text = f"Every {_duration(schedule.interval_seconds)} from " + _local(
+            schedule.anchor_at, zone
+        )
+    else:
+        if schedule.day_selector is CalendarDaySelector.WEEKDAYS:
+            days = "on " + ", ".join(_WEEKDAYS[day - 1] for day in schedule.weekdays)
+        elif schedule.day_selector is CalendarDaySelector.MONTH_DAYS:
+            days = "on day " + ", ".join(map(str, schedule.month_days))
+        else:
+            days = "every day"
+        months = (
+            " in months " + ", ".join(map(str, schedule.months))
+            if schedule.months
+            else ""
+        )
+        text = (
+            f"Calendar {days}{months} at {schedule.hour:02d}:{schedule.minute:02d} "
+            f"{schedule.timezone}"
+        )
+    if from_approval:
+        text += " (timed from approval)"
+    return ("Now, then " + text[0].lower() + text[1:]) if run_immediately else text
+
+
+def schedule_payload(schedule: RoutineSchedule) -> dict[str, object]:
     payload: dict[str, object] = {"kind": schedule.kind.value}
     if isinstance(schedule, OnceSchedule):
         payload["exact_at"] = schedule.exact_at.isoformat()
@@ -1720,174 +753,113 @@ def _schedule_payload(schedule: RoutineSchedule) -> dict[str, object]:
     return payload
 
 
-def routine_approval_arguments(authority: FrozenJsonObject) -> FrozenJsonObject:
-    """Keep one exact product review envelope over the validated snapshot."""
-    envelope = {
-        "proposal": authority["routine"],
-        "authority": authority["authority"],
-    }
-    if "schedule_preview" in authority:
-        envelope["schedule_preview"] = authority["schedule_preview"]
-    return FrozenJsonObject.from_mapping(envelope)
+def _summary(routine: ScheduledRoutine) -> ScheduledRoutineSummary:
+    return ScheduledRoutineSummary(
+        routine_id=routine.routine_id,
+        title=routine.title,
+        state=routine.state,
+        schedule_kind=routine.schedule.kind,
+        next_due_at=routine.next_due_at,
+        revision=routine.revision,
+        occurrence_count=routine.occurrence_count,
+        consecutive_failures=routine.consecutive_failures,
+    )
 
 
-MAX_SCHEDULE_PREVIEW_OCCURRENCES = 3
+def _resolve_sources(
+    requested: tuple[str, ...],
+    registrations: tuple[SourceRegistration, ...],
+    refs: ScopeRefs | None = None,
+) -> tuple[str, ...]:
+    """Resolve source handles, names or ids against the agent's current sources.
 
-
-def schedule_preview(
-    routine: ScheduledRoutine,
-    *,
-    not_before: datetime | None,
-    pending_immediate: bool = False,
-) -> dict[str, object]:
-    """Project the next scheduled runs as UTC and schedule-local weekday text.
-
-    ``not_before`` is the instant the store materializes the first slot from:
-    the proposal's creation/revision time, or a stored routine's next due slot.
-    ``pending_immediate`` counts a not-yet-admitted immediate first run.
-    A calendar or slot whose first run falls after expiration is rejected, the
-    same rule once and interval schedules already enforce. A cumulative
-    occurrence cap that expiration makes unreachable is reported as a warning.
+    Handles (``s1``, ``s2``...) mean something only with the origin run's refs.
     """
 
-    zone_name = (
-        routine.schedule.timezone
-        if isinstance(routine.schedule, CalendarSchedule)
-        else "UTC"
-    )
-    remaining = routine.cumulative_max_occurrences - routine.occurrence_count
-    immediate = pending_immediate and routine.run_immediately
-    if not_before is None or remaining < 1:
-        return {
-            "timezone": zone_name,
-            "first_occurrences": (),
-            "immediate_first_run": False,
-            "occurrences_before_expiry": 0,
-            "warnings": (),
+    resolved: set[str] = set()
+    for requested_item in requested:
+        item = (
+            refs.resolve(SOURCE_REF_PREFIX, requested_item) if refs else None
+        ) or requested_item
+        matches = {
+            source.id
+            for source in registrations
+            if item == source.id or item.casefold() == source.display_name.casefold()
         }
-    forecast = forecast_slots(
-        routine.schedule,
-        not_before=not_before,
-        expires_at=routine.expires_at,
-        limit=min(MAX_SCHEDULE_PREVIEW_OCCURRENCES, remaining),
-        count_limit=remaining,
-    )
-    if (
-        forecast.first_unbounded_at is not None
-        and forecast.first_unbounded_at > routine.expires_at
+        if len(matches) != 1:
+            names = ", ".join(sorted(source.display_name for source in registrations))
+            raise RoutineError(
+                "routine_source_unknown",
+                f"No single current source is named {requested_item!r}.",
+                ToolRecovery(
+                    RecoveryKind.CORRECT_ARGUMENTS,
+                    ("Current sources: " + names)[:512] if names else "No sources.",
+                ),
+            )
+        resolved |= matches
+    return tuple(sorted(resolved))
+
+
+def _local(value: datetime, zone: tzinfo) -> str:
+    return value.astimezone(zone).strftime("%a %Y-%m-%d %H:%M %Z")
+
+
+def _duration(seconds: int) -> str:
+    for size, unit in ((86_400, "day"), (3_600, "hour"), (60, "minute")):
+        if seconds % size == 0:
+            count = seconds // size
+            return f"{count} {unit}" + ("" if count == 1 else "s")
+    return f"{seconds} seconds"
+
+
+def _relative(
+    values: Mapping[str, object], name: str, reference_at: datetime
+) -> datetime:
+    seconds = _integer(values, name)
+    if not 1 <= seconds <= MAX_RELATIVE_SCHEDULE_SECONDS:
+        raise RoutineError(
+            "routine_relative_time_invalid", "Relative timing is outside its bound."
+        )
+    return reference_at.astimezone(UTC) + timedelta(seconds=seconds)
+
+
+def _instant(values: Mapping[str, object], name: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(_string(values, name))
+    except ValueError as error:
+        raise RoutineError(
+            "routine_datetime_invalid", f"{name} must be ISO 8601 text."
+        ) from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise RoutineError(
+            "routine_datetime_invalid", f"{name} must include a UTC offset."
+        )
+    return parsed.astimezone(UTC)
+
+
+def _string(values: Mapping[str, object], name: str) -> str:
+    value = values.get(name)
+    if not isinstance(value, str) or not value:
+        raise RoutineError("routine_schedule_invalid", f"{name} must be text.")
+    return value
+
+
+def _integer(values: Mapping[str, object], name: str) -> int:
+    value = values.get(name)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise RoutineError("routine_schedule_invalid", f"{name} must be an integer.")
+    return value
+
+
+def _integers(values: Mapping[str, object], name: str) -> tuple[int, ...]:
+    value = values.get(name, ())
+    if not isinstance(value, (tuple, list)) or any(
+        not isinstance(item, int) or isinstance(item, bool) for item in value
     ):
         raise RoutineError(
-            "routine_expiration_before_schedule",
-            "The routine expires before its first scheduled run at "
-            f"{_local_slot_text(forecast.first_unbounded_at, zone_name)} "
-            f"({forecast.first_unbounded_at.isoformat()}); expires_at is "
-            f"{_local_slot_text(routine.expires_at, zone_name)}. Move expires_at "
-            "after the first run or choose an earlier schedule.",
+            "routine_schedule_invalid", f"{name} must be an integer array."
         )
-    available = forecast.reachable_slots + (1 if immediate else 0)
-    warnings: list[str] = []
-    if available < remaining:
-        warnings.append(
-            f"cumulative_max_occurrences allows {remaining} more run(s), but only "
-            f"{available} fit before expires_at "
-            f"{_local_slot_text(routine.expires_at, zone_name)}; the routine "
-            "expires first. Extend expires_at or lower the cap if that is unintended."
-        )
-    return {
-        "timezone": zone_name,
-        "first_occurrences": tuple(
-            {"at": slot.isoformat(), "local": _local_slot_text(slot, zone_name)}
-            for slot in forecast.occurrences
-        ),
-        "immediate_first_run": immediate,
-        "occurrences_before_expiry": available,
-        "warnings": tuple(warnings),
-    }
-
-
-def _local_slot_text(value: datetime, zone_name: str) -> str:
-    local = value.astimezone(UTC if zone_name == "UTC" else ZoneInfo(zone_name))
-    return local.strftime("%A %Y-%m-%d %H:%M %Z")
-
-
-def _optional_decimal_text(value: Decimal | None) -> str | None:
-    return None if value is None else str(value)
-
-
-def _routine_proposal_payload(routine: ScheduledRoutine) -> dict[str, object]:
-    return {
-        "routine_id": routine.routine_id,
-        "conversation_id": routine.conversation_id,
-        "title": routine.title,
-        "authorized_instruction": routine.authorized_instruction,
-        "instruction_digest": routine.instruction_digest,
-        "schedule": _schedule_payload(routine.schedule),
-        "run_immediately": routine.run_immediately,
-        "allowed_operational_effects": sorted(
-            item.value for item in routine.allowed_operational_effects
-        ),
-        "misfire_policy": routine.misfire_policy.value,
-        "reporting_mode": routine.reporting_mode.value,
-        "precheck": (
-            None
-            if routine.precheck is None
-            else {
-                "capability_id": routine.precheck.capability_id,
-                "contract_digest": routine.precheck.contract_digest,
-                "source_id": routine.precheck.source_id,
-                "resource_id": routine.precheck.resource_id,
-            }
-        ),
-        "allowed_source_ids": routine.allowed_source_ids,
-        "allowed_connector_binding_ids": routine.allowed_connector_binding_ids,
-        "allowed_resource_ids": routine.allowed_resource_ids,
-        "allowed_capability_ids": routine.allowed_capability_ids,
-        "contract_bindings": routine.contract_bindings.material(),
-        "capability_grants": tuple(
-            grant.material() for grant in routine.capability_grants
-        ),
-        "allowed_access_modes": tuple(
-            sorted(item.value for item in routine.allowed_access_modes)
-        ),
-        "sensitivity_ceiling": routine.sensitivity_ceiling.value,
-        "eligible_model_routes": routine.eligible_model_routes,
-        "skill_bindings": tuple(
-            {
-                "skill_name": binding.skill_name,
-                "skill_revision": binding.skill_revision,
-                "content_digest": binding.content_digest,
-            }
-            for binding in routine.skill_bindings
-        ),
-        "outcome_contract": outcome_contract_projection(routine.outcome_contract),
-        "distribution_plan": distribution_plan_projection(routine.distribution_plan),
-        "per_run_max_tokens": routine.per_run_max_tokens,
-        "per_run_max_cost_usd": _optional_decimal_text(routine.per_run_max_cost_usd),
-        "cumulative_max_tokens": routine.cumulative_max_tokens,
-        "cumulative_max_cost_usd": _optional_decimal_text(
-            routine.cumulative_max_cost_usd
-        ),
-        "cumulative_max_attempts": routine.cumulative_max_attempts,
-        "cumulative_max_occurrences": routine.cumulative_max_occurrences,
-        "maximum_consecutive_failures": routine.maximum_consecutive_failures,
-        "expires_at": routine.expires_at.isoformat(),
-        "basis_run_id": (
-            None
-            if routine.promotion_evidence is None
-            else routine.promotion_evidence.basis_run_id
-        ),
-        "revision": routine.revision,
-    }
-
-
-__all__ = [
-    "MAX_SCHEDULE_PREVIEW_OCCURRENCES",
-    "RoutineCatalog",
-    "RoutineError",
-    "RoutineOwner",
-    "RoutineStore",
-    "schedule_preview",
-]
+    return tuple(value)
 
 
 def _reject_scope_refs(instruction: str, origin: Transcript) -> None:
@@ -1900,13 +872,23 @@ def _reject_scope_refs(instruction: str, origin: Transcript) -> None:
     if named:
         raise RoutineError(
             "routine_instruction_scope_ref",
-            f"authorized_instruction names this run's handles {', '.join(named)}, "
+            f"prompt names this run's handles {', '.join(named)}, "
             "which later runs number differently.",
             ToolRecovery(
                 RecoveryKind.CORRECT_ARGUMENTS,
-                "Name each source or resource in authorized_instruction by its "
-                "catalog name or full id: "
-                + "; ".join(f"{item} is {issued[item]}" for item in named)
-                + ".",
+                "Name each source or resource in prompt by its catalog name or full "
+                "id: " + "; ".join(f"{item} is {issued[item]}" for item in named) + ".",
             ),
         )
+
+
+__all__ = [
+    "PreparedRoutine",
+    "RoutineError",
+    "RoutineOwner",
+    "RoutineStore",
+    "RoutineSupervisorStore",
+    "parse_schedule",
+    "schedule_payload",
+    "schedule_text",
+]

@@ -1128,21 +1128,9 @@ class PresentationController:
             return CommandOutcome(
                 "run",
                 run_message=(
-                    "Create a saved assignment for this self-contained "
-                    "instruction, eliciting any missing schedule or scope details and "
-                    "using the routine management tools: " + instruction
-                ),
-                conversation_id=conversation_id,
-            )
-        if len(parts) >= 4 and parts[1] == "promote":
-            instruction = command.split(maxsplit=3)[3].strip()
-            return CommandOutcome(
-                "run",
-                run_message=(
-                    "Promote completed run "
-                    + parts[2]
-                    + " into a saved assignment with this self-contained "
-                    "instruction, using exact promotion evidence: " + instruction
+                    "Save a routine with routine_save: a title, a self-contained "
+                    "prompt, a schedule and optional sources, asking only for a "
+                    "missing schedule. The request is: " + instruction
                 ),
                 conversation_id=conversation_id,
             )
@@ -1151,10 +1139,9 @@ class PresentationController:
             return CommandOutcome(
                 "run",
                 run_message=(
-                    "Inspect and update saved assignment "
+                    "Update routine "
                     + parts[2]
-                    + " using its exact current revision and the routine management "
-                    "tools. The replacement self-contained instruction is: "
+                    + " with routine_save, passing only the fields that change: "
                     + instruction
                 ),
                 conversation_id=conversation_id,
@@ -1162,7 +1149,6 @@ class PresentationController:
         return CommandOutcome(
             "notice",
             "Usage: /routines | /routines create <instruction> | "
-            "/routines promote <basis-run-id> <instruction> | "
             "/routines update <routine-id> <instruction>",
             conversation_id=conversation_id,
         )
@@ -1203,8 +1189,14 @@ class PresentationController:
                     payload={"question": question},
                     conversation_id=conversation_id,
                 )
-            promote = f"/routines promote {run_id} {question}\nSchedule: {argument}"
-            return await self._routines_command(promote.split(), promote)
+            return CommandOutcome(
+                "run",
+                run_message=(
+                    f"Save a routine that repeats my earlier question {question!r} "
+                    f"on this schedule: {argument}. Use routine_save."
+                ),
+                conversation_id=conversation_id,
+            )
         material = (
             f"The approach and facts behind my question {question!r} and your answer "
             f"(run {run_id}) are correct and worth reusing."

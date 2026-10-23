@@ -2,24 +2,16 @@
 
 from __future__ import annotations
 
-from ...capabilities import AccessMode, OperationalEffect
-from ...llm.models import ModelSensitivity
 from ...routines.models import (
     AmbiguousTimePolicy,
     CalendarDaySelector,
     CalendarSchedule,
     IntervalSchedule,
-    MisfirePolicy,
     NonexistentTimePolicy,
     OnceSchedule,
-    ReportingMode,
-    ResourceRevisionObservation,
-    ResourceRevisionPrecheck,
     RoutineOccurrence,
     RoutineOccurrenceDisposition,
-    RoutinePromotionEvidence,
     RoutineSchedule,
-    RoutineSkillBinding,
     RoutineSlotKind,
     RoutineState,
     ScheduledRoutine,
@@ -36,29 +28,13 @@ from .common import (
     mapping,
     optional_datetime_decode,
     optional_datetime_encode,
-    optional_decimal_decode,
-    optional_decimal_encode,
     optional_text,
-    plain_encode,
     record,
     record_fields,
     sequence,
     text,
 )
-from .distribution import (
-    decode_distribution_plan,
-    decode_outcome_contract,
-    encode_distribution_plan,
-    encode_outcome_contract,
-)
-from .execution_scope import (
-    decode_capability_grant,
-    decode_execution_contract_bindings,
-    decode_execution_scope,
-    encode_capability_grant,
-    encode_execution_contract_bindings,
-    encode_execution_scope,
-)
+from .execution_scope import decode_execution_scope, encode_execution_scope
 
 
 def encode_scheduled_routine(value: ScheduledRoutine) -> str:
@@ -71,78 +47,20 @@ def encode_scheduled_routine(value: ScheduledRoutine) -> str:
                 "conversation_id": value.conversation_id,
                 "owner_principal_id": value.owner_principal_id,
                 "title": value.title,
-                "run_immediately": value.run_immediately,
                 "authorized_instruction": value.authorized_instruction,
                 "instruction_digest": value.instruction_digest,
                 "schedule": _encode_schedule(value.schedule),
-                "schedule_interpreter_revision": (value.schedule_interpreter_revision),
-                "misfire_policy": value.misfire_policy.value,
-                "reporting_mode": value.reporting_mode.value,
-                "precheck": (
-                    None if value.precheck is None else _encode_precheck(value.precheck)
-                ),
-                "last_acknowledged_precheck_observation": (
-                    None
-                    if value.last_acknowledged_precheck_observation is None
-                    else _encode_observation(
-                        value.last_acknowledged_precheck_observation
-                    )
-                ),
-                "allowed_source_ids": list(value.allowed_source_ids),
-                "allowed_connector_binding_ids": list(
-                    value.allowed_connector_binding_ids
-                ),
-                "allowed_resource_ids": list(value.allowed_resource_ids),
-                "allowed_capability_ids": list(value.allowed_capability_ids),
-                "contract_bindings": encode_execution_contract_bindings(
-                    value.contract_bindings
-                ),
-                "capability_grants": [
-                    encode_capability_grant(item) for item in value.capability_grants
-                ],
-                "allowed_access_modes": plain_encode(
-                    tuple(sorted(item.value for item in value.allowed_access_modes))
-                ),
-                "allowed_operational_effects": plain_encode(
-                    tuple(
-                        sorted(item.value for item in value.allowed_operational_effects)
-                    )
-                ),
-                "sensitivity_ceiling": value.sensitivity_ceiling.value,
-                "eligible_model_routes": list(value.eligible_model_routes),
-                "skill_bindings": [
-                    _encode_skill_binding(item) for item in value.skill_bindings
-                ],
-                "outcome_contract": encode_outcome_contract(value.outcome_contract),
-                "distribution_plan": encode_distribution_plan(value.distribution_plan),
-                "per_run_max_tokens": value.per_run_max_tokens,
-                "per_run_max_cost_usd": optional_decimal_encode(
-                    value.per_run_max_cost_usd
-                ),
-                "cumulative_max_tokens": value.cumulative_max_tokens,
-                "cumulative_max_cost_usd": optional_decimal_encode(
-                    value.cumulative_max_cost_usd
-                ),
-                "cumulative_max_attempts": value.cumulative_max_attempts,
-                "cumulative_max_occurrences": value.cumulative_max_occurrences,
-                "reserved_tokens": value.reserved_tokens,
-                "reserved_cost_usd": decimal_encode(value.reserved_cost_usd),
+                "schedule_interpreter_revision": value.schedule_interpreter_revision,
+                "source_ids": list(value.source_ids),
                 "charged_tokens": value.charged_tokens,
                 "charged_cost_usd": decimal_encode(value.charged_cost_usd),
                 "attempt_count": value.attempt_count,
                 "occurrence_count": value.occurrence_count,
-                "maximum_consecutive_failures": (value.maximum_consecutive_failures),
                 "consecutive_failures": value.consecutive_failures,
-                "expires_at": datetime_encode(value.expires_at),
                 "next_due_at": optional_datetime_encode(value.next_due_at),
                 "active_occurrence_id": value.active_occurrence_id,
                 "last_occurrence_id": value.last_occurrence_id,
                 "last_delivery_ids": list(value.last_delivery_ids),
-                "promotion_evidence": (
-                    None
-                    if value.promotion_evidence is None
-                    else _encode_promotion(value.promotion_evidence)
-                ),
                 "state": value.state.value,
                 "revision": value.revision,
                 "created_at": datetime_encode(value.created_at),
@@ -165,48 +83,20 @@ def decode_scheduled_routine(
             "conversation_id",
             "owner_principal_id",
             "title",
-            "run_immediately",
             "authorized_instruction",
             "instruction_digest",
             "schedule",
             "schedule_interpreter_revision",
-            "misfire_policy",
-            "reporting_mode",
-            "precheck",
-            "last_acknowledged_precheck_observation",
-            "allowed_source_ids",
-            "allowed_connector_binding_ids",
-            "allowed_resource_ids",
-            "allowed_capability_ids",
-            "contract_bindings",
-            "capability_grants",
-            "allowed_access_modes",
-            "allowed_operational_effects",
-            "sensitivity_ceiling",
-            "eligible_model_routes",
-            "skill_bindings",
-            "outcome_contract",
-            "distribution_plan",
-            "per_run_max_tokens",
-            "per_run_max_cost_usd",
-            "cumulative_max_tokens",
-            "cumulative_max_cost_usd",
-            "cumulative_max_attempts",
-            "cumulative_max_occurrences",
-            "reserved_tokens",
-            "reserved_cost_usd",
+            "source_ids",
             "charged_tokens",
             "charged_cost_usd",
             "attempt_count",
             "occurrence_count",
-            "maximum_consecutive_failures",
             "consecutive_failures",
-            "expires_at",
             "next_due_at",
             "active_occurrence_id",
             "last_occurrence_id",
             "last_delivery_ids",
-            "promotion_evidence",
             "state",
             "revision",
             "created_at",
@@ -214,41 +104,10 @@ def decode_scheduled_routine(
         ),
     )
     try:
-        misfire = MisfirePolicy(text(fields["misfire_policy"], "misfire policy"))
-        reporting = ReportingMode(text(fields["reporting_mode"], "reporting mode"))
-        sensitivity = ModelSensitivity(
-            text(fields["sensitivity_ceiling"], "routine sensitivity")
-        )
         state = RoutineState(text(fields["state"], "routine state"))
-        access_modes = frozenset(
-            AccessMode(text(item, "routine access mode"))
-            for item in sequence(fields["allowed_access_modes"], "access modes")
-        )
-        effects = frozenset(
-            OperationalEffect(text(item, "routine operational effect"))
-            for item in sequence(
-                fields["allowed_operational_effects"],
-                "operational effects",
-            )
-        )
     except ValueError:
         raise ValueError("stored routine enum is invalid") from None
-    precheck = fields["precheck"]
-    observation = fields["last_acknowledged_precheck_observation"]
-    promotion = fields["promotion_evidence"]
-    if type(fields["run_immediately"]) is not bool:
-        raise ValueError("stored routine run_immediately must be a boolean")
     return ScheduledRoutine(
-        run_immediately=fields["run_immediately"] is True,
-        contract_bindings=decode_execution_contract_bindings(
-            fields["contract_bindings"]
-        ),
-        capability_grants=tuple(
-            decode_capability_grant(item)
-            for item in sequence(
-                fields["capability_grants"], "routine capability grants"
-            )
-        ),
         routine_id=routine_id,
         agent_id=agent_id,
         conversation_id=text(fields["conversation_id"], "routine conversation"),
@@ -267,73 +126,15 @@ def decode_scheduled_routine(
             fields["schedule_interpreter_revision"],
             "routine schedule interpreter revision",
         ),
-        misfire_policy=misfire,
-        reporting_mode=reporting,
-        precheck=None if precheck is None else _decode_precheck(precheck),
-        last_acknowledged_precheck_observation=(
-            None if observation is None else _decode_observation(observation)
-        ),
-        allowed_source_ids=_text_sequence(fields["allowed_source_ids"], "source ids"),
-        allowed_connector_binding_ids=_text_sequence(
-            fields["allowed_connector_binding_ids"],
-            "connector binding ids",
-        ),
-        allowed_resource_ids=_text_sequence(
-            fields["allowed_resource_ids"],
-            "resource ids",
-        ),
-        allowed_capability_ids=_text_sequence(
-            fields["allowed_capability_ids"],
-            "capability ids",
-        ),
-        allowed_access_modes=access_modes,
-        allowed_operational_effects=effects,
-        sensitivity_ceiling=sensitivity,
-        eligible_model_routes=_text_sequence(
-            fields["eligible_model_routes"],
-            "model routes",
-        ),
-        skill_bindings=tuple(
-            _decode_skill_binding(item)
-            for item in sequence(fields["skill_bindings"], "skill bindings")
-        ),
-        outcome_contract=decode_outcome_contract(fields["outcome_contract"]),
-        distribution_plan=decode_distribution_plan(fields["distribution_plan"]),
-        per_run_max_tokens=integer(
-            fields["per_run_max_tokens"],
-            "routine per-run tokens",
-        ),
-        per_run_max_cost_usd=optional_decimal_decode(fields["per_run_max_cost_usd"]),
-        cumulative_max_tokens=integer(
-            fields["cumulative_max_tokens"],
-            "routine cumulative tokens",
-        ),
-        cumulative_max_cost_usd=optional_decimal_decode(
-            fields["cumulative_max_cost_usd"]
-        ),
-        cumulative_max_attempts=integer(
-            fields["cumulative_max_attempts"],
-            "routine cumulative attempts",
-        ),
-        cumulative_max_occurrences=integer(
-            fields["cumulative_max_occurrences"],
-            "routine cumulative occurrences",
-        ),
-        reserved_tokens=integer(fields["reserved_tokens"], "routine reserved tokens"),
-        reserved_cost_usd=decimal_decode(fields["reserved_cost_usd"]),
+        source_ids=_text_sequence(fields["source_ids"], "source ids"),
         charged_tokens=integer(fields["charged_tokens"], "routine charged tokens"),
         charged_cost_usd=decimal_decode(fields["charged_cost_usd"]),
         attempt_count=integer(fields["attempt_count"], "routine attempts"),
         occurrence_count=integer(fields["occurrence_count"], "routine occurrences"),
-        maximum_consecutive_failures=integer(
-            fields["maximum_consecutive_failures"],
-            "routine maximum failures",
-        ),
         consecutive_failures=integer(
             fields["consecutive_failures"],
             "routine consecutive failures",
         ),
-        expires_at=datetime_decode(fields["expires_at"]),
         next_due_at=optional_datetime_decode(fields["next_due_at"]),
         active_occurrence_id=optional_text(
             fields["active_occurrence_id"],
@@ -346,9 +147,6 @@ def decode_scheduled_routine(
         last_delivery_ids=_text_sequence(
             fields["last_delivery_ids"],
             "last delivery ids",
-        ),
-        promotion_evidence=(
-            None if promotion is None else _decode_promotion(promotion)
         ),
         state=state,
         revision=integer(fields["revision"], "routine revision"),
@@ -372,11 +170,6 @@ def encode_routine_occurrence(value: RoutineOccurrence) -> str:
                 "claimed_at": optional_datetime_encode(value.claimed_at),
                 "claim_token": value.claim_token,
                 "lease_expires_at": optional_datetime_encode(value.lease_expires_at),
-                "precheck_observation": (
-                    None
-                    if value.precheck_observation is None
-                    else _encode_observation(value.precheck_observation)
-                ),
                 "execution_scope": (
                     None
                     if value.execution_scope is None
@@ -384,8 +177,6 @@ def encode_routine_occurrence(value: RoutineOccurrence) -> str:
                 ),
                 "execution_scope_digest": value.execution_scope_digest,
                 "reserved_run_id": value.reserved_run_id,
-                "reserved_tokens": value.reserved_tokens,
-                "reserved_cost_usd": decimal_encode(value.reserved_cost_usd),
                 "charged_tokens": value.charged_tokens,
                 "charged_cost_usd": decimal_encode(value.charged_cost_usd),
                 "run_bound_at": optional_datetime_encode(value.run_bound_at),
@@ -423,12 +214,9 @@ def decode_routine_occurrence(
             "claimed_at",
             "claim_token",
             "lease_expires_at",
-            "precheck_observation",
             "execution_scope",
             "execution_scope_digest",
             "reserved_run_id",
-            "reserved_tokens",
-            "reserved_cost_usd",
             "charged_tokens",
             "charged_cost_usd",
             "run_bound_at",
@@ -452,7 +240,6 @@ def decode_routine_occurrence(
         )
     except ValueError:
         raise ValueError("stored occurrence enum is invalid") from None
-    observation = fields["precheck_observation"]
     scope = fields["execution_scope"]
     return RoutineOccurrence(
         effect_receipt_ids=_text_sequence(
@@ -471,9 +258,6 @@ def decode_routine_occurrence(
         claimed_at=optional_datetime_decode(fields["claimed_at"]),
         claim_token=optional_text(fields["claim_token"], "occurrence claim token"),
         lease_expires_at=optional_datetime_decode(fields["lease_expires_at"]),
-        precheck_observation=(
-            None if observation is None else _decode_observation(observation)
-        ),
         execution_scope=None if scope is None else decode_execution_scope(scope),
         execution_scope_digest=optional_text(
             fields["execution_scope_digest"],
@@ -483,11 +267,6 @@ def decode_routine_occurrence(
             fields["reserved_run_id"],
             "occurrence reserved run id",
         ),
-        reserved_tokens=integer(
-            fields["reserved_tokens"],
-            "occurrence reserved tokens",
-        ),
-        reserved_cost_usd=decimal_decode(fields["reserved_cost_usd"]),
         charged_tokens=integer(
             fields["charged_tokens"],
             "occurrence charged tokens",
@@ -597,139 +376,6 @@ def _decode_schedule(value: JsonValue) -> RoutineSchedule:
         months=_integer_sequence(fields["months"], "calendar months"),
         nonexistent_time_policy=nonexistent,
         ambiguous_time_policy=ambiguous,
-    )
-
-
-def _encode_precheck(value: ResourceRevisionPrecheck) -> JsonValue:
-    return record(
-        "ResourceRevisionPrecheck",
-        {
-            "capability_id": value.capability_id,
-            "contract_digest": value.contract_digest,
-            "source_id": value.source_id,
-            "resource_id": value.resource_id,
-        },
-    )
-
-
-def _decode_precheck(value: JsonValue) -> ResourceRevisionPrecheck:
-    fields = record_fields(
-        value,
-        "ResourceRevisionPrecheck",
-        ("capability_id", "contract_digest", "source_id", "resource_id"),
-    )
-    return ResourceRevisionPrecheck(
-        capability_id=text(fields["capability_id"], "precheck capability id"),
-        contract_digest=text(fields["contract_digest"], "precheck contract digest"),
-        source_id=text(fields["source_id"], "precheck source id"),
-        resource_id=text(fields["resource_id"], "precheck resource id"),
-    )
-
-
-def _encode_observation(value: ResourceRevisionObservation) -> JsonValue:
-    return record(
-        "ResourceRevisionObservation",
-        {
-            "source_id": value.source_id,
-            "resource_id": value.resource_id,
-            "resource_revision": value.resource_revision,
-            "catalog_revision": value.catalog_revision,
-            "observed_at": datetime_encode(value.observed_at),
-        },
-    )
-
-
-def _decode_observation(value: JsonValue) -> ResourceRevisionObservation:
-    fields = record_fields(
-        value,
-        "ResourceRevisionObservation",
-        (
-            "source_id",
-            "resource_id",
-            "resource_revision",
-            "catalog_revision",
-            "observed_at",
-        ),
-    )
-    return ResourceRevisionObservation(
-        source_id=text(fields["source_id"], "observation source id"),
-        resource_id=text(fields["resource_id"], "observation resource id"),
-        resource_revision=text(
-            fields["resource_revision"],
-            "observation resource revision",
-        ),
-        catalog_revision=text(
-            fields["catalog_revision"],
-            "observation catalog revision",
-        ),
-        observed_at=datetime_decode(fields["observed_at"]),
-    )
-
-
-def _encode_skill_binding(value: RoutineSkillBinding) -> JsonValue:
-    return record(
-        "RoutineSkillBinding",
-        {
-            "skill_name": value.skill_name,
-            "skill_revision": value.skill_revision,
-            "content_digest": value.content_digest,
-            "attached_by_principal": value.attached_by_principal,
-            "attached_at": datetime_encode(value.attached_at),
-        },
-    )
-
-
-def _decode_skill_binding(value: JsonValue) -> RoutineSkillBinding:
-    fields = record_fields(
-        value,
-        "RoutineSkillBinding",
-        (
-            "skill_name",
-            "skill_revision",
-            "content_digest",
-            "attached_by_principal",
-            "attached_at",
-        ),
-    )
-    return RoutineSkillBinding(
-        skill_name=text(fields["skill_name"], "routine skill name"),
-        skill_revision=integer(fields["skill_revision"], "routine skill revision"),
-        content_digest=text(fields["content_digest"], "routine skill digest"),
-        attached_by_principal=text(
-            fields["attached_by_principal"],
-            "routine skill principal",
-        ),
-        attached_at=datetime_decode(fields["attached_at"]),
-    )
-
-
-def _encode_promotion(value: RoutinePromotionEvidence) -> JsonValue:
-    return record(
-        "RoutinePromotionEvidence",
-        {
-            "basis_run_id": value.basis_run_id,
-            "terminal_result_digest": value.terminal_result_digest,
-            "executed_capability_ids": list(value.executed_capability_ids),
-        },
-    )
-
-
-def _decode_promotion(value: JsonValue) -> RoutinePromotionEvidence:
-    fields = record_fields(
-        value,
-        "RoutinePromotionEvidence",
-        ("basis_run_id", "terminal_result_digest", "executed_capability_ids"),
-    )
-    return RoutinePromotionEvidence(
-        basis_run_id=text(fields["basis_run_id"], "routine basis run id"),
-        terminal_result_digest=text(
-            fields["terminal_result_digest"],
-            "routine terminal result digest",
-        ),
-        executed_capability_ids=_text_sequence(
-            fields["executed_capability_ids"],
-            "executed capability ids",
-        ),
     )
 
 

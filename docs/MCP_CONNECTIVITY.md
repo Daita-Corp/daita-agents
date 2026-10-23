@@ -428,7 +428,7 @@ values, while any supplied value must still match exactly. `fixed_arguments` are
 values for the connector tool's own input arguments and are validated against
 its declared property schema when the grant is prepared. A Conversation Inbox
 destination ID is report delivery, not a connector argument, and is rejected
-there with a correction pointing to `distribution_destination_id`.
+there with a correction: a routine reports to its conversation's Inbox.
 
 The enclosing `RequestedCapabilityGrant` supplies the exact capability ID and
 `max_calls_per_occurrence` (1 to 256, further bounded by the run). The constraints

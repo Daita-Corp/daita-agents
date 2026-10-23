@@ -31,7 +31,10 @@ request intersects its caller/run deadline before setup; retries retain that
 logical deadline and receive a fresh, narrower attempt deadline. Counting has
 its own phase cap (`call_policy.input_count_timeout_seconds`, at most 60).
 Monotonic deadlines are runtime-only; policy durations and both retry ceilings
-are serialized and included in frozen machine model-contract digests.
+are serialized and included in the machine model-contract digests that a run's
+scope fixes when it starts. Routines no longer freeze routes: each occurrence
+uses the agent's current model routes and normal run limits, bound when that
+run starts; graph tasks still carry the routes their job froze.
 Counting transport failures retain their canonical cause and proven zero generation
 usage; invalid count data and unsupported counting remain permanent admission
 failures. External cancellation remains cancellation.

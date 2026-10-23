@@ -76,8 +76,7 @@ inspection remain in the exact transcript after the callable set changes. Exact 
 bounded fragments; use its `contract_digest`, child JSON Pointer `path`, and
 `next_offset` to retrieve omitted portions. Partial data never claims completeness.
 `requires_automation_grant` describes scheduled authority. A foreground action
-uses the normal exact approval at invocation. For routine authoring, inspect a tool
-when its exact contract is missing or incomplete. Inspection checks current local
+uses the normal exact approval at invocation. Inspection checks current local
 applicability within the frozen candidates; remote identity/schema checks still
 belong to invocation. Framework inbox
 destinations concern report delivery; an MCP action's destination is defined by
@@ -218,10 +217,7 @@ cannot grant it. Missing columns and keys remain unknown. Current catalog eviden
 can be reused without a redundant schema call. Denied, failed or uncertain effects
 are reported without retry or replacement; recovery performs no action.
 
-When routine creation or revision is callable, a mandatory code-owned context block
-exposes the complete frozen eligible model-route choices and host per-run token/cost
-ceilings. These are local configuration facts, not remaining credit or approval.
-There is no current-model alias or implied default; a null host cost ceiling
-means none. Token, attempt and occurrence ceilings always bound a routine, and its
-two dollar ceilings are optional and set together. Machine runs receive no
-routine-management facts. Loading another working set removes authoring guidance.
+When routine creation or revision is callable, the context adds one line:
+scheduled runs ask a person before any write. A routine needs no model-route,
+budget or grant choices; each run uses the agent's current model and normal
+run limits. Machine runs receive no routine-management tools.

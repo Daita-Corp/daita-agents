@@ -195,6 +195,13 @@ changes*.
   the host holds that agent.
 - **Routines and graph jobs are separate systems**, with no routine-to-graph
   bridge.
+- **A routine is a title, a prompt and a schedule**, optionally limited to named
+  sources, with one `RoutineIntent` shape for the tool, CLI, Python API and
+  host. Creating or changing one shows one confirm card. Everything else is a
+  fixed code default: delivery to the conversation's Inbox, missed slots
+  skipped, the agent's current model and normal run limits, Needs you after 3
+  consecutive failures, a one-time routine ending after it runs. A routine
+  freezes no access, grants, budgets or expiry; each run asks before writes.
 - **The only distribution destination** is the originating conversation's inbox.
 - **SQLite behind `SQLStateStore`**, with no event sourcing or replay
   projections.

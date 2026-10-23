@@ -47,10 +47,7 @@ if TYPE_CHECKING:
     )
     from ..loop.analysis import AnalysisEvidence
     from ..loop.models import ConversationRun, LoopExit
-    from ..routines.models import (
-        ResourceRevisionObservation,
-        RoutineOccurrence,
-    )
+    from ..routines.models import RoutineOccurrence
     from .sqlite_records import (
         EffectReceipt,
         EffectResolution,
@@ -146,7 +143,6 @@ class StateStore(
         run_id: str,
         execution_scope: ExecutionScope,
         bound_at: datetime,
-        precheck_observation: ResourceRevisionObservation | None = ...,
     ) -> RoutineOccurrence | None: ...
 
     async def replace_source_permission_scopes(
