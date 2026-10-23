@@ -2,21 +2,40 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import shutil
 import sqlite3
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from daita import Agent, SQLiteSource
 from daita.catalog import CatalogLinkStaleReason
-from daita.llm.models import TextBlock
+from daita.distribution import OutcomeState
+from daita.errors import StateCompatibilityError
+from daita.llm.models import FinishReason, ModelResponse, ModelUsage, TextBlock
+from daita.llm.pricing import CostEstimate
+from daita.llm.providers.mock import MockModelProvider
+from daita.routines.models import (
+    IntervalSchedule,
+    RoutineOccurrence,
+    RoutineOccurrenceDisposition,
+    RoutineSlotKind,
+    RoutineState,
+    ScheduledRoutine,
+    text_digest,
+)
+from daita.routines.schedule import occurrence_id, scheduled_slot_key
 from daita.storage.home_migrations import (
     CURRENT_HOME_REVISION,
     HOME_MIGRATIONS,
     MINIMUM_SUPPORTED_HOME_REVISION,
 )
+from tests.storage._routine_history import released_occurrence, released_routine
 from tests.support.paths import REPO_ROOT
 from tests.support.workspace import workspace_for
 
@@ -201,3 +220,319 @@ async def test_revision_4_golden_home_retains_its_declared_link(
         assert status.stale_reason is CatalogLinkStaleReason.SOURCE_INACTIVE
     finally:
         await agent.close()
+
+
+_AGENT = "agent-golden-revision-1"
+_CONVERSATION = "conversation-released"
+_NAMED_SOURCE = "source:sha256:" + "b" * 64
+
+
+def _microseconds(value: datetime) -> int:
+    return (value - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(microseconds=1)
+
+
+def _released_routines(due: datetime) -> tuple[
+    tuple[ScheduledRoutine, str],
+    tuple[ScheduledRoutine, str],
+    tuple[ScheduledRoutine, str],
+    dict[str, str],
+]:
+    """A due recurring routine, one interrupted mid-precheck and one disabled
+    routine naming a source, as released revisions stored them."""
+
+    def routine(routine_id: str, prompt: str, **values: object) -> ScheduledRoutine:
+        fields: dict[str, object] = dict(
+            routine_id=routine_id,
+            agent_id=_AGENT,
+            conversation_id=_CONVERSATION,
+            owner_principal_id=f"agent:{_AGENT}",
+            title=routine_id.replace("-", " "),
+            authorized_instruction=prompt,
+            instruction_digest=text_digest(prompt),
+            schedule=IntervalSchedule(3_600, due),
+            schedule_interpreter_revision=1,
+            source_ids=(),
+            charged_tokens=0,
+            charged_cost_usd=Decimal("0"),
+            attempt_count=0,
+            occurrence_count=0,
+            consecutive_failures=0,
+            next_due_at=due,
+            active_occurrence_id=None,
+            last_occurrence_id=None,
+            last_delivery_ids=(),
+            state=RoutineState.ACTIVE,
+            revision=1,
+            created_at=due - timedelta(days=1),
+            updated_at=due - timedelta(hours=2),
+        )
+        fields.update(values)
+        return ScheduledRoutine(**fields)  # type: ignore[arg-type]
+
+    def occurrence(
+        owner: ScheduledRoutine, scheduled_for: datetime
+    ) -> RoutineOccurrence:
+        slot = scheduled_slot_key(owner.routine_id, owner.revision, scheduled_for)
+        return RoutineOccurrence(
+            occurrence_id=occurrence_id(owner.routine_id, slot),
+            agent_id=_AGENT,
+            routine_id=owner.routine_id,
+            routine_revision=owner.revision,
+            slot_kind=RoutineSlotKind.SCHEDULED,
+            slot_key=slot,
+            scheduled_for=scheduled_for,
+            claimed_at=scheduled_for,
+            claim_token="released-claim",
+            lease_expires_at=scheduled_for + timedelta(seconds=30),
+            execution_scope=None,
+            execution_scope_digest=None,
+            reserved_run_id=None,
+            charged_tokens=0,
+            charged_cost_usd=Decimal("0"),
+            run_bound_at=None,
+            run_terminal_at=None,
+            conclusion_digest=None,
+            terminal_run_id=None,
+            delivery_ids=(),
+            attempt_count=1,
+            failure_code=None,
+            retry_at=None,
+            disposition=RoutineOccurrenceDisposition.CLAIMED,
+            created_at=scheduled_for,
+            updated_at=scheduled_for,
+        )
+
+    earlier = due - timedelta(hours=1)
+    skipped_slot = scheduled_slot_key("released-recurring", 1, earlier)
+    recurring = routine(
+        "released-recurring",
+        "Report the paid invoice count.",
+        charged_tokens=120,
+        charged_cost_usd=Decimal("0.02"),
+        attempt_count=1,
+        occurrence_count=1,
+        consecutive_failures=1,
+        last_occurrence_id=occurrence_id("released-recurring", skipped_slot),
+    )
+    skipped = occurrence(recurring, earlier)
+    interrupted_slot = scheduled_slot_key("released-interrupted", 1, earlier)
+    interrupted = routine(
+        "released-interrupted",
+        "Report the open invoice count.",
+        attempt_count=1,
+        occurrence_count=1,
+        next_due_at=due + timedelta(hours=1),
+        active_occurrence_id=occurrence_id("released-interrupted", interrupted_slot),
+    )
+    prechecking = occurrence(interrupted, earlier)
+    named = routine(
+        "released-named",
+        "Report the overdue invoice count.",
+        source_ids=(_NAMED_SOURCE,),
+        next_due_at=None,
+        state=RoutineState.DISABLED,
+    )
+    return (
+        (
+            recurring,
+            released_routine(
+                recurring,
+                capability_grants=(
+                    {
+                        "__record__": "CapabilityGrant",
+                        "fields": {"capability_id": "data.upsert_rows"},
+                    },
+                ),
+            ),
+        ),
+        (
+            interrupted,
+            released_routine(
+                interrupted,
+                precheck={
+                    "__record__": "ResourceRevisionPrecheck",
+                    "fields": {
+                        "capability_id": "data.resource_revision_observation",
+                        "contract_digest": "sha256:" + "3" * 64,
+                        "source_id": _NAMED_SOURCE,
+                        "resource_id": "catalog-resource:sha256:" + "d" * 64,
+                    },
+                },
+            ),
+        ),
+        (named, released_routine(named)),
+        {
+            skipped.occurrence_id: released_occurrence(
+                skipped, disposition="skipped_no_change"
+            ),
+            prechecking.occurrence_id: released_occurrence(
+                prechecking, disposition="prechecking"
+            ),
+        },
+    )
+
+
+def _seed(
+    home: Path, due: datetime
+) -> tuple[ScheduledRoutine, ScheduledRoutine, ScheduledRoutine]:
+    recurring, interrupted, named, occurrences = _released_routines(due)
+    with sqlite3.connect(home / "state.db") as connection:
+        # The fixture's connector tool is unrelated; the mock route cannot
+        # represent it.
+        connection.execute("DELETE FROM mcp_server_bindings")
+        for routine, data in (recurring, interrupted, named):
+            connection.execute(
+                "INSERT INTO scheduled_routines VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    _AGENT,
+                    routine.routine_id,
+                    _CONVERSATION,
+                    routine.state.value,
+                    (
+                        None
+                        if routine.next_due_at is None
+                        else _microseconds(routine.next_due_at)
+                    ),
+                    data,
+                ),
+            )
+        for identity, data in occurrences.items():
+            fields = json.loads(data)["fields"]
+            lease = datetime.fromisoformat(
+                fields["lease_expires_at"]["__datetime__"].replace("Z", "+00:00")
+            )
+            connection.execute(
+                "INSERT INTO routine_occurrences VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _AGENT,
+                    identity,
+                    fields["routine_id"],
+                    1,
+                    fields["slot_key"],
+                    fields["disposition"],
+                    _microseconds(lease),
+                    None,
+                    data,
+                ),
+            )
+    return recurring[0], interrupted[0], named[0]
+
+
+@pytest.mark.parametrize(
+    "source_revision",
+    tuple(
+        migration.revision
+        for migration in HOME_MIGRATIONS
+        if MINIMUM_SUPPORTED_HOME_REVISION <= migration.revision < 4
+    ),
+)
+async def test_released_routines_upgrade_to_the_simple_shape_and_keep_running(
+    tmp_path: Path, source_revision: int
+) -> None:
+    home = tmp_path / "agents/golden"
+    _materialize_fixture(FIXTURES / f"revision-{source_revision}", home)
+    due = datetime.now(UTC) - timedelta(seconds=30)
+    recurring, interrupted, named = _seed(home, due)
+    with sqlite3.connect(home / "state.db") as connection:
+        released_rows = tuple(
+            connection.execute("SELECT * FROM scheduled_routines ORDER BY routine_id")
+        )
+
+    # Without a model nothing runs, so the upgraded records are as stored.
+    agent = await Agent.open("golden", root=tmp_path, workspace=workspace_for(tmp_path))
+    try:
+        upgraded = await agent.inspect_routine(recurring.routine_id)
+        assert upgraded is not None and upgraded.routine == recurring
+        (skipped,) = upgraded.recent_occurrences
+        assert skipped.disposition is RoutineOccurrenceDisposition.COMPLETED
+        resumable = await agent.inspect_routine(interrupted.routine_id)
+        assert resumable is not None
+        (claim,) = resumable.recent_occurrences
+        # A claim interrupted mid-precheck is now an ordinary claim.
+        assert claim.disposition is RoutineOccurrenceDisposition.CLAIMED
+        # The routine's named sources become its optional source list.
+        disabled = await agent.inspect_routine(named.routine_id)
+        assert disabled is not None and disabled.routine == named
+        assert disabled.routine.source_ids == (_NAMED_SOURCE,)
+    finally:
+        await agent.close()
+    # The rollback copy keeps the released rows exactly.
+    (rollback,) = tuple((home / ".home-rollbacks").iterdir())
+    with sqlite3.connect(rollback / "state.db") as connection:
+        assert (
+            tuple(
+                connection.execute(
+                    "SELECT * FROM scheduled_routines ORDER BY routine_id"
+                )
+            )
+            == released_rows
+        )
+
+    usage = ModelUsage(
+        input_tokens=40,
+        output_tokens=8,
+        cost_estimate=CostEstimate.complete(Decimal("0")),
+    )
+    provider = MockModelProvider(
+        tuple(
+            ModelResponse(
+                finish_reason=FinishReason.STOP, text="The count is 7.", usage=usage
+            )
+            for _ in range(2)
+        ),
+        provider_id="mock:released",
+        complete_pricing=True,
+    )
+    running = await Agent.open(
+        "golden",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=provider,
+        model_profile=provider.model_profile,
+    )
+    try:
+        async with asyncio.timeout(30):
+            while len(await running.list_deliveries(conversation_id=_CONVERSATION)) < 2:
+                await asyncio.sleep(0.01)
+        deliveries = await running.list_deliveries(conversation_id=_CONVERSATION)
+        assert {item.conclusion_state for item in deliveries} == {
+            OutcomeState.SUCCEEDED
+        }, [item.failure_code for item in deliveries]
+        ran = await running.inspect_routine(recurring.routine_id)
+        assert ran is not None
+        assert ran.routine.occurrence_count == recurring.occurrence_count + 1
+        assert ran.routine.charged_tokens == recurring.charged_tokens + 48
+        assert ran.routine.consecutive_failures == 0
+        assert ran.routine.next_due_at == due + timedelta(hours=1)
+        resumed = await running.inspect_routine(interrupted.routine_id)
+        assert resumed is not None
+        assert resumed.routine.last_occurrence_id == interrupted.active_occurrence_id
+        assert resumed.recent_occurrences[0].disposition is (
+            RoutineOccurrenceDisposition.COMPLETED
+        )
+    finally:
+        await running.close()
+
+
+async def test_a_malformed_released_routine_fails_closed_without_writing(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "agents/golden"
+    _materialize_fixture(FIXTURES / "revision-3", home)
+    _seed(home, datetime.now(UTC) - timedelta(seconds=30))
+    with sqlite3.connect(home / "state.db") as connection:
+        (data,) = connection.execute(
+            "SELECT data FROM scheduled_routines WHERE routine_id = ?",
+            ("released-recurring",),
+        ).fetchone()
+        damaged = json.loads(data)
+        del damaged["fields"]["allowed_source_ids"]
+        connection.execute(
+            "UPDATE scheduled_routines SET data = ? WHERE routine_id = ?",
+            (json.dumps(damaged, sort_keys=True), "released-recurring"),
+        )
+    before = _sha256(home / "state.db")
+    with pytest.raises(StateCompatibilityError):
+        await Agent.open("golden", root=tmp_path, workspace=workspace_for(tmp_path))
+    assert _sha256(home / "state.db") == before
+    assert not (home / ".home-rollbacks").exists()

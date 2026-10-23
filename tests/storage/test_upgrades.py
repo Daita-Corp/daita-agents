@@ -46,6 +46,7 @@ from daita.storage.home_migrations.revision_0004 import REVISION_4
 from daita.storage.schema_contract import require_healthy, require_schema
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_schema import CURRENT_SCHEMA
+from tests.storage._routine_history import restore_released_routines
 from tests.support.home_revisions import undo_revision_4_schema
 from tests.support.host import StartHost, host_workspace
 from tests.support.mcp_actions import ActionFixture
@@ -349,24 +350,22 @@ def _make_preproduction_home(home: Path, shape: str) -> None:
 
 
 @pytest.mark.parametrize("source_revision", [2, 3])
-async def test_populated_prior_mcp_home_preserves_binding_grant_and_receipt(
+async def test_populated_prior_mcp_home_preserves_binding_routine_and_receipt(
     tmp_path: Path,
     source_revision: int,
 ) -> None:
     action = await ActionFixture(tmp_path).start()
     try:
-        proposal = await action.agent.propose_routine(await action.draft())
+        intent = await action.draft()
         action.script()
-        routine = await action.agent.create_routine(proposal)
+        routine = await action.create(intent)
         await action.delivery()
         inspection = await action.agent.inspect_routine(routine.routine_id)
         receipts = await action.receipts()
         assert inspection is not None
-        assert len(inspection.routine.capability_grants) == len(receipts) == 1
-        grant = inspection.routine.capability_grants[0]
+        assert len(receipts) == 1
         receipt = receipts[0]
-        # The routine still stores its grant, but the action was approved at
-        # the time, so its receipt names no grant.
+        # The action was approved at the time, so its receipt names no grant.
         assert receipt.capability_grant_digest is None
         assert receipt.routine_id == routine.routine_id
         binding = action.binding
@@ -375,13 +374,29 @@ async def test_populated_prior_mcp_home_preserves_binding_grant_and_receipt(
     finally:
         await action.agent.close()
 
-    # Restore the released revision-2 or pushed development revision-3 format.
-    # Conversion must keep identities, grants, receipts and all unrelated rows.
+    # Restore the released revision-2 or pushed development revision-3 format,
+    # whose routine carried a standing grant. Conversion keeps identities,
+    # receipts and all unrelated rows and returns the routine to its current shape.
     with sqlite3.connect(home / "state.db") as connection:
         preserved = {
             table: tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
             for table in ("scheduled_routines", "effect_receipts")
         }
+        restore_released_routines(connection)
+        (encoded,) = connection.execute(
+            "SELECT data FROM scheduled_routines"
+        ).fetchone()
+        released = json.loads(encoded)
+        released["fields"]["capability_grants"] = [
+            {
+                "__record__": "CapabilityGrant",
+                "fields": {"capability_id": action.tool.capability_id},
+            }
+        ]
+        connection.execute(
+            "UPDATE scheduled_routines SET data = ?",
+            (json.dumps(released, sort_keys=True, separators=(",", ":")),),
+        )
         run_ids = tuple(connection.execute("SELECT id FROM runs ORDER BY id"))
         for run_id, encoded in connection.execute("SELECT id, input FROM runs"):
             payload = json.loads(encoded)
@@ -452,7 +467,7 @@ async def test_populated_prior_mcp_home_preserves_binding_grant_and_receipt(
         assert (await reopened.list_mcp_servers())[0].binding == expected_binding
         upgraded = await reopened.inspect_routine(routine.routine_id)
         assert upgraded is not None
-        assert upgraded.routine.capability_grants == (grant,)
+        assert upgraded.routine == inspection.routine
         assert await reopened.inspect_effect(receipt.receipt_id) == receipt
         assert len(action.server.request_methods) == request_count
     finally:

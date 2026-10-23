@@ -132,8 +132,8 @@
         "affected_paths": [
           "state.db"
         ],
-        "checksum": "0b0775dd1335a7333cb5b449e70a3de707ad28ecc7a17b14c3cb2ed6473283f7",
-        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete. Retire inactive learning candidates and their review stamps; approved knowledge is unaffected.",
+        "checksum": "e560a84ee23daf851d37f486619a16bab55e6327daff7361b54056b0d0ed9cf5",
+        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete. Retire inactive learning candidates and their review stamps; approved knowledge is unaffected. Routines keep their title, prompt, schedule, named sources, counters and state; their frozen access, grants, routes, sensitivity, budgets, expiry, outcome, precheck, skills and provenance are dropped, and their runs ask before writes. Occurrences drop prechecks and reservations.",
         "migration_id": "0004_foreground_analysis_evidence",
         "revision": 4
       }
@@ -780,19 +780,6 @@
         "resource_id",
         "revision"
       ],
-      "ResourceRevisionObservation": [
-        "source_id",
-        "resource_id",
-        "resource_revision",
-        "catalog_revision",
-        "observed_at"
-      ],
-      "ResourceRevisionPrecheck": [
-        "capability_id",
-        "contract_digest",
-        "source_id",
-        "resource_id"
-      ],
       "RoutineOccurrence": [
         "routine_id",
         "routine_revision",
@@ -802,12 +789,9 @@
         "claimed_at",
         "claim_token",
         "lease_expires_at",
-        "precheck_observation",
         "execution_scope",
         "execution_scope_digest",
         "reserved_run_id",
-        "reserved_tokens",
-        "reserved_cost_usd",
         "charged_tokens",
         "charged_cost_usd",
         "run_bound_at",
@@ -822,18 +806,6 @@
         "disposition",
         "created_at",
         "updated_at"
-      ],
-      "RoutinePromotionEvidence": [
-        "basis_run_id",
-        "terminal_result_digest",
-        "executed_capability_ids"
-      ],
-      "RoutineSkillBinding": [
-        "skill_name",
-        "skill_revision",
-        "content_digest",
-        "attached_by_principal",
-        "attached_at"
       ],
       "RunInput": [
         "id",
@@ -863,48 +835,20 @@
         "conversation_id",
         "owner_principal_id",
         "title",
-        "run_immediately",
         "authorized_instruction",
         "instruction_digest",
         "schedule",
         "schedule_interpreter_revision",
-        "misfire_policy",
-        "reporting_mode",
-        "precheck",
-        "last_acknowledged_precheck_observation",
-        "allowed_source_ids",
-        "allowed_connector_binding_ids",
-        "allowed_resource_ids",
-        "allowed_capability_ids",
-        "contract_bindings",
-        "capability_grants",
-        "allowed_access_modes",
-        "allowed_operational_effects",
-        "sensitivity_ceiling",
-        "eligible_model_routes",
-        "skill_bindings",
-        "outcome_contract",
-        "distribution_plan",
-        "per_run_max_tokens",
-        "per_run_max_cost_usd",
-        "cumulative_max_tokens",
-        "cumulative_max_cost_usd",
-        "cumulative_max_attempts",
-        "cumulative_max_occurrences",
-        "reserved_tokens",
-        "reserved_cost_usd",
+        "source_ids",
         "charged_tokens",
         "charged_cost_usd",
         "attempt_count",
         "occurrence_count",
-        "maximum_consecutive_failures",
         "consecutive_failures",
-        "expires_at",
         "next_due_at",
         "active_occurrence_id",
         "last_occurrence_id",
         "last_delivery_ids",
-        "promotion_evidence",
         "state",
         "revision",
         "created_at",
@@ -4053,7 +3997,7 @@
       }
     }
   },
-  "contract_sha256": "d01ed39a4c3a02a78e7789f8df3685ae400db09590eb9106dd06daa986649912",
+  "contract_sha256": "e8e71f3eab99e3d02577b5681bf9b5ab156575d1c13782906535df5d2f7e4d4a",
   "home_revision": 4,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1
