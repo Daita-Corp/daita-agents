@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 
@@ -13,7 +14,14 @@ from daita.distribution.models import (
     OutcomeConclusionKind,
     OutcomeState,
 )
-from daita.jobs.graph.models import GraphJob, GraphState
+from daita.jobs import (
+    ChecklistItem,
+    ChecklistStatus,
+    Delegation,
+    DelegationState,
+    Job,
+    JobState,
+)
 from daita.llm.models import ModelSensitivity
 from daita.routines.models import (
     RoutineOccurrence,
@@ -34,29 +42,40 @@ from daita.work_board import (
     work_board_projection,
 )
 from tests.routines._storage_support import occurrence_record
-from tests.support.graph import GRAPH_NOW, graph_admission
 
 pytestmark = pytest.mark.unit
 
-NOW = GRAPH_NOW + timedelta(days=30)
+NOW = datetime(2026, 10, 16, 12, tzinfo=UTC)
+STARTED = NOW - timedelta(hours=1)
+OBJECTIVE = "Compare the monthly totals."
 _DIGEST = "sha256:" + "0" * 64
-_TERMINAL = {GraphState.SUCCEEDED, GraphState.FAILED, GraphState.CANCELLED}
+
+
+_STATE_FIELDS: dict[JobState, dict[str, object]] = {
+    JobState.WAITING_FOR_YOU: {"question": "Which month?"},
+    JobState.FAILED: {"failure_code": "job_run_failed"},
+    JobState.DONE: {"final_summary": "September was higher."},
+}
 
 
 def _job(
     job_id: str,
-    state: GraphState,
+    state: JobState,
     *,
     updated_at: datetime = NOW - timedelta(minutes=5),
-    failure_code: str | None = None,
-) -> GraphJob:
-    return replace(
-        graph_admission(job_id=job_id).job,
+    **fields: object,
+) -> Job:
+    values: dict[str, Any] = {**_STATE_FIELDS.get(state, {}), **fields}
+    return Job(
+        job_id=job_id,
+        agent_id="agent-1",
+        conversation_id="conversation-1",
+        objective=values.pop("objective", OBJECTIVE),
+        source_ids=(),
         state=state,
+        created_at=min(STARTED, updated_at),
         updated_at=updated_at,
-        terminal_at=updated_at if state in _TERMINAL else None,
-        terminal_result_id="result-1" if state is GraphState.SUCCEEDED else None,
-        failure_code=failure_code,
+        **values,
     )
 
 
@@ -142,7 +161,7 @@ def _delivery(
 
 def _board(
     *,
-    jobs: tuple[GraphJob, ...] = (),
+    jobs: tuple[Job, ...] = (),
     routines: tuple[ScheduledRoutineSummary, ...] = (),
     active: tuple[RoutineOccurrence, ...] = (),
     results: tuple[RoutineOccurrence, ...] = (),
@@ -167,48 +186,84 @@ def _only(board: WorkBoard) -> WorkCard | None:
 
 
 @pytest.mark.parametrize(
-    "state,column,summary,started",
+    "state,fields,column,summary,started",
     [
-        (GraphState.QUEUED, WorkColumn.SCHEDULED, "", False),
-        (GraphState.ACTIVE, WorkColumn.RUNNING, "", True),
-        (GraphState.CANCEL_REQUESTED, WorkColumn.RUNNING, "", True),
-        (GraphState.BLOCKED, WorkColumn.NEEDS_YOU, "Waiting for you", False),
+        (JobState.RUNNING, {}, WorkColumn.RUNNING, "", True),
         (
-            GraphState.NEEDS_ATTENTION,
+            JobState.WAITING_FOR_YOU,
+            {},
             WorkColumn.NEEDS_YOU,
-            "Needs your attention",
+            "Which month?",
             False,
         ),
-        (GraphState.FAILED, WorkColumn.NEEDS_YOU, "graph_task_failed", False),
-        (GraphState.SUCCEEDED, WorkColumn.DONE, "", False),
-        (GraphState.CANCELLED, WorkColumn.DONE, "", False),
+        (
+            JobState.FAILED,
+            {},
+            WorkColumn.NEEDS_YOU,
+            "job_run_failed",
+            False,
+        ),
+        (
+            JobState.FAILED,
+            {"failure_code": "job_upgraded", "final_summary": "Start it again."},
+            WorkColumn.NEEDS_YOU,
+            "Start it again.",
+            False,
+        ),
+        (
+            JobState.DONE,
+            {},
+            WorkColumn.DONE,
+            "September was higher.",
+            False,
+        ),
+        (JobState.CANCELLED, {}, WorkColumn.DONE, "", False),
     ],
 )
 def test_every_job_state_lands_in_its_column(
-    state: GraphState, column: WorkColumn, summary: str, started: bool
+    state: JobState,
+    fields: dict[str, Any],
+    column: WorkColumn,
+    summary: str,
+    started: bool,
 ) -> None:
-    failure = "graph_task_failed" if state is GraphState.FAILED else None
-    job = _job("job-1", state, failure_code=failure)
+    job = _job("job-1", state, **fields)
     card = _only(_board(jobs=(job,)))
     assert card is not None
     assert (card.kind, card.id, card.column) == (WorkKind.JOB, "job-1", column)
     assert (card.status, card.summary) == (state.value, summary)
-    assert card.title == "Complete the deterministic graph test."
+    assert card.title == OBJECTIVE
     assert card.updated_at == job.updated_at
-    assert card.started_at == (job.created_at if started else None)
+    assert card.started_at == (STARTED if started else None)
     assert card.delivery_id is None
+
+
+def test_a_running_job_shows_its_checklist_and_sub_runs() -> None:
+    job = _job(
+        "job-1",
+        JobState.RUNNING,
+        checklist=(
+            ChecklistItem("a", "Read A", ChecklistStatus.DONE),
+            ChecklistItem("b", "Read B", ChecklistStatus.IN_PROGRESS),
+            ChecklistItem("c", "Read C", ChecklistStatus.CANCELLED),
+        ),
+        delegations=(Delegation("d-1", "Read B", DelegationState.RUNNING, "run-1"),),
+    )
+    card = _only(_board(jobs=(job,)))
+    assert card is not None
+    assert card.summary == "1 of 2 done · 1 sub-run running"
 
 
 @pytest.mark.parametrize(
     "state,window",
     [
-        (GraphState.SUCCEEDED, DEFAULT_DONE_WINDOW),
-        (GraphState.CANCELLED, DEFAULT_DONE_WINDOW),
-        (GraphState.FAILED, FAILED_JOB_WINDOW),
+        (JobState.DONE, DEFAULT_DONE_WINDOW),
+        (JobState.CANCELLED, DEFAULT_DONE_WINDOW),
+        (JobState.FAILED, FAILED_JOB_WINDOW),
     ],
 )
 def test_terminal_jobs_age_off_exactly_at_their_window(
-    state: GraphState, window: timedelta
+    state: JobState, window: timedelta
 ) -> None:
     at_edge = _job("job-edge", state, updated_at=NOW - window)
     past_edge = _job(
@@ -219,9 +274,11 @@ def test_terminal_jobs_age_off_exactly_at_their_window(
 
 
 def test_a_job_read_twice_keeps_its_latest_state() -> None:
-    queued = _job("job-1", GraphState.QUEUED, updated_at=NOW - timedelta(minutes=9))
-    active = _job("job-1", GraphState.ACTIVE, updated_at=NOW - timedelta(minutes=8))
-    card = _only(_board(jobs=(active, queued)))
+    waiting = _job(
+        "job-1", JobState.WAITING_FOR_YOU, updated_at=NOW - timedelta(minutes=9)
+    )
+    running = _job("job-1", JobState.RUNNING, updated_at=NOW - timedelta(minutes=8))
+    card = _only(_board(jobs=(running, waiting)))
     assert card is not None and card.column is WorkColumn.RUNNING
 
 
@@ -386,7 +443,7 @@ def test_unclaimed_run_starts_at_its_scheduled_time() -> None:
         (
             _delivery(
                 "job-1/event/1/control_opened/control-1",
-                subject_kind=DeliverySubjectKind.GRAPH_ATTENTION,
+                subject_kind=DeliverySubjectKind.JOB,
             ),
             None,
             None,
@@ -472,13 +529,11 @@ def test_columns_sort_by_their_own_time_then_id() -> None:
     earlier = NOW - timedelta(minutes=30)
     board = _board(
         jobs=(
-            _job("job-queued-old", GraphState.QUEUED, updated_at=earlier),
-            _job("job-queued-new", GraphState.QUEUED, updated_at=later),
-            _job("job-blocked-b", GraphState.BLOCKED, updated_at=earlier),
-            _job("job-blocked-a", GraphState.BLOCKED, updated_at=earlier),
-            _job("job-blocked-new", GraphState.BLOCKED, updated_at=later),
-            _job("job-done-old", GraphState.SUCCEEDED, updated_at=earlier),
-            _job("job-done-new", GraphState.SUCCEEDED, updated_at=later),
+            _job("job-blocked-b", JobState.WAITING_FOR_YOU, updated_at=earlier),
+            _job("job-blocked-a", JobState.WAITING_FOR_YOU, updated_at=earlier),
+            _job("job-blocked-new", JobState.WAITING_FOR_YOU, updated_at=later),
+            _job("job-done-old", JobState.DONE, updated_at=earlier),
+            _job("job-done-new", JobState.DONE, updated_at=later),
         ),
         routines=(
             _routine("routine-late", next_due_at=NOW + timedelta(hours=2)),
@@ -495,8 +550,6 @@ def test_columns_sort_by_their_own_time_then_id() -> None:
     assert [card.id for card in board.columns[WorkColumn.SCHEDULED]] == [
         "routine-soon",
         "routine-late",
-        "job-queued-new",
-        "job-queued-old",
     ]
     assert [card.id for card in board.columns[WorkColumn.RUNNING]] == [
         "occurrence-first",
@@ -516,16 +569,16 @@ def test_columns_sort_by_their_own_time_then_id() -> None:
 
 def test_columns_truncate_and_every_column_is_present() -> None:
     jobs = tuple(
-        _job(f"job-{index:02d}", GraphState.QUEUED)
+        _job(f"job-{index:02d}", JobState.WAITING_FOR_YOU)
         for index in range(MAX_WORK_CARDS_PER_COLUMN + 2)
     )
     board = _board(jobs=jobs)
-    assert len(board.columns[WorkColumn.SCHEDULED]) == MAX_WORK_CARDS_PER_COLUMN
-    assert board.columns[WorkColumn.SCHEDULED][0].id == "job-00"
+    assert len(board.columns[WorkColumn.NEEDS_YOU]) == MAX_WORK_CARDS_PER_COLUMN
+    assert board.columns[WorkColumn.NEEDS_YOU][0].id == "job-00"
     assert dict(board.truncated) == {
-        WorkColumn.SCHEDULED: 2,
+        WorkColumn.SCHEDULED: 0,
         WorkColumn.RUNNING: 0,
-        WorkColumn.NEEDS_YOU: 0,
+        WorkColumn.NEEDS_YOU: 2,
         WorkColumn.DONE: 0,
     }
     empty = _board()
@@ -535,11 +588,7 @@ def test_columns_truncate_and_every_column_is_present() -> None:
 
 
 def test_long_multiline_text_is_bounded_to_one_line() -> None:
-    job = _job("job-1", GraphState.QUEUED)
-    specification = replace(job.specification, objective="Count\n" + "x" * 500)
-    job = replace(
-        job, specification=specification, specification_digest=specification.digest
-    )
+    job = _job("job-1", JobState.WAITING_FOR_YOU, objective="Count\n" + "x" * 500)
     result = _occurrence(
         "occurrence-1", "routine-1", RoutineOccurrenceDisposition.COMPLETED
     )
@@ -548,7 +597,7 @@ def test_long_multiline_text_is_bounded_to_one_line() -> None:
         results=(result,),
         deliveries=(_delivery("occurrence-1", preview="Line one\nline two " * 40),),
     )
-    (job_card,) = board.columns[WorkColumn.SCHEDULED]
+    (job_card,) = board.columns[WorkColumn.NEEDS_YOU]
     (run_card,) = board.columns[WorkColumn.DONE]
     assert job_card.title.startswith("Count x") and job_card.title.endswith("…")
     assert len(job_card.title) == 120
@@ -558,7 +607,7 @@ def test_long_multiline_text_is_bounded_to_one_line() -> None:
 
 def test_projection_is_json_safe_with_every_column() -> None:
     board = _board(
-        jobs=(_job("job-1", GraphState.ACTIVE),),
+        jobs=(_job("job-1", JobState.RUNNING),),
         routines=(_routine("routine-1"),),
     )
     projected = work_board_projection(board)
@@ -573,11 +622,11 @@ def test_projection_is_json_safe_with_every_column() -> None:
             "kind": "job",
             "id": "job-1",
             "column": "running",
-            "title": "Complete the deterministic graph test.",
-            "status": "active",
+            "title": OBJECTIVE,
+            "status": "running",
             "summary": "",
             "updated_at": (NOW - timedelta(minutes=5)).isoformat(),
-            "started_at": GRAPH_NOW.isoformat(),
+            "started_at": STARTED.isoformat(),
             "due_at": None,
             "routine_id": None,
             "delivery_id": None,

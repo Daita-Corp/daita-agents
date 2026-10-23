@@ -18,13 +18,13 @@ import pytest
 
 from daita import (
     Agent,
-    GraphState,
     IntervalSchedule,
     RoutineIntent,
     SQLiteSource,
 )
 from daita._json import canonical_json
 from daita.evaluation import measure_observer_events
+from daita.jobs import JobState
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -44,11 +44,7 @@ from daita.observation import (
     PrivateDiagnosticSink,
     summarize_diagnostics,
 )
-from tests.jobs.graph.test_public_composition import (
-    _ProductionGraphProvider,
-    _wait_terminal,
-)
-from tests.support.job_benchmarks import create_probe_home
+from tests.support.jobs import JobModel, in_state, open_job_agent, reply, wait_for_job
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.acceptance
@@ -348,51 +344,38 @@ async def test_routine_run_reaches_the_host_sink_without_an_observer(tmp_path):
     assert summary[routine[0]["run_id"]]["completed_model_steps"] == 1
 
 
-async def test_graph_task_run_reaches_the_host_sink_without_an_observer(tmp_path):
-    home = await create_probe_home(tmp_path, "diagnostics-graph", distractor_tables=1)
-    provider = _ProductionGraphProvider(
-        source_id=home.source_id,
-        resources=tuple(sorted(home.resource_ids.items())),
+async def test_job_runs_reach_the_host_sink_without_an_observer(tmp_path):
+    model = JobModel()
+    model.script(
+        main=[
+            reply(ToolCall("d", "delegate", {"goal": "Count", "context": ""})),
+            reply(text="Counted."),
+        ],
+        subruns={"Count": lambda request: reply(text="Three rows.")},
     )
-    path = tmp_path / "diagnostics" / "graph.jsonl"
-    agent = await Agent.open(
-        home.name,
-        root=home.root,
-        model=provider,
-        model_profile=provider.model_profile,
-        workspace=workspace_for(home.root),
-        diagnostics_path=path,
-    )
+    path = tmp_path / "diagnostics" / "jobs.jsonl"
+    agent = await open_job_agent(tmp_path / "root", model, diagnostics_path=path)
     try:
-        foreground = await agent.run(
-            "Start a durable graph query over all exact resources.",
-            source_scope_ids=(home.source_id,),
-        )
-        assert foreground.kind is LoopExitKind.COMPLETED
-        (job,) = await agent.list_jobs()
-        inspection = await _wait_terminal(agent, job.job_id)
-        assert inspection.job.state is GraphState.SUCCEEDED
+        job = await agent.start_job("Count the rows.")
+        await wait_for_job(agent, job.job_id, in_state(JobState.DONE), model=model)
     finally:
         await agent.close()
 
     records = _records(path)
-    task = [r for r in records if r["run_origin"] == "job_task"]
-    assert {r["kind"] for r in task} >= {
-        "run.started",
-        "model.completed",
-        "tool.completed",
-        "run.completed",
-    }
-    query = next(
-        r["data"]
-        for r in task
-        if r["kind"] == "tool.completed" and r["data"]["tool_name"] == "data_query"
+    for origin in ("job", "job_subrun"):
+        assert {r["kind"] for r in records if r["run_origin"] == origin} >= {
+            "run.started",
+            "model.completed",
+            "run.completed",
+        }
+    assert any(
+        r["run_origin"] == "job"
+        and r["kind"] == "tool.completed"
+        and r["data"]["tool_name"] == "delegate"
+        for r in records
     )
-    assert query["result_bytes"]["stored"] > 0
-    assert query["result_bytes"]["model"] > query["result_bytes"]["stored"]
-    assert "SELECT" not in path.read_text()
     origins = {item["run_origin"] for item in summarize_diagnostics(path)}
-    assert origins >= {"user", "job_task"}
+    assert origins >= {"job", "job_subrun"}
 
 
 def test_summary_groups_runs_and_never_sums_unknown_as_zero(tmp_path):

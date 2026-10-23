@@ -66,7 +66,7 @@ from daita.storage.home_migrations.revision_0002_legacy_jobs import (
     JobSpecification,
     JobStatus,
 )
-from daita.storage.sqlite import SQLiteStateStore
+from daita.storage.sqlite_graph import inspect_graph
 from tests.support.graph import GRAPH_NOW
 
 pytestmark = pytest.mark.integration
@@ -493,14 +493,13 @@ async def test_revision_one_jobs_convert_with_complete_executability_ledger(
     assert (target / "USER.md").read_bytes() == (source / "USER.md").read_bytes()
     validate_revision_2_home(source, target, report=report)
 
-    draft_store = await SQLiteStateStore.open(
-        target / "state.db", current_home_validated=True
-    )
-    succeeded_graph = await draft_store.inspect_graph("agent-1", "a-succeeded")
+    # The revision-2 graph is read through the frozen store the migration uses.
+    with connect_graph(target / "state.db", read_only=True) as connection:
+        succeeded_graph = inspect_graph(connection, "agent-1", "a-succeeded")
+        connected = inspect_graph(connection, "agent-1", "connected")
     assert succeeded_graph is not None
     assert succeeded_graph.job.terminal_result_id == "a-succeeded:final-result"
     assert len(succeeded_graph.results) == 2
-    connected = await draft_store.inspect_graph("agent-1", "connected")
     assert connected is not None
     assert "remote-job-1" in str(connected.job.migration_provenance["attempt_evidence"])
     with connect_graph(target / "state.db", read_only=True) as connection:

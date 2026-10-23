@@ -43,7 +43,9 @@ def test_revision_two_schema_is_the_only_current_contract(
 
     assert CURRENT_HOME_REVISION == 4
     assert tuple(item.revision for item in HOME_MIGRATIONS) == (1, 2, 3, 4)
-    assert "job_graphs" in CURRENT_SCHEMA.tables
+    # Revision 4 replaced the task graph with one checklist-job table.
+    assert "jobs" in CURRENT_SCHEMA.tables
+    assert not {name for name in CURRENT_SCHEMA.tables if name.startswith("job_")}
     assert "autonomous_followups" not in CURRENT_SCHEMA.tables
 
 

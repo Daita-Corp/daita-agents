@@ -270,12 +270,14 @@ def test_rendered_and_enforced_target_bounds_read_one_lane_policy():
     lanes = {origin: call_target_lane(origin) for origin in RunOrigin}
     assert lanes == {
         RunOrigin.USER: CallTargetLane.FOREGROUND,
-        RunOrigin.JOB_TASK: CallTargetLane.GRAPH_TASK,
+        RunOrigin.JOB: CallTargetLane.JOB,
+        RunOrigin.JOB_SUBRUN: CallTargetLane.JOB,
+        RunOrigin.JOB_TASK: None,
         RunOrigin.JOB_EVENT: None,
         RunOrigin.SCHEDULED_ROUTINE: None,
     }
     assert _POLICY.call_target_ceiling(lanes[RunOrigin.USER]) == 4
-    assert _POLICY.call_target_ceiling(lanes[RunOrigin.JOB_TASK]) == 16
+    assert _POLICY.call_target_ceiling(lanes[RunOrigin.JOB]) == 16
     for origin, lane in lanes.items():
         ceiling = _POLICY.call_target_ceiling(lane)
         sentence = _POLICY.limits_sentence(lane)

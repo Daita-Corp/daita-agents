@@ -29,9 +29,7 @@ from daita.capabilities import (
 )
 from daita.capability_runtime import APPROVED_TARGET_CHANGED
 from daita.distribution.models import OutcomeState
-from daita.jobs.graph.admission import START_GRAPH_JOB_TOOL_NAME
-from daita.jobs.graph.capabilities import TASK_COMPLETE_TOOL_NAME
-from daita.jobs.graph.models import GraphState
+from daita.jobs import JobState
 from daita.llm.models import (
     MessageRole,
     ModelRequest,
@@ -49,6 +47,7 @@ from tests.support.data_write_approval import (
     data_write_approval,
 )
 from tests.support.distribution import inbox_distribution_plan
+from tests.support.jobs import wait_for_job
 from tests.support.native_writes import (
     NOW,
     ScriptedResearchModel,
@@ -718,17 +717,15 @@ async def test_upsert_evidence_is_derived_from_earlier_reads_of_the_same_table(
         await agent.close()
 
 
-async def test_exact_native_upsert_runs_once_as_a_preview_bound_graph_task(
-    tmp_path, monkeypatch
-) -> None:
+async def test_exact_native_upsert_runs_once_from_a_job(tmp_path, monkeypatch) -> None:
     (
         agent,
         provider,
         db,
         _research,
         _binding,
-        resource,
-        constraints,
+        _resource,
+        _constraints,
         batch,
         _clock,
         approvals,
@@ -738,30 +735,21 @@ async def test_exact_native_upsert_runs_once_as_a_preview_bound_graph_task(
         limits=LoopLimits(max_estimated_cost_usd=Decimal("10")),
     )
     intent = {key: value for key, value in batch.items() if key != "evidence_call_ids"}
-    grant_constraints = {
-        "source_id": batch["source_id"],
-        "resource_id": resource.id,
-        "resource_revision": resource.current_revision,
-        **{
-            key: value
-            for key, value in constraints.items()
-            if key != "allowed_operations"
-        },
-    }
+    objective = "Apply the exact company upsert once."
 
     def apply_preview(request: ModelRequest) -> ModelResponse:
         preview = next(
             block
             for message in request.messages
             for block in message.content
-            if isinstance(block, ToolResultBlock) and block.call_id == "graph-preview"
+            if isinstance(block, ToolResultBlock) and block.call_id == "job-preview"
         )
         assert not preview.is_error, preview.output
         data = preview.output["data"]
         assert isinstance(data, Mapping)
         return response(
             ToolCall(
-                "graph-write",
+                "job-write",
                 "data_upsert_rows",
                 {
                     **intent,
@@ -771,40 +759,9 @@ async def test_exact_native_upsert_runs_once_as_a_preview_bound_graph_task(
             )
         )
 
+    # Only the job's main run calls the model.
     provider.replace_script(
         (
-            response(
-                ToolCall(
-                    "load-graph",
-                    "toolbox_load",
-                    {"tool_names": (START_GRAPH_JOB_TOOL_NAME,)},
-                )
-            ),
-            response(
-                ToolCall(
-                    "start-graph",
-                    START_GRAPH_JOB_TOOL_NAME,
-                    {
-                        "objective": "Apply the exact admitted company upsert once.",
-                        "outcome_contract": {"kind": "native_upsert_result"},
-                        "deadline_seconds": 600,
-                        "initial_task": {
-                            "capability_id": "data.upsert_rows",
-                            "arguments": intent,
-                            "expected_result_contract": {
-                                "result_kind": "native_upsert_result"
-                            },
-                            "retained_references": {
-                                "source_ids": (batch["source_id"],),
-                                "resource_ids": (resource.id,),
-                                "connector_binding_ids": (),
-                            },
-                            "effect_grant": {"constraints": grant_constraints},
-                        },
-                    },
-                )
-            ),
-            response(text="The exact grant-backed graph job was admitted."),
             response(
                 ToolCall(
                     "load-write",
@@ -814,72 +771,23 @@ async def test_exact_native_upsert_runs_once_as_a_preview_bound_graph_task(
             ),
             response(
                 ToolCall(
-                    "graph-preview", "data_upsert_rows", {**intent, "mode": "preview"}
+                    "job-preview", "data_upsert_rows", {**intent, "mode": "preview"}
                 )
             ),
             apply_preview,
-            response(
-                ToolCall(
-                    "complete-effect-task",
-                    TASK_COMPLETE_TOOL_NAME,
-                    {
-                        "result_kind": "native_upsert_result",
-                        "summary": "Applied the exact previewed company upsert.",
-                        "payload": {"input_count": 1},
-                        "downstream_constraints": {},
-                    },
-                )
-            ),
+            response(text="Applied the exact previewed company upsert."),
         )
     )
     try:
-        foreground = await agent.run("Run the exact durable graph upsert.")
-        for _ in range(500):
-            jobs = await agent.list_jobs(limit=5)
-            if jobs and jobs[0].state in {
-                GraphState.SUCCEEDED,
-                GraphState.FAILED,
-                GraphState.NEEDS_ATTENTION,
-            }:
-                break
-            await asyncio.sleep(0.01)
-        assert jobs
-        inspection = await agent.inspect_job(jobs[0].job_id)
-        assert inspection is not None
-        diagnostic: list[object] = []
-        for attempt in inspection.attempts:
-            try:
-                transcript = await agent.transcript(attempt.run_id)
-            except KeyError:
-                continue
-            diagnostic.extend(
-                block.output
-                for message in transcript.messages
-                for block in message.content
-                if isinstance(block, ToolResultBlock)
-            )
-        assert jobs[0].state is GraphState.SUCCEEDED, canonical_json(
-            {
-                "diagnostic": diagnostic,
-                "tasks": [
-                    item.specification.digest_material() for item in inspection.tasks
-                ],
-            }
+        job = await agent.start_job(objective, (batch["source_id"],))
+        current = await wait_for_job(
+            agent, job.job_id, lambda item: item.state is not JobState.RUNNING
         )
-        worker = next(
-            item
-            for item in inspection.tasks
-            if item.task_id != jobs[0].finalizer_task_id
+        assert current.state is JobState.DONE, canonical_json(
+            {"state": current.state.value, "failure": current.failure_code}
         )
-        result = await agent.read_task_result(jobs[0].job_id, worker.task_id)
-        assert result is not None and len(result.effect_receipt_ids) == 1
-        assert result.verification["evidence_call_ids"] == ("graph-write",)
-        assert result.downstream_constraints["effect_completion_evidence"] == (
-            "adapter_verified",
-        )
-        assert result.residual_risk is None
-        receipts = await agent._embedded._store.list_effect_receipts(
-            agent.id, run_id=result.run_id
+        receipts = await agent._embedded._store.job_effect_receipts(
+            agent.id, job.job_id
         )
         assert len(receipts) == 1
         assert receipts[0].outcome is EffectOutcome.SUCCEEDED
@@ -896,14 +804,8 @@ async def test_exact_native_upsert_runs_once_as_a_preview_bound_graph_task(
             == 1
         )
         # The job's write asks at the time, naming the job that asked.
-        assert [item.capability_id for item in approvals] == [
-            "jobs.graph.start",
-            "data.upsert_rows",
-        ]
-        assert approvals[1].requester == (
-            "Apply the exact admitted company upsert once."
-        )
-        assert foreground.reason == "completed"
+        assert [item.capability_id for item in approvals] == ["data.upsert_rows"]
+        assert approvals[0].requester == objective
     finally:
         await agent.close()
 
@@ -982,8 +884,7 @@ async def test_immediate_and_weekly_research_upsert_production_path(
             "stale_revision",
             "insert_column",
         }:
-            # Graph tasks still prepare standing native grants until they are
-            # removed; routines no longer carry any.
+            # Routines no longer carry standing native grants.
             bad = dict(grant_constraints)
             if mode == "wrong_key":
                 bad["key_columns"] = ("id",)

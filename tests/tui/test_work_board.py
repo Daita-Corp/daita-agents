@@ -13,7 +13,6 @@ from daita import (
     DeliveryInspection,
     DeliveryState,
     DeliverySubjectKind,
-    GraphState,
     OutcomeConclusionKind,
     OutcomeState,
     RoutineState,
@@ -37,7 +36,7 @@ from daita.tui.widgets.command_center import WorkBoardView
 from daita.tui.widgets.transcript import TranscriptView
 from tests.support.distribution import inbox_distribution_plan
 from tests.support.host import StartHost, host_workspace, remote_agent
-from tests.tui._support import _tui_delivery_view, _tui_job_summary
+from tests.tui._support import _tui_delivery_view, _tui_job
 
 NOW = datetime(2026, 10, 18, 12, tzinfo=UTC)
 
@@ -332,7 +331,7 @@ async def test_enter_opens_each_card_kind_in_its_owner_screen(
     expected_id: str,
 ) -> None:
     app, agent = await _app_with_board(start_host, monkeypatch, [_board(card)])
-    job = _tui_job_summary("job-target", GraphState.ACTIVE, result_available=False)
+    job = _tui_job("job-target")
     routine = ScheduledRoutineSummary(
         routine_id="routine-target",
         title="Next report",

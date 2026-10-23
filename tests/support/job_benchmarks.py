@@ -8,16 +8,15 @@ import math
 import os
 import random
 import sqlite3
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from time import perf_counter
 
 import pytest
 
-from daita import Agent, GraphState, LoopLimits, SQLiteSource
+from daita import Agent, LoopLimits, SQLiteSource
 from daita._json import canonical_json
 from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import (
@@ -42,11 +41,9 @@ from daita.llm.protocols import (
     StreamingModelProvider,
     provider_has_complete_pricing,
 )
-from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import (
     LoopExit,
     LoopExitKind,
-    RunInput,
     Transcript,
     validate_completed_transcript,
 )
@@ -69,18 +66,6 @@ PROFILE_SAMPLE_ROWS = 5
 PROFILE_NULL_VALUES = 2
 TARGET_IMMEDIATE_TABLE = "stage_b_immediate_probe"
 TARGET_PROFILE_TABLE = "stage_b_profile_probe"
-LIFECYCLE_TOOLS = frozenset(
-    {"job_list", "job_inspect", "job_read_results", "job_cancel"}
-)
-TERMINAL_STATES = frozenset(
-    {
-        GraphState.SUCCEEDED,
-        GraphState.FAILED,
-        GraphState.CANCELLED,
-        GraphState.NEEDS_ATTENTION,
-    }
-)
-
 OFFLINE_EAGER_LIMITS = LoopLimits()
 
 
@@ -498,57 +483,6 @@ async def open_live_home(home: ProbeHome, model_id: str) -> LiveAgentFixture:
     )
 
 
-async def seed_completed_profile_agent(
-    tmp_path: Path,
-    name: str,
-    model_id: str,
-    *,
-    distractor_tables: int = 0,
-) -> tuple[LiveAgentFixture, str]:
-    """Create one real completed job without spending a live model interaction."""
-
-    home = await create_probe_home(
-        tmp_path,
-        name,
-        distractor_tables=distractor_tables,
-    )
-    provider = MockModelProvider((stop_response("Seed conversation ready."),))
-    agent = await Agent.open(
-        home.name,
-        root=home.root,
-        model=provider,
-        model_profile=provider.model_profile,
-        limits=OFFLINE_EAGER_LIMITS,
-        workspace=workspace_for(home.root),
-    )
-    try:
-        result = await agent.run(
-            "Seed one deterministic completed profile job.",
-            source_scope_ids=(home.source_id,),
-        )
-        assert result.kind is LoopExitKind.COMPLETED
-        job_id = await admit_profile_job(
-            agent, home.resource_ids[TARGET_PROFILE_TABLE], result
-        )
-        jobs = await agent.list_jobs()
-        assert len(jobs) == 1
-        terminal = await wait_for_terminal(agent, job_id)
-        assert terminal.job.state is GraphState.SUCCEEDED
-        await assert_profile_result(agent, job_id)
-        # A fresh query must not accidentally answer a historical-result question.
-        # Change only this disposable source after the verified snapshot is complete.
-        with sqlite3.connect(home.database) as connection:
-            connection.executemany(
-                f"INSERT INTO {TARGET_PROFILE_TABLE} VALUES (?, ?, ?)",
-                ((6, None, 15.5), (7, None, 16.5)),
-            )
-        await agent.refresh_source(home.source_id)
-        await assert_profile_result(agent, job_id)
-    finally:
-        await agent.close()
-    return await open_live_home(home, model_id), job_id
-
-
 async def capture_run(
     fixture: LiveAgentFixture,
     message: str,
@@ -643,88 +577,6 @@ def results_for(
     return tuple(selected)
 
 
-async def wait_for_terminal(agent: Agent, job_id: str, *, timeout: float = 30.0):
-    deadline = asyncio.get_running_loop().time() + timeout
-    latest = None
-    while asyncio.get_running_loop().time() < deadline:
-        latest = await agent.inspect_job(job_id)
-        assert latest is not None
-        if latest.job.state in TERMINAL_STATES:
-            return latest
-        await asyncio.sleep(0.02)
-    pytest.fail(f"job did not reach a terminal state: {latest!r}")
-
-
-async def wait_for_running(agent: Agent, job_id: str, *, timeout: float = 5.0):
-    deadline = asyncio.get_running_loop().time() + timeout
-    latest = None
-    while asyncio.get_running_loop().time() < deadline:
-        latest = await agent.inspect_job(job_id)
-        assert latest is not None
-        if latest.job.state is GraphState.ACTIVE:
-            return latest
-        await asyncio.sleep(0.01)
-    pytest.fail(f"job did not enter the running state: {latest!r}")
-
-
-async def assert_profile_result(agent: Agent, job_id: str) -> Mapping[str, object]:
-    result = await agent.read_job_result(job_id)
-    assert result is not None
-    assert result.payload["sampled_rows"] == PROFILE_SAMPLE_ROWS
-    assert len(result.artifact_ids) == 1
-    payload = await agent.read_artifact(result.artifact_ids[0])
-    document = json.loads(payload.content)
-    assert isinstance(document, Mapping)
-    resources = document["resources"]
-    assert isinstance(resources, Sequence)
-    assert len(resources) == 1
-    resource = resources[0]
-    assert isinstance(resource, Mapping)
-    assert resource["sampled_rows"] == PROFILE_SAMPLE_ROWS
-    profiles = resource["column_profiles"]
-    assert isinstance(profiles, Sequence)
-    nullable = next(
-        item
-        for item in profiles
-        if isinstance(item, Mapping) and item.get("column") == "nullable_code"
-    )
-    assert nullable["null_values"] == PROFILE_NULL_VALUES
-    return document
-
-
-async def admit_profile_job(
-    agent: Agent,
-    resource_id: str,
-    origin: LoopExit,
-    *,
-    sample_rows: int = PROFILE_SAMPLE_ROWS,
-) -> str:
-    """Admit the internal static profile graph in an existing conversation.
-
-    No model tool starts profile jobs; migrated revision-2 profile jobs run the
-    same internal executor and finalizer, so tests admit the graph directly.
-    """
-
-    embedded = agent._embedded
-    admission = await embedded._data_profile_admission.build_static_graph_admission(
-        run=RunInput(
-            id=origin.run_id,
-            agent_id=agent.id,
-            message="Profile one exact resource.",
-            created_at=datetime.now(UTC),
-            conversation_id=origin.conversation_id,
-        ),
-        call_id="internal-profile",
-        arguments={
-            "resource_ids": (resource_id,),
-            "sample_rows": sample_rows,
-            "deadline_seconds": 300,
-        },
-    )
-    job = await embedded._job_owner.admit(admission)
-    return job.job_id
-
-
 def toolbox_load_response(*tool_names: str) -> ModelResponse:
     return ModelResponse(
         finish_reason=FinishReason.TOOL_CALLS,
@@ -806,7 +658,6 @@ __all__ = [
     "DEFAULT_MODEL_ID",
     "IMMEDIATE_AMOUNT",
     "IMMEDIATE_TOKEN",
-    "LIFECYCLE_TOOLS",
     "LiveAgentFixture",
     "MAX_COST_ENV",
     "MODEL_IDS_ENV",
@@ -820,13 +671,11 @@ __all__ = [
     "TARGET_PROFILE_TABLE",
     "assert_completed",
     "assert_on_demand_invocation",
-    "assert_profile_result",
     "benchmark_limits",
     "benchmark_marks",
     "capture_run",
     "configured_model_ids",
     "create_live_agent",
-    "admit_profile_job",
     "create_probe_database",
     "create_probe_home",
     "live_provider",
@@ -835,10 +684,7 @@ __all__ = [
     "p95_bootstrap_interval",
     "record_metrics",
     "results_for",
-    "seed_completed_profile_agent",
     "toolbox_load_response",
     "stop_response",
     "transcript_text",
-    "wait_for_running",
-    "wait_for_terminal",
 ]

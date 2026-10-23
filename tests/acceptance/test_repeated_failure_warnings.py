@@ -19,8 +19,7 @@ from daita import (
     SQLiteSource,
 )
 from daita._json import canonical_json
-from daita.context import AgentContextBuilder
-from daita.jobs.graph.models import TaskRole
+from daita.jobs import JobState
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
@@ -36,9 +35,8 @@ from daita.llm.models import (
 from daita.llm.pricing import CostEstimate
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.session import RunSessionEvidence
-from tests.support.conversations import CatalogSpy
-from tests.support.model_graph_integration import READ_TOOL_NAME, ModelGraphIntegration
-from tests.support.toolbox_model import ToolboxAwareMockModelProvider, result_ref
+from tests.support.jobs import JobModel, in_state, open_job_agent, reply, wait_for_job
+from tests.support.toolbox_model import ToolboxAwareMockModelProvider
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.acceptance
@@ -307,92 +305,62 @@ async def test_routine_occurrences_warn_separately_and_keep_their_failure_count(
     assert warned == silent
 
 
-def _graph_script() -> tuple[ModelResponse, ...]:
-    return (
-        _refused("attempt-1-a"),
-        _refused("attempt-1-b"),
-        # Plain text is a protocol violation; the task gets a second attempt.
-        _stop("Done without a lifecycle result."),
-        _refused("attempt-2-a"),
-        _tool(
-            "read-call",
-            READ_TOOL_NAME,
-            resource_ids=tuple(f"resource-{index}" for index in range(5)),
-        ),
-        _tool(
-            "complete-call",
-            "task_complete",
-            result_kind="test.graph.read",
-            summary="Read after correcting the call.",
-            payload={"value": 42},
-            evidence_refs=(result_ref("read-call"),),
-            artifact_ids=(),
-            residual_risk=None,
-            downstream_constraints={},
-        ),
+async def _job(tmp_path: Path) -> tuple[JobModel, tuple[object, ...]]:
+    model = JobModel()
+    model.script(
+        main=[
+            _refused("run-1-a"),
+            _refused("run-1-b"),
+            reply(ToolCall("ask", "ask_user", {"question": "Which table?"})),
+            # The answer starts a second main run, which counts afresh.
+            _refused("run-2-a"),
+            _stop("Read after correcting the call."),
+        ]
     )
-
-
-async def _graph(tmp_path: Path) -> tuple[MockModelProvider, tuple[object, ...]]:
-    integration = await ModelGraphIntegration.open(tmp_path, script=_graph_script())
-    loop = integration.supervisor._graph_model_loop
-    assert loop is not None
-    loop._context_builder = AgentContextBuilder(
-        CatalogSpy(), profile=integration.provider.model_profile
-    )
+    agent = await open_job_agent(tmp_path, model)
     try:
-        admission = integration.build()
-        await integration.admit_and_start(admission)
-        terminal = await integration.wait_terminal(admission.job.job_id)
-        work = next(item for item in terminal.tasks if item.role is TaskRole.WORKER)
-        attempts = tuple(
-            item for item in terminal.attempts if item.task_id == work.task_id
+        job = await agent.start_job("Count the warehouse rows.")
+        await wait_for_job(
+            agent, job.job_id, in_state(JobState.WAITING_FOR_YOU), model=model
         )
-        transcripts = []
-        for attempt in attempts:
-            transcript = await integration.store.load(attempt.run_id)
-            transcripts.append(_shape(transcript.messages))
-        integration.provider.assert_consumed()
-        return integration.provider, (
-            terminal.job.state,
-            work.attempt_count,
-            tuple(item.state for item in attempts),
+        await agent.answer_job(job.job_id, "orders")
+        done = await wait_for_job(
+            agent, job.job_id, in_state(JobState.DONE), model=model
+        )
+        assert not model.main
+        return model, (
+            done.state,
+            done.run_count,
+            done.tokens_used,
+            done.final_summary,
             tuple(
-                sorted(
-                    (
-                        item.task_id is None,
-                        item.dimension,
-                        item.ceiling,
-                        item.settled,
-                        item.reserved,
-                    )
-                    for item in terminal.budget_ledgers
-                )
+                _shape(request.messages[:-1])
+                for kind, request in model.requests
+                if kind == "job"
             ),
-            tuple(transcripts),
         )
     finally:
-        await integration.close()
+        await agent.close()
 
 
-async def test_graph_task_attempts_warn_separately_without_changing_limits(
+async def test_job_runs_warn_separately_without_changing_limits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    provider, warned = await _graph(tmp_path / "warned")
-    # Requests 0-2 are the first attempt; 3-5 the second, which starts fresh.
-    assert tuple(_warned(request) for request in provider.requests) == (
+    model, warned = await _job(tmp_path / "warned")
+    # Requests 0-2 are the first main run; 3-4 the second, which starts fresh.
+    requests = [request for kind, request in model.requests if kind == "job"]
+    assert tuple(_warned(request) for request in requests) == (
         False,
         False,
         True,
         False,
         False,
-        False,
     )
-    assert "`warehouse_row_count`" in _status(provider.requests[2])
+    assert "`warehouse_row_count`" in _status(requests[2])
 
     _disable_warnings(monkeypatch)
-    silent_provider, silent = await _graph(tmp_path / "silent")
-    assert not any(_warned(request) for request in silent_provider.requests)
+    silent_model, silent = await _job(tmp_path / "silent")
+    assert not any(_warned(request) for _kind, request in silent_model.requests)
     assert warned == silent
 
 

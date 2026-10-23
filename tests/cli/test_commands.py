@@ -9,6 +9,7 @@ import shlex
 import sys
 import tempfile
 from contextlib import redirect_stdout
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +39,8 @@ from daita.distribution import (
     delivery_view_projection,
 )
 from daita.distribution.owner import construct_logical_delivery
+from daita.jobs import JobState
+from daita.jobs.capabilities import job_payload
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -55,6 +58,7 @@ from tests.support.cli import (
     json_lines as _json_lines,
 )
 from tests.support.distribution import inbox_distribution_plan
+from tests.support.jobs import stored_job
 from tests.support.workspace import workspace_for
 
 
@@ -1141,41 +1145,14 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
             frozenset({"-h", "--help"}),
         )
     jobs = _subcommands(commands["jobs"])
-    assert set(jobs) == {
-        "accept-review",
-        "answer",
-        "artifacts",
-        "attempts",
-        "blockers",
-        "board",
-        "cancel-graph",
-        "checkpoints",
-        "dependencies",
-        "inspect",
-        "list",
-        "reject",
-        "replace-task",
-        "request-changes",
-        "result",
-        "retry-control",
-        "tasks",
-        "timeline",
-    }
-    assert _surface(jobs["timeline"]) == (
-        ("name", "job_id"),
-        frozenset({"-h", "--help", "--after", "--limit", "--task-id"}),
+    assert set(jobs) == {"answer", "cancel", "inspect", "list"}
+    assert _surface(jobs["list"]) == (
+        ("name",),
+        frozenset({"-h", "--help", "--state", "--limit"}),
     )
-    assert _surface(jobs["accept-review"]) == (
-        ("name", "job_id", "task_id", "control_id"),
-        frozenset(
-            {
-                "-h",
-                "--help",
-                "--principal-id",
-                "--rationale",
-                "--idempotency-key",
-            }
-        ),
+    assert _surface(jobs["answer"]) == (
+        ("name", "job_id", "text"),
+        frozenset({"-h", "--help"}),
     )
 
 
@@ -1219,100 +1196,54 @@ def test_cli_routine_list_uses_public_agent_surface(tmp_path: Path) -> None:
     fake.close.assert_awaited_once()
 
 
-def test_cli_job_board_and_review_use_only_public_agent_surfaces(
+def test_cli_job_list_and_answer_use_only_public_agent_surfaces(
     tmp_path: Path,
 ) -> None:
-    diagnostics = SimpleNamespace(
-        blockers=({"kind": "open_control"},),
-        exhausted_budgets=(),
-        deadlocked=False,
-        deadlock_reason=None,
+    waiting = replace(
+        stored_job("job-1"),
+        state=JobState.WAITING_FOR_YOU,
+        question="Which month?",
     )
-    board = SimpleNamespace(
-        job_id="job-1",
-        graph_state=SimpleNamespace(value="blocked"),
-        graph_revision=7,
-        columns=(SimpleNamespace(name="blocked", task_ids=("worker",)),),
-        dependencies=(
-            SimpleNamespace(
-                upstream_task_id="worker",
-                downstream_task_id="finalizer",
-                edge_kind="requires_accepted_success",
-                satisfied=False,
-            ),
-        ),
-        diagnostics=diagnostics,
-    )
-    accepted = SimpleNamespace(
-        result_id="result-reviewed",
-        result_digest="sha256:" + "7" * 64,
-        task_id="worker",
-    )
+    running = replace(stored_job("job-1"), state=JobState.RUNNING, revision=2)
     fake = SimpleNamespace(
-        job_board=AsyncMock(return_value=board),
-        accept_task_review=AsyncMock(return_value=accepted),
+        list_jobs=AsyncMock(return_value=(waiting,)),
+        answer_job=AsyncMock(return_value=running),
         close=AsyncMock(),
     )
-    board_args = cli.build_parser().parse_args(
-        ["--no-host", "--root", str(tmp_path), "jobs", "board", "atlas", "job-1"]
-    )
-    review_args = cli.build_parser().parse_args(
+    list_args = cli.build_parser().parse_args(
         [
             "--no-host",
             "--root",
             str(tmp_path),
             "jobs",
-            "accept-review",
+            "list",
+            "atlas",
+            "--state",
+            "waiting_for_you",
+        ]
+    )
+    answer_args = cli.build_parser().parse_args(
+        [
+            "--no-host",
+            "--root",
+            str(tmp_path),
+            "jobs",
+            "answer",
             "atlas",
             "job-1",
-            "worker",
-            "review-control",
-            "--principal-id",
-            "principal-1",
-            "--rationale",
-            "Authenticated candidate accepted.",
-            "--idempotency-key",
-            "accept-once",
+            "September",
         ]
     )
     with patch.object(Agent, "open", new=AsyncMock(return_value=fake)):
-        board_result = asyncio.run(cli._execute(board_args))
-        review_result = asyncio.run(cli._execute(review_args))
+        listed = asyncio.run(cli._execute(list_args))
+        answered = asyncio.run(cli._execute(answer_args))
 
-    assert board_result == {
-        "job_id": "job-1",
-        "graph_state": "blocked",
-        "graph_revision": 7,
-        "columns": [{"name": "blocked", "task_ids": ("worker",)}],
-        "dependencies": [
-            {
-                "upstream_task_id": "worker",
-                "downstream_task_id": "finalizer",
-                "edge_kind": "requires_accepted_success",
-                "satisfied": False,
-            }
-        ],
-        "diagnostics": {
-            "blockers": ({"kind": "open_control"},),
-            "exhausted_budgets": (),
-            "deadlocked": False,
-            "deadlock_reason": None,
-        },
-    }
-    assert review_result == {
-        "result_id": "result-reviewed",
-        "result_digest": "sha256:" + "7" * 64,
-        "task_id": "worker",
-    }
-    fake.job_board.assert_awaited_once_with("job-1")
-    fake.accept_task_review.assert_awaited_once_with(
-        "job-1",
-        "worker",
-        "review-control",
-        principal_id="principal-1",
-        rationale="Authenticated candidate accepted.",
-        idempotency_key="accept-once",
+    assert listed == [job_payload(waiting, detailed=False)]
+    assert answered == job_payload(running, detailed=False)
+    fake.list_jobs.assert_awaited_once_with(
+        states=frozenset({JobState.WAITING_FOR_YOU}), limit=50
     )
+    fake.answer_job.assert_awaited_once_with("job-1", "September")
     assert fake.close.await_count == 2
 
 

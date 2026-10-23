@@ -74,6 +74,7 @@ _PHASE_F = {
     "DAITA_PHASE_F_LIVE_PROFILE": "user_flow",
 }
 _POSTGRES = {"DAITA_RUN_POSTGRES_LIVE_LLM": "1"}
+_JOBS = {"DAITA_RUN_LIVE_JOBS": "1"}
 
 # The single smoke list: one representative case per live suite.
 CASES: tuple[SmokeCase, ...] = (
@@ -96,12 +97,6 @@ CASES: tuple[SmokeCase, ...] = (
         {"DAITA_RUN_LIVE_DATA_OPERATIONS": "1"},
     ),
     SmokeCase(
-        "acceptance/l8_graph",
-        "tests/live/acceptance/test_result_refs.py::"
-        "test_l8_graph_task_complete_cites_its_read[0]",
-        {"DAITA_RUN_LIVE_RESULT_REFS": "1"},
-    ),
-    SmokeCase(
         "mcp/reads",
         "tests/live/mcp/test_read_workflows.py::"
         "test_live_dependent_reads_discover_tools_and_bind_returned_account"
@@ -115,10 +110,21 @@ CASES: tuple[SmokeCase, ...] = (
         _PHASE_F,
     ),
     SmokeCase(
-        "jobs/graph_planner",
-        "tests/live/jobs/test_graph_planner.py::"
-        "test_live_planner_uses_typed_replacement_without_production_cutover",
-        {"DAITA_RUN_LIVE_GRAPH_PLANNER": "1"},
+        "jobs/delegate",
+        "tests/live/jobs/test_jobs.py::"
+        "test_live_two_part_analysis_job_delegates_and_delivers",
+        _JOBS,
+    ),
+    SmokeCase(
+        "jobs/restart",
+        "tests/live/jobs/test_jobs.py::"
+        "test_live_job_interrupted_by_a_restart_resumes_and_finishes",
+        _JOBS,
+    ),
+    SmokeCase(
+        "jobs/write",
+        "tests/live/jobs/test_jobs.py::test_live_job_performs_one_approved_write",
+        _JOBS,
     ),
     SmokeCase(
         "routines/creation",

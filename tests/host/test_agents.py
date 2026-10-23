@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import os
-from datetime import timedelta
+from dataclasses import replace
 
 import pytest
 
-from daita import Agent, LocalFileAccess
+from daita import Agent, JobState, LocalFileAccess
 from daita.hosting.agent_home import read_writer_holder
 from daita.hosting.errors import HostActiveError
 from daita.storage.sqlite import SQLiteStateStore
@@ -18,7 +18,6 @@ from tests.support.approval_learning import (
     _memory_call,
     _stop,
 )
-from tests.support.graph import GRAPH_NOW, graph_admission
 from tests.support.host import (
     error_code,
     finished_run,
@@ -26,6 +25,7 @@ from tests.support.host import (
     short_root,
     value,
 )
+from tests.support.jobs import stored_job
 from tests.support.mcp import MemoryKeychain
 from tests.support.workspace import workspace_for
 
@@ -102,16 +102,20 @@ async def test_startup_opens_only_agents_with_background_work(
         )
         agent_id = agent.id
         await agent.close()
-    # An unfinished job; its seeded task is not runnable, which is expected.
+    # An unfinished job, waiting for its user, so no run starts.
     store = await SQLiteStateStore.open(root / "agents" / "busy" / "state.db")
     try:
-        await store.admit_graph(graph_admission(job_id="job-1", agent_id=agent_id))
+        await store.admit_job(
+            replace(
+                stored_job("job-1", agent_id),
+                state=JobState.WAITING_FOR_YOU,
+                question="Which region?",
+            )
+        )
     finally:
         await store.close()
 
-    # Inside the job's one-hour deadline, so the supervisor never expires it.
-    clock = GRAPH_NOW + timedelta(minutes=10)
-    harness = await start_host(root=root, agent_options={"clock": lambda: clock})
+    harness = await start_host(root=root)
 
     assert harness.host.registry.open_names() == ("busy",)
 

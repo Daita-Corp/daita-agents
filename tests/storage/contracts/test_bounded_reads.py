@@ -5,7 +5,8 @@ import pytest
 from daita.llm.models import CanonicalMessage, MessageRole, TextBlock
 from daita.loop.models import ConversationRun, LoopExit, LoopExitKind, RunInput
 from daita.storage.protocols import StateStore
-from tests.support.graph import GRAPH_NOW, graph_admission
+from tests.support.graph import GRAPH_NOW
+from tests.support.jobs import stored_job
 
 pytestmark = [pytest.mark.integration, pytest.mark.contract]
 
@@ -69,21 +70,11 @@ async def test_conversation_pages_preserve_exact_turns_and_caller_scope(
             )
 
 
-async def test_attempt_authority_snapshot_is_agent_scoped(state_store: StateStore):
-    admission = graph_admission()
-    await state_store.admit_graph(admission)
-    snapshot = await state_store.read_graph_attempt_authority(
-        "agent-1", "job-1", "worker", "missing"
+async def test_job_records_are_agent_scoped(state_store: StateStore):
+    job = await state_store.admit_job(stored_job())
+    assert await state_store.load_job("agent-1", "job-1") == job
+    assert await state_store.list_jobs("agent-1", states=frozenset(), limit=10) == (
+        job,
     )
-    assert snapshot is not None
-    assert snapshot.job == admission.job
-    assert snapshot.task == next(
-        task for task in admission.tasks if task.task_id == "worker"
-    )
-    assert snapshot.attempt is None
-    assert (
-        await state_store.read_graph_attempt_authority(
-            "foreign", "job-1", "worker", "missing"
-        )
-        is None
-    )
+    assert await state_store.load_job("foreign", "job-1") is None
+    assert await state_store.list_jobs("foreign", states=frozenset(), limit=10) == ()

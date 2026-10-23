@@ -22,7 +22,7 @@ from time import perf_counter
 
 import pytest
 
-from daita import Agent, AgentConfig, GraphState, HostCapacityLimits
+from daita import Agent, AgentConfig, HostCapacityLimits
 from daita._json import canonical_json
 from daita.adapters.sqlite_query import SQLiteQueryBackend
 from daita.llm.models import (
@@ -35,7 +35,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import LoopExitKind
-from tests.support.job_benchmarks import admit_profile_job, p95_bootstrap_interval
+from tests.support.job_benchmarks import p95_bootstrap_interval
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.slow
@@ -147,15 +147,9 @@ async def test_public_composition_throughput_campaign(tmp_path, monkeypatch):
     campaign_deadline = asyncio.get_running_loop().time() + 600
     native_peak = native_sum_peaks = 0
     original_read = SQLiteQueryBackend.execute_read
-    hold_graph = asyncio.Event()
-    graph_started = asyncio.Event()
-    blocked = False
     slow_source: str | None = None
 
     async def fixture_read(self, **kwargs):
-        if blocked:
-            graph_started.set()
-            await hold_graph.wait()
         if kwargs["source_id"] == slow_source:
             await asyncio.sleep(0.02)
         return await original_read(self, **kwargs)
@@ -285,37 +279,6 @@ async def test_public_composition_throughput_campaign(tmp_path, monkeypatch):
             await agent.delete_artifact(ref.artifact_id)
 
         await measure("exact_dataset_csv", export)
-
-        async def saturated_graph():
-            nonlocal blocked
-            hold_graph.clear()
-            graph_started.clear()
-            blocked = True
-            provider.calls = ()
-            origin = await _run(agent)
-            for _ in range(4):
-                await admit_profile_job(agent, resource_id, origin, sample_rows=5)
-            await asyncio.wait_for(graph_started.wait(), timeout=5)
-            await _run(agent)
-            blocked = False
-            hold_graph.set()
-            async with asyncio.timeout(15):
-                while any(
-                    job.state
-                    not in {
-                        GraphState.SUCCEEDED,
-                        GraphState.FAILED,
-                        GraphState.NEEDS_ATTENTION,
-                        GraphState.CANCELLED,
-                    }
-                    for job in await agent.list_jobs()
-                ):
-                    await asyncio.sleep(0.01)
-            assert all(
-                job.state is GraphState.SUCCEEDED for job in await agent.list_jobs()
-            )
-
-        await measure("queued_graphs_with_foreground", saturated_graph, tasks=5)
 
         if agent.analysis_runtime()["available"]:
             await agent.close()
@@ -457,7 +420,7 @@ async def test_public_composition_throughput_campaign(tmp_path, monkeypatch):
                     host_capacity=HostCapacityLimits(
                         execution_capacity=8,
                         provider_capacity=4,
-                        graph_parallelism=4,
+                        job_parallelism=4,
                         postgresql_read_capacity=4,
                     )
                 )
@@ -479,8 +442,6 @@ async def test_public_composition_throughput_campaign(tmp_path, monkeypatch):
                 "reason": "native runtime unavailable",
             }
     finally:
-        blocked = False
-        hold_graph.set()
         await agent.close()
     diagnostics = agent.admission_diagnostics()
     assert diagnostics.active_leases == diagnostics.active_permits == 0

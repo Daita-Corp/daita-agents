@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import AsyncIterator, Mapping
-from datetime import datetime, timedelta
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -49,26 +50,8 @@ from daita.distribution.models import (
 )
 from daita.hosting.home_upgrade import AgentHomeStatus
 from daita.hosting.sources import SourceEditResult
-from daita.jobs.graph.models import (
-    BudgetAmount,
-    ControlKind,
-    ControlState,
-    GraphInspection,
-    GraphJob,
-    GraphMutation,
-    GraphState,
-    GraphTask,
-    MutationDecision,
-    TaskAttempt,
-    TaskCheckpoint,
-    TaskControl,
-    TaskDependency,
-    TaskResult,
-    TaskState,
-    canonical_digest,
-)
-from daita.jobs.owner import GraphBlockerProjection
-from daita.jobs.projections import GraphBoardProjection, GraphTimelinePage
+from daita.jobs import Job, JobState
+from daita.jobs.graph.models import canonical_digest
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -104,14 +87,13 @@ from daita.storage.sqlite_records import (
     effect_receipt_id,
 )
 from daita.work_board import WorkBoard
-from tests.support.graph import GRAPH_NOW, graph_admission, task_result
 from tests.support.host import StartHost, hosts
+from tests.support.jobs import stored_job
 from tests.support.mcp import MemoryKeychain, conformance_identities, mock_transport
 from tests.support.toolbox_model import ToolboxAwareMockModelProvider
 from tests.support.workspace import workspace_for
 
-# Inside the seeded job's one-hour deadline, so the supervisor never expires it.
-NOW = GRAPH_NOW + timedelta(minutes=10)
+NOW = datetime(2026, 9, 16, 12, 10, tzinfo=UTC)
 NAME = "surface"
 USAGE = ModelUsage(
     input_tokens=100,
@@ -174,7 +156,7 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
     created = await Agent.create(NAME, **options)  # type: ignore[arg-type]
     agent_id = created.id
     await created.close()
-    await _seed_blocked_job(tmp_path / "agents" / NAME / "state.db", agent_id)
+    await _seed_waiting_jobs(tmp_path / "agents" / NAME / "state.db", agent_id)
     home_status = await Agent.inspect_home(NAME, root=tmp_path)
 
     agent = await Agent.open(NAME, **options)  # type: ignore[arg-type]
@@ -227,22 +209,9 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
 
         job = await agent.inspect_job("job-blocked")
         jobs = await agent.list_jobs()
-        job_board = await agent.job_board("job-blocked")
-        timeline = await agent.job_timeline("job-blocked")
-        blockers = await agent.graph_blockers("job-blocked")
-        answered = await agent.answer_task_input(
-            "job-blocked",
-            "worker",
-            "control-1",
-            principal_id=agent_id,
-            answer={"region": "EMEA"},
-            idempotency_key="answer-1",
-        )
-        task = await agent.inspect_job_task("job-blocked", "worker")
-        tasks = await agent.list_job_tasks("job-blocked")
-        dependencies = await agent.list_job_dependencies("job-blocked")
-        attempts = await agent.list_task_attempts("job-blocked", "worker")
-        cancelled = await agent.cancel_job("job-blocked")
+        cancelled = await agent.cancel_job("job-cancelled")
+        # The answered job's next main run finds no scripted reply and fails.
+        answered = await agent.answer_job("job-blocked", "EMEA")
 
         await agent.save_skill("order-report", "Count orders.", "Count the rows.")
         annotation = _annotation(agent_id, source.id, resource, origin.run_id)
@@ -286,7 +255,6 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
             ),
             retry_policy=RetryPolicy(max_attempts_per_candidate=1),
         )
-        result = task_result(agent_id=agent_id, job_id="job-blocked")
         values: dict[object, tuple[object, ...]] = {
             # Scalars and arguments as a client builds them.
             type(None): (None,),
@@ -300,10 +268,11 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
             str | Path: (str(database), database),
             timedelta: (timedelta(days=1, microseconds=7),),
             tuple[str, ...]: ((source.id, resource.id), ()),
-            frozenset[GraphState]: (
-                frozenset({GraphState.ACTIVE, GraphState.SUCCEEDED}),
+            tuple[str, ...] | None: ((source.id,), None),
+            frozenset[JobState]: (
+                frozenset({JobState.RUNNING, JobState.DONE}),
+                frozenset(),
             ),
-            frozenset[TaskState]: (frozenset({TaskState.READY}),),
             frozenset[RoutineState]: (frozenset({RoutineState.ACTIVE}), frozenset()),
             ModelSensitivity: (ModelSensitivity.RESTRICTED,),
             EffectResolutionDecision: (EffectResolutionDecision.CLOSE_WITHOUT_RETRY,),
@@ -375,17 +344,9 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
             ScheduledRoutine: (routine, paused),
             tuple[ScheduledRoutineSummary, ...]: (await agent.list_routines(),),
             ScheduledRoutineInspection | None: (inspection,),
-            tuple[GraphJob, ...]: (jobs,),
-            GraphJob | None: (cancelled,),
-            GraphInspection | None: (job,),
-            GraphTask | None: (task,),
-            tuple[GraphTask, ...]: (tasks,),
-            tuple[TaskDependency, ...]: (dependencies,),
-            tuple[TaskAttempt, ...]: (attempts,),
-            GraphBoardProjection | None: (job_board,),
-            GraphTimelinePage | None: (timeline,),
-            GraphBlockerProjection | None: (blockers,),
-            TaskControl | None: (answered,),
+            tuple[Job, ...]: (jobs,),
+            Job: (answered,),
+            Job | None: (job, cancelled),
             tuple[SkillSummary, ...]: (await agent.list_skills(),),
             Skill | None: (await agent.read_skill("order-report"),),
             SemanticAnnotationView
@@ -401,11 +362,6 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
             # Records that need PostgreSQL, a model login or a finished effect.
             ModelRoute: (route,),
             ModelRoute | None: (route, agent.model_route),
-            TaskResult: (result,),
-            TaskResult | None: (result,),
-            TaskControl: (answered,),
-            tuple[TaskCheckpoint, ...]: ((_checkpoint(agent_id),),),
-            GraphMutation: (_mutation(agent_id),),
             EffectReceipt: (receipt,),
             EffectReceipt | None: (receipt,),
             tuple[EffectReceipt, ...]: ((receipt,),),
@@ -434,54 +390,19 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
         await agent.close()
 
 
-async def _seed_blocked_job(state_path: Path, agent_id: str) -> None:
-    """Admit one graph job whose worker waits on the user's answer."""
+async def _seed_waiting_jobs(state_path: Path, agent_id: str) -> None:
+    """Store two jobs waiting on the user's answer: one to answer, one to cancel."""
 
     store = await SQLiteStateStore.open(state_path)
     try:
-        await store.admit_graph(
-            graph_admission(job_id="job-blocked", agent_id=agent_id)
-        )
-        attempt = await store.claim_graph_task(
-            agent_id,
-            "job-blocked",
-            "worker",
-            attempt_id="attempt-1",
-            claim_token="claim-1",
-            run_id="run-1",
-            executor_id="executor-1",
-            claimed_at=GRAPH_NOW,
-            lease_seconds=30,
-            absolute_deadline_at=GRAPH_NOW + timedelta(minutes=2),
-            budget_reservations=(BudgetAmount("work_units", 2),),
-        )
-        assert attempt is not None
-        assert await store.start_graph_attempt(
-            agent_id,
-            "job-blocked",
-            "worker",
-            "attempt-1",
-            claim_token="claim-1",
-            fencing_epoch=attempt.fencing_epoch,
-            started_at=GRAPH_NOW + timedelta(seconds=1),
-        )
-        payload = {"question": "Which region should the report cover?"}
-        await store.open_graph_control(
-            TaskControl(
-                agent_id=agent_id,
-                job_id="job-blocked",
-                task_id="worker",
-                control_id="control-1",
-                kind=ControlKind.NEEDS_INPUT,
-                state=ControlState.OPEN,
-                requesting_attempt_id="attempt-1",
-                payload=payload,
-                created_at=GRAPH_NOW + timedelta(seconds=2),
-                payload_digest=canonical_digest(payload),
-            ),
-            claim_token="claim-1",
-            fencing_epoch=attempt.fencing_epoch,
-        )
+        for job_id in ("job-blocked", "job-cancelled"):
+            await store.admit_job(
+                replace(
+                    stored_job(job_id, agent_id, at=NOW - timedelta(minutes=5)),
+                    state=JobState.WAITING_FOR_YOU,
+                    question="Which region should the report cover?",
+                )
+            )
     finally:
         await store.close()
 
@@ -550,41 +471,6 @@ def _receipt(agent_id: str, run_id: str, started_at: datetime) -> EffectReceipt:
             FrozenJsonObject.from_mapping({"affected_rows": 1}),
         ),
         finished_at=started_at + timedelta(seconds=1),
-    )
-
-
-def _checkpoint(agent_id: str) -> TaskCheckpoint:
-    payload = {"rows_scanned": 120, "phase": "aggregate"}
-    return TaskCheckpoint(
-        agent_id=agent_id,
-        job_id="job-blocked",
-        task_id="worker",
-        attempt_id="attempt-1",
-        checkpoint_id="checkpoint-1",
-        fencing_epoch=1,
-        ordinal=1,
-        milestone="Scanned the orders table.",
-        payload=payload,
-        created_at=NOW,
-        payload_digest=canonical_digest(payload),
-    )
-
-
-def _mutation(agent_id: str) -> GraphMutation:
-    return GraphMutation(
-        agent_id=agent_id,
-        job_id="job-blocked",
-        mutation_id="mutation-1",
-        actor_kind="principal",
-        actor_key=agent_id,
-        idempotency_key="replace-worker-1",
-        payload_digest=canonical_digest({"replace": "worker"}),
-        expected_revision=1,
-        committed_revision=2,
-        decision=MutationDecision.COMMITTED,
-        created_at=NOW,
-        resulting_task_ids=("worker-2",),
-        resulting_edges=(("worker-2", "finalizer"),),
     )
 
 

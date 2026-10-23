@@ -153,14 +153,11 @@ def test_all_current_model_origins_use_admission_and_run_sessions():
     embedded = embedded_path.read_text(encoding="utf-8")
     routing = (PACKAGE / "llm" / "routing.py").read_text(encoding="utf-8")
 
-    for origin in ("_run", "execute_routine_run"):
+    for origin in ("_run", "execute_routine_run", "execute_job_run"):
         body = _function_text(embedded_path, origin)
         assert "admit_execution" in body
         assert "RunSession(" in body
         assert "RunSessionWriter(" in body
-    supervisor = (PACKAGE / "jobs" / "supervisor.py").read_text(encoding="utf-8")
-    assert "RunSession(" in supervisor
-    assert "RunSessionWriter(" in supervisor
     assert "return await self._run(" in _function_text(embedded_path, "learn")
     assert "_admit_owned_system_work" in _function_text(
         embedded_path, "configure_model"
@@ -177,9 +174,6 @@ def test_cutover_removed_global_run_state_and_registered_only_revision_two():
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
-    profiles = (PACKAGE / "domains" / "data" / "profile_jobs.py").read_text(
-        encoding="utf-8"
-    )
     skills = (PACKAGE / "skills" / "capabilities.py").read_text(encoding="utf-8")
     delivery = (PACKAGE / "artifacts" / "delivery.py").read_text(encoding="utf-8")
     migrations = (PACKAGE / "storage" / "home_migrations" / "registry.py").read_text(
@@ -205,7 +199,7 @@ def test_cutover_removed_global_run_state_and_registered_only_revision_two():
     assert "_files_only_runs" not in _python_text(PACKAGE)
     assert "_selected_learning_candidates" not in context
     assert "_explicit_learning_runs" not in semantics
-    assert "_selected_profiles" not in profiles
+    assert not (PACKAGE / "domains" / "data" / "profile_jobs.py").exists()
     assert "_scheduled_bindings" not in skills
     assert "self._one_time" not in delivery
     assert "_source_permission_lock" in embedded
@@ -223,12 +217,13 @@ def test_cutover_removed_global_run_state_and_registered_only_revision_two():
         "REVISION_3",
         "REVISION_4",
     )
-    assert "job_graphs" in CURRENT_SCHEMA.tables
+    assert "jobs" in CURRENT_SCHEMA.tables
+    assert "job_graphs" not in CURRENT_SCHEMA.tables
     assert "autonomous_followups" not in CURRENT_SCHEMA.tables
     assert "REVISION_2" in migrations
 
 
-def test_current_graph_kernel_is_registered_and_legacy_runtime_is_unreachable():
+def test_checklist_jobs_are_registered_and_legacy_runtime_is_unreachable():
     registry = (PACKAGE / "storage" / "home_migrations" / "registry.py").read_text(
         encoding="utf-8"
     )
@@ -243,20 +238,21 @@ def test_current_graph_kernel_is_registered_and_legacy_runtime_is_unreachable():
             "hosting/resident.py",
         )
     )
-    graph_supervisor = (PACKAGE / "jobs" / "supervisor.py").read_text(encoding="utf-8")
+    job_supervisor = (PACKAGE / "jobs" / "supervisor.py").read_text(encoding="utf-8")
 
     assert "draft_revision_0002" not in registry
     assert "REVISION_2" in registry
-    assert "job_graphs" in CURRENT_SCHEMA.tables
+    assert "jobs" in CURRENT_SCHEMA.tables
     assert "draft_graph" not in codec_exports
     assert "open_draft_graph" not in production_roots
-    assert "GraphAdmissionCapabilityDomain" in production_roots
+    assert "JobCapabilityDomain" in production_roots
     assert "await job_supervisor.start()" in production_roots
-    assert "RunOrigin.JOB_TASK" in graph_supervisor
-    assert "_ProcessJobCapacity" not in graph_supervisor
-    assert "start_graph_integration" not in graph_supervisor
+    assert "RunOrigin.JOB" in job_supervisor
+    assert "RunOrigin.JOB_TASK" not in job_supervisor
+    assert "_ProcessJobCapacity" not in job_supervisor
     assert not (PACKAGE / "autonomy.py").exists()
-    assert not (PACKAGE / "jobs" / "models.py").exists()
+    assert not (PACKAGE / "jobs" / "graph" / "execution.py").exists()
+    assert not (PACKAGE / "storage" / "sql_graph.py").exists()
 
 
 def test_common_runtime_has_one_owner_and_no_domain_dependencies():
@@ -560,10 +556,9 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
             "analysis",
             "artifacts",
             "data",
-            "data_profile_jobs",
             "distribution",
             "jobs",
-            "jobs.graph_task",
+            "job_runs",
             "memory",
             "routines",
             "semantics",
@@ -590,8 +585,8 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["semantic_view"] == "semantics"
         assert resolved["artifact_create"] == "artifacts"
         assert resolved["artifact_create"] == "artifacts"
-        assert "data_profile_jobs" not in set(resolved.values())
         assert resolved["job_list"] == "jobs"
+        assert resolved["checklist_write"] == "job_runs"
         assert resolved["routine_list"] == "routines"
         assert resolved["delivery_list"] == "distribution"
         assert resolved["delivery_inspect"] == "distribution"
@@ -685,9 +680,12 @@ def test_public_surface_is_focused():
         "DeliveryView",
         "DistributionPlan",
         "DistributionTargetBinding",
-        "GraphInspection",
-        "GraphJob",
-        "GraphState",
+        "ChecklistItem",
+        "ChecklistStatus",
+        "Delegation",
+        "DelegationState",
+        "Job",
+        "JobState",
         "IntervalSchedule",
         "LocalFileAccess",
         "LocalWorkspace",
@@ -695,7 +693,6 @@ def test_public_surface_is_focused():
         "LoopExitKind",
         "LoopLimits",
         "TOOLBOX_DEFINITIONS",
-        "TaskResult",
         "ToolLoadMode",
         "ToolPresentation",
         "ToolboxDefinition",
@@ -798,16 +795,18 @@ def test_confirmed_dead_error_apis_do_not_return():
     }.isdisjoint(daita.__all__)
 
 
-def test_jobs_have_one_graph_aggregate_and_no_parallel_execution_system():
-    assert _class_owners("GraphJob") == {"jobs/graph/models.py"}
+def test_jobs_have_one_record_and_no_parallel_execution_system():
+    assert _class_owners("Job") == {"jobs/models.py"}
     assert _class_owners("JobOwner") == {"jobs/owner.py"}
     assert _class_owners("JobSupervisor") == {"jobs/supervisor.py"}
-    assert _class_owners("InternalCapabilityRequest") == {"capability_runtime.py"}
+    assert _class_owners("InternalCapabilityRequest") == set()
 
-    assert "job_runs" in CURRENT_SCHEMA.tables
-    assert "job_graphs" in CURRENT_SCHEMA.tables
-    assert "job_task_attempts" in CURRENT_SCHEMA.tables
+    assert "jobs" in CURRENT_SCHEMA.tables
     for parallel_table in (
+        "job_runs",
+        "job_graphs",
+        "job_tasks",
+        "job_task_attempts",
         "job_attempts",
         "job_results",
         "job_workers",
@@ -859,7 +858,8 @@ def test_graph_finalization_and_distribution_have_single_current_owners():
     assert "JobRun" not in runtime
     assert "JobRun" not in loop
     assert "JobRun" not in providers
-    assert "execute_internal(" in supervisor
+    assert "execute_internal(" not in supervisor
+    assert "self._execute_run(" in supervisor
     assert "executor.execute(" not in supervisor
     assert "execute_read(" not in supervisor
 
@@ -1190,7 +1190,7 @@ def test_semantics_use_existing_storage_context_and_runtime_owners():
 def test_durable_state_contract_composes_domain_owned_interfaces():
     from daita.artifacts.store import ArtifactRegistry
     from daita.catalog.protocols import CatalogStore
-    from daita.jobs.owner import GraphJobStore, GraphSupervisorStore
+    from daita.jobs.owner import JobStore
     from daita.loop.driver import TranscriptStore
     from daita.routines.owner import RoutineStore, RoutineSupervisorStore
     from daita.storage.protocols import StateStore
@@ -1199,8 +1199,7 @@ def test_durable_state_contract_composes_domain_owned_interfaces():
     for contract in (
         ArtifactRegistry,
         CatalogStore,
-        GraphJobStore,
-        GraphSupervisorStore,
+        JobStore,
         TranscriptStore,
         RoutineStore,
         RoutineSupervisorStore,
@@ -1233,7 +1232,7 @@ def test_state_backends_share_domain_operations_without_driver_dependencies():
     for name in _class_methods(PACKAGE / "storage/sql.py", "SQLStateStore"):
         if not name.startswith("_") and name != "close":
             assert getattr(SQLiteStateStore, name) is getattr(SQLStateStore, name)
-    for module in ("storage/sql.py", "storage/sql_graph.py"):
+    for module in ("storage/sql.py", "storage/sql_jobs.py"):
         assert not _imports(PACKAGE / module) & {
             "sqlite",
             "sqlite3",
@@ -1316,6 +1315,7 @@ async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_bran
             "data_update_rows",
             "data_upsert_rows",
             "job_cancel",
+            "job_start",
             "memory_set",
             "routine_control",
             "routine_save",
@@ -1510,7 +1510,7 @@ def test_artifact_continuity_uses_current_context_and_export_owners():
 def test_job_scope_has_one_agent_owner_and_no_conversation_gate():
     capabilities = (PACKAGE / "jobs" / "capabilities.py").read_text(encoding="utf-8")
     owner = (PACKAGE / "jobs" / "owner.py").read_text(encoding="utf-8")
-    models = (PACKAGE / "jobs" / "graph" / "models.py").read_text(encoding="utf-8")
+    models = (PACKAGE / "jobs" / "models.py").read_text(encoding="utf-8")
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
 
     for obsolete in (
@@ -1520,7 +1520,6 @@ def test_job_scope_has_one_agent_owner_and_no_conversation_gate():
         "not available in this conversation scope",
     ):
         assert obsolete not in capabilities + owner
-    assert "job_owner_agent_scope" in capabilities
     assert "conversation_id" in capabilities
     assert "conversation_id" in models
     assert (
@@ -1530,7 +1529,7 @@ def test_job_scope_has_one_agent_owner_and_no_conversation_gate():
     assert "JobCapabilityDomain(job_declaration_bundle, job_owner)" in embedded
     assert "ToolLoadMode.PINNED" in capabilities
     assert "ToolLoadMode.ON_DEMAND" in capabilities
-    assert "item.id == JOB_CANCEL_CAPABILITY_ID" in capabilities
+    assert "capability.operational_effect is OperationalEffect.NONE" in capabilities
 
 
 def test_exact_artifact_read_is_agent_owned_while_list_and_convert_stay_conversation_scoped():

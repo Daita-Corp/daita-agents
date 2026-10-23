@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -22,13 +22,7 @@ from daita import (
     WorkColumn,
     WorkKind,
 )
-from daita.jobs.graph.models import (
-    BudgetAmount,
-    ControlKind,
-    ControlState,
-    TaskControl,
-    canonical_digest,
-)
+from daita.jobs import JobState
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
@@ -39,13 +33,12 @@ from daita.llm.models import (
 from daita.llm.pricing import CostEstimate
 from daita.llm.providers.mock import MockModelProvider
 from daita.storage.sqlite import SQLiteStateStore
-from tests.support.graph import GRAPH_NOW, graph_admission, with_topology
+from tests.support.jobs import stored_job
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.acceptance
 
-# Inside the seeded jobs' one-hour deadline, so the supervisor never expires them.
-NOW = GRAPH_NOW + timedelta(minutes=10)
+NOW = datetime(2026, 9, 16, 12, 10, tzinfo=UTC)
 NAME = "work-board"
 USAGE = ModelUsage(
     input_tokens=100,
@@ -68,64 +61,17 @@ def _profile(provider: MockModelProvider) -> ModelProfile:
     )
 
 
-async def _seed_queued_and_blocked_jobs(state_path: Path, agent_id: str) -> None:
-    """Admit a job with no ready work and a job blocked on the user's input."""
+async def _seed_waiting_job(state_path: Path, agent_id: str) -> None:
+    """Store a job that is waiting for the user's answer."""
 
     store = await SQLiteStateStore.open(state_path)
     try:
-        queued = graph_admission(job_id="job-queued", agent_id=agent_id)
-        # Ready only after the test's fixed clock, so no supervisor claims it.
-        later = GRAPH_NOW + timedelta(minutes=50)
-        tasks = tuple(
-            replace(task, not_before=later) if task.task_id == "worker" else task
-            for task in queued.tasks
-        )
-        queued = with_topology(queued, tasks=tasks, dependencies=queued.dependencies)
-        await store.admit_graph(
-            replace(queued, graph=replace(queued.graph, next_ready_at=later))
-        )
-        await store.admit_graph(
-            graph_admission(job_id="job-blocked", agent_id=agent_id)
-        )
-        attempt = await store.claim_graph_task(
-            agent_id,
-            "job-blocked",
-            "worker",
-            attempt_id="attempt-1",
-            claim_token="claim-1",
-            run_id="run-1",
-            executor_id="executor-1",
-            claimed_at=GRAPH_NOW,
-            lease_seconds=30,
-            absolute_deadline_at=GRAPH_NOW + timedelta(minutes=2),
-            budget_reservations=(BudgetAmount("work_units", 2),),
-        )
-        assert attempt is not None
-        assert await store.start_graph_attempt(
-            agent_id,
-            "job-blocked",
-            "worker",
-            "attempt-1",
-            claim_token="claim-1",
-            fencing_epoch=attempt.fencing_epoch,
-            started_at=GRAPH_NOW + timedelta(seconds=1),
-        )
-        payload = {"question": "Which region should the report cover?"}
-        await store.open_graph_control(
-            TaskControl(
-                agent_id=agent_id,
-                job_id="job-blocked",
-                task_id="worker",
-                control_id="control-1",
-                kind=ControlKind.NEEDS_INPUT,
-                state=ControlState.OPEN,
-                requesting_attempt_id="attempt-1",
-                payload=payload,
-                created_at=GRAPH_NOW + timedelta(seconds=2),
-                payload_digest=canonical_digest(payload),
-            ),
-            claim_token="claim-1",
-            fencing_epoch=attempt.fencing_epoch,
+        await store.admit_job(
+            replace(
+                stored_job("job-blocked", agent_id, at=NOW - timedelta(minutes=5)),
+                state=JobState.WAITING_FOR_YOU,
+                question="Which region should the report cover?",
+            )
         )
     finally:
         await store.close()
@@ -203,7 +149,7 @@ async def test_work_board_shows_real_jobs_routines_and_results_until_dismissed(
     await created.close()
     state_path = tmp_path / "agents" / NAME / "state.db"
     assert state_path.is_file()
-    await _seed_queued_and_blocked_jobs(state_path, agent_id)
+    await _seed_waiting_job(state_path, agent_id)
 
     agent = await Agent.open(NAME, **options)  # type: ignore[arg-type]
     try:
@@ -231,7 +177,6 @@ async def test_work_board_shows_real_jobs_routines_and_results_until_dismissed(
         assert board.generated_at == NOW
         assert _columns(board) == {
             WorkColumn.SCHEDULED: {
-                (WorkKind.JOB, "job-queued", None),
                 (WorkKind.ROUTINE, routines["Current value report"].routine_id, None),
                 (WorkKind.ROUTINE, routines["Current value export"].routine_id, None),
             },

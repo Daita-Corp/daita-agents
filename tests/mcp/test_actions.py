@@ -30,9 +30,7 @@ from daita.capabilities import (
     OperationalEffect,
 )
 from daita.distribution.models import OutcomeState
-from daita.jobs.graph.admission import START_GRAPH_JOB_TOOL_NAME
-from daita.jobs.graph.capabilities import TASK_COMPLETE_TOOL_NAME
-from daita.jobs.graph.models import GraphState
+from daita.jobs import JobState
 from daita.llm.models import (
     ModelSensitivity,
     ToolCall,
@@ -44,6 +42,7 @@ from daita.routines.owner import RoutineError
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_records import EffectResolutionDecision
 from tests.support.host import StartHost, host_workspace, remote_agent
+from tests.support.jobs import wait_for_job
 
 
 @pytest.fixture
@@ -69,53 +68,14 @@ async def test_exact_direct_result_action_is_graph_eligible_only_under_its_grant
     assert capability.effect_receipt_policy is not None
 
 
-async def test_exact_mcp_action_runs_once_as_a_grant_backed_graph_task(
-    tmp_path,
-) -> None:
+async def test_exact_mcp_action_runs_once_from_a_job(tmp_path) -> None:
     action = ActionFixture(tmp_path)
     action.limits = LoopLimits(max_estimated_cost_usd=Decimal("10"))
     await action.start()
-    arguments = {"destination": "fixed-room", "content": "Graph status"}
-    constraints = {
-        "binding_id": action.binding.binding_id,
-        "binding_revision": action.binding.revision,
-        "remote_tool_name": action.tool.remote_name,
-        "fixed_arguments": arguments,
-        "variable_argument_names": (),
-    }
+    arguments = {"destination": "fixed-room", "content": "Job status"}
+    objective = "Invoke the exact notification once."
+    # Only the job's main run calls the model.
     action.model.steps = [
-        response(
-            ToolCall(
-                "load-graph",
-                "toolbox_load",
-                {"tool_names": (START_GRAPH_JOB_TOOL_NAME,)},
-            )
-        ),
-        response(
-            ToolCall(
-                "start-graph",
-                START_GRAPH_JOB_TOOL_NAME,
-                {
-                    "objective": "Invoke the exact admitted notification once.",
-                    "outcome_contract": {"kind": "mcp_action_result"},
-                    "deadline_seconds": 600,
-                    "initial_task": {
-                        "capability_id": action.tool.capability_id,
-                        "arguments": arguments,
-                        "expected_result_contract": {
-                            "result_kind": "mcp_action_result"
-                        },
-                        "retained_references": {
-                            "source_ids": (),
-                            "resource_ids": (),
-                            "connector_binding_ids": (action.binding.binding_id,),
-                        },
-                        "effect_grant": {"constraints": constraints},
-                    },
-                },
-            )
-        ),
-        response(text="The exact grant-backed graph job was admitted."),
         response(
             ToolCall(
                 "load-action",
@@ -123,63 +83,30 @@ async def test_exact_mcp_action_runs_once_as_a_grant_backed_graph_task(
                 {"tool_names": (action.tool.local_name,)},
             )
         ),
-        response(ToolCall("graph-action", action.tool.local_name, arguments)),
-        response(
-            ToolCall(
-                "complete-effect-task",
-                TASK_COMPLETE_TOOL_NAME,
-                {
-                    "result_kind": "mcp_action_result",
-                    "summary": "The MCP server reported the exact invocation.",
-                    "payload": {"invocation_reported": True},
-                    "downstream_constraints": {},
-                },
-            )
-        ),
+        response(ToolCall("job-action", action.tool.local_name, arguments)),
+        response(text="The MCP server reported the exact invocation."),
     ]
     try:
-        await action.agent.run("Run the exact durable graph action.")
-        for _ in range(500):
-            jobs = await action.agent.list_jobs(limit=5)
-            if jobs and jobs[0].state in {
-                GraphState.SUCCEEDED,
-                GraphState.FAILED,
-                GraphState.NEEDS_ATTENTION,
-            }:
-                break
-            await asyncio.sleep(0.01)
-        assert jobs
-        assert jobs[0].state is GraphState.SUCCEEDED
-        inspection = await action.agent.inspect_job(jobs[0].job_id)
-        assert inspection is not None
-        worker = next(
-            item
-            for item in inspection.tasks
-            if item.task_id != jobs[0].finalizer_task_id
+        job = await action.agent.start_job(objective)
+        current = await wait_for_job(
+            action.agent, job.job_id, lambda item: item.state is not JobState.RUNNING
         )
-        result = await action.agent.read_task_result(jobs[0].job_id, worker.task_id)
-        assert result is not None and len(result.effect_receipt_ids) == 1
-        assert result.verification["evidence_call_ids"] == ("graph-action",)
-        assert result.downstream_constraints["effect_completion_evidence"] == (
-            "server_reported_invocation_only",
-        )
-        assert result.summary == (
-            "The MCP server reported that the exact action was invoked. "
-            "Downstream business completion is not verified."
-        )
-        assert result.provenance["summary_authority"] == ("code_owned_effect_evidence")
-        assert result.residual_risk is not None
+        assert current.state is JobState.DONE, current.failure_code
         assert len(action.server.calls) == 1
+        receipts = await action.agent._embedded._store.job_effect_receipts(
+            action.agent.id, job.job_id
+        )
+        assert len(receipts) == 1
+        assert receipts[0].outcome is EffectOutcome.SUCCEEDED
+        assert receipts[0].evidence_basis is EffectEvidenceBasis.SERVER_REPORTED
+        assert [item.requester for item in action.approvals] == [objective]
         assert isinstance(action.agent._embedded._store, SQLiteStateStore)
         with sqlite3.connect(action.agent._embedded._store.path) as connection:
             linkage = connection.execute(
-                "SELECT job_id, task_id, task_attempt_id FROM effect_receipts WHERE id = ?",
-                (result.effect_receipt_ids[0],),
+                "SELECT job_id FROM effect_receipts WHERE id = ?",
+                (receipts[0].receipt_id,),
             ).fetchone()
-        assert linkage is not None and linkage[:2] == (
-            jobs[0].job_id,
-            worker.task_id,
-        )
+        assert linkage == (job.job_id,)
     finally:
         await action.agent.close()
 

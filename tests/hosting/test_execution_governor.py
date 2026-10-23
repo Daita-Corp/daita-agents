@@ -280,7 +280,7 @@ async def test_background_admission_uses_exact_weighted_deficit_cycle():
         for workload, count in (
             (WorkloadClass.SYSTEM, 8),
             (WorkloadClass.ROUTINE, 3),
-            (WorkloadClass.GRAPH, 2),
+            (WorkloadClass.JOB, 2),
         )
         for index in range(count)
     )
@@ -291,7 +291,7 @@ async def test_background_admission_uses_exact_weighted_deficit_cycle():
     assert order == [
         *([WorkloadClass.SYSTEM] * 8),
         *([WorkloadClass.ROUTINE] * 3),
-        *([WorkloadClass.GRAPH] * 2),
+        *([WorkloadClass.JOB] * 2),
     ]
     await coordinator.close(deadline=_deadline())
 
@@ -315,7 +315,7 @@ async def test_background_admission_adds_bounded_thirty_second_aging_quanta():
             order.append(workload)
 
     graph_tasks = tuple(
-        asyncio.create_task(wait_for_slot(WorkloadClass.GRAPH, index))
+        asyncio.create_task(wait_for_slot(WorkloadClass.JOB, index))
         for index in range(6)
     )
     while coordinator.diagnostics().waiting_admissions != len(graph_tasks):
@@ -337,7 +337,7 @@ async def test_background_admission_adds_bounded_thirty_second_aging_quanta():
     assert order[:17] == [
         *([WorkloadClass.SYSTEM] * 8),
         *([WorkloadClass.ROUTINE] * 3),
-        *([WorkloadClass.GRAPH] * 6),
+        *([WorkloadClass.JOB] * 6),
     ]
     await coordinator.close(deadline=_deadline())
 
@@ -359,7 +359,7 @@ async def test_provider_capacity_keeps_strict_foreground_reservation(provider_ca
     async def background(
         identity: str, ready: asyncio.Event, release: asyncio.Event
     ) -> None:
-        lease = await coordinator.admit_execution(WorkloadClass.GRAPH, identity)
+        lease = await coordinator.admit_execution(WorkloadClass.JOB, identity)
         async with lease:
             permit = await coordinator.provider_permit("provider:account")
             async with permit:
@@ -444,7 +444,7 @@ async def test_saturated_graph_work_preserves_foreground_admission_p95():
     )
     backgrounds = tuple(
         [
-            await coordinator.admit_execution(WorkloadClass.GRAPH, f"graph-{index}")
+            await coordinator.admit_execution(WorkloadClass.JOB, f"graph-{index}")
             for index in range(4)
         ]
     )
@@ -541,7 +541,7 @@ async def test_diagnostics_storage_is_bounded_by_kind_and_workload():
         for field, ceiling in (
             ("execution_capacity", 16),
             ("provider_capacity", 8),
-            ("graph_parallelism", 4),
+            ("job_parallelism", 4),
             ("postgresql_read_capacity", 8),
             ("sqlite_pressure_capacity", 4),
         )
@@ -560,9 +560,9 @@ def test_host_capacity_keeps_compatibility_defaults_and_typed_config():
     assert (
         default.execution_capacity,
         default.provider_capacity,
-        default.graph_parallelism,
+        default.job_parallelism,
         default.postgresql_read_capacity,
-    ) == (5, 2, 1, 2)
+    ) == (5, 2, 2, 2)
     assert (
         default.foreground_execution_reserve,
         default.foreground_provider_reserve,

@@ -76,11 +76,11 @@ ON_DEMAND_LOAD = (
     "routine_save",
     "skill_save",
 )
-# Lanes the model can be shown: foreground user runs, graph task workers, and
-# machine origins that carry no per-call target ceiling.
+# Lanes the model can be shown: foreground user runs, job runs and sub-runs,
+# and machine origins that carry no per-call target ceiling.
 LANES: tuple[tuple[str, CallTargetLane | None], ...] = (
     ("foreground", CallTargetLane.FOREGROUND),
-    ("graph_task", CallTargetLane.GRAPH_TASK),
+    ("job", CallTargetLane.JOB),
     ("machine", None),
 )
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")

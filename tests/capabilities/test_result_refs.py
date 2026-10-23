@@ -436,7 +436,7 @@ async def test_no_model_facing_schema_asks_for_a_tool_call_id(tmp_path: Path) ->
             violations.extend(
                 _schema_violations(name, definition.input_schema, "input")
             )
-        assert {"task_complete", "python_execute", "data_upsert_rows"} <= set(
+        assert {"checklist_write", "python_execute", "data_upsert_rows"} <= set(
             registry.tool_names
         )
     finally:
