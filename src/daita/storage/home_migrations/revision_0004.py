@@ -1,12 +1,16 @@
 """Add foreground analytical evidence, declared catalog links and sync truncation."""
 
 import json
+import re
 import sqlite3
+from hashlib import sha256
 from pathlib import Path
 
 from ..sqlite_schema import (
     ANALYSIS_EVIDENCE_SQL,
     CATALOG_LINKS_SQL,
+    JOBS_SQL,
+    RETIRE_GRAPH_SQL,
     RETIRE_LEARNING_CANDIDATES_SQL,
     SCHEMA_REVISION_4,
 )
@@ -15,6 +19,200 @@ from .models import HomeMigration
 
 def _dump(record: object) -> str:
     return json.dumps(record, sort_keys=True, separators=(",", ":"))
+
+
+def _digest(value: object) -> str:
+    material = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return "sha256:" + sha256(material.encode("utf-8")).hexdigest()
+
+
+# Finished graph jobs keep their accepted result; unfinished ones fail with
+# this summary and show as Needs you. A requested cancellation is honoured.
+_UPGRADED_SUMMARY = "Created by an older version of Daita; start it again."
+_FINISHED_GRAPH_STATES = {
+    "succeeded": "done",
+    "failed": "failed",
+    "cancelled": "cancelled",
+    "cancel_requested": "cancelled",
+}
+# The default per-run token limit times the code-owned job allowance.
+_UPGRADED_TOKEN_LIMIT = 10 * 100_000
+
+
+def _bounded(value: str, maximum: int) -> str:
+    return value if len(value) <= maximum else value[: maximum - 1].rstrip() + "…"
+
+
+def _checklist_job(
+    record: dict[str, object],
+    results: dict[str, str],
+    *,
+    agent_id: str,
+    job_id: str,
+) -> tuple[dict[str, object], str]:
+    """Rewrite one stored graph job as the checklist-job record it becomes."""
+
+    if record["__record__"] != "GraphJob":
+        raise ValueError("Historical graph job record is invalid")
+    fields = record["fields"]
+    assert isinstance(fields, dict)
+    specification = fields["specification"]["fields"]
+    authority = specification["authority"]["fields"]
+    state = _FINISHED_GRAPH_STATES.get(fields["state"], "failed")
+    finished = fields["state"] in _FINISHED_GRAPH_STATES
+    summary: str | None = None
+    failure_code: str | None = None
+    if state == "done":
+        summary = _bounded(results.get(fields["terminal_result_id"], ""), 16_384)
+    elif not finished:
+        summary, failure_code = _UPGRADED_SUMMARY, "job_upgraded"
+    elif state == "failed":
+        code = fields["failure_code"]
+        failure_code = (
+            code
+            if isinstance(code, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,127}", code)
+            else "job_failed"
+        )
+    updated_at = fields["terminal_at"] or fields["updated_at"]
+    job = {
+        "job_id": job_id,
+        "agent_id": agent_id,
+        "conversation_id": fields["conversation_id"],
+        "objective": _bounded(specification["objective"], 16_384),
+        "source_ids": sorted(authority["source_ids"]),
+        "state": state,
+        "checklist": [],
+        "delegations": [],
+        "question": None,
+        "answers": [],
+        "current_run_id": None,
+        "run_count": 0,
+        "tokens_used": 0,
+        "run_limit": 20,
+        "token_limit": _UPGRADED_TOKEN_LIMIT,
+        "final_summary": summary,
+        "failure_code": failure_code,
+        "sensitivity": authority["sensitivity"],
+        "revision": 1,
+        "created_at": fields["created_at"],
+        "updated_at": updated_at,
+    }
+    return {"__record__": "Job", "fields": job}, state
+
+
+def _job_delivery(record: dict[str, object], *, agent_id: str) -> dict[str, object]:
+    """A graph job's result delivery becomes the job's ordinary delivery."""
+
+    fields = record["fields"]
+    assert isinstance(fields, dict)
+    if fields["visibility_state"] == "acknowledged" and not fields["acknowledged_at"]:
+        fields["acknowledged_at"] = fields["updated_at"]
+    fields["subject_kind"] = "job"
+    fields["migration_provenance"] = {}
+    fields["logical_key"] = "delivery:" + _digest(
+        {
+            "agent_id": agent_id,
+            "subject_kind": "job",
+            "subject_id": fields["subject_id"],
+            "target_fingerprint": fields["target"]["fields"]["target_fingerprint"],
+        }
+    )
+    return record
+
+
+def _convert_graph_jobs(connection: sqlite3.Connection) -> None:
+    """Replace the task graph with one checklist-job row per graph job.
+
+    Deliveries and receipts keep pointing at the same job id. Graph attention
+    notices described graph transitions that no longer exist and are dropped.
+    """
+
+    results = {
+        result_id: json.loads(data)["fields"]["summary"]
+        for result_id, data in connection.execute(
+            "SELECT result_id, data FROM job_task_results"
+        )
+    }
+    jobs = []
+    for (
+        agent_id,
+        job_id,
+        created_us,
+        updated_us,
+        terminal_us,
+        encoded,
+    ) in connection.execute(
+        "SELECT agent_id, job_id, created_at_us, updated_at_us, terminal_at_us, "
+        "data FROM job_runs"
+    ).fetchall():
+        job, state = _checklist_job(
+            json.loads(encoded), results, agent_id=agent_id, job_id=job_id
+        )
+        jobs.append(
+            (
+                agent_id,
+                job_id,
+                job["fields"]["conversation_id"],  # type: ignore[index]
+                state,
+                created_us,
+                max(updated_us, terminal_us or updated_us),
+                _dump(job),
+            )
+        )
+    receipts = connection.execute(
+        "SELECT agent_id, id, run_id, call_id, operation_key, routine_id, "
+        "occurrence_id, grant_digest, unresolved, job_id, data FROM effect_receipts"
+    ).fetchall()
+    connection.execute("DELETE FROM deliveries WHERE subject_kind = 'graph_attention'")
+    for agent_id, delivery_id, encoded in connection.execute(
+        "SELECT agent_id, delivery_id, data FROM deliveries "
+        "WHERE subject_kind = 'graph_job' ORDER BY created_at_us, delivery_id"
+    ).fetchall():
+        delivery = _job_delivery(json.loads(encoded), agent_id=agent_id)
+        fields = delivery["fields"]
+        assert isinstance(fields, dict)
+        duplicate = connection.execute(
+            "SELECT 1 FROM deliveries WHERE agent_id = ? AND subject_kind = 'job' "
+            "AND subject_id = ? AND target_fingerprint = ?",
+            (agent_id, fields["subject_id"], _fingerprint(fields)),
+        ).fetchone()
+        if duplicate is not None:
+            connection.execute(
+                "DELETE FROM deliveries WHERE agent_id = ? AND delivery_id = ?",
+                (agent_id, delivery_id),
+            )
+            continue
+        connection.execute(
+            "UPDATE deliveries SET subject_kind = 'job', logical_key = ?, state = ?, "
+            "data = ? WHERE agent_id = ? AND delivery_id = ?",
+            (
+                fields["logical_key"],
+                fields["visibility_state"],
+                _dump(delivery),
+                agent_id,
+                delivery_id,
+            ),
+        )
+    connection.executescript(RETIRE_GRAPH_SQL + JOBS_SQL)
+    connection.executemany(
+        "INSERT INTO jobs(agent_id, job_id, conversation_id, state, revision, "
+        "created_at_us, updated_at_us, data) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+        jobs,
+    )
+    connection.executemany(
+        "INSERT INTO effect_receipts(agent_id, id, run_id, call_id, operation_key, "
+        "routine_id, occurrence_id, grant_digest, unresolved, job_id, data) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        receipts,
+    )
+
+
+def _fingerprint(fields: dict[str, object]) -> str:
+    target = fields["target"]
+    assert isinstance(target, dict)
+    return str(target["fields"]["target_fingerprint"])
 
 
 def _untruncated_sync(record: dict[str, object]) -> dict[str, object]:
@@ -138,6 +336,7 @@ def _apply_revision_4(home: Path, source_shape: str | None) -> None:
                 "WHERE agent_id = ? AND occurrence_id = ?",
                 (_dump(occurrence), fields["disposition"], agent_id, occurrence_id),
             )
+        _convert_graph_jobs(connection)
         connection.commit()
 
 
@@ -155,7 +354,10 @@ REVISION_4 = HomeMigration(
         "Retire inactive learning candidates and their review stamps; approved knowledge is unaffected. "
         "Routines keep their title, prompt, schedule, named sources, counters and state; their frozen "
         "access, grants, routes, sensitivity, budgets, expiry, outcome, precheck, skills and provenance "
-        "are dropped, and their runs ask before writes. Occurrences drop prechecks and reservations."
+        "are dropped, and their runs ask before writes. Occurrences drop prechecks and reservations. "
+        "The task graph is replaced by one checklist-job record per job: finished jobs keep their "
+        "accepted result, unfinished jobs fail with an upgrade message, result deliveries and "
+        "receipts keep their job id, graph attention notices are dropped, and the graph tables go."
     ),
     affected_paths=("state.db",),
     target_schema=SCHEMA_REVISION_4,
