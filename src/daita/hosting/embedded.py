@@ -1999,6 +1999,7 @@ class EmbeddedAgent:
             requester: str,
             stop_after_input_tokens: int | None,
             main: bool,
+            admitted: Callable[[], Awaitable[bool]] | None = None,
         ) -> LoopExit | None:
             if loop is None:
                 return None
@@ -2049,14 +2050,21 @@ class EmbeddedAgent:
                 return await execute(
                     None, deadline if parent is None else min(deadline, parent)
                 )
-            lease = await admission_coordinator.admit_execution(
-                WorkloadClass.JOB,
-                run_input.id,
-                conversation_id=conversation_id,
-                absolute_deadline=deadline,
-            )
+            try:
+                # Waiting for a slot is bounded but does not use the run's time.
+                lease = await admission_coordinator.admit_execution(
+                    WorkloadClass.JOB,
+                    run_input.id,
+                    conversation_id=conversation_id,
+                    absolute_deadline=deadline,
+                    run_seconds=limits.max_wall_time_seconds,
+                )
+            except TimeoutError:
+                return None
             async with lease:
-                return await execute(lease, deadline)
+                if admitted is not None and not await admitted():
+                    return None
+                return await execute(lease, lease.absolute_deadline)
 
         job_executor: JobRunExecutor | None = (
             execute_job_run if loop is not None else None

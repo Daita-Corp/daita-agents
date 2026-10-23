@@ -536,7 +536,14 @@ class RunAdmissionCoordinator:
         *,
         conversation_id: str | None = None,
         absolute_deadline: float | None = None,
+        run_seconds: float | None = None,
     ) -> AdmissionLease:
+        """Wait for a slot until ``absolute_deadline``.
+
+        The lease's deadline is that same instant, or, with ``run_seconds``,
+        that long after the slot is granted, so waiting does not use it up.
+        """
+
         if not isinstance(workload_class, WorkloadClass):
             raise TypeError("workload_class must be WorkloadClass")
         if not isinstance(identity, str) or not identity:
@@ -545,6 +552,8 @@ class RunAdmissionCoordinator:
             not isinstance(conversation_id, str) or not conversation_id
         ):
             raise ValueError("conversation_id must be non-empty text or None")
+        if run_seconds is not None and not run_seconds > 0:
+            raise ValueError("run_seconds must be positive")
         deadline = _deadline_or_infinity(absolute_deadline)
         if deadline <= asyncio.get_running_loop().time():
             raise TimeoutError("execution admission deadline expired")
@@ -577,7 +586,11 @@ class RunAdmissionCoordinator:
                     conversation_id=conversation_id,
                     acquisition_sequence=waiter.sequence,
                     acquired_at=acquired_at,
-                    absolute_deadline=deadline,
+                    absolute_deadline=(
+                        deadline
+                        if run_seconds is None
+                        else asyncio.get_running_loop().time() + run_seconds
+                    ),
                     owner_task=asyncio.current_task(),
                 )
                 self._active[lease.lease_id] = lease

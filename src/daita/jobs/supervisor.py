@@ -10,6 +10,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
@@ -110,7 +111,13 @@ class JobRunExecutor(Protocol):
         requester: str,
         stop_after_input_tokens: int | None,
         main: bool,
-    ) -> LoopExit | None: ...
+        admitted: Callable[[], Awaitable[bool]] | None = None,
+    ) -> LoopExit | None:
+        """Run once admitted; ``None`` when no run happened.
+
+        A main run calls ``admitted`` once it holds a slot and runs only if it
+        returns true. ``None`` without that call means it never got a slot.
+        """
 
 
 # (parent scope, named source ids, sub-run scope id) -> the sub-run's scope.
@@ -321,16 +328,25 @@ class JobSupervisor:
         run_id = self._id_factory("run")
         if _RUN_ID.fullmatch(run_id) is None:
             raise ValueError("job run identity is invalid")
-        started = await self._owner.begin_run(job_id, run_id)
-        if started is None or started.state is not JobState.RUNNING:
-            return
+        begun = False
+
+        async def admitted() -> bool:
+            # The run counts only once it holds a slot.
+            nonlocal begun
+            started = await self._owner.begin_run(job_id, run_id)
+            begun = started is not None
+            return started is not None and started.state is JobState.RUNNING
+
         try:
-            run = await self._main_run_input(started, run_id, receipts, previous)
+            # The record the run starts from, as begin_run will leave it.
+            starting = replace(job, run_count=job.run_count + 1, current_run_id=run_id)
+            run = await self._main_run_input(starting, run_id, receipts, previous)
             result = await self._execute_run(
                 run,
-                requester=job_title(started),
+                requester=job_title(job),
                 stop_after_input_tokens=self._stop_after_input_tokens,
                 main=True,
+                admitted=admitted,
             )
         except asyncio.CancelledError:
             raise
@@ -341,6 +357,10 @@ class JobSupervisor:
             self._stop_for_host_close()
             return
         except Exception as error:
+            if not begun:
+                # A run that could not start still counts, so a broken start
+                # cannot retry forever.
+                await self._owner.begin_run(job_id, run_id)
             await self._owner.end_run(
                 job_id,
                 run_id,

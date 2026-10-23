@@ -86,7 +86,9 @@ other run failure fails the job.
 A job stops as `failed` after 20 runs or ten times the per-run token limit in
 total (sub-runs count), whichever comes first; answering a job stopped at a
 limit raises both by the same amount and continues it. Main runs take a
-`WorkloadClass.JOB` execution lease from `RunAdmissionCoordinator`; sub-runs run
+`WorkloadClass.JOB` execution lease from `RunAdmissionCoordinator`. A run counts
+against the job only once it holds the lease, and its time limit starts then; a
+wait that times out leaves the job running to try again. Sub-runs run
 inside their main run's lease and deadline, at most `HostCapacityLimits.
 job_parallelism` (default 2) per agent at once. A provider quota rejection
 holds the job for five minutes instead of failing it.
