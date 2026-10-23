@@ -342,7 +342,6 @@ async def test_enter_opens_each_card_kind_in_its_owner_screen(
         revision=1,
         occurrence_count=0,
         consecutive_failures=0,
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
     )
 
     async def list_jobs():

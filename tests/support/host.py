@@ -20,11 +20,9 @@ import pytest
 
 from daita import (
     LocalWorkspace,
-    MisfirePolicy,
     OnceSchedule,
-    ReportingMode,
+    RoutineIntent,
     ScheduledRoutine,
-    ScheduledRoutineDraft,
     __version__,
 )
 from daita.host.client import RemoteAgent, connect
@@ -37,12 +35,10 @@ from daita.llm.models import (
     FinishReason,
     ModelProfile,
     ModelResponse,
-    ModelSensitivity,
     ModelUsage,
 )
 from daita.llm.pricing import CostEstimate
 from tests.llm._subscription_support import _jwt
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.mcp import MemoryKeychain
 
 VERSION_HEADERS = {PROTOCOL_HEADER: str(PROTOCOL_VERSION), VERSION_HEADER: __version__}
@@ -226,9 +222,9 @@ def measured(text: str) -> ModelResponse:
 
 
 async def scheduled_routine(
-    agent: RemoteAgent, model_id: str, *, due_in: timedelta
+    agent: RemoteAgent, *, due_in: timedelta
 ) -> ScheduledRoutine:
-    """Ask one question, then schedule one reporting routine from its answer.
+    """Ask one question, then schedule one reporting routine in that conversation.
 
     The model must script one ``measured`` answer for the question and one per
     occurrence.
@@ -236,34 +232,14 @@ async def scheduled_routine(
 
     origin = await agent.run("How many invoices are paid?")
     assert origin.conversation_id is not None
-    (destination,) = await agent.distribution_destinations(origin.conversation_id)
-    now = datetime.now(UTC)
-    draft = ScheduledRoutineDraft(
-        origin_run_id=origin.run_id,
-        title="Paid invoice count",
-        authorized_instruction="Report the paid invoice count.",
-        schedule=OnceSchedule(now + due_in),
-        misfire_policy=MisfirePolicy.LATEST_ONLY,
-        reporting_mode=ReportingMode.ALWAYS,
-        precheck=None,
-        allowed_source_ids=(),
-        allowed_connector_binding_ids=(),
-        allowed_resource_ids=(),
-        allowed_capability_ids=("artifact.create_document",),
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
-        outcome_contract=no_artifact_outcome_contract(),
-        distribution_destination_id=destination.destination_id,
-        eligible_model_routes=(model_id,),
-        per_run_max_tokens=1_000,
-        per_run_max_cost_usd=None,
-        cumulative_max_tokens=10_000,
-        cumulative_max_cost_usd=None,
-        cumulative_max_attempts=10,
-        cumulative_max_occurrences=10,
-        maximum_consecutive_failures=3,
-        expires_at=now + timedelta(days=30),
+    return await agent.create_routine(
+        RoutineIntent(
+            title="Paid invoice count",
+            prompt="Report the paid invoice count.",
+            schedule=OnceSchedule(datetime.now(UTC) + due_in),
+        ),
+        conversation_id=origin.conversation_id,
     )
-    return await agent.create_routine(await agent.propose_routine(draft))
 
 
 def host_workspace(harness: HostHarness) -> LocalWorkspace:

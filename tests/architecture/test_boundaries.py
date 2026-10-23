@@ -346,7 +346,7 @@ def test_local_workspace_backend_is_explicit_and_conditionally_composed():
     assert "SessionFolderSource.for_workspace(identity.id, workspace)" in compose_text
     assert "session_workspace=workspace_backend" in compose_text
     assert "SourceTypeRegistry(source_types, local_files=not hosted)" in compose_text
-    assert "routine_precheck,\n            source_files,\n        )" in compose_text
+    assert "relational_upsert,\n            source_files,\n        )" in compose_text
 
 
 def test_bound_text_edit_has_one_artifact_producer_and_publication_owner():
@@ -593,7 +593,6 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         assert "data_profile_jobs" not in set(resolved.values())
         assert resolved["job_list"] == "jobs"
         assert resolved["routine_list"] == "routines"
-        assert resolved["distribution_destination_list"] == "distribution"
         assert resolved["delivery_list"] == "distribution"
         assert resolved["delivery_inspect"] == "distribution"
 
@@ -684,7 +683,6 @@ def test_public_surface_is_focused():
         "DeliverySubjectKind",
         "DeliveryState",
         "DeliveryView",
-        "DistributionDestination",
         "DistributionPlan",
         "DistributionTargetBinding",
         "GraphInspection",
@@ -716,7 +714,6 @@ def test_public_surface_is_focused():
         "MCPServerInspection",
         "MCPToolBinding",
         "MCPToolSelection",
-        "MisfirePolicy",
         "ModelRoute",
         "ModelRouteCandidate",
         "NonexistentTimePolicy",
@@ -732,9 +729,8 @@ def test_public_surface_is_focused():
         "RelationalUpdateReadiness",
         "RelationalWriteScope",
         "RetryPolicy",
-        "ReportingMode",
         "ResidentReady",
-        "ResourceRevisionPrecheck",
+        "RoutineIntent",
         "RoutineState",
         "ResourceRevisionBinding",
         "SQLiteSource",
@@ -750,8 +746,6 @@ def test_public_surface_is_focused():
         "SemanticValidationError",
         "Skill",
         "SkillSummary",
-        "ScheduledRoutineDraft",
-        "RequestedCapabilityGrant",
         "ScheduledRoutineInspection",
         "ScheduledRoutineSummary",
         "ScheduledRoutine",

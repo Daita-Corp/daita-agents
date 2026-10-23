@@ -32,7 +32,6 @@ from daita.capabilities import (
     source_id_schema,
 )
 from daita.capability_runtime import CapabilityRuntime
-from daita.distribution import outcome_contract_projection
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
@@ -57,7 +56,6 @@ from tests.support.capability_runtime import (
     presentation_metadata,
     static_registry,
 )
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.workspace import workspace_for
 
 SOURCE_A = "source:sha256:" + "a" * 64
@@ -391,7 +389,9 @@ async def test_every_model_facing_identity_argument_admits_handles(tmp_path: Pat
     assert {p: v for p, v in found.items() if v != patterns[family[p]]} == {}
 
 
-async def test_routine_save_persists_full_ids_named_by_handles(tmp_path: Path) -> None:
+async def test_routine_save_persists_full_source_ids_named_by_name(
+    tmp_path: Path,
+) -> None:
     database = tmp_path / "current.sqlite"
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE current_value (value INTEGER NOT NULL)")
@@ -416,42 +416,19 @@ async def test_routine_save_persists_full_ids_named_by_handles(tmp_path: Path) -
     )
     try:
         source = await agent.attach(SQLiteSource(database, name="Current"))
-        resource = (await agent.list_catalog_resources(source_id=source.id))[0]
         origin = await agent.run("Create a scheduled report.")
         assert origin.conversation_id is not None
-        destinations = await agent.distribution_destinations(origin.conversation_id)
         run = (await agent._embedded._store.load(origin.run_id)).run
         now = datetime.now(UTC)
         arguments = {
             "title": "Report",
-            "authorized_instruction": "Describe the current_value resource.",
+            "prompt": "Describe the current_value resource.",
             "schedule": {
                 "kind": "interval",
                 "interval_seconds": 3600,
                 "anchor_at": (now + timedelta(hours=1)).isoformat(),
             },
-            "misfire_policy": "latest_only",
-            "reporting_mode": "always",
-            "allowed_source_ids": ("s1",),
-            "allowed_resource_ids": ("t1",),
-            "allowed_connector_binding_ids": (),
-            "allowed_capability_ids": ("catalog.describe",),
-            "sensitivity_ceiling": "internal",
-            "outcome_contract": outcome_contract_projection(
-                no_artifact_outcome_contract()
-            ),
-            "distribution_destination_id": destinations[0].destination_id,
-            "eligible_model_routes": (provider.provider_id,),
-            "per_run_max_tokens": 1000,
-            "per_run_max_cost_usd": "0.01",
-            "cumulative_max_tokens": 10000,
-            "cumulative_max_cost_usd": "0.10",
-            "cumulative_max_attempts": 10,
-            "cumulative_max_occurrences": 10,
-            "maximum_consecutive_failures": 3,
-            "expires_at": (now + timedelta(days=30)).isoformat(),
-            "skill_names": (),
-            "run_immediately": False,
+            "sources": ("current",),
         }
         created = await execute_projected(
             agent._embedded._capability_runtime,
@@ -462,12 +439,10 @@ async def test_routine_save_persists_full_ids_named_by_handles(tmp_path: Path) -
         (summary,) = await agent.list_routines()
         inspection = await agent.inspect_routine(summary.routine_id)
         assert inspection is not None
-        assert inspection.routine.allowed_source_ids == (source.id,)
-        assert inspection.routine.allowed_resource_ids == (resource.id,)
+        assert inspection.routine.source_ids == (source.id,)
         assert approvals
-        approved = canonical_json(approvals[-1].arguments)
-        assert source.id in approved and resource.id in approved
-        assert '"s1"' not in approved and '"t1"' not in approved
+        # The confirmation card names the source; the record keeps its full id.
+        assert approvals[-1].arguments["sources"] == ("Current",)
     finally:
         await agent.close()
 

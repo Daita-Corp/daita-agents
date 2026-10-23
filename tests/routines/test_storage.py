@@ -119,7 +119,8 @@ async def test_pre_run_escalation_finalization_rolls_back_as_one_transaction(
 ) -> None:
     store = await SQLiteStateStore.open(tmp_path / "state.db")
     routine = await store.admit_scheduled_routine(
-        routine_record(maximum_consecutive_failures=1)
+        # A one-time routine that fails escalates to Needs you.
+        routine_record(schedule=OnceSchedule(NOW))
     )
     claimed = await store.claim_due_routine_occurrence(
         routine.agent_id,
@@ -635,7 +636,6 @@ async def test_claim_fault_rolls_back_occurrence_and_budget(
         "subscription_no_tokens",
         "subscription_replayed_stall",
         "subscription_other_unknown",
-        "occurrence_exhausted",
     ),
 )
 async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
@@ -645,24 +645,8 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
     store = await SQLiteStateStore.open(tmp_path / "state.db")
     try:
         draft = routine_record()
-        # Subscription routines carry no dollar ceilings; tokens still bound them.
+        # A subscription run has no dollar limit; its run's token limit still bounds it.
         unpriced = usage_case.startswith("subscription")
-        if unpriced:
-            draft = replace(
-                draft, per_run_max_cost_usd=None, cumulative_max_cost_usd=None
-            )
-        if usage_case == "occurrence_exhausted":
-            draft = replace(draft, cumulative_max_occurrences=1)
-        elif usage_case not in {
-            "normal",
-            "subscription",
-            "subscription_replayed_stall",
-        }:
-            draft = replace(
-                draft,
-                cumulative_max_tokens=5_000,
-                cumulative_max_cost_usd=None if unpriced else Decimal("0.05"),
-            )
         if usage_case == "once":
             draft = replace(draft, schedule=OnceSchedule(exact_at=NOW))
         routine = await store.admit_scheduled_routine(draft)
@@ -677,7 +661,6 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
         assert claimed is not None
         scope = execution_scope(claimed)
         if unpriced:
-            assert claimed.reserved_cost_usd == Decimal("0")
             scope = replace(scope, per_run_max_cost_usd=None)
         bound = await store.bind_routine_occurrence_run(
             routine.agent_id,
@@ -799,7 +782,6 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
         completed = usage_case in {
             "normal",
             "once",
-            "occurrence_exhausted",
             "subscription",
             "subscription_replayed_stall",
         }
@@ -822,44 +804,24 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
         )
         assert persisted is not None
         assert persisted.active_occurrence_id is None
-        assert persisted.reserved_tokens == 0
         assert persisted.last_delivery_ids == ("delivery-routine-1",)
         if usage_case == "normal":
             assert persisted.next_due_at == NOW + timedelta(hours=1)
         elif usage_case == "subscription_replayed_stall":
-            # Unknown consumption is charged the whole per-run reservation.
+            # Unknown consumption is charged the run's whole token limit.
             assert persisted.next_due_at == NOW + timedelta(hours=1)
             assert persisted.charged_tokens == first[0].charged_tokens
-            assert persisted.charged_tokens == claimed.reserved_tokens > 100
+            assert persisted.charged_tokens == scope.per_run_max_tokens > 100
             assert persisted.charged_cost_usd == Decimal("0")
         elif usage_case == "subscription":
             assert persisted.next_due_at == NOW + timedelta(hours=1)
             assert persisted.charged_tokens == 100
             assert persisted.charged_cost_usd == Decimal("0")
-            assert persisted.reserved_cost_usd == Decimal("0")
-        elif usage_case == "occurrence_exhausted":
-            # A used-up allowance cannot stay ACTIVE with an unclaimable past due.
-            assert persisted.state is RoutineState.NEEDS_ATTENTION
-            assert persisted.next_due_at is None
-            assert await store.next_routine_deadline(routine.agent_id) is None
-            with pytest.raises(ValueError, match="routine_occurrence_budget_exhausted"):
-                await store.transition_scheduled_routine(
-                    routine.agent_id,
-                    routine.routine_id,
-                    expected_revision=persisted.revision,
-                    state=RoutineState.ACTIVE,
-                    transitioned_at=NOW + timedelta(hours=2),
-                )
-            assert (
-                await store.load_scheduled_routine(routine.agent_id, routine.routine_id)
-                == persisted
-            )
         elif usage_case == "once":
             assert persisted.next_due_at is None
             assert persisted.state is RoutineState.COMPLETED
             assert persisted.charged_tokens == 100
             assert persisted.charged_cost_usd == Decimal("0.01")
-            assert persisted.model_budget_exhausted
         else:
             expected_tokens, expected_cost = (
                 (8_000, Decimal("0.08"))
@@ -872,8 +834,10 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
             assert (
                 persisted.charged_cost_usd == first[0].charged_cost_usd == expected_cost
             )
-            assert persisted.next_due_at is None
-            assert persisted.state is RoutineState.NEEDS_ATTENTION
+            # One failure keeps a recurring routine going at its next slot.
+            assert persisted.state is RoutineState.ACTIVE
+            assert persisted.consecutive_failures == 1
+            assert persisted.next_due_at == NOW + timedelta(hours=1)
             assert duplicate_delivery.outcome.conclusion_state is OutcomeState.FAILED
             await store.close()
             store = await SQLiteStateStore.open(tmp_path / "state.db")
@@ -881,14 +845,6 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
                 await store.load_scheduled_routine(routine.agent_id, routine.routine_id)
                 == persisted
             )
-            with pytest.raises(ValueError, match="routine_model_budget_exhausted"):
-                await store.transition_scheduled_routine(
-                    routine.agent_id,
-                    routine.routine_id,
-                    expected_revision=persisted.revision,
-                    state=RoutineState.ACTIVE,
-                    transitioned_at=NOW + timedelta(seconds=5),
-                )
     finally:
         await store.close()
 
@@ -992,8 +948,6 @@ async def test_routine_charges_equal_the_sum_of_its_run_usage(
             )
             assert current is not None
             routine = current
-        assert routine.reserved_tokens == 0
-        assert routine.reserved_cost_usd == Decimal("0")
         assert routine.charged_tokens == sum(item.total_tokens for item in runs)
         assert routine.charged_cost_usd == sum(
             (item.cost_estimate.amount_usd or Decimal(0) for item in runs),
@@ -1093,16 +1047,14 @@ async def test_reopen_converges_completed_reserved_run_without_reexecution(
         await reopened.close()
 
 
-async def test_immediate_first_creation_claims_once_with_normal_budget_and_next_anchor(
+async def test_immediate_first_creation_claims_once_and_keeps_the_next_anchor(
     tmp_path,
 ):
     store = await SQLiteStateStore.open(tmp_path / "state.db", clock=lambda: NOW)
-    proposal = replace(routine_record(), run_immediately=True)
-    created = await store.admit_scheduled_routine(proposal)
+    proposal = routine_record()
+    created = await store.admit_scheduled_routine(proposal, run_immediately=True)
     assert created.active_occurrence_id is not None
     assert created.occurrence_count == created.attempt_count == 1
-    assert created.reserved_tokens == created.per_run_max_tokens
-    assert created.reserved_cost_usd == created.per_run_max_cost_usd
     assert created.next_due_at == NOW + timedelta(hours=1)
     occurrences = await store.list_routine_occurrences(
         created.agent_id, created.routine_id
@@ -1111,7 +1063,7 @@ async def test_immediate_first_creation_claims_once_with_normal_budget_and_next_
     assert occurrences[0].slot_kind is RoutineSlotKind.MANUAL
     assert occurrences[0].scheduled_for == NOW
     with pytest.raises(ValueError, match="routine_identity_already_exists"):
-        await store.admit_scheduled_routine(proposal)
+        await store.admit_scheduled_routine(proposal, run_immediately=True)
     assert (
         await store.list_routine_occurrences(created.agent_id, created.routine_id)
         == occurrences
@@ -1124,14 +1076,14 @@ async def test_immediate_first_claim_failure_rolls_back_the_whole_creation(
 ):
 
     store = await SQLiteStateStore.open(tmp_path / "state.db", clock=lambda: NOW)
-    proposal = replace(routine_record(), run_immediately=True)
+    proposal = routine_record()
 
     def fail_claim(*_args):
         raise OSError("cannot persist immediate occurrence")
 
     monkeypatch.setattr(routine_store_module, "_insert_routine_occurrence", fail_claim)
     with pytest.raises(OSError, match="immediate occurrence"):
-        await store.admit_scheduled_routine(proposal)
+        await store.admit_scheduled_routine(proposal, run_immediately=True)
     assert (
         await store.load_scheduled_routine(proposal.agent_id, proposal.routine_id)
         is None
@@ -1147,7 +1099,7 @@ async def test_cancelled_immediate_admission_settles_one_atomic_assignment(
     tmp_path, monkeypatch
 ):
     store = await SQLiteStateStore.open(tmp_path / "state.db", clock=lambda: NOW)
-    proposal = replace(routine_record(), run_immediately=True)
+    proposal = routine_record()
     entered, release = threading.Event(), threading.Event()
     original = routine_store_module._insert_routine_occurrence
 
@@ -1158,7 +1110,9 @@ async def test_cancelled_immediate_admission_settles_one_atomic_assignment(
         return original(*args)
 
     monkeypatch.setattr(routine_store_module, "_insert_routine_occurrence", hold_claim)
-    admission = asyncio.create_task(store.admit_scheduled_routine(proposal))
+    admission = asyncio.create_task(
+        store.admit_scheduled_routine(proposal, run_immediately=True)
+    )
     try:
         assert await asyncio.to_thread(entered.wait, 2)
         admission.cancel()
@@ -1175,10 +1129,8 @@ async def test_cancelled_immediate_admission_settles_one_atomic_assignment(
             proposal.agent_id, proposal.routine_id
         )
         assert len(occurrences) == 1 and stored.occurrence_count == 1
-        assert stored.reserved_tokens == occurrences[0].reserved_tokens
-        assert stored.reserved_cost_usd == occurrences[0].reserved_cost_usd
         with pytest.raises(ValueError, match="routine_identity_already_exists"):
-            await store.admit_scheduled_routine(proposal)
+            await store.admit_scheduled_routine(proposal, run_immediately=True)
         assert await store.list_effect_receipts(proposal.agent_id) == ()
     finally:
         release.set()
@@ -1229,7 +1181,6 @@ async def test_active_occurrence_reads_return_only_queued_or_running_work(
         active = await store.list_active_routine_occurrences("agent-1")
         assert {item.disposition for item in active} == {
             RoutineOccurrenceDisposition.CLAIMED,
-            RoutineOccurrenceDisposition.PRECHECKING,
             RoutineOccurrenceDisposition.RUNNING,
             RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION,
             RoutineOccurrenceDisposition.RETRYABLE,
@@ -1283,5 +1234,203 @@ async def test_occurrence_lookup_returns_only_known_owned_identities(
         ):
             with pytest.raises(ValueError, match="occurrence identities"):
                 await store.load_routine_occurrences("agent-1", invalid)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("carried", (True, False))
+async def test_older_receipt_with_a_grant_verifies_against_its_runs_scope(
+    tmp_path: Path, carried: bool
+) -> None:
+    """A receipt that used a standing grant, from before grants were removed.
+
+    The routine record no longer has grants; the run's own execution scope
+    still carries the one the receipt used, and finalization checks it there.
+    """
+
+    from daita._json import FrozenJsonObject, canonical_json
+    from daita.capabilities import CapabilityGrant, EffectEvidenceBasis, EffectOutcome
+    from daita.llm.models import ToolCall, ToolResultBlock
+    from daita.storage.sqlite_codecs import encode_receipt
+    from daita.storage.sqlite_records import EffectReceipt, effect_receipt_id
+
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    try:
+        routine = await store.admit_scheduled_routine(routine_record())
+        claimed = await store.claim_due_routine_occurrence(
+            routine.agent_id,
+            routine.routine_id,
+            expected_revision=routine.revision,
+            expected_due_at=NOW,
+            claimed_at=NOW,
+            claim_token="claim-granted",
+        )
+        assert claimed is not None
+        unscoped = execution_scope(claimed)
+        grant = CapabilityGrant(
+            grant_id="grant-released",
+            domain_owner_id="data",
+            capability_id="data.query",
+            capability_contract_digest=(
+                unscoped.contract_bindings.capability_contracts["data.query"]
+            ),
+            constraints_kind="released",
+            constraints=FrozenJsonObject.from_mapping({}),
+            max_calls_per_occurrence=1,
+        )
+        scope = replace(unscoped, capability_grants=(grant,))
+        run_id = "run-routine-granted"
+        assert await store.bind_routine_occurrence_run(
+            routine.agent_id,
+            claimed.occurrence_id,
+            claim_token="claim-granted",
+            run_id=run_id,
+            execution_scope=scope,
+            bound_at=NOW + timedelta(seconds=1),
+        )
+        run = RunInput(
+            id=run_id,
+            agent_id=routine.agent_id,
+            message=routine.authorized_instruction,
+            created_at=NOW + timedelta(seconds=1),
+            conversation_id=routine.conversation_id,
+            source_scope_ids=("source-1",),
+            start=RunStartEnvelope(
+                origin=RunOrigin.SCHEDULED_ROUTINE,
+                instruction_authority=InstructionAuthority.FOREGROUND_AUTHORIZED,
+                trusted_instruction_id="routine:routine-1:revision:1",
+                trusted_instruction=routine.authorized_instruction,
+                instruction_digest=routine.instruction_digest,
+                untrusted_payload={},
+                payload_digest="sha256:" + sha256(b"{}").hexdigest(),
+                execution_scope=scope,
+            ),
+        )
+        await store.start(run)
+        await store.append(run.id, run.start_message())
+        operation_key = "sha256:" + "5" * 64
+        receipt = EffectReceipt(
+            receipt_id=effect_receipt_id(
+                agent_id=routine.agent_id,
+                run_id=run_id,
+                call_id="granted-call",
+                operation_key=operation_key,
+            ),
+            receipt_kind="effect",
+            agent_id=routine.agent_id,
+            run_id=run_id,
+            call_id="granted-call",
+            capability_id="data.query",
+            domain_owner_id="data",
+            capability_contract_digest=grant.capability_contract_digest,
+            operation_key=operation_key,
+            argument_fingerprint="sha256:" + "6" * 64,
+            sensitivity=ModelSensitivity.INTERNAL,
+            started_at=NOW + timedelta(seconds=1),
+            routine_id=routine.routine_id,
+            routine_revision=routine.revision,
+            occurrence_id=claimed.occurrence_id,
+            # Older data: the receipt names the grant that authorized it.
+            capability_grant_digest=(
+                grant.grant_digest if carried else "sha256:" + "9" * 64
+            ),
+            outcome=EffectOutcome.SUCCEEDED,
+            evidence_basis=EffectEvidenceBasis.SERVER_REPORTED,
+            payload=FrozenJsonObject.from_mapping({}),
+            finished_at=NOW + timedelta(seconds=1),
+        )
+
+        def insert(connection) -> None:
+            connection.execute(
+                "INSERT INTO effect_receipts(agent_id, id, run_id, call_id, "
+                "operation_key, routine_id, occurrence_id, grant_digest, "
+                "unresolved, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                (
+                    receipt.agent_id,
+                    receipt.receipt_id,
+                    receipt.run_id,
+                    receipt.call_id,
+                    receipt.operation_key,
+                    receipt.routine_id,
+                    receipt.occurrence_id,
+                    receipt.capability_grant_digest,
+                    encode_receipt(receipt),
+                ),
+            )
+
+        await sqlite_module.run_sql_transaction(store._database, insert)
+        output = {
+            "effect_receipt": {
+                "receipt_id": receipt.receipt_id,
+                "receipt_digest": receipt.receipt_digest,
+                "outcome": receipt.outcome.value,
+                "evidence_basis": receipt.evidence_basis.value,
+            }
+        }
+        call = ToolCall("granted-call", "data_query", {})
+        await store.append(
+            run.id, CanonicalMessage(role=MessageRole.ASSISTANT, tool_calls=(call,))
+        )
+        await store.append(
+            run.id,
+            CanonicalMessage(
+                role=MessageRole.TOOL,
+                content=(
+                    ToolResultBlock(
+                        call_id=call.id,
+                        output=output,
+                        sensitivity=ModelSensitivity.INTERNAL,
+                        sensitivity_provenance={"authority": "test"},
+                        capability_id="data.query",
+                        executor_id="data.query.executor",
+                        output_sha256="sha256:"
+                        + sha256(
+                            canonical_json(
+                                FrozenJsonObject.from_mapping(output)
+                            ).encode("utf-8")
+                        ).hexdigest(),
+                    ),
+                ),
+            ),
+        )
+        result = LoopExit(
+            run_id=run.id,
+            conversation_id=routine.conversation_id,
+            kind=LoopExitKind.COMPLETED,
+            reason="completed",
+            created_at=NOW + timedelta(seconds=2),
+            final_text="The value was written.",
+            steps=2,
+            usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
+        )
+        await store.complete(
+            result,
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT,
+                content=(TextBlock("The value was written."),),
+            ),
+        )
+        assert await store.mark_routine_occurrence_run_terminal(
+            routine.agent_id,
+            claimed.occurrence_id,
+            run_id=run.id,
+            terminal_at=result.created_at,
+        )
+        finalized = await store.finalize_routine_occurrence(
+            routine.agent_id,
+            claimed.occurrence_id,
+            delivery_id="delivery-granted",
+            finalized_at=NOW + timedelta(seconds=3),
+        )
+        assert finalized is not None and finalized[1] is not None
+        occurrence, delivery = finalized
+        assert delivery is not None
+        assert occurrence.effect_receipt_ids == (receipt.receipt_id,)
+        if carried:
+            assert occurrence.disposition is RoutineOccurrenceDisposition.COMPLETED
+            assert delivery.outcome.conclusion_state is OutcomeState.SUCCEEDED
+        else:
+            assert occurrence.failure_code == "outcome_effect_binding_invalid"
+            assert delivery.outcome.conclusion_state is OutcomeState.FAILED
     finally:
         await store.close()

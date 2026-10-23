@@ -4,8 +4,6 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 
-from daita import Agent
-from daita._json import FrozenJsonObject
 from daita.capabilities import (
     AccessMode,
     AutomationEligibility,
@@ -31,16 +29,12 @@ from daita.distribution import (
 from daita.distribution.capabilities import (
     DELIVERY_INSPECT_TOOL_NAME,
     DELIVERY_LIST_TOOL_NAME,
-    DISTRIBUTION_DESTINATION_LIST_TOOL_NAME,
     DISTRIBUTION_DOMAIN_OWNER_ID,
 )
 from daita.llm import ModelSensitivity
-from daita.llm.models import FinishReason, ModelResponse, ToolCall, ToolResultBlock
-from daita.llm.providers.mock import MockModelProvider
 from daita.loop import InstructionAuthority, RunInput, RunOrigin, RunStartEnvelope
 from tests.support.capability_runtime import frozen_execution_bindings
 from tests.support.distribution import inbox_distribution_plan
-from tests.support.workspace import workspace_for
 
 NOW = datetime(2026, 8, 28, 18, tzinfo=UTC)
 DIGEST = "sha256:" + "a" * 64
@@ -162,11 +156,10 @@ async def test_distribution_tools_are_exact_foreground_effect_free_reads() -> No
         id="run-user",
         agent_id="agent-1",
         conversation_id="conversation-1",
-        message="Show destinations and deliveries.",
+        message="Show deliveries.",
         created_at=NOW,
     )
     assert await domain.project(user) == (
-        DISTRIBUTION_DESTINATION_LIST_TOOL_NAME,
         DELIVERY_LIST_TOOL_NAME,
         DELIVERY_INSPECT_TOOL_NAME,
     )
@@ -177,7 +170,6 @@ async def test_distribution_tools_are_exact_foreground_effect_free_reads() -> No
         for capability in domain.declarations.capabilities
     )
     assert {item.name for item in domain.declarations.tool_views} == {
-        DISTRIBUTION_DESTINATION_LIST_TOOL_NAME,
         DELIVERY_LIST_TOOL_NAME,
         DELIVERY_INSPECT_TOOL_NAME,
     }
@@ -238,15 +230,6 @@ async def test_scheduled_scope_cannot_discover_or_inspect_distribution() -> None
 async def test_distribution_executors_return_only_safe_bounded_projections() -> None:
     domain, executors = _domain()
     by_id = {item.executor_id: item for item in executors}
-    destination = await by_id["distribution.destination.list.executor"].execute(
-        ToolExecution(
-            run_id="run-user",
-            call_id="call-destinations",
-            capability_id="distribution.destination.list",
-            conversation_id="conversation-1",
-            arguments={"_request_sensitivity": "internal"},
-        )
-    )
     listed = await by_id["distribution.delivery.list.executor"].execute(
         ToolExecution(
             run_id="run-user",
@@ -263,61 +246,7 @@ async def test_distribution_executors_return_only_safe_bounded_projections() -> 
         )
     )
 
-    assert destination.data["count"] == 1
     assert listed.data["count"] == 1
     assert inspected.data["delivery_id"] == "delivery-1"
     assert "payload" not in inspected.data
     assert "provider" not in inspected.data
-
-
-async def test_foreground_model_discovers_destination_through_static_domain(
-    tmp_path,
-) -> None:
-    provider = MockModelProvider(
-        (
-            ModelResponse(
-                finish_reason=FinishReason.TOOL_CALLS,
-                tool_calls=(
-                    ToolCall(
-                        id="call-destinations",
-                        name=DISTRIBUTION_DESTINATION_LIST_TOOL_NAME,
-                        arguments={},
-                    ),
-                ),
-            ),
-            ModelResponse(
-                finish_reason=FinishReason.STOP,
-                text="The current conversation Inbox is selectable.",
-            ),
-        ),
-        provider_id="mock:distribution-discovery",
-        complete_pricing=True,
-    )
-    agent = await Agent.create(
-        "distribution-discovery",
-        root=tmp_path,
-        workspace=workspace_for(tmp_path),
-        model=provider,
-        model_profile=provider.model_profile,
-    )
-    try:
-        result = await agent.run("Which distribution destination can I select?")
-        transcript = await agent.transcript(result.run_id)
-        tool_results = tuple(
-            block
-            for message in transcript.messages
-            for block in message.content
-            if isinstance(block, ToolResultBlock)
-        )
-        assert len(tool_results) == 1
-        assert not tool_results[0].is_error, tool_results[0].output
-        assert tool_results[0].capability_id == ("distribution.destination.list")
-        data = tool_results[0].output["data"]
-        assert isinstance(data, FrozenJsonObject)
-        assert data["count"] == 1
-        assert result.final_text == ("The current conversation Inbox is selectable.")
-        assert DISTRIBUTION_DESTINATION_LIST_TOOL_NAME in {
-            tool.name for tool in provider.requests[0].tools
-        }
-    finally:
-        await agent.close()

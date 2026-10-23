@@ -13,21 +13,15 @@ import pytest
 
 from daita import (
     Agent,
-    ArtifactRequirement,
     DeliveryView,
     IntervalSchedule,
-    MisfirePolicy,
-    OutcomeContract,
     OutcomeState,
-    ReportingMode,
-    ScheduledRoutineDraft,
+    RoutineIntent,
     SQLiteSource,
     WorkBoard,
     WorkColumn,
     WorkKind,
 )
-from daita.artifacts.models import ArtifactAuthorship
-from daita.domains.data.export_capabilities import DATA_EXPORT_TABULAR_CAPABILITY_ID
 from daita.jobs.graph.models import (
     BudgetAmount,
     ControlKind,
@@ -35,17 +29,16 @@ from daita.jobs.graph.models import (
     TaskControl,
     canonical_digest,
 )
+from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
     ModelResponse,
-    ModelSensitivity,
     ModelUsage,
 )
 from daita.llm.pricing import CostEstimate
 from daita.llm.providers.mock import MockModelProvider
 from daita.storage.sqlite import SQLiteStateStore
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.graph import GRAPH_NOW, graph_admission, with_topology
 from tests.support.workspace import workspace_for
 
@@ -72,28 +65,6 @@ def _profile(provider: MockModelProvider) -> ModelProfile:
         max_output_tokens=2_000,
         supports_tools=True,
         supports_parallel_tools=False,
-    )
-
-
-def _csv_export_contract() -> OutcomeContract:
-    requirement = ArtifactRequirement(
-        required=True,
-        minimum_count=1,
-        maximum_count=1,
-        allowed_media_types=("text/csv",),
-        allowed_authorships=(ArtifactAuthorship.EXACT_SOURCE_DATA,),
-        allowed_producer_capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
-        maximum_artifact_bytes=1024 * 1024,
-        maximum_total_bytes=1024 * 1024,
-        maximum_sensitivity=ModelSensitivity.INTERNAL,
-    )
-    return OutcomeContract(
-        require_terminal_conclusion=True,
-        artifact_requirements=(requirement,),
-        maximum_total_artifact_bytes=1024 * 1024,
-        maximum_effective_sensitivity=ModelSensitivity.INTERNAL,
-        require_current_run_provenance=True,
-        require_exact_source_bindings=True,
     )
 
 
@@ -163,44 +134,19 @@ async def _seed_queued_and_blocked_jobs(state_path: Path, agent_id: str) -> None
 async def _run_routine(
     agent: Agent,
     *,
-    origin_run_id: str,
     conversation_id: str,
     title: str,
     source_id: str,
-    resource_id: str,
-    capability_id: str,
-    outcome_contract: OutcomeContract,
-    provider: MockModelProvider,
 ) -> DeliveryView:
-    (destination,) = await agent.distribution_destinations(
-        conversation_id, sensitivity_ceiling=ModelSensitivity.INTERNAL
+    created = await agent.create_routine(
+        RoutineIntent(
+            title=title,
+            prompt="Report the current value from the exact resource.",
+            schedule=IntervalSchedule(3_600, NOW + timedelta(hours=1)),
+            sources=(source_id,),
+        ),
+        conversation_id=conversation_id,
     )
-    draft = ScheduledRoutineDraft(
-        origin_run_id=origin_run_id,
-        title=title,
-        authorized_instruction="Report the current value from the exact resource.",
-        schedule=IntervalSchedule(3_600, NOW + timedelta(hours=1)),
-        misfire_policy=MisfirePolicy.LATEST_ONLY,
-        reporting_mode=ReportingMode.ALWAYS,
-        precheck=None,
-        allowed_source_ids=(source_id,),
-        allowed_connector_binding_ids=(),
-        allowed_resource_ids=(resource_id,),
-        allowed_capability_ids=(capability_id,),
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
-        outcome_contract=outcome_contract,
-        distribution_destination_id=destination.destination_id,
-        eligible_model_routes=(provider.provider_id,),
-        per_run_max_tokens=2_000,
-        per_run_max_cost_usd=None,
-        cumulative_max_tokens=20_000,
-        cumulative_max_cost_usd=None,
-        cumulative_max_attempts=10,
-        cumulative_max_occurrences=10,
-        maximum_consecutive_failures=3,
-        expires_at=NOW + timedelta(days=30),
-    )
-    created = await agent.create_routine(await agent.propose_routine(draft))
     seen = {
         item.delivery_id
         for item in await agent.list_deliveries(conversation_id=conversation_id)
@@ -239,7 +185,8 @@ async def test_work_board_shows_real_jobs_routines_and_results_until_dismissed(
         (
             _stop("Foreground authorization complete."),
             _stop("The current value is 7."),
-            _stop("No export was produced."),
+            # The second routine's run fails, so its result needs the user.
+            ModelProviderError(ProviderErrorCode.INVALID_REQUEST),
         ),
         provider_id="mock:work-board",
         complete_pricing=True,
@@ -261,29 +208,19 @@ async def test_work_board_shows_real_jobs_routines_and_results_until_dismissed(
     agent = await Agent.open(NAME, **options)  # type: ignore[arg-type]
     try:
         source = await agent.attach(SQLiteSource(database))
-        (resource,) = await agent.list_catalog_resources(source_id=source.id)
         origin = await agent.run("Authorize the scheduled value reports.")
         assert origin.conversation_id is not None
-        routine_options = {
-            "origin_run_id": origin.run_id,
-            "conversation_id": origin.conversation_id,
-            "source_id": source.id,
-            "resource_id": resource.id,
-            "provider": provider,
-        }
         succeeded = await _run_routine(
             agent,
             title="Current value report",
-            capability_id="catalog.describe",
-            outcome_contract=no_artifact_outcome_contract(),
-            **routine_options,  # type: ignore[arg-type]
+            conversation_id=origin.conversation_id,
+            source_id=source.id,
         )
         failed = await _run_routine(
             agent,
             title="Current value export",
-            capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
-            outcome_contract=_csv_export_contract(),
-            **routine_options,  # type: ignore[arg-type]
+            conversation_id=origin.conversation_id,
+            source_id=source.id,
         )
         provider.assert_consumed()
         assert succeeded.conclusion_state is OutcomeState.SUCCEEDED

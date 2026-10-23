@@ -121,10 +121,10 @@ CASES: tuple[SmokeCase, ...] = (
         {"DAITA_RUN_LIVE_GRAPH_PLANNER": "1"},
     ),
     SmokeCase(
-        "routines/contract_authoring",
+        "routines/creation",
         "tests/live/routines/test_contract_authoring.py::"
-        "test_model_authors_scheduled_contract_without_dispatch[0-familiar]",
-        {**_PHASE_F, "DAITA_RUN_CONTRACT_QUALIFICATION": "1"},
+        "test_model_saves_example_routine_with_one_call_and_one_confirm",
+        {"DAITA_RUN_CONTRACT_QUALIFICATION": "1"},
     ),
     SmokeCase(
         "data/write_release",

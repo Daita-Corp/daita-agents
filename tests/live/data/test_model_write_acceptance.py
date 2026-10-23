@@ -1,4 +1,4 @@
-from tests.support.postgresql_model_write import admit_owner_routine
+from tests.support.postgresql_model_write import OWNER_SCHEDULE, admit_owner_routine
 
 """Real-model PostgreSQL acceptance with strict and ordinary-user profiles.
 
@@ -10,24 +10,19 @@ scheduled cases explicitly seed owner fixtures; they do not prove model creation
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import replace
 
 import pytest
 
-from daita import EffectRequirement
 from daita.capabilities import EffectEvidenceBasis, EffectOutcome
 from daita.capability_runtime import APPROVED_TARGET_CHANGED
-from daita.distribution.models import OutcomeState, outcome_contract_projection
+from daita.distribution.models import OutcomeState
 from daita.llm.models import ToolResultBlock
 from daita.loop.models import LoopExitKind
+from daita.routines.owner import schedule_text
 from daita.storage.sqlite_records import EffectResolutionDecision
-from tests.support.distribution import no_artifact_outcome_contract
-from tests.support.live_billing import live_model_id
 from tests.support.postgresql_live import _TABLE, row
 from tests.support.postgresql_live_harness import (
     AUTHORIZATION,
-    EXPIRES,
-    FIXTURE_SENSITIVITY,
     LIMITS,
     NEXT_SLOT,
     REPORT_INSTRUCTION,
@@ -478,23 +473,6 @@ async def test_live_uncertain_commit_restart_and_human_recovery(
         )
 
 
-def _routine_budget_text(budgets, lead, cumulative_label):
-    """Describe routine ceilings, naming dollars only when the run is priced."""
-
-    if budgets["per_run_max_cost_usd"] is None:
-        return (
-            f"{lead} {budgets['per_run_max_tokens']} tokens per run and "
-            f"{budgets['cumulative_max_tokens']} tokens {cumulative_label}, "
-            "with no dollar ceiling. "
-        )
-    return (
-        f"{lead} {budgets['per_run_max_tokens']} tokens and "
-        f"${budgets['per_run_max_cost_usd']} per run, "
-        f"{budgets['cumulative_max_tokens']} tokens and "
-        f"${budgets['cumulative_max_cost_usd']} {cumulative_label}. "
-    )
-
-
 @pytest.mark.parametrize("setup", ["model_authored", "owner_admitted_routine"])
 async def test_live_model_authors_and_executes_immediate_weekly_upsert(
     database, scenario_factory, model_id, setup
@@ -503,83 +481,25 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
     async with scenario_factory(
         max_runs=3 if setup == "model_authored" else 2, setup_mode=setup
     ) as scenario:
-        state = (
-            await scenario.agent.inspect_source_permissions(database.source_id)
-        ).state
-        permission = state.relational_write_scopes[0]
-        scenario.routine_grant = {
-            "source_id": database.source_id,
-            "resource_id": database.resource_id,
-            "resource_revision": permission.resource_revision,
-            "key_columns": ["domain"],
-            "allowed_insert_columns": ["domain", "evidence_url", "name"],
-            "allowed_update_columns": ["evidence_url", "name"],
-            "generated_identity_columns": ["id"],
-            "max_rows": 1,
-        }
-        outcome = replace(
-            no_artifact_outcome_contract(FIXTURE_SENSITIVITY),
-            require_exact_source_bindings=True,
-            effect_requirements=(
-                EffectRequirement(
-                    "data.upsert_rows",
-                    1,
-                    frozenset({EffectEvidenceBasis.ADAPTER_VERIFIED}),
-                ),
-            ),
-        )
+        # The confirm card must show the requested schedule; each run's
+        # upsert then asks at the time and must match the expected rows.
         scenario.routine_contract = {
-            "schedule": {
-                "kind": "calendar",
-                "timezone": "America/Chicago",
-                "hour": 9,
-                "minute": 0,
-                "day_selector": "weekdays",
-                "weekdays": [1],
-                "month_days": [],
-                "months": [],
-                "nonexistent_time_policy": "skip",
-                "ambiguous_time_policy": "first",
-            },
-            "run_immediately": True,
-            "allowed_source_ids": [database.source_id],
-            "allowed_resource_ids": [database.resource_id],
-            "allowed_connector_binding_ids": [],
-            "allowed_capability_ids": ["data.preview_upsert_rows", "data.upsert_rows"],
-            "eligible_model_routes": [live_model_id(model_id)],
-            "sensitivity_ceiling": FIXTURE_SENSITIVITY.value,
-            "skill_bindings": [],
-            "precheck": None,
-            "misfire_policy": "latest_only",
-            "reporting_mode": "always",
-            **scenario.routine_budgets,
-            "maximum_consecutive_failures": 1,
-            "expires_at": EXPIRES.isoformat(),
-            "outcome_contract": outcome_contract_projection(outcome),
+            "schedule": schedule_text(OWNER_SCHEDULE, run_immediately=True)
         }
+        scenario.expect_upsert([row()])
         prompt = (
             "Create one routine to maintain this owner-supplied company finding in the companies table immediately and every Monday at 09:00 America/Chicago: "
             "domain new.test, name New, evidence_url https://evidence.test/new.test. Match domain, insert missing rows and update only name/evidence_url; preserve omitted notes and let PostgreSQL assign IDs. "
-            "Each occurrence must obtain a fresh preview and invoke one bounded upsert, even when unchanged. Grant one row and one upsert per occurrence. "
-            "Use only the preview and upsert capabilities, this exact source/table, no other connectors, skills, artifacts, or precheck. "
-            "Discover the current conversation inbox and always report there. Require one adapter-verified successful upsert and a terminal conclusion with current-run provenance/exact bindings; "
-            f"restrict sensitivity to {FIXTURE_SENSITIVITY.value}. "
-            "Use latest_only misfires, skip nonexistent times, and the first ambiguous time. Stop after two occurrences/two attempts, or "
-            + EXPIRES.isoformat()
-            + ". Allow one consecutive failure. "
-            + _routine_budget_text(
-                scenario.routine_budgets, "Authorize", "cumulatively"
-            )
-            + "Do not perform a separate foreground write. "
-            "Save this reporting instruction in the routine: "
+            "Each run must obtain a fresh preview and invoke one bounded upsert, even when unchanged. "
+            "Use only this source and table. Do not perform a separate foreground write. "
+            "Save this reporting instruction in the routine prompt: "
             + REPORT_INSTRUCTION
             + " "
-            "Current owner-provided target references (discover all tool and grant contracts yourself): "
+            "Current owner-provided target references: "
             + json.dumps(
                 {
                     "source_id": database.source_id,
                     "resource_id": database.resource_id,
-                    "model_route": live_model_id(model_id),
                 }
             )
         )
@@ -589,20 +509,9 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
             "update its name and evidence link, leaving other details alone. Do this now "
             "and every Monday at 9am America/Chicago. Check and save the record each time, "
             "even when unchanged, and report the result here after every run. "
-            "Only use this company table. Allow one company-saving operation per run. "
-            "Stop after two runs, after any failure, or on "
-            + EXPIRES.isoformat()
-            + ". "
-            "If a run is missed, only catch up the most recent one. Skip nonexistent clock "
-            "times and use the first occurrence of an ambiguous clock time. "
-            + _routine_budget_text(
-                scenario.routine_budgets,
-                "Use the current model with a budget of",
-                "overall",
-            )
-            + "Keep the work at the table's current sensitivity. Report success only with "
-            "database-confirmed evidence for the exact table. Include the immediate save "
-            "in the scheduled work, rather than saving it separately first."
+            "Only use this company table. Report success only with database-confirmed "
+            "evidence for the exact table. Include the immediate save in the scheduled "
+            "work, rather than saving it separately first."
         )
         if setup == "model_authored":
             creation, _ = await scenario.run(prompt, user_prompt=user_prompt)
@@ -610,18 +519,16 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
             if scenario.profile == "user_flow":
                 scenario.assert_report(creation, "assignment_saved")
         else:
-            await admit_owner_routine(
-                scenario, user_prompt if scenario.profile == "user_flow" else prompt
-            )
+            await admit_owner_routine(scenario, database.source_id)
             creation = None
             scenario.stages.append("owner_admitted_fixture_not_model_creation")
         routines = await scenario.agent.list_routines()
         assert len(routines) == 1, creation
         inspection = await scenario.agent.inspect_routine(routines[0].routine_id)
-        assert len(inspection.routine.capability_grants) == 1
-        assert inspection.routine.capability_grants[0].max_calls_per_occurrence == 1
+        assert inspection.routine.schedule == OWNER_SCHEDULE
+        assert inspection.routine.source_ids in ((), (database.source_id,))
         if setup == "model_authored":
-            scenario.stages.append("model_authored_assignment_saved_with_exact_grant")
+            scenario.stages.append("model_authored_routine_saved_after_one_confirm")
         immediate, immediate_transcript = await scenario.scheduled_result(1)
         scenario.assert_report(immediate, "succeeded", (1, 0, 0))
         immediate_call = assert_preview_binding(
@@ -670,10 +577,14 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
                 "notes": None,
             }
         ]
-        if setup == "model_authored":
-            assert len(scenario.approvals) == 1 and scenario.approvals[0]["approved"]
-        else:
-            assert scenario.approvals == []
+        # One confirm for a model-authored routine, then each scheduled
+        # upsert asked at the time and was approved once.
+        assert [item["tool"] for item in scenario.approvals] == [
+            *(["routine_save"] if setup == "model_authored" else []),
+            "data_upsert_rows",
+            "data_upsert_rows",
+        ]
+        assert all(item["approved"] for item in scenario.approvals)
         deliveries = await scenario.agent.list_deliveries(
             conversation_id=scenario.conversation_id
         )

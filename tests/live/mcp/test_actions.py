@@ -1,7 +1,7 @@
 """Real-model Phase F effectiveness; MCP effects stay inside MockTransport.
 
 Ten cases, at most twelve AgentLoop runs per model/repetition. No model
-responses or routine proposals are scripted in this module.
+responses or routines are scripted in this module.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from daita.capabilities import EffectEvidenceBasis
+from daita import CalendarSchedule
 from daita.distribution.models import OutcomeState
 from daita.llm.models import ToolResultBlock
 from tests.support.job_benchmarks import (
@@ -20,7 +20,6 @@ from tests.support.job_benchmarks import (
     assert_on_demand_invocation,
     results_for,
 )
-from tests.support.live_billing import live_model_id
 from tests.support.mcp_routine_harness import (
     AUTHORIZATION,
     CONTENT,
@@ -173,7 +172,7 @@ async def test_live_research_and_honest_action_evidence(
             assert len(await scenario.agent.list_effects(unresolved_only=True)) == 1
 
 
-async def test_live_model_authors_grant_and_runs_immediate_and_weekly_occurrences(
+async def test_live_model_saves_routine_and_runs_immediate_and_weekly_occurrences(
     tmp_path: Path,
     model_id: str,
     repetition: int,
@@ -198,21 +197,13 @@ async def test_live_model_authors_grant_and_runs_immediate_and_weekly_occurrence
         inspection = await scenario.agent.inspect_routine(routines[0].routine_id)
         assert inspection is not None
         routine = inspection.routine
-        assert len(routine.capability_grants) == 1
-        assert scenario.grant_is_exact(routine.capability_grants[0].material())
-        assert len(routine.outcome_contract.effect_requirements) == 1
-        requirement = routine.outcome_contract.effect_requirements[0]
-        assert requirement.capability_id == scenario.action.capability_id
-        assert requirement.minimum_successful_calls == 1
-        assert requirement.accepted_evidence_bases == frozenset(
-            {EffectEvidenceBasis.SERVER_REPORTED}
+        assert isinstance(routine.schedule, CalendarSchedule)
+        assert (routine.schedule.timezone, routine.schedule.weekdays) == (
+            "America/Chicago",
+            (1,),
         )
-        assert routine.allowed_source_ids == routine.allowed_resource_ids == ()
-        assert routine.skill_bindings == ()
-        assert routine.eligible_model_routes == (live_model_id(model_id),)
-        assert routine.outcome_contract.require_exact_source_bindings
-        assert routine.outcome_contract.artifact_requirements == ()
-        assert routine.maximum_consecutive_failures == 1
+        assert (routine.schedule.hour, routine.schedule.minute) == (9, 0)
+        assert routine.source_ids == ()
 
         immediate, immediate_transcript = await scenario.scheduled_result(1)
         assert_completed(immediate, immediate_transcript)
@@ -234,9 +225,13 @@ async def test_live_model_authors_grant_and_runs_immediate_and_weekly_occurrence
                 if call.name == scenario.action.local_name
             ]
             assert len(calls) == 1
-        assert (
-            len(scenario.approvals) == 1 and scenario.approvals[0]["approved"] is True
-        )
+        # One confirm card, then each scheduled action asked at the time.
+        assert [item["tool"] for item in scenario.approvals] == [
+            "routine_save",
+            scenario.action.local_name,
+            scenario.action.local_name,
+        ]
+        assert all(item["approved"] is True for item in scenario.approvals)
         assert scenario.conversation_id is not None
         for item in await scenario.agent.list_deliveries(
             conversation_id=scenario.conversation_id

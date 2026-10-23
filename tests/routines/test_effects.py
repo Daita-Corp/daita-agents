@@ -1,4 +1,4 @@
-"""Phase D proof: one ordinary loop/supervisor for native and unrelated effects."""
+"""Scheduled routines run effects through the one loop and supervisor."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import (
     AccessMode,
     CallProvenance,
-    CapabilityInputError,
     CapabilityRegistry,
     EffectEvidenceBasis,
     EffectObservation,
@@ -25,12 +24,7 @@ from daita.capabilities import (
     ToolView,
 )
 from daita.capability_runtime import CapabilityRuntime, SideEffectPlan
-from daita.distribution import (
-    DistributionOwner,
-    OutcomeState,
-    conversation_inbox_destination_id,
-)
-from daita.distribution.models import EffectRequirement
+from daita.distribution import DistributionOwner, OutcomeState
 from daita.identity import AgentIdentity
 from daita.llm.models import (
     FinishReason,
@@ -44,9 +38,7 @@ from daita.llm.pricing import CostEstimate
 from daita.loop import AgentLoop, LoopLimits
 from daita.routines.models import (
     IntervalSchedule,
-    MisfirePolicy,
-    ReportingMode,
-    RequestedCapabilityGrant,
+    RoutineIntent,
     RoutineOccurrenceDisposition,
     RoutineState,
 )
@@ -61,15 +53,7 @@ from tests.support.capability_runtime import (
     machine_scope_builder,
     presentation_metadata,
 )
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.toolbox_model import ToolboxAwareMockModelProvider
-
-
-class _NoCatalog:
-    async def readable_resource_ids(self, *args, **kwargs):
-        raise AssertionError(
-            "a source-free routine must not query an ambient source catalog"
-        )
 
 
 class _Context:
@@ -103,17 +87,7 @@ class _DocumentDomain(StaticTestDomain):
         return CallProvenance()
 
 
-class _StandingDomain(StaticTestDomain):
-    async def prepare_automation_grant(
-        self, capability, constraints, max_calls_per_occurrence, proposal
-    ):
-        if constraints["target"] != "admitted-target" or max_calls_per_occurrence > 2:
-            raise CapabilityInputError(
-                "grant_outside_scope",
-                "The exact target or call ceiling is not admitted.",
-            )
-        return constraints
-
+class _ActionDomain(StaticTestDomain):
     async def side_effect_plan(self, run, call, capability, execution, fingerprint):
         # Scheduled effects ask a person at the time, like the real domains.
         return SideEffectPlan(
@@ -144,14 +118,13 @@ async def _assignment(
     *,
     basis=EffectEvidenceBasis.SERVER_REPORTED,
     mode="success",
-    minimum=1,
     invoke=True,
     repeated=False,
     defer=False,
     read_only=False,
     through_tool=False,
     approvals=None,
-    document_minimum=0,
+    document=False,
     after_run=None,
     clock=None,
 ):
@@ -202,7 +175,7 @@ async def _assignment(
         description=capability.description,
         presentation=presentation_metadata(load_mode=ToolLoadMode.ON_DEMAND),
     )
-    domain = _StandingDomain((capability,), (view,))
+    domain = _ActionDomain((capability,), (view,))
     executor = _RoutineExecutor(store=store, mode=mode, basis=basis)
     from daita.domains.data.export_capabilities import (
         DOCUMENT_CREATE_CAPABILITY_ID,
@@ -213,7 +186,7 @@ async def _assignment(
     declarations = artifact_capability_declarations(
         include_local_delivery=False, include_local_edit=False
     )
-    document = next(
+    document_capability = next(
         item
         for item in declarations.capabilities
         if item.id == DOCUMENT_CREATE_CAPABILITY_ID
@@ -223,16 +196,16 @@ async def _assignment(
     create_view = next(
         item
         for item in declarations.tool_views
-        if document.id in dict(item.mode_capability_ids).values()
+        if document_capability.id in dict(item.mode_capability_ids).values()
     )
     document_view = ToolView(
         name=create_view.name,
-        capability_id=document.id,
-        description=document.description,
+        capability_id=document_capability.id,
+        description=document_capability.description,
         presentation=create_view.presentation,
     )
     document_domain = _DocumentDomain(
-        (document,), (document_view,), domain_owner_id="artifact"
+        (document_capability,), (document_view,), domain_owner_id="artifact"
     )
     if await store.load_identity() is None:
         await store.initialize_identity(
@@ -279,7 +252,7 @@ async def _assignment(
             text="The assignment is finished.",
         )
     )
-    if document_minimum:
+    if document:
         script.insert(
             0,
             ModelResponse(
@@ -321,18 +294,7 @@ async def _assignment(
 
     limits = LoopLimits(max_total_tokens=10000, max_estimated_cost_usd=Decimal("1"))
     distribution = DistributionOwner(agent_id="agent-effect", store=store)
-    owner = RoutineOwner(
-        agent_id="agent-effect",
-        store=store,
-        catalog=_NoCatalog(),
-        distribution=distribution,
-        skills=None,
-        eligible_model_routes=(model.provider_id,),
-        maximum_per_run_tokens=10000,
-        maximum_per_run_cost_usd=Decimal("1"),
-        clock=clock,
-        execution_contract_reader=read_contracts,
-    )
+    owner = RoutineOwner(agent_id="agent-effect", store=store, clock=clock)
     from daita.capabilities import (
         ApprovalDecision,
         CapabilityDeclarations,
@@ -377,140 +339,51 @@ async def _assignment(
         approval_handler=approve,
         clock=clock,
     )
-    owner.bind_capability_registry(registry)
-    owner.bind_grant_preparer(runtime.prepare_automation_grant)
-    contract = replace(
-        no_artifact_outcome_contract(),
-        effect_requirements=(
-            ()
-            if read_only
-            else (EffectRequirement(capability.id, minimum, frozenset({basis})),)
-        ),
-    )
-    if document_minimum:
-        from daita.artifacts.models import ArtifactAuthorship
-        from daita.distribution.models import ArtifactRequirement
-
-        contract = replace(
-            contract,
-            maximum_total_artifact_bytes=4096,
-            artifact_requirements=(
-                ArtifactRequirement(
-                    required=True,
-                    minimum_count=document_minimum,
-                    maximum_count=2,
-                    allowed_media_types=("text/markdown",),
-                    allowed_authorships=(ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,),
-                    allowed_producer_capability_ids=(document.id,),
-                    maximum_artifact_bytes=2048,
-                    maximum_total_bytes=4096,
-                    maximum_sensitivity=ModelSensitivity.INTERNAL,
-                ),
-            ),
-        )
-    proposal = await owner.prepare_create(
-        run_id="run-effect",
-        conversation_id="conversation-effect",
-        call_id="create-effect",
+    intent = RoutineIntent(
         title="Exact external assignment",
-        authorized_instruction="Invoke the exact admitted action and report its evidence.",
+        prompt="Invoke the exact admitted action and report its evidence.",
         schedule=IntervalSchedule(3600, STARTED_AT),
-        misfire_policy=MisfirePolicy.LATEST_ONLY,
-        reporting_mode=ReportingMode.ALWAYS,
-        precheck=None,
-        allowed_source_ids=(),
-        allowed_resource_ids=(),
-        allowed_connector_binding_ids=(),
-        allowed_capability_ids=(
-            tuple(sorted((capability.id, document.id)))
-            if document_minimum
-            else (capability.id,)
-        ),
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
-        outcome_contract=contract,
-        distribution_destination_id=conversation_inbox_destination_id(
-            "conversation-effect"
-        ),
-        eligible_model_routes=(model.provider_id,),
-        per_run_max_tokens=10000,
-        per_run_max_cost_usd=Decimal("1"),
-        cumulative_max_tokens=100000,
-        cumulative_max_cost_usd=Decimal("10"),
-        cumulative_max_attempts=10,
-        cumulative_max_occurrences=10,
-        maximum_consecutive_failures=3,
-        expires_at=STARTED_AT + timedelta(days=1),
-        skill_names=(),
-        basis_run_id=None,
-        requested_capability_grants=(
-            ()
-            if read_only
-            else (
-                RequestedCapabilityGrant(
-                    capability.id,
-                    FrozenJsonObject.from_mapping({"target": "admitted-target"}),
-                    1,
-                ),
-            )
-        ),
         run_immediately=True,
     )
+    proposal = (
+        await owner.prepare(
+            intent, conversation_id="conversation-effect", identity="create-effect"
+        )
+    ).routine
     if through_tool:
-        from daita.routines.capabilities import _spec_schema
-        from daita.routines.owner import _routine_proposal_payload
         from tests.support.capability_runtime import execute_projected
 
-        payload = _routine_proposal_payload(proposal)
-        schema = _spec_schema(update=False)
-        properties = schema["properties"]
-        assert isinstance(properties, dict)
-        arguments = {
-            key: value
-            for key, value in payload.items()
-            if key in properties and value is not None
-        }
-        arguments.update(
-            skill_names=(),
-            distribution_destination_id=proposal.distribution_plan.targets[
-                0
-            ].destination_id,
-            requested_capability_grants=tuple(
-                {
-                    "capability_id": grant.capability_id,
-                    "constraints": grant.constraints,
-                    "max_calls_per_occurrence": grant.max_calls_per_occurrence,
-                }
-                for grant in proposal.capability_grants
-            ),
-        )
         origin = (await store.load("run-effect")).run
-        rejected = await execute_projected(
-            runtime,
-            origin,
-            (ToolCall("private-create", "routine_save", arguments),),
-            sensitivity=ModelSensitivity.RESTRICTED,
-        )
-        assert rejected.ordered_results[0].is_error
-        assert (
-            rejected.ordered_results[0].output["error"]["code"]
-            == "routine_instruction_sensitivity_exceeded"
-        )
-        assert await store.list_scheduled_routines("agent-effect") == ()
-        assert not approvals
         outcome = await execute_projected(
             runtime,
             origin,
-            (ToolCall("create-effect", "routine_save", arguments),),
+            (
+                ToolCall(
+                    "create-effect",
+                    "routine_save",
+                    {
+                        "title": intent.title,
+                        "prompt": intent.prompt,
+                        "schedule": {
+                            "kind": "interval",
+                            "interval_seconds": 3600,
+                            "anchor_at": STARTED_AT.isoformat(),
+                        },
+                        "run_immediately": True,
+                    },
+                ),
+            ),
         )
         assert not outcome.ordered_results[0].is_error, outcome.ordered_results[
             0
         ].output
-        routine = await store.load_scheduled_routine(
-            "agent-effect", proposal.routine_id
-        )
-        assert routine is not None
+        (routine,) = await store.list_scheduled_routines("agent-effect")
     else:
-        routine = await owner.admit(proposal)
+        routine = await owner.save(
+            await owner.prepare(
+                intent, conversation_id="conversation-effect", identity="create-effect"
+            )
+        )
     loop = AgentLoop(
         model=model,
         context_builder=_Context(),
@@ -520,7 +393,7 @@ async def _assignment(
         clock=clock,
     )
 
-    async def execute_run(occurrence, run, observation):
+    async def execute_run(occurrence, run):
         prepared = await loop.prepare(run)
         assert run.execution_scope is not None
         bound = await store.bind_routine_occurrence_run(
@@ -548,6 +421,9 @@ async def _assignment(
         machine_scope=machine_scope_builder(
             agent_id="agent-effect", registry=registry, contracts=read_contracts
         ),
+        model_routes=(model.provider_id,),
+        per_run_max_tokens=limits.max_total_tokens,
+        per_run_max_cost_usd=limits.max_estimated_cost_usd,
         clock=clock,
         id_factory=identity_factory,
     )
@@ -596,25 +472,14 @@ async def test_routine_effect_asks_at_the_time_and_records_one_authenticated_rec
         await store.close()
 
 
-@pytest.mark.parametrize(
-    "minimum,expected",
-    (
-        (0, RoutineOccurrenceDisposition.COMPLETED),
-        (1, RoutineOccurrenceDisposition.TERMINAL_FAILED),
-    ),
-)
-async def test_optional_and_required_actions_cannot_be_satisfied_by_speech(
-    tmp_path, minimum, expected
-):
+async def test_speech_alone_performs_no_action_and_records_no_receipt(tmp_path):
     store, owner, runtime, executor, model, inspection, proposal, supervisor = (
-        await _assignment(tmp_path, minimum=minimum, invoke=False)
+        await _assignment(tmp_path, invoke=False)
     )
     try:
         occurrence = inspection.recent_occurrences[0]
-        assert occurrence.disposition is expected
+        assert occurrence.disposition is RoutineOccurrenceDisposition.COMPLETED
         assert occurrence.effect_receipt_ids == () and executor.calls == 0
-        if minimum:
-            assert occurrence.failure_code == "outcome_effect_requirement_unsatisfied"
     finally:
         await store.close()
 
@@ -646,7 +511,7 @@ async def test_uncertain_or_unusable_required_effect_never_reports_success(
     tmp_path, mode, basis, receipt_outcome, failure
 ):
     store, owner, runtime, executor, model, inspection, proposal, supervisor = (
-        await _assignment(tmp_path, mode=mode, basis=basis, minimum=0)
+        await _assignment(tmp_path, mode=mode, basis=basis)
     )
     try:
         occurrence = inspection.recent_occurrences[0]
@@ -680,7 +545,7 @@ async def test_each_distinct_operation_in_an_occurrence_asks_and_is_receipted(
         await store.close()
 
 
-async def test_uncertainty_blocks_resume_manual_claim_and_new_clones_after_reopen(
+async def test_uncertainty_blocks_resume_after_reopen(
     tmp_path,
 ):
     from daita.routines.models import RoutineControlAction
@@ -715,57 +580,10 @@ async def test_uncertainty_blocks_resume_manual_claim_and_new_clones_after_reope
             blocked.value.receipt_ids
             == inspection.recent_occurrences[0].effect_receipt_ids
         )
-        with pytest.raises(EffectUnresolvedError):
-            await reopened.admit_scheduled_routine(
-                replace(proposal, routine_id="routine-new-clone")
-            )
-        assert (
-            await reopened.load_scheduled_routine("agent-effect", "routine-new-clone")
-            is None
-        )
         assert len(await reopened.list_effect_receipts("agent-effect")) == 1
         assert executor.calls == 1
     finally:
         await reopened.close()
-
-
-@pytest.mark.parametrize("expansion", ["schedule", "instruction", "budget", "expiry"])
-async def test_unresolved_effect_blocks_expanding_an_unrelated_assignment(
-    tmp_path, expansion
-):
-    from daita.routines.models import text_digest
-    from daita.storage.sqlite_records import EffectUnresolvedError
-
-    store, owner, runtime, executor, model, inspection, proposal, supervisor = (
-        await _assignment(tmp_path, mode="disconnect", defer=True)
-    )
-    try:
-        unrelated = await owner.admit(
-            replace(proposal, routine_id="routine-unrelated", run_immediately=False)
-        )
-        await supervisor._run_claimed(inspection.recent_occurrences[0])
-        expansions: dict[str, dict[str, object]] = {
-            "schedule": {"schedule": IntervalSchedule(60, STARTED_AT)},
-            "instruction": {
-                "authorized_instruction": "Perform a different action.",
-                "instruction_digest": text_digest("Perform a different action."),
-            },
-            "budget": {"cumulative_max_occurrences": 11},
-            "expiry": {"expires_at": proposal.expires_at + timedelta(days=1)},
-        }
-        changes = expansions[expansion]
-        revised = replace(unrelated, revision=unrelated.revision + 1, **changes)
-        with pytest.raises(EffectUnresolvedError):
-            await store.revise_scheduled_routine(
-                revised, expected_revision=unrelated.revision
-            )
-        assert (
-            await store.load_scheduled_routine("agent-effect", unrelated.routine_id)
-            == unrelated
-        )
-        assert executor.calls == 1
-    finally:
-        await store.close()
 
 
 async def test_existing_unrelated_routine_can_finish_while_uncertain_routine_stays_blocked(
@@ -778,11 +596,10 @@ async def test_existing_unrelated_routine_can_finish_while_uncertain_routine_sta
         await _assignment(tmp_path, mode="disconnect", defer=True)
     )
     try:
-        independent = await owner.admit(
+        independent = await store.admit_scheduled_routine(
             replace(
                 proposal,
                 routine_id="routine-earlier-independent",
-                run_immediately=False,
                 schedule=IntervalSchedule(3600, STARTED_AT + timedelta(hours=1)),
             )
         )
@@ -845,7 +662,7 @@ async def test_existing_unrelated_routine_can_finish_while_uncertain_routine_sta
         await store.close()
 
 
-async def test_known_nonapplication_never_satisfies_a_required_effect(
+async def test_known_nonapplication_is_receipted_and_left_resolved(
     tmp_path,
 ):
     store, owner, runtime, executor, model, inspection, proposal, supervisor = (
@@ -860,10 +677,6 @@ async def test_known_nonapplication_never_satisfies_a_required_effect(
         receipts = await store.list_effect_receipts("agent-effect")
         assert executor.calls == len(receipts) == 2
         assert {item.outcome for item in receipts} == {EffectOutcome.NOT_APPLIED}
-        assert (
-            inspection.recent_occurrences[0].failure_code
-            == "outcome_effect_requirement_unsatisfied"
-        )
         assert not any(item.unresolved for item in receipts)
     finally:
         await store.close()
@@ -939,65 +752,9 @@ async def test_source_free_effect_free_assignment_uses_the_same_occurrence_path(
             == scope.allowed_connector_binding_ids
             == ()
         )
-        assert scope.capability_grants == inspection.routine.capability_grants == ()
+        assert scope.capability_grants == ()
         assert inspection.recent_occurrences[0].effect_receipt_ids == ()
         assert executor.calls == 0 and len(model.logical_requests) == 1
-    finally:
-        await store.close()
-
-
-async def test_effect_requirement_accepts_supported_alternatives_and_rejects_stronger_proof(
-    tmp_path,
-):
-    from daita.routines.owner import RoutineError
-
-    store, owner, runtime, executor, model, inspection, proposal, supervisor = (
-        await _assignment(tmp_path, defer=True)
-    )
-    try:
-        both = EffectRequirement(
-            "test.action",
-            1,
-            frozenset(
-                {
-                    EffectEvidenceBasis.ADAPTER_VERIFIED,
-                    EffectEvidenceBasis.SERVER_REPORTED,
-                }
-            ),
-        )
-        await owner.proposal_authority_snapshot(
-            replace(
-                proposal,
-                outcome_contract=replace(
-                    proposal.outcome_contract, effect_requirements=(both,)
-                ),
-            )
-        )
-        stronger = replace(
-            both,
-            accepted_evidence_bases=frozenset({EffectEvidenceBasis.ADAPTER_VERIFIED}),
-        )
-        with pytest.raises(RoutineError) as unsupported:
-            await owner.proposal_authority_snapshot(
-                replace(
-                    proposal,
-                    outcome_contract=replace(
-                        proposal.outcome_contract, effect_requirements=(stronger,)
-                    ),
-                )
-            )
-        assert unsupported.value.code == "routine_effect_requirement_unsupported"
-        excessive = replace(both, minimum_successful_calls=2)
-        with pytest.raises(ValueError, match="grants and completion requirements"):
-            await owner.proposal_authority_snapshot(
-                replace(
-                    proposal,
-                    outcome_contract=replace(
-                        proposal.outcome_contract, effect_requirements=(excessive,)
-                    ),
-                )
-            )
-        assert executor.calls == 0
     finally:
         await store.close()
 
@@ -1030,22 +787,15 @@ async def test_immediate_assignment_confirms_creation_then_asks_before_its_effec
         )
         assert executor.calls == 1
         assert inspection.routine.occurrence_count == 1
-        approved = approvals[0].arguments["proposal"]
-        assert isinstance(approved, FrozenJsonObject)
-        assert approved["run_immediately"] is True
-        approved_grants = approved["capability_grants"]
-        assert isinstance(approved_grants, tuple)
-        assert approved_grants[0] == FrozenJsonObject.from_mapping(
-            inspection.routine.capability_grants[0].material()
-        )
+        # The one confirm card says the routine also runs now.
+        assert str(approvals[0].arguments["schedule"]).startswith("Now, then every")
     finally:
         await store.close()
 
 
-@pytest.mark.parametrize("document_minimum", (1, 2))
 @pytest.mark.parametrize("crash_before_terminal", (False, True))
 async def test_failed_assignment_keeps_authenticated_partial_artifacts(
-    tmp_path, document_minimum, crash_before_terminal
+    tmp_path, crash_before_terminal
 ):
     async def recover_missing_terminal(store, run, result):
         import sqlite3
@@ -1069,7 +819,7 @@ async def test_failed_assignment_keeps_authenticated_partial_artifacts(
         await _assignment(
             tmp_path,
             mode="disconnect",
-            document_minimum=document_minimum,
+            document=True,
             after_run=recover_missing_terminal if crash_before_terminal else None,
         )
     )

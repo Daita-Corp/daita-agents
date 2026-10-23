@@ -544,7 +544,6 @@ async def test_skill_view_is_fixed_and_projected_without_sources(tmp_path):
             # The live session folder source answers SQL over local files.
             "data_query",
             "delivery_list",
-            "distribution_destination_list",
             "file_read",
             "file_search",
             "job_list",
@@ -782,7 +781,6 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
             # The live session folder source answers SQL over local files.
             "data_query",
             "delivery_list",
-            "distribution_destination_list",
             "file_read",
             "file_search",
             "job_list",

@@ -26,8 +26,6 @@ from daita.llm.models import (
 )
 from daita.llm.pricing import CostEstimate
 from daita.loop.models import LoopExitKind
-from daita.routines.capabilities import _spec_schema
-from daita.routines.owner import _routine_proposal_payload
 from tests.support.job_benchmarks import RecordingProvider
 from tests.support.mcp_actions import ActionModel, response
 from tests.support.mcp_routine_harness import (
@@ -45,7 +43,7 @@ from tests.support.mcp_routine_harness import (
     limits,
     live_provider,
     model_ids,
-    owner_routine_draft,
+    owner_routine_arguments,
     repeats,
     summarize_reports,
 )
@@ -84,34 +82,8 @@ async def test_contract_comparison_harness_freezes_schema_and_prevents_dispatch(
         action_argument_names=names,
     ) as scenario:
         model.steps = [response(text="Prepare the assignment.")]
-        origin, _ = await scenario.run("Prepare the assignment.")
-        destination = (
-            await scenario.agent.distribution_destinations(
-                origin.conversation_id,
-                sensitivity_ceiling=scenario.binding.maximum_outbound_sensitivity,
-            )
-        )[0]
-        draft = owner_routine_draft(scenario, origin.run_id, destination.destination_id)
-        proposal = await scenario.agent.propose_routine(draft)
-        properties = _spec_schema(update=False)["properties"]
-        assert isinstance(properties, Mapping)
-        arguments = {
-            key: value
-            for key, value in _routine_proposal_payload(proposal).items()
-            if key in properties and value is not None
-        }
-        arguments.update(
-            skill_names=(),
-            distribution_destination_id=destination.destination_id,
-            requested_capability_grants=[
-                {
-                    "capability_id": grant.capability_id,
-                    "constraints": grant.constraints,
-                    "max_calls_per_occurrence": grant.max_calls_per_occurrence,
-                }
-                for grant in proposal.capability_grants
-            ],
-        )
+        await scenario.run("Prepare the assignment.")
+        arguments = owner_routine_arguments(scenario)
         model.steps = [
             response(
                 ToolCall("load", "toolbox_load", {"tool_names": ["routine_save"]})
@@ -165,7 +137,7 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
                 ),
             ),
             replace(
-                response(ToolCall("destination", "distribution_destination_list", {})),
+                response(ToolCall("inventory", "routine_list", {})),
                 usage=ModelUsage(
                     input_tokens=4533,
                     output_tokens=47,
@@ -220,18 +192,14 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
         assert len(texts[0].encode()) < 7200
         assert '"match_outcomes":' in texts[0]
         assert '"kind":"toolbox"' not in texts[0]
-        assert "For scheduled work" not in texts[0]
-        assert "For scheduled work" in texts[1]
-        assert "For scheduled work" not in texts[3]
-        assert "exact argument schema" in texts[1]
+        scheduled = "Scheduled runs ask a person before any write."
+        assert scheduled not in texts[0]
+        assert scheduled in texts[1]
+        assert scheduled not in texts[3]
         assert "Foreground actions request approval when invoked" in texts[3]
         assert "Framework inbox destinations" in texts[3]
         assert "Framework inbox destinations" not in texts[0]
-        assert model.provider_id not in texts[0]
-        assert model.provider_id in texts[1]
-        assert '"maximum_per_run_tokens":100000' in texts[1]
-        assert '"maximum_per_run_cost_usd":"0.50"' in texts[1]
-        assert "Routine authoring choices" not in texts[3]
+        assert model.provider_id not in texts[0] + texts[1]
         assert model.provider_id not in transcript.run.message
         for request in requests:
             assert (
@@ -444,37 +412,9 @@ async def test_scheduled_mcp_harness_confirms_once_then_asks_before_each_action(
         model.steps = [
             response(text="The owner requests one exact immediate and weekly routine.")
         ]
-        origin, _ = await scenario.run(
-            "Prepare the scheduled release-readiness report."
-        )
-        destination = (
-            await scenario.agent.distribution_destinations(
-                origin.conversation_id,
-                sensitivity_ceiling=scenario.binding.maximum_outbound_sensitivity,
-            )
-        )[0]
+        await scenario.run("Prepare the scheduled release-readiness report.")
         assert scenario.limits.max_total_tokens == 100_000
-        draft = owner_routine_draft(scenario, origin.run_id, destination.destination_id)
-        proposal = await scenario.agent.propose_routine(draft)
-        properties = _spec_schema(update=False)["properties"]
-        assert isinstance(properties, Mapping)
-        arguments = {
-            key: value
-            for key, value in _routine_proposal_payload(proposal).items()
-            if key in properties and value is not None
-        }
-        arguments.update(
-            skill_names=(),
-            distribution_destination_id=destination.destination_id,
-            requested_capability_grants=[
-                {
-                    "capability_id": grant.capability_id,
-                    "constraints": grant.constraints,
-                    "max_calls_per_occurrence": grant.max_calls_per_occurrence,
-                }
-                for grant in proposal.capability_grants
-            ],
-        )
+        arguments = owner_routine_arguments(scenario)
         model.steps = [
             response(
                 ToolCall(
@@ -501,15 +441,10 @@ async def test_scheduled_mcp_harness_confirms_once_then_asks_before_each_action(
         details = data["routine"]
         assert isinstance(details, Mapping)
         assert isinstance(details["routine_id"], str)
-        assert details["reserved_occurrences"] == 1
-        assert (
-            "contract_bindings" not in details
-            and "authorized_instruction" not in details
-        )
+        assert "prompt" not in details and "authorized_instruction" not in details
         inspection = await scenario.agent.inspect_routine(details["routine_id"])
-        assert inspection is not None and inspection.routine.capability_grants
-        assert inspection.routine.authorized_instruction == draft.authorized_instruction
-        assert inspection.routine.contract_bindings.capability_contracts
+        assert inspection is not None
+        assert inspection.routine.authorized_instruction == arguments["prompt"]
         if fail_confirmation:
             assert result.kind is LoopExitKind.FAILED
             assert (
@@ -865,7 +800,6 @@ async def test_scheduled_mcp_user_flow_prompts_and_review_remain_separate(
             ):
                 assert internal not in prompt
             assert DESTINATION in prompt
-        assert "100000" in prompts[-1] and "200000" in prompts[-1]
         assert "Monday" in prompts[-1] and "09:00 America/Chicago" in prompts[-1]
         assert "user_flow" in report_path("case").parts
         model.steps = [response(text="The assignment could not be saved.")]

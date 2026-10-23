@@ -10,7 +10,6 @@ from typing import NamedTuple
 import pytest
 
 from daita import connect
-from daita.distribution.models import outcome_contract_projection
 from daita.host import service
 from daita.host.paths import host_paths
 from daita.host.settings import read_setting, write_setting
@@ -19,7 +18,6 @@ from daita.tui.app import DaitaApp
 from daita.tui.screens.confirm import ConfirmScreen
 from daita.tui.widgets.approval import ApprovalPanel
 from tests.support.approval_learning import MockModelProvider, _call
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.host import (
     HostHarness,
     StartHost,
@@ -34,7 +32,6 @@ SIZE = (110, 36)
 
 
 class Destination(NamedTuple):
-    destination_id: str
     conversation_id: str
 
 
@@ -133,14 +130,9 @@ async def _agent(
     try:
         origin = await agent.run("How many invoices are paid?")
         assert origin.conversation_id is not None
-        (destination,) = await agent.distribution_destinations(origin.conversation_id)
     finally:
         await agent.close()
-    return (
-        harness,
-        model,
-        Destination(destination.destination_id, origin.conversation_id),
-    )
+    return harness, model, Destination(origin.conversation_id)
 
 
 def _app(harness: HostHarness) -> DaitaApp:
@@ -164,7 +156,7 @@ async def _save_routine(
 
     model.replace_script(
         (
-            _call(_routine_save(destination.destination_id, model, title)),
+            _call(_routine_save(title)),
             measured("Scheduled."),
         )
     )
@@ -179,41 +171,19 @@ async def _save_routine(
     await bounded(settled_or_approved, timeout=20)
 
 
-def _routine_save(
-    destination_id: str, model: MockModelProvider, title: str
-) -> ToolCall:
+def _routine_save(title: str) -> ToolCall:
     now = datetime.now(UTC)
     return ToolCall(
         id=f"save-{title.split()[0].lower()}",
         name="routine_save",
         arguments={
             "title": title,
-            "authorized_instruction": "Report the paid invoice count.",
+            "prompt": "Report the paid invoice count.",
             "schedule": {
                 "kind": "interval",
                 "interval_seconds": 3600,
                 "anchor_at": (now + timedelta(hours=1)).isoformat(),
             },
-            "misfire_policy": "latest_only",
-            "reporting_mode": "always",
-            "allowed_source_ids": (),
-            "allowed_resource_ids": (),
-            "allowed_connector_binding_ids": (),
-            "allowed_capability_ids": ("artifact.create_document",),
-            "sensitivity_ceiling": "internal",
-            "outcome_contract": outcome_contract_projection(
-                no_artifact_outcome_contract()
-            ),
-            "distribution_destination_id": destination_id,
-            "eligible_model_routes": (model.provider_id,),
-            "per_run_max_tokens": 1000,
-            "cumulative_max_tokens": 10000,
-            "cumulative_max_attempts": 10,
-            "cumulative_max_occurrences": 10,
-            "maximum_consecutive_failures": 3,
-            "expires_at": (now + timedelta(days=30)).isoformat(),
-            "skill_names": (),
-            "run_immediately": False,
         },
     )
 

@@ -11,27 +11,18 @@ from pathlib import Path
 
 import pytest
 
-from daita import (
-    Agent,
-    IntervalSchedule,
-    MisfirePolicy,
-    ReportingMode,
-    ScheduledRoutineDraft,
-    SQLiteSource,
-)
+from daita import Agent, IntervalSchedule, RoutineIntent, SQLiteSource
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
     ModelRequest,
     ModelResponse,
-    ModelSensitivity,
     ModelUsage,
     ToolCall,
     ToolResultBlock,
 )
 from daita.llm.pricing import CostEstimate
 from daita.loop.models import Transcript
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.integration
@@ -120,35 +111,13 @@ async def _routine(agent: Agent, model: _Model) -> tuple[str, str, str]:
     model.steps.append(_stop("Noted."))
     origin = await agent.run("Report the current values every hour.")
     assert origin.conversation_id is not None
-    (destination,) = await agent.distribution_destinations(origin.conversation_id)
     routine = await agent.create_routine(
-        await agent.propose_routine(
-            ScheduledRoutineDraft(
-                origin_run_id=origin.run_id,
-                title="Current values",
-                authorized_instruction="Report the current values.",
-                schedule=IntervalSchedule(3_600, NOW + timedelta(hours=1)),
-                misfire_policy=MisfirePolicy.LATEST_ONLY,
-                reporting_mode=ReportingMode.ALWAYS,
-                precheck=None,
-                allowed_source_ids=(),
-                allowed_connector_binding_ids=(),
-                allowed_resource_ids=(),
-                allowed_capability_ids=("artifact.create_document",),
-                sensitivity_ceiling=ModelSensitivity.INTERNAL,
-                outcome_contract=no_artifact_outcome_contract(),
-                distribution_destination_id=destination.destination_id,
-                eligible_model_routes=(model.provider_id,),
-                per_run_max_tokens=2_000,
-                per_run_max_cost_usd=None,
-                cumulative_max_tokens=20_000,
-                cumulative_max_cost_usd=None,
-                cumulative_max_attempts=10,
-                cumulative_max_occurrences=10,
-                maximum_consecutive_failures=3,
-                expires_at=NOW + timedelta(days=30),
-            )
-        )
+        RoutineIntent(
+            title="Current values",
+            prompt="Report the current values.",
+            schedule=IntervalSchedule(3_600, NOW + timedelta(hours=1)),
+        ),
+        conversation_id=origin.conversation_id,
     )
     return routine.routine_id, origin.conversation_id, origin.run_id
 

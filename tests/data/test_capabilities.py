@@ -42,10 +42,8 @@ from daita.domains.data import (
     relational_update_capability_declarations,
     relational_update_preview_capability_declarations,
     relational_upsert_capability_declarations,
-    resource_revision_observation_declarations,
     source_file_capability_declarations,
 )
-from daita.domains.data.routine_precheck import ResourceRevisionCatalog
 from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import RunInput
 
@@ -298,11 +296,6 @@ def _domain(catalog: _Catalog, *, source_files: bool = False) -> DataCapabilityD
     preview_bundle = relational_update_preview_capability_declarations()
     update_bundle = relational_update_capability_declarations()
     upsert_bundle = relational_upsert_capability_declarations()
-    revision_bundle = resource_revision_observation_declarations(
-        agent_id="agent-relational",
-        catalog=cast(ResourceRevisionCatalog, catalog),
-        clock=lambda: datetime(2026, 9, 3, tzinfo=UTC),
-    )
     file_bundle = source_file_capability_declarations()
     capabilities = (
         *catalog_bundle.capabilities,
@@ -311,7 +304,6 @@ def _domain(catalog: _Catalog, *, source_files: bool = False) -> DataCapabilityD
         *preview_bundle.capabilities,
         *update_bundle.capabilities,
         *upsert_bundle.capabilities,
-        *revision_bundle.capabilities,
         *(file_bundle.capabilities if source_files else ()),
     )
     return DataCapabilityDomain(

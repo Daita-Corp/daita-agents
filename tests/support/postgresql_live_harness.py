@@ -63,7 +63,6 @@ REPORT_ENV = "DAITA_POSTGRES_LIVE_REPORT_DIR"
 PROFILE_ENV = "DAITA_POSTGRES_LIVE_PROFILE"
 NOW = datetime(2026, 9, 13, 12, tzinfo=UTC)
 NEXT_SLOT = datetime(2026, 9, 14, 14, tzinfo=UTC)
-EXPIRES = datetime(2026, 9, 20, 12, tzinfo=UTC)
 FIXTURE_SENSITIVITY = ModelSensitivity.INTERNAL
 LIMITS = replace(LoopLimits(), max_estimated_cost_usd=Decimal("0.15"))
 USER_FLOW_LIMITS = replace(LoopLimits(), max_estimated_cost_usd=Decimal("0.50"))
@@ -257,27 +256,14 @@ class Evaluation:
         self.expected_write = None
         self.deny_write = False
         self.approval_hook: Callable[[], Awaitable[object]] | None = None
+        # The exact confirmation card values a routine save must show.
         self.routine_contract: Mapping[str, object] | None = None
-        self.routine_grant: object | None = None
         self.recovery_digest = None
         self.conversation_id = None
 
     @property
     def agent(self):
         return self.db.agent
-
-    @property
-    def routine_budgets(self):
-        limits = self.config.limits
-        cost = limits.max_estimated_cost_usd
-        return {
-            "per_run_max_tokens": limits.max_total_tokens,
-            "per_run_max_cost_usd": None if cost is None else str(cost),
-            "cumulative_max_tokens": 2 * limits.max_total_tokens,
-            "cumulative_max_cost_usd": None if cost is None else str(2 * cost),
-            "cumulative_max_attempts": 2,
-            "cumulative_max_occurrences": 2,
-        }
 
     async def reopen(self):
         await self.agent.close()
@@ -437,58 +423,10 @@ class Evaluation:
             or request.capability_id != ROUTINE_CREATE_CAPABILITY_ID
         ):
             return False
-        proposal = request.arguments.get("proposal")
-        if not isinstance(proposal, Mapping):
-            return False
-        grants = proposal.get("capability_grants")
-        if (
-            not isinstance(grants, tuple)
-            or len(grants) != 1
-            or not isinstance(grants[0], Mapping)
-        ):
-            return False
-        grant = grants[0]
-        if (
-            grant.get("capability_id") != "data.upsert_rows"
-            or grant.get("max_calls_per_occurrence") != 1
-            or canonical_json(grant.get("constraints"))
-            != canonical_json(self.routine_grant)
-        ):
-            return False
-        for key, value in self.routine_contract.items():
-            actual = proposal.get(key)
-            if key in {"per_run_max_cost_usd", "cumulative_max_cost_usd"}:
-                if value is None:
-                    if actual is not None:
-                        return False
-                    continue
-                if (
-                    not isinstance(actual, str)
-                    or not isinstance(value, str)
-                    or Decimal(actual) != Decimal(value)
-                ):
-                    return False
-                continue
-            if key == "allowed_capability_ids" and isinstance(actual, tuple):
-                if not isinstance(value, (list, tuple)):
-                    return False
-                if self.profile == "user_flow":
-                    # A user allowing this table does not prescribe the tool
-                    # sequence. Permit ordinary reads of that exact frozen
-                    # source/resource alongside the same single native grant.
-                    required = set(value)
-                    allowed = required | {
-                        "catalog.search",
-                        "catalog.describe",
-                        "data.query",
-                    }
-                    if not required <= set(actual) <= allowed:
-                        return False
-                    continue
-                actual = sorted(actual)
-            if canonical_json(actual) != canonical_json(value):
-                return False
-        return True
+        return all(
+            canonical_json(request.arguments.get(key)) == canonical_json(value)
+            for key, value in self.routine_contract.items()
+        )
 
     async def approve(self, request):
         # At most one approved write/routine per foreground run; repeats get a

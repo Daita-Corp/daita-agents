@@ -9,7 +9,6 @@ from tests.support.mcp_actions import (
 import asyncio
 import json
 import sqlite3
-from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -475,94 +474,6 @@ async def test_exact_inspection_rechecks_revocation_without_remote_io(action):
     assert action.server.calls == action.approvals == []
 
 
-@pytest.mark.parametrize("extra_confirmation", [False, True])
-async def test_grant_correction_details_reach_next_real_request_before_any_approval(
-    action, extra_confirmation
-):
-    from daita.routines.capabilities import _spec_schema
-    from daita.routines.owner import _routine_proposal_payload
-
-    proposal = await action.agent.propose_routine(
-        replace(await action.draft(), run_immediately=False)
-    )
-    properties = _spec_schema(update=False)["properties"]
-    assert isinstance(properties, Mapping)
-    arguments = {
-        key: value
-        for key, value in _routine_proposal_payload(proposal).items()
-        if key in properties and value is not None
-    }
-    grant = proposal.capability_grants[0]
-    arguments.update(
-        skill_names=(),
-        distribution_destination_id=proposal.distribution_plan.targets[
-            0
-        ].destination_id,
-        requested_capability_grants=[
-            {
-                "capability_id": grant.capability_id,
-                "constraints": grant.constraints,
-                "max_calls_per_occurrence": grant.max_calls_per_occurrence,
-            }
-        ],
-    )
-    invalid = json.loads(canonical_json(arguments))
-    constraints = invalid["requested_capability_grants"][0]["constraints"]
-    if extra_confirmation:
-        constraints["fixed_arguments"]["require_confirmation"] = True
-    else:
-        constraints["fixed_arguments"] = {"room": "fixed-room"}
-        constraints["variable_argument_names"] = ["message"]
-    before = len(action.model.requests)
-    action.model.steps = [
-        response(
-            ToolCall(
-                "action-schema",
-                "toolbox_load",
-                {"tool_names": [action.tool.local_name]},
-            )
-        ),
-        response(
-            ToolCall("routine-schema", "toolbox_load", {"tool_names": ["routine_save"]})
-        ),
-        response(ToolCall("invalid-grant", "routine_save", invalid)),
-        response(ToolCall("correct-grant", "routine_save", arguments)),
-        response(text="Assignment saved; no notification was sent."),
-    ]
-    approvals_before_correction = []
-    original_generate = action.model.generate
-
-    async def generate(request):
-        if len(action.model.requests) == before + 3:
-            approvals_before_correction.extend(action.approvals)
-            assert await action.agent.list_routines() == ()
-        return await original_generate(request)
-
-    action.model.generate = generate
-    result = await action.agent.run(
-        "Save the reviewed assignment for next Monday.",
-        conversation_id=action.origin.conversation_id,
-    )
-    assert result.kind.value == "completed"
-    correction_request = action.model.requests[before + 3]
-    error = next(
-        block
-        for message in correction_request.messages
-        for block in message.content
-        if isinstance(block, ToolResultBlock) and block.call_id == "invalid-grant"
-    )
-    error_payload = json.loads(canonical_json(error.output))
-    assert error_payload["error"]["code"] == "mcp_grant_constraints_invalid"
-    assert error_payload["error"]["details"]["unknown_argument_names"] == (
-        ["require_confirmation"] if extra_confirmation else ["message", "room"]
-    )
-    assert approvals_before_correction == []
-    assert len(action.approvals) == 1
-    assert len(await action.agent.list_routines()) == 1
-    assert action.server.calls == []
-    assert await action.receipts() == ()
-
-
 async def test_grant_diagnostic_names_are_bounded_and_omission_is_explicit(action):
     from daita.domains.mcp import MCPCapabilityDomain
 
@@ -650,31 +561,19 @@ async def test_possible_dispatch_failures_are_uncertain_and_never_replayed(
 
 @pytest.mark.acceptance
 async def test_immediate_and_recurring_mcp_assignment_asks_before_each_action(action):
-    proposal = await action.agent.propose_routine(await action.draft())
-    from daita.routines.capabilities import _spec_schema
-    from daita.routines.owner import _routine_proposal_payload
-
-    properties = _spec_schema(update=False)["properties"]
-    assert isinstance(properties, Mapping)
+    intent = await action.draft()
     arguments = {
-        key: value
-        for key, value in _routine_proposal_payload(proposal).items()
-        if key in properties and value is not None
+        "title": intent.title,
+        "prompt": intent.prompt,
+        "schedule": {
+            "kind": "calendar",
+            "timezone": "America/Chicago",
+            "hour": 9,
+            "minute": 0,
+            "weekdays": [1],
+        },
+        "run_immediately": True,
     }
-    arguments.update(
-        skill_names=(),
-        distribution_destination_id=proposal.distribution_plan.targets[
-            0
-        ].destination_id,
-        requested_capability_grants=tuple(
-            {
-                "capability_id": grant.capability_id,
-                "constraints": grant.constraints,
-                "max_calls_per_occurrence": grant.max_calls_per_occurrence,
-            }
-            for grant in proposal.capability_grants
-        ),
-    )
     action.script(research=True)
     action.model.steps = [
         response(
@@ -707,9 +606,10 @@ async def test_immediate_and_recurring_mcp_assignment_asks_before_each_action(ac
         "routines.create",
         action.tool.capability_id,
     ]
-    approval = canonical_json(action.approvals[0].arguments)
-    assert '"fixed_arguments":{"destination":"fixed-room"}' in approval
-    assert '"variable_argument_names":["content"]' in approval
+    card = action.approvals[0].arguments
+    assert card["title"] == intent.title and card["prompt"] == intent.prompt
+    assert card["schedule"].startswith("Now, then calendar on Mon at 09:00")
+    assert card["sources"] == "All current sources"
     action.script(
         [("weekly", {"destination": "fixed-room", "content": "Weekly content"})],
         research=True,
@@ -720,33 +620,29 @@ async def test_immediate_and_recurring_mcp_assignment_asks_before_each_action(ac
     assert weekly.delivery.outcome.conclusion_state is OutcomeState.SUCCEEDED
     assert len(await action.receipts()) == 2
     assert len(action.approvals) == 3
-    assert action.approvals[-1].requester == proposal.title
+    assert action.approvals[-1].requester == intent.title
     assert action.server.calls[-1] == (
         "notify",
         {"destination": "fixed-room", "content": "Weekly content"},
     )
 
 
-@pytest.mark.parametrize(
-    "minimum,no_action,error",
-    [(1, True, False), (0, True, False), (1, False, True), (0, False, True)],
-)
+@pytest.mark.parametrize("no_action,error", [(True, False), (False, True)])
 @pytest.mark.acceptance
-async def test_required_action_and_partial_research_are_reported_honestly(
-    action, minimum, no_action, error
+async def test_skipped_or_failed_action_and_partial_research_are_reported_honestly(
+    action, no_action, error
 ):
-    proposal = await action.agent.propose_routine(await action.draft(minimum=minimum))
+    intent = await action.draft()
     if error:
         action.server.results["notify"] = {
             "content": [{"type": "text", "text": "Partial application error"}],
             "isError": True,
         }
     action.script(research=True, no_action=no_action)
-    routine = await action.agent.create_routine(proposal)
+    routine = await action.create(intent)
     delivery = await action.delivery()
-    expected = (
-        OutcomeState.SUCCEEDED if minimum == 0 and no_action else OutcomeState.FAILED
-    )
+    # No action is a completed run; an uncertain action never reports success.
+    expected = OutcomeState.SUCCEEDED if no_action else OutcomeState.FAILED
     assert delivery.delivery.outcome.conclusion_state is expected
     inspection = await action.agent.inspect_routine(routine.routine_id)
     results = await action.results(inspection.recent_occurrences[0].reserved_run_id)
@@ -755,24 +651,13 @@ async def test_required_action_and_partial_research_are_reported_honestly(
     assert "research.test/report" in canonical_json(research.output)
 
 
-@pytest.mark.acceptance
-async def test_server_reported_action_cannot_promise_adapter_verified_completion(
-    action,
-):
-    with pytest.raises((ValueError, CapabilityInputError, RoutineError)):
-        await action.agent.propose_routine(
-            await action.draft(basis=EffectEvidenceBasis.ADAPTER_VERIFIED)
-        )
-    assert not action.server.calls
-
-
 @pytest.mark.parametrize(
     "invalid", ["fixed_destination", "missing_fixed", "extra_argument", "wrong_type"]
 )
 async def test_scheduled_actions_show_their_exact_arguments_and_denial_sends_nothing(
     action, invalid
 ):
-    proposal = await action.agent.propose_routine(await action.draft())
+    intent = await action.draft()
     arguments: dict[str, object] = {"destination": "fixed-room", "content": "Status"}
     if invalid == "fixed_destination":
         arguments["destination"] = "unapproved-room"
@@ -784,9 +669,10 @@ async def test_scheduled_actions_show_their_exact_arguments_and_denial_sends_not
         arguments["content"] = {"nested": "unapproved"}
     action.script([("invalid", arguments)])
     action.decision = ApprovalDecision.DENY
-    await action.agent.create_routine(proposal)
+    await action.create(intent)
+    # The refused or invalid action is an ordinary result the run completes from.
     delivery = await action.delivery()
-    assert delivery.delivery.outcome.conclusion_state is OutcomeState.FAILED
+    assert delivery.delivery.outcome.conclusion_state is OutcomeState.SUCCEEDED
     assert not action.server.calls and not await action.receipts()
     if invalid in {"fixed_destination", "extra_argument"}:
         # A schema-valid call asks a person, who sees exactly what would be sent.
@@ -814,9 +700,7 @@ async def test_scheduled_actions_show_their_exact_arguments_and_denial_sends_not
 async def test_grant_normalization_rejects_unenforceable_or_wrong_contracts(
     action, invalid
 ):
-    draft = await action.draft()
-    grant = draft.requested_capability_grants[0]
-    constraints = grant.constraints.to_dict()
+    constraints = action.grant_constraints()
     if invalid == "binding":
         constraints["binding_id"] = "another-binding"
     elif invalid == "revision":
@@ -835,35 +719,16 @@ async def test_grant_normalization_rejects_unenforceable_or_wrong_contracts(
         constraints["variable_argument_names"] = ["content", "options"]
     else:
         constraints["fixed_arguments"] = {"destination": 1}
-    draft = replace(
-        draft,
-        requested_capability_grants=(
-            replace(grant, constraints=FrozenJsonObject.from_mapping(constraints)),
-        ),
-    )
     with pytest.raises((ValueError, RuntimeError)):
-        await action.agent.propose_routine(draft)
-    assert not action.server.calls and not await action.agent.list_routines()
+        await action.prepare_grant(constraints)
+    assert not action.server.calls
 
 
 async def test_each_distinct_scheduled_action_asks_and_an_identical_repeat_never_resends(
     action,
 ):
-    draft = await action.draft(ceiling=2, minimum=2)
-    grant = draft.requested_capability_grants[0]
-    constraints = grant.constraints.to_dict()
-    constraints["fixed_arguments"] = {
-        "destination": "fixed-room",
-        "options": {"recipient": "reviewed"},
-    }
-    draft = replace(
-        draft,
-        requested_capability_grants=(
-            replace(grant, constraints=FrozenJsonObject.from_mapping(constraints)),
-        ),
-    )
-    proposal = await action.agent.propose_routine(draft)
-    fixed = constraints["fixed_arguments"]
+    intent = await action.draft()
+    fixed = {"destination": "fixed-room", "options": {"recipient": "reviewed"}}
     action.script(
         [
             ("first", {**fixed, "content": "one"}),
@@ -880,7 +745,7 @@ async def test_each_distinct_scheduled_action_asks_and_an_identical_repeat_never
             ),
         ]
     )
-    routine = await action.agent.create_routine(proposal)
+    routine = await action.create(intent)
     await action.delivery()
     # Approved at the time, so no grant ceiling applies; the repeat of an
     # identical operation is still never dispatched again.
@@ -1058,8 +923,8 @@ async def test_known_completion_semantics_never_enable_unsupported_unattended_ca
         )
         assert capability.execution_admission_policy is not None
         assert not capability.execution_admission_policy.graph_v1_eligible
-        with pytest.raises((ValueError, RuntimeError, RoutineError)):
-            await fixture.agent.propose_routine(await fixture.draft())
+        with pytest.raises(CapabilityInputError):
+            await fixture.prepare_grant(fixture.grant_constraints())
         fixture.script()
         await fixture.agent.run("Invoke only a supported direct-result action.")
         assert len(fixture.server.calls) == (1 if known == "remote_optional" else 0)
@@ -1316,11 +1181,10 @@ async def test_guided_ui_explicit_action_permissions_reach_public_admission(
 async def test_disconnect_blocks_restart_future_slots_controls_revision_clones_until_exact_recovery(
     action, decision
 ):
-    draft = await action.draft()
-    proposal = await action.agent.propose_routine(draft)
+    intent = await action.draft()
     action.transport.mode = "disconnect"
     action.script(research=True)
-    routine = await action.agent.create_routine(proposal)
+    routine = await action.create(intent)
     delivery = await action.delivery()
     assert delivery.delivery.outcome.conclusion_state is OutcomeState.FAILED
     receipt = (await action.receipts())[0]
@@ -1335,19 +1199,6 @@ async def test_disconnect_blocks_restart_future_slots_controls_revision_clones_u
     for control in (action.agent.resume_routine, action.agent.run_routine_now):
         with pytest.raises((ValueError, RuntimeError, RoutineError)):
             await control(routine.routine_id, expected_revision=revision)
-    with pytest.raises((ValueError, RuntimeError, RoutineError)):
-        await action.agent.update_routine(
-            routine.routine_id,
-            expected_revision=revision,
-            draft=replace(
-                draft,
-                run_immediately=False,
-                authorized_instruction="Send different content to fixed-room.",
-            ),
-        )
-    with pytest.raises((ValueError, RuntimeError, RoutineError)):
-        clone = await action.agent.propose_routine(replace(draft, title="Clone"))
-        await action.agent.create_routine(clone)
     action.script([("changed-run", {"destination": "changed-room", "content": "new"})])
     await action.agent.run("Send a changed notification now.")
     assert [name for name, _ in action.server.calls].count("notify") == 1
@@ -1431,107 +1282,21 @@ def test_action_admission_is_explicit_and_independent_of_data_access():
         replace(read, access_mode=AccessMode.WRITE)
 
 
-async def _routine_save_arguments(action, fixed_arguments):
-    from daita.routines.capabilities import _spec_schema
-    from daita.routines.owner import _routine_proposal_payload
-
-    proposal = await action.agent.propose_routine(
-        replace(await action.draft(), run_immediately=False)
-    )
-    properties = _spec_schema(update=False)["properties"]
-    assert isinstance(properties, Mapping)
-    arguments = {
-        key: value
-        for key, value in _routine_proposal_payload(proposal).items()
-        if key in properties
-        and value is not None
-        and key not in {"allowed_connector_binding_ids", "run_immediately"}
-    }
-    # Author only what the request decides: the connector tool's own arguments.
-    arguments.update(
-        skill_names=(),
-        requested_capability_grants=[
-            {
-                "capability_id": action.tool.capability_id,
-                "constraints": {
-                    "fixed_arguments": fixed_arguments,
-                    "variable_argument_names": ["content"],
-                },
-                "max_calls_per_occurrence": 1,
-            }
-        ],
-    )
-    return proposal, arguments
-
-
-async def test_routine_save_derives_grant_identity_connector_scope_and_inbox(action):
-    from daita.tui.projection import approval_summary
-
-    proposal, arguments = await _routine_save_arguments(
-        action, {"destination": "fixed-room"}
-    )
-    action.model.steps = [
-        response(ToolCall("load", "toolbox_load", {"tool_names": ["routine_save"]})),
-        response(ToolCall("save", "routine_save", arguments)),
-        response(text="Saved; no notification was sent."),
-    ]
-    result = await action.agent.run(
-        "Save the reviewed assignment.", conversation_id=action.origin.conversation_id
-    )
-    assert result.kind.value == "completed"
-    (summary,) = await action.agent.list_routines()
-    inspection = await action.agent.inspect_routine(summary.routine_id)
-    assert inspection is not None
-    routine = inspection.routine
-    assert routine.allowed_connector_binding_ids == (action.binding.binding_id,)
-    assert routine.distribution_plan == proposal.distribution_plan
-    (grant,) = routine.capability_grants
-    assert grant.constraints == proposal.capability_grants[0].constraints
-    assert grant.constraints["binding_revision"] == action.binding.revision
-    assert grant.constraints["remote_tool_name"] == "notify"
-
-    (review,) = action.approvals
-    text = approval_summary(
-        json.dumps(review.arguments.to_dict(), default=list), "routines.create"
-    )
-    destination = proposal.distribution_plan.targets[0].destination_id
-    connector_line = next(
-        line for line in text.splitlines() if line.startswith("Connector tool")
-    )
-    delivery_line = next(
-        line for line in text.splitlines() if line.startswith("Report delivery")
-    )
-    assert '{"destination": "fixed-room"}' in connector_line
-    assert action.binding.binding_id in connector_line
-    assert destination not in connector_line
-    assert destination in delivery_line and "fixed-room" not in delivery_line
-    assert action.server.calls == []
-
-
 async def test_inbox_destination_is_rejected_as_a_connector_argument(action):
-    proposal, arguments = await _routine_save_arguments(action, {})
-    destination = proposal.distribution_plan.targets[0].destination_id
-    arguments["requested_capability_grants"][0]["constraints"]["fixed_arguments"] = {
-        "destination": destination
+    from daita.distribution import conversation_inbox_destination_id
+
+    constraints = action.grant_constraints()
+    constraints["fixed_arguments"] = {
+        "destination": conversation_inbox_destination_id("conversation-1")
     }
-    action.model.steps = [
-        response(ToolCall("load", "toolbox_load", {"tool_names": ["routine_save"]})),
-        response(ToolCall("save", "routine_save", arguments)),
-        response(text="Stopped to correct the grant."),
-    ]
-    result = await action.agent.run(
-        "Save the reviewed assignment.", conversation_id=action.origin.conversation_id
-    )
-    saved = next(
-        item for item in await action.results(result.run_id) if item.call_id == "save"
-    )
-    error = json.loads(canonical_json(saved.output))["error"]
-    assert error["code"] == "mcp_grant_delivery_destination_argument"
-    assert error["details"]["argument_names"] == ["destination"]
-    assert error["details"]["recovery"]["kind"] == "correct_arguments"
-    assert "distribution_destination_id" in error["details"]["recovery"]["constraint"]
+    with pytest.raises(CapabilityInputError) as failure:
+        await action.prepare_grant(constraints)
+    assert failure.value.code == "mcp_grant_delivery_destination_argument"
+    details = json.loads(canonical_json(failure.value.details))
+    assert details["argument_names"] == ["destination"]
+    assert details["recovery"]["kind"] == "correct_arguments"
+    assert "conversation's Inbox" in details["recovery"]["constraint"]
     assert action.approvals == []
-    assert await action.agent.list_routines() == ()
     assert action.server.calls == []
 
 
@@ -1556,20 +1321,11 @@ async def test_fixed_grant_values_are_checked_against_the_connector_schema(actio
 
 
 async def test_supplied_grant_identity_must_still_match_the_capability(action):
-    draft = await action.draft()
-    (requested,) = draft.requested_capability_grants
-    stale = replace(
-        requested,
-        constraints=FrozenJsonObject.from_mapping(
-            {
-                **requested.constraints.to_dict(),
-                "binding_revision": action.binding.revision + 1,
-            }
-        ),
-    )
+    stale = {
+        **action.grant_constraints(),
+        "binding_revision": action.binding.revision + 1,
+    }
     with pytest.raises(CapabilityInputError) as failure:
-        await action.agent.propose_routine(
-            replace(draft, requested_capability_grants=(stale,))
-        )
+        await action.prepare_grant(stale)
     assert failure.value.code == "mcp_grant_constraints_invalid"
     assert failure.value.details["identity_fields"] == ("binding_revision",)

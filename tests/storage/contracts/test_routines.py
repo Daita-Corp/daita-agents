@@ -13,10 +13,12 @@ from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
     ModelSensitivity,
+    ModelUsage,
     TextBlock,
     ToolCall,
     ToolResultBlock,
 )
+from daita.llm.pricing import CostEstimate
 from daita.loop.models import (
     InstructionAuthority,
     LoopExit,
@@ -26,6 +28,7 @@ from daita.loop.models import (
     RunStartEnvelope,
 )
 from daita.routines.models import (
+    OnceSchedule,
     RoutineOccurrenceDisposition,
     RoutineState,
 )
@@ -40,9 +43,6 @@ pytestmark = [pytest.mark.integration, pytest.mark.contract]
     [
         {"principal_id": "different-principal"},
         {"grant_id": "unapproved-grant"},
-        {"sensitivity_ceiling": ModelSensitivity.RESTRICTED},
-        {"per_run_max_tokens": 6000},
-        {"per_run_max_cost_usd": Decimal("0.10")},
         {"distribution_plan_digest": "sha256:" + "e" * 64},
     ],
 )
@@ -76,7 +76,7 @@ async def test_run_binding_rejects_every_changed_authority_field(
     assert current == claimed
 
 
-async def test_duplicate_ticks_reserve_one_occurrence_and_one_budget(
+async def test_duplicate_ticks_reserve_one_occurrence(
     state_store: StateStore,
 ) -> None:
     store = state_store
@@ -107,8 +107,6 @@ async def test_duplicate_ticks_reserve_one_occurrence_and_one_budget(
     assert persisted is not None
     assert persisted.occurrence_count == 1
     assert persisted.attempt_count == 1
-    assert persisted.reserved_tokens == persisted.per_run_max_tokens
-    assert persisted.reserved_cost_usd == persisted.per_run_max_cost_usd
 
 
 async def test_pre_run_failure_below_threshold_advances_with_one_delivery(
@@ -216,7 +214,7 @@ async def test_pre_run_failure_threshold_delivers_one_no_run_escalation(
 ) -> None:
     store = state_store
     routine = await store.admit_scheduled_routine(
-        routine_record(maximum_consecutive_failures=1)
+        routine_record(schedule=OnceSchedule(NOW))
     )
     claimed = await store.claim_due_routine_occurrence(
         routine.agent_id,
@@ -263,6 +261,131 @@ async def test_pre_run_failure_threshold_delivers_one_no_run_escalation(
     assert persisted.active_occurrence_id is None
     assert persisted.next_due_at is None
     assert persisted.last_delivery_ids == (delivery.delivery_id,)
+
+
+async def test_three_consecutive_failures_pause_a_recurring_routine(
+    state_store: StateStore,
+) -> None:
+    store = state_store
+    routine = await store.admit_scheduled_routine(routine_record())
+    due = NOW
+    for failures in (1, 2, 3):
+        claimed = await store.claim_due_routine_occurrence(
+            routine.agent_id,
+            routine.routine_id,
+            expected_revision=routine.revision,
+            expected_due_at=due,
+            claimed_at=due,
+            claim_token=f"claim-failure-{failures}",
+        )
+        assert claimed is not None
+        finalized = await store.finalize_routine_occurrence(
+            routine.agent_id,
+            claimed.occurrence_id,
+            delivery_id=f"delivery-failure-{failures}",
+            finalized_at=due + timedelta(seconds=1),
+            failure_code="routine_test_failure",
+        )
+        assert finalized is not None and finalized[1] is not None
+        persisted = await store.load_scheduled_routine(
+            routine.agent_id, routine.routine_id
+        )
+        assert persisted is not None
+        assert persisted.consecutive_failures == failures
+        if failures < 3:
+            # Fewer failures keep it running at its next slot.
+            assert persisted.state is RoutineState.ACTIVE
+            assert persisted.next_due_at == due + timedelta(hours=1)
+            due = persisted.next_due_at
+        else:
+            assert persisted.state is RoutineState.NEEDS_ATTENTION
+            assert persisted.next_due_at is None
+            assert finalized[1].outcome.conclusion_state is OutcomeState.FAILED
+    assert len(await store.list_deliveries(routine.agent_id)) == 3
+
+
+async def test_successful_one_time_routine_completes(state_store: StateStore) -> None:
+    store = state_store
+    routine = await store.admit_scheduled_routine(
+        routine_record(schedule=OnceSchedule(NOW))
+    )
+    claimed = await store.claim_due_routine_occurrence(
+        routine.agent_id,
+        routine.routine_id,
+        expected_revision=routine.revision,
+        expected_due_at=NOW,
+        claimed_at=NOW,
+        claim_token="claim-once",
+    )
+    assert claimed is not None
+    run = await _bound_run(store, claimed, "run-routine-once")
+    result = LoopExit(
+        run_id=run.id,
+        conversation_id=routine.conversation_id,
+        kind=LoopExitKind.COMPLETED,
+        reason="completed",
+        created_at=NOW + timedelta(seconds=2),
+        final_text="Data quality matters.",
+        steps=1,
+        usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
+    )
+    await store.complete(
+        result,
+        CanonicalMessage(
+            role=MessageRole.ASSISTANT, content=(TextBlock("Data quality matters."),)
+        ),
+    )
+    assert await store.mark_routine_occurrence_run_terminal(
+        routine.agent_id, claimed.occurrence_id, run_id=run.id, terminal_at=NOW
+    )
+    finalized = await store.finalize_routine_occurrence(
+        routine.agent_id,
+        claimed.occurrence_id,
+        delivery_id="delivery-once",
+        finalized_at=NOW + timedelta(seconds=3),
+    )
+    assert finalized is not None and finalized[1] is not None
+    assert finalized[1].outcome.conclusion_state is OutcomeState.SUCCEEDED
+    persisted = await store.load_scheduled_routine(routine.agent_id, routine.routine_id)
+    assert persisted is not None
+    assert persisted.state is RoutineState.COMPLETED
+    assert persisted.next_due_at is None
+    assert await store.next_routine_deadline(routine.agent_id) is None
+
+
+async def _bound_run(store: StateStore, claimed, run_id: str) -> RunInput:
+    scope = execution_scope(claimed)
+    bound = await store.bind_routine_occurrence_run(
+        claimed.agent_id,
+        claimed.occurrence_id,
+        claim_token=claimed.claim_token,
+        run_id=run_id,
+        execution_scope=scope,
+        bound_at=NOW + timedelta(seconds=1),
+    )
+    assert bound is not None
+    instruction = "Read the exact admitted resource and report its current value."
+    run = RunInput(
+        id=run_id,
+        agent_id=claimed.agent_id,
+        message=instruction,
+        created_at=NOW + timedelta(seconds=1),
+        conversation_id="conversation-1",
+        source_scope_ids=("source-1",),
+        start=RunStartEnvelope(
+            origin=RunOrigin.SCHEDULED_ROUTINE,
+            instruction_authority=InstructionAuthority.FOREGROUND_AUTHORIZED,
+            trusted_instruction_id="routine:routine-1:revision:1",
+            trusted_instruction=instruction,
+            instruction_digest="sha256:" + sha256(instruction.encode()).hexdigest(),
+            untrusted_payload={},
+            payload_digest="sha256:" + sha256(b"{}").hexdigest(),
+            execution_scope=scope,
+        ),
+    )
+    await store.start(run)
+    await store.append(run.id, run.start_message())
+    return run
 
 
 async def test_manual_control_identity_is_stable_and_cannot_overlap(
@@ -334,7 +457,7 @@ async def test_stale_claim_recovery_fences_the_old_token(
     )
 
 
-async def test_terminal_result_sensitivity_escalation_fails_and_blocks_delivery(
+async def test_terminal_result_sensitivity_reaches_the_inbox_without_a_ceiling(
     state_store: StateStore,
 ) -> None:
     store = state_store
@@ -408,6 +531,7 @@ async def test_terminal_result_sensitivity_escalation_fails_and_blocks_delivery(
         created_at=NOW + timedelta(seconds=2),
         final_text="The sensitive current value is 42.",
         steps=2,
+        usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
     )
     await store.complete(
         result,
@@ -432,14 +556,14 @@ async def test_terminal_result_sensitivity_escalation_fails_and_blocks_delivery(
     assert finalized is not None
     occurrence, delivery = finalized
     assert delivery is not None
-    assert occurrence.disposition is RoutineOccurrenceDisposition.TERMINAL_FAILED
-    assert occurrence.failure_code == "outcome_sensitivity_contract_failed"
-    assert delivery.outcome.conclusion_state is OutcomeState.FAILED
-    assert delivery.outcome.failure_code == "outcome_sensitivity_contract_failed"
+    # A routine has no sensitivity ceiling: the result keeps its own
+    # classification and the conversation's Inbox shows it.
+    assert occurrence.disposition is RoutineOccurrenceDisposition.COMPLETED
+    assert delivery.outcome.conclusion_state is OutcomeState.SUCCEEDED
     assert delivery.outcome.effective_sensitivity is ModelSensitivity.CONFIDENTIAL
-    assert delivery.outcome.conclusion_preview == ""
-    assert delivery.visibility_state is DeliveryState.BLOCKED
-    assert delivery.blocked_reason_code == "sensitivity_exceeds_destination"
+    assert delivery.outcome.conclusion_preview == "The sensitive current value is 42."
+    assert delivery.visibility_state is DeliveryState.AVAILABLE
+    assert delivery.blocked_reason_code is None
 
 
 async def test_terminal_failure_at_threshold_uses_its_one_conclusion_as_escalation(
@@ -447,7 +571,7 @@ async def test_terminal_failure_at_threshold_uses_its_one_conclusion_as_escalati
 ) -> None:
     store = state_store
     routine = await store.admit_scheduled_routine(
-        routine_record(maximum_consecutive_failures=1)
+        routine_record(schedule=OnceSchedule(NOW))
     )
     claimed = await store.claim_due_routine_occurrence(
         routine.agent_id,

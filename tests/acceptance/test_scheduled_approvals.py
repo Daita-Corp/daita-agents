@@ -14,10 +14,8 @@ import pytest
 from daita import (
     Agent,
     IntervalSchedule,
-    MisfirePolicy,
     OnceSchedule,
-    ReportingMode,
-    ScheduledRoutineDraft,
+    RoutineIntent,
     WorkColumn,
     WorkKind,
     connect,
@@ -27,14 +25,12 @@ from daita.distribution import OutcomeState
 from daita.llm.models import (
     ModelRequest,
     ModelResponse,
-    ModelSensitivity,
     ModelUsage,
     ToolCall,
     ToolResultBlock,
 )
 from daita.llm.pricing import CostEstimate
 from daita.routines.models import RoutineSchedule
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.host import (
     StartHost,
     bounded,
@@ -132,43 +128,11 @@ def _write_script(batch: Mapping[str, object]) -> list[Step]:
     return [_measured(step) for step in steps]
 
 
-def _draft(
-    origin_run_id: str,
-    destination_id: str,
-    source_id: str,
-    resource_id: str,
-    route: str,
-    schedule: RoutineSchedule,
-    expires_at: datetime,
-) -> ScheduledRoutineDraft:
-    """A read-only routine: no write capability and no grant is authored."""
+def _intent(source_id: str, schedule: RoutineSchedule) -> RoutineIntent:
+    """A routine is a title, a prompt and a schedule: no grant is authored."""
 
-    return ScheduledRoutineDraft(
-        origin_run_id=origin_run_id,
-        title=TITLE,
-        authorized_instruction=INSTRUCTION,
-        schedule=schedule,
-        misfire_policy=MisfirePolicy.LATEST_ONLY,
-        reporting_mode=ReportingMode.ALWAYS,
-        precheck=None,
-        allowed_source_ids=(source_id,),
-        allowed_connector_binding_ids=(),
-        allowed_resource_ids=(resource_id,),
-        allowed_capability_ids=("catalog.describe",),
-        sensitivity_ceiling=ModelSensitivity.RESTRICTED,
-        outcome_contract=no_artifact_outcome_contract(
-            sensitivity=ModelSensitivity.RESTRICTED
-        ),
-        distribution_destination_id=destination_id,
-        eligible_model_routes=(route,),
-        per_run_max_tokens=2_000,
-        per_run_max_cost_usd=None,
-        cumulative_max_tokens=20_000,
-        cumulative_max_cost_usd=None,
-        cumulative_max_attempts=10,
-        cumulative_max_occurrences=10,
-        maximum_consecutive_failures=3,
-        expires_at=expires_at,
+    return RoutineIntent(
+        title=TITLE, prompt=INSTRUCTION, schedule=schedule, sources=(source_id,)
     )
 
 
@@ -186,7 +150,7 @@ async def _scheduled_write(
     """A host whose agent's routine fires in seconds while nobody watches."""
 
     root = short_root()
-    agent, provider, db, _alpha, _binding, resource, _scope, batch, _clock, _ok = (
+    agent, provider, db, _alpha, _binding, _resource, _scope, batch, _clock, _ok = (
         await create_fixture(root, monkeypatch)
     )
     await agent.close()
@@ -199,23 +163,14 @@ async def _scheduled_write(
         provider.replace_script([_measured(response(text="Noted."))])
         origin = await remote.run("Keep today's totals in the companies table.")
         assert origin.conversation_id is not None
-        (destination,) = await remote.distribution_destinations(origin.conversation_id)
         provider.replace_script(_write_script(batch))
-        now = datetime.now(UTC)
         routine = await remote.create_routine(
-            await remote.propose_routine(
-                _draft(
-                    origin.run_id,
-                    destination.destination_id,
-                    str(batch["source_id"]),
-                    resource.id,
-                    provider.provider_id,
-                    OnceSchedule(now + timedelta(seconds=2)),
-                    now + timedelta(days=30),
-                )
-            )
+            _intent(
+                str(batch["source_id"]),
+                OnceSchedule(datetime.now(UTC) + timedelta(seconds=2)),
+            ),
+            conversation_id=origin.conversation_id,
         )
-        assert routine.capability_grants == ()
     finally:
         # Nobody watches from here on, so the question also notifies.
         await remote.close()
@@ -285,8 +240,6 @@ async def test_a_scheduled_write_asks_notifies_and_commits_once_after_approval(
         assert receipt.routine_id == routine_id
         assert receipt.capability_grant_digest is None
         assert outcome.effect_receipt_ids == (receipt.receipt_id,)
-        inspection = await remote.inspect_routine(routine_id)
-        assert inspection is not None and inspection.routine.capability_grants == ()
         assert not provider.steps
     finally:
         await remote.close()
@@ -340,9 +293,18 @@ async def test_an_unanswered_scheduled_write_expires_into_needs_you(
 async def test_library_mode_without_an_approval_handler_refuses_a_scheduled_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    agent, provider, db, _alpha, _binding, resource, _scope, batch, clock, approvals = (
-        await create_fixture(tmp_path, monkeypatch)
-    )
+    (
+        agent,
+        provider,
+        db,
+        _alpha,
+        _binding,
+        _resource,
+        _scope,
+        batch,
+        clock,
+        approvals,
+    ) = await create_fixture(tmp_path, monkeypatch)
     await agent.close()
     agent = await Agent.open(
         NAME,
@@ -356,20 +318,13 @@ async def test_library_mode_without_an_approval_handler_refuses_a_scheduled_writ
         provider.replace_script([_measured(response(text="Noted."))])
         origin = await agent.run("Keep today's totals in the companies table.")
         assert origin.conversation_id is not None
-        (destination,) = await agent.distribution_destinations(origin.conversation_id)
         provider.replace_script(_write_script(batch))
         routine = await agent.create_routine(
-            await agent.propose_routine(
-                _draft(
-                    origin.run_id,
-                    destination.destination_id,
-                    str(batch["source_id"]),
-                    resource.id,
-                    provider.provider_id,
-                    IntervalSchedule(3_600, NOW + timedelta(hours=1)),
-                    NOW + timedelta(days=30),
-                )
-            )
+            _intent(
+                str(batch["source_id"]),
+                IntervalSchedule(3_600, NOW + timedelta(hours=1)),
+            ),
+            conversation_id=origin.conversation_id,
         )
         await agent.run_routine_now(
             routine.routine_id, expected_revision=routine.revision

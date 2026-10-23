@@ -31,14 +31,11 @@ from daita._json import FrozenJsonObject
 from daita.distribution import (
     DeliveryInspection,
     DeliverySubjectKind,
-    DistributionDestination,
-    DistributionDestinationState,
     OutcomeConclusionKind,
     OutcomeState,
     delivery_inspection_projection,
     delivery_view,
     delivery_view_projection,
-    distribution_destination_projection,
 )
 from daita.distribution.owner import construct_logical_delivery
 from daita.llm.models import (
@@ -1088,13 +1085,11 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "list",
         "inspect",
         "create",
-        "promote",
         "update",
         "pause",
         "resume",
         "run-now",
         "disable",
-        "destinations",
     }
     assert _surface(routines["list"]) == (
         ("name",),
@@ -1104,9 +1099,35 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         ("name", "routine_id"),
         frozenset({"-h", "--help"}),
     )
-    assert _surface(routines["destinations"]) == (
-        ("name", "conversation_id"),
-        frozenset({"-h", "--help", "--sensitivity-ceiling"}),
+    assert _surface(routines["create"]) == (
+        ("name",),
+        frozenset(
+            {
+                "-h",
+                "--help",
+                "--title",
+                "--prompt",
+                "--schedule",
+                "--source",
+                "--spec",
+                "--run-immediately",
+            }
+        ),
+    )
+    assert _surface(routines["update"]) == (
+        ("name", "routine_id"),
+        frozenset(
+            {
+                "-h",
+                "--help",
+                "--expected-revision",
+                "--title",
+                "--prompt",
+                "--schedule",
+                "--source",
+                "--spec",
+            }
+        ),
     )
     work = _subcommands(commands["work"])
     assert set(work) == {"show", "inspect", "dismiss"}
@@ -2021,40 +2042,102 @@ def test_work_inspect_and_dismiss_report_an_unknown_delivery(
     fake.close.assert_awaited_once()
 
 
-def test_routines_destinations_lists_one_conversation_destination(
-    tmp_path: Path,
-) -> None:
-    destination = DistributionDestination(
-        destination_id="conversation_inbox:conversation-1",
-        kind="conversation_inbox",
-        label="Conversation Inbox",
-        state=DistributionDestinationState.AVAILABLE,
-        revision=1,
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
-        supported_outcome_media=("text/csv",),
-        selectable=True,
-    )
-    fake = SimpleNamespace(
-        distribution_destinations=AsyncMock(return_value=(destination,)),
-        close=AsyncMock(),
-    )
-    args = cli.build_parser().parse_args(
-        [
-            "--no-host",
-            "--root",
-            str(tmp_path),
-            "routines",
-            "destinations",
-            "atlas",
-            "conversation-1",
-            "--sensitivity-ceiling",
-            "internal",
-        ]
-    )
-    with patch.object(Agent, "open", new=AsyncMock(return_value=fake)):
-        result = asyncio.run(cli._execute(args))
-    assert result == [distribution_destination_projection(destination)]
-    fake.distribution_destinations.assert_awaited_once_with(
-        "conversation-1", sensitivity_ceiling=ModelSensitivity.INTERNAL
-    )
-    fake.close.assert_awaited_once()
+async def _attach_folder(root: Path, name: str) -> str:
+    folder = root.parent / "drop"
+    folder.mkdir()
+    (folder / "orders.csv").write_text("region,amount\nnorth,10\n", encoding="utf-8")
+    agent = await Agent.open(name, root=root, workspace=workspace_for(root))
+    try:
+        return (await agent.attach(FolderSource(folder, name="Drop folder"))).id
+    finally:
+        await agent.close()
+
+
+def _routine_result(stdout: str) -> dict[str, Any]:
+    """The review and its prompt print first; the record ends the last line."""
+
+    last = stdout.strip().splitlines()[-1]
+    return json.loads(last[last.index("{") :])
+
+
+def test_cli_routines_create_and_update_round_trip_one_routine_intent() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve() / "state"
+        asyncio.run(_create_agent(root, "routine-agent"))
+        source_id = asyncio.run(_attach_folder(root, "routine-agent"))
+        base = ["--no-host", "--root", str(root), "routines"]
+        created_code, created_stdout, created_stderr = _invoke(
+            [
+                *base,
+                "create",
+                "routine-agent",
+                "--title",
+                "Hourly orders",
+                "--prompt",
+                "Report the order total.",
+                "--schedule",
+                '{"kind": "interval", "interval_seconds": 3600, '
+                '"anchor_after_seconds": 600}',
+                "--source",
+                "Drop folder",
+            ],
+            stdin="y\n",
+        )
+        spec = root / "routine.json"
+        spec.write_text(
+            json.dumps(
+                {
+                    "title": "Once from a file",
+                    "prompt": "Report the order total once.",
+                    "schedule": {"kind": "once", "after_seconds": 3600},
+                }
+            ),
+            encoding="utf-8",
+        )
+        spec_code, spec_stdout, _ = _invoke(
+            [*base, "create", "routine-agent", "--spec", str(spec)], stdin="y\n"
+        )
+        created = _routine_result(created_stdout)
+        updated_code, updated_stdout, updated_stderr = _invoke(
+            [
+                *base,
+                "update",
+                "routine-agent",
+                str(created["routine_id"]),
+                "--schedule",
+                '{"kind": "calendar", "timezone": "America/Chicago", '
+                '"hour": 9, "minute": 0}',
+            ],
+            stdin="y\n",
+        )
+
+    assert (created_code, created_stderr) == (0, "")
+    # One confirmation shows the title, local-time schedule, prompt and sources.
+    assert created_stdout.count("Approval required") == 1
+    for shown in (
+        "Hourly orders",
+        "Every 1 hour from",
+        "Report the order total.",
+        "Drop folder",
+    ):
+        assert shown in created_stdout
+    assert created["title"] == "Hourly orders"
+    assert created["prompt"] == "Report the order total."
+    assert created["source_ids"] == [source_id]
+    assert created["schedule"]["kind"] == "interval"
+    assert created["revision"] == 1
+
+    assert spec_code == 0
+    from_file = _routine_result(spec_stdout)
+    assert from_file["title"] == "Once from a file"
+    assert from_file["schedule"]["kind"] == "once"
+    assert from_file["source_ids"] == []
+
+    assert (updated_code, updated_stderr) == (0, "")
+    updated = _routine_result(updated_stdout)
+    assert updated["routine_id"] == created["routine_id"]
+    assert updated["revision"] == 2
+    assert updated["schedule"]["kind"] == "calendar"
+    # Fields the update omitted keep their stored values.
+    for kept in ("title", "prompt", "source_ids", "conversation_id"):
+        assert updated[kept] == created[kept]

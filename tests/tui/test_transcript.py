@@ -474,8 +474,10 @@ async def test_chat_accumulates_and_resumes_the_full_conversation_transcript(
 
             scheduled = await app.controller.dispatch_command("/schedule every monday")
             assert scheduled.kind == "run" and scheduled.run_message is not None
-            assert last_run[1] in scheduled.run_message
-            assert "Second question\nSchedule: every monday" in scheduled.run_message
+            assert "'Second question' on this schedule: every monday" in (
+                scheduled.run_message
+            )
+            assert "routine_save" in scheduled.run_message
             prompt = await app.controller.dispatch_command("/schedule")
             assert prompt.screen == "schedule_prompt"
             assert prompt.payload == {"question": "Second question"}

@@ -19,24 +19,21 @@ from daita import (
     AgentEvent,
     AgentEventKind,
     IntervalSchedule,
-    MisfirePolicy,
-    ReportingMode,
-    ScheduledRoutineDraft,
+    RoutineIntent,
 )
 from daita._json import canonical_json
 from daita.adapters.analytical_workspace.native import NativePythonWorker
 from daita.adapters.local_workspace import LocalWorkspaceBackend
 from daita.adapters.models import SourceRegistration
 from daita.adapters.sqlite_query import SQLiteQueryBackend
-from daita.artifacts.models import ArtifactAuthorship, ArtifactError
+from daita.artifacts.models import ArtifactError
 from daita.config import AgentConfig, AnalysisLimits
-from daita.distribution import ArtifactRequirement, OutcomeState
-from daita.llm.models import FinishReason, ModelResponse, ModelSensitivity, ModelUsage
+from daita.distribution import OutcomeState
+from daita.llm.models import FinishReason, ModelResponse, ModelUsage
 from daita.llm.pricing import CostEstimate
 from daita.loop.models import LoopExitKind, LoopLimits, RunOrigin
 from tests.artifacts._public_surface_support import _profile, _tool
 from tests.support.analysis import facts as evidence_facts
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.toolbox_model import ToolboxAwareMockModelProvider
 from tests.support.workspace import workspace_for
 
@@ -208,55 +205,16 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
                 ModelResponse(finish_reason=FinishReason.STOP, text="42", usage=usage),
             )
         )
-        now = datetime.now(UTC)
-        outcome = replace(
-            no_artifact_outcome_contract(),
-            maximum_total_artifact_bytes=4096,
-            artifact_requirements=(
-                ArtifactRequirement(
-                    required=True,
-                    minimum_count=2 if batch else 1,
-                    maximum_count=2 if batch else 1,
-                    allowed_media_types=("application/json", "text/x-python"),
-                    allowed_authorships=(ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,),
-                    allowed_producer_capability_ids=("analysis.execute",),
-                    maximum_artifact_bytes=4096,
-                    maximum_total_bytes=4096,
-                    maximum_sensitivity=ModelSensitivity.INTERNAL,
-                ),
+        # The routine names its one source; its runs never reach the other.
+        stored = await agent.create_routine(
+            RoutineIntent(
+                title="Scoped Python report",
+                prompt="Read only the granted numbers and produce a JSON artifact using Python.",
+                schedule=IntervalSchedule(3600, datetime.now(UTC) + timedelta(hours=1)),
+                sources=(source.id,),
             ),
+            conversation_id=origin.conversation_id,
         )
-        destinations = await agent.distribution_destinations(origin.conversation_id)
-        draft = ScheduledRoutineDraft(
-            origin_run_id=origin.run_id,
-            title="Scoped Python report",
-            authorized_instruction="Read only the granted numbers and produce a JSON artifact using Python.",
-            schedule=IntervalSchedule(3600, now + timedelta(hours=1)),
-            misfire_policy=MisfirePolicy.LATEST_ONLY,
-            reporting_mode=ReportingMode.ALWAYS,
-            precheck=None,
-            allowed_source_ids=(source.id,),
-            allowed_resource_ids=(resource.id,),
-            allowed_connector_binding_ids=(),
-            allowed_capability_ids=(
-                "data.query",
-                "analysis.execute",
-                *(("data.export_tabular",) if captured else ()),
-            ),
-            sensitivity_ceiling=ModelSensitivity.INTERNAL,
-            outcome_contract=outcome,
-            distribution_destination_id=destinations[0].destination_id,
-            eligible_model_routes=(model.provider_id,),
-            per_run_max_tokens=50000,
-            per_run_max_cost_usd=Decimal("0.50"),
-            cumulative_max_tokens=50000,
-            cumulative_max_cost_usd=Decimal("0.50"),
-            cumulative_max_attempts=1,
-            cumulative_max_occurrences=1,
-            maximum_consecutive_failures=1,
-            expires_at=now + timedelta(days=1),
-        )
-        stored = await agent.create_routine(await agent.propose_routine(draft))
         await agent.run_routine_now(
             stored.routine_id, expected_revision=stored.revision
         )

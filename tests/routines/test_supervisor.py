@@ -9,20 +9,13 @@ from typing import cast
 import pytest
 
 import daita.storage.sql_deliveries as delivery_store_module
-from daita._json import FrozenJsonObject
 from daita.artifacts.store import AgentHomeArtifactStore
-from daita.capabilities import AccessMode, OperationalEffect, ToolOutput
-from daita.capability_runtime import (
-    CapabilityRuntime,
-    InternalCapabilityOutcome,
-    InternalCapabilityRequest,
-)
+from daita.capability_runtime import CapabilityRuntime
 from daita.distribution import DistributionOwner, OutcomeState
 from daita.identity import AgentIdentity
 from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
-    ModelSensitivity,
     ModelUsage,
     TextBlock,
 )
@@ -30,10 +23,6 @@ from daita.llm.pricing import CostEstimate
 from daita.loop.models import LoopExit, LoopExitKind, RunInput
 from daita.routines.models import (
     IntervalSchedule,
-    MisfirePolicy,
-    ReportingMode,
-    ResourceRevisionObservation,
-    ResourceRevisionPrecheck,
     RoutineOccurrence,
     RoutineOccurrenceDisposition,
     RoutineState,
@@ -45,84 +34,29 @@ from daita.routines.supervisor import RoutineSupervisor
 from daita.storage.errors import StorageUnavailableError
 from daita.storage.sqlite import SQLiteStateStore
 from tests.routines._supervisor_support import _ids
-from tests.support.capability_runtime import (
-    frozen_execution_bindings,
-    machine_scope_builder,
-)
-from tests.support.distribution import (
-    inbox_distribution_plan,
-    no_artifact_outcome_contract,
-)
+from tests.support.capability_runtime import machine_scope_builder
 
 NOW = datetime(2026, 8, 28, 12, tzinfo=UTC)
 _SCOPE = machine_scope_builder(
     capability_ids=(
         "catalog.describe",
         "data.query",
-        "data.resource_revision_observation",
     ),
     resource_ids=("resource-1",),
 )
 
 
 class _Owner:
-    async def authority_snapshot(self, routine: ScheduledRoutine) -> FrozenJsonObject:
-        return FrozenJsonObject.from_mapping({"routine_id": routine.routine_id})
+    """The supervisor needs no owner decisions for a stored routine."""
 
 
 class _UnusedRuntime:
-    async def execute_internal(
-        self, request: InternalCapabilityRequest
-    ) -> InternalCapabilityOutcome:
-        del request
-        raise AssertionError("always-reporting routine cannot execute a precheck")
+    """Routine occurrences execute through the loop, never internally."""
 
 
-class _ObservationRuntime:
-    def __init__(self, observation: ResourceRevisionObservation) -> None:
-        self.observation = observation
-        self.calls = 0
-
-    async def execute_internal(
-        self, request: InternalCapabilityRequest
-    ) -> InternalCapabilityOutcome:
-        self.calls += 1
-        value = self.observation
-        return InternalCapabilityOutcome(
-            ToolOutput(
-                kind="data.resource_revision_observation",
-                data={
-                    "source_id": value.source_id,
-                    "resource_id": value.resource_id,
-                    "resource_revision": value.resource_revision,
-                    "catalog_revision": value.catalog_revision,
-                    "observed_at": value.observed_at.isoformat(),
-                },
-                sensitivity=ModelSensitivity.INTERNAL,
-                sensitivity_provenance={"authority": "test"},
-            )
-        )
-
-
-def _routine(
-    *,
-    precheck: ResourceRevisionPrecheck | None = None,
-    observation: ResourceRevisionObservation | None = None,
-) -> ScheduledRoutine:
-    instruction = (
-        "Report this exact structural catalog revision."
-        if precheck is not None
-        else "Read the exact resource and report its current value."
-    )
-    capability_ids = (
-        ("catalog.describe", "data.resource_revision_observation")
-        if precheck is not None
-        else ("data.query",)
-    )
+def _routine() -> ScheduledRoutine:
+    instruction = "Read the exact resource and report its current value."
     return ScheduledRoutine(
-        contract_bindings=frozen_execution_bindings(
-            capability_ids, ("resource-1",), ("mock",)
-        ),
         routine_id="routine-supervisor",
         agent_id="agent-1",
         conversation_id="conversation-1",
@@ -132,43 +66,16 @@ def _routine(
         instruction_digest=text_digest(instruction),
         schedule=IntervalSchedule(3600, NOW),
         schedule_interpreter_revision=1,
-        misfire_policy=MisfirePolicy.LATEST_ONLY,
-        reporting_mode=(
-            ReportingMode.ALWAYS if precheck is None else ReportingMode.CHANGES_ONLY
-        ),
-        precheck=precheck,
-        last_acknowledged_precheck_observation=observation,
-        allowed_source_ids=("source-1",),
-        allowed_connector_binding_ids=(),
-        allowed_resource_ids=("resource-1",),
-        allowed_capability_ids=capability_ids,
-        allowed_access_modes=frozenset({AccessMode.READ}),
-        allowed_operational_effects=frozenset({OperationalEffect.NONE}),
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
-        eligible_model_routes=("mock",),
-        skill_bindings=(),
-        outcome_contract=no_artifact_outcome_contract(),
-        distribution_plan=inbox_distribution_plan("conversation-1"),
-        per_run_max_tokens=1_000,
-        per_run_max_cost_usd=Decimal("0.10"),
-        cumulative_max_tokens=10_000,
-        cumulative_max_cost_usd=Decimal("1"),
-        cumulative_max_attempts=10,
-        cumulative_max_occurrences=10,
-        reserved_tokens=0,
-        reserved_cost_usd=Decimal("0"),
+        source_ids=("source-1",),
         charged_tokens=0,
         charged_cost_usd=Decimal("0"),
         attempt_count=0,
         occurrence_count=0,
-        maximum_consecutive_failures=3,
         consecutive_failures=0,
-        expires_at=NOW + timedelta(days=30),
         next_due_at=None,
         active_occurrence_id=None,
         last_occurrence_id=None,
         last_delivery_ids=(),
-        promotion_evidence=None,
         state=RoutineState.ACTIVE,
         revision=1,
         created_at=NOW,
@@ -212,7 +119,6 @@ async def _wait_for_terminal(
         occurrence = await store.load_routine_occurrence("agent-1", occurrence_id)
         if occurrence is not None and occurrence.disposition in {
             RoutineOccurrenceDisposition.COMPLETED,
-            RoutineOccurrenceDisposition.SKIPPED_NO_CHANGE,
             RoutineOccurrenceDisposition.TERMINAL_FAILED,
         }:
             return occurrence
@@ -261,11 +167,9 @@ async def test_supervisor_runs_one_due_slot_and_delivers_once(
     async def execute(
         occurrence: RoutineOccurrence,
         run: RunInput,
-        observation: ResourceRevisionObservation | None,
     ) -> LoopExit | None:
         nonlocal executed
         executed += 1
-        assert observation is None
         assert run.execution_scope is not None
         bound = await store.bind_routine_occurrence_run(
             "agent-1",
@@ -306,6 +210,9 @@ async def test_supervisor_runs_one_due_slot_and_delivers_once(
         artifacts=artifacts,
         execute_run=execute,
         machine_scope=_SCOPE,
+        model_routes=("mock",),
+        per_run_max_tokens=1_000,
+        per_run_max_cost_usd=Decimal("0.10"),
         clock=lambda: NOW,
         id_factory=_ids(),
         poll_seconds=0.02,
@@ -341,22 +248,18 @@ async def test_quota_rejection_holds_the_route_without_counting_a_failure(
 ) -> None:
     store = await SQLiteStateStore.open(tmp_path / "state.db")
     await _seed_conversation(store)
-    # An uncapped subscription routine: tokens, attempts and occurrences bound it.
-    routine = await store.admit_scheduled_routine(
-        replace(_routine(), per_run_max_cost_usd=None, cumulative_max_cost_usd=None)
-    )
+    routine = await store.admit_scheduled_routine(_routine())
     distribution = DistributionOwner(agent_id="agent-1", store=store)
     artifacts = await AgentHomeArtifactStore.open(
         agent_id="agent-1",
         agent_home=tmp_path,
         registry=store,
     )
-    route = routine.eligible_model_routes[0]
+    route = "mock"
 
     async def execute(
         occurrence: RoutineOccurrence,
         run: RunInput,
-        observation: ResourceRevisionObservation | None,
     ) -> LoopExit | None:
         assert run.execution_scope is not None
         assert run.execution_scope.per_run_max_cost_usd is None
@@ -391,6 +294,10 @@ async def test_quota_rejection_holds_the_route_without_counting_a_failure(
         artifacts=artifacts,
         execute_run=execute,
         machine_scope=_SCOPE,
+        # An uncapped subscription route: the run's token limit still bounds it.
+        model_routes=("mock",),
+        per_run_max_tokens=1_000,
+        per_run_max_cost_usd=None,
         clock=lambda: NOW,
         id_factory=_ids(),
         poll_seconds=0.02,
@@ -405,15 +312,14 @@ async def test_quota_rejection_holds_the_route_without_counting_a_failure(
         assert persisted.state is RoutineState.ACTIVE
         assert persisted.consecutive_failures == 0
         assert persisted.charged_tokens == 0
-        assert supervisor._quota_held(persisted, NOW + timedelta(minutes=4))
-        assert not supervisor._quota_held(persisted, NOW + timedelta(minutes=6))
+        assert supervisor._quota_held(NOW + timedelta(minutes=4))
+        assert not supervisor._quota_held(NOW + timedelta(minutes=6))
         repeated = await store.result(cast(str, terminal.terminal_run_id))
         assert repeated is not None
         # A repeat rejection doubles the hold; a completed run clears it.
-        supervisor._observe_quota(persisted, repeated)
-        assert supervisor._quota_held(persisted, NOW + timedelta(minutes=9))
+        supervisor._observe_quota(repeated)
+        assert supervisor._quota_held(NOW + timedelta(minutes=9))
         supervisor._observe_quota(
-            persisted,
             replace(
                 repeated,
                 kind=LoopExitKind.COMPLETED,
@@ -422,7 +328,7 @@ async def test_quota_rejection_holds_the_route_without_counting_a_failure(
                 provider_id=None,
             ),
         )
-        assert not supervisor._quota_held(persisted, NOW)
+        assert not supervisor._quota_held(NOW)
     finally:
         await supervisor.close()
         await store.close()
@@ -447,16 +353,15 @@ async def test_unclaimable_past_due_routine_waits_the_poll_interval(
         del args, kwargs
         nonlocal claims
         claims += 1
-        raise ValueError("routine_occurrence_budget_exhausted")
+        raise ValueError("routine_claim_refused")
 
     monkeypatch.setattr(store, "claim_due_routine_occurrence", refuse)
 
     async def execute(
         occurrence: RoutineOccurrence,
         run: RunInput,
-        observation: ResourceRevisionObservation | None,
     ) -> LoopExit | None:
-        del occurrence, run, observation
+        del occurrence, run
         raise AssertionError("an unclaimable routine cannot run")
 
     supervisor = RoutineSupervisor(
@@ -468,6 +373,9 @@ async def test_unclaimable_past_due_routine_waits_the_poll_interval(
         artifacts=artifacts,
         execute_run=execute,
         machine_scope=_SCOPE,
+        model_routes=("mock",),
+        per_run_max_tokens=1_000,
+        per_run_max_cost_usd=Decimal("0.10"),
         clock=lambda: NOW,
         id_factory=_ids(),
         poll_seconds=1,
@@ -524,9 +432,7 @@ async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
     async def execute(
         occurrence: RoutineOccurrence,
         run: RunInput,
-        observation: ResourceRevisionObservation | None,
     ) -> LoopExit | None:
-        assert observation is None
         assert run.execution_scope is not None
         bound = await store.bind_routine_occurrence_run(
             "agent-1",
@@ -567,6 +473,9 @@ async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
         artifacts=artifacts,
         execute_run=execute,
         machine_scope=_SCOPE,
+        model_routes=("mock",),
+        per_run_max_tokens=1_000,
+        per_run_max_cost_usd=Decimal("0.10"),
         clock=lambda: NOW,
         id_factory=_ids(),
         poll_seconds=30,
@@ -641,136 +550,20 @@ async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
         await store.close()
 
 
-async def test_unchanged_precheck_advances_with_zero_model_runs(tmp_path) -> None:
-    store = await SQLiteStateStore.open(tmp_path / "state.db")
-    await _seed_conversation(store)
-    observation = ResourceRevisionObservation(
-        source_id="source-1",
-        resource_id="resource-1",
-        resource_revision="sha256:" + "1" * 64,
-        catalog_revision="sha256:" + "2" * 64,
-        observed_at=NOW - timedelta(hours=1),
-    )
-    precheck = ResourceRevisionPrecheck(
-        capability_id="data.resource_revision_observation",
-        contract_digest="sha256:" + "3" * 64,
-        source_id="source-1",
-        resource_id="resource-1",
-    )
-    routine = await store.admit_scheduled_routine(
-        _routine(precheck=precheck, observation=observation)
-    )
-    runtime = _ObservationRuntime(replace(observation, observed_at=NOW))
-    distribution = DistributionOwner(agent_id="agent-1", store=store)
-    artifacts = await AgentHomeArtifactStore.open(
-        agent_id="agent-1",
-        agent_home=tmp_path,
-        registry=store,
-    )
-    model_calls = 0
-
-    async def execute(
-        occurrence: RoutineOccurrence,
-        run: RunInput,
-        observed: ResourceRevisionObservation | None,
-    ) -> LoopExit | None:
-        del occurrence, run, observed
-        nonlocal model_calls
-        model_calls += 1
-        raise AssertionError("unchanged precheck must not start a model run")
-
-    supervisor = RoutineSupervisor(
-        agent_id="agent-1",
-        store=store,
-        owner=cast(RoutineOwner, _Owner()),
-        runtime=cast(CapabilityRuntime, runtime),
-        distribution=distribution,
-        artifacts=artifacts,
-        execute_run=execute,
-        machine_scope=_SCOPE,
-        clock=lambda: NOW,
-        id_factory=_ids(),
-        poll_seconds=0.02,
-    )
-    try:
-        await supervisor.start()
-        occurrence_id = await _wait_for_occurrence_id(store, routine.routine_id)
-        terminal = await _wait_for_terminal(store, occurrence_id)
-        assert terminal.disposition is RoutineOccurrenceDisposition.SKIPPED_NO_CHANGE
-        assert runtime.calls == 1
-        assert model_calls == 0
-        deliveries = await store.list_deliveries("agent-1")
-        assert len(deliveries) == 1
-        assert deliveries[0].outcome.conclusion_state is OutcomeState.SKIPPED_NO_CHANGE
-    finally:
-        await supervisor.close()
-        await store.close()
-
-
-@pytest.mark.parametrize(
-    "change", ("values", "multiple_resources", "mcp", "wrong_observer")
-)
-def test_revision_precheck_rejects_assignments_it_cannot_observe(change):
-    precheck = ResourceRevisionPrecheck(
-        "data.resource_revision_observation",
-        "sha256:" + "3" * 64,
-        "source-1",
-        "resource-1",
-    )
-    routine = _routine(precheck=precheck)
-    with pytest.raises(ValueError, match="revision prechecks support only"):
-        if change == "values":
-            replace(
-                routine,
-                allowed_capability_ids=(
-                    "data.query",
-                    "data.resource_revision_observation",
-                ),
-                contract_bindings=frozen_execution_bindings(
-                    ("data.query", "data.resource_revision_observation"),
-                    ("resource-1",),
-                    ("mock",),
-                ),
-            )
-        elif change == "multiple_resources":
-            replace(
-                routine,
-                allowed_resource_ids=("resource-1", "resource-2"),
-                contract_bindings=frozen_execution_bindings(
-                    routine.allowed_capability_ids,
-                    ("resource-1", "resource-2"),
-                    ("mock",),
-                ),
-            )
-        elif change == "mcp":
-            replace(routine, allowed_connector_binding_ids=("binding-web",))
-        else:
-            replace(
-                routine, precheck=replace(precheck, capability_id="catalog.describe")
-            )
-
-
-@pytest.mark.parametrize(
-    "boundary", ["cumulative_attempts", "occurrence_attempts", "bound", "started"]
-)
+@pytest.mark.parametrize("boundary", ["occurrence_attempts", "bound", "started"])
 async def test_recovery_finishes_exhausted_or_unstarted_occurrence_without_replay(
     tmp_path, boundary
 ) -> None:
     store = await SQLiteStateStore.open(tmp_path / "state.db")
     await _seed_conversation(store)
-    routine = await store.admit_scheduled_routine(
-        replace(
-            _routine(),
-            cumulative_max_attempts=1 if boundary == "cumulative_attempts" else 10,
-        )
-    )
+    routine = await store.admit_scheduled_routine(_routine())
     artifacts = await AgentHomeArtifactStore.open(
         agent_id="agent-1", agent_home=tmp_path, registry=store
     )
     now = NOW
     executed = 0
 
-    async def execute(occurrence, run, observation):
+    async def execute(occurrence, run):
         nonlocal executed
         executed += 1
         assert boundary in {"bound", "started"}, "expired claims must not dispatch"
@@ -796,6 +589,9 @@ async def test_recovery_finishes_exhausted_or_unstarted_occurrence_without_repla
         artifacts=artifacts,
         execute_run=execute,
         machine_scope=_SCOPE,
+        model_routes=("mock",),
+        per_run_max_tokens=1_000,
+        per_run_max_cost_usd=Decimal("0.10"),
         clock=lambda: now,
         id_factory=_ids(),
     )
@@ -843,8 +639,6 @@ async def test_recovery_finishes_exhausted_or_unstarted_occurrence_without_repla
                 "agent-1", routine.routine_id
             )
             assert persisted is not None and persisted.active_occurrence_id is None
-            assert persisted.reserved_tokens == 0
-            assert persisted.attempt_count <= persisted.cumulative_max_attempts
             assert current.attempt_count <= 3
             await supervisor._recover()
             deliveries = await store.list_deliveries("agent-1")

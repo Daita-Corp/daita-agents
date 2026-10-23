@@ -14,18 +14,12 @@ import pytest
 
 from daita import (
     Agent,
-    ArtifactRequirement,
     IntervalSchedule,
-    MisfirePolicy,
-    OutcomeContract,
-    ReportingMode,
-    ScheduledRoutineDraft,
+    RoutineIntent,
     SQLiteSource,
 )
 from daita._json import canonical_json
-from daita.artifacts.models import ArtifactAuthorship
 from daita.context import AgentContextBuilder
-from daita.domains.data.export_capabilities import DATA_EXPORT_TABULAR_CAPABILITY_ID
 from daita.jobs.graph.models import TaskRole
 from daita.llm.models import (
     CanonicalMessage,
@@ -34,7 +28,6 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
-    ModelSensitivity,
     ModelUsage,
     TextBlock,
     ToolCall,
@@ -209,28 +202,6 @@ async def test_foreground_transcript_results_and_budgets_match_without_warnings(
     assert warned == silent
 
 
-def _artifact_contract() -> OutcomeContract:
-    requirement = ArtifactRequirement(
-        required=True,
-        minimum_count=1,
-        maximum_count=1,
-        allowed_media_types=("text/csv",),
-        allowed_authorships=(ArtifactAuthorship.EXACT_SOURCE_DATA,),
-        allowed_producer_capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
-        maximum_artifact_bytes=1024 * 1024,
-        maximum_total_bytes=1024 * 1024,
-        maximum_sensitivity=ModelSensitivity.INTERNAL,
-    )
-    return OutcomeContract(
-        require_terminal_conclusion=True,
-        artifact_requirements=(requirement,),
-        maximum_total_artifact_bytes=1024 * 1024,
-        maximum_effective_sensitivity=ModelSensitivity.INTERNAL,
-        require_current_run_provenance=True,
-        require_exact_source_bindings=True,
-    )
-
-
 async def _wait_for_deliveries(agent: Agent, conversation_id: str, count: int):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 15.0
@@ -243,7 +214,7 @@ async def _wait_for_deliveries(agent: Agent, conversation_id: str, count: int):
 
 
 async def _routine(tmp_path: Path) -> tuple[MockModelProvider, tuple[object, ...]]:
-    """Two consecutive occurrences; each misses its artifact and so fails."""
+    """Two consecutive occurrences, each refused a tool it tried to call."""
 
     tmp_path.mkdir()
     database = tmp_path / "orders.sqlite"
@@ -274,39 +245,17 @@ async def _routine(tmp_path: Path) -> tuple[MockModelProvider, tuple[object, ...
     )
     try:
         source = await agent.attach(SQLiteSource(database))
-        (resource,) = await agent.list_catalog_resources(source_id=source.id)
         origin = await agent.run("Authorize a scheduled export of orders.")
         assert origin.conversation_id is not None
-        (destination,) = await agent.distribution_destinations(
-            origin.conversation_id,
-            sensitivity_ceiling=ModelSensitivity.INTERNAL,
+        created = await agent.create_routine(
+            RoutineIntent(
+                title="Repeated refusal routine",
+                prompt="Export the orders table as CSV.",
+                schedule=IntervalSchedule(3_600, NOW + timedelta(hours=1)),
+                sources=(source.id,),
+            ),
+            conversation_id=origin.conversation_id,
         )
-        draft = ScheduledRoutineDraft(
-            origin_run_id=origin.run_id,
-            title="Repeated refusal routine",
-            authorized_instruction="Export the orders table as CSV.",
-            schedule=IntervalSchedule(3_600, NOW + timedelta(hours=1)),
-            misfire_policy=MisfirePolicy.LATEST_ONLY,
-            reporting_mode=ReportingMode.ALWAYS,
-            precheck=None,
-            allowed_source_ids=(source.id,),
-            allowed_connector_binding_ids=(),
-            allowed_resource_ids=(resource.id,),
-            allowed_capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
-            sensitivity_ceiling=ModelSensitivity.INTERNAL,
-            outcome_contract=_artifact_contract(),
-            distribution_destination_id=destination.destination_id,
-            eligible_model_routes=(provider.provider_id,),
-            per_run_max_tokens=2_000,
-            per_run_max_cost_usd=None,
-            cumulative_max_tokens=20_000,
-            cumulative_max_cost_usd=None,
-            cumulative_max_attempts=10,
-            cumulative_max_occurrences=10,
-            maximum_consecutive_failures=3,
-            expires_at=NOW + timedelta(days=30),
-        )
-        created = await agent.create_routine(await agent.propose_routine(draft))
         await agent.run_routine_now(
             created.routine_id, expected_revision=created.revision
         )
@@ -347,12 +296,10 @@ async def test_routine_occurrences_warn_separately_and_keep_their_failure_count(
         False,
         False,
     )
+    # No outcome contract: each occurrence completes with its final answer.
     consecutive_failures, failure_codes, _ = warned
-    assert consecutive_failures == 2
-    assert failure_codes == (
-        "outcome_artifact_contract_failed",
-        "outcome_artifact_contract_failed",
-    )
+    assert consecutive_failures == 0
+    assert failure_codes == ("", "")
 
     _disable_warnings(monkeypatch)
     silent_provider, silent = await _routine(tmp_path / "silent")

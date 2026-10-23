@@ -21,12 +21,10 @@ from daita import (
     MCPBindingStatus,
     MCPServerInspection,
     MCPToolSelection,
-    MisfirePolicy,
     PostgreSQLSource,
-    ReportingMode,
+    RoutineIntent,
     RoutineState,
     ScheduledRoutine,
-    ScheduledRoutineDraft,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
     SQLiteSource,
@@ -48,7 +46,6 @@ from daita.catalog.models import CatalogResource, CatalogSummary
 from daita.distribution.models import (
     DeliveryInspection,
     DeliveryView,
-    DistributionDestination,
 )
 from daita.hosting.home_upgrade import AgentHomeStatus
 from daita.hosting.sources import SourceEditResult
@@ -107,7 +104,6 @@ from daita.storage.sqlite_records import (
     effect_receipt_id,
 )
 from daita.work_board import WorkBoard
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.graph import GRAPH_NOW, graph_admission, task_result
 from tests.support.host import StartHost, hosts
 from tests.support.mcp import MemoryKeychain, conformance_identities, mock_transport
@@ -207,35 +203,15 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
         assert origin.conversation_id is not None
         (artifact,) = artifacts = await agent.list_artifacts()
 
-        (destination,) = destinations = await agent.distribution_destinations(
-            origin.conversation_id, sensitivity_ceiling=ModelSensitivity.INTERNAL
-        )
-        draft = ScheduledRoutineDraft(
-            origin_run_id=origin.run_id,
+        intent = RoutineIntent(
             title="Order count report",
-            authorized_instruction="Report the number of orders.",
+            prompt="Report the number of orders.",
             schedule=IntervalSchedule(3_600, NOW + timedelta(hours=1)),
-            misfire_policy=MisfirePolicy.LATEST_ONLY,
-            reporting_mode=ReportingMode.ALWAYS,
-            precheck=None,
-            allowed_source_ids=(source.id,),
-            allowed_connector_binding_ids=(),
-            allowed_resource_ids=(resource.id,),
-            allowed_capability_ids=("catalog.describe",),
-            sensitivity_ceiling=ModelSensitivity.INTERNAL,
-            outcome_contract=no_artifact_outcome_contract(),
-            distribution_destination_id=destination.destination_id,
-            eligible_model_routes=(provider.provider_id,),
-            per_run_max_tokens=2_000,
-            per_run_max_cost_usd=None,
-            cumulative_max_tokens=20_000,
-            cumulative_max_cost_usd=None,
-            cumulative_max_attempts=10,
-            cumulative_max_occurrences=10,
-            maximum_consecutive_failures=3,
-            expires_at=NOW + timedelta(days=30),
+            sources=(source.id,),
         )
-        routine = await agent.create_routine(await agent.propose_routine(draft))
+        routine = await agent.create_routine(
+            intent, conversation_id=origin.conversation_id
+        )
         await agent.run_routine_now(
             routine.routine_id, expected_revision=routine.revision
         )
@@ -360,7 +336,17 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
                     schemas=("public", "sales"),
                 ),
             ),
-            ScheduledRoutineDraft: (draft,),
+            # One typed schedule, and the JSON shape with relative timing.
+            RoutineIntent: (
+                intent,
+                RoutineIntent(
+                    prompt="Report the order count.",
+                    schedule=FrozenJsonObject.from_mapping(
+                        {"kind": "once", "after_seconds": 480}
+                    ),
+                    sources=("Orders",),
+                ),
+            ),
             # Results captured from the running agent.
             LoopExit: (origin,),
             Transcript: (await agent.transcript(origin.run_id),),
@@ -383,7 +369,6 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
                 await agent.save_artifact(artifact.artifact_id, exports),
             ),
             ArtifactDestination: (await agent.export_destination(),),
-            tuple[DistributionDestination, ...]: (destinations,),
             DeliveryInspection | None: (delivery,),
             DeliveryView | None: (acknowledged,),
             WorkBoard: (board,),

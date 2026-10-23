@@ -1,9 +1,8 @@
-"""Opt-in live-model evidence for one frozen Stage D2 inbox outcome.
+"""Opt-in live-model evidence for one Stage D2 inbox outcome.
 
-The source, destination, schedule, outcome contract, and capability ceiling are
-all established deterministically. The one authorized live scheduled run must
-choose the admitted SQLite source and exact CSV artifact capability. This file
-is never part of the deterministic gate.
+The source, schedule and routine are established deterministically. The one
+authorized live scheduled run must choose the named SQLite source and the exact
+CSV export. This file is never part of the deterministic gate.
 """
 
 from __future__ import annotations
@@ -19,25 +18,19 @@ import pytest
 
 from daita import (
     Agent,
-    ArtifactRequirement,
     DeliveryView,
     IntervalSchedule,
     LoopLimits,
-    MisfirePolicy,
-    OutcomeContract,
-    ReportingMode,
-    ScheduledRoutineDraft,
+    RoutineIntent,
     SQLiteSource,
 )
 from daita.artifacts.models import ArtifactAuthorship
-from daita.catalog.capabilities import CATALOG_DESCRIBE_CAPABILITY_ID
 from daita.domains.data.export_capabilities import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
 )
 from daita.llm.models import (
     FinishReason,
     ModelResponse,
-    ModelSensitivity,
     ModelUsage,
 )
 from daita.llm.pricing import CostEstimate
@@ -77,28 +70,6 @@ def _cost_limit() -> Decimal:
     if not value.is_finite() or value <= 0:
         pytest.fail(f"{_MAX_COST} must be a finite positive decimal")
     return value
-
-
-def _artifact_contract() -> OutcomeContract:
-    requirement = ArtifactRequirement(
-        required=True,
-        minimum_count=1,
-        maximum_count=1,
-        allowed_media_types=("text/csv",),
-        allowed_authorships=(ArtifactAuthorship.EXACT_SOURCE_DATA,),
-        allowed_producer_capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
-        maximum_artifact_bytes=8 * 1024 * 1024,
-        maximum_total_bytes=8 * 1024 * 1024,
-        maximum_sensitivity=ModelSensitivity.INTERNAL,
-    )
-    return OutcomeContract(
-        require_terminal_conclusion=True,
-        artifact_requirements=(requirement,),
-        maximum_total_artifact_bytes=8 * 1024 * 1024,
-        maximum_effective_sensitivity=ModelSensitivity.INTERNAL,
-        require_current_run_provenance=True,
-        require_exact_source_bindings=True,
-    )
 
 
 async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
@@ -167,49 +138,22 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
     )
     try:
         assert origin.conversation_id is not None
-        (destination,) = await agent.distribution_destinations(
-            origin.conversation_id,
-            sensitivity_ceiling=ModelSensitivity.INTERNAL,
-        )
-        now = datetime.now(UTC)
-        proposal = await agent.propose_routine(
-            ScheduledRoutineDraft(
-                origin_run_id=origin.run_id,
+        created = await agent.create_routine(
+            RoutineIntent(
                 title="Stage D2 live CSV outcome",
-                authorized_instruction=(
+                prompt=(
                     "Create one exact CSV artifact from the admitted SQLite table "
                     "stage_d2_probe. Read the scheduled row and include probe_name "
                     "and token. Use the admitted exact relational export capability; do "
                     "not answer from schema or copy source rows through model text."
                 ),
-                schedule=IntervalSchedule(3_600, now + timedelta(hours=1)),
-                misfire_policy=MisfirePolicy.LATEST_ONLY,
-                reporting_mode=ReportingMode.ALWAYS,
-                precheck=None,
-                allowed_source_ids=(source.id,),
-                allowed_connector_binding_ids=(),
-                allowed_resource_ids=(resource.id,),
-                allowed_capability_ids=(
-                    CATALOG_DESCRIBE_CAPABILITY_ID,
-                    DATA_EXPORT_TABULAR_CAPABILITY_ID,
+                schedule=IntervalSchedule(
+                    3_600, datetime.now(UTC) + timedelta(hours=1)
                 ),
-                sensitivity_ceiling=ModelSensitivity.INTERNAL,
-                outcome_contract=_artifact_contract(),
-                distribution_destination_id=destination.destination_id,
-                eligible_model_routes=(live.provider_id,),
-                per_run_max_tokens=limits.max_total_tokens,
-                per_run_max_cost_usd=cost_limit,
-                cumulative_max_tokens=limits.max_total_tokens * 2,
-                cumulative_max_cost_usd=(
-                    None if cost_limit is None else cost_limit * 2
-                ),
-                cumulative_max_attempts=2,
-                cumulative_max_occurrences=2,
-                maximum_consecutive_failures=1,
-                expires_at=now + timedelta(days=1),
-            )
+                sources=(source.id,),
+            ),
+            conversation_id=origin.conversation_id,
         )
-        created = await agent.create_routine(proposal)
         await agent.run_routine_now(
             created.routine_id,
             expected_revision=created.revision,
@@ -235,12 +179,10 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
         assert transcript.run.origin is RunOrigin.SCHEDULED_ROUTINE
         scope = transcript.run.execution_scope
         assert scope is not None
+        # Fixed at run start: the named source and every non-excluded capability.
         assert scope.allowed_source_ids == (source.id,)
-        assert scope.allowed_resource_ids == (resource.id,)
-        assert scope.allowed_capability_ids == (
-            CATALOG_DESCRIBE_CAPABILITY_ID,
-            DATA_EXPORT_TABULAR_CAPABILITY_ID,
-        )
+        assert resource.id in scope.allowed_resource_ids
+        assert DATA_EXPORT_TABULAR_CAPABILITY_ID in scope.allowed_capability_ids
         calls = tuple(
             call for call, _ in await agent.tool_evidence(delivery.resulting_run_id)
         )

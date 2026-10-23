@@ -12,7 +12,6 @@ import sys
 from collections import Counter
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -25,17 +24,10 @@ import httpx2 as httpx
 
 from daita import (
     Agent,
-    CalendarDaySelector,
-    CalendarSchedule,
-    EffectRequirement,
     LoopLimits,
     MCPToolSelection,
-    MisfirePolicy,
-    ReportingMode,
-    RequestedCapabilityGrant,
-    ScheduledRoutineDraft,
 )
-from daita._json import FrozenJsonObject, canonical_json
+from daita._json import canonical_json
 from daita.adapters.mcp import SDKMCPClientFactory
 from daita.capabilities import (
     AccessMode,
@@ -57,7 +49,6 @@ from daita.loop.models import (
     validate_completed_transcript,
 )
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.job_benchmarks import RecordingProvider
 from tests.support.live_billing import (
     api_equivalent_cost,
@@ -77,9 +68,6 @@ PROFILE_ENV = "DAITA_PHASE_F_LIVE_PROFILE"
 REPORT_ENV = "DAITA_PHASE_F_LIVE_REPORT_DIR"
 NOW = datetime(2026, 9, 6, 12, tzinfo=UTC)
 NEXT_SLOT = datetime(2026, 9, 7, 14, tzinfo=UTC)
-# Tuesday 07:00 America/Chicago: after the second Monday 09:00 run, so the
-# two-occurrence cap is reachable with or without an immediate first run.
-EXPIRES = datetime(2026, 9, 15, 12, tzinfo=UTC)
 DESTINATION = "release-room"
 CONTENT = "Release readiness check F_37C2"
 SOURCE = "https://research.fixture.test/release-readiness"
@@ -309,8 +297,6 @@ class Evaluation:
         self.action_argument_names = action_argument_names
         self.limits = limits()
         self.answer_reviews: list[dict[str, object]] = []
-        # Subscription runs carry no dollar cap, so their routines carry none.
-        self.cost_limit = self.limits.max_estimated_cost_usd
         self.conversation_id: str | None = None
         self.clock = NOW
         self.routine = routine
@@ -394,22 +380,6 @@ class Evaluation:
         self.server.request_methods.clear()
         self.transport.timings.clear()
 
-    def grant_is_exact(self, grant: Mapping[str, object]) -> bool:
-        return (
-            grant.get("capability_id") == self.action.capability_id
-            and grant.get("max_calls_per_occurrence") == 1
-            and canonical_json(grant.get("constraints"))
-            == canonical_json(
-                {
-                    "binding_id": self.binding.binding_id,
-                    "binding_revision": self.binding.revision,
-                    "remote_tool_name": self.action.remote_name,
-                    "fixed_arguments": {self.action_argument_names[0]: DESTINATION},
-                    "variable_argument_names": [self.action_argument_names[1]],
-                }
-            )
-        )
-
     async def approve(self, request: ApprovalRequest) -> ApprovalDecision:
         accepted = False
         arguments = request.arguments
@@ -431,37 +401,14 @@ class Evaluation:
             and request.tool_name == "routine_save"
             and self.routine
         ):
-            proposal = arguments.get("proposal")
-            if not isinstance(proposal, Mapping):
-                return ApprovalDecision.DENY
-            arguments = proposal
-            grants = arguments.get("capability_grants")
+            # The one confirmation card: title, local-time schedule, prompt, sources.
             schedule = arguments.get("schedule")
-            capabilities = arguments.get("allowed_capability_ids")
             accepted = (
-                isinstance(grants, tuple)
-                and len(grants) == 1
-                and isinstance(grants[0], Mapping)
-                and self.grant_is_exact(grants[0])
-                and isinstance(schedule, Mapping)
-                and schedule.get("kind") == "calendar"
-                and schedule.get("timezone") == "America/Chicago"
-                and schedule.get("hour") == 9
-                and schedule.get("minute") == 0
-                and schedule.get("weekdays") == (1,)
-                and arguments.get("run_immediately") is self.run_immediately
-                and arguments.get("allowed_connector_binding_ids")
-                == (self.binding.binding_id,)
-                and isinstance(capabilities, tuple)
-                and set(capabilities)
-                == {self.action.capability_id, self.research.capability_id}
-                and arguments.get("cumulative_max_attempts") == 2
-                and arguments.get("cumulative_max_occurrences") == 2
-                and arguments.get("per_run_max_tokens") == self.limits.max_total_tokens
-                and arguments.get("cumulative_max_tokens")
-                == 2 * self.limits.max_total_tokens
-                and self._dollar_ceilings_are_exact(arguments)
-                and arguments.get("expires_at") == EXPIRES.isoformat()
+                isinstance(schedule, str)
+                and "on Mon at 09:00 America/Chicago" in schedule
+                and schedule.startswith("Now, then") is self.run_immediately
+                and isinstance(arguments.get("prompt"), str)
+                and arguments.get("sources") == "All current sources"
             )
         self.approvals.append(
             {
@@ -471,30 +418,6 @@ class Evaluation:
             }
         )
         return ApprovalDecision.APPROVE if accepted else ApprovalDecision.DENY
-
-    def _dollar_ceilings_are_exact(self, arguments: Mapping[str, object]) -> bool:
-        per_run = arguments.get("per_run_max_cost_usd")
-        cumulative = arguments.get("cumulative_max_cost_usd")
-        if self.cost_limit is None:
-            return per_run is None and cumulative is None
-        return (
-            per_run is not None
-            and cumulative is not None
-            and Decimal(str(per_run)) == self.cost_limit
-            and Decimal(str(cumulative)) == 2 * self.cost_limit
-        )
-
-    def _budget_text(self, lead: str, cumulative_label: str) -> str:
-        tokens = self.limits.max_total_tokens
-        if self.cost_limit is None:
-            return (
-                f"{lead} {tokens} tokens per run and {2 * tokens} tokens "
-                f"{cumulative_label}, with no dollar ceiling. "
-            )
-        return (
-            f"{lead} {tokens} tokens and ${self.cost_limit} per run, "
-            f"{2 * tokens} tokens and ${2 * self.cost_limit} {cumulative_label}. "
-        )
 
     async def run(self, prompt: str) -> tuple[LoopExit, Transcript]:
         started = perf_counter()
@@ -586,41 +509,15 @@ class Evaluation:
                 "Set up a saved assignment using our connected release research and notifications: "
                 f"research current release readiness and post the finding, verification marker, and citation to {DESTINATION} "
                 + timing
-                + "Allow one notification each time, "
-                "always to that room; only the message content may change. Use the current model. "
-                "Keep the information internal and put each run's report in this conversation's inbox. "
-                "Use no database tables, files, saved procedures, or artifacts. "
-                "Always report what happened, including unconfirmed results. Require confirmation "
-                "from the notification service, without claiming downstream delivery was verified. "
-                "If a scheduled time is missed, run only the latest missed occurrence. "
-                "Stop after two occurrences or two attempts, or one consecutive failure, "
-                f"and expire at {EXPIRES.isoformat()}. "
-                + self._budget_text("Use exactly", "total")
-                + "Tell me when the assignment is saved. Do not send an additional notification while setting it up."
+                + "Always report what happened, including unconfirmed results, without "
+                "claiming downstream delivery was verified. Tell me when the assignment is "
+                "saved. Do not send an additional notification while setting it up."
             )
-        contract = {
-            "binding_id": self.binding.binding_id,
-            "binding_revision": self.binding.revision,
-            "notification_capability_id": self.action.capability_id,
-            "notification_remote_tool_name": self.action.remote_name,
-            "research_capability_id": self.research.capability_id,
-            "model_route": self.provider.provider_id,
-        }
         return (
             "Create one routine that researches current release readiness and posts the finding, "
             f"verification marker, and citation to {DESTINATION}, immediately and every Monday at 09:00 America/Chicago. "
-            "Grant exactly one notification per occurrence, fixing the destination and allowing only "
-            "the scalar content argument to vary. Require server-reported notification evidence. "
-            "Use only the admitted research and notification capabilities; no sources, resources, "
-            "skills, or artifacts. Discover this conversation's inbox destination. Always report, "
-            "use latest_only misfire handling, and stop after two occurrences/two attempts or "
-            f"{EXPIRES.isoformat()}, with one consecutive failure allowed. "
-            + self._budget_text("Authorize", "cumulatively")
-            + "Keep sensitivity internal, require a terminal conclusion and current-run "
-            "provenance with exact bindings. Embed this reporting instruction in the saved routine: "
-            f"{REPORT_INSTRUCTION} Do not send a separate foreground notification. "
-            "These current admission references are provided by the fixture owner; construct "
-            f"the routine and grant yourself: {canonical_json(contract)}"
+            "Embed this reporting instruction in the saved routine's prompt: "
+            f"{REPORT_INSTRUCTION} Do not send a separate foreground notification."
         )
 
     async def report(self, status: str, error: str | None) -> dict[str, object]:
@@ -834,72 +731,21 @@ def _api_equivalent_total(usages: list[ModelUsage], provider_id: str) -> str | N
     return str(sum((Decimal(cast(str, amount)) for amount in amounts), Decimal(0)))
 
 
-def owner_routine_draft(
-    scenario: Evaluation, origin_run_id: str, destination_id: str
-) -> ScheduledRoutineDraft:
-    """Exact typed fixture authorization, independent of model proposal authoring."""
-    amount = scenario.cost_limit
-    return ScheduledRoutineDraft(
-        origin_run_id=origin_run_id,
-        title="Release readiness",
-        authorized_instruction="Research current release readiness and post the cited finding and marker to release-room. Report invocation evidence honestly.",
-        schedule=CalendarSchedule(
-            timezone="America/Chicago",
-            hour=9,
-            minute=0,
-            day_selector=CalendarDaySelector.WEEKDAYS,
-            weekdays=(1,),
-        ),
-        misfire_policy=MisfirePolicy.LATEST_ONLY,
-        reporting_mode=ReportingMode.ALWAYS,
-        precheck=None,
-        allowed_source_ids=(),
-        allowed_resource_ids=(),
-        allowed_connector_binding_ids=(scenario.binding.binding_id,),
-        allowed_capability_ids=(
-            scenario.action.capability_id,
-            scenario.research.capability_id,
-        ),
-        sensitivity_ceiling=scenario.binding.maximum_outbound_sensitivity,
-        outcome_contract=replace(
-            no_artifact_outcome_contract(),
-            effect_requirements=(
-                EffectRequirement(
-                    scenario.action.capability_id,
-                    1,
-                    frozenset({EffectEvidenceBasis.SERVER_REPORTED}),
-                ),
-            ),
-        ),
-        distribution_destination_id=destination_id,
-        eligible_model_routes=(scenario.provider.provider_id,),
-        per_run_max_tokens=scenario.limits.max_total_tokens,
-        per_run_max_cost_usd=amount,
-        cumulative_max_tokens=2 * scenario.limits.max_total_tokens,
-        cumulative_max_cost_usd=None if amount is None else 2 * amount,
-        cumulative_max_attempts=2,
-        cumulative_max_occurrences=2,
-        maximum_consecutive_failures=1,
-        expires_at=EXPIRES,
-        run_immediately=scenario.run_immediately,
-        requested_capability_grants=(
-            RequestedCapabilityGrant(
-                scenario.action.capability_id,
-                FrozenJsonObject.from_mapping(
-                    {
-                        "binding_id": scenario.binding.binding_id,
-                        "binding_revision": scenario.binding.revision,
-                        "remote_tool_name": scenario.action.remote_name,
-                        "fixed_arguments": {
-                            scenario.action_argument_names[0]: DESTINATION
-                        },
-                        "variable_argument_names": [scenario.action_argument_names[1]],
-                    }
-                ),
-                1,
-            ),
-        ),
-    )
+def owner_routine_arguments(scenario: Evaluation) -> dict[str, object]:
+    """The owner's exact routine, as routine_save arguments or a RoutineIntent."""
+
+    return {
+        "title": "Release readiness",
+        "prompt": "Research current release readiness and post the cited finding and marker to release-room. Report invocation evidence honestly.",
+        "schedule": {
+            "kind": "calendar",
+            "timezone": "America/Chicago",
+            "hour": 9,
+            "minute": 0,
+            "weekdays": [1],
+        },
+        "run_immediately": scenario.run_immediately,
+    }
 
 
 @asynccontextmanager

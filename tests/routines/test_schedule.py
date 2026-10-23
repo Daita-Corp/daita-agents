@@ -11,13 +11,11 @@ from daita.routines.models import (
     CalendarDaySelector,
     CalendarSchedule,
     IntervalSchedule,
-    MisfirePolicy,
     NonexistentTimePolicy,
     OnceSchedule,
 )
 from daita.routines.schedule import (
     first_slot,
-    forecast_slots,
     manual_slot_key,
     next_slot,
     occurrence_id,
@@ -33,15 +31,12 @@ def _utc(value: str) -> datetime:
 
 def test_once_and_interval_boundaries_are_exact() -> None:
     instant = _utc("2026-08-27T12:00:00+00:00")
-    expires = _utc("2027-08-27T12:00:00+00:00")
     once = OnceSchedule(instant)
-    assert first_slot(once, not_before=instant, expires_at=expires) == instant
-    assert next_slot(once, after=instant, expires_at=expires) is None
+    assert first_slot(once, not_before=instant) == instant
+    assert next_slot(once, after=instant) is None
 
     minimum = IntervalSchedule(MIN_ROUTINE_INTERVAL_SECONDS, instant)
-    assert next_slot(minimum, after=instant, expires_at=expires) == _utc(
-        "2026-08-27T12:01:00+00:00"
-    )
+    assert next_slot(minimum, after=instant) == _utc("2026-08-27T12:01:00+00:00")
     maximum = IntervalSchedule(MAX_ROUTINE_INTERVAL_SECONDS, instant)
     assert maximum.interval_seconds == MAX_ROUTINE_INTERVAL_SECONDS
     with pytest.raises(ValueError, match="outside its bound"):
@@ -71,7 +66,6 @@ def test_spring_gap_has_explicit_policy(
     assert first_slot(
         schedule,
         not_before=_utc("2026-03-08T05:00:00+00:00"),
-        expires_at=_utc("2026-03-10T00:00:00+00:00"),
     ) == _utc(expected)
 
 
@@ -96,7 +90,6 @@ def test_autumn_overlap_has_explicit_policy(
     assert first_slot(
         schedule,
         not_before=_utc("2026-11-01T04:00:00+00:00"),
-        expires_at=_utc("2026-11-02T00:00:00+00:00"),
     ) == _utc(expected)
 
 
@@ -111,14 +104,12 @@ def test_weekly_calendar_keeps_local_wall_clock_across_dst() -> None:
     before = first_slot(
         schedule,
         not_before=_utc("2026-03-01T00:00:00+00:00"),
-        expires_at=_utc("2026-04-01T00:00:00+00:00"),
     )
     assert before is not None
     assert before == _utc("2026-03-05T14:00:00+00:00")
     assert next_slot(
         schedule,
         after=before,
-        expires_at=_utc("2026-04-01T00:00:00+00:00"),
     ) == _utc("2026-03-12T13:00:00+00:00")
 
 
@@ -134,7 +125,6 @@ def test_leap_year_and_month_end_selection() -> None:
     assert first_slot(
         leap,
         not_before=_utc("2027-03-01T00:00:00+00:00"),
-        expires_at=_utc("2030-01-01T00:00:00+00:00"),
     ) == _utc("2028-02-29T15:00:00+00:00")
 
     impossible = CalendarSchedule(
@@ -170,100 +160,56 @@ def test_ambiguous_or_invalid_timezone_is_rejected(timezone: str) -> None:
         validate_schedule(schedule)
 
 
-def test_misfire_skip_and_latest_only_are_bounded() -> None:
+def test_missed_slots_are_skipped() -> None:
     schedule = IntervalSchedule(3_600, _utc("2026-08-27T00:00:00+00:00"))
-    materialized_due_at = _utc("2026-08-27T01:00:00+00:00")
-    now = _utc("2026-08-27T04:30:00+00:00")
-    expires_at = _utc("2026-08-28T00:00:00+00:00")
     skipped = select_due_slot(
         schedule,
-        materialized_due_at=materialized_due_at,
-        now=now,
-        expires_at=expires_at,
-        misfire_policy=MisfirePolicy.SKIP,
+        materialized_due_at=_utc("2026-08-27T01:00:00+00:00"),
+        now=_utc("2026-08-27T04:30:00+00:00"),
     )
     assert skipped.selected_at is None
     assert skipped.skipped_slots == 4
     assert skipped.next_due_at == _utc("2026-08-27T05:00:00+00:00")
 
-    latest = select_due_slot(
-        schedule,
-        materialized_due_at=materialized_due_at,
-        now=now,
-        expires_at=expires_at,
-        misfire_policy=MisfirePolicy.LATEST_ONLY,
-    )
-    assert latest.selected_at == _utc("2026-08-27T04:00:00+00:00")
-    assert latest.skipped_slots == 3
-    assert latest.next_due_at == _utc("2026-08-27T05:00:00+00:00")
-
 
 @pytest.mark.parametrize(
-    ("due", "now", "expires", "expected"),
+    ("due", "now", "expected"),
     [
-        # (selected/skipped under SKIP, LATEST_ONLY selected/skipped, next due)
-        ("01:00", "01:00", "23:00", (("01:00", 0), ("01:00", 0), "02:00")),
-        ("01:00", "01:59", "23:00", (("01:00", 0), ("01:00", 0), "02:00")),
-        ("01:00", "02:00", "23:00", ((None, 2), ("02:00", 1), "03:00")),
-        ("01:00", "04:30", "03:00", ((None, 3), ("03:00", 2), None)),
-        ("01:00", "04:30", "02:30", ((None, 2), ("02:00", 1), None)),
-        ("01:00", "03:00", "03:00", ((None, 3), ("03:00", 2), None)),
-        ("01:00", "01:30", "01:30", (("01:00", 0), ("01:00", 0), None)),
+        # (selected, skipped, next due)
+        ("01:00", "01:00", ("01:00", 0, "02:00")),
+        ("01:00", "01:59", ("01:00", 0, "02:00")),
+        ("01:00", "02:00", (None, 2, "03:00")),
+        ("01:00", "04:30", (None, 4, "05:00")),
     ],
 )
 def test_interval_backlog_boundaries_match_hand_computed_slots(
     due: str,
     now: str,
-    expires: str,
-    expected: tuple[tuple[str | None, int], tuple[str | None, int], str | None],
+    expected: tuple[str | None, int, str],
 ) -> None:
     def at(clock: str) -> datetime:
         return _utc(f"2026-08-27T{clock}:00+00:00")
 
     schedule = IntervalSchedule(3_600, at("00:00"))
-    for policy, (selected, skipped) in zip(
-        (MisfirePolicy.SKIP, MisfirePolicy.LATEST_ONLY), expected[:2], strict=True
-    ):
-        selection = select_due_slot(
-            schedule,
-            materialized_due_at=at(due),
-            now=at(now),
-            expires_at=at(expires),
-            misfire_policy=policy,
-        )
-        assert selection.selected_at == (None if selected is None else at(selected))
-        assert selection.skipped_slots == skipped
-        assert selection.next_due_at == (
-            None if expected[2] is None else at(expected[2])
-        )
+    selected, skipped, following = expected
+    selection = select_due_slot(schedule, materialized_due_at=at(due), now=at(now))
+    assert selection.selected_at == (None if selected is None else at(selected))
+    assert selection.skipped_slots == skipped
+    assert selection.next_due_at == at(following)
 
 
 def test_interval_backlog_beyond_the_occurrence_bound_stays_selectable() -> None:
     anchor = _utc("2026-08-27T00:00:00+00:00")
     schedule = IntervalSchedule(MIN_ROUTINE_INTERVAL_SECONDS, anchor)
     # A minute routine whose host was closed for a week misses 10,080 slots.
-    now = _utc("2026-09-03T00:00:30+00:00")
-    expires = _utc("2027-08-27T00:00:00+00:00")
-    latest = select_due_slot(
-        schedule,
-        materialized_due_at=anchor,
-        now=now,
-        expires_at=expires,
-        misfire_policy=MisfirePolicy.LATEST_ONLY,
-    )
-    assert latest.selected_at == _utc("2026-09-03T00:00:00+00:00")
-    assert latest.skipped_slots == 7 * 24 * 60
-    assert latest.next_due_at == _utc("2026-09-03T00:01:00+00:00")
     skipped = select_due_slot(
         schedule,
         materialized_due_at=anchor,
-        now=now,
-        expires_at=expires,
-        misfire_policy=MisfirePolicy.SKIP,
+        now=_utc("2026-09-03T00:00:30+00:00"),
     )
     assert skipped.selected_at is None
     assert skipped.skipped_slots == 7 * 24 * 60 + 1
-    assert skipped.next_due_at == latest.next_due_at
+    assert skipped.next_due_at == _utc("2026-09-03T00:01:00+00:00")
 
 
 def test_pause_resume_and_schedule_revision_choose_future_identity() -> None:
@@ -271,7 +217,6 @@ def test_pause_resume_and_schedule_revision_choose_future_identity() -> None:
     resumed = next_slot(
         schedule,
         after=_utc("2026-08-27T04:30:00+00:00"),
-        expires_at=_utc("2026-08-28T00:00:00+00:00"),
     )
     assert resumed is not None
     assert resumed == _utc("2026-08-27T05:00:00+00:00")
@@ -297,63 +242,5 @@ def test_backward_clock_movement_cannot_recreate_completed_slot() -> None:
     assert next_slot(
         schedule,
         after=completed,
-        expires_at=_utc("2026-08-28T00:00:00+00:00"),
     ) == _utc("2026-08-27T05:00:00+00:00")
     assert scheduled_slot_key("routine-1", 1, completed) == original_key
-
-
-@pytest.mark.parametrize(
-    "schedule",
-    (
-        IntervalSchedule(3600, _utc("2026-09-01T00:30:00+00:00")),
-        CalendarSchedule(
-            timezone="America/Chicago",
-            hour=9,
-            minute=0,
-            day_selector=CalendarDaySelector.WEEKDAYS,
-            weekdays=(1, 3),
-        ),
-        OnceSchedule(_utc("2026-09-02T00:00:00+00:00")),
-    ),
-)
-def test_forecast_matches_slot_by_slot_iteration(schedule) -> None:
-    not_before = _utc("2026-09-01T00:00:00+00:00")
-    expires = _utc("2026-09-29T00:00:00+00:00")
-    slots = []
-    cursor = first_slot(schedule, not_before=not_before, expires_at=expires)
-    while cursor is not None:
-        slots.append(cursor)
-        cursor = next_slot(schedule, after=cursor, expires_at=expires)
-    for cap in (1, 5, 10_000):
-        forecast = forecast_slots(
-            schedule,
-            not_before=not_before,
-            expires_at=expires,
-            limit=1,
-            count_limit=cap,
-        )
-        assert forecast.occurrences == tuple(slots[:1])
-        assert forecast.reachable_slots == min(cap, len(slots))
-    assert forecast_slots(
-        schedule, not_before=not_before, expires_at=expires, limit=3, count_limit=3
-    ).occurrences == tuple(slots[:3])
-
-
-def test_forecast_reports_a_first_slot_beyond_expiration() -> None:
-    monday = CalendarSchedule(
-        timezone="America/Chicago",
-        hour=9,
-        minute=0,
-        day_selector=CalendarDaySelector.WEEKDAYS,
-        weekdays=(1,),
-    )
-    forecast = forecast_slots(
-        monday,
-        not_before=_utc("2026-09-05T12:00:00+00:00"),
-        expires_at=_utc("2026-09-06T12:00:00+00:00"),
-        limit=3,
-        count_limit=3,
-    )
-    assert forecast.occurrences == ()
-    assert forecast.reachable_slots == 0
-    assert forecast.first_unbounded_at == _utc("2026-09-07T14:00:00+00:00")

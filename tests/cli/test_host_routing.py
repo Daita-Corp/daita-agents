@@ -10,7 +10,6 @@ from pathlib import Path
 
 import pytest
 
-from daita.distribution.models import outcome_contract_projection
 from daita.host.paths import host_paths
 from tests.support.approval_learning import (
     MockModelProvider,
@@ -19,7 +18,6 @@ from tests.support.approval_learning import (
     _stop,
 )
 from tests.support.cli import invoke, json_lines
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.host import HostHarness, StartHost, remove_root, short_root
 
 pytestmark = pytest.mark.integration
@@ -179,17 +177,7 @@ async def test_routine_create_confirms_at_the_cli_through_the_host(
     await harness.create_agent()
     code, stdout, _ = await _daita(harness, "run", "sales", "How many are paid?")
     assert code == 0
-    origin = json.loads(stdout)
-    code, stdout, _ = await _daita(
-        harness, "routines", "destinations", "sales", origin["conversation_id"]
-    )
-    (destination,) = json.loads(stdout)
-    spec = _routine_spec(
-        harness.work() / "routine.json",
-        origin_run_id=origin["run_id"],
-        destination_id=destination["destination_id"],
-        model=model.provider_id,
-    )
+    spec = _routine_spec(harness.work() / "routine.json")
 
     code, stdout, stderr = await _daita(
         harness, "routines", "create", "sales", "--spec", str(spec), stdin="n\n"
@@ -210,39 +198,17 @@ async def test_routine_create_confirms_at_the_cli_through_the_host(
     assert harness.host.hub.pending("sales") == ()
 
 
-def _routine_spec(
-    path: Path, *, origin_run_id: str, destination_id: str, model: str
-) -> Path:
-    now = datetime.now(UTC)
+def _routine_spec(path: Path) -> Path:
     path.write_text(
         json.dumps(
             {
-                "origin_run_id": origin_run_id,
                 "title": "Paid invoice count",
-                "authorized_instruction": "Report the paid invoice count.",
+                "prompt": "Report the paid invoice count.",
                 "schedule": {
                     "kind": "interval",
                     "interval_seconds": 3600,
-                    "anchor_at": (now + timedelta(hours=1)).isoformat(),
+                    "anchor_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
                 },
-                "misfire_policy": "latest_only",
-                "reporting_mode": "always",
-                "allowed_source_ids": [],
-                "allowed_connector_binding_ids": [],
-                "allowed_resource_ids": [],
-                "allowed_capability_ids": ["artifact.create_document"],
-                "sensitivity_ceiling": "internal",
-                "outcome_contract": outcome_contract_projection(
-                    no_artifact_outcome_contract()
-                ),
-                "distribution_destination_id": destination_id,
-                "eligible_model_routes": [model],
-                "per_run_max_tokens": 1000,
-                "cumulative_max_tokens": 10000,
-                "cumulative_max_attempts": 10,
-                "cumulative_max_occurrences": 10,
-                "maximum_consecutive_failures": 3,
-                "expires_at": (now + timedelta(days=30)).isoformat(),
             }
         ),
         encoding="utf-8",

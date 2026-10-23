@@ -11,23 +11,18 @@ from pathlib import Path
 from daita import (
     Agent,
     IntervalSchedule,
-    MisfirePolicy,
-    ReportingMode,
-    ScheduledRoutineDraft,
+    RoutineIntent,
     SQLiteSource,
 )
-from daita.distribution import conversation_inbox_destination_id
 from daita.hosting.resident import run_resident_host
 from daita.llm.models import (
     FinishReason,
     ModelResponse,
-    ModelSensitivity,
     ModelUsage,
 )
 from daita.llm.pricing import CostEstimate
 from daita.llm.providers.mock import MockModelProvider
 from daita.workspace import LocalWorkspace
-from tests.support.distribution import no_artifact_outcome_contract
 
 INITIAL = datetime(2026, 8, 28, 12, tzinfo=UTC)
 ADVANCED = INITIAL + timedelta(hours=1)
@@ -76,36 +71,16 @@ async def main(root: Path) -> None:
         clock=lambda: INITIAL,
     )
     source = await agent.attach(SQLiteSource(database, name="Current"))
-    resource = (await agent.list_catalog_resources(source_id=source.id))[0]
     origin = await agent.run("Read the current value before scheduling it.")
-    draft = ScheduledRoutineDraft(
-        origin_run_id=origin.run_id,
-        title="Resident current value",
-        authorized_instruction="Inspect the exact current_value resource and report it.",
-        schedule=IntervalSchedule(3_600, ADVANCED),
-        misfire_policy=MisfirePolicy.LATEST_ONLY,
-        reporting_mode=ReportingMode.ALWAYS,
-        precheck=None,
-        allowed_source_ids=(source.id,),
-        allowed_connector_binding_ids=(),
-        allowed_resource_ids=(resource.id,),
-        allowed_capability_ids=("catalog.describe",),
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
-        outcome_contract=no_artifact_outcome_contract(),
-        distribution_destination_id=conversation_inbox_destination_id(
-            origin.conversation_id
+    await agent.create_routine(
+        RoutineIntent(
+            title="Resident current value",
+            prompt="Inspect the exact current_value resource and report it.",
+            schedule=IntervalSchedule(3_600, ADVANCED),
+            sources=(source.id,),
         ),
-        eligible_model_routes=(foreground.provider_id,),
-        per_run_max_tokens=1_000,
-        per_run_max_cost_usd=Decimal("0"),
-        cumulative_max_tokens=10_000,
-        cumulative_max_cost_usd=Decimal("0"),
-        cumulative_max_attempts=10,
-        cumulative_max_occurrences=10,
-        maximum_consecutive_failures=3,
-        expires_at=INITIAL + timedelta(days=30),
+        conversation_id=origin.conversation_id,
     )
-    await agent.create_routine(await agent.propose_routine(draft))
     state_path = agent.home / "state.db"
     assert await agent.list_deliveries() == ()
     await agent.close()

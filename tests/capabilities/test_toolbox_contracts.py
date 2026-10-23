@@ -191,7 +191,6 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             "catalog_search",
             "data_query",
             "delivery_list",
-            "distribution_destination_list",
             "file_read",
             "file_search",
             "graph_add_dependencies",

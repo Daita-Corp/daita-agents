@@ -77,7 +77,6 @@ def _routine(
         revision=1,
         occurrence_count=0,
         consecutive_failures=consecutive_failures,
-        sensitivity_ceiling=ModelSensitivity.RESTRICTED,
     )
 
 
@@ -291,7 +290,6 @@ def test_routine_attention_summary_without_failures_and_with_one() -> None:
         (disposition, True)
         for disposition in (
             RoutineOccurrenceDisposition.CLAIMED,
-            RoutineOccurrenceDisposition.PRECHECKING,
             RoutineOccurrenceDisposition.RUNNING,
             RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION,
             RoutineOccurrenceDisposition.RETRYABLE,
@@ -300,7 +298,6 @@ def test_routine_attention_summary_without_failures_and_with_one() -> None:
     + [
         (disposition, False)
         for disposition in (
-            RoutineOccurrenceDisposition.SKIPPED_NO_CHANGE,
             RoutineOccurrenceDisposition.COMPLETED,
             RoutineOccurrenceDisposition.TERMINAL_FAILED,
         )
