@@ -1,4 +1,4 @@
-"""A real model runs background jobs: delegating, resuming and writing once.
+"""A real model runs background jobs: delegating, resuming, asking and writing.
 
 Opt in with ``DAITA_RUN_LIVE_JOBS=1``; use ``DAITA_LIVE_BILLING=subscription``
 to run on the ChatGPT subscription. Checklist rules, limits, cancellation and
@@ -20,7 +20,7 @@ import pytest
 from daita import Agent, ApprovalDecision, ApprovalRequest, LoopLimits, SQLiteSource
 from daita.adapters.mcp import SDKMCPClientFactory
 from daita.distribution import DeliverySubjectKind, OutcomeState
-from daita.jobs import DelegationState, Job, JobState
+from daita.jobs import ChecklistStatus, DelegationState, Job, JobState
 from tests.support.jobs import in_state, wait_for_job
 from tests.support.live_billing import cost_cap, live_provider
 from tests.support.mcp import mock_transport
@@ -100,6 +100,22 @@ async def _sales_agent(root: Path, name: str) -> tuple[Agent, Callable[[], Any]]
     return created, open_agent
 
 
+def _assert_compared(job: Job) -> None:
+    """The job read both tables: no open items and both real totals reported."""
+
+    assert job.final_summary
+    open_items = [
+        item.title
+        for item in job.checklist
+        if item.status not in {ChecklistStatus.DONE, ChecklistStatus.CANCELLED}
+    ]
+    assert not open_items, open_items
+    assert any(item.status is ChecklistStatus.DONE for item in job.checklist)
+    # orders total 60.5 over 3 rows; refunds total 7.5 over 2 rows.
+    assert "60.5" in job.final_summary, job.final_summary
+    assert "7.5" in job.final_summary, job.final_summary
+
+
 def _record(record_property: Callable[[str, object], None], job: Job) -> None:
     record_property("job_state", job.state.value)
     record_property("run_count", job.run_count)
@@ -126,7 +142,7 @@ async def test_live_two_part_analysis_job_delegates_and_delivers(
             item for item in done.delegations if item.state is DelegationState.DONE
         ]
         assert len(finished) >= 2, "each part went to its own sub-run"
-        assert done.final_summary
+        _assert_compared(done)
         (delivery,) = await agent.list_deliveries(conversation_id=job.conversation_id)
         assert delivery.subject_kind is DeliverySubjectKind.JOB
         assert delivery.conclusion_state is OutcomeState.SUCCEEDED
@@ -163,7 +179,44 @@ async def test_live_job_interrupted_by_a_restart_resumes_and_finishes(
         assert done.state is JobState.DONE, done.failure_code or done.question
         # The restart started a new main run from the saved checklist.
         assert done.run_count >= 2
-        assert done.final_summary
+        _assert_compared(done)
+    finally:
+        await agent.close()
+
+
+async def test_live_job_asks_and_uses_the_answer(
+    tmp_path: Path, record_property: Callable[[str, object], None]
+) -> None:
+    agent, _open = await _sales_agent(tmp_path / "root", "live-ask")
+    try:
+        job = await agent.start_job(
+            "Summarize one of the sales tables for me. I haven't decided which "
+            "one yet: ask me which table I want before you query anything, then "
+            "report that table's row count and total amount."
+        )
+        waiting = await wait_for_job(
+            agent,
+            job.job_id,
+            in_state(JobState.DONE, JobState.FAILED, JobState.WAITING_FOR_YOU),
+            timeout=_JOB_TIMEOUT,
+        )
+        assert waiting.state is JobState.WAITING_FOR_YOU, (
+            waiting.failure_code or waiting.final_summary
+        )
+        assert waiting.question
+        await agent.answer_job(job.job_id, "The refunds table, please.")
+        done = await wait_for_job(
+            agent,
+            job.job_id,
+            in_state(JobState.DONE, JobState.FAILED, JobState.WAITING_FOR_YOU),
+            timeout=_JOB_TIMEOUT,
+        )
+        _record(record_property, done)
+        assert done.state is JobState.DONE, done.failure_code or done.question
+        # The answer started a new main run, which used it.
+        assert done.run_count >= 2
+        assert [item.text for item in done.answers] == ["The refunds table, please."]
+        assert done.final_summary and "7.5" in done.final_summary, done.final_summary
     finally:
         await agent.close()
 

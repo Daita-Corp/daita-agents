@@ -242,8 +242,9 @@ asks a real model for the example one-time routine and checks one
 
 The background-job cases (`tests/live/jobs/test_jobs.py`) show a real model
 finishing a two-part job through `checklist_write` and `delegate`, a job that
-resumes after a restart, and a job that performs one approved write against
-the simulated PostgreSQL fixture. Enable them with `DAITA_RUN_LIVE_JOBS=1`;
+resumes after a restart, a job that asks with `ask_user` and uses the answer,
+and a job that performs one approved write against the simulated PostgreSQL
+fixture. The two-part cases check the real table totals. Enable them with `DAITA_RUN_LIVE_JOBS=1`;
 choose the model with `DAITA_LIVE_JOBS_MODEL_ID` and, under API billing, its key
 with `DAITA_LIVE_JOBS_LLM_API_KEY`.
 

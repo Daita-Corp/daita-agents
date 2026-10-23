@@ -122,6 +122,11 @@ CASES: tuple[SmokeCase, ...] = (
         _JOBS,
     ),
     SmokeCase(
+        "jobs/ask",
+        "tests/live/jobs/test_jobs.py::test_live_job_asks_and_uses_the_answer",
+        _JOBS,
+    ),
+    SmokeCase(
         "jobs/write",
         "tests/live/jobs/test_jobs.py::test_live_job_performs_one_approved_write",
         _JOBS,

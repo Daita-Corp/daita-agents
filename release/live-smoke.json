@@ -10,6 +10,7 @@
     "tests/live/data/test_model_write_acceptance.py::test_live_drift_during_approval_does_not_reapply[openai:gpt-5.6-terra-0]": "passed",
     "tests/live/data/test_model_write_acceptance.py::test_live_mixed_upsert_and_unchanged_repeat[openai:gpt-5.6-terra-0]": "passed",
     "tests/live/data_operations/test_workflows.py::test_live_analytical_correctness[openai:gpt-5.6-terra-0-join_grain-00]": "passed",
+    "tests/live/jobs/test_jobs.py::test_live_job_asks_and_uses_the_answer": "passed",
     "tests/live/jobs/test_jobs.py::test_live_job_interrupted_by_a_restart_resumes_and_finishes": "passed",
     "tests/live/jobs/test_jobs.py::test_live_job_performs_one_approved_write": "passed",
     "tests/live/jobs/test_jobs.py::test_live_two_part_analysis_job_delegates_and_delivers": "passed",

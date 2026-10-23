@@ -10,7 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from daita import LoopLimits, WorkColumn
+from daita import AgentConfig, LoopLimits, WorkColumn
+from daita.config import HostCapacityLimits
+from daita.hosting.execution_governor import AdmissionLeaseState, WorkloadClass
 from daita.jobs import ChecklistStatus, DelegationState, JobState
 from daita.jobs.models import (
     INTERRUPTED_BY_RESTART,
@@ -344,4 +346,42 @@ async def test_a_restart_resumes_from_the_checklist_and_reports_interrupted_subr
         ]
         assert done.checklist[0].status is ChecklistStatus.DONE
     finally:
+        await agent.close()
+
+
+async def test_a_job_waiting_for_a_slot_keeps_waiting_and_runs_with_its_full_time(
+    tmp_path: Path,
+) -> None:
+    model = JobModel()
+    model.script(main=[reply(text="Finished after the wait.")])
+    # One background slot, held below, and a run time shorter than the wait.
+    agent = await open_job_agent(
+        tmp_path,
+        model,
+        config=AgentConfig(
+            host_capacity=HostCapacityLimits(
+                execution_capacity=2, foreground_execution_reserve=1
+            )
+        ),
+        limits=LoopLimits(max_wall_time_seconds=0.5),
+    )
+    coordinator = agent._embedded._admission_coordinator
+    holder = await coordinator.admit_execution(WorkloadClass.JOB, "holder")
+    try:
+        job = await agent.start_job("Wait for a slot.")
+        # Several waits time out; none counts a run or fails the job.
+        await asyncio.sleep(1.6)
+        waiting = await agent.inspect_job(job.job_id)
+        assert waiting is not None
+        assert (waiting.state, waiting.run_count) == (JobState.RUNNING, 0)
+        assert model.requests == []
+        await holder.release()
+        done = await wait_for_job(
+            agent, job.job_id, in_state(JobState.DONE), model=model
+        )
+        assert done.run_count == 1
+        assert done.final_summary == "Finished after the wait."
+    finally:
+        if holder.state is AdmissionLeaseState.ACTIVE:
+            await holder.release()
         await agent.close()
