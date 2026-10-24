@@ -111,6 +111,8 @@ argument mistakes gets all of them back at once.
   instead of copying its `binding`, and `expected_occurrences` defaults to 1.
   `routine_control` makes `expected_revision` optional (default: the current
   revision).
+- **Defaults are visible.** A tool that routes by a selector argument (`mode`,
+  `action`, `output`) now states the selector's default in its schema.
 - **Approval cards** show every value the action will use, including bound
   and defaulted ones (for example a new annotation's id and the routine
   revision being controlled).

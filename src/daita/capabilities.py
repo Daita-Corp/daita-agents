@@ -3095,6 +3095,9 @@ def _mode_input_schema(
     # Routes narrowed to presence modes alone leave nothing to select.
     if not view.mode_by_presence and selectable:
         properties[selector] = {"type": "string", "enum": selectable}
+        if view.default_mode is not None:
+            # An omitted selector takes this route; the model must see that.
+            properties[selector]["default"] = view.default_mode
     required: set[str] | None = None
     for index, (_mode, schema) in enumerate(routes):
         if (
