@@ -78,16 +78,10 @@ class WriteModel:
         elif self.phase == 2:
             preview = self.results["preview"]
             if not preview.is_error and not self.preview_only:
-                data = preview.output["data"]
-                assert isinstance(data, Mapping)
-                arguments = {
-                    **self.arguments,
-                    "mode": "apply",
-                    "preview_fingerprint": data["preview_fingerprint"],
-                }
-                if self.operation == "update":
-                    arguments["expected_affected_rows"] = data["matched_rows"]
-                calls = (ToolCall(id="write", name=write_name, arguments=arguments),)
+                # The write is one call; Daita re-previews it for approval.
+                calls = (
+                    ToolCall(id="write", name=write_name, arguments=self.arguments),
+                )
         elif self.phase != 3:
             raise AssertionError("unexpected extra model request")
         self.phase += 1

@@ -20,6 +20,7 @@ from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import LoopLimits, RunInput, ToolBatchOutcome
 from tests.support.capability_runtime import (
     StaticTestDomain,
+    argument_issues,
     execute_projected,
     presentation_metadata,
     static_registry,
@@ -48,10 +49,75 @@ def test_nested_argument_errors_retain_object_path(field, unexpected):
     value = {"target": "chosen", "invented": "value"} if unexpected else {}
     with pytest.raises(CapabilityInputError) as failure:
         registry.validate_arguments(capability.id, {field: value})
-    assert failure.value.details["path"] == f"arguments.{field}"
-    assert failure.value.details["names"] == (
-        ("invented",) if unexpected else ("target",)
+    name = "invented" if unexpected else "target"
+    assert failure.value.code == "invalid_arguments"
+    (issue,) = argument_issues(failure.value.details)
+    assert issue["path"] == f"arguments.{field}.{name}"
+    assert issue["name"] == name
+    assert issue["code"] == (
+        "unexpected_arguments" if unexpected else "missing_arguments"
     )
+
+
+def test_every_structural_problem_comes_back_in_one_result():
+    from dataclasses import replace
+
+    capability, view = _declaration()
+    shape = {
+        "type": "object",
+        "properties": {"id": {"type": "string"}, "count": {"type": "integer"}},
+        "required": ["id", "count"],
+        "additionalProperties": False,
+    }
+    capability = replace(
+        capability,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "maxLength": 3},
+                "limit": {"type": "integer", "maximum": 10},
+                "target": {"oneOf": [{"type": "string"}, shape]},
+                "items": {"type": "array", "items": {"type": "integer"}},
+            },
+            "required": ["name"],
+            "additionalProperties": False,
+        },
+    )
+    domain = StaticTestDomain((capability,), (view,))
+    registry = CapabilityRegistry(
+        declarations=(domain.declarations,), executors=(_CountingExecutor(),)
+    )
+
+    def issues(arguments: dict[str, object]) -> list[dict[str, object]]:
+        with pytest.raises(CapabilityInputError) as failure:
+            registry.validate_arguments(capability.id, arguments)
+        assert failure.value.code == "invalid_arguments"
+        found = argument_issues(failure.value.details)
+        assert failure.value.details["issue_count"] == len(found)
+        return found
+
+    # Three mistakes, one result.
+    assert {
+        (issue["path"], issue["code"])
+        for issue in issues({"name": "long", "limit": 11, "extra": True})
+    } == {
+        ("arguments.name", "invalid_argument_value"),
+        ("arguments.limit", "invalid_argument_value"),
+        ("arguments.extra", "unexpected_arguments"),
+    }
+    # The closest oneOf shape is the object one: its own problems are reported.
+    assert {
+        (issue["path"], issue["code"])
+        for issue in issues({"name": "ok", "target": {"id": 1}})
+    } == {
+        ("arguments.target.id", "invalid_argument_type"),
+        ("arguments.target.count", "missing_arguments"),
+    }
+    # At most 32 problems are listed; the count says how many there were.
+    with pytest.raises(CapabilityInputError) as many:
+        registry.validate_arguments(capability.id, {"name": "ok", "items": ["x"] * 40})
+    assert len(argument_issues(many.value.details)) == 32
+    assert many.value.details["issue_count"] == 40
 
 
 class _CountingExecutor:
@@ -182,7 +248,10 @@ async def test_schema_and_domain_current_admission_precede_executor_io() -> None
         _run(),
         (ToolCall(id="call-schema", name=view.name),),
     )
-    assert _error_code(invalid_schema) == "missing_arguments"
+    assert _error_code(invalid_schema) == "invalid_arguments"
+    error = invalid_schema.ordered_results[0].output["error"]
+    assert isinstance(error, Mapping)
+    assert error["details"]["issues"][0]["code"] == "missing_arguments"
     assert domain.prepare_calls == 0
     assert executor.calls == 0
 

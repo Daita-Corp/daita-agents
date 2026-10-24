@@ -20,6 +20,7 @@ from daita import (
     SemanticKind,
     SemanticSubject,
 )
+from daita._json import canonical_json
 from daita.host.client import connect
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
@@ -132,11 +133,9 @@ def _semantic_call(
     annotation_id: str,
     source_id: str,
     resource_id: str,
-    revision: str,
     field_name: str,
     statement: str,
     supersedes_id: str | None = None,
-    expected_sha256: str | None = None,
 ) -> ToolCall:
     arguments: dict[str, object] = {
         "id": annotation_id,
@@ -152,12 +151,9 @@ def _semantic_call(
                 "kind": "user_assertion",
             }
         ],
-        "catalog_revisions": [{"resource_id": resource_id, "revision": revision}],
     }
     if supersedes_id is not None:
         arguments["supersedes_id"] = supersedes_id
-    if expected_sha256 is not None:
-        arguments["expected_sha256"] = expected_sha256
     return ToolCall(
         id=call_id,
         name="semantic_save",
@@ -234,7 +230,6 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         annotation_id=original.id,
         source_id=source.id,
         resource_id=resource.id,
-        revision=resource.current_revision,
         field_name="booked_at",
         statement=original.statement,
     )
@@ -243,13 +238,11 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         annotation_id="booked-revenue-corrected",
         source_id=source.id,
         resource_id=resource.id,
-        revision=resource.current_revision,
         field_name="booked_at",
         statement=(
             "Booked revenue uses invoices.booked_at and excludes completed refunds."
         ),
         supersedes_id=original.id,
-        expected_sha256=original_digest,
     )
     provider = MockModelProvider(
         (
@@ -278,6 +271,17 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
                 tool_calls=(create,),
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="definition saved"),
+            # Superseding needs a view in the run; Daita binds that version.
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="view-definition",
+                        name="semantic_view",
+                        arguments={"id": original.id},
+                    ),
+                ),
+            ),
             ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(correct,),
@@ -354,6 +358,13 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         assert tuple(request.tool_name for request in approvals) == (
             "semantic_save",
             "semantic_save",
+        )
+        # The card shows the version the run viewed and the bound revisions.
+        assert approvals[1].arguments["expected_sha256"] == original_digest
+        assert canonical_json(approvals[1].arguments["catalog_revisions"]) == (
+            canonical_json(
+                ({"resource_id": resource.id, "revision": resource.current_revision},)
+            )
         )
         viewed_skill = next(
             result

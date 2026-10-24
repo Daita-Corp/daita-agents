@@ -844,14 +844,13 @@ class _EditRoutingProvider:
                 {"tool_names": ["artifact_edit_text"]},
             )
         if "edit-create" not in results:
+            # The edit names the file it read; the binding stays with Daita.
             read_data = _data(results["edit-read"])
-            binding = read_data.get("binding")
-            assert isinstance(binding, str)
             return _tool(
                 "edit-create",
                 "artifact_edit_text",
                 {
-                    "binding": binding,
+                    "path": read_data["path"],
                     "replacements": [
                         {
                             "old_text": "timeout: 30",

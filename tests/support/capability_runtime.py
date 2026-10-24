@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import replace
+from typing import Any, cast
 
 from daita._json import FrozenJsonObject
 from daita.capabilities import (
@@ -150,6 +151,15 @@ class StaticTestDomain:
         error: BaseException,
     ) -> CapabilityFailure | None:
         return None
+
+
+def argument_issues(details: object) -> list[dict[str, Any]]:
+    """The structural problems listed by one ``invalid_arguments`` error."""
+
+    assert isinstance(details, Mapping)
+    issues = FrozenJsonObject.from_mapping(details).to_dict()["issues"]
+    assert isinstance(issues, list)
+    return cast(list[dict[str, Any]], issues)
 
 
 def static_registry(
@@ -408,6 +418,7 @@ def machine_scope_builder(
 __all__ = [
     "ContextToolProjectionAdapter",
     "StaticTestDomain",
+    "argument_issues",
     "execute_projected",
     "machine_scope_builder",
     "presentation_metadata",

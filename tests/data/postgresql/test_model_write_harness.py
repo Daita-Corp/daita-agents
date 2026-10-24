@@ -301,7 +301,7 @@ async def test_exact_write_approval_fails_closed(tamper):
         ]
     )
     assert scenario.expected_write is not None
-    args = {**scenario.expected_write, "preview_fingerprint": "sha256:" + "a" * 64}
+    args = dict(scenario.expected_write)
     if tamper == "resource":
         args["resource_id"] = "other"
     elif tamper == "value":
@@ -388,7 +388,6 @@ async def test_update_approval_distinguishes_identity_from_a_positive_wrong_matc
                         {"column": column, "operator": "eq", "value": value}
                         for column, value in where
                     ],
-                    "preview_fingerprint": "sha256:" + "a" * 64,
                 },
                 "target": {"source_id": "source", "resource_id": "table"},
                 "preview": {
@@ -736,7 +735,6 @@ async def test_user_flow_update_oracle_preserves_exact_guarded_identity(case):
     args = {
         **scenario.expected_write,
         "where": where,
-        "preview_fingerprint": "sha256:" + "a" * 64,
     }
     review: dict[str, Any] = {
         "arguments": args,

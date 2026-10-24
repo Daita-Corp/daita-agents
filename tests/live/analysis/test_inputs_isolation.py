@@ -67,7 +67,6 @@ async def test_partial_broker_read_retains_coverage_and_contract_after_history_c
                 "python_execute",
                 {
                     "code": "import json\nr=tools.call('file_read', {'source_id':'s1', 'path':'partial.txt'})\nassert not r['is_error']\nd=r['output']['data']\nsummary={'captured_bytes':len(d['content'].encode()), 'complete':d['complete']}\nprint(summary)\nopen('coverage.json','w').write(json.dumps(summary))\noutputs.add('coverage','coverage.json')",
-                    "expected_state": {"generation": 0, "revision": 0},
                     "save_output": "coverage",
                 },
             ),
@@ -153,7 +152,6 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
         "python_execute",
         {
             "code": "open('answer.txt','w').write('42')\noutputs.add('answer','answer.txt')",
-            "expected_state": {"generation": 0, "revision": 0},
             "save_output": "answer",
         },
     )
@@ -165,7 +163,6 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
                 "python_execute",
                 {
                     "code": "open('answer.txt','w').write('42')\noutputs.add('answer','answer.txt')",
-                    "expected_state": {"generation": 0, "revision": 0},
                     "save_output": "answer",
                 },
             ),
@@ -190,7 +187,6 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
                     "inputs": {
                         "preview": {"kind": "tool_result", "evidence_id": evidence_id}
                     },
-                    "expected_state": {"generation": 1, "revision": 1},
                 },
             )
 
@@ -201,7 +197,6 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
                     "python_execute",
                     {
                         "code": f"r=tools.call('artifact_read', {{'artifact_id':{artifact.artifact_id!r}}})\nassert not r['is_error']\nprint(r['output']['data']['text'])\nlisting=tools.call('artifact_list', {{}})\nassert not listing['is_error']\ndenied=tools.call('artifact_create', {{'from': 'document'}})\nassert denied['is_error']",
-                        "expected_state": {"generation": 0, "revision": 0},
                     },
                 ),
                 ModelResponse(finish_reason=FinishReason.STOP, text="read"),
@@ -297,7 +292,6 @@ async def test_arrow_input_preserves_schema_decimal_null_integer_timezone_duplic
                                 "artifact_id": artifact.artifact_id,
                             }
                         },
-                        "expected_state": {"generation": 0, "revision": 0},
                     },
                 ),
                 ModelResponse(finish_reason=FinishReason.STOP, text="read"),
@@ -334,7 +328,6 @@ async def test_arrow_input_preserves_schema_decimal_null_integer_timezone_duplic
         "malformed_json",
         "forged_result_ref",
         "forged_evidence_id",
-        "stale_state",
     ],
 )
 async def test_invalid_inputs_and_candidates_never_publish(
@@ -342,7 +335,6 @@ async def test_invalid_inputs_and_candidates_never_publish(
 ):
     arguments: dict[str, object] = {
         "code": "print(42)",
-        "expected_state": {"generation": 0, "revision": 0},
         "save_output": "bad",
     }
     if failure == "symlink":
@@ -357,12 +349,10 @@ async def test_invalid_inputs_and_candidates_never_publish(
         )
     elif failure == "forged_result_ref":
         arguments["inputs"] = {"bad": {"kind": "tool_result", "result_ref": "r99"}}
-    elif failure == "forged_evidence_id":
+    else:
         arguments["inputs"] = {
             "bad": {"kind": "tool_result", "evidence_id": "unissued-result"}
         }
-    else:
-        arguments["expected_state"] = {"generation": 9, "revision": 99}
     agent = await make_agent(tmp_path, (_tool("invalid", "python_execute", arguments),))
     try:
         result = await agent.run("Reject invalid candidate and input references.")
@@ -379,10 +369,7 @@ async def test_invalid_inputs_and_candidates_never_publish(
         block = pair[1]
         assert block is not None
         output = json.loads(canonical_json(block.output))
-        if failure == "stale_state":
-            assert block.is_error and output["error"]["code"] == "analysis_stale_state"
-            assert not any(record.kind == "generation" for record in records)
-        elif failure == "forged_result_ref":
+        if failure == "forged_result_ref":
             # The runtime refuses an unissued result_ref before any worker starts.
             assert block.is_error
             assert output["error"]["code"] == "result_ref_invalid"
@@ -421,7 +408,6 @@ async def test_saved_input_new_run_and_active_artifact_deletion(
                 "python_execute",
                 {
                     "code": "open('retained.json','w').write('{\"value\":42}')\noutputs.add('retained','retained.json')",
-                    "expected_state": {"generation": 0, "revision": 0},
                     "save_output": "retained",
                 },
             ),
@@ -430,7 +416,6 @@ async def test_saved_input_new_run_and_active_artifact_deletion(
                 "python_execute",
                 {
                     "code": "open('other.json','w').write('{\"value\":43}')\noutputs.add('other','other.json')",
-                    "expected_state": {"generation": 1, "revision": 1},
                     "save_output": "other",
                 },
             ),
@@ -461,7 +446,6 @@ async def test_saved_input_new_run_and_active_artifact_deletion(
                                 "artifact_id": artifact.artifact_id,
                             }
                         },
-                        "expected_state": {"generation": 0, "revision": 0},
                     },
                 ),
                 _tool(
@@ -475,7 +459,6 @@ async def test_saved_input_new_run_and_active_artifact_deletion(
                                 "artifact_id": other.artifact_id,
                             }
                         },
-                        "expected_state": {"generation": 1, "revision": 1},
                     },
                 ),
                 ModelResponse(finish_reason=FinishReason.STOP, text="input deleted"),

@@ -37,24 +37,7 @@ OBJECTIVE = "Record New Co in the companies table."
 
 
 def write_steps(batch: Mapping[str, object], *, then: ModelResponse) -> list[Any]:
-    """Load the upsert tool, preview the fixture's one row, apply it, then ``then``."""
-
-    def apply(request: ModelRequest) -> ModelResponse:
-        preview = tool_result(request, "preview")
-        assert not preview.is_error, preview.output
-        data = preview.output["data"]
-        assert isinstance(data, Mapping)
-        return reply(
-            ToolCall(
-                "write",
-                "data_upsert_rows",
-                {
-                    **batch,
-                    "mode": "apply",
-                    "preview_fingerprint": data["preview_fingerprint"],
-                },
-            )
-        )
+    """Load the upsert tool, write the fixture's one row in one call, then ``then``."""
 
     def after(request: ModelRequest) -> ModelResponse:
         write = tool_result(request, "write")
@@ -63,8 +46,7 @@ def write_steps(batch: Mapping[str, object], *, then: ModelResponse) -> list[Any
 
     return [
         reply(ToolCall("load", "toolbox_load", {"tool_names": ["data_upsert_rows"]})),
-        reply(ToolCall("preview", "data_upsert_rows", {**batch, "mode": "preview"})),
-        apply,
+        reply(ToolCall("write", "data_upsert_rows", dict(batch))),
         after,
     ]
 

@@ -46,7 +46,6 @@ async def test_public_agent_runs_python_and_dependent_cell(tmp_path):
                 "python_execute",
                 {
                     "code": "answer = 6 * 7; print(answer)",
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
             _tool(
@@ -54,7 +53,6 @@ async def test_public_agent_runs_python_and_dependent_cell(tmp_path):
                 "python_execute",
                 {
                     "code": "print(answer + 1)",
-                    "expected_state": {"generation": 1, "revision": 1},
                 },
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="42 and 43"),
@@ -158,7 +156,6 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
                         "python_execute",
                         {
                             "code": "raise AssertionError('must not execute')",
-                            "expected_state": {"generation": 0, "revision": 0},
                             "inputs": {
                                 "old": {
                                     "kind": "artifact",
@@ -192,7 +189,6 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
                                 if batch
                                 else ""
                             ),
-                            "expected_state": {"generation": 0, "revision": 0},
                             **(
                                 {"save_outputs": ["answer", "recipe"]}
                                 if batch
@@ -289,7 +285,6 @@ async def test_explicit_analysis_save_commits_one_artifact_and_persists_provenan
                 "python_execute",
                 {
                     "code": "open('answer.txt', 'w').write('42\\n')\noutputs.add('answer','answer.txt')",
-                    "expected_state": {"generation": 0, "revision": 0},
                     "save_output": "answer",
                 },
             ),
@@ -336,7 +331,6 @@ async def test_nonstandard_json_constants_never_publish_artifacts(tmp_path, cons
                 {
                     "code": f"open('dataset.json','w').write({payload!r})\n"
                     "outputs.add('dataset','dataset.json')",
-                    "expected_state": {"generation": 0, "revision": 0},
                     "save_output": "dataset",
                 },
             ),
@@ -380,7 +374,6 @@ async def test_batch_publication_retains_exact_outputs_and_reports_partial_failu
                     "code": "open('answer.json','w').write('{\"n\":42}')\n"
                     "open('recipe.py','w').write('print(42)')\n"
                     "outputs.add('answer','answer.json')\noutputs.add('recipe','recipe.py')",
-                    "expected_state": {"generation": 0, "revision": 0},
                     "save_outputs": [
                         "answer",
                         "absent" if failure == "missing_candidate" else "recipe",
@@ -475,7 +468,6 @@ async def test_batch_reads_overlap_finish_out_of_order_and_retain_individual_err
                 "python_execute",
                 {
                     "code": "rs = tools.batch([{'name':'file_read','arguments':{'source_id':'s1','path':p}} for p in ['one.txt','missing.txt','two.txt']])\nassert [r['is_error'] for r in rs] == [False,True,False], rs\nassert [rs[i]['output']['data']['content'] for i in [0,2]] == ['17','25'], rs\nprint('ordered')",
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="42"),
@@ -569,7 +561,6 @@ async def test_batch_rejects_whole_envelopes_before_io_and_counts_attempts(
                 "python_execute",
                 {
                     "code": f"rs = tools.batch({calls!r})\nassert len(rs) == 3 and all(r['is_error'] for r in rs), rs\nprint('denied')",
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="denied"),
@@ -635,7 +626,6 @@ async def test_batch_interruption_settles_dispatched_and_queued_children(
                 "python_execute",
                 {
                     "code": code,
-                    "expected_state": {"generation": 0, "revision": 0},
                     # The cell budget also covers worker start and first dispatch,
                     # so a tighter one can expire before the blocked read begins.
                     "timeout_seconds": 2 if interruption == "timeout" else 30,
@@ -715,7 +705,6 @@ async def test_batch_trace_exhaustion_dispatches_nothing_and_retains_requested_u
                 "python_execute",
                 {
                     "code": "tools.batch([{'name':'file_read','arguments':{'source_id':'s1','path':'one.txt'}}]*3)",
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
             ModelResponse(
@@ -761,7 +750,9 @@ async def test_python_threads_serialize_batches_and_keep_each_response_identity(
             _tool(
                 "batch",
                 "python_execute",
-                {"code": code, "expected_state": {"generation": 0, "revision": 0}},
+                {
+                    "code": code,
+                },
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="Read both."),
         )
@@ -869,7 +860,6 @@ async def test_batch_uses_distinct_source_lanes_and_rechecks_revoked_authority(
                 "python_execute",
                 {
                     "code": f"rs = tools.batch({children!r})\nassert [r['is_error'] for r in rs] == [True,True,False], rs\nassert rs[2]['output']['data']['rows'] == [{{'n':42}}]\nprint('revalidated')",
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
             ModelResponse(
@@ -949,7 +939,6 @@ async def test_worker_rejects_stale_batch_response_identity_without_replay(
                 "python_execute",
                 {
                     "code": "tools.batch([{'name':'file_read','arguments':{'source_id':'s1','path':'one.txt'}}])",
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
             ModelResponse(
@@ -1014,7 +1003,6 @@ async def test_real_python_broker_reads_and_denies_recursive_calls(
                     "\nprint(r)\n"
                     "assert not r['is_error']\n"
                     "denied = tools.call('python_execute', {})\nassert denied['is_error']",
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="Read complete"),
@@ -1152,7 +1140,6 @@ async def test_exact_arrow_export_bind_compute_and_reopen(tmp_path, handoff):
                     f"assert sha256(open(inputs.path('rows'), 'rb').read()).hexdigest() == {digest_expression}\n"
                     f"assert table.num_rows == {len(expected)}\nprint(sum(table.column('alias').to_pylist()))",
                     "inputs": inputs,
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             )
 
@@ -1357,7 +1344,6 @@ async def test_capture_failure_retains_publication_without_query_replay(
                         else ""
                     )
                     + "print('bounded failure')",
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
             ModelResponse(
@@ -1515,7 +1501,6 @@ async def test_capture_metadata_delivery_bound_keeps_committed_reference(
                     "capture",
                     "python_execute",
                     {
-                        "expected_state": {"generation": 0, "revision": 0},
                         "code": f"r = tools.capture('data_query', {arguments!r}, name='wide')\nassert r['is_error'], r\nassert r['output']['artifact']['artifact_id']\nprint('reference retained')",
                     },
                 ),

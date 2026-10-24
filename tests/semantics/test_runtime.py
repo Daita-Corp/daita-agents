@@ -17,7 +17,6 @@ from daita.llm.models import (
     FinishReason,
     ModelProfile,
     ModelResponse,
-    ModelSensitivity,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -36,7 +35,7 @@ from daita.semantics import (
 from daita.tui.commands import (
     learning_invocation_message as _learning_invocation_message,
 )
-from tests.support.capability_runtime import execute_projected, make_run_session
+from tests.support.capability_runtime import make_run_session
 from tests.support.toolbox_model import (
     ToolboxAwareMockModelProvider as MockModelProvider,
     result_ref,
@@ -133,7 +132,6 @@ async def test_schema_bound_memory_redirects_to_semantics_and_survives_restart(
                 _semantic_call(
                     source.id,
                     resource.id,
-                    resource.current_revision,
                     statement=statement,
                 )
             ),
@@ -176,7 +174,6 @@ async def test_schema_bound_memory_redirects_to_semantics_and_survives_restart(
 def _semantic_call(
     source_id: str,
     resource_id: str,
-    revision: str,
     *,
     call_id: str = "semantic-save",
     annotation_id: str = "booked-revenue",
@@ -184,7 +181,6 @@ def _semantic_call(
     field_name: str = "booked_at",
     evidence_kind: str = "user_assertion",
     tool_call_id: str | None = None,
-    expected_sha256: str | None = None,
     supersedes_id: str | None = None,
 ) -> ToolCall:
     evidence: dict[str, object] = {"kind": evidence_kind}
@@ -200,10 +196,7 @@ def _semantic_call(
         "kind": "metric_definition",
         "statement": statement,
         "evidence": [evidence],
-        "catalog_revisions": [{"resource_id": resource_id, "revision": revision}],
     }
-    if expected_sha256 is not None:
-        arguments["expected_sha256"] = expected_sha256
     if supersedes_id is not None:
         arguments["supersedes_id"] = supersedes_id
     return ToolCall(id=call_id, name=SEMANTIC_SAVE_TOOL_NAME, arguments=arguments)
@@ -337,7 +330,7 @@ async def test_missing_approval_and_denial_bind_current_evidence_without_state(
     tmp_path,
 ):
     _, source, resource = await _seed_source(tmp_path, "semantic-denial")
-    call = _semantic_call(source.id, resource.id, resource.current_revision)
+    call = _semantic_call(source.id, resource.id)
 
     provider = MockModelProvider((_call(call), _stop("not saved")))
     agent = await Agent.open(
@@ -366,7 +359,6 @@ async def test_missing_approval_and_denial_bind_current_evidence_without_state(
     denied_call = _semantic_call(
         source.id,
         resource.id,
-        resource.current_revision,
     )
     denied_arguments = dict(denied_call.arguments)
     denied_arguments["evidence"] = [
@@ -423,32 +415,22 @@ async def test_catalog_and_transcript_evidence_fail_before_approval(tmp_path):
         _semantic_call(
             source.id,
             "catalog-resource:sha256:" + "e" * 64,
-            "missing-revision",
             annotation_id="missing-resource",
         ),
         _semantic_call(
             "source:sha256:" + "f" * 64,
             resource.id,
-            resource.current_revision,
             annotation_id="source-mismatch",
         ),
         _semantic_call(
             source.id,
             resource.id,
-            "stale-revision",
-            annotation_id="stale-revision",
-        ),
-        _semantic_call(
-            source.id,
-            resource.id,
-            resource.current_revision,
             annotation_id="missing-field",
             field_name="missing",
         ),
         _semantic_call(
             source.id,
             resource.id,
-            resource.current_revision,
             annotation_id="bad-evidence",
             evidence_kind="tool_result",
             tool_call_id="missing-call",
@@ -472,7 +454,6 @@ async def test_catalog_and_transcript_evidence_fail_before_approval(tmp_path):
         for prompt in (
             "Teach the missing resource definition.",
             "Teach the source-mismatched definition.",
-            "Teach stale.",
             "Teach missing.",
             "Teach invalid evidence.",
         ):
@@ -480,7 +461,6 @@ async def test_catalog_and_transcript_evidence_fail_before_approval(tmp_path):
         assert tuple(_error_code(item) for item in _tool_results(provider)) == (
             "resource_read_not_allowed",
             "source_scope_violation",
-            "semantic_stale_revision",
             "semantic_unknown_field",
             "result_ref_invalid",
         )
@@ -498,49 +478,45 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
         approvals.append(request)
         return ApprovalDecision.APPROVE
 
-    create = _semantic_call(
-        source.id,
-        resource.id,
-        resource.current_revision,
-    )
-    missing_replacement_digest = _semantic_call(
-        source.id,
-        resource.id,
-        resource.current_revision,
-        statement="Booked revenue uses the paid timestamp.",
-    )
-    stale_replacement_digest = _semantic_call(
-        source.id,
-        resource.id,
-        resource.current_revision,
-        statement="Booked revenue uses the paid timestamp.",
-        expected_sha256="0" * 64,
-    )
-    missing_delete_digest = ToolCall(
-        id="delete-missing",
-        name=SEMANTIC_SAVE_TOOL_NAME,
-        arguments={"action": "delete", "id": "booked-revenue"},
-    )
-    stale_delete_digest = ToolCall(
-        id="delete-stale",
-        name=SEMANTIC_SAVE_TOOL_NAME,
-        arguments={
-            "action": "delete",
-            "id": "booked-revenue",
-            "expected_sha256": "0" * 64,
-        },
+    def replace_with(statement: str, call_id: str) -> ToolCall:
+        return _semantic_call(
+            source.id, resource.id, call_id=call_id, statement=statement
+        )
+
+    def view(call_id: str) -> ToolCall:
+        return ToolCall(
+            id=call_id, name="semantic_view", arguments={"id": "booked-revenue"}
+        )
+
+    def delete(call_id: str) -> ToolCall:
+        return ToolCall(
+            id=call_id,
+            name=SEMANTIC_SAVE_TOOL_NAME,
+            arguments={"action": "delete", "id": "booked-revenue"},
+        )
+
+    # Each run names what it changes; Daita binds the version that run viewed.
+    runs = (
+        (_semantic_call(source.id, resource.id),),
+        (replace_with("Booked revenue uses the paid timestamp.", "blind"),),
+        (
+            view("view-1"),
+            replace_with("Booked revenue uses invoices.paid_at.", "replace-1"),
+            replace_with("Booked revenue uses invoices.issued_at.", "stale-1"),
+        ),
+        (delete("blind-delete"),),
+        (
+            view("view-2"),
+            replace_with("Booked revenue uses invoices.booked_at.", "replace-2"),
+            delete("stale-delete"),
+        ),
+        (view("view-3"), delete("delete")),
     )
     provider = MockModelProvider(
         tuple(
             item
-            for call in (
-                create,
-                missing_replacement_digest,
-                stale_replacement_digest,
-                missing_delete_digest,
-                stale_delete_digest,
-            )
-            for item in (_call(call), _stop("continued"))
+            for calls in runs
+            for item in (*(_call(call) for call in calls), _stop("continued"))
         )
     )
     agent = await Agent.open(
@@ -558,55 +534,26 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
         for message in (
             "Create the definition.",
             "Replace without loading.",
-            "Replace from a stale view.",
+            "Replace twice from one view.",
             "Delete the definition without loading.",
-            "Delete the definition from a stale view.",
+            "Change it, then delete it from the earlier view.",
+            "Delete the definition.",
         ):
             await agent.learn(message)
-        results = _tool_results(provider)
-        assert results[0].is_error is False
-        assert tuple(_error_code(item) for item in results[1:]) == (
-            "semantic_expected_sha256_required",
-            "semantic_stale_digest",
-            "missing_arguments",
-            "semantic_stale_digest",
-        )
-        assert len(approvals) == 1
-        current = await agent.read_semantic_annotation("booked-revenue")
-        assert current is not None
-        assert current.annotation.statement == (
-            "Booked revenue uses invoices.booked_at."
-        )
-        delete_run = RunInput(
-            id="delete-approved-run",
-            agent_id=agent.id,
-            message="forget the definition",
-            created_at=NOW,
-            conversation_id="delete-approved-conversation",
-            source_scope_ids=(source.id,),
-        )
-        runtime = agent._embedded._capability_runtime
-        deleted = (
-            await execute_projected(
-                runtime,
-                delete_run,
-                (
-                    ToolCall(
-                        id="delete-approved",
-                        name=SEMANTIC_SAVE_TOOL_NAME,
-                        arguments={
-                            "action": "delete",
-                            "id": current.annotation.id,
-                            "expected_sha256": current.sha256,
-                        },
-                    ),
-                ),
-                sensitivity=ModelSensitivity.INTERNAL,
-                session_options=RunSessionOptions(explicit_learning=True),
-            )
-        )[0]
-        assert deleted.is_error is False
-        assert len(approvals) == 2
+        results = {item.call_id: item for item in _tool_results(provider)}
+        assert {
+            call_id: _error_code(results[call_id])
+            for call_id in ("blind", "stale-1", "blind-delete", "stale-delete")
+        } == {
+            "blind": "semantic_view_required",
+            "stale-1": "semantic_stale_digest",
+            "blind-delete": "semantic_view_required",
+            "stale-delete": "semantic_stale_digest",
+        }
+        for call_id in ("semantic-save", "replace-1", "replace-2", "delete"):
+            assert results[call_id].is_error is False, results[call_id].output
+        # Stale changes fail before their card; each success asked once.
+        assert len(approvals) == 4
         assert await agent.read_semantic_annotation("booked-revenue") is None
     finally:
         await agent.close()
@@ -623,7 +570,6 @@ async def test_state_change_during_semantic_approval_returns_state_changed(
                 _semantic_call(
                     source.id,
                     resource.id,
-                    resource.current_revision,
                 )
             ),
             _stop("state changed"),
@@ -690,7 +636,6 @@ async def test_tool_result_evidence_is_valid_and_save_is_recalled_after_reopen(
     semantic = _semantic_call(
         source.id,
         resource.id,
-        resource.current_revision,
         evidence_kind="tool_result",
         tool_call_id="query-1",
     )
@@ -776,7 +721,6 @@ async def test_natural_language_and_learn_route_to_semantics_without_new_command
                 _semantic_call(
                     source.id,
                     resource.id,
-                    resource.current_revision,
                     statement="Natural language booked revenue uses booked_at.",
                 )
             ),

@@ -386,13 +386,12 @@ async def test_bulk_update_uses_exact_preview_approval_commit_and_readback(
         for request in approvals:
             document = data_write_approval(request)
             assert document is not None
-            expected_rows = document["arguments"]["expected_affected_rows"]
-            preview_fingerprint = document["arguments"]["preview_fingerprint"]
-            assert isinstance(expected_rows, int)
-            assert expected_rows == document["preview"]["matched_rows"]
-            assert expected_rows > 1
-            assert isinstance(preview_fingerprint, str)
-            assert preview_fingerprint.startswith("sha256:")
+            # Daita's own preview is on the card; nothing was copied back.
+            matched_rows = document["preview"]["matched_rows"]
+            assert isinstance(matched_rows, int) and matched_rows > 1
+            assert not {"preview_fingerprint", "expected_affected_rows"} & set(
+                document["arguments"]
+            )
     finally:
         await agent.close()
         await _restore_bulk_priority(port=port, password=password)

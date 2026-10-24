@@ -19,6 +19,7 @@ from tests.support.approval_learning import (
     Capability,
     FrozenInstanceError,
     FrozenJsonObject,
+    Mapping,
     MockModelProvider,
     OperationalEffect,
     SideEffectExecutor,
@@ -42,6 +43,7 @@ from tests.support.approval_learning import (
     threading,
     workspace_for,
 )
+from tests.support.capability_runtime import argument_issues
 
 
 def test_approval_records_and_write_invariants_are_exact_and_frozen():
@@ -267,7 +269,10 @@ async def test_oversized_content_is_rejected_before_approval(tmp_path):
                 _memory_call(content="x" * (MEMORY_MAX_CHARACTERS + 1)),
             )
         )[0]
-        assert _error_code(schema_result) == "invalid_argument_value"
+        assert _error_code(schema_result) == "invalid_arguments"
+        error = schema_result.output["error"]
+        assert isinstance(error, Mapping)
+        assert argument_issues(error["details"])[0]["code"] == "invalid_argument_value"
         preflight_result = (
             await _execute(
                 agent,

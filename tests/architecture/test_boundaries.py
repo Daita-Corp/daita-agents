@@ -364,8 +364,9 @@ def test_bound_text_edit_has_one_artifact_producer_and_publication_owner():
     assert isinstance(edit_required, (tuple, list))
     assert isinstance(save_properties, Mapping)
     assert isinstance(save_required, (tuple, list))
-    assert set(edit_properties) == {"binding", "replacements"}
-    assert set(edit_required) == {"binding", "replacements"}
+    # The edit names its file_read; the binding never passes through the model.
+    assert set(edit_properties) == {"result_ref", "path", "replacements"}
+    assert set(edit_required) == {"replacements"}
     assert set(save_properties) == {
         "artifact_id",
         "mode",
@@ -373,8 +374,8 @@ def test_bound_text_edit_has_one_artifact_producer_and_publication_owner():
         "filename",
     }
     assert set(save_required) == {"artifact_id", "mode"}
+    # An edit's path only names a file this run already read with file_read.
     assert not {
-        "path",
         "relative_path",
         "revision",
         "physical_revision",

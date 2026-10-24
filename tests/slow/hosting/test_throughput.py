@@ -519,9 +519,7 @@ class _NativeProvider(_Provider):
                 ),
             )
         else:
-            arguments: dict[str, object] = {
-                "expected_state": {"generation": 0, "revision": 0}
-            }
+            arguments: dict[str, object] = {}
             if self.mode in {"capture", "export_bind"}:
                 if self.mode == "capture":
                     prefix = f"r = tools.capture('data_query', {self.export_arguments!r}, name='rows')\nassert not r['is_error'], r\n"

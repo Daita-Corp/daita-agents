@@ -315,7 +315,7 @@ async def test_mode_selects_the_existing_capability_and_strips_the_selector():
     [
         ({"target": "row-1"}, "invalid_argument_value"),
         ({"mode": "delete", "target": "row-1"}, "invalid_argument_value"),
-        ({"mode": "apply", "target": "row-1"}, "missing_arguments"),
+        ({"mode": "apply", "target": "row-1"}, "invalid_arguments"),
     ],
 )
 async def test_invalid_mode_or_route_arguments_never_reach_an_executor(arguments, code):

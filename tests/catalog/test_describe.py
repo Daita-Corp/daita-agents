@@ -48,6 +48,7 @@ from tests.catalog._schema_support import (
     sqlite3,
     workspace_for,
 )
+from tests.support.capability_runtime import argument_issues
 from tests.support.wide_catalog import (
     CHAIN as WIDE_CHAIN,
     COLUMN_COUNT as WIDE_COLUMN_COUNT,
@@ -447,7 +448,7 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
                     capability_id,
                     {"query": "orders", "limit": limit},
                 )
-            assert invalid_limit.value.code == "invalid_argument_value"
+            assert invalid_limit.value.code == "invalid_arguments"
             assert _validation_details(invalid_limit.value) == {
                 "constraint": "maximum",
                 "name": "limit",
@@ -509,10 +510,16 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
                     "limit": CATALOG_TOOL_DEFAULT_LIMIT,
                 },
             )
-        assert _validation_details(duplicate_resources.value) == {
-            "constraint": "uniqueItems",
-            "name": "resource_ids",
-        }
+        # Every problem comes back at once: the duplicate and each malformed id.
+        assert duplicate_resources.value.code == "invalid_arguments"
+        assert [
+            (issue["constraint"], issue["name"])
+            for issue in argument_issues(duplicate_resources.value.details)
+        ] == [
+            ("uniqueItems", "resource_ids"),
+            ("pattern", "resource_ids[0]"),
+            ("pattern", "resource_ids[1]"),
+        ]
 
         assert CatalogSearchRequest(agent_id="agent", query="orders").limit == (
             CATALOG_SEARCH_REQUEST_DEFAULT_LIMIT
@@ -641,7 +648,7 @@ async def test_catalog_describe_invalid_input_never_reaches_catalog_execution(
             _mapping(_mapping(result.output)["error"])["code"] for result in results
         )
         assert error_codes == (
-            "invalid_argument_value",
+            "invalid_arguments",
             "catalog_invalid_describe",
             "catalog_invalid_describe",
             "catalog_invalid_describe",
@@ -902,11 +909,16 @@ async def _describe(
 
 
 def _validation_details(error: CapabilityInputError) -> dict[str, object]:
+    """The one structural issue of an ``invalid_arguments`` error."""
+
     details = dict(error.details.to_dict())
     recovery = details.pop("recovery")
     assert isinstance(recovery, dict)
     assert recovery["kind"] == "correct_arguments"
-    return details
+    assert error.code == "invalid_arguments"
+    (issue,) = argument_issues(details)
+    assert issue["code"] == "invalid_argument_value"
+    return {"constraint": issue["constraint"], "name": issue["name"]}
 
 
 def _field_names(value: object) -> set[str]:

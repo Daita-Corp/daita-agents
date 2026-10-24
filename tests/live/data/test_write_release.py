@@ -96,10 +96,9 @@ async def test_mixed_upsert_generated_identity_exact_receipt_and_unchanged_repea
     assert len(database.approvals) == 1
     approved_arguments = database.approvals[0].arguments["arguments"]
     assert isinstance(approved_arguments, Mapping)
-    assert (
-        approved_arguments["preview_fingerprint"]
-        == receipt.payload["preview_fingerprint"]
-    )
+    # The receipt binds Daita's own preview; the approved call carried none.
+    assert "preview_fingerprint" not in approved_arguments
+    assert str(receipt.payload["preview_fingerprint"]).startswith("sha256:")
     database.upsert(rows)
     await database.run()
     receipts = await database.agent.list_effects()

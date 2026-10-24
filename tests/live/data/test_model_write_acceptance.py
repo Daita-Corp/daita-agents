@@ -28,6 +28,7 @@ from tests.support.postgresql_live_harness import (
     REPORT_INSTRUCTION,
     USER_FLOW_LIMITS,
     assert_exact_preview,
+    assert_one_call,
     assert_preview_binding,
     calls_for,
     evaluate,
@@ -211,6 +212,7 @@ async def test_live_mixed_upsert_and_unchanged_repeat(database, scenario_factory
             ),
         )
         assert_exact_preview(scenario, transcript)
+        assert_one_call(scenario.evidence[transcript.run.id])
         receipt = await database.receipt(EffectOutcome.SUCCEEDED)
         assert tuple(
             receipt.payload[key]
@@ -232,6 +234,7 @@ async def test_live_mixed_upsert_and_unchanged_repeat(database, scenario_factory
             user_prompt="Please check and save that same batch again, even if nothing has changed, and tell me the result.",
         )
         assert_exact_preview(scenario, repeated_transcript)
+        assert_one_call(scenario.evidence[repeated_transcript.run.id])
         receipts = await scenario.agent.list_effects()
         assert len(receipts) == 2
         unchanged = next(
@@ -303,9 +306,10 @@ async def test_live_drift_during_approval_does_not_reapply(database, scenario_fa
             user_prompt="Please change the name of the company whose domain is existing.test to Updated. Leave everything else alone and let me know the result.",
         )
         assert_exact_preview(scenario, transcript, "update")
-        # Post-approval drift is final for the request in both profiles: the
-        # framework recovery says stop and report, so the user_flow prompt
-        # needs no stop rule and the model never re-previews or re-applies.
+        # One call: Daita's own preview was on the card. Post-approval drift is
+        # final for the request in both profiles: the framework recovery says
+        # stop and report, so the model never re-previews or re-applies.
+        assert_one_call(scenario.evidence[transcript.run.id], "update")
         assert (
             len(
                 calls_for(
@@ -557,10 +561,9 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
         ):
             receipt = next(item for item in receipts if item.run_id == run.run_id)
             assert receipt.call_id == call.id
-            assert (
-                receipt.payload["preview_fingerprint"]
-                == call.arguments["preview_fingerprint"]
-            )
+            # The receipt binds Daita's own preview; the call carried none.
+            assert str(receipt.payload["preview_fingerprint"]).startswith("sha256:")
+            assert "preview_fingerprint" not in call.arguments
             assert (
                 tuple(
                     receipt.payload[key]

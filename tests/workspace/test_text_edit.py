@@ -52,6 +52,7 @@ from daita.loop.models import (
     RunStartEnvelope,
 )
 from tests.support.distribution import inbox_distribution_plan
+from tests.support.toolbox_model import cite_result_refs, result_ref
 
 
 class _EditWorkflowProvider:
@@ -65,8 +66,13 @@ class _EditWorkflowProvider:
         after_edit: Callable[[], None] | None = None,
         target_path: str = "config.yaml",
         save: bool = True,
+        reference: Mapping[str, object] | None = None,
     ) -> None:
         self.replacements = replacements
+        # The edit names its earlier read; nothing is copied from the result.
+        self.reference = (
+            {"result_ref": result_ref("read")} if reference is None else reference
+        )
         self.after_read = after_read
         self.after_edit = after_edit
         self.target_path = target_path
@@ -100,14 +106,13 @@ class _EditWorkflowProvider:
         if edit is None:
             if "artifact_edit_text" not in visible:
                 return self._load("artifact_edit_text")
-            data = read.output.get("data")
-            assert isinstance(data, Mapping)
-            binding = data.get("binding")
-            assert isinstance(binding, str)
-            return _call(
-                "edit",
-                "artifact_edit_text",
-                {"binding": binding, "replacements": self.replacements},
+            return cite_result_refs(
+                _call(
+                    "edit",
+                    "artifact_edit_text",
+                    {**self.reference, "replacements": self.replacements},
+                ),
+                request,
             )
         if edit.is_error:
             return _stop("edit failed")
@@ -879,6 +884,44 @@ async def _prepare_only_edit(
     return agent, target, result.artifacts[0].artifact_id
 
 
+@pytest.mark.parametrize(
+    ("reference", "code"),
+    (
+        ({"path": "config.yaml"}, None),
+        # A result that is not a file_read, and a path this run never read.
+        ({"result_ref": result_ref("load-1")}, "result_ref_invalid"),
+        ({"path": "other.yaml"}, "artifact_edit_binding_invalid"),
+        (
+            {"path": "config.yaml", "result_ref": result_ref("read")},
+            "artifact_edit_binding_invalid",
+        ),
+    ),
+)
+async def test_edit_names_its_read_and_a_forged_reference_is_refused(
+    tmp_path: Path, reference: dict[str, object], code: str | None
+) -> None:
+    provider = _EditWorkflowProvider(
+        ({"old_text": "timeout: 30", "new_text": "timeout: 60"},),
+        save=False,
+        reference=reference,
+    )
+    agent, workspace = await _agent(tmp_path, provider)
+    (workspace / "config.yaml").write_text("timeout: 30\n", encoding="utf-8")
+    (workspace / "other.yaml").write_text("timeout: 30\n", encoding="utf-8")
+    try:
+        result = await agent.run("Prepare the timeout edit")
+        edit = _results(provider.requests[-1])["edit"]
+        if code is None:
+            assert not edit.is_error and len(result.artifacts) == 1
+            return
+        assert edit.is_error and result.artifacts == ()
+        error = edit.output["error"]
+        assert isinstance(error, Mapping)
+        assert error["code"] == code
+    finally:
+        await agent.close()
+
+
 @pytest.mark.parametrize("rename_scope", ("workspace", "parent"))
 async def test_namespace_drift_immediately_before_publication_preserves_target(
     tmp_path: Path,
@@ -1153,13 +1196,16 @@ async def test_raw_edit_and_replacement_targets_fail_before_workspace_or_artifac
         }
         assert set(errors) == {"forged-edit", "forged-save"}
         assert all(block.is_error for block in errors.values())
-        assert errors["forged-edit"].output["error"]["code"] in {  # type: ignore[index]
-            "missing_arguments",
-            "unexpected_arguments",
-        }
-        assert errors["forged-save"].output["error"]["code"] == (  # type: ignore[index]
-            "unexpected_arguments"
+        assert errors["forged-edit"].output["error"]["code"] == (  # type: ignore[index]
+            "invalid_arguments"
         )
+        assert errors["forged-save"].output["error"]["code"] == (  # type: ignore[index]
+            "invalid_arguments"
+        )
+        # Every forged field is reported at once, each as unexpected.
+        issues = errors["forged-edit"].output["error"]["details"]["issues"]  # type: ignore[index]
+        assert {issue["name"] for issue in issues} == {"revision", "content"}
+        assert {issue["code"] for issue in issues} == {"unexpected_arguments"}
     finally:
         await agent.close()
 

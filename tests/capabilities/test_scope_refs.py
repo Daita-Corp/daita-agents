@@ -294,12 +294,14 @@ async def test_unissued_handles_and_garbled_ids_fail_before_dispatch(store, rig)
         error = result.output["error"]
         assert result.is_error and isinstance(error, Mapping)
         assert error["code"] == (
-            "invalid_argument_value" if family is None else f"{family}_ref_invalid"
+            "invalid_arguments" if family is None else f"{family}_ref_invalid"
         )
         assert isinstance(detail := error["details"], Mapping)
         assert detail["execution_disposition"] == "not_dispatched"
-        assert detail["name"] == name
-        details.append(detail)
+        # A garbled id is a schema problem, reported among the call's issues.
+        issue = detail if family is not None else detail["issues"][0]
+        assert issue["name"] == name
+        details.append(issue)
     assert details[0]["recovery"] == _frozen(
         {
             "kind": "correct_arguments",

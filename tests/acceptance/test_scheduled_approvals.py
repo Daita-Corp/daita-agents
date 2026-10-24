@@ -90,24 +90,7 @@ def _tool_result(request: ModelRequest, call_id: str) -> ToolResultBlock:
 
 
 def _write_script(batch: Mapping[str, object]) -> list[Step]:
-    """Preview, then apply, the fixture's one-row upsert; report what happened."""
-
-    def apply(request: ModelRequest) -> ModelResponse:
-        preview = _tool_result(request, "preview")
-        assert not preview.is_error, preview.output
-        data = preview.output["data"]
-        assert isinstance(data, Mapping)
-        return response(
-            ToolCall(
-                "write",
-                "data_upsert_rows",
-                {
-                    **batch,
-                    "mode": "apply",
-                    "preview_fingerprint": data["preview_fingerprint"],
-                },
-            )
-        )
+    """Write the fixture's one-row upsert in one call; report what happened."""
 
     def report(request: ModelRequest) -> ModelResponse:
         write = _tool_result(request, "write")
@@ -121,8 +104,7 @@ def _write_script(batch: Mapping[str, object]) -> list[Step]:
         response(
             ToolCall("load", "toolbox_load", {"tool_names": ["data_upsert_rows"]})
         ),
-        response(ToolCall("preview", "data_upsert_rows", {**batch, "mode": "preview"})),
-        apply,
+        response(ToolCall("write", "data_upsert_rows", dict(batch))),
         report,
     ]
     return [_measured(step) for step in steps]

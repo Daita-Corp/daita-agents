@@ -261,10 +261,15 @@ async def run_live_text_edit_scenario(
     assert read_call.arguments["path"] == _RELATIVE_PATH
     assert set(read_call.arguments) <= {"source_id", "path", "position"}
     assert read_call.arguments.get("position") in {None, "start"}
-    assert set(edit_call.arguments) == {"binding", "replacements"}
-    assert edit_call.arguments["binding"] == binding
+    # The edit names its read; the binding never passes through the model.
+    reference = set(edit_call.arguments) - {"replacements"}
+    assert reference in ({"result_ref"}, {"path"}), edit_call.arguments
+    if reference == {"path"}:
+        assert edit_call.arguments["path"] == _RELATIVE_PATH
+    else:
+        assert edit_call.arguments["result_ref"] == read_call.id
     assert not {
-        "path",
+        "binding",
         "revision",
         "physical_revision",
         "content",

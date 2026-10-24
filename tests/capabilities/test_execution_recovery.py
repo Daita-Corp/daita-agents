@@ -46,6 +46,7 @@ from tests.capabilities._toolbox_support import (
     _presentation,
     _run,
 )
+from tests.support.capability_runtime import argument_issues
 
 _POLICY = ExecutionAdmissionPolicy(
     shape="test.bounded_read",
@@ -429,7 +430,8 @@ async def test_correct_arguments_recovery_for_invalid_arguments():
     bad = ToolCall(id="bad", name="bounded_read", arguments={"unknown": "x"})
     result = (await _execute(runtime, run, projection, bad)).ordered_results[0]
 
-    assert _error_code(result) == "unexpected_arguments"
+    assert _error_code(result) == "invalid_arguments"
+    assert argument_issues(_details(result))[0]["code"] == "unexpected_arguments"
     assert _recovery(result)["kind"] == "correct_arguments"
     assert _details(result)["execution_disposition"] == "not_dispatched"
     assert _dispatches(executors) == 0

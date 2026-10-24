@@ -12,7 +12,6 @@ import importlib.metadata
 import json
 import os
 import platform
-import re
 import subprocess
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -170,7 +169,8 @@ def calls_for(evidence, tool_name, mode=None):
         call
         for call, _ in evidence
         if call.name == tool_name
-        and (mode is None or call.arguments.get("mode") == mode)
+        # A write call that omits mode applies: one call writes.
+        and (mode is None or call.arguments.get("mode", "apply") == mode)
     ]
 
 
@@ -298,8 +298,8 @@ class Evaluation:
             "resource_id": self.db.resource_id,
             "where": [{"column": "id", "operator": "eq", "value": 1}],
             "assignments": [{"column": "name", "value": "Updated"}],
-            "expected_affected_rows": 1,
         }
+        self.expected_matched_rows = 1
 
     def write_is_exact(self, request):
         if self.expected_write is None:
@@ -319,19 +319,13 @@ class Evaluation:
             or review["target"].get("resource_id") != self.db.resource_id
         ):
             return False
-        fingerprint = args.pop("preview_fingerprint", None)
-        if (
-            not isinstance(fingerprint, str)
-            or re.fullmatch(r"sha256:[0-9a-f]{64}", fingerprint) is None
-        ):
-            return False
         # Model-derived lineage is validated by the production domain, never by
         # approval. Its presence cannot change the approved target or row values.
         args.pop("evidence_call_ids", None)
         expected = dict(self.expected_write)
         # Any equality-only selector of the intended row that names a unique key
-        # is the same approved write in both profiles; production re-checks the
-        # preview fingerprint for drift before applying it.
+        # is the same approved write in both profiles; production re-checks its
+        # own preview for drift before applying it.
         if operation == "update":
             if set(review["target"]) - TARGET_KEYS:
                 return False
@@ -356,7 +350,7 @@ class Evaluation:
                 return False
             if (
                 type(preview["matched_rows"]) is not int
-                or preview["matched_rows"] != expected["expected_affected_rows"]
+                or preview["matched_rows"] != self.expected_matched_rows
             ):
                 return False
             samples = preview["samples"]
@@ -922,22 +916,19 @@ def assert_preview_binding(evidence, operation="upsert"):
         f"Calls by mode: {write_call_summary(evidence, tool_name)}. "
         "A missing write or duplicate request fails effectiveness."
     )
-    call = calls[0]
-    preview_ids = {
-        item.id for item in calls_for(evidence, f"data_{operation}_rows", "preview")
-    }
-    previews = [
-        block
-        for _, block in evidence
-        if block is not None and block.call_id in preview_ids and not block.is_error
-    ]
-    assert any(
-        isinstance(block.output["data"], Mapping)
-        and block.output["data"]["preview_fingerprint"]
-        == call.arguments["preview_fingerprint"]
-        for block in previews
+    # The write is one call: nothing is copied from an earlier preview.
+    assert "preview_fingerprint" not in calls[0].arguments
+    return calls[0]
+
+
+def assert_one_call(evidence, operation="upsert"):
+    """The write took one call, with no separate mode=preview call first."""
+
+    tool_name = f"data_{operation}_rows"
+    assert not calls_for(evidence, tool_name, "preview"), (
+        f"Expected one {tool_name} call; calls by mode: "
+        f"{write_call_summary(evidence, tool_name)}."
     )
-    return call
 
 
 def assert_exact_preview(scenario, transcript, operation="upsert"):
@@ -954,32 +945,31 @@ def assert_exact_preview(scenario, transcript, operation="upsert"):
     assert canonical_json(matching[0]["arguments"]["arguments"]) == canonical_json(
         {key: value for key, value in call.arguments.items() if key != "mode"}
     )
-    previews = [
-        block.output["data"]
+    # The card's preview is Daita's own, and it matches what was written.
+    (result,) = [
+        block
         for message in transcript.messages
         for block in message.content
-        if isinstance(block, ToolResultBlock)
-        and block.capability_id == f"data.preview_{operation}_rows"
-        and not block.is_error
-        and isinstance(block.output["data"], Mapping)
-        and block.output["data"]["preview_fingerprint"]
-        == call.arguments["preview_fingerprint"]
+        if isinstance(block, ToolResultBlock) and block.call_id == call.id
     ]
-    assert previews
     review = matching[0]["arguments"]["preview"]
+    if operation == "update":
+        assert set(review) == UPDATE_PREVIEW_KEYS
+    if result.is_error:
+        return  # Refused after approval (for example drift): nothing written.
+    written = result.output["data"]
+    assert isinstance(written, Mapping)
+    if operation == "update":
+        assert review["matched_rows"] == written["affected_rows"]
+        return
     fields = (
-        ("matched_rows", "samples", "warnings")
-        if operation == "update"
-        else (
-            "input_count",
-            "inserted_count",
-            "updated_count",
-            "unchanged_count",
-            "identity_sequence_gaps_possible",
-            "classifications",
-        )
+        "input_count",
+        "inserted_count",
+        "updated_count",
+        "unchanged_count",
+        "identity_sequence_gaps_possible",
+        "classifications",
     )
-    expected = {key: previews[-1][key] for key in fields}
-    if operation == "upsert":
-        expected["classifications"] = expected["classifications"][:5]
+    expected = {key: written[key] for key in fields}
+    expected["classifications"] = expected["classifications"][:5]
     assert canonical_json(review) == canonical_json(expected)

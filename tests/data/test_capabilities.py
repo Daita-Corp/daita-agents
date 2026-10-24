@@ -153,6 +153,7 @@ def test_data_query_file_outputs_route_to_exact_export_with_one_limits_clause() 
     assert thaw_json(properties["output"]) == {
         "type": "string",
         "enum": ["rows", "csv", "xlsx"],
+        "default": "rows",
     }
     assert "output" not in cast(list[str], definition.input_schema["required"])
 

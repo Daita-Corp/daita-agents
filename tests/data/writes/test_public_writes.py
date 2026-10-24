@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -189,42 +188,30 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
             "assignments": ({"column": "name", "value": "Updated"},),
         }
 
-        def apply(request):
-            preview = next(
+        def report(request):
+            write = next(
                 block
                 for message in request.messages
                 for block in message.content
-                if isinstance(block, ToolResultBlock) and block.call_id == "preview"
+                if isinstance(block, ToolResultBlock) and block.call_id == "write"
             )
             if review_action in {"short_id", "unknown_id"}:
-                assert preview.is_error
-                error = preview.output["error"]
+                assert write.is_error
+                error = write.output["error"]
                 assert isinstance(error, Mapping)
-                assert error["code"] == (
-                    "invalid_argument_value"
-                    if review_action == "short_id"
-                    else "resource_read_not_allowed"
-                )
-                if review_action == "unknown_id":
+                if review_action == "short_id":
+                    assert error["code"] == "invalid_arguments"
+                    assert error["details"]["issues"][0]["code"] == (
+                        "invalid_argument_value"
+                    )
+                else:
+                    assert error["code"] == "resource_read_not_allowed"
                     assert "without shortening" in str(error["message"])
                 assert resource.id not in canonical_json(error)
                 return response(text="The exact target is unresolved; no change made.")
-            assert not preview.is_error, preview.output
-            data = preview.output["data"]
-            assert isinstance(data, Mapping)
-            return response(
-                ToolCall(
-                    id="write",
-                    name="data_update_rows",
-                    arguments={
-                        **arguments,
-                        "mode": "apply",
-                        "preview_fingerprint": data["preview_fingerprint"],
-                        "expected_affected_rows": data["matched_rows"],
-                    },
-                )
-            )
+            return response(text="Report the exact returned effect evidence.")
 
+        # One call: Daita previews on the approval card and writes once.
         provider.replace_script(
             [
                 response(
@@ -235,14 +222,9 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
                     )
                 ),
                 response(
-                    ToolCall(
-                        id="preview",
-                        name="data_update_rows",
-                        arguments={**arguments, "mode": "preview"},
-                    )
+                    ToolCall(id="write", name="data_update_rows", arguments=arguments)
                 ),
-                apply,
-                response(text="Report the exact returned effect evidence."),
+                report,
             ]
         )
         result = await agent.run(
@@ -271,19 +253,14 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
         assert approval_document is not None
         assert set(approval_document["target"]) == TARGET_KEYS
         assert set(approval_document["preview"]) == UPDATE_PREVIEW_KEYS
-        assert (
-            approval_document["arguments"]["expected_affected_rows"]
-            == approval_document["preview"]["matched_rows"]
-        )
+        assert approval_document["preview"]["matched_rows"] == 1
         call = next(
             call
             for message in transcript.messages
             for call in message.tool_calls
-            if call.name == "data_update_rows" and call.arguments["mode"] == "apply"
+            if call.id == "write"
         )
-        assert dict(approval.arguments["arguments"]) == {
-            key: value for key, value in call.arguments.items() if key != "mode"
-        }
+        assert dict(approval.arguments["arguments"]) == dict(call.arguments)
         document, reviewable = approval_review_document(
             tool_name=approval.tool_name,
             capability_id=approval.capability_id,
@@ -348,32 +325,13 @@ def script(
             "resource_id": request.scope_refs[batch["resource_id"]],
         }
 
-    def apply(request):
-        previews = [
-            block
-            for message in request.messages
-            for block in message.content
-            if isinstance(block, ToolResultBlock)
-            and block.capability_id == "data.preview_upsert_rows"
-            and not block.is_error
-        ]
-        assert previews, [
-            block.output
-            for message in request.messages
-            for block in message.content
-            if isinstance(block, ToolResultBlock)
-        ]
-        data = previews[-1].output["data"]
-        assert isinstance(data, Mapping)
-        return response(
+    def upsert(call_id: str, **extra: object):
+        # A write is one call; mode=preview only shows the classification.
+        return lambda request: response(
             ToolCall(
-                id="write",
+                id=call_id,
                 name="data_upsert_rows",
-                arguments={
-                    **named(request),
-                    "mode": "apply",
-                    "preview_fingerprint": data["preview_fingerprint"],
-                },
+                arguments={**named(request), **extra},
             )
         )
 
@@ -399,13 +357,7 @@ def script(
                 },
             )
         ),
-        lambda request: response(
-            ToolCall(
-                id="preview",
-                name="data_upsert_rows",
-                arguments={**named(request), "mode": "preview"},
-            )
-        ),
+        upsert("write") if write else upsert("preview", mode="preview"),
     ]
     if schema:
         steps.insert(
@@ -418,26 +370,8 @@ def script(
                 )
             ),
         )
-    if write:
-        steps.append(apply)
     if duplicate:
-        steps.append(
-            response(
-                ToolCall(
-                    id="preview-again",
-                    name="data_upsert_rows",
-                    arguments={**batch, "mode": "preview"},
-                )
-            )
-        )
-
-        def repeat(request):
-            result = apply(request)
-            return replace(
-                result, tool_calls=(replace(result.tool_calls[0], id="write-again"),)
-            )
-
-        steps.append(repeat)
+        steps.append(upsert("write-again"))
     steps.append(
         response(
             text="Research found one reported relationship with Acme, based on one cited source. Coverage is incomplete; transaction evidence establishes storage, not truth of the researched claim."
@@ -578,7 +512,8 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
             for call, _ in await agent.tool_evidence(result.run_id)
             if call.id == "write"
         )
-        assert write_call.arguments["mode"] == "apply"
+        # The write was one call with mode omitted: apply is the default.
+        assert "mode" not in write_call.arguments
         assert write_call.arguments["source_id"] == batch["source_id"]
         assert write_call.arguments["resource_id"] == batch["resource_id"]
         assert dict(approval.arguments["arguments"]) == {
@@ -698,11 +633,10 @@ async def test_upsert_evidence_is_derived_from_earlier_reads_of_the_same_table(
         assert not outputs["schema"].is_error
         assert not outputs["research"].is_error
         # Only the authenticated read of the written table is evidence; the
-        # unrelated MCP research read and the write's own preview are not.
-        for call_id in ("preview", "write"):
-            data = outputs[call_id].output["data"]
-            assert isinstance(data, Mapping)
-            assert data["evidence_call_ids"] == ("schema",)
+        # unrelated MCP research read is not.
+        data = outputs["write"].output["data"]
+        assert isinstance(data, Mapping)
+        assert data["evidence_call_ids"] == ("schema",)
         approval = next(
             item for item in approvals if item.capability_id == "data.upsert_rows"
         )
@@ -737,29 +671,7 @@ async def test_exact_native_upsert_runs_once_from_a_job(tmp_path, monkeypatch) -
     intent = {key: value for key, value in batch.items() if key != "evidence_call_ids"}
     objective = "Apply the exact company upsert once."
 
-    def apply_preview(request: ModelRequest) -> ModelResponse:
-        preview = next(
-            block
-            for message in request.messages
-            for block in message.content
-            if isinstance(block, ToolResultBlock) and block.call_id == "job-preview"
-        )
-        assert not preview.is_error, preview.output
-        data = preview.output["data"]
-        assert isinstance(data, Mapping)
-        return response(
-            ToolCall(
-                "job-write",
-                "data_upsert_rows",
-                {
-                    **intent,
-                    "mode": "apply",
-                    "preview_fingerprint": data["preview_fingerprint"],
-                },
-            )
-        )
-
-    # Only the job's main run calls the model.
+    # Only the job's main run calls the model; the write is one call.
     provider.replace_script(
         (
             response(
@@ -769,13 +681,8 @@ async def test_exact_native_upsert_runs_once_from_a_job(tmp_path, monkeypatch) -
                     {"tool_names": ("data_upsert_rows",)},
                 )
             ),
-            response(
-                ToolCall(
-                    "job-preview", "data_upsert_rows", {**intent, "mode": "preview"}
-                )
-            ),
-            apply_preview,
-            response(text="Applied the exact previewed company upsert."),
+            response(ToolCall("job-write", "data_upsert_rows", intent)),
+            response(text="Applied the exact company upsert."),
         )
     )
     try:
@@ -1087,8 +994,9 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                     for block in results
                     if block.capability_id == "data.upsert_rows"
                 ]
-                assert len(previews) == len(writes) == 1
-                assert not previews[0].is_error and not writes[0].is_error
+                # One call writes; no separate preview step.
+                assert not previews and len(writes) == 1
+                assert not writes[0].is_error
                 schemas = [
                     block
                     for block in results

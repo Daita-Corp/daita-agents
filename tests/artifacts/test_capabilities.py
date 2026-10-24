@@ -667,7 +667,7 @@ def test_artifact_save_local_schema_rejects_bytes_paths_commands_and_overwrite()
     }
 
 
-def test_artifact_edit_binding_contract_requires_verbatim_opaque_reuse() -> None:
+def test_artifact_edit_names_its_read_instead_of_copying_a_binding() -> None:
     declarations = artifact_capability_declarations(include_local_edit=True)
     view = next(
         item
@@ -679,12 +679,9 @@ def test_artifact_edit_binding_contract_requires_verbatim_opaque_reuse() -> None
     )
     properties = capability.input_schema.get("properties")
     assert isinstance(properties, Mapping)
-    binding = properties.get("binding")
-    assert isinstance(binding, Mapping)
-    contract = f"{capability.description} {binding.get('description')}".casefold()
-    assert "verbatim" in contract
-    assert "opaque" in contract
-    assert "never be decoded" in contract
+    assert "binding" not in properties
+    assert {"result_ref", "path"} <= set(properties)
+    assert capability.result_ref_arguments == ("result_ref",)
 
 
 def test_artifact_set_export_location_schema_accepts_only_one_destination_id() -> None:
