@@ -2005,11 +2005,18 @@ class ToolExecution:
     execution_scope: ExecutionScope | None = None
     caller_principal_verified: bool = True
     provenance: CallProvenance = CallProvenance()
+    # The preflight a person approved and the runtime rechecked; set only for
+    # the dispatch of a side effect, so the executor binds what was reviewed.
+    approved_preflight: FrozenJsonObject | None = None
 
     def __post_init__(self) -> None:
         _text(self.run_id, "tool run_id")
         if not isinstance(self.provenance, CallProvenance):
             raise TypeError("tool provenance must be CallProvenance")
+        if self.approved_preflight is not None and not isinstance(
+            self.approved_preflight, FrozenJsonObject
+        ):
+            raise TypeError("tool approved preflight must be FrozenJsonObject")
         _text(self.call_id, "tool call_id")
         _text(self.capability_id, "tool capability_id")
         if self.caller_principal_id is not None:
@@ -3261,10 +3268,26 @@ def _check_rule(rule: Mapping[str, object]) -> None:
             _check_rule(nested)
 
 
-def _validate_object(
+MAX_ARGUMENT_ISSUES = 32
+
+
+def _issue(
+    issues: list[dict[str, object]],
+    code: str,
+    name: str,
+    path: str,
+    problem: str,
+    **facts: object,
+) -> None:
+    issues.append(
+        {"code": code, "name": name, "path": path, "problem": problem, **facts}
+    )
+
+
+def _collect_object_issues(
     schema: Mapping[str, object],
     value: Mapping[str, object],
-    error_type: type[ValueError] | type[RuntimeError],
+    issues: list[dict[str, object]],
     *,
     path: str,
 ) -> None:
@@ -3276,41 +3299,23 @@ def _validate_object(
         raise ValueError("tool schema required must be an array")
     if any(not isinstance(name, str) for name in required):
         raise ValueError("tool schema required must contain strings")
-    names = tuple(name for name in required if isinstance(name, str))
-    missing = [name for name in names if name not in value]
-    if missing:
-        if error_type is CapabilityInputError:
-            raise CapabilityInputError(
-                "missing_arguments",
-                "Missing required tool arguments.",
-                {"names": missing, "path": path},
-                recovery=ToolRecovery(
-                    RecoveryKind.CORRECT_ARGUMENTS,
-                    "Supply the required arguments: " + ", ".join(missing) + ".",
-                ),
-            )
-        raise error_type(f"missing output fields: {', '.join(missing)}")
+    for name in required:
+        if name not in value:
+            _issue(issues, "missing_arguments", name, f"{path}.{name}", "is required")
     if additional is False:
-        unexpected = [name for name in value if name not in properties]
-        if unexpected:
-            if error_type is CapabilityInputError:
-                raise CapabilityInputError(
+        for name in value:
+            if name not in properties:
+                _issue(
+                    issues,
                     "unexpected_arguments",
-                    "Unexpected tool arguments.",
-                    {"names": unexpected, "path": path},
-                    recovery=ToolRecovery(
-                        RecoveryKind.CORRECT_ARGUMENTS,
-                        "Remove the undeclared arguments: "
-                        + ", ".join(unexpected)
-                        + ".",
-                    ),
+                    name,
+                    f"{path}.{name}",
+                    "is not a declared field; remove it",
                 )
-            raise error_type(f"unexpected output fields: {', '.join(unexpected)}")
     for name, item in value.items():
         rule = properties.get(name)
-        if not isinstance(rule, Mapping):
-            continue
-        _validate_rule(name, item, rule, error_type, path=f"{path}.{name}")
+        if isinstance(rule, Mapping):
+            _collect_issues(name, item, rule, issues, path=f"{path}.{name}")
 
 
 def validate_tool_schema_value(
@@ -3331,112 +3336,137 @@ def _validate_rule(
     item: object,
     rule: Mapping[str, object],
     error_type: type[ValueError] | type[RuntimeError],
-    *,
-    path: str | None = None,
 ) -> None:
-    if path is None:
-        path = name
+    """Raise one error that lists every structural problem in ``item``."""
+
+    issues: list[dict[str, object]] = []
+    _collect_issues(name, item, rule, issues, path=name)
+    if not issues:
+        return
+    if error_type is not CapabilityInputError:
+        first = issues[0]
+        raise error_type(f"output field {first['name']} {first['problem']}")
+    shown = issues[:MAX_ARGUMENT_ISSUES]
+    problems = [f"{issue['path']} {issue['problem']}" for issue in shown]
+    raise CapabilityInputError(
+        "invalid_arguments",
+        f"{len(issues)} argument problem(s): " + "; ".join(problems[:4]) + ".",
+        {"issues": shown, "issue_count": len(issues)},
+        recovery=ToolRecovery(
+            RecoveryKind.CORRECT_ARGUMENTS,
+            "Fix every listed issue, then call the tool once more.",
+        ),
+    )
+
+
+def _collect_issues(
+    name: str,
+    item: object,
+    rule: Mapping[str, object],
+    issues: list[dict[str, object]],
+    *,
+    path: str,
+) -> None:
     alternatives = rule.get("oneOf")
     if isinstance(alternatives, (tuple, list)):
-        matched = 0
+        branches: list[tuple[bool, list[dict[str, object]]]] = []
         for alternative in alternatives:
             assert isinstance(alternative, Mapping)
-            try:
-                _validate_rule(name, item, alternative, error_type, path=path)
-            except error_type:
-                continue
-            matched += 1
-        if matched != 1:
-            _constraint_error(error_type, name, "exactly one declared shape", "oneOf")
+            branch: list[dict[str, object]] = []
+            _collect_issues(name, item, alternative, branch, path=path)
+            branches.append((_matches_type(item, alternative.get("type")), branch))
+        matched = sum(1 for _, branch in branches if not branch)
+        if matched > 1:
+            _issue(
+                issues,
+                "invalid_argument_value",
+                name,
+                path,
+                "must match exactly one declared shape",
+                constraint="oneOf",
+            )
+        elif not matched:
+            # Report the closest shape: the right type first, then fewest problems.
+            issues.extend(min(branches, key=lambda b: (not b[0], len(b[1])))[1])
     expected = rule.get("type")
     if expected is not None and not _matches_type(item, expected):
-        if error_type is CapabilityInputError:
-            raise CapabilityInputError(
-                "invalid_argument_type",
-                f"Tool argument {name} must be {expected}.",
-                {"name": name, "expected": expected},
-                recovery=ToolRecovery(
-                    RecoveryKind.CORRECT_ARGUMENTS,
-                    f"Send {name} as {expected}.",
-                ),
-            )
-        raise error_type(f"output field {name} must be {expected}")
+        _issue(
+            issues,
+            "invalid_argument_type",
+            name,
+            path,
+            f"must be {expected}",
+            expected=expected,
+        )
+        return
     enum = rule.get("enum")
     if isinstance(enum, (tuple, list)) and item not in enum:
-        _constraint_error(
-            error_type,
-            name,
-            "one of the declared enum values",
-            "enum",
-        )
+        _constraint_issue(issues, name, path, "one of the declared enum values", "enum")
     if isinstance(item, str):
         minimum = rule.get("minLength")
         maximum = rule.get("maxLength")
         pattern = rule.get("pattern")
         if isinstance(minimum, int) and len(item) < minimum:
-            _constraint_error(
-                error_type, name, f"at least {minimum} characters", "minLength"
+            _constraint_issue(
+                issues, name, path, f"at least {minimum} characters", "minLength"
             )
         if isinstance(maximum, int) and len(item) > maximum:
-            _constraint_error(
-                error_type, name, f"at most {maximum} characters", "maxLength"
+            _constraint_issue(
+                issues, name, path, f"at most {maximum} characters", "maxLength"
             )
         if isinstance(pattern, str) and re.search(pattern, item) is None:
-            _constraint_error(error_type, name, "the declared pattern", "pattern")
+            _constraint_issue(issues, name, path, "the declared pattern", "pattern")
     if isinstance(item, (int, float)) and not isinstance(item, bool):
         minimum = rule.get("minimum")
         maximum = rule.get("maximum")
         if isinstance(minimum, (int, float)) and item < minimum:
-            _constraint_error(error_type, name, f"at least {minimum}", "minimum")
+            _constraint_issue(issues, name, path, f"at least {minimum}", "minimum")
         if isinstance(maximum, (int, float)) and item > maximum:
-            _constraint_error(error_type, name, f"at most {maximum}", "maximum")
+            _constraint_issue(issues, name, path, f"at most {maximum}", "maximum")
     if isinstance(item, (tuple, list)):
         minimum = rule.get("minItems")
         maximum = rule.get("maxItems")
         if isinstance(minimum, int) and len(item) < minimum:
-            _constraint_error(error_type, name, f"at least {minimum} items", "minItems")
+            _constraint_issue(
+                issues, name, path, f"at least {minimum} items", "minItems"
+            )
         if isinstance(maximum, int) and len(item) > maximum:
-            _constraint_error(error_type, name, f"at most {maximum} items", "maxItems")
+            _constraint_issue(
+                issues, name, path, f"at most {maximum} items", "maxItems"
+            )
         if rule.get("uniqueItems") is True:
             projected = tuple(canonical_json(value) for value in item)
             if len(projected) != len(set(projected)):
-                _constraint_error(
-                    error_type,
-                    name,
-                    "unique items",
-                    "uniqueItems",
-                )
+                _constraint_issue(issues, name, path, "unique items", "uniqueItems")
         item_rule = rule.get("items")
         if isinstance(item_rule, Mapping):
             for index, value in enumerate(item):
-                _validate_rule(
+                _collect_issues(
                     f"{name}[{index}]",
                     value,
                     item_rule,
-                    error_type,
+                    issues,
                     path=f"{path}[{index}]",
                 )
     if isinstance(item, Mapping) and expected == "object":
-        _validate_object(rule, item, error_type, path=path)
+        _collect_object_issues(rule, item, issues, path=path)
 
 
-def _constraint_error(
-    error_type: type[ValueError] | type[RuntimeError],
+def _constraint_issue(
+    issues: list[dict[str, object]],
     name: str,
+    path: str,
     expected: str,
     constraint: str,
 ) -> None:
-    if error_type is CapabilityInputError:
-        raise CapabilityInputError(
-            "invalid_argument_value",
-            f"Tool argument {name} must satisfy {expected}.",
-            {"constraint": constraint, "name": name},
-            recovery=ToolRecovery(
-                RecoveryKind.CORRECT_ARGUMENTS,
-                f"{name} must satisfy {expected}.",
-            ),
-        )
-    raise error_type(f"output field {name} must satisfy {expected}")
+    _issue(
+        issues,
+        "invalid_argument_value",
+        name,
+        path,
+        f"must satisfy {expected}",
+        constraint=constraint,
+    )
 
 
 def _matches_type(value: object, expected: object) -> bool:

@@ -28,9 +28,12 @@ one; with `action: "delete"` it removes one named skill instead. `semantic_view`
 is given (filtered by source, resource, kind and limit) and loads one
 annotation with its `current_sha256` when an `id` is given. `semantic_save`
 creates, replaces or supersedes an annotation; with `action: "delete"` it
-deletes one. Each save and delete keeps its own exact approval card, and
-replacement, supersession and deletion all require the `expected_sha256` from
-the latest view.
+deletes one. Each save and delete keeps its own exact approval card.
+Replacing a skill, and replacing, superseding or deleting an annotation, needs
+an earlier view of it in the same run: Daita checks the change against the
+version that view showed and refuses it if the stored version changed since.
+The model never copies a digest or catalog revision; Daita binds the current
+catalog revisions itself, and the approval card shows every bound value.
 
 Daita does not silently promote a model's inference into durable knowledge:
 it learns only when you teach it with `/learn`, or ask it to

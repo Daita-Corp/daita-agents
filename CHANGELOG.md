@@ -80,3 +80,39 @@ the limits and continues it. This replaces the task-graph job system.
   by an older version of Daita; start it again.", result deliveries and
   receipts keep their job, graph attention notices are dropped, and the graph
   tables are removed.
+
+### Smoother interactive tools
+
+Tools no longer make the model copy back values Daita already holds, a
+relational write is one call and one approval, and a call with several
+argument mistakes gets all of them back at once.
+
+- **Argument errors.** Every structural problem in a call's arguments comes
+  back in one `invalid_arguments` error whose `details.issues` lists up to 32
+  problems (`code`, `path`, `name`, `problem`), with `issue_count` for the
+  total. For a `oneOf`, the issues are those of the closest shape. The
+  per-problem codes (`missing_arguments`, `unexpected_arguments`,
+  `invalid_argument_type`, `invalid_argument_value`) now appear inside
+  `issues` instead of as the error code.
+- **One-call writes.** `data_update_rows` and `data_upsert_rows` default to
+  `mode=apply`: Daita builds the preview, shows it on the approval card,
+  re-checks it for drift after approval and writes once with a receipt, in
+  foreground, routine, job and sub-runs alike. `mode=preview` still only
+  shows the preview. `preview_fingerprint` and `expected_affected_rows` are
+  removed from the arguments and from preview results.
+- **No copied values.** `python_execute` drops `expected_state`; a result says
+  `state_reset: true` when the interpreter was replaced. `semantic_save` drops
+  `catalog_revisions` and `expected_sha256`, and `semantic_save` with
+  `action=delete` drops `expected_sha256`: Daita binds the current catalog
+  revisions, and a replacement, supersession or deletion needs an earlier
+  `semantic_view` in the run, whose version Daita binds. `skill_save` drops
+  `expected_sha256`; replacing needs an earlier `skill_view` in the run.
+  `artifact_edit_text` names the earlier `file_read` by `result_ref` or `path`
+  instead of copying its `binding`, and `expected_occurrences` defaults to 1.
+  `routine_control` makes `expected_revision` optional (default: the current
+  revision).
+- **Approval cards** show every value the action will use, including bound
+  and defaulted ones (for example a new annotation's id and the routine
+  revision being controlled).
+- **Python API.** Custom executors receive the preflight a person approved as
+  `ToolExecution.approved_preflight`.

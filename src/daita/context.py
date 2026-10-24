@@ -3028,13 +3028,11 @@ def _tool_guidance(
         )
     if "analysis.execute" in capability_ids:
         instructions.append(
-            "Python workspace: variables persist within this run only. Start with "
-            "expected_state={generation:0,revision:0}; use the returned expected_state "
-            "for every later cell. A python_error can leave earlier assignments intact "
-            "(state_may_have_changed); correct the code using retained state. state_lost "
-            "means the interpreter closed: only an explicit later cell with the returned "
-            "state can request replacement, subject to remaining allowances and verified "
-            "cleanup. Failed code is never automatically replayed or refunded. "
+            "Python workspace: variables persist within this run only. A python_error "
+            "can leave earlier assignments intact (state_may_have_changed); correct the "
+            "code using retained state. state_lost means the interpreter closed; a later "
+            "cell starts a new one with state_reset=true, subject to remaining allowances "
+            "and verified cleanup. Failed code is never automatically replayed or refunded. "
             "tools.call(name, arguments) returns a structured dict with is_error, output, "
             "evidence_id and sensitivity. Check is_error before using output['data']; "
             "use the tool's declared result shape, never assume text or rows. Only already "
@@ -3190,7 +3188,8 @@ def _tool_guidance(
             + ", ".join(discoverable_native)
             + ". For a requested mutation, load the tool with toolbox_load; no search is "
             "needed for these exact names. Loading takes effect next step and grants no "
-            "authority; preview and apply remain sequential."
+            "authority. A write is one call: Daita shows its own preview on the "
+            "approval card."
         )
     elif (
         "data.query" in candidates
@@ -3262,17 +3261,16 @@ def _tool_guidance(
         )
     if ARTIFACT_EDIT_TEXT_CAPABILITY_ID in capability_ids:
         instructions.append(
-            "Local text edits are artifact-backed: obtain a current read of the "
-            "exact target, copy its data.binding string verbatim into "
-            "artifact_edit_text, and never decode, normalize, or reconstruct that "
-            "opaque binding. Bound publication requires the save capability with "
+            "Local text edits are artifact-backed: read the exact target with "
+            "file_read, then name that read in artifact_edit_text by its result_ref "
+            "or path. Bound publication requires the save capability with "
             "mode=replace_bound_file and only the "
             "committed edit artifact_id. The edit tool prepares an internal complete "
             "replacement and never changes the source file. Only the final save call "
             "requests one approval, rechecks drift, and may atomically replace the "
-            "unchanged bound file. Never provide a path, revision, destination, "
-            "filename, or raw bytes to either edit preparation or bound replacement; "
-            "after drift, re-read instead of retrying, merging, or rebasing."
+            "unchanged bound file. Never provide a revision, destination, filename, "
+            "or raw bytes to either edit preparation or bound replacement; after "
+            "drift, re-read instead of retrying, merging, or rebasing."
         )
         instructions.extend(
             (

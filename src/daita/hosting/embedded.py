@@ -1583,7 +1583,9 @@ class EmbeddedAgent:
                 for capability in relational_query.capabilities
             ),
         )
-        skill_domain = SkillCapabilityDomain(skill_declaration_bundle)
+        skill_domain = SkillCapabilityDomain(
+            skill_declaration_bundle, transcript_loader=store.load
+        )
         semantic_domain = SemanticCapabilityDomain(
             semantic_declaration_bundle,
             data_view,

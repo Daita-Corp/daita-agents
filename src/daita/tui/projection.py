@@ -847,7 +847,7 @@ def approval_summary(arguments_text: str, capability_id: str) -> str:
                     + json.dumps(arguments.get("where"), ensure_ascii=True),
                     "Set: "
                     + json.dumps(arguments.get("assignments"), ensure_ascii=True),
-                    f"Preview: {preview.get('matched_rows')} matching row(s); expected {arguments.get('expected_affected_rows')}.",
+                    f"Preview: {preview.get('matched_rows')} matching row(s) will change.",
                     "Bounded samples of primary keys and before/after values: "
                     + json.dumps(preview.get("samples"), ensure_ascii=True),
                 )

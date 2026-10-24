@@ -3695,6 +3695,7 @@ class CapabilityRuntime:
                         None,
                         ToolBatchCertainty.DEFINITE,
                     )
+            execution = replace(execution, approved_preflight=fingerprint)
             if capability.effect_receipt_policy is not None:
                 if dispatch is not None:
                     # Reservation starts the receipt-owned effect boundary.

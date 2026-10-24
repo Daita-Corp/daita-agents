@@ -140,8 +140,8 @@ class AnalysisCapabilityDomain:
         description = (
             "Run Python in an isolated bounded workspace to compute over or transform "
             "authenticated tool results. Prefer data_query for SQL and aggregates, "
-            "including local file data. Start with expected_state={generation:0,"
-            "revision:0}, then pass the returned state. r=tools.call(name, args): "
+            "including local file data. Variables persist across calls in this run; "
+            "state_reset=true means they were lost. r=tools.call(name, args): "
             "r['is_error'], r['output']['data'], r['evidence_id']. outputs.add('name',"
             "'f.png') registers a temporary file (letter, then letters, digits, _ or "
             "-); save_outputs=[...] keeps it; check returned refs. Print bounded "
@@ -156,22 +156,13 @@ class AnalysisCapabilityDomain:
                 "type": "object",
                 "properties": {
                     "code": {"type": "string", "maxLength": limits.code_bytes},
-                    "expected_state": {
-                        "type": "object",
-                        "properties": {
-                            "generation": {"type": "integer", "minimum": 0},
-                            "revision": {"type": "integer", "minimum": 0},
-                        },
-                        "required": ["generation", "revision"],
-                        "additionalProperties": False,
-                    },
                     "timeout_seconds": {
                         "type": "number",
                         "exclusiveMinimum": 0,
                         "maximum": 30,
                     },
                 },
-                "required": ["code", "expected_state"],
+                "required": ["code"],
                 "additionalProperties": False,
             },
             output_kind="analysis.cell",
@@ -251,7 +242,7 @@ class AnalysisCapabilityDomain:
             "stdout": {"type": "string", "maxLength": 16384},
             "stderr": {"type": "string", "maxLength": 16384},
             "traceback": {"type": ["string", "null"], "maxLength": 8192},
-            "expected_state": properties["expected_state"],
+            "state_reset": {"type": "boolean"},
             "state_lost": {"type": "boolean"},
             "state_may_have_changed": {"type": "boolean"},
             "usage": {"type": "object"},
@@ -287,7 +278,6 @@ class AnalysisCapabilityDomain:
                     "stdout",
                     "stderr",
                     "traceback",
-                    "expected_state",
                     "state_lost",
                     "state_may_have_changed",
                     "usage",
@@ -516,10 +506,6 @@ class AnalysisCapabilityDomain:
                         "failure": "TimeoutError",
                         "state_lost": True,
                         "state_may_have_changed": True,
-                        "expected_state": {
-                            "generation": state.generation,
-                            "revision": state.revision,
-                        },
                         "usage": last.get("usage", {}),
                         "cleanup": last.get("cleanup"),
                         "outputs": [],
@@ -533,12 +519,8 @@ class AnalysisCapabilityDomain:
         cell_deadline: float,
         cell_started: float,
     ) -> ToolOutput:
-        expected = dict(cast(Mapping[str, object], request.arguments["expected_state"]))
-        if expected != {"generation": state.generation, "revision": state.revision}:
-            raise CapabilityInputError(
-                "analysis_stale_state",
-                "Use the current host-issued generation and revision.",
-            )
+        # A new worker after an earlier one means earlier variables are gone.
+        state_reset = state.worker is None and state.generation > 0
         state.session.cancellation.raise_if_cancelled()
         self._remaining_cpu(state)
         await state.session.writer.record_analysis(
@@ -1000,10 +982,7 @@ class AnalysisCapabilityDomain:
             ]
             result.update(
                 {
-                    "expected_state": {
-                        "generation": state.generation,
-                        "revision": state.revision,
-                    },
+                    "state_reset": state_reset,
                     "state_may_have_changed": result["status"] == "python_error",
                     "state_lost": False,
                     "usage": {
@@ -1134,10 +1113,6 @@ class AnalysisCapabilityDomain:
                     "failure": type(error).__name__,
                     "state_lost": True,
                     "state_may_have_changed": True,
-                    "expected_state": {
-                        "generation": state.generation,
-                        "revision": state.revision,
-                    },
                     "usage": dict(worker.usage),
                     "cleanup": worker.cleanup,
                     "outputs": [],

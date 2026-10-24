@@ -135,32 +135,25 @@ def _data_query_description(file_outputs: tuple[str, ...]) -> str:
 
 
 RELATIONAL_UPDATE_DESCRIPTION = (
-    "Update rows in a PostgreSQL table. mode=preview changes nothing and "
-    "returns matched_rows, samples, preview_fingerprint. mode=apply "
-    "resends the arguments plus preview_fingerprint and "
-    "expected_affected_rows=matched_rows; calling it is what requests "
-    "approval. Only outcome=committed proves it; a change after approval is "
-    "final for the request. Limits: structured filters, no SQL. "
+    "Update rows in a PostgreSQL table in one call: Daita previews the "
+    "matching rows on the approval card, rechecks them after approval and "
+    "writes once. mode=preview only shows matched_rows and samples. Only "
+    "outcome=committed proves it; a change after approval is final for the "
+    "request. Limits: structured filters, no SQL. "
     'Example: {"where": [{"column": "id", "operator": "eq", "value": 7}], '
     '"assignments": [{"column": "status", "value": "paid"}], ...}. '
-    "Mistakes: asking for approval in chat; applying a zero-match preview; "
-    "retrying after denial."
+    "Mistakes: asking for approval in chat; retrying after denial."
 )
 RELATIONAL_UPSERT_DESCRIPTION = (
     "Insert missing rows and update existing ones in one PostgreSQL table by "
-    "key_columns; needs upsert permission. mode=preview changes nothing and "
-    "classifies rows as insert, update or unchanged. mode=apply sends the "
-    "same batch plus preview_fingerprint, requests approval, locks the table "
-    "briefly and reports verified counts; a change after approval is final "
-    "for the request. Limits: one uniform batch of up to 1000 scalar rows, no "
+    "key_columns in one call; needs upsert permission. Daita classifies the "
+    "batch on the approval card, locks the table briefly, rechecks and writes "
+    "once, reporting verified counts. mode=preview only classifies rows as "
+    "insert, update or unchanged. A change after approval is final for the "
+    "request. Limits: one uniform batch of up to 1000 scalar rows, no "
     'chunking. Example: {"key_columns": ["sku"], "rows": [{"sku": "A1", '
     '"qty": 3}], ...}. Mistakes: omitting a column to clear it (send null); '
     "retrying after denial or failure."
-)
-_REPREVIEW = ToolRecovery(
-    RecoveryKind.REINSPECT_BINDING,
-    "The table changed since the preview; run mode=preview again and apply "
-    "only the new preview_fingerprint.",
 )
 _MAX_PREVIEW_OUTPUT_BYTES = 256 * 1_024
 
@@ -1255,8 +1248,15 @@ class RelationalUpdatePreviewExecutor:
             raise ValueError("preview backend returned a different update identity")
         return ToolOutput(
             kind=RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
-            data=result.tool_data(),
+            data=_without_fingerprint(result.tool_data()),
         )
+
+
+def _without_fingerprint(data: Mapping[str, object]) -> FrozenJsonObject:
+    # The fingerprint binds approval to dispatch inside Daita; the model never sends it.
+    return FrozenJsonObject.from_mapping(
+        {key: value for key, value in data.items() if key != "preview_fingerprint"}
+    )
 
 
 class RelationalUpdateExecutor:
@@ -1288,28 +1288,13 @@ class RelationalUpdateExecutor:
         )
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        command = RelationalUpdateCommand.from_mapping(request.arguments)
-        backend = await self._backend(command.intent.source_id)
-        preview = await backend.preview_update(
-            agent_id=self._agent_id,
-            intent=command.intent,
-        )
+        intent = RelationalUpdateIntent.from_mapping(request.arguments)
+        backend = await self._backend(intent.source_id)
+        preview = await backend.preview_update(agent_id=self._agent_id, intent=intent)
         if preview.matched_rows == 0:
             raise CapabilityInputError(
                 "write_target_not_found",
-                "The previewed target selection does not currently match any rows.",
-            )
-        if preview.matched_rows != command.expected_affected_rows:
-            raise CapabilityInputError(
-                "write_state_changed",
-                "The exact target count differs from the approved update plan.",
-                recovery=_REPREVIEW,
-            )
-        if preview.fingerprint.preview_fingerprint != command.preview_fingerprint:
-            raise CapabilityInputError(
-                "write_preview_stale",
-                "The supplied preview fingerprint is not the exact current preview.",
-                recovery=_REPREVIEW,
+                "The target selection does not currently match any rows.",
             )
         return FrozenJsonObject.from_mapping(
             {
@@ -1328,7 +1313,16 @@ class RelationalUpdateExecutor:
         )
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
-        command = RelationalUpdateCommand.from_mapping(request.arguments)
+        approved = request.approved_preflight
+        if approved is None:
+            raise ValueError("update dispatch requires its approved preflight")
+        command = RelationalUpdateCommand(
+            intent=RelationalUpdateIntent.from_mapping(request.arguments),
+            preview_fingerprint=cast(str, approved["preview_fingerprint"]),
+            expected_affected_rows=cast(
+                int, cast(Mapping[str, object], approved["review"])["matched_rows"]
+            ),
+        )
         backend = await self._backend(command.intent.source_id)
         result = await backend.execute_update(
             agent_id=self._agent_id,
@@ -1594,9 +1588,9 @@ def relational_update_capability_declarations() -> CapabilityDeclarations:
     capability = Capability(
         id=RELATIONAL_UPDATE_CAPABILITY_ID,
         description=(
-            "Submit one exact previewed PostgreSQL update to runtime approval. "
-            "Calling this tool opens the approval interaction and applies the "
-            "update exactly once only if approved and revalidation succeeds."
+            "Preview one exact PostgreSQL update for runtime approval, then "
+            "apply it exactly once only if approved and the recheck finds the "
+            "same rows."
         ),
         input_schema={
             "type": "object",
@@ -1619,23 +1613,8 @@ def relational_update_capability_declarations() -> CapabilityDeclarations:
                     "minItems": 1,
                     "items": cell_schema,
                 },
-                "preview_fingerprint": {
-                    "type": "string",
-                    "pattern": r"^sha256:[0-9a-f]{64}$",
-                },
-                "expected_affected_rows": {
-                    "type": "integer",
-                    "minimum": 1,
-                },
             },
-            "required": [
-                "source_id",
-                "resource_id",
-                "where",
-                "assignments",
-                "preview_fingerprint",
-                "expected_affected_rows",
-            ],
+            "required": ["source_id", "resource_id", "where", "assignments"],
             "additionalProperties": False,
         },
         output_kind=RELATIONAL_UPDATE_EVIDENCE_KIND,
@@ -1663,12 +1642,13 @@ def relational_update_capability_declarations() -> CapabilityDeclarations:
             ("preview", RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID),
             ("apply", capability.id),
         ),
+        default_mode="apply",
         presentation=ToolPresentation(
             toolbox_id=ToolboxId.SOURCES,
             load_mode=ToolLoadMode.ON_DEMAND,
             text_trust=ToolTextTrust.CODE,
-            summary="Preview, then apply, an exact update to existing relational rows.",
-            when_to_use="Use mode=preview first; apply that exact preview with approval or a standing grant.",
+            summary="Update existing relational rows in one approved call.",
+            when_to_use="Call once to write; the approval card shows the matching rows. Use mode=preview only to look first.",
             keywords=(
                 "data",
                 "relational",
@@ -1983,7 +1963,6 @@ def _relational_update_preview_output_schema() -> dict[str, object]:
         "samples",
         "target_set_sha256",
         "statement_sha256",
-        "preview_fingerprint",
         "checks",
         "warnings",
         "trust_classification",
@@ -2003,7 +1982,6 @@ def _relational_update_preview_output_schema() -> dict[str, object]:
             "samples": {"type": "array", "items": {"type": "object"}},
             "target_set_sha256": hash_rule,
             "statement_sha256": hash_rule,
-            "preview_fingerprint": hash_rule,
             "checks": {
                 "type": "object",
                 "properties": {
@@ -2136,7 +2114,7 @@ NATIVE_WRITE_GRANT_POLICY = AutomationGrantPolicy(
             )
         )
         + ". These are its mode=apply and mode=preview routes, not separate tools "
-        "to load. Each occurrence calls mode=preview before mode=apply.",
+        "to load. Each occurrence applies in one call.",
         "properties": {
             "source_id": {"type": "string", "maxLength": 256},
             "resource_id": {"type": "string", "maxLength": 256},
@@ -2219,7 +2197,9 @@ class RelationalUpsertPreviewExecutor(_RelationalUpsertRouting):
         backend = await self._backend(intent)
         return ToolOutput(
             kind="data.preview_upsert_rows",
-            data=await backend.preview_upsert(agent_id=self._agent_id, intent=intent),
+            data=_without_fingerprint(
+                await backend.preview_upsert(agent_id=self._agent_id, intent=intent)
+            ),
         )
 
 
@@ -2230,12 +2210,6 @@ class RelationalUpsertExecutor(_RelationalUpsertRouting):
         intent = _upsert_intent(request)
         backend = await self._backend(intent)
         preview = await backend.preview_upsert(agent_id=self._agent_id, intent=intent)
-        if preview["preview_fingerprint"] != request.arguments["preview_fingerprint"]:
-            raise CapabilityInputError(
-                "write_preview_stale",
-                "The exact upsert preview changed before dispatch.",
-                recovery=_REPREVIEW,
-            )
         return FrozenJsonObject.from_mapping(
             {
                 **{
@@ -2267,13 +2241,17 @@ class RelationalUpsertExecutor(_RelationalUpsertRouting):
         )
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
+        if request.approved_preflight is None:
+            raise ValueError("upsert dispatch requires its approved preflight")
         intent = _upsert_intent(request)
         backend = await self._backend(intent)
         result = await backend.execute_upsert(
             agent_id=self._agent_id,
             execution=request,
             intent=intent,
-            preview_fingerprint=cast(str, request.arguments["preview_fingerprint"]),
+            preview_fingerprint=cast(
+                str, request.approved_preflight["preview_fingerprint"]
+            ),
         )
         return ToolOutput(
             kind="data.upsert_rows_result",
@@ -2367,20 +2345,14 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
     write = Capability(
         id="data.upsert_rows",
         description=(
-            "Apply one authenticated current-run upsert preview atomically under exact approval or a standing grant. "
+            "Preview one exact upsert batch for approval, then apply it atomically once if approved and unchanged. "
             "No chunking or replay. Unchanged rows consume the invocation and produce verified zero-change evidence. "
             "Rollback does not restore identity sequence allocations."
         ),
         input_schema={
             "type": "object",
-            "properties": {
-                **properties,
-                "preview_fingerprint": {
-                    "type": "string",
-                    "pattern": r"^sha256:[0-9a-f]{64}$",
-                },
-            },
-            "required": [*required, "preview_fingerprint"],
+            "properties": properties,
+            "required": required,
             "additionalProperties": False,
         },
         output_kind="data.upsert_rows_result",
@@ -2415,17 +2387,19 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
                 capability_id=write.id,
                 description=RELATIONAL_UPSERT_DESCRIPTION,
                 mode_capability_ids=(("preview", preview.id), ("apply", write.id)),
+                default_mode="apply",
                 presentation=ToolPresentation(
                     toolbox_id=ToolboxId.SOURCES,
                     load_mode=ToolLoadMode.ON_DEMAND,
                     text_trust=ToolTextTrust.CODE,
                     summary=(
-                        "Preview, then apply, an exact relational batch: insert missing "
-                        "rows, update existing rows, or leave them unchanged."
+                        "Write an exact relational batch in one approved call: insert "
+                        "missing rows, update existing rows, or leave them unchanged."
                     ),
                     when_to_use=(
-                        "Use mode=preview first for a batch identified by exact conflict "
-                        "keys; apply that exact preview with approval or a standing grant."
+                        "Call once to write a batch identified by exact conflict keys; "
+                        "the approval card shows the planned actions. Use mode=preview "
+                        "only to look first."
                     ),
                     keywords=(
                         "data",
@@ -2455,7 +2429,6 @@ def _upsert_output_schema(*, preview: bool) -> dict[str, object]:
         "resource_id": {"type": "string"},
         "resource_revision": {"type": "string"},
         "intent_sha256": {"type": "string"},
-        "preview_fingerprint": {"type": "string"},
         "target_set_sha256": {"type": "string"},
         "permission_fingerprint": {"type": "string"},
         "input_count": {"type": "integer", "minimum": 1, "maximum": 1000},
@@ -2489,6 +2462,7 @@ def _upsert_output_schema(*, preview: bool) -> dict[str, object]:
     if not preview:
         properties.update(
             {
+                "preview_fingerprint": {"type": "string"},
                 "receipt_id": {"type": "string"},
                 "committed_at": {"type": "string"},
                 "generated_identities": {

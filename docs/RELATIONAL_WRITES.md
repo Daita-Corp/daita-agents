@@ -41,10 +41,9 @@ Four independent controls must all permit an update:
    enabled by the user.
 3. **Current readiness:** the live table, role, grants, and catalog state must
    pass Daita's non-mutating checks.
-4. **Exact authority:** foreground writes need approval of the current-run
-   previewed call. Routines need an approved revision with one native write
-   grant and one invocation per occurrence. A background job's write asks a
-   person at the time, like any machine-run write.
+4. **Exact authority:** every write is one call that a person approves at the
+   time. Daita builds the preview itself and shows it on the approval card;
+   routine occurrences, background jobs and their sub-runs ask the same way.
 
 The model cannot enable source permissions, grant database privileges, or
 approve its own update.
@@ -166,7 +165,8 @@ Set priority to high for support tickets where ticket_status is waiting and
 category is billing.
 ```
 
-Daita first runs a read-only preview. It identifies the complete matching
+The agent makes one `data_update_rows` call. Before asking you, Daita runs a
+read-only preview and puts it on the approval card. It identifies the complete matching
 primary-key set, reports the exact matched row count, and displays at most five
 bounded before/after samples. The samples help review the change; the matched
 count and complete target fingerprint cover every selected row, including rows
@@ -241,8 +241,8 @@ current application state when operational policy requires it.
 
 Daita established that the approved update did not commit. Common causes
 include target drift, constraint violations, permission changes, and statement
-or lock timeouts. Correct the underlying issue, then request a new preview. A
-previous approval is never reused.
+or lock timeouts. Correct the underlying issue, then ask again; the new call
+shows a new preview. A previous approval is never reused.
 
 ### `outcome_unknown`
 
@@ -281,12 +281,15 @@ credential, but it does not change database grants or restore data.
 
 ## Structured upsert
 
-The public tools are `data_update_rows` and `data_upsert_rows`. Each takes
-`mode`: `preview` runs the read-only preview and `apply` runs the write. Mode
+The public tools are `data_update_rows` and `data_upsert_rows`. A write is one
+call: `mode` defaults to `apply`, which builds its own preview, shows it on the
+approval card, re-checks it for drift after approval and writes once with a
+receipt. `mode=preview` stays for "show me first" and changes nothing. Mode
 selects the existing preview or write capability; it is not a separate
 execution path. The model supplies exact source/resource IDs and scalar values,
-never SQL. `mode=apply` requires a successful authenticated preview from the
-same run with matching intent.
+never SQL, and never a preview fingerprint or expected row count: Daita keeps
+the preview it showed you and checks the write against it. Routine, job and
+sub-run writes use the same one-call sequence.
 
 Compatibility: `data_preview_update_rows` and `data_preview_upsert_rows` were
 removed without aliases. Capability IDs (`data.preview_update_rows`,

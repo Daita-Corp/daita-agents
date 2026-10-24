@@ -199,9 +199,12 @@ class RoutineControlExecutor(_RoutineExecutor):
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
         routine_id = _string(request.arguments, "routine_id")
-        expected_revision = _integer(request.arguments, "expected_revision")
         action = RoutineControlAction(_string(request.arguments, "action"))
         inspection = await self._owner.inspect(routine_id)
+        expected_revision = request.arguments.get(
+            "expected_revision",
+            None if inspection is None else inspection.routine.revision,
+        )
         if inspection is None or inspection.routine.revision != expected_revision:
             raise RoutineError(
                 "routine_revision_changed",
@@ -218,9 +221,13 @@ class RoutineControlExecutor(_RoutineExecutor):
         )
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
+        # The revision the person approved, whether sent or defaulted.
+        approved = request.approved_preflight
+        if approved is None:
+            raise ValueError("routine control requires its approved preflight")
         routine = await self._owner.control(
             _string(request.arguments, "routine_id"),
-            expected_revision=_integer(request.arguments, "expected_revision"),
+            expected_revision=_integer(approved, "expected_revision"),
             action=RoutineControlAction(_string(request.arguments, "action")),
             authorized_control_call_id=request.call_id,
         )
@@ -419,7 +426,10 @@ def routine_capability_declarations(
     )
     control_capability = Capability(
         id=ROUTINE_CONTROL_CAPABILITY_ID,
-        description="Pause, resume, run now, or permanently disable one exact routine revision.",
+        description=(
+            "Pause, resume, run now, or permanently disable one routine; "
+            "expected_revision defaults to the current revision."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -430,7 +440,7 @@ def routine_capability_declarations(
                     "enum": [item.value for item in RoutineControlAction],
                 },
             },
-            "required": ["routine_id", "expected_revision", "action"],
+            "required": ["routine_id", "action"],
             "additionalProperties": False,
         },
         output_kind="routine.receipt",

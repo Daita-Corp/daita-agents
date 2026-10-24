@@ -51,7 +51,6 @@ from ...scope import EffectiveSourceScope, resolve_effective_source_scope
 from ...storage.sqlite_records import RelationalWriteScope, SourcePermissionStateError
 from .sql import (
     DuckDBReadValidationError,
-    RelationalUpdateCommand,
     RelationalUpdateIntent,
     ResourceSchema,
     read_validator,
@@ -613,24 +612,12 @@ class DataCapabilityDomain:
                 generated_identity_columns=permission.generated_identity_columns,
                 max_rows=permission.max_rows,
             )
-            await self._authenticate_native_lineage(
-                run,
-                call,
-                arguments,
-                capability,
-                intent.evidence_call_ids,
-                execution=capability.id == "data.upsert_rows",
+            await self._authenticate_upsert_evidence(
+                run, call, capability, intent.evidence_call_ids
             )
         if capability.id in _UPDATE_CAPABILITIES:
-            await self._validate_relational_update_call(
-                run,
-                arguments,
-                execution=capability.id == RELATIONAL_UPDATE_CAPABILITY_ID,
-            )
+            await self._validate_relational_update_call(run, arguments)
             if capability.id == RELATIONAL_UPDATE_CAPABILITY_ID:
-                await self._authenticate_native_lineage(
-                    run, call, arguments, capability, (), execution=True
-                )
                 permission = await self._catalog.load_relational_write_scope(
                     run.agent_id,
                     cast(str, arguments["source_id"]),
@@ -641,11 +628,6 @@ class DataCapabilityDomain:
                         "resource_write_not_allowed",
                         "The current write permission is unavailable.",
                         recovery=_WRITE_PERMISSION_REQUIRED,
-                    )
-                if cast(int, arguments["expected_affected_rows"]) > permission.max_rows:
-                    raise CapabilityInputError(
-                        "write_row_limit",
-                        "The exact update exceeds its permission row ceiling.",
                     )
         return arguments
 
@@ -1588,8 +1570,6 @@ class DataCapabilityDomain:
         self,
         run: RunInput,
         arguments: Mapping[str, object],
-        *,
-        execution: bool,
     ) -> None:
         source_id = arguments.get("source_id")
         if not isinstance(source_id, str):
@@ -1608,11 +1588,7 @@ class DataCapabilityDomain:
                 {"source_id": source_id},
             )
         try:
-            intent = (
-                RelationalUpdateCommand.from_mapping(arguments).intent
-                if execution
-                else RelationalUpdateIntent.from_mapping(arguments)
-            )
+            intent = RelationalUpdateIntent.from_mapping(arguments)
         except (TypeError, ValueError) as error:
             raise CapabilityInputError(
                 "write_assignment_invalid",
@@ -1677,24 +1653,18 @@ class DataCapabilityDomain:
                 "The request exceeds the target's current admitted classification.",
             )
 
-    async def _authenticate_native_lineage(
+    async def _authenticate_upsert_evidence(
         self,
         run: RunInput,
         call: ToolCall,
-        arguments: Mapping[str, object],
         capability: Capability,
         evidence_ids: tuple[str, ...],
-        *,
-        execution: bool,
     ) -> None:
-        if not execution and not evidence_ids:
+        if not evidence_ids:
             return
-        calls, results = await self._authenticated_prior_results(run, call, capability)
+        _, results = await self._authenticated_prior_results(run, call, capability)
         if (
-            evidence_ids
-            and tuple(
-                block.call_id for block in results if block.call_id in evidence_ids
-            )
+            tuple(block.call_id for block in results if block.call_id in evidence_ids)
             != evidence_ids
         ):
             known = {block.call_id for block in results}
@@ -1708,54 +1678,6 @@ class DataCapabilityDomain:
                     else "; the call ids are out of order."
                 ),
             )
-        if not execution:
-            return
-        expected = native_preview_capability(capability.id)
-        for result in results:
-            data = result.output.get("data")
-            if (
-                result.capability_id != expected
-                or not isinstance(data, Mapping)
-                or data.get("preview_fingerprint") != arguments["preview_fingerprint"]
-            ):
-                continue
-            original = calls[result.call_id].arguments
-            if expected == "data.preview_upsert_rows":
-                current = RelationalUpsertIntent.from_mapping(arguments)
-                previewed = RelationalUpsertIntent.from_mapping(original)
-                # Typed validation and adapter preflight authenticate semantic equality; compare all requested values here.
-                a, b = current.to_payload(), previewed.to_payload()
-                a["rows"] = tuple(sorted(current.rows, key=canonical_json))
-                b["rows"] = tuple(sorted(previewed.rows, key=canonical_json))
-                if canonical_json(a) == canonical_json(b):
-                    return
-            else:
-                current_update = RelationalUpdateCommand.from_mapping(arguments).intent
-                original_update = RelationalUpdateIntent.from_mapping(original)
-                resources = await self._catalog.resource_schemas(
-                    run.agent_id, current_update.source_id
-                )
-                a_update = validate_relational_update_intent(
-                    current_update, resources=resources
-                ).validated
-                b_update = validate_relational_update_intent(
-                    original_update, resources=resources
-                ).validated
-                if (
-                    a_update is not None
-                    and b_update is not None
-                    and a_update.intent_sha256 == b_update.intent_sha256
-                ):
-                    return
-        raise CapabilityInputError(
-            "write_preview_not_authenticated",
-            "The write requires its exact successful current-run preview and matching intent.",
-            recovery=ToolRecovery(
-                RecoveryKind.CORRECT_ARGUMENTS,
-                "Call mode=preview with the same arguments in this run, then "
-                "apply with its preview_fingerprint.",
-            ),
-        )
 
     async def derive_call_provenance(
         self,
@@ -1809,7 +1731,7 @@ class DataCapabilityDomain:
         if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
             raise CapabilityInputError(
                 "write_preview_not_authenticated",
-                "The preview belongs to another run or agent.",
+                "The transcript belongs to another run or agent.",
             )
         registry = self._registry
 

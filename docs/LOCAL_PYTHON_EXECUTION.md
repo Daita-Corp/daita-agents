@@ -38,13 +38,13 @@ run-local; job runs use the same per-run lifecycle as routines.
 
 ## Cells and read tools
 
-The first call supplies `expected_state={"generation":0,"revision":0}`. Each
-accepted cell returns the exact state for the next call. A Python exception
-advances the revision and reports `state_may_have_changed`: assignments before
-the exception remain. Timeout, resource or protocol failure reports `state_lost`
-and closes the interpreter. An explicitly requested later cell can start a fresh
-generation using the returned state; the failed code is never replayed and its
-consumption remains charged. Reuse retained variables after successful cells and
+Each call sends only `code` (plus optional inputs, saves and timeout); Daita
+tracks the interpreter the run is using. A Python exception reports
+`state_may_have_changed`: assignments before the exception remain. Timeout,
+resource or protocol failure reports `state_lost` and closes the interpreter.
+A later cell then starts a fresh interpreter and its result says
+`state_reset: true`, so the model knows earlier variables are gone; the failed
+code is never replayed and its consumption remains charged. Reuse retained variables after successful cells and
 ordinary Python errors instead of rereading or recomputing sufficient inputs.
 Replacement is subject to remaining allowances and verified cleanup; it does not
 restore variables from the lost interpreter.

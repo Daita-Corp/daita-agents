@@ -87,8 +87,8 @@ candidates, including unloaded tools. A read-only Sources group does not claim
 update capability. These facts grant no permission; current revocation, receipt
 blocks and approval still apply. Search cannot add an absent effect. Independent
 schema/discovery calls or grounded value-read/load calls can share a model step;
-loaded execution schemas become callable only on the next step. Preview and write
-remain sequential.
+loaded execution schemas become callable only on the next step. A write is one
+call: Daita builds its own preview and shows it on the approval card.
 
 Foreground preparation also reads the existing durable external-effect blocking
 check. If blocked, mandatory context includes up to 20 receipt IDs and an omitted

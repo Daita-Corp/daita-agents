@@ -88,10 +88,15 @@ revisions, the highest input sensitivity and per-input lineage (`source_id`,
 inform discovery and join paths only; they grant no read authority.
 
 Data capabilities are reads except for explicitly admitted `data_update_rows` and
-`data_upsert_rows`, initially backed by PostgreSQL. Their read-only counterparts are
-`data_preview_update_rows` and `data_preview_upsert_rows`. Execution requires an
-authenticated current-run preview and matching intent. Update retains its exact
-selection, target-count, drift, rollback and receipt safeguards.
+`data_upsert_rows`, initially backed by PostgreSQL. A write is one call: `mode`
+defaults to `apply`, whose side-effect preflight builds the preview that the
+approval card shows. After approval the runtime runs the preflight again and
+refuses a drifted preview, then hands the approved preflight to the executor
+(`ToolExecution.approved_preflight`), so the locked transaction checks the same
+preview fingerprint and row count the person reviewed. The model never sends a
+fingerprint or count, and the preview is not stored. `mode=preview` routes to the
+read-only `data.preview_update_rows`/`data.preview_upsert_rows`. Update retains
+its exact selection, target-count, drift, rollback and receipt safeguards.
 
 `RelationalWriteScope` binds exact structural revision, explicit update/upsert
 operations, keys, insert/update columns, admitted identity generation and row limits.
@@ -160,8 +165,9 @@ the same worker and validator, binding typed copies of its complete inputs in
 private scratch and exposing only their aliases; homes without local scratch
 (`Agent.from_storage`) do not offer it.
 
-An authenticated current-run session-folder `file_read` binding can feed
-`artifact_edit_text`. That capability commits a complete replacement artifact
+`artifact_edit_text` names an earlier session-folder `file_read` of this run by
+its `result_ref` or path; the artifact domain takes that read's authenticated
+binding from the transcript, so the model never copies it. That capability commits a complete replacement artifact
 without changing the local file. `artifact_save_local` requires exact approval,
 revalidates the unchanged bound file, and atomically publishes the artifact.
 Drift requires a fresh read and edit. Attached folders are read-only sources:

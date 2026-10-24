@@ -138,11 +138,14 @@ worker and removes its private scratch state.
 
 For one bounded UTF-8 text file, Daita can perform the cohesive sequence
 `file_read` → `artifact_edit_text` → approval → `artifact_save_local`. The edit
-tool accepts only the authenticated current-run binding returned by a session
-folder `file_read`; it does not accept a path, revision, or file bytes. Attached
-folders are read-only sources, so their reads carry no edit binding. It applies
-ordered exact replacements, including exact-anchor insertion and deletion,
-then commits the complete replacement as an internal artifact. Preparing the
+tool names an earlier session-folder `file_read` of the same run, by its
+`result_ref` or its path, and Daita uses the authenticated binding that read
+returned; the edit does not accept a binding, revision, or file bytes, and a
+reference to anything other than such a read is refused. Attached folders are
+read-only sources, so their reads carry no edit binding. It applies ordered
+exact replacements, including exact-anchor insertion and deletion (each
+replacement expects one occurrence unless `expected_occurrences` says
+otherwise), then commits the complete replacement as an internal artifact. Preparing the
 artifact never changes the local file.
 
 The final save derives its only target from that committed binding and asks
