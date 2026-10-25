@@ -250,6 +250,9 @@ _DROPPED_OCCURRENCE_FIELDS = (
     "precheck_observation",
     "reserved_tokens",
     "reserved_cost_usd",
+    # The occurrence's run row already records the scope that run started with.
+    "execution_scope",
+    "execution_scope_digest",
 )
 # Prechecks are gone: a claim mid-precheck is an ordinary claim, and an
 # occurrence skipped as unchanged ended without a run, like a completed one.
@@ -278,6 +281,20 @@ def _simple_occurrence(record: dict[str, object]) -> dict[str, object]:
     disposition = fields["disposition"]
     assert isinstance(disposition, str)
     fields["disposition"] = _OCCURRENCE_DISPOSITIONS.get(disposition, disposition)
+    return record
+
+
+def _askable_mcp_binding(record: dict[str, object]) -> dict[str, object]:
+    """MCP actions ask at the time; tools no longer record unattended eligibility."""
+
+    if record["__record__"] != "MCPServerBinding":
+        raise ValueError("Historical MCP binding is invalid")
+    fields = record["fields"]
+    assert isinstance(fields, dict)
+    for tool in fields["tools"]:
+        if tool["__record__"] != "MCPToolBinding":
+            raise ValueError("Historical MCP tool binding is invalid")
+        del tool["fields"]["automation_eligibility"]
     return record
 
 
@@ -336,6 +353,17 @@ def _apply_revision_4(home: Path, source_shape: str | None) -> None:
                 "WHERE agent_id = ? AND occurrence_id = ?",
                 (_dump(occurrence), fields["disposition"], agent_id, occurrence_id),
             )
+        for agent_id, binding_id, encoded in connection.execute(
+            "SELECT agent_id, binding_id, data FROM mcp_server_bindings"
+        ).fetchall():
+            connection.execute(
+                "UPDATE mcp_server_bindings SET data = ? WHERE agent_id = ? AND binding_id = ?",
+                (
+                    _dump(_askable_mcp_binding(json.loads(encoded))),
+                    agent_id,
+                    binding_id,
+                ),
+            )
         _convert_graph_jobs(connection)
         connection.commit()
 
@@ -354,7 +382,9 @@ REVISION_4 = HomeMigration(
         "Retire inactive learning candidates and their review stamps; approved knowledge is unaffected. "
         "Routines keep their title, prompt, schedule, named sources, counters and state; their frozen "
         "access, grants, routes, sensitivity, budgets, expiry, outcome, precheck, skills and provenance "
-        "are dropped, and their runs ask before writes. Occurrences drop prechecks and reservations. "
+        "are dropped, and their runs ask before writes. Occurrences drop prechecks, reservations "
+        "and their copy of the run's scope. MCP tool bindings drop unattended eligibility; every "
+        "MCP action asks at the time. "
         "The task graph is replaced by one checklist-job record per job: finished jobs keep their "
         "accepted result, unfinished jobs fail with an upgrade message, result deliveries and "
         "receipts keep their job id, graph attention notices are dropped, and the graph tables go."

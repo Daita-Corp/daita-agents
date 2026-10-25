@@ -132,8 +132,8 @@
         "affected_paths": [
           "state.db"
         ],
-        "checksum": "a1b159370b43f1c9859f477e95cab29d1b7ea3bc1c91ee7945a4e98429a3535b",
-        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete. Retire inactive learning candidates and their review stamps; approved knowledge is unaffected. Routines keep their title, prompt, schedule, named sources, counters and state; their frozen access, grants, routes, sensitivity, budgets, expiry, outcome, precheck, skills and provenance are dropped, and their runs ask before writes. Occurrences drop prechecks and reservations. The task graph is replaced by one checklist-job record per job: finished jobs keep their accepted result, unfinished jobs fail with an upgrade message, result deliveries and receipts keep their job id, graph attention notices are dropped, and the graph tables go.",
+        "checksum": "4b87d6d31da8a323cb593aeef4a3b93792b26a78c07d90876584d0aa1a2c5792",
+        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete. Retire inactive learning candidates and their review stamps; approved knowledge is unaffected. Routines keep their title, prompt, schedule, named sources, counters and state; their frozen access, grants, routes, sensitivity, budgets, expiry, outcome, precheck, skills and provenance are dropped, and their runs ask before writes. Occurrences drop prechecks, reservations and their copy of the run's scope. MCP tool bindings drop unattended eligibility; every MCP action asks at the time. The task graph is replaced by one checklist-job record per job: finished jobs keep their accepted result, unfinished jobs fail with an upgrade message, result deliveries and receipts keep their job id, graph attention notices are dropped, and the graph tables go.",
         "migration_id": "0004_foreground_analysis_evidence",
         "revision": 4
       }
@@ -728,7 +728,6 @@
         "result_sensitivity",
         "access_mode",
         "operational_effect",
-        "automation_eligibility",
         "maximum_outbound_sensitivity",
         "completion_semantics",
         "task_support"
@@ -827,8 +826,6 @@
         "claimed_at",
         "claim_token",
         "lease_expires_at",
-        "execution_scope",
-        "execution_scope_digest",
         "reserved_run_id",
         "charged_tokens",
         "charged_cost_usd",
@@ -2098,7 +2095,7 @@
       }
     }
   },
-  "contract_sha256": "4561428d09b40a81fcec6b501c2818f8eef9d6461df89650ef2c2b2074bef39b",
+  "contract_sha256": "5db6b16c9b941bb7432e172924325fc3a37942f2a3525fdca5ee70835ef0e6a2",
   "home_revision": 4,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1
