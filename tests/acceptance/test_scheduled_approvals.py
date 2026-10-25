@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import replace
+import json
+import signal
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -22,41 +23,41 @@ from daita import (
 )
 from daita.capabilities import EffectOutcome
 from daita.distribution import OutcomeState
-from daita.llm.models import (
-    ModelRequest,
-    ModelResponse,
-    ModelUsage,
-    ToolCall,
-    ToolResultBlock,
+from daita.host.paths import host_paths
+from daita.host.supervise import host_status
+from daita.routines.models import (
+    ROUTINE_CLAIM_LEASE_SECONDS,
+    RoutineSchedule,
+    RoutineState,
 )
-from daita.llm.pricing import CostEstimate
-from daita.routines.models import RoutineSchedule
+from tests.data.writes._upsert_support import Database
 from tests.support.host import (
     StartHost,
     bounded,
+    client,
     pending_interaction,
     short_root,
     value,
+    work_folder,
 )
 from tests.support.native_writes import (
     NOW,
     ScriptedResearchModel,
+    companies_structure,
     create_fixture,
+    measured_step,
+    patch_fake_postgresql,
     response,
+    scheduled_write_script,
 )
 from tests.support.workspace import workspace_for
 
 pytestmark = [pytest.mark.acceptance, pytest.mark.integration]
 
+REPOSITORY = Path(__file__).resolve().parents[2]
 NAME = "native-acceptance"
 TITLE = "Daily totals"
 INSTRUCTION = "Upsert today's totals into reporting.daily."
-USAGE = ModelUsage(
-    input_tokens=100,
-    output_tokens=10,
-    cost_estimate=CostEstimate.complete(Decimal("0")),
-)
-Step = ModelResponse | Callable[[ModelRequest], ModelResponse]
 
 
 class Sent:
@@ -70,44 +71,6 @@ class Sent:
 
     def texts(self) -> list[str]:
         return [text for _title, text in self.items]
-
-
-def _measured(step: Step) -> Step:
-    """Scheduled runs need measured usage; wrap a scripted step to report it."""
-
-    if isinstance(step, ModelResponse):
-        return replace(step, usage=USAGE)
-    return lambda request: replace(step(request), usage=USAGE)
-
-
-def _tool_result(request: ModelRequest, call_id: str) -> ToolResultBlock:
-    return next(
-        block
-        for message in request.messages
-        for block in message.content
-        if isinstance(block, ToolResultBlock) and block.call_id == call_id
-    )
-
-
-def _write_script(batch: Mapping[str, object]) -> list[Step]:
-    """Write the fixture's one-row upsert in one call; report what happened."""
-
-    def report(request: ModelRequest) -> ModelResponse:
-        write = _tool_result(request, "write")
-        if not write.is_error:
-            return response(text="Saved today's totals.")
-        error = write.output["error"]
-        assert isinstance(error, Mapping)
-        return response(text=f"The write was refused ({error['code']}).")
-
-    steps: list[Step] = [
-        response(
-            ToolCall("load", "toolbox_load", {"tool_names": ["data_upsert_rows"]})
-        ),
-        response(ToolCall("write", "data_upsert_rows", dict(batch))),
-        report,
-    ]
-    return [_measured(step) for step in steps]
 
 
 def _intent(source_id: str, schedule: RoutineSchedule) -> RoutineIntent:
@@ -142,10 +105,10 @@ async def _scheduled_write(
     )
     remote = await connect(NAME, cwd=harness.work(), root=harness.root)
     try:
-        provider.replace_script([_measured(response(text="Noted."))])
+        provider.replace_script([measured_step(response(text="Noted."))])
         origin = await remote.run("Keep today's totals in the companies table.")
         assert origin.conversation_id is not None
-        provider.replace_script(_write_script(batch))
+        provider.replace_script(scheduled_write_script(batch))
         routine = await remote.create_routine(
             _intent(
                 str(batch["source_id"]),
@@ -272,6 +235,128 @@ async def test_an_unanswered_scheduled_write_expires_into_needs_you(
         await remote.close()
 
 
+async def test_a_scheduled_write_pending_when_the_host_restarts_never_writes_unasked(
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness, provider, db, _sent, routine_id = await _scheduled_write(
+        start_host, monkeypatch, drain_seconds=0.2
+    )
+    await pending_interaction(harness.http, NAME, timeout=30)
+    # The host stops with the question open; the run cannot keep waiting.
+    await harness.stop()
+    assert not db.rows and _inserts(db) == 0
+    steps_at_stop = len(provider.steps)
+
+    restarted = await start_host(model=provider, root=harness.root)
+    remote, card, outcome = await _result(restarted, routine_id)
+    try:
+        # Questions live in host memory: the restarted host has none, and the
+        # interrupted occurrence needs a person rather than writing unasked.
+        assert value(await restarted.http.get(f"/v1/agents/{NAME}/interactions")) == ()
+        assert card.column is WorkColumn.NEEDS_YOU
+        assert outcome.conclusion_state is OutcomeState.FAILED
+        assert not db.rows and _inserts(db) == 0
+        assert await remote.list_effects() == ()
+        assert len(provider.steps) == steps_at_stop
+    finally:
+        await remote.close()
+
+
+async def test_a_host_killed_after_a_scheduled_write_dispatches_never_replays_it(
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = short_root()
+    agent, *_fixture, batch, _clock, _approvals = await create_fixture(
+        root, monkeypatch
+    )
+    await agent.close()
+    batch_file = root.parent / f"{root.name}-batch.json"
+    batch_file.write_text(json.dumps(batch), encoding="utf-8")
+    committing = root.parent / f"{root.name}-committing"
+    paths = host_paths(root)
+    # A real host process: its approved write hangs at commit and is killed there.
+    host = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "tests.support.killed_write_host",
+            str(root),
+            str(batch_file),
+            str(committing),
+        ],
+        cwd=REPOSITORY,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    http = client(paths)
+    try:
+        await bounded(lambda: host_status(paths), timeout=30)
+        remote = await connect(NAME, cwd=work_folder(root), root=root)
+        try:
+            origin = await remote.run("Keep today's totals in the companies table.")
+            assert origin.conversation_id is not None
+            routine = await remote.create_routine(
+                _intent(
+                    str(batch["source_id"]),
+                    OnceSchedule(datetime.now(UTC) + timedelta(seconds=2)),
+                ),
+                conversation_id=origin.conversation_id,
+            )
+        finally:
+            await remote.close()
+        interaction = await pending_interaction(http, NAME, timeout=30)
+        value(
+            await http.post(
+                f"/v1/agents/{NAME}/interactions/{interaction['id']}",
+                json={"decision": "approve"},
+            )
+        )
+        await bounded(committing.exists, timeout=30)
+        host.send_signal(signal.SIGKILL)
+        host.wait(timeout=20)
+    finally:
+        await http.aclose()
+        if host.poll() is None:
+            host.kill()
+            host.wait(timeout=20)
+
+    # Any replay after the restart would reach this database.
+    replay = Database()
+    patch_fake_postgresql(monkeypatch, replay, companies_structure(replay))
+    model = ScriptedResearchModel()
+    restarted = await start_host(model=model, root=root)
+    remote = await connect(NAME, cwd=restarted.work(), root=root)
+    try:
+        (receipt,) = await bounded(remote.list_effects, timeout=30)
+        # Nobody knows whether the commit landed, so the outcome stays uncertain.
+        assert receipt.outcome is EffectOutcome.UNCERTAIN
+        assert receipt.routine_id == routine.routine_id
+
+        async def needs_you() -> object:
+            board = await remote.work_board()
+            return next(
+                (
+                    card
+                    for card in board.columns.get(WorkColumn.NEEDS_YOU, ())
+                    if card.kind is WorkKind.ROUTINE_RUN
+                    and card.routine_id == routine.routine_id
+                ),
+                None,
+            )
+
+        # The killed host's claim fences the occurrence until its lease ends;
+        # then it surfaces as Needs you, with the routine paused.
+        await bounded(needs_you, timeout=ROUTINE_CLAIM_LEASE_SECONDS + 30)
+        inspection = await remote.inspect_routine(routine.routine_id)
+        assert inspection is not None
+        assert inspection.routine.state is RoutineState.PAUSED
+        assert value(await restarted.http.get(f"/v1/agents/{NAME}/interactions")) == ()
+        assert _inserts(replay) == 0 and not replay.rows
+        assert model.requests == []
+    finally:
+        await remote.close()
+
+
 async def test_library_mode_without_an_approval_handler_refuses_a_scheduled_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -297,10 +382,10 @@ async def test_library_mode_without_an_approval_handler_refuses_a_scheduled_writ
         clock=lambda: clock[0],
     )
     try:
-        provider.replace_script([_measured(response(text="Noted."))])
+        provider.replace_script([measured_step(response(text="Noted."))])
         origin = await agent.run("Keep today's totals in the companies table.")
         assert origin.conversation_id is not None
-        provider.replace_script(_write_script(batch))
+        provider.replace_script(scheduled_write_script(batch))
         routine = await agent.create_routine(
             _intent(
                 str(batch["source_id"]),

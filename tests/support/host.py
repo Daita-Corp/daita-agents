@@ -193,11 +193,14 @@ async def hosts() -> AsyncIterator[StartHost]:
     try:
         yield start
     finally:
-        for harness in harnesses:
-            try:
+        # A restart reuses its root, so stop every host before removing any.
+        try:
+            for harness in harnesses:
                 await harness.stop()
+            for harness in harnesses:
                 assert not harness.paths.socket.exists()
-            finally:
+        finally:
+            for harness in harnesses:
                 remove_root(harness.root)
 
 

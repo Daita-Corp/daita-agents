@@ -138,6 +138,12 @@ CASES: tuple[SmokeCase, ...] = (
         {"DAITA_RUN_CONTRACT_QUALIFICATION": "1"},
     ),
     SmokeCase(
+        "routines/scheduled_write",
+        "tests/live/routines/test_scheduled_write.py::"
+        "test_live_scheduled_routine_asks_notifies_and_writes_once_after_approval",
+        {"DAITA_RUN_LIVE_SCHEDULED_WRITE": "1"},
+    ),
+    SmokeCase(
         "data/write_release",
         "tests/live/data/test_model_write_acceptance.py::"
         f"test_live_mixed_upsert_and_unchanged_repeat[{_MODEL}-0]",

@@ -240,6 +240,14 @@ asks a real model for the example one-time routine and checks one
 `DAITA_CONTRACT_MODEL_ID` and, under API billing, its key with
 `DAITA_CONTRACT_LLM_API_KEY`.
 
+The scheduled-write case (`tests/live/routines/test_scheduled_write.py`) runs a
+real model's one-time routine in a real host while no client watches: the run
+asks to upsert one row into the simulated PostgreSQL fixture, the host
+notifies, the test approves through the interaction route, and exactly one
+receipted write follows. Enable it with `DAITA_RUN_LIVE_SCHEDULED_WRITE=1`;
+choose its model with `DAITA_LIVE_SCHEDULED_WRITE_MODEL_ID` and, under API
+billing, its key with `DAITA_LIVE_SCHEDULED_WRITE_LLM_API_KEY`.
+
 The background-job cases (`tests/live/jobs/test_jobs.py`) show a real model
 finishing a two-part job through `checklist_write` and `delegate`, a job that
 resumes after a restart, a job that asks with `ask_user` and uses the answer,
