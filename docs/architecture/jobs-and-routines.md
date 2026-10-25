@@ -172,5 +172,3 @@ progress while the host runs, whether or not a TUI is open. It reuses the
 existing runtime and state store and is each home's only writer while it holds
 the agent. Clients start it on demand; `daita host install` registers it as a
 login service (launchd or systemd) so it restarts after a crash and at login.
-`daita host --agent <name>` is deprecated: it prints a notice and runs
-`daita host serve`.

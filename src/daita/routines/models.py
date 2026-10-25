@@ -12,7 +12,6 @@ from hashlib import sha256
 from typing import TypeAlias, cast
 
 from .._json import FrozenJsonObject
-from ..capabilities import ExecutionScope
 from ..distribution.models import (
     MAX_DISTRIBUTION_TARGETS,
     MAX_OUTCOME_ARTIFACT_BYTES,
@@ -529,8 +528,6 @@ class RoutineOccurrence:
     claimed_at: datetime | None
     claim_token: str | None
     lease_expires_at: datetime | None
-    execution_scope: ExecutionScope | None
-    execution_scope_digest: str | None
     reserved_run_id: str | None
     charged_tokens: int
     charged_cost_usd: Decimal
@@ -581,15 +578,6 @@ class RoutineOccurrence:
             and self.lease_expires_at <= self.claimed_at
         ):
             raise ValueError("occurrence lease must expire after claim")
-        if (self.execution_scope is None) != (self.execution_scope_digest is None):
-            raise ValueError(
-                "occurrence execution scope and digest must be present together"
-            )
-        if (
-            self.execution_scope is not None
-            and self.execution_scope.digest != self.execution_scope_digest
-        ):
-            raise ValueError("occurrence execution scope digest does not match")
         for optional_identity, identity_name in (
             (self.reserved_run_id, "occurrence reserved_run_id"),
             (self.terminal_run_id, "occurrence terminal_run_id"),

@@ -8,8 +8,6 @@ from dataclasses import dataclass, replace
 from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
-    AutomationEligibility,
-    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -260,7 +258,6 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
             },
             executor_id=view.executor_id,
             access_mode=AccessMode.NONE,
-            automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         ),
         Capability(
             id=SKILL_SAVE_CAPABILITY_ID,
@@ -307,7 +304,6 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
             executor_id=save.executor_id,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
         Capability(
             id=SKILL_DELETE_CAPABILITY_ID,
@@ -326,7 +322,6 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
             executor_id=delete.executor_id,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
     )
     return SkillDeclarations(
@@ -482,18 +477,6 @@ class SkillCapabilityDomain:
         return arguments
 
     prepare_session_call = prepare_call
-
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject:
-        raise CapabilityInputError(
-            "automation_grant_unsupported",
-            "This domain does not admit unattended external effects.",
-        )
 
     async def side_effect_plan(
         self,

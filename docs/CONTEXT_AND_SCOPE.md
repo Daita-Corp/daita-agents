@@ -65,18 +65,14 @@ preview/execution tools so one load can prepare both without a search. Revoked
 or absent write capabilities are not advertised. Preparation fits this guidance
 against the same candidate catalog used by step projection. Loading does not
 activate a same-step call or authorize a write.
-For grant-requiring capabilities, discovery includes the exact automation contract
-used by scheduling. It does not activate execution tools. A contract too large for
-the bounded page is omitted in full with `automation_contract_omitted`.
 `toolbox_inspect` reads an exact prepared tool contract without loading or executing
-it. Search, load and inspection derive their contracts from the same registry and
-grant metadata. Load receipts retain compact incomplete references and grant metadata;
-they do not copy execution schemas into every load result. Schemas obtained through
+it. Load and inspection derive their contracts from the same registry. Load
+receipts retain compact incomplete references; they do not copy execution
+schemas into every load result. Schemas obtained through
 inspection remain in the exact transcript after the callable set changes. Exact inspection returns either the complete contract or
 bounded fragments; use its `contract_digest`, child JSON Pointer `path`, and
 `next_offset` to retrieve omitted portions. Partial data never claims completeness.
-`requires_automation_grant` describes scheduled authority. A foreground action
-uses the normal exact approval at invocation. Inspection checks current local
+An action, in any run, uses the normal exact approval at invocation. Inspection checks current local
 applicability within the frozen candidates; remote identity/schema checks still
 belong to invocation. Framework inbox
 destinations concern report delivery; an MCP action's destination is defined by

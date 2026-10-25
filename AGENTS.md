@@ -106,7 +106,6 @@ Runs come from two places:
 | Secrets | Secret references and lazy resolution | `security/` |
 | Product surfaces | CLI and Textual TUI, clients of the host | `cli.py`, `tui/` |
 | Host | One background process per user that opens every agent and serves clients over an owner-only Unix socket | `host/` |
-| Resident host (deprecated) | `daita host --agent <name>`: now a deprecation notice plus `daita host serve` | `hosting/resident.py` |
 
 ## Invariants
 
@@ -122,9 +121,8 @@ These protect users. Each comes with the reason it exists.
 3. **Untrusted content never grants authority.** Catalog metadata, file contents,
    tool and MCP results, memory, skills, semantic notes and model text are
    labeled untrusted. Authority comes only from code-owned capability metadata,
-   current permissions, approvals and grants. Never infer access, effects or
-   automation eligibility from a tool name or description. *Why: prompt
-   injection.*
+   current permissions and a person's approvals. Never infer access or effects
+   from a tool name or description. *Why: prompt injection.*
 4. **The catalog is structural truth, and SQL is validated against it before any
    source I/O.** Connector guardrails still apply during execution. *Why: model
    text cannot be trusted to name real resources or safe queries.*
@@ -229,7 +227,7 @@ before changing that area.
 | --- | --- | --- |
 | Runtime | Composition, the loop, context building, budgets, source scope, capability execution, approval and observation | [`runtime.md`](docs/architecture/runtime.md) |
 | Data and files | Source types and operations, catalog and declared links, SQL validation, combined queries, relational writes, folders, artifacts | [`data-and-files.md`](docs/architecture/data-and-files.md) |
-| MCP | Admitted bindings, call-time rechecks, actions and grants | [`mcp.md`](docs/architecture/mcp.md) |
+| MCP | Admitted bindings, call-time rechecks and approved actions | [`mcp.md`](docs/architecture/mcp.md) |
 | Jobs and routines | Checklist jobs, supervision, routine schedules, machine-run limits, outcomes and deliveries | [`jobs-and-routines.md`](docs/architecture/jobs-and-routines.md) |
 | Persistence | State boundary, home revisions, migrations, upgrades, release contract | [`persistence.md`](docs/architecture/persistence.md) |
 | Models | Canonical records, routing and retries, call policy, provider lifecycle | [`models.md`](docs/architecture/models.md) |
@@ -246,9 +244,9 @@ user's side.
 1. Pick the owning domain (see *System map*); add the capability there rather
    than creating a new domain.
 2. Declare a `Capability` in that domain's declarations with a stable `id`,
-   input and output schemas, `access_mode`, `operational_effect` and
-   `automation_eligibility`. Add an `EffectReceiptPolicy` for external effects
-   and an `AutomationGrantPolicy` if machine runs may perform the effect.
+   input and output schemas, `access_mode` and `operational_effect`. Add an
+   `EffectReceiptPolicy` for external effects; every run asks a person before
+   performing one.
 3. Implement its `Executor`, plus an optional `ToolView` for the model-facing
    shape.
 4. In the domain, project when the tool applies, bind arguments and revalidate
@@ -320,8 +318,9 @@ The full release policy is in `docs/architecture/persistence.md`.
 
 ### Add a CLI command
 Add the parser in `build_parser()` and its branch in the command dispatch in
-`cli.py`. Use only the public `Agent` API, and format output through
-`cli_text.py`. Add tests in `tests/cli/`.
+`cli.py`. Use only the public `Agent` API, keep output formatting in `cli.py`,
+and sanitize untrusted text before printing it (invariant 12). Add tests in
+`tests/cli/`.
 
 ### Add a host route
 1. Add the member to the `Agent` facade first; the host adds no behaviour of its
@@ -532,7 +531,7 @@ protects the user in its place.
   be used now: a source registration, a model profile, an MCP binding, a run
   under capacity. Admission is checked again at use.
 - **Authority**: permission to read or change something. It comes only from
-  code-owned capability metadata, current permissions, approvals and grants.
+  code-owned capability metadata, current permissions and a person's approvals.
 - **Bounded**: has an explicit size, count or time limit enforced in code.
 - **Code-owned**: decided by Daita's code, never by model output or external
   content.
@@ -545,10 +544,6 @@ protects the user in its place.
   effects.
 - **Frozen**: fixed when a run starts, or when a person confirmed a routine, and
   unchanged afterwards.
-- **Grant**: a standing, exact permission that let machine runs perform one
-  specific effect without interactive approval. Being replaced by approval at
-  the time; machine runs no longer use grants, and the machinery is removed in
-  a later phase.
 - **Receipt**: the durable record reserved before an external effect and
   finalized with its evidence; the only truth about whether the effect happened.
 - **Sensitivity**: an information-handling classification. It never confers
@@ -567,7 +562,6 @@ protects the user in its place.
 | `src/daita/hosting/embedded.py` | composition and agent-home admission |
 | `src/daita/hosting/agent_home.py` | agent-home directories and the writer lock |
 | `src/daita/hosting/execution_governor.py` | execution admission and resource permits |
-| `src/daita/hosting/resident.py` | deprecated one-agent resident process; warns and is removed in a later release |
 | `src/daita/host/server.py` | the host process: singleton lock, socket, app, graceful shutdown |
 | `src/daita/host/registry.py` | opens and closes agents inside the host, idle policy |
 | `src/daita/host/runs.py` | run submission, cancellation and completion |
@@ -612,6 +606,6 @@ protects the user in its place.
 | `src/daita/hosting/home_upgrade.py` | staged upgrade, validation, rollback, and crash recovery |
 | `src/daita/llm/routing.py` | normalized provider routing |
 | `src/daita/llm/provider_definitions.py` | built-in provider definitions |
-| `src/daita/cli.py`, `src/daita/cli_text.py` | CLI parser, dispatch and output |
+| `src/daita/cli.py` | CLI parser, dispatch and output |
 | `src/daita/tui/` | Textual TUI: app, controller, commands, screens, widgets |
 | `tests/architecture/test_boundaries.py` | architecture and public-surface boundaries |

@@ -394,15 +394,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="open the same interactive Textual app as `daita`",
     )
     chat.add_argument("name")
-    chat.add_argument("--model", help="ignored; model setup happens inside the app")
     chat.add_argument("--conversation")
 
     host = commands.add_parser(
         "host",
         help="run the background Daita host that owns agents, runs and routines",
-    )
-    host.add_argument(
-        "--agent", dest="host_agent", help="deprecated; runs `daita host serve`"
     )
     host_commands = host.add_subparsers(dest="host_command")
     host_serve = host_commands.add_parser("serve", help="run the host in this process")
@@ -1694,14 +1690,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         result: object
         if args.no_host and args.command in (None, "chat"):
             raise ValueError("the terminal app always uses the Daita host")
-        if args.command == "host" and args.host_agent is not None:
-            print(
-                "daita host --agent is deprecated; the Daita host now serves every "
-                "agent. Running daita host serve.",
-                file=sys.stderr,
-            )
-            root = [] if args.root is None else ["--root", str(args.root)]
-            args = build_parser().parse_args([*root, "host", "serve"])
         if args.command == "host" and args.host_command is not None:
             return _host_command(args)
         if args.command is None:

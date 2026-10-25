@@ -223,7 +223,7 @@ daita host install
 `daita host stop` stops it. It handles `SIGINT` and `SIGTERM`, finishes or
 cancels active runs, and closes every agent before exiting. It uses the same
 writer lock as a script's `Agent.open()`, which is refused while the host holds
-that agent. `daita host --agent <name>` is deprecated and now runs the host.
+that agent.
 There is no cloud execution or host availability service.
 
 If a host stops, persisted routines and occurrences remain inspectable but no

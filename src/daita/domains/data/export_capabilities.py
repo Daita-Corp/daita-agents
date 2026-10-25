@@ -71,8 +71,6 @@ from ...artifacts.store import AgentHomeArtifactStore
 from ...capabilities import (
     AccessMode,
     ArtifactPolicy,
-    AutomationEligibility,
-    AutomationScopeProposal,
     CallProvenance,
     Capability,
     CapabilityDeclarations,
@@ -1113,7 +1111,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=DOCUMENT_CREATE_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         derives_call_provenance=True,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"text/markdown", "text/plain"}),
@@ -1222,7 +1219,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_CREATE_TABULAR_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         result_ref_arguments=("evidence_refs[]",),
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset(
@@ -1285,7 +1281,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=RESULT_SNAPSHOT_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         result_ref_arguments=("result_ref",),
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({RESULT_SNAPSHOT_MEDIA_TYPE}),
@@ -1324,7 +1319,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_LIST_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     artifact_read = Capability(
         id=ARTIFACT_READ_CAPABILITY_ID,
@@ -1366,7 +1360,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_READ_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     convert = Capability(
         id=ARTIFACT_CONVERT_CAPABILITY_ID,
@@ -1411,7 +1404,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_CONVERT_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"text/csv"}),
             allowed_authorships=frozenset({ArtifactAuthorship.EXACT_SOURCE_DATA}),
@@ -1502,7 +1494,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_EDIT_TEXT_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=TEXT_EDIT_MEDIA_TYPES,
             allowed_authorships=frozenset({ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS}),
@@ -1554,7 +1545,6 @@ def artifact_capability_declarations(
         executor_id=ARTIFACT_SAVE_LOCAL_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.CHANGE_INFRASTRUCTURE,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     set_location = Capability(
         id=ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
@@ -1579,7 +1569,6 @@ def artifact_capability_declarations(
         executor_id=ARTIFACT_SET_EXPORT_LOCATION_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.CHANGE_INFRASTRUCTURE,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     capabilities = (
         document,
@@ -2580,18 +2569,6 @@ class ArtifactCapabilityDomain:
             valid.append(call_id)
         return CallProvenance(tuple(valid))
 
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject:
-        raise CapabilityInputError(
-            "automation_grant_unsupported",
-            "This domain does not admit unattended external effects.",
-        )
-
     async def side_effect_plan(
         self,
         run: RunInput,
@@ -3170,7 +3147,6 @@ def _tabular_export_capability(
         },
         executor_id=DATA_EXPORT_TABULAR_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset(
                 {

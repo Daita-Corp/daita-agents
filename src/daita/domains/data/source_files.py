@@ -13,7 +13,6 @@ from typing import Protocol, cast
 from ..._json import FrozenJsonObject
 from ...capabilities import (
     AccessMode,
-    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     Executor,
@@ -266,7 +265,6 @@ def source_file_capability_declarations() -> CapabilityDeclarations:
         output_schema=_search_output_schema(),
         executor_id=FILE_SEARCH_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     )
     read = Capability(
         id=TEXT_READ_CAPABILITY_ID,
@@ -294,7 +292,6 @@ def source_file_capability_declarations() -> CapabilityDeclarations:
         output_schema=_read_output_schema(),
         executor_id=TEXT_READ_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     )
     views = (
         ToolView(
@@ -381,7 +378,6 @@ def path_query_capability() -> Capability:
         executor_id=PATH_QUERY_EXECUTOR_ID,
         access_mode=AccessMode.READ,
         # Only a foreground user run has the live session folder it queries.
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
 
 

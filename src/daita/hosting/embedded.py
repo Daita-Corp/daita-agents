@@ -1572,11 +1572,6 @@ class EmbeddedAgent:
             relational_export_available=relational_export is not None,
             combined_query_available=combined_engine is not None,
             transcript_loader=store.load,
-            upsert_readiness=lambda agent_id, constraints: (
-                _relational_upsert_readiness(
-                    data_view, source_backends, agent_id, constraints
-                )
-            ),
             source_files_available=source_files is not None,
             path_query_available=any(
                 capability.id == PATH_QUERY_CAPABILITY_ID

@@ -757,7 +757,7 @@ failure.
 
 ## Explicit entry points
 
-The deprecated resident, diagnostic, and packaging entry points are modules so
+The diagnostic and packaging entry points are modules so
 their imports resolve from the repository root:
 
 ```bash

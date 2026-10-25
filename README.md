@@ -94,8 +94,8 @@ and treats source content, remote output, memory, and skills as untrusted input.
 Saved knowledge helps interpret data; it cannot grant access or override
 current source facts.
 
-External effects require exact permissions and approval or a bounded standing
-grant. Native writes use a preview from the current run and transactional
+External effects require exact permissions and a person's approval at the time,
+in scheduled and background runs too. Native writes use a preview from the current run and transactional
 checks. Daita records effect receipts and never silently retries an uncertain
 action.
 

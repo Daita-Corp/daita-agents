@@ -15,8 +15,6 @@ from typing import Protocol, cast
 from ._json import FrozenJsonObject, canonical_json
 from .capabilities import (
     AccessMode,
-    AutomationEligibility,
-    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -1399,7 +1397,6 @@ def semantic_declarations(
                 "additionalProperties": False,
             },
             executor_id=listing.executor_id,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
         Capability(
             id=SEMANTIC_VIEW_CAPABILITY_ID,
@@ -1464,7 +1461,6 @@ def semantic_declarations(
                 "additionalProperties": False,
             },
             executor_id=view.executor_id,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
         Capability(
             id=SEMANTIC_SAVE_CAPABILITY_ID,
@@ -1496,7 +1492,6 @@ def semantic_declarations(
             executor_id=save.executor_id,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
             result_ref_arguments=("evidence[].result_ref",),
         ),
         Capability(
@@ -1525,7 +1520,6 @@ def semantic_declarations(
             executor_id=delete.executor_id,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
     )
     return SemanticDeclarations(
@@ -1856,18 +1850,6 @@ class SemanticCapabilityDomain:
                 ),
             )
         return cast(str, viewed[-1])
-
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject:
-        raise CapabilityInputError(
-            "automation_grant_unsupported",
-            "This domain does not admit unattended external effects.",
-        )
 
     async def side_effect_plan(
         self,

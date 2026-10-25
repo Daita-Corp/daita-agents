@@ -962,8 +962,8 @@ class Agent:
     ) -> MCPBindingStatus:
         """Admit exact locally classified tools; actions default to per-call approval.
 
-        Remote metadata never supplies authority. Unattended eligibility needs an
-        explicit local selection and a separately approved routine grant.
+        Remote metadata never supplies authority. Every action, in a scheduled
+        or job run too, asks a person at the time.
         """
         return await self._embedded.attach_mcp_server(
             endpoint=endpoint,

@@ -113,8 +113,7 @@ await agent.run("Look up the requested reference.")
 Attachment and successful refresh activate in the same open Agent. The host
 stages one new immutable catalog under its existing system admission lease,
 then publishes it to runtime, routine and job admission, and contract readers
-between runs. In-flight runs keep their frozen catalog; changed binding revisions
-invalidate old grants. Failed staging preserves the prior admission. Open still
+between runs. In-flight runs keep their frozen catalog. Failed staging preserves the prior admission. Open still
 reconstructs accepted declarations without network I/O. SDK clients are lazy,
 unchanged bindings keep their owner, and replaced owners drain before management
 returns. Binding namespaces prevent collisions across servers.
@@ -241,7 +240,7 @@ The host must consume the eventual `daita-agents==1.2.0` artifact with its exact
 `mcp==2.2.0` dependency, both private JSON Schema worker modules, and the matching
 agent-home revision-3 migration and release-contract snapshot. Revision-1 and
 revision-2 homes must pass the normal staged upgrade before opening; released revision-2 binding IDs,
-grants, receipts and data remain intact. No revision 4 is introduced.
+receipts and data remain intact. No revision 4 is introduced.
 An unreleased development home carrying an earlier revision-3 checksum is not
 silently rewritten; restore its pre-upgrade backup and apply the amended migration.
 
@@ -299,7 +298,7 @@ Open `/mcp` and choose **Add server** for guided setup:
    Space. Each row shows its local access and effect; unsupported tools are disabled
    with their rejection reasons. Defaults assume reads, so independently verify
    each selected tool. **Advanced / permissions** edits the highlighted tool's
-   alias, description, access, effect, unattended eligibility, result/outbound
+   alias, description, access, effect, result/outbound
    sensitivity and completion semantics. Set **What data may be sent to this
    server?**; this bounds the full request classification, and stricter per-tool
    limits still apply. **Add server · N tools** confirms these exact permissions.
@@ -378,7 +377,7 @@ external action does not make it supported.
 
 ```python
 from daita import MCPToolSelection
-from daita.capabilities import AccessMode, AutomationEligibility, OperationalEffect
+from daita.capabilities import AccessMode, OperationalEffect
 from daita.llm.models import ModelSensitivity
 
 selection = MCPToolSelection(
@@ -387,7 +386,6 @@ selection = MCPToolSelection(
     description="Send a notification through the reviewed service.",
     access_mode=AccessMode.NONE,
     operational_effect=OperationalEffect.EXTERNAL_ACTION,
-    automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     result_sensitivity=ModelSensitivity.INTERNAL,
     maximum_outbound_sensitivity=ModelSensitivity.INTERNAL,
 )
@@ -398,10 +396,10 @@ status = await agent.attach_mcp_server(
 )
 ```
 
-Action selections default to `INTERACTIVE_ONLY` when eligibility is omitted.
-Setting `AUTOMATION_DIRECT` permits a routine proposal;
-it grants no standing authority by itself. Each foreground invocation still
-requires exact approval through the ordinary runtime. The public typed
+Admitting an action grants no standing authority. Every invocation, in a
+foreground, scheduled or job run, requires exact approval at the time through
+the ordinary runtime; in a scheduled or job run the host opens the approval and
+notifies you, and the card names the routine or job. The public typed
 admission API is a local operator control and must not be delegated to
 model-written content.
 
@@ -410,36 +408,10 @@ classification**, including retained history, research and connector metadata.
 A restricted request cannot call an internal-only action. Adjust local admission
 only when the actual service may receive that classification.
 
-Every action uses the same `mcp.tool_call` grant constraints:
-
-```python
-constraints = {
-    "binding_id": status.binding.binding_id,
-    "binding_revision": status.binding.revision,
-    "remote_tool_name": "notify",
-    "fixed_arguments": {"destination": "reviewed-room"},
-    "variable_argument_names": ["content"],
-}
-```
-
-`binding_id`, `binding_revision` and `remote_tool_name` follow from the
-capability ID: a request may omit them and the domain fills the current admitted
-values, while any supplied value must still match exactly. `fixed_arguments` are
-values for the connector tool's own input arguments and are validated against
-its declared property schema when the grant is prepared. A Conversation Inbox
-destination ID is report delivery, not a connector argument, and is rejected
-there with a correction: a routine reports to its conversation's Inbox.
-
-The enclosing `RequestedCapabilityGrant` supplies the exact capability ID and
-`max_calls_per_occurrence` (1 to 256, further bounded by the run). The constraints
-kind is `mcp.tool_call`; it is assigned by the domain policy, not sent to the server.
-Approval shows the fixed values and variable names. Every fixed value must be
-present and match exactly; extra names are rejected. The complete call must pass
-the admitted input schema. This release permits only declared scalar variables
-(string, integer, number or boolean). Fix an entire nested object or array to
-restrict recipients or targets inside it. Variable arbitrary JSON cannot enforce
-nested restrictions. Credentials belong in binding-owned secret references, never
-in grants or tool arguments.
+Approval shows the exact arguments of that one call. The complete call must pass
+the admitted input schema. A Conversation Inbox destination ID is report
+delivery, not a connector argument. Credentials belong in binding-owned secret
+references, never in tool arguments.
 
 ## Invocation evidence and uncertainty
 
@@ -466,7 +438,6 @@ Positive local non-dispatch can establish `NOT_APPLIED / LOCAL_NOT_DISPATCHED`.
 Missing/invalid observations use runtime uncertainty. Failed receipt persistence
 leaves a blocking reservation; reopening recovers it as uncertain.
 
-Tools known to require asynchronous completion cannot enter an unattended proposal.
 `MCPCompletionSemantics.ASYNCHRONOUS_ONLY` records a locally known limitation and
 cannot execute through this release. Protocol `execution.taskSupport="required"`
 also prevents direct execution; optional task support uses ordinary direct calls.

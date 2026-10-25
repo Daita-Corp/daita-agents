@@ -118,3 +118,27 @@ argument mistakes gets all of them back at once.
   revision being controlled).
 - **Python API.** Custom executors receive the preflight a person approved as
   `ToolExecution.approved_preflight`.
+
+### Removed: standing grants and the resident host
+
+Every effect is now approved by a person at the time, so the pre-authorization
+machinery is gone.
+
+- **Removed grant API.** `AutomationEligibility`, `AutomationGrantPolicy`,
+  `AutomationScopeProposal`, `Capability.automation_eligibility`,
+  `Capability.automation_grant_policy`, `CapabilityRuntime.prepare_automation_grant`
+  and every domain's `prepare_automation_grant`, and
+  `SideEffectPlan.capability_grant_digest`. Scheduled and job runs may use
+  every capability except routine and job management.
+- **MCP.** `MCPToolSelection` and `MCPToolBinding` drop
+  `automation_eligibility`, and the TUI's MCP screen drops its eligibility
+  choice. Every MCP action asks at the time, in any run.
+- **Toolbox.** `toolbox_search` results drop `automation_eligibility`,
+  `requires_automation_grant`, `automation_contract` and
+  `automation_contract_omitted`; contracts drop `grant_policy`.
+- **Removed resident host.** `daita host --agent`, `daita.ResidentReady` and
+  `daita.run_resident_host` are removed; use `daita host serve` or
+  `daita.connect()`. The ignored `daita chat --model` flag is removed.
+- **Existing homes.** Upgrading drops each stored MCP tool's eligibility and
+  each routine occurrence's copy of its run's scope. Grants recorded by older
+  runs stay readable as history and are never honoured.

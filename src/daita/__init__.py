@@ -67,7 +67,6 @@ from .distribution import (
     OutcomeState,
 )
 from .host import connect
-from .hosting.resident import ResidentReady, run_resident_host
 from .jobs import (
     ChecklistItem,
     ChecklistStatus,
@@ -210,7 +209,6 @@ __all__ = [
     "PostgreSQLSource",
     "RelationalUpdateReadiness",
     "RetryPolicy",
-    "ResidentReady",
     "RoutineIntent",
     "RoutineState",
     "ResourceRevisionBinding",
@@ -239,5 +237,4 @@ __all__ = [
     "WorkKind",
     "__version__",
     "create_llm_provider",
-    "run_resident_host",
 ]

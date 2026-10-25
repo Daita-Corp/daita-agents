@@ -646,8 +646,6 @@ def _claim_routine_slot(
         claimed_at=claimed_at,
         claim_token=claim_token,
         lease_expires_at=claimed_at + timedelta(seconds=ROUTINE_CLAIM_LEASE_SECONDS),
-        execution_scope=None,
-        execution_scope_digest=None,
         reserved_run_id=None,
         charged_tokens=0,
         charged_cost_usd=Decimal("0"),
@@ -693,9 +691,7 @@ def bind_occurrence_run(
         return (
             current
             if (
-                current.reserved_run_id == run_id
-                and current.claim_token == claim_token
-                and current.execution_scope == execution_scope
+                current.reserved_run_id == run_id and current.claim_token == claim_token
             )
             else None
         )
@@ -727,8 +723,6 @@ def bind_occurrence_run(
         return None
     updated = replace(
         current,
-        execution_scope=execution_scope,
-        execution_scope_digest=execution_scope.digest,
         reserved_run_id=run_id,
         run_bound_at=bound_at,
         disposition=RoutineOccurrenceDisposition.RUNNING,
@@ -867,6 +861,7 @@ def finalize_occurrence(
     effect_receipt_ids: tuple[str, ...] = ()
     uncertain_effect = False
     rate_limited = False
+    scope_digest: str | None = None
     if pre_run_outcome:
         successful = False
         terminal_failure_code = failure_code
@@ -919,9 +914,7 @@ def finalize_occurrence(
         effect_receipt_ids = tuple(receipt.receipt_id for receipt in receipts)
         scope = run_input.execution_scope
         assert scope is not None
-        # Approved at the time; a receipt from older data that used a standing
-        # grant still verifies against the grant its run's scope carried.
-        grants = {grant.capability_id: grant for grant in scope.capability_grants}
+        scope_digest = scope.digest
         scope_contracts = scope.contract_bindings.capability_contracts
         result_blocks: dict[str, list[ToolResultBlock]] = {}
         for exchange in transcript.messages:
@@ -939,21 +932,12 @@ def finalize_occurrence(
                 EffectOutcome.UNCERTAIN,
             }:
                 uncertain_effect = True
-            grant = grants.get(receipt.capability_id)
             if (
                 receipt.routine_id != current.routine_id
                 or receipt.routine_revision != current.routine_revision
                 or receipt.occurrence_id != current.occurrence_id
                 or receipt.capability_contract_digest
                 != scope_contracts.get(receipt.capability_id)
-                or (
-                    receipt.capability_grant_digest is not None
-                    and (
-                        grant is None
-                        or receipt.capability_grant_digest != grant.grant_digest
-                        or receipt.domain_owner_id != grant.domain_owner_id
-                    )
-                )
             ):
                 contract_failure_code = "outcome_effect_binding_invalid"
                 continue
@@ -1186,7 +1170,7 @@ def finalize_occurrence(
             validated_artifact_references if resulting_run_id is not None else ()
         ),
         effective_sensitivity=sensitivity,
-        provenance_digest=current.execution_scope_digest or conclusion_digest,
+        provenance_digest=scope_digest or conclusion_digest,
         failure_code=terminal_failure_code,
         observed_at=finalized_at,
         effect_receipt_ids=effect_receipt_ids,

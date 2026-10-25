@@ -10,8 +10,6 @@ from typing import TYPE_CHECKING
 from .._json import FrozenJsonObject, canonical_json
 from ..capabilities import (
     AccessMode,
-    AutomationEligibility,
-    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -392,18 +390,6 @@ class _JobDomainBase:
             )
         return arguments
 
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject:
-        raise CapabilityInputError(
-            "automation_grant_unsupported",
-            "This domain does not admit unattended external effects.",
-        )
-
     async def side_effect_plan(
         self,
         run: RunInput,
@@ -511,7 +497,6 @@ def _capability(
         output_schema={"type": "object", "additionalProperties": True},
         executor_id=executor_id,
         access_mode=AccessMode.NONE,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         **options,  # type: ignore[arg-type]
     )
 

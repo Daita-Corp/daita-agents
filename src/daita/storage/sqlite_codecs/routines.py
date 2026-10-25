@@ -34,7 +34,6 @@ from .common import (
     sequence,
     text,
 )
-from .execution_scope import decode_execution_scope, encode_execution_scope
 
 
 def encode_scheduled_routine(value: ScheduledRoutine) -> str:
@@ -170,12 +169,6 @@ def encode_routine_occurrence(value: RoutineOccurrence) -> str:
                 "claimed_at": optional_datetime_encode(value.claimed_at),
                 "claim_token": value.claim_token,
                 "lease_expires_at": optional_datetime_encode(value.lease_expires_at),
-                "execution_scope": (
-                    None
-                    if value.execution_scope is None
-                    else encode_execution_scope(value.execution_scope)
-                ),
-                "execution_scope_digest": value.execution_scope_digest,
                 "reserved_run_id": value.reserved_run_id,
                 "charged_tokens": value.charged_tokens,
                 "charged_cost_usd": decimal_encode(value.charged_cost_usd),
@@ -214,8 +207,6 @@ def decode_routine_occurrence(
             "claimed_at",
             "claim_token",
             "lease_expires_at",
-            "execution_scope",
-            "execution_scope_digest",
             "reserved_run_id",
             "charged_tokens",
             "charged_cost_usd",
@@ -240,7 +231,6 @@ def decode_routine_occurrence(
         )
     except ValueError:
         raise ValueError("stored occurrence enum is invalid") from None
-    scope = fields["execution_scope"]
     return RoutineOccurrence(
         effect_receipt_ids=_text_sequence(
             fields["effect_receipt_ids"], "occurrence effect receipt IDs"
@@ -258,11 +248,6 @@ def decode_routine_occurrence(
         claimed_at=optional_datetime_decode(fields["claimed_at"]),
         claim_token=optional_text(fields["claim_token"], "occurrence claim token"),
         lease_expires_at=optional_datetime_decode(fields["lease_expires_at"]),
-        execution_scope=None if scope is None else decode_execution_scope(scope),
-        execution_scope_digest=optional_text(
-            fields["execution_scope_digest"],
-            "occurrence scope digest",
-        ),
         reserved_run_id=optional_text(
             fields["reserved_run_id"],
             "occurrence reserved run id",

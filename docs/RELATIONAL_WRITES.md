@@ -6,8 +6,8 @@ preview and exact authority. Daita checks the live table, permissions, and
 preview again before a transaction. The model never writes mutation SQL.
 
 Updates can affect one row or many rows within an approved ceiling of at most
-10,000. Upserts use one uniform batch of at most 1,000 rows. Permissions and
-any standing grant may narrow these limits further. PostgreSQL is the initial
+10,000. Upserts use one uniform batch of at most 1,000 rows. Permissions may
+narrow these limits further. PostgreSQL is the initial
 native backend.
 
 For release evaluation with real model generation and a disposable PostgreSQL
@@ -293,7 +293,7 @@ sub-run writes use the same one-call sequence.
 
 Compatibility: `data_preview_update_rows` and `data_preview_upsert_rows` were
 removed without aliases. Capability IDs (`data.preview_update_rows`,
-`data.update_rows`, `data.preview_upsert_rows`, `data.upsert_rows`), grants,
+`data.update_rows`, `data.preview_upsert_rows`, `data.upsert_rows`),
 receipts and approvals are unchanged, so saved routines and jobs keep
 revalidating normally.
 
@@ -341,10 +341,8 @@ recovery. A rollback describes table-row non-application; PostgreSQL identity
 sequence allocations can leave gaps and are not restored by rollback.
 
 Zero existing matches may legitimately insert the supplied upsert batch. Empty
-research findings are different from a nonempty unchanged batch: an empty result
-cannot satisfy a routine that requires a write invocation. Grants may permit new
-keys discovered in later research runs while retaining exact table, column,
-operation, row and call ceilings.
+research findings are different from a nonempty unchanged batch: with no rows
+there is nothing to write, and no write is attempted.
 
 ## Explicit relational write permissions
 
@@ -390,19 +388,11 @@ cannot be stored in a lower-classified target merely because columns are writabl
 
 ## Native routines and release limits
 
-A native routine grant uses `constraints_kind="data.relational_write"` and freezes
-`source_id`, `resource_id`, `resource_revision`, `key_columns`,
-`allowed_insert_columns`, `allowed_update_columns`, `generated_identity_columns`,
-and `max_rows`. The requested call ceiling must be one, and the routine may contain
-at most one native write capability. Current permissions and retained contracts
-revalidate before dispatch. Research tools must admit the full outbound sensitivity.
-
-An immediate-first weekly assignment creates one immediate occurrence and retains
-its calendar schedule. Each occurrence uses the ordinary loop, previews its current
-findings, reserves one native call, and reports authenticated transaction counts.
-A required write cannot be satisfied by model prose or an unrelated research result.
-An approved optional no-findings path can omit the effect; a required effect remains
-unsatisfied when research yields no batch.
+A routine occurrence or job run writes exactly as a foreground run does: one
+call, one approval at the time (the card names the routine or job), then the
+same drift check and receipt. There is no standing permission to write without
+asking. Current permissions and contracts revalidate before dispatch, and
+research tools must admit the full outbound sensitivity.
 
 This native implementation has deterministic acceptance coverage with fake external
 I/O. It is not production release approval or live PostgreSQL certification.
@@ -415,10 +405,3 @@ exercise real transactions and independent readback using the existing disposabl
 fixture and a scripted model. They cover conflict handling, rollback, locks,
 revocation, cancellation, lost commit confirmation, receipts, and human recovery.
 Their offline harness checks do not replace a passing authorized database run.
-
-During native grant admission, the data owner requires the matching preview
-capability in `allowed_capability_ids` before checking write readiness. A missing
-or opposite-operation preview produces `automation_grant_preview_required`.
-The automation constraint description exposes this prerequisite without loading
-execution tools. Schema access remains a separately requested read capability;
-neither grant admission nor preview permission grants structural discovery.

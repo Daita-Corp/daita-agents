@@ -31,7 +31,6 @@ from daita import (
 from daita.adapters.mcp import MCPClientFactory, SDKMCPClientFactory
 from daita.capabilities import (
     AccessMode,
-    AutomationEligibility,
     OperationalEffect,
 )
 from daita.llm.models import ModelSensitivity, ModelUsage
@@ -185,7 +184,6 @@ async def run() -> None:
                         "Simulate a notification.",
                         access_mode=AccessMode.NONE,
                         operational_effect=OperationalEffect.EXTERNAL_ACTION,
-                        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
                     ),
                 ),
                 maximum_outbound_sensitivity=ModelSensitivity.INTERNAL,

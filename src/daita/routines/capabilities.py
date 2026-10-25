@@ -9,8 +9,6 @@ from datetime import datetime
 from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
-    AutomationEligibility,
-    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -306,18 +304,6 @@ class RoutineCapabilityDomain:
             )
         return arguments
 
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject:
-        raise CapabilityInputError(
-            "automation_grant_unsupported",
-            "This domain does not admit unattended external effects.",
-        )
-
     async def side_effect_plan(
         self,
         run: RunInput,
@@ -390,7 +376,6 @@ def routine_capability_declarations(
         output_schema=_object_output_schema(("routines", "count")),
         executor_id=ROUTINE_LIST_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     inspect_capability = Capability(
         id=ROUTINE_INSPECT_CAPABILITY_ID,
@@ -400,7 +385,6 @@ def routine_capability_declarations(
         output_schema=_object_output_schema(("routine", "recent_occurrences")),
         executor_id=ROUTINE_INSPECT_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     create_capability = Capability(
         id=ROUTINE_CREATE_CAPABILITY_ID,
@@ -411,7 +395,6 @@ def routine_capability_declarations(
         executor_id=ROUTINE_CREATE_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.MANAGE_SCHEDULED_ROUTINE,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     update_capability = Capability(
         id=ROUTINE_UPDATE_CAPABILITY_ID,
@@ -422,7 +405,6 @@ def routine_capability_declarations(
         executor_id=ROUTINE_UPDATE_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.MANAGE_SCHEDULED_ROUTINE,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     control_capability = Capability(
         id=ROUTINE_CONTROL_CAPABILITY_ID,
@@ -448,7 +430,6 @@ def routine_capability_declarations(
         executor_id=ROUTINE_CONTROL_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.MANAGE_SCHEDULED_ROUTINE,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     capabilities = (
         list_capability,

@@ -109,9 +109,8 @@ counts summing to the input count. Mismatches roll back the entire batch. Sequen
 allocations may leave gaps after rollback; receipts describe table-row effects.
 
 A native write in a scheduled or job run asks a person at the time, exactly as a
-foreground write does; the approval card carries the routine or job title. The
-data domain still normalizes native standing grants for routine authoring, but
-no run uses them. An unchanged batch consumes its reservation and produces
+foreground write does; the approval card carries the routine or job title.
+An unchanged batch consumes its reservation and produces
 verified zero-mutation evidence. Full request sensitivity must fit the current target classification.
 Research lineage remains model-derived claims, distinct from transaction facts.
 Receipt reservation/finalization stays in CapabilityRuntime. No arbitrary SQL,

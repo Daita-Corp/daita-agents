@@ -16,8 +16,6 @@ from ...capabilities import (
     RESOURCE_ID_PATTERN,
     SOURCE_ID_PATTERN,
     AccessMode,
-    AutomationEligibility,
-    AutomationGrantPolicy,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -50,7 +48,6 @@ from .controller import (
     RELATIONAL_UPDATE_EVIDENCE_KIND,
     RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
     RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
-    native_preview_capability,
 )
 from .results import BoundedResultProjection
 from .source_files import (
@@ -1542,7 +1539,6 @@ def relational_update_preview_capability_declarations() -> CapabilityDeclaration
         output_schema=_relational_update_preview_output_schema(),
         executor_id=RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     )
     return CapabilityDeclarations(
         domain_owner_id="data",
@@ -1622,9 +1618,7 @@ def relational_update_capability_declarations() -> CapabilityDeclarations:
         executor_id=RELATIONAL_UPDATE_EXECUTOR_ID,
         access_mode=AccessMode.WRITE,
         operational_effect=OperationalEffect.MUTATE_DATA,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         effect_receipt_policy=RELATIONAL_UPDATE_RECEIPT_POLICY,
-        automation_grant_policy=NATIVE_WRITE_GRANT_POLICY,
         execution_admission_policy=ExecutionAdmissionPolicy(
             shape="preview_bound_postgresql_update",
             inline_eligible=True,
@@ -1724,7 +1718,6 @@ def _query_declarations(
         output_schema=_query_output_schema(),
         executor_id=DATA_QUERY_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         execution_admission_policy=ExecutionAdmissionPolicy(
             shape="relational_read",
             inline_eligible=True,
@@ -1831,7 +1824,6 @@ def _query_declarations(
         output_schema=_combined_query_output_schema(),
         executor_id=DATA_QUERY_COMBINED_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     path_capability = path_query_capability()
     presence_modes = (
@@ -2092,55 +2084,12 @@ __all__ = [
     "relational_update_capability_declarations",
 ]
 
-# The native grant is one exact resource and one bounded invocation per occurrence.
 _NATIVE_COLUMNS_SCHEMA = {
     "type": "array",
     "items": {"type": "string", "minLength": 1, "maxLength": 256},
     "maxItems": 512,
     "uniqueItems": True,
 }
-NATIVE_WRITE_GRANT_POLICY = AutomationGrantPolicy(
-    constraints_kind="data.relational_write",
-    constraints_schema={
-        "type": "object",
-        "description": "Only for routine proposals: allowed_capability_ids lists both "
-        "routes of the one write tool: "
-        + "; ".join(
-            f"{tool_name} needs {capability_id} and "
-            f"{native_preview_capability(capability_id)}"
-            for tool_name, capability_id in (
-                (RELATIONAL_UPDATE_TOOL_NAME, RELATIONAL_UPDATE_CAPABILITY_ID),
-                (RELATIONAL_UPSERT_TOOL_NAME, "data.upsert_rows"),
-            )
-        )
-        + ". These are its mode=apply and mode=preview routes, not separate tools "
-        "to load. Each occurrence applies in one call.",
-        "properties": {
-            "source_id": {"type": "string", "maxLength": 256},
-            "resource_id": {"type": "string", "maxLength": 256},
-            "resource_revision": {
-                "type": "string",
-                "pattern": r"^sha256:[0-9a-f]{64}$",
-            },
-            "key_columns": _NATIVE_COLUMNS_SCHEMA,
-            "allowed_insert_columns": _NATIVE_COLUMNS_SCHEMA,
-            "allowed_update_columns": _NATIVE_COLUMNS_SCHEMA,
-            "generated_identity_columns": _NATIVE_COLUMNS_SCHEMA,
-            "max_rows": {"type": "integer", "minimum": 1, "maximum": 10000},
-        },
-        "required": [
-            "source_id",
-            "resource_id",
-            "resource_revision",
-            "key_columns",
-            "allowed_insert_columns",
-            "allowed_update_columns",
-            "generated_identity_columns",
-            "max_rows",
-        ],
-        "additionalProperties": False,
-    },
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2339,7 +2288,6 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
         output_schema=_upsert_output_schema(preview=True),
         executor_id=RelationalUpsertPreviewExecutor.executor_id,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         derives_call_provenance=True,
     )
     write = Capability(
@@ -2360,8 +2308,6 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
         executor_id=RelationalUpsertExecutor.executor_id,
         access_mode=AccessMode.WRITE,
         operational_effect=OperationalEffect.MUTATE_DATA,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
-        automation_grant_policy=NATIVE_WRITE_GRANT_POLICY,
         effect_receipt_policy=EffectReceiptPolicy(
             receipt_kind="data.upsert_rows",
             payload_schema=_UPSERT_RECEIPT_SCHEMA,

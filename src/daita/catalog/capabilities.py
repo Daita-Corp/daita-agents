@@ -8,7 +8,6 @@ from typing import Protocol
 from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
-    AutomationEligibility,
     Capability,
     Executor,
     ToolboxId,
@@ -233,7 +232,6 @@ def catalog_declarations(
         output_schema=_search_output_schema(),
         executor_id=search_executor.executor_id,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     )
     describe = Capability(
         id=CATALOG_DESCRIBE_CAPABILITY_ID,
@@ -291,7 +289,6 @@ def catalog_declarations(
         output_schema=_describe_output_schema(),
         executor_id=describe_executor.executor_id,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     )
     return CatalogDeclarations(
         capabilities=(search, describe),

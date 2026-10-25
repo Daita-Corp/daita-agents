@@ -210,17 +210,14 @@ capability execution contracts. `toolbox_load` accepts exact on-demand names
 directly; search is unnecessary when those names are known. `toolbox_inspect`
 reads an exact prepared contract without changing the callable set or executing
 a capability. These controls grant no authority and bypass no admission checks.
-Search includes the existing domain-owned automation contract for grant-requiring
-tools so scheduling can inspect constraints without activating execution schemas.
-Its `requires_automation_grant` flag refers to scheduled execution. Search,
-load receipts and exact inspection share one registered contract projection,
-with exact revision digests. Load retains compact incomplete references and grant
-metadata; explicit inspection supplies input/output schemas. Inspected contracts
-remain in the ordinary transcript after callable-set replacement. Foreground actions
+Load receipts and exact inspection share one registered contract projection,
+with exact revision digests. Load retains compact incomplete references;
+explicit inspection supplies input/output schemas. Inspected contracts
+remain in the ordinary transcript after callable-set replacement. Actions
 use ordinary approval at invocation.
-Byte pressure omits whole contracts with `automation_contract_omitted` before
-removing candidates. Load receipts omit their remaining grant metadata as a whole
-when byte/depth bounds require it, preserving exact inspection references. `toolbox_inspect` retrieves a complete
+Byte pressure removes search candidates from the end of a bounded page, and
+load receipts keep exact inspection references when byte/depth bounds require
+it. `toolbox_inspect` retrieves a complete
 contract or explicitly partial path/page/string fragments bound to its digest.
 Inspection intersects frozen candidates with current local domain applicability;
 it never refreshes remote state or replaces execution-time validation. The default
@@ -254,10 +251,12 @@ External native data effects and admitted external actions declare an
 `EffectReceiptPolicy`. Effect-free and local management capabilities cannot use
 it. Every effect, in a foreground or a machine run, asks a person at the time
 through the agent's `ApprovalHandler`; a run with no handler refuses the effect
-with `approval_required`. Routine authoring still accepts standing grants and the
-runtime still normalizes them (`AutomationGrantPolicy`, `prepare_automation_grant`),
-but no run uses them to perform an effect; that machinery is removed in a later
-phase.
+with `approval_required`. There are no standing grants: a capability declares
+no unattended eligibility, and scheduled and job runs may use every capability
+except the exclusion list in `hosting/embedded.py` (routine and job management;
+local computer files are outside their scope). Older run scopes and receipts may
+still record a grant from an earlier release; they are decoded as history and
+never honoured.
 
 The runtime reserves a unique operation and call identity in SQLite before
 external dispatch, validates the resulting observation and ordinary output, and
@@ -278,8 +277,8 @@ receipt payloads. Current row values do not resolve prior operation uncertainty.
 The frozen context informs reporting; execution still rechecks the store.
 
 Do not call source clients or executors directly from `AgentLoop`, `Agent`, a
-tool view, or model-authored text. Do not infer access, effects, or automation
-eligibility from a tool name when capability metadata defines them.
+tool view, or model-authored text. Do not infer access or effects from a tool
+name when capability metadata defines them.
 
 ## Memory, skills, semantics, approval and observation
 

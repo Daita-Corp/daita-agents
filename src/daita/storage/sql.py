@@ -35,7 +35,6 @@ from ..artifacts.models import (
     artifact_ref_from_mapping,
 )
 from ..capabilities import (
-    CapabilityGrant,
     EffectEvidenceBasis,
     EffectObservation,
     ExecutionScope,
@@ -1660,7 +1659,6 @@ class SQLStateStore:
         self,
         receipt: EffectReceipt,
         *,
-        grant: CapabilityGrant | None = None,
         max_receipts_per_run: int = 64,
     ) -> EffectReceipt:
         if (
@@ -1728,39 +1726,25 @@ class SQLStateStore:
                 if scope is not None and scope.scope_kind is ExecutionScopeKind.JOB
                 else None
             )
-            if scope is None:
-                if grant is not None:
-                    raise EffectReceiptConflictError(
-                        "foreground receipt cannot carry machine authorization"
-                    )
-            elif job_id is not None:
+            if receipt.capability_grant_digest is not None:
+                raise EffectReceiptConflictError(
+                    "effects are approved at the time; a receipt cannot carry a grant"
+                )
+            if job_id is not None:
                 job = _job_store.load_job(connection, receipt.agent_id, job_id)
                 if (
                     receipt.routine_id is not None
-                    or grant is not None
                     or job is None
                     or job.state is not JobState.RUNNING
                 ):
                     raise EffectReceiptConflictError(
                         "job receipt requires its running job"
                     )
-            else:
+            elif scope is not None:
                 routine_id = receipt.routine_id
                 if routine_id is None:
                     raise EffectReceiptConflictError(
                         "machine receipt lacks routine or job authorization"
-                    )
-                # Approved at the time: a grant is only checked when one was used.
-                if grant is not None and (
-                    grant not in scope.capability_grants
-                    or grant.capability_id != receipt.capability_id
-                    or grant.domain_owner_id != receipt.domain_owner_id
-                    or grant.capability_contract_digest
-                    != receipt.capability_contract_digest
-                    or grant.grant_digest != receipt.capability_grant_digest
-                ):
-                    raise EffectReceiptConflictError(
-                        "receipt lacks its exact frozen scope grant"
                     )
                 if (
                     scope.routine_id != receipt.routine_id
@@ -1778,8 +1762,7 @@ class SQLStateStore:
                     occurrence is None
                     or routine is None
                     or (
-                        occurrence[0].execution_scope != scope
-                        or occurrence[0].reserved_run_id != receipt.run_id
+                        occurrence[0].reserved_run_id != receipt.run_id
                         or occurrence[0].routine_revision != receipt.routine_revision
                         or occurrence[0].disposition
                         is not RoutineOccurrenceDisposition.RUNNING
@@ -1795,21 +1778,6 @@ class SQLStateStore:
                     raise EffectReceiptConflictError(
                         "receipt occurrence claim is no longer current"
                     )
-                if grant is not None:
-                    count = required_row(
-                        connection.execute(
-                            "SELECT COUNT(*) FROM effect_receipts WHERE agent_id = ? AND occurrence_id = ? AND grant_digest = ?",
-                            (
-                                receipt.agent_id,
-                                receipt.occurrence_id,
-                                grant.grant_digest,
-                            ),
-                        )
-                    )[0]
-                    if count >= grant.max_calls_per_occurrence:
-                        raise EffectReceiptConflictError(
-                            "the grant invocation ceiling is exhausted"
-                        )
             connection.execute(
                 "INSERT INTO effect_receipts(agent_id, id, run_id, call_id, operation_key, routine_id, occurrence_id, grant_digest, unresolved, job_id, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
                 (
@@ -3005,7 +2973,7 @@ class SQLStateStore:
         return await settled_thread(read)
 
     async def get_artifact_record(self, artifact_id: str) -> ArtifactRecord | None:
-        return await _run_graph_read(
+        return await _run_read_transaction(
             self._database,
             lambda connection: _get_artifact_record(connection, artifact_id),
         )
@@ -3079,7 +3047,7 @@ class SQLStateStore:
                 )
             )
 
-        return await _run_graph_read(self._database, read)
+        return await _run_read_transaction(self._database, read)
 
     async def list_artifact_refs(
         self,
@@ -3256,7 +3224,7 @@ class SQLStateStore:
             raise ValueError("conversation page limit must be between 1 and 100")
         if type(after_turn_index) is not int or after_turn_index < -1:
             raise ValueError("conversation cursor must be at least -1")
-        return await _run_graph_read(
+        return await _run_read_transaction(
             self._database,
             lambda connection: _conversation_records(
                 connection,
@@ -3273,7 +3241,7 @@ class SQLStateStore:
         conversation_id: str,
     ) -> tuple[ConversationRun, ...]:
         """Compatibility full-history read; interactive callers should use pages."""
-        return await _run_graph_read(
+        return await _run_read_transaction(
             self._database,
             lambda connection: _conversation_records(
                 connection, agent_id, conversation_id
@@ -3308,7 +3276,7 @@ class SQLStateStore:
             exists = bool(row[0])
             return exists, exists and (caller_principal_id is None or not row[1])
 
-        return await _run_graph_read(self._database, read)
+        return await _run_read_transaction(self._database, read)
 
     async def conversation_exists(
         self,
@@ -3468,7 +3436,7 @@ class SQLStateStore:
                 )
             )
 
-        return await _run_graph_read(self._database, read)
+        return await _run_read_transaction(self._database, read)
 
     async def pending_analysis_evidence(
         self, agent_id: str, *, after: tuple[str, str] = ("", "")
@@ -3489,7 +3457,7 @@ class SQLStateStore:
                 )
             )
 
-        return await _run_graph_read(self._database, read)
+        return await _run_read_transaction(self._database, read)
 
     async def recover_analysis_evidence(
         self,
@@ -4178,7 +4146,7 @@ def _conversation_records(
     )
 
 
-async def _run_graph_read(
+async def _run_read_transaction(
     path: SQLDatabase,
     callback: Callable[[SQLConnection], _T],
     *,

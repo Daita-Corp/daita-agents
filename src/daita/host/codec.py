@@ -57,7 +57,6 @@ from ..artifacts.models import (
 from ..capabilities import (
     AccessMode,
     ApprovalRequest,
-    AutomationEligibility,
     OperationalEffect,
 )
 from ..catalog.models import CatalogResource, CatalogSummary, ResourceKind, Sensitivity
@@ -511,7 +510,6 @@ for _enum in (
     AmbiguousTimePolicy,
     ArtifactAuthorship,
     ArtifactDestinationKind,
-    AutomationEligibility,
     CalendarDaySelector,
     DeliveryState,
     DeliverySubjectKind,

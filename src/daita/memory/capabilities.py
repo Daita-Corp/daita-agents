@@ -8,8 +8,6 @@ from dataclasses import dataclass, replace
 from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
-    AutomationEligibility,
-    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -152,7 +150,6 @@ def memory_set_declarations(store: MemoryStore) -> MemoryDeclarations:
         executor_id=executor.executor_id,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     return MemoryDeclarations(
         capabilities=(capability,),
@@ -240,18 +237,6 @@ class MemoryCapabilityDomain:
         return arguments
 
     prepare_session_call = prepare_call
-
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject:
-        raise CapabilityInputError(
-            "automation_grant_unsupported",
-            "This domain does not admit unattended external effects.",
-        )
 
     async def side_effect_plan(
         self,

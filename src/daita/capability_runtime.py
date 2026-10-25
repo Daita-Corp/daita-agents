@@ -31,13 +31,10 @@ from .capabilities import (
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
-    AutomationEligibility,
-    AutomationScopeProposal,
     CallProvenance,
     CallTargetLane,
     Capability,
     CapabilityDeclarations,
-    CapabilityGrant,
     CapabilityInputError,
     CapabilityRegistry,
     EffectEvidenceBasis,
@@ -154,7 +151,6 @@ class EffectReceiptStore(Protocol):
         self,
         receipt: EffectReceipt,
         *,
-        grant: CapabilityGrant | None = None,
         max_receipts_per_run: int = 64,
     ) -> EffectReceipt: ...
     async def finish_effect_receipt(self, receipt: EffectReceipt) -> EffectReceipt: ...
@@ -239,7 +235,6 @@ class SideEffectPlan:
     approval_arguments: FrozenJsonObject | None = None
     approval_reason: str = "Allow this exact side-effecting tool invocation once?"
     recheck_after_approval: bool = True
-    capability_grant_digest: str | None = None
     effect_intent: FrozenJsonObject | None = None
 
     def __post_init__(self) -> None:
@@ -253,12 +248,6 @@ class SideEffectPlan:
             raise ValueError("approval_reason must be non-empty text")
         if not isinstance(self.recheck_after_approval, bool):
             raise TypeError("recheck_after_approval must be a boolean")
-        if (
-            self.capability_grant_digest is not None
-            and re.fullmatch(r"sha256:[0-9a-f]{64}", self.capability_grant_digest)
-            is None
-        ):
-            raise ValueError("side-effect grant digest is invalid")
         if self.effect_intent is not None:
             if not isinstance(self.effect_intent, FrozenJsonObject):
                 raise TypeError(
@@ -278,14 +267,6 @@ class CapabilityDomain(Protocol):
     def declarations(self) -> CapabilityDeclarations: ...
 
     async def project(self, run: RunInput) -> tuple[str, ...]: ...
-
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject: ...
 
     def normalize_arguments(
         self,
@@ -865,89 +846,6 @@ class CapabilityRuntime:
                 "execution_contract_changed",
                 "An approved execution contract changed; foreground approval is required for a revision.",
             )
-
-    async def prepare_automation_grant(
-        self,
-        capability_id: str,
-        requested_constraints: Mapping[str, object],
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> CapabilityGrant:
-        """Normalize one proposed grant through its current owner; never execute it."""
-
-        if not isinstance(proposal, AutomationScopeProposal):
-            raise TypeError("grant preparation requires an immutable scope proposal")
-        if (
-            type(max_calls_per_occurrence) is not int
-            or not 1 <= max_calls_per_occurrence <= 256
-        ):
-            raise CapabilityInputError(
-                "automation_grant_invalid",
-                "The requested call ceiling is outside its bound.",
-            )
-        try:
-            capability, _ = self._registry.resolve_execution(capability_id)
-            owner_id = self._registry.resolve_domain_owner(capability_id)
-        except KeyError:
-            raise CapabilityInputError(
-                "automation_grant_unsupported", "The exact capability is unavailable."
-            ) from None
-        policy = capability.automation_grant_policy
-        if (
-            capability.automation_eligibility
-            is not AutomationEligibility.AUTOMATION_DIRECT
-            or policy is None
-            or capability.effect_receipt_policy is None
-        ):
-            raise CapabilityInputError(
-                "automation_grant_unsupported",
-                "This capability does not support unattended effects.",
-            )
-        if (
-            capability_id not in proposal.allowed_capability_ids
-            or capability.access_mode not in proposal.allowed_access_modes
-            or capability.operational_effect not in proposal.allowed_operational_effects
-            or proposal.expires_at <= self._clock()
-        ):
-            raise CapabilityInputError(
-                "automation_grant_outside_scope",
-                "The proposed ceilings do not admit this effect.",
-            )
-        requested = self._registry.validate_grant_constraints(
-            capability_id, requested_constraints, requested=True
-        )
-        normalized = await self._domains[owner_id].prepare_automation_grant(
-            capability, requested, max_calls_per_occurrence, proposal
-        )
-        if not isinstance(normalized, FrozenJsonObject):
-            raise TypeError("domain grant preparation must return frozen constraints")
-        normalized = self._registry.validate_grant_constraints(
-            capability_id, normalized
-        )
-        return CapabilityGrant(
-            # Identical preparation must survive the normal approval recheck.
-            # This value confers authority only inside its exact enclosing routine scope.
-            grant_id="capability-grant:"
-            + _sha256_digest(
-                {
-                    "agent_id": proposal.agent_id,
-                    "principal_id": proposal.principal_id,
-                    "capability_contract": self._registry.contract_digest(
-                        capability_id
-                    ),
-                    "domain_owner_id": owner_id,
-                    "constraints_kind": policy.constraints_kind,
-                    "constraints": normalized,
-                    "max_calls_per_occurrence": max_calls_per_occurrence,
-                }
-            ).removeprefix("sha256:"),
-            domain_owner_id=owner_id,
-            capability_id=capability_id,
-            capability_contract_digest=self._registry.contract_digest(capability_id),
-            constraints_kind=policy.constraints_kind,
-            constraints=normalized,
-            max_calls_per_occurrence=max_calls_per_occurrence,
-        )
 
     async def freeze_source_scope(self, run: RunInput) -> RunInput:
         """Return ``run`` with its effective source scope resolved before it starts.
@@ -2162,21 +2060,6 @@ class CapabilityRuntime:
                     "toolbox_search_limited",
                     "The bounded toolbox search result cannot fit its byte limit.",
                 )
-            # Authoring metadata is useful without activating execution schemas,
-            # but must not make a candidate unreachable on a bounded page. Omit
-            # whole contracts before removing candidates; exact load remains the
-            # full-contract inspection path for unusually large declarations.
-            expanded = [item for item in matches if "automation_contract" in item]
-            if expanded:
-                largest = max(
-                    expanded,
-                    key=lambda item: len(
-                        canonical_json(item["automation_contract"]).encode()
-                    ),
-                )
-                del largest["automation_contract"]
-                largest["automation_contract_omitted"] = True
-                continue
             matches.pop()
 
     def _toolbox_search_cursor(
@@ -3833,16 +3716,15 @@ class CapabilityRuntime:
         capability: Capability,
         domain: CapabilityDomain,
         plan: SideEffectPlan,
-    ) -> CapabilityGrant | None:
+    ) -> None:
         del run, capability, domain
         if plan.effect_intent is None:
             raise ValueError(
                 "receipt-bearing effects require a canonical domain intent"
             )
         # Every run, foreground or machine, asks a person at the time (invariant 5).
-        if plan.capability_grant_digest is not None or not plan.approval_required:
+        if not plan.approval_required:
             raise ValueError("external effects require exact per-call approval")
-        return None
 
     async def _execute_reserved_effect(
         self,
@@ -3864,7 +3746,7 @@ class CapabilityRuntime:
         store = self._effect_receipts
         policy = capability.effect_receipt_policy
         assert store is not None and policy is not None
-        grant = self._validate_effect_plan(run, capability, domain, plan)
+        self._validate_effect_plan(run, capability, domain, plan)
         scope = run.start.execution_scope if run.start is not None else None
         routine_id = None if scope is None else scope.routine_id
         await store.require_effects_unblocked(
@@ -3918,7 +3800,6 @@ class CapabilityRuntime:
             routine_id=routine_id,
             routine_revision=None if scope is None else scope.routine_revision,
             occurrence_id=None if scope is None else scope.occurrence_id,
-            capability_grant_digest=None if grant is None else grant.grant_digest,
         )
         active_task = asyncio.current_task()
         cancellations_before_reservation = (
@@ -3926,7 +3807,6 @@ class CapabilityRuntime:
         )
         await store.start_effect_receipt(
             receipt,
-            grant=grant,
             max_receipts_per_run=min(self._limits.max_tool_calls_per_run, 256),
         )
         execution = replace(execution, effect_receipt_id=receipt.receipt_id)
@@ -4510,35 +4390,10 @@ def _catalog_entry_material(entry: RunToolCatalogEntry) -> dict[str, object]:
             "keywords": entry.view.presentation.keywords,
         },
         "origin_revision_digest": entry.origin_revision_digest,
-        "automation_contract": _automation_contract(entry),
         "mode_routes": [
             {"mode": mode, "entry": _catalog_entry_material(route)}
             for mode, route in entry.routes
         ],
-    }
-
-
-def _automation_contract(entry: RunToolCatalogEntry) -> dict[str, object]:
-    """Bounded declaration data for authoring, never an execution grant."""
-    policy = entry.capability.automation_grant_policy
-    receipt = entry.capability.effect_receipt_policy
-    return {
-        "tool_name": entry.view.name,
-        "capability_id": entry.capability.id,
-        "automation_eligibility": entry.capability.automation_eligibility.value,
-        "requires_automation_grant": policy is not None,
-        "grant_policy": (
-            None
-            if policy is None
-            else {
-                "constraints_kind": policy.constraints_kind,
-                "constraints_schema": policy.requested_constraints_schema,
-            }
-        ),
-        "effect_evidence_basis": (
-            None if receipt is None else receipt.success_evidence_basis.value
-        ),
-        "connector": entry.view.connector_presentation,
     }
 
 
@@ -4563,8 +4418,12 @@ def _tool_contract(
     entry: RunToolCatalogEntry, *, include_schemas: bool = True
 ) -> dict[str, object]:
     """One registered declaration projection shared by search, load and inspection."""
+    receipt = entry.capability.effect_receipt_policy
     contract = {
-        **_automation_contract(entry),
+        "effect_evidence_basis": (
+            None if receipt is None else receipt.success_evidence_basis.value
+        ),
+        "connector": entry.view.connector_presentation,
         **_tool_contract_reference(entry),
     }
     if include_schemas:
@@ -5110,9 +4969,6 @@ def _toolbox_search_match(
         "tool_name": entry.view.name,
         "toolbox_id": entry.toolbox_id.value,
         "capability_id": entry.capability.id,
-        "automation_eligibility": entry.capability.automation_eligibility.value,
-        "requires_automation_grant": entry.capability.automation_grant_policy
-        is not None,
         "summary": entry.view.presentation.summary,
         "when_to_use": entry.view.presentation.when_to_use,
         "text_trust": entry.view.presentation.text_trust.value,
@@ -5122,8 +4978,6 @@ def _toolbox_search_match(
         "score": score,
         "match_status": "matched" if score > 0 else "unmatched_fallback",
     }
-    if entry.capability.automation_grant_policy is not None:
-        match["automation_contract"] = _tool_contract(entry)
     match["inspection_tool"] = "toolbox_inspect"
     return match
 

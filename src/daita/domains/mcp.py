@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
-from typing import Protocol, cast
+from typing import Protocol
 
 from .._json import FrozenJsonObject, canonical_json
 from ..adapters.mcp import (
@@ -31,9 +31,6 @@ from ..adapters.mcp import (
     validate_mcp_schema_value,
 )
 from ..capabilities import (
-    AutomationEligibility,
-    AutomationGrantPolicy,
-    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -50,10 +47,8 @@ from ..capabilities import (
     ToolRecovery,
     ToolView,
     recovery_details,
-    validate_tool_schema_value,
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
-from ..distribution.models import is_distribution_destination_id
 from ..llm.models import ModelSensitivity, ToolCall
 from ..llm.provider_definitions import tool_schema_incompatibility
 from ..loop.models import RunInput
@@ -67,71 +62,6 @@ _MCP_BINDING_CHANGED = ToolRecovery(
     "and re-admit it before this tool can run. It was not called.",
 )
 MCP_OUTPUT_KIND = "mcp.tool.result"
-
-_MCP_GRANT_IDENTITY_FIELDS = ("binding_id", "binding_revision", "remote_tool_name")
-_MCP_GRANT_VARIABLE_NAMES_SCHEMA = {
-    "type": "array",
-    "maxItems": 128,
-    "uniqueItems": True,
-    "items": {"type": "string", "minLength": 1, "maxLength": 128},
-}
-MCP_GRANT_POLICY = AutomationGrantPolicy(
-    constraints_kind="mcp.tool_call",
-    # Retained grant shape; part of every MCP action's contract digest.
-    constraints_schema={
-        "type": "object",
-        "properties": {
-            "binding_id": {"type": "string", "maxLength": 256},
-            "binding_revision": {"type": "integer", "minimum": 1},
-            "remote_tool_name": {"type": "string", "maxLength": 256},
-            "fixed_arguments": {"type": "object"},
-            "variable_argument_names": _MCP_GRANT_VARIABLE_NAMES_SCHEMA,
-        },
-        "required": [
-            *_MCP_GRANT_IDENTITY_FIELDS,
-            "fixed_arguments",
-            "variable_argument_names",
-        ],
-        "additionalProperties": False,
-    },
-    # Authoring shape: the binding, revision and remote tool follow from the
-    # capability_id, so the domain fills them when they are omitted.
-    request_schema={
-        "type": "object",
-        "properties": {
-            "binding_id": {
-                "type": "string",
-                "maxLength": 256,
-                "description": "Optional; derived from capability_id.",
-            },
-            "binding_revision": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "Optional; derived from capability_id.",
-            },
-            "remote_tool_name": {
-                "type": "string",
-                "maxLength": 256,
-                "description": "Optional; derived from capability_id.",
-            },
-            "fixed_arguments": {
-                "type": "object",
-                "description": (
-                    "Exact values for the connector tool's own input arguments, "
-                    "keyed by its input schema property names. A Daita Inbox "
-                    "destination is not a connector argument; a routine reports "
-                    "to its conversation's Inbox."
-                ),
-            },
-            "variable_argument_names": {
-                **_MCP_GRANT_VARIABLE_NAMES_SCHEMA,
-                "description": "Connector tool scalar arguments each run may set.",
-            },
-        },
-        "required": ["fixed_arguments", "variable_argument_names"],
-        "additionalProperties": False,
-    },
-)
 
 MCP_RECEIPT_POLICY = EffectReceiptPolicy(
     receipt_kind="mcp.tool_call",
@@ -777,193 +707,6 @@ class MCPCapabilityDomain:
         )
         return arguments
 
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject:
-        binding, tool = self._binding_by_capability[capability.id]
-        if (
-            tool.operational_effect is OperationalEffect.NONE
-            or tool.automation_eligibility
-            is not AutomationEligibility.AUTOMATION_DIRECT
-            or tool.completion_semantics is not MCPCompletionSemantics.DIRECT_RESULT
-            or tool.task_support == "required"
-            or type(max_calls_per_occurrence) is not int
-            or not 1 <= max_calls_per_occurrence <= 256
-        ):
-            raise CapabilityInputError(
-                "automation_grant_unsupported",
-                "This MCP tool does not support the requested unattended invocation contract.",
-            )
-        if proposal.agent_id != self._agent_id or (
-            binding.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION
-            and proposal.principal_id != binding.owner_principal_id
-        ):
-            raise CapabilityInputError(
-                "automation_grant_scope_invalid",
-                "The MCP binding is outside the proposed scope.",
-            )
-        if binding.binding_id not in proposal.allowed_connector_binding_ids:
-            raise CapabilityInputError(
-                "automation_grant_scope_invalid",
-                "The MCP binding is outside the proposed connector scope.",
-                {"binding_id": binding.binding_id},
-                recovery=ToolRecovery(
-                    RecoveryKind.CORRECT_ARGUMENTS,
-                    "Include this binding_id in allowed_connector_binding_ids; a "
-                    "routine may omit that list to derive it from its capabilities.",
-                ),
-            )
-        constraints = _with_grant_identity(binding, tool, constraints)
-        _reject_delivery_destination_arguments(tool, constraints)
-        try:
-            await check_personal_connection(
-                binding.authentication,
-                self._connection_provider,
-                proposal.principal_id,
-            )
-        except MCPError as error:
-            raise CapabilityInputError(error.code, str(error)) from None
-        _require_current_binding(
-            await self._store.load_mcp_binding(self._agent_id, binding.binding_id),
-            binding,
-            tool,
-        )
-        if proposal.sensitivity_ceiling.routing_rank > min(
-            binding.maximum_outbound_sensitivity.routing_rank,
-            tool.maximum_outbound_sensitivity.routing_rank,
-        ):
-            raise CapabilityInputError(
-                "mcp_outbound_sensitivity_exceeded",
-                "The proposed request classification exceeds MCP outbound admission.",
-            )
-        await self._validate_constraints(binding, tool, constraints)
-        normalized = constraints.to_dict()
-        normalized["variable_argument_names"] = sorted(
-            cast(tuple[str, ...], constraints["variable_argument_names"])
-        )
-        return FrozenJsonObject.from_mapping(normalized)
-
-    @staticmethod
-    async def _validate_constraints(
-        binding: MCPServerBinding, tool: MCPToolBinding, constraints: FrozenJsonObject
-    ) -> None:
-        validate_tool_schema_value(MCP_GRANT_POLICY.constraints_schema, constraints)
-        fixed = cast(Mapping[str, object], constraints["fixed_arguments"])
-        variable = cast(tuple[str, ...], constraints["variable_argument_names"])
-        if variable and any(
-            key in tool.input_schema for key in ("oneOf", "anyOf", "allOf")
-        ):
-            raise CapabilityInputError(
-                "mcp_grant_constraints_invalid",
-                "Root schema alternatives cannot establish scalar variable grant boundaries.",
-            )
-        properties = cast(
-            Mapping[str, Mapping[str, object]], tool.input_schema.get("properties", {})
-        )
-        names = set(fixed) | set(variable)
-        identity_fields = [
-            name
-            for name, expected in (
-                ("binding_id", binding.binding_id),
-                ("binding_revision", binding.revision),
-                ("remote_tool_name", tool.remote_name),
-            )
-            if constraints[name] != expected
-        ]
-        if identity_fields:
-            raise CapabilityInputError(
-                "mcp_grant_constraints_invalid",
-                "The grant must use this exact admitted binding, revision and tool.",
-                {
-                    "identity_fields": identity_fields,
-                    "inspect_tool_name": tool.local_name,
-                },
-            )
-        missing = (
-            set(cast(tuple[str, ...], tool.input_schema.get("required", ()))) - names
-        )
-        unknown = names - set(properties)
-        overlapping = set(fixed) & set(variable)
-        if (
-            len(fixed) > 128
-            or overlapping
-            or len(variable) != len(set(variable))
-            or unknown
-            or missing
-        ):
-            groups = {
-                "missing_argument_names": missing,
-                "unknown_argument_names": unknown,
-                "overlapping_argument_names": overlapping,
-            }
-            details: dict[str, object] = {
-                key: [name[:128] for name in sorted(values)[:32]]
-                for key, values in groups.items()
-            }
-            details.update(
-                inspect_tool_name=tool.local_name,
-                argument_counts={key: len(values) for key, values in groups.items()},
-                names_truncated=any(
-                    len(values) > 32 or any(len(name) > 128 for name in values)
-                    for values in groups.values()
-                ),
-                fixed_argument_limit=128,
-            )
-            raise CapabilityInputError(
-                "mcp_grant_constraints_invalid",
-                "Correct the listed missing, unknown or overlapping grant arguments. "
-                "Use toolbox_inspect for the exact declared names and types; do not invent fields.",
-                details,
-            )
-        # A variable object/array cannot enforce a nested recipient or table limit.
-        # This release admits scalar variables; fix composite values in full.
-        if any(
-            properties[name].get("type")
-            not in {"string", "integer", "number", "boolean"}
-            for name in variable
-        ):
-            raise CapabilityInputError(
-                "mcp_grant_nested_variable_unsupported",
-                "Fix the entire nested argument; variable JSON cannot enforce nested restrictions.",
-                {
-                    "argument_names": sorted(
-                        name
-                        for name in variable
-                        if properties[name].get("type")
-                        not in {"string", "integer", "number", "boolean"}
-                    )[:32],
-                    "inspect_tool_name": tool.local_name,
-                },
-            )
-        partial_schema = tool.input_schema.to_dict()
-        partial_schema["required"] = list(fixed)
-        try:
-            await validate_mcp_schema_value(partial_schema, fixed)
-        except ValueError:
-            invalid = []
-            for name in sorted(fixed):
-                try:
-                    await validate_mcp_schema_value(
-                        {**partial_schema, "required": [name]},
-                        {name: fixed[name]},
-                    )
-                except ValueError:
-                    invalid.append(name)
-            raise CapabilityInputError(
-                "mcp_grant_constraints_invalid",
-                "Fixed grant arguments do not satisfy the connector tool's input "
-                "schema. Correct the listed values; use toolbox_inspect for the "
-                "exact declared types.",
-                {
-                    "invalid_argument_names": [name[:128] for name in invalid[:32]],
-                    "inspect_tool_name": tool.local_name,
-                },
-            ) from None
-
     async def side_effect_plan(
         self,
         run: RunInput,
@@ -1178,32 +921,22 @@ async def activate_mcp_domain(
             executor_id=tool.executor_id,
             access_mode=tool.access_mode,
             operational_effect=tool.operational_effect,
-            automation_eligibility=tool.automation_eligibility,
             effect_receipt_policy=(
                 MCP_RECEIPT_POLICY
                 if tool.operational_effect is not OperationalEffect.NONE
-                else None
-            ),
-            automation_grant_policy=(
-                MCP_GRANT_POLICY
-                if tool.operational_effect is not OperationalEffect.NONE
-                and tool.automation_eligibility
-                is AutomationEligibility.AUTOMATION_DIRECT
                 else None
             ),
             execution_admission_policy=ExecutionAdmissionPolicy(
                 shape=(
                     "read_only_mcp"
                     if tool.operational_effect is OperationalEffect.NONE
-                    else "exact_grant_mcp_action"
+                    else "mcp_action"
                 ),
                 inline_eligible=True,
                 graph_v1_eligible=(
                     tool.operational_effect is OperationalEffect.NONE
                     or (
-                        tool.automation_eligibility
-                        is AutomationEligibility.AUTOMATION_DIRECT
-                        and tool.completion_semantics
+                        tool.completion_semantics
                         is MCPCompletionSemantics.DIRECT_RESULT
                         and tool.task_support != "required"
                     )
@@ -1259,63 +992,6 @@ async def activate_mcp_domain(
         connection_provider=connection_provider,
     )
     return domain, tuple(activated), tuple(item.executor for item in activated)
-
-
-def _with_grant_identity(
-    binding: MCPServerBinding, tool: MCPToolBinding, constraints: FrozenJsonObject
-) -> FrozenJsonObject:
-    """Fill identity the capability_id already determines; keep given values.
-
-    Supplied identity values stay and are checked for exact equality later, so
-    a stale or foreign identity is still rejected rather than overwritten.
-    """
-
-    values = constraints.to_dict()
-    for name, value in (
-        ("binding_id", binding.binding_id),
-        ("binding_revision", binding.revision),
-        ("remote_tool_name", tool.remote_name),
-    ):
-        values.setdefault(name, value)
-    return FrozenJsonObject.from_mapping(values)
-
-
-def _reject_delivery_destination_arguments(
-    tool: MCPToolBinding, constraints: FrozenJsonObject
-) -> None:
-    """A Daita Inbox destination never belongs in a connector tool argument."""
-
-    fixed = constraints.get("fixed_arguments")
-    if not isinstance(fixed, Mapping):
-        return
-
-    def contains_destination(value: object) -> bool:
-        if is_distribution_destination_id(value):
-            return True
-        if isinstance(value, Mapping):
-            return any(contains_destination(item) for item in value.values())
-        if isinstance(value, (tuple, list)):
-            return any(contains_destination(item) for item in value)
-        return False
-
-    names = sorted(name for name, value in fixed.items() if contains_destination(value))
-    if names:
-        raise CapabilityInputError(
-            "mcp_grant_delivery_destination_argument",
-            "A Daita Inbox destination id was given as a connector tool argument. "
-            "fixed_arguments are values the connector tool itself receives; Daita "
-            "report delivery is chosen separately.",
-            {
-                "argument_names": [name[:128] for name in names[:32]],
-                "inspect_tool_name": tool.local_name,
-            },
-            recovery=ToolRecovery(
-                RecoveryKind.CORRECT_ARGUMENTS,
-                "Report delivery is separate: a routine reports to its "
-                "conversation's Inbox. Fix these arguments to the connector "
-                "tool's own target values from the user's request.",
-            ),
-        )
 
 
 def _require_current_binding(

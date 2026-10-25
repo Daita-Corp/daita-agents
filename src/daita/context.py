@@ -2858,11 +2858,10 @@ def _system_prompt(
             (
                 "Pinned tools are callable. toolbox_load replaces on-demand tools next step; "
                 "load known names directly, no search. Group independent reads. "
-                "toolbox_inspect reads exact schemas and grants without activation. "
+                "toolbox_inspect reads exact schemas without activation. "
                 "Complete result contracts survive tool switching; incomplete "
                 "references require inspection. For partial inspection use returned "
-                "paths/offsets and exact contract_digest. Search automation_contract "
-                "supports scheduling; future tools need not be loaded. Manifest "
+                "paths/offsets and exact contract_digest. Manifest "
                 "access/effects cover all prepared candidates; repeated search cannot "
                 "add an absent effect. Discovery grants no authority: execution "
                 "revalidates admission and approval.",
@@ -3205,8 +3204,7 @@ def _tool_guidance(
         )
     if external_actions_callable:
         instructions.append(
-            "Foreground actions request approval when invoked; no separate automation grant is needed. "
-            "Automation grants apply to scheduled execution. Use the action's own exact argument schema "
+            "Actions request approval when invoked. Use the action's own exact argument schema "
             "for its destination. Framework inbox destinations govern report delivery, not external action targets."
         )
     if SEMANTIC_SAVE_CAPABILITY_ID in candidates or capability_ids & {

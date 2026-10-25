@@ -34,7 +34,6 @@ from ...artifacts.store import AgentHomeArtifactStore
 from ...capabilities import (
     AccessMode,
     ArtifactPolicy,
-    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -168,7 +167,6 @@ class AnalysisCapabilityDomain:
             output_kind="analysis.cell",
             output_schema={"type": "object"},
             access_mode=AccessMode.READ,
-            automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
             artifact_policy=ArtifactPolicy(
                 allowed_media_types=frozenset(MEDIA_TYPES.values()),
                 allowed_authorships=frozenset(
@@ -1621,9 +1619,6 @@ class AnalysisCapabilityDomain:
                 "The native worker was closed; its interpreter state is lost.",
             )
         return None
-
-    async def prepare_automation_grant(self, *args, **kwargs):
-        raise ValueError("Analysis has no external-effect standing grants")
 
     async def side_effect_plan(self, *args, **kwargs):
         raise ValueError("Analysis has no external effects")

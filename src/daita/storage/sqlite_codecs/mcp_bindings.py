@@ -13,7 +13,6 @@ from ...adapters.mcp import (
 )
 from ...capabilities import (
     AccessMode,
-    AutomationEligibility,
     OperationalEffect,
     ToolboxId,
     ToolLoadMode,
@@ -227,7 +226,6 @@ def _encode_tool(value: MCPToolBinding):
             "result_sensitivity": value.result_sensitivity.value,
             "access_mode": value.access_mode.value,
             "operational_effect": value.operational_effect.value,
-            "automation_eligibility": value.automation_eligibility.value,
             "maximum_outbound_sensitivity": value.maximum_outbound_sensitivity.value,
             "completion_semantics": value.completion_semantics.value,
             "task_support": value.task_support,
@@ -259,7 +257,6 @@ def _decode_tool(value) -> MCPToolBinding:
             "result_sensitivity",
             "access_mode",
             "operational_effect",
-            "automation_eligibility",
             "maximum_outbound_sensitivity",
             "completion_semantics",
             "task_support",
@@ -335,9 +332,6 @@ def _decode_tool(value) -> MCPToolBinding:
         access_mode=AccessMode(text(fields["access_mode"], "MCP access mode")),
         operational_effect=OperationalEffect(
             text(fields["operational_effect"], "MCP effect")
-        ),
-        automation_eligibility=AutomationEligibility(
-            text(fields["automation_eligibility"], "MCP automation eligibility")
         ),
         maximum_outbound_sensitivity=ModelSensitivity(
             text(fields["maximum_outbound_sensitivity"], "MCP tool outbound ceiling")
