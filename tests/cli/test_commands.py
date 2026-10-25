@@ -409,8 +409,6 @@ def test_chat_subcommand_is_a_strict_alias_of_the_textual_app():
             [
                 "chat",
                 "atlas",
-                "--model",
-                "mock:scripted",
                 "--conversation",
                 "conversation-1",
             ],
@@ -844,7 +842,7 @@ def test_future_cli_2_parser_adds_the_bounded_chat_surface():
     assert "chat" in commands
     assert _surface(commands["chat"]) == (
         ("name",),
-        frozenset({"-h", "--help", "--model", "--conversation"}),
+        frozenset({"-h", "--help", "--conversation"}),
     )
 
 
@@ -853,9 +851,7 @@ def test_cli_2_chat_rejects_non_tty_streams_before_provider_or_agent_open():
         patch.object(cli, "create_llm_provider") as provider_factory,
         patch.object(cli.Agent, "open", new_callable=AsyncMock) as agent_open,
     ):
-        code, stdout, stderr = _invoke(
-            ["chat", "not-opened", "--model", "mock:scripted"]
-        )
+        code, stdout, stderr = _invoke(["chat", "not-opened"])
 
     assert code == 1
     assert stdout == ""
@@ -1076,7 +1072,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
 
     assert _surface(commands["host"]) == (
         (),
-        frozenset({"-h", "--help", "--agent"}),
+        frozenset({"-h", "--help"}),
     )
     diagnostics = _subcommands(commands["diagnostics"])
     assert set(diagnostics) == {"summary"}
@@ -1262,16 +1258,6 @@ def test_cli_host_offers_the_host_lifecycle_and_needs_a_command_or_an_agent() ->
     }
     with pytest.raises(ValueError, match="choose a host command"):
         asyncio.run(cli._execute(args))
-
-
-def test_cli_host_agent_warns_and_serves_every_agent(tmp_path: Path, capsys) -> None:
-    with patch.object(cli, "_host_command", return_value=0) as served:
-        code = cli.main(["--root", str(tmp_path), "host", "--agent", "atlas"])
-    assert code == 0
-    assert "daita host --agent is deprecated" in capsys.readouterr().err
-    served.assert_called_once()
-    args = served.call_args.args[0]
-    assert (args.host_command, args.root) == ("serve", tmp_path)
 
 
 def test_future_cli_4_direct_knowledge_commands_survive_reopen():

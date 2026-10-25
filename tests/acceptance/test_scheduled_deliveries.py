@@ -164,7 +164,13 @@ def _released_routine(fields: dict[str, object]) -> None:
 
 
 def _released_occurrence(fields: dict[str, object]) -> None:
-    fields.update(precheck_observation=None, reserved_tokens=0, reserved_cost_usd="0")
+    fields.update(
+        precheck_observation=None,
+        reserved_tokens=0,
+        reserved_cost_usd="0",
+        execution_scope=None,
+        execution_scope_digest=None,
+    )
 
 
 async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen(

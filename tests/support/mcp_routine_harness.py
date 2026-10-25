@@ -33,7 +33,6 @@ from daita.capabilities import (
     AccessMode,
     ApprovalDecision,
     ApprovalRequest,
-    AutomationEligibility,
     EffectEvidenceBasis,
     EffectOutcome,
     OperationalEffect,
@@ -345,7 +344,6 @@ class Evaluation:
                     if tool["name"] == "notify_release"
                     else OperationalEffect.NONE
                 ),
-                automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
                 maximum_outbound_sensitivity=ModelSensitivity.INTERNAL,
             )
             for tool in self.server.tools

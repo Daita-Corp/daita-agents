@@ -5,7 +5,6 @@ from __future__ import annotations
 from daita.capabilities import CallTargetLane
 from tests.capabilities._toolbox_support import (
     AccessMode,
-    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityRegistry,
@@ -59,7 +58,6 @@ def test_remote_tool_text_is_forced_to_sources_on_demand_and_stays_untrusted() -
         result_sensitivity=ModelSensitivity.INTERNAL,
         access_mode=AccessMode.READ,
         operational_effect=OperationalEffect.NONE,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         maximum_outbound_sensitivity=ModelSensitivity.RESTRICTED,
         completion_semantics=MCPCompletionSemantics.DIRECT_RESULT,
         task_support="forbidden",

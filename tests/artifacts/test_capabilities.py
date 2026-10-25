@@ -16,7 +16,7 @@ import daita.domains.data.controller as data_controller
 from daita import Agent, ApprovalDecision, ApprovalRequest, ArtifactError
 from daita._json import FrozenJsonObject
 from daita.artifacts.models import ArtifactRef
-from daita.capabilities import AccessMode, AutomationEligibility, OperationalEffect
+from daita.capabilities import AccessMode, OperationalEffect
 from daita.context import AgentContextBuilder
 from daita.domains.data.export_capabilities import (
     ARTIFACT_CONVERT_CAPABILITY_ID,
@@ -190,35 +190,25 @@ def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -
         assert schema["additionalProperties"] is False
 
 
-def test_d2_certifies_only_the_three_accepted_scheduled_artifact_capabilities() -> None:
+def test_artifact_and_export_capabilities_declare_their_access_and_no_effect() -> None:
     declarations = artifact_capability_declarations()
     data_declarations = exact_export_capability_declarations(
         adapter_ids=("sqlite", "postgresql")
     )
     capabilities = (*declarations.capabilities, *data_declarations.capabilities)
     by_id = {capability.id: capability for capability in capabilities}
-    scheduled = {
-        capability.id
-        for capability in capabilities
-        if capability.automation_eligibility is AutomationEligibility.AUTOMATION_DIRECT
-    }
 
-    assert scheduled == {
-        DOCUMENT_CREATE_CAPABILITY_ID,
-        RESULT_SNAPSHOT_CAPABILITY_ID,
-        DATA_EXPORT_TABULAR_CAPABILITY_ID,
-    }
     assert by_id[DATA_EXPORT_TABULAR_CAPABILITY_ID].access_mode is AccessMode.READ
-    assert (
-        by_id[ARTIFACT_CREATE_TABULAR_CAPABILITY_ID].automation_eligibility
-        is AutomationEligibility.INTERACTIVE_ONLY
-    )
     assert by_id[ARTIFACT_CREATE_TABULAR_CAPABILITY_ID].access_mode is AccessMode.NONE
     assert by_id[DOCUMENT_CREATE_CAPABILITY_ID].access_mode is AccessMode.NONE
     assert by_id[RESULT_SNAPSHOT_CAPABILITY_ID].access_mode is AccessMode.NONE
     assert all(
         by_id[capability_id].operational_effect is OperationalEffect.NONE
-        for capability_id in scheduled
+        for capability_id in (
+            DOCUMENT_CREATE_CAPABILITY_ID,
+            RESULT_SNAPSHOT_CAPABILITY_ID,
+            DATA_EXPORT_TABULAR_CAPABILITY_ID,
+        )
     )
 
 

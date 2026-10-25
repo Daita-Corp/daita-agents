@@ -144,7 +144,7 @@ async def test_released_connector_binding_reopens_and_rejects_stale_revision(
     with sqlite3.connect(":memory:") as fixture:
         fixture.executescript(
             (
-                REPO_ROOT / "tests/fixtures/agent-home-revisions/revision-3/state.sql"
+                REPO_ROOT / "tests/fixtures/agent-home-revisions/revision-4/state.sql"
             ).read_text()
         )
         agent, identity, data = fixture.execute(

@@ -5,7 +5,6 @@ These checks use existing fake-I/O fixtures and never count as live LLM evidence
 
 import json
 from dataclasses import replace
-from datetime import timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -14,27 +13,18 @@ import pytest
 
 from daita import ApprovalDecision, ApprovalRequest
 from daita._json import FrozenJsonObject, canonical_json
-from daita.capabilities import (
-    AccessMode,
-    AutomationScopeProposal,
-    CapabilityInputError,
-    OperationalEffect,
-)
 from daita.catalog.models import Sensitivity
 from daita.llm import factory
 from daita.llm.models import (
     MessageRole,
-    ModelSensitivity,
     ModelStreamCompleted,
     TextBlock,
 )
 from daita.loop.models import LoopExitKind
 from daita.routines.capabilities import ROUTINE_CREATE_CAPABILITY_ID
-from tests.support.distribution import inbox_distribution_plan
 from tests.support.native_writes import create_fixture, response
 from tests.support.postgresql_live_harness import (
     AUTHORIZATION,
-    FIXTURE_SENSITIVITY,
     KEY_ENV,
     LIMITS,
     MODEL_ENV,
@@ -51,104 +41,6 @@ from tests.support.postgresql_live_harness import (
     repeats,
 )
 from tests.support.postgresql_write_release import DriverProbe, WriteModel
-
-
-@pytest.mark.parametrize(
-    "broaden,operation,prerequisite",
-    [
-        (False, "upsert", "matching"),
-        (True, "upsert", "matching"),
-        (False, "upsert", "omitted"),
-        (False, "upsert", "wrong"),
-        (False, "update", "matching"),
-        (False, "update", "omitted"),
-        (False, "update", "wrong"),
-    ],
-)
-async def test_native_write_grant_requires_its_preview_and_an_internal_target(
-    tmp_path, monkeypatch, broaden, operation, prerequisite
-):
-    ceiling = ModelSensitivity.RESTRICTED if broaden else FIXTURE_SENSITIVITY
-    cost = LIMITS.max_estimated_cost_usd
-    assert cost is not None
-    fixture = await create_fixture(
-        tmp_path, monkeypatch, sensitivity=Sensitivity.INTERNAL
-    )
-    agent, provider, db, _, binding, resource, constraints, batch, clock, _ = fixture
-    try:
-        if operation == "update":
-            constraints = {
-                **constraints,
-                "allowed_operations": ("update",),
-                "key_columns": ("id",),
-                "allowed_insert_columns": (),
-                "generated_identity_columns": (),
-            }
-            permission = await agent.preview_source_permissions(
-                source_id=batch["source_id"],
-                read_mode="all",
-                read_resource_ids=(),
-                relational_write_scopes={resource.id: constraints},
-            )
-            await agent.apply_source_permissions(
-                source_id=batch["source_id"],
-                confirmation_fingerprint=permission.confirmation_fingerprint,
-            )
-        await agent.revoke_mcp_server(binding.binding_id)
-        grant = {
-            "source_id": batch["source_id"],
-            "resource_id": resource.id,
-            "resource_revision": resource.current_revision,
-            **{
-                key: value
-                for key, value in constraints.items()
-                if key != "allowed_operations"
-            },
-        }
-        write = f"data.{operation}_rows"
-        preview_operation = "update" if operation == "upsert" else "upsert"
-        preview = f"data.preview_{operation if prerequisite == 'matching' else preview_operation}_rows"
-        # Graph tasks still prepare standing native grants until they are removed.
-        proposal = AutomationScopeProposal(
-            agent_id=agent.id,
-            principal_id=f"agent:{agent.id}",
-            allowed_source_ids=(batch["source_id"],),
-            allowed_resource_ids=(resource.id,),
-            allowed_connector_binding_ids=(),
-            allowed_capability_ids=(
-                (write,) if prerequisite == "omitted" else (preview, write)
-            ),
-            allowed_access_modes=frozenset(AccessMode),
-            allowed_operational_effects=frozenset(OperationalEffect),
-            sensitivity_ceiling=ceiling,
-            eligible_model_routes=(provider.provider_id,),
-            per_run_max_cost_usd=cost,
-            per_run_max_tokens=LIMITS.max_total_tokens,
-            expires_at=clock[0] + timedelta(days=7),
-            distribution_plan_digest=inbox_distribution_plan(
-                "conversation-1", ceiling
-            ).plan_digest,
-        )
-        runtime = agent._embedded._capability_runtime
-        before = list(db.log)
-        if prerequisite != "matching":
-            with pytest.raises(CapabilityInputError) as failure:
-                await runtime.prepare_automation_grant(write, grant, 1, proposal)
-            assert failure.value.code == "automation_grant_preview_required"
-            assert f"data.preview_{operation}_rows" in str(failure.value)
-        elif broaden:
-            with pytest.raises(CapabilityInputError) as failure:
-                await runtime.prepare_automation_grant(write, grant, 1, proposal)
-            assert failure.value.code == "write_sensitivity_denied"
-        else:
-            prepared = await runtime.prepare_automation_grant(write, grant, 1, proposal)
-            assert prepared.capability_id == write
-        # Refused preparation touches nothing; none ever writes.
-        assert (db.log == before) or (prerequisite == "matching" and not broaden)
-        assert not db.rows
-        assert not await agent.list_effects() and not fixture[-1]
-    finally:
-        await agent.close()
 
 
 async def test_owner_admitted_routine_fixture_saves_the_owner_intent(

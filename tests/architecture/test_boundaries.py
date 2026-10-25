@@ -235,7 +235,6 @@ def test_checklist_jobs_are_registered_and_legacy_runtime_is_unreachable():
         for relative in (
             "agent.py",
             "hosting/embedded.py",
-            "hosting/resident.py",
         )
     )
     job_supervisor = (PACKAGE / "jobs" / "supervisor.py").read_text(encoding="utf-8")
@@ -450,7 +449,6 @@ def test_mcp_is_server_neutral_lazy_and_uses_existing_runtime_owners():
         "preview_endpoint",
     ):
         assert action_extension not in adapter
-    assert "MCP_GRANT_POLICY" in domain
     assert "MCP_RECEIPT_POLICY" in domain
     assert "activate_mcp_domain" in embedded
     assert "mcp_domain" in embedded
@@ -727,7 +725,6 @@ def test_public_surface_is_focused():
         "RelationalUpdateReadiness",
         "RelationalWriteScope",
         "RetryPolicy",
-        "ResidentReady",
         "RoutineIntent",
         "RoutineState",
         "ResourceRevisionBinding",
@@ -754,7 +751,6 @@ def test_public_surface_is_focused():
         "WorkKind",
         "__version__",
         "create_llm_provider",
-        "run_resident_host",
     }
 
 
@@ -2526,7 +2522,6 @@ def test_xlsx_dependencies_are_scoped_and_integrations_remain_lazy():
 def test_native_write_contracts_are_neutral_and_use_the_existing_domain():
     from dataclasses import fields
 
-    from daita.capabilities import AutomationEligibility
     from daita.domains.data.capabilities import (
         relational_update_capability_declarations,
         relational_update_preview_capability_declarations,
@@ -2560,17 +2555,8 @@ def test_native_write_contracts_are_neutral_and_use_the_existing_domain():
         assert bundle.domain_owner_id == "data"
         for capability in bundle.capabilities:
             assert "postgresql" not in capability.id
-            assert (
-                capability.automation_eligibility
-                is AutomationEligibility.AUTOMATION_DIRECT
-            )
             if capability.access_mode is AccessMode.WRITE:
                 assert capability.operational_effect is OperationalEffect.MUTATE_DATA
-                assert capability.automation_grant_policy is not None
-                assert (
-                    capability.automation_grant_policy.constraints_kind
-                    == "data.relational_write"
-                )
                 assert capability.effect_receipt_policy is not None
             else:
                 assert capability.operational_effect is OperationalEffect.NONE

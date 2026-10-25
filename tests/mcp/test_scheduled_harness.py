@@ -196,7 +196,7 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
         assert scheduled not in texts[0]
         assert scheduled in texts[1]
         assert scheduled not in texts[3]
-        assert "Foreground actions request approval when invoked" in texts[3]
+        assert "Actions request approval when invoked" in texts[3]
         assert "Framework inbox destinations" in texts[3]
         assert "Framework inbox destinations" not in texts[0]
         assert model.provider_id not in texts[0] + texts[1]

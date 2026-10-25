@@ -155,7 +155,6 @@ async def _assignment(
             capability,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.NONE,
-            automation_grant_policy=None,
             effect_receipt_policy=None,
         )
     from collections.abc import Mapping
@@ -744,7 +743,10 @@ async def test_source_free_effect_free_assignment_uses_the_same_occurrence_path(
             inspection.recent_occurrences[0].disposition
             is RoutineOccurrenceDisposition.COMPLETED
         )
-        scope = inspection.recent_occurrences[0].execution_scope
+        # The occurrence's run records the scope it started with.
+        terminal_run_id = inspection.recent_occurrences[0].terminal_run_id
+        assert terminal_run_id is not None
+        scope = (await store.load(terminal_run_id)).run.execution_scope
         assert (
             scope is not None
             and scope.allowed_source_ids

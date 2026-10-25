@@ -284,8 +284,6 @@ def _released_routines(due: datetime) -> tuple[
             claimed_at=scheduled_for,
             claim_token="released-claim",
             lease_expires_at=scheduled_for + timedelta(seconds=30),
-            execution_scope=None,
-            execution_scope_digest=None,
             reserved_run_id=None,
             charged_tokens=0,
             charged_cost_usd=Decimal("0"),

@@ -23,7 +23,6 @@ from daita.artifacts.renderers import (
 )
 from daita.capabilities import (
     AccessMode,
-    AutomationEligibility,
     OperationalEffect,
     ToolLoadMode,
 )
@@ -189,7 +188,6 @@ def test_artifact_create_table_is_one_bounded_source_neutral_tool() -> None:
     assert view.presentation.load_mode is ToolLoadMode.ON_DEMAND
     assert capability.access_mode is AccessMode.NONE
     assert capability.operational_effect is OperationalEffect.NONE
-    assert capability.automation_eligibility is AutomationEligibility.INTERACTIVE_ONLY
     properties = capability.input_schema.get("properties")
     assert isinstance(properties, Mapping)
     assert set(properties) == {

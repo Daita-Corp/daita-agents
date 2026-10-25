@@ -1,24 +1,16 @@
 from tests.capabilities._effect_contract_support import (
-    _GRANT,
     _RECEIPT,
     _capability,
 )
 
-"""Capability policies and normalized grants are authority, never presentation."""
+"""Capability policies are authority, never presentation."""
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 
 import pytest
 
 from daita._json import FrozenJsonObject
 from daita.capabilities import (
-    AccessMode,
-    AutomationEligibility,
-    AutomationScopeProposal,
-    Capability,
-    CapabilityInputError,
     EffectEvidenceBasis,
     EffectObservation,
     EffectOutcome,
@@ -29,83 +21,29 @@ from daita.capabilities import (
     ToolOutputValidationError,
     capability_contract_digest,
 )
-from daita.capability_runtime import CapabilityRuntime
 from daita.llm.models import ModelSensitivity
 from tests.support.capability_runtime import StaticTestDomain, static_registry
 
 _DIGEST = "sha256:" + "a" * 64
 
 
-def _proposal() -> AutomationScopeProposal:
-    return AutomationScopeProposal(
-        agent_id="agent",
-        principal_id="human",
-        allowed_source_ids=(),
-        allowed_resource_ids=(),
-        allowed_connector_binding_ids=(),
-        allowed_capability_ids=("test.action",),
-        allowed_access_modes=frozenset({AccessMode.NONE}),
-        allowed_operational_effects=frozenset({OperationalEffect.EXTERNAL_ACTION}),
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
-        eligible_model_routes=("route",),
-        per_run_max_cost_usd=Decimal("1"),
-        per_run_max_tokens=1000,
-        expires_at=datetime.now(UTC) + timedelta(days=1),
-        distribution_plan_digest=_DIGEST,
-    )
-
-
 class _Executor:
     executor_id = "test.action.executor"
-    calls = 0
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
-        self.calls += 1
-        raise AssertionError("grant preparation must not dispatch an action")
-
-
-class _GrantDomain(StaticTestDomain):
-    preparations = 0
-    corrupt = False
-
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject:
-        self.preparations += 1
-        if max_calls_per_occurrence > 2 or constraints["target"] != "admitted-target":
-            raise CapabilityInputError(
-                "automation_grant_outside_scope",
-                "Target or call ceiling is not admitted.",
-            )
-        return (
-            FrozenJsonObject.from_mapping({"invalid": True})
-            if self.corrupt
-            else constraints
-        )
+        raise AssertionError("contract validation must not dispatch an action")
 
 
 def test_effect_policy_invariants_and_execution_digests():
     capability = _capability()
     for change in (
         lambda: replace(capability, effect_receipt_policy=None),
-        lambda: replace(capability, automation_grant_policy=None),
         lambda: replace(capability, operational_effect=OperationalEffect.NONE),
-        lambda: replace(
-            capability, automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY
-        ),
     ):
         with pytest.raises(ValueError):
             change()
     digest = capability_contract_digest(capability, domain_owner_id="test")
     for changed in (
-        replace(
-            capability,
-            automation_grant_policy=replace(_GRANT, constraints_kind="test.new"),
-        ),
         replace(
             capability, effect_receipt_policy=replace(_RECEIPT, receipt_kind="test.new")
         ),
@@ -117,44 +55,6 @@ def test_effect_policy_invariants_and_execution_digests():
         ),
     ):
         assert capability_contract_digest(changed, domain_owner_id="test") != digest
-
-
-async def test_grant_preparation_validates_before_and_after_domain_without_execution():
-    capability = _capability()
-    domain = _GrantDomain((capability,), ())
-    executor = _Executor()
-    registry = static_registry(domain, (executor,))
-    runtime = CapabilityRuntime(registry, (domain,))
-    proposal = _proposal()
-    grant = await runtime.prepare_automation_grant(
-        capability.id, {"target": "admitted-target"}, 2, proposal
-    )
-    assert grant.capability_contract_digest == registry.contract_digest(capability.id)
-    assert grant.constraints.to_dict() == {"target": "admitted-target"}
-    assert grant.grant_digest != replace(grant, max_calls_per_occurrence=1).grant_digest
-    assert executor.calls == 0 and domain.preparations == 1
-    with pytest.raises(CapabilityInputError):
-        await runtime.prepare_automation_grant(
-            capability.id, {"target": "admitted-target", "grant": True}, 1, proposal
-        )
-    assert domain.preparations == 1
-    with pytest.raises(CapabilityInputError, match="Target or call ceiling"):
-        await runtime.prepare_automation_grant(
-            capability.id, {"target": "admitted-target"}, 3, proposal
-        )
-    with pytest.raises(CapabilityInputError, match="proposed ceilings"):
-        await runtime.prepare_automation_grant(
-            capability.id,
-            {"target": "admitted-target"},
-            1,
-            replace(proposal, allowed_capability_ids=("other",)),
-        )
-    domain.corrupt = True
-    with pytest.raises(CapabilityInputError):
-        await runtime.prepare_automation_grant(
-            capability.id, {"target": "admitted-target"}, 1, proposal
-        )
-    assert executor.calls == 0
 
 
 def test_bindings_require_exact_coverage_and_are_immutable():

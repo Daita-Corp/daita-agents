@@ -6,7 +6,6 @@ from hashlib import sha256
 
 from daita.capabilities import (
     AccessMode,
-    AutomationEligibility,
     CapabilityDeclarations,
     ExecutionScope,
     ExecutionScopeKind,
@@ -164,8 +163,7 @@ async def test_distribution_tools_are_exact_foreground_effect_free_reads() -> No
         DELIVERY_INSPECT_TOOL_NAME,
     )
     assert all(
-        capability.automation_eligibility is AutomationEligibility.INTERACTIVE_ONLY
-        and capability.operational_effect is OperationalEffect.NONE
+        capability.operational_effect is OperationalEffect.NONE
         and capability.access_mode is AccessMode.NONE
         for capability in domain.declarations.capabilities
     )

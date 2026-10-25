@@ -10,10 +10,8 @@ from typing import Any, cast
 from daita._json import FrozenJsonObject
 from daita.capabilities import (
     AccessMode,
-    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
-    CapabilityInputError,
     CapabilityRegistry,
     ExecutionContractBindings,
     ExecutionContractReader,
@@ -93,18 +91,6 @@ class StaticTestDomain:
     ) -> FrozenJsonObject:
         del request_sensitivity
         return arguments
-
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject:
-        raise CapabilityInputError(
-            "automation_grant_unsupported",
-            "This domain does not admit unattended external effects.",
-        )
 
     async def side_effect_plan(
         self,

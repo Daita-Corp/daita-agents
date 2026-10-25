@@ -13,7 +13,7 @@ import daita.routines.owner as owner_module
 from daita import Agent, SQLiteSource
 from daita._json import FrozenJsonObject
 from daita.adapters.models import SourceRegistration
-from daita.capabilities import AutomationEligibility, OperationalEffect
+from daita.capabilities import OperationalEffect
 from daita.llm.models import FinishReason, ModelResponse
 from daita.llm.providers.mock import MockModelProvider
 from daita.routines.capabilities import (
@@ -113,10 +113,6 @@ def test_routine_tools_are_static_interactive_management_capabilities(
     assert declarations.tool_views[0].name == ROUTINE_LIST_TOOL_NAME
     assert by_id[ROUTINE_CREATE_CAPABILITY_ID].operational_effect is (
         OperationalEffect.MANAGE_SCHEDULED_ROUTINE
-    )
-    assert all(
-        item.automation_eligibility is AutomationEligibility.INTERACTIVE_ONLY
-        for item in declarations.capabilities
     )
 
 

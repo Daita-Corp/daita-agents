@@ -11,7 +11,6 @@ import pytest
 
 from daita.capabilities import (
     AccessMode,
-    AutomationEligibility,
     Capability,
     CapabilityRegistry,
     ExecutionScope,
@@ -21,7 +20,6 @@ from daita.capabilities import (
     ToolLoadMode,
     ToolOutput,
     ToolView,
-    capability_contract_digest,
 )
 from daita.capability_runtime import CapabilityRuntime
 from daita.llm.models import MessageRole, ModelSensitivity, TextBlock, ToolCall
@@ -56,10 +54,7 @@ class _Executor:
         return ToolOutput(kind="test.output")
 
 
-def _capability(
-    identity: str,
-    eligibility: AutomationEligibility,
-) -> Capability:
+def _capability(identity: str) -> Capability:
     return Capability(
         id=identity,
         description=f"Exercise {identity}.",
@@ -69,7 +64,6 @@ def _capability(
         executor_id=f"{identity}.executor",
         access_mode=AccessMode.READ,
         operational_effect=OperationalEffect.NONE,
-        automation_eligibility=eligibility,
     )
 
 
@@ -145,23 +139,7 @@ async def test_empty_machine_source_ceiling_never_queries_all_current_sources():
     assert scope.resource_ids == frozenset()
 
 
-def test_automation_eligibility_is_fail_closed_and_part_of_contract_identity() -> None:
-    default = Capability(
-        id="test.default",
-        description="Default eligibility.",
-        input_schema={"type": "object", "properties": {}},
-        output_kind="test.output",
-        output_schema={"type": "object", "properties": {}},
-        executor_id="test.default.executor",
-    )
-    scheduled = _capability(
-        "test.scheduled",
-        AutomationEligibility.AUTOMATION_DIRECT,
-    )
-    assert default.automation_eligibility is AutomationEligibility.INTERACTIVE_ONLY
-    assert capability_contract_digest(default, domain_owner_id="test") != (
-        capability_contract_digest(scheduled, domain_owner_id="test")
-    )
+def test_external_effects_require_a_receipt_policy() -> None:
     with pytest.raises(ValueError, match="require a receipt policy"):
         Capability(
             id="test.invalid",
@@ -171,7 +149,6 @@ def test_automation_eligibility_is_fail_closed_and_part_of_contract_identity() -
             output_schema={"type": "object", "properties": {}},
             executor_id="test.invalid.executor",
             operational_effect=OperationalEffect.MUTATE_DATA,
-            automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         )
 
 
@@ -218,15 +195,9 @@ def test_nonroutine_scope_cannot_use_mcp_only_relaxation() -> None:
 async def test_scheduled_catalog_projects_its_whole_fixed_scope_and_nothing_outside() -> (
     None
 ):
-    scheduled = _capability(
-        "test.scheduled",
-        AutomationEligibility.AUTOMATION_DIRECT,
-    )
-    interactive = _capability(
-        "test.interactive",
-        AutomationEligibility.INTERACTIVE_ONLY,
-    )
-    outside = _capability("test.outside", AutomationEligibility.AUTOMATION_DIRECT)
+    scheduled = _capability("test.scheduled")
+    interactive = _capability("test.interactive")
+    outside = _capability("test.outside")
     views = tuple(
         ToolView(
             name=f"tool_{item.id.split('.')[-1]}",
@@ -345,7 +316,7 @@ async def test_machine_calls_revalidate_retained_contracts_after_preparation(
     model = MockModelProvider((), provider_id="mock:routine")
     policy = ModelCallPolicy()
 
-    capability = _capability("test.scheduled", AutomationEligibility.AUTOMATION_DIRECT)
+    capability = _capability("test.scheduled")
     origin = "sha256:" + "d" * 64
     view = ToolView(
         name="read_exact",

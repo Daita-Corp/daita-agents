@@ -138,6 +138,11 @@ async def test_reservation_requires_owned_live_run_and_prevents_call_and_operati
             await store.start_effect_receipt(foreign)
         with pytest.raises(ValueError, match="terminal observation"):
             await store.finish_effect_receipt(started)
+        # Effects are approved at the time; no receipt may claim a standing grant.
+        with pytest.raises(EffectReceiptConflictError, match="cannot carry a grant"):
+            await store.start_effect_receipt(
+                replace(started, capability_grant_digest="sha256:" + "8" * 64)
+            )
         await store.start_effect_receipt(started)
         with pytest.raises(EffectUnresolvedError):
             await store.start_effect_receipt(_started("other-call"))

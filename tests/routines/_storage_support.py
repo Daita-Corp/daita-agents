@@ -124,8 +124,6 @@ def occurrence_record(
         claimed_at=NOW,
         claim_token="claim-1",
         lease_expires_at=NOW + timedelta(seconds=30),
-        execution_scope=None,
-        execution_scope_digest=None,
         reserved_run_id=None,
         charged_tokens=0,
         charged_cost_usd=Decimal("0"),

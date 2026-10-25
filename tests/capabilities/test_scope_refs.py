@@ -16,7 +16,6 @@ from daita.capabilities import (
     AccessMode,
     ApprovalDecision,
     ApprovalRequest,
-    AutomationEligibility,
     CallTargetLane,
     Capability,
     EffectEvidenceBasis,
@@ -155,7 +154,6 @@ def _capability(name: str, input_schema: dict[str, object], **kw) -> Capability:
             output_schema=_IDENTITY_INPUT,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.EXTERNAL_ACTION,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
             effect_receipt_policy=EffectReceiptPolicy(
                 capability_id, _IDENTITY_INPUT, EffectEvidenceBasis.SERVER_REPORTED
             ),

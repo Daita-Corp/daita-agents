@@ -357,7 +357,13 @@ async def test_public_source_free_once_routine_commits_its_document(tmp_path):
             inspection is not None
             and inspection.routine.state is RoutineState.COMPLETED
         )
-        scope = inspection.recent_occurrences[0].execution_scope
+        # The occurrence's run records the scope it started with.
+        terminal_run_id = inspection.recent_occurrences[0].terminal_run_id
+        scope = next(
+            item.transcript.run.execution_scope
+            for item in await agent.conversation_runs(origin.conversation_id)
+            if item.transcript.run.id == terminal_run_id
+        )
         assert (
             scope is not None
             and scope.allowed_source_ids

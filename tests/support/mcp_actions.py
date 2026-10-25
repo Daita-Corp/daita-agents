@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -22,9 +22,6 @@ from daita.adapters.mcp import SDKMCPClientFactory
 from daita.capabilities import (
     AccessMode,
     ApprovalDecision,
-    AutomationEligibility,
-    AutomationScopeProposal,
-    CapabilityGrant,
     OperationalEffect,
 )
 from daita.llm.models import (
@@ -38,7 +35,6 @@ from daita.llm.models import (
 )
 from daita.llm.pricing import CostEstimate
 from daita.loop.models import LoopLimits
-from tests.support.distribution import inbox_distribution_plan
 from tests.support.mcp import MCPConformanceTransport, MCPFixtureIdentity
 from tests.support.workspace import workspace_for
 
@@ -207,7 +203,6 @@ class ActionFixture:
             "Send the reviewed notification.",
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.EXTERNAL_ACTION,
-            automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         )
         status = await self.agent.attach_mcp_server(
             endpoint=self.server.endpoint,
@@ -311,44 +306,6 @@ class ActionFixture:
     async def create(self, intent: RoutineIntent):
         return await self.agent.create_routine(
             intent, conversation_id=self.origin.conversation_id
-        )
-
-    def grant_constraints(self) -> dict[str, object]:
-        return {
-            "binding_id": self.binding.binding_id,
-            "binding_revision": self.binding.revision,
-            "remote_tool_name": self.tool.remote_name,
-            "fixed_arguments": {"destination": "fixed-room"},
-            "variable_argument_names": ["content"],
-        }
-
-    async def prepare_grant(self, constraints, ceiling=1) -> CapabilityGrant:
-        """Normalize one standing MCP grant through the real runtime and domain."""
-
-        return await self.agent._embedded._capability_runtime.prepare_automation_grant(
-            self.tool.capability_id,
-            constraints,
-            ceiling,
-            AutomationScopeProposal(
-                agent_id=self.agent.id,
-                principal_id=f"agent:{self.agent.id}",
-                allowed_source_ids=(),
-                allowed_resource_ids=(),
-                allowed_connector_binding_ids=(self.binding.binding_id,),
-                allowed_capability_ids=(self.tool.capability_id,),
-                allowed_access_modes=frozenset({AccessMode.NONE}),
-                allowed_operational_effects=frozenset(
-                    {OperationalEffect.EXTERNAL_ACTION}
-                ),
-                sensitivity_ceiling=ModelSensitivity.INTERNAL,
-                eligible_model_routes=(self.model.provider_id,),
-                per_run_max_cost_usd=None,
-                per_run_max_tokens=8000,
-                expires_at=NOW + timedelta(days=30),
-                distribution_plan_digest=inbox_distribution_plan(
-                    "conversation-1"
-                ).plan_digest,
-            ),
         )
 
     async def delivery(self, count=1):

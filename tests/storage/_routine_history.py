@@ -64,10 +64,12 @@ def released_routine(
 
 
 def released_occurrence(occurrence: RoutineOccurrence, *, disposition: str) -> str:
-    """The shape with precheck observations and per-occurrence reservations."""
+    """The shape with precheck observations, reservations and a scope copy."""
 
     payload = json.loads(encode_routine_occurrence(occurrence))
     payload["fields"].update(
+        execution_scope=None,
+        execution_scope_digest=None,
         precheck_observation=None,
         reserved_tokens=0,
         reserved_cost_usd={"__decimal__": "0"},

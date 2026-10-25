@@ -414,6 +414,9 @@ async def test_populated_prior_mcp_home_preserves_binding_routine_and_receipt(
             payload = json.loads(encoded)
             fields = payload["fields"]
             assert fields["owner_principal_id"] == binding.agent_id
+            # Released tools recorded unattended eligibility; revision 4 drops it.
+            for tool in fields["tools"]:
+                tool["fields"]["automation_eligibility"] = "interactive_only"
             if source_revision == 2:
                 for field in (
                     "owner_principal_id",

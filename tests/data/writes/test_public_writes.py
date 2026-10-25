@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -17,14 +17,10 @@ from daita import (
 from daita._json import canonical_json
 from daita.adapters import postgresql_write as native
 from daita.capabilities import (
-    AccessMode,
     ApprovalDecision,
-    AutomationScopeProposal,
     CallTargetLane,
-    CapabilityInputError,
     EffectEvidenceBasis,
     EffectOutcome,
-    OperationalEffect,
 )
 from daita.capability_runtime import APPROVED_TARGET_CHANGED
 from daita.distribution.models import OutcomeState
@@ -45,10 +41,8 @@ from tests.support.data_write_approval import (
     UPSERT_PREVIEW_KEYS,
     data_write_approval,
 )
-from tests.support.distribution import inbox_distribution_plan
 from tests.support.jobs import wait_for_job
 from tests.support.native_writes import (
-    NOW,
     ScriptedResearchModel,
     create_fixture,
     response,
@@ -544,6 +538,53 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         await agent.close()
 
 
+async def test_a_write_above_the_target_classification_is_refused_before_dispatch(
+    tmp_path, monkeypatch
+):
+    from daita.catalog.models import Sensitivity
+
+    (
+        agent,
+        provider,
+        db,
+        research,
+        binding,
+        resource,
+        constraints,
+        batch,
+        clock,
+        approvals,
+    ) = await create_fixture(tmp_path, monkeypatch, sensitivity=Sensitivity.INTERNAL)
+    try:
+        # Restricted context makes the whole request restricted; the internal
+        # target cannot receive it.
+        await agent.set_memory(
+            "A retained private research note.", sensitivity=ModelSensitivity.RESTRICTED
+        )
+        script(provider, binding, batch)
+        result = await agent.run(
+            "Research companies doing business with Acme and save cited findings now."
+        )
+        transcript = await agent._embedded._store.load(result.run_id)
+        (write,) = (
+            block
+            for message in transcript.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock) and block.call_id == "write"
+        )
+        assert write.is_error
+        error = write.output["error"]
+        assert isinstance(error, Mapping)
+        assert error["code"] == "write_sensitivity_denied"
+        assert not any(item.capability_id == "data.upsert_rows" for item in approvals)
+        assert not db.rows
+        assert not await agent._embedded._store.list_effect_receipts(
+            agent.id, run_id=result.run_id
+        )
+    finally:
+        await agent.close()
+
+
 async def test_upsert_drift_during_approval_is_final_with_no_mutation(
     tmp_path, monkeypatch
 ):
@@ -725,12 +766,6 @@ async def test_exact_native_upsert_runs_once_from_a_job(tmp_path, monkeypatch) -
         "model_schema",
         "missing_effect",
         "commit_loss",
-        "two_calls",
-        "two_native",
-        "wrong_key",
-        "row_ceiling",
-        "stale_revision",
-        "insert_column",
     ],
 )
 @pytest.mark.acceptance
@@ -760,16 +795,6 @@ async def test_immediate_and_weekly_research_upsert_production_path(
         origin = await agent.run(
             "Research companies doing business with Acme, save cited findings now, and recheck every Monday. At least one verified write invocation is required."
         )
-        grant_constraints = {
-            "source_id": batch["source_id"],
-            "resource_id": resource.id,
-            "resource_revision": resource.current_revision,
-            **{
-                key: value
-                for key, value in constraints.items()
-                if key != "allowed_operations"
-            },
-        }
         intent = RoutineIntent(
             title="Acme relationship research",
             prompt="Research reported company relationships with Acme using the admitted research tool; preserve evidence URLs and describe source coverage. Preview and upsert one bounded batch into the exact companies target. If there are no findings, report that nothing was written.",
@@ -783,65 +808,6 @@ async def test_immediate_and_weekly_research_upsert_production_path(
             sources=(batch["source_id"],),
             run_immediately=True,
         )
-        if mode in {
-            "two_calls",
-            "two_native",
-            "wrong_key",
-            "row_ceiling",
-            "stale_revision",
-            "insert_column",
-        }:
-            # Routines no longer carry standing native grants.
-            bad = dict(grant_constraints)
-            if mode == "wrong_key":
-                bad["key_columns"] = ("id",)
-            elif mode == "row_ceiling":
-                bad["max_rows"] = 11
-            elif mode == "stale_revision":
-                bad["resource_revision"] = "sha256:" + "0" * 64
-            elif mode == "insert_column":
-                bad["allowed_insert_columns"] = (
-                    *bad["allowed_insert_columns"],
-                    "notes",
-                )
-            capability_ids = (
-                binding.tools[0].capability_id,
-                "data.preview_upsert_rows",
-                "data.upsert_rows",
-                *(("data.update_rows",) if mode == "two_native" else ()),
-            )
-            proposal = AutomationScopeProposal(
-                agent_id=agent.id,
-                principal_id=f"agent:{agent.id}",
-                allowed_source_ids=(batch["source_id"],),
-                allowed_resource_ids=(resource.id,),
-                allowed_connector_binding_ids=(binding.binding_id,),
-                allowed_capability_ids=capability_ids,
-                allowed_access_modes=frozenset(AccessMode),
-                allowed_operational_effects=frozenset(OperationalEffect),
-                sensitivity_ceiling=ModelSensitivity.RESTRICTED,
-                eligible_model_routes=(provider.provider_id,),
-                per_run_max_cost_usd=Decimal("1"),
-                per_run_max_tokens=8000,
-                expires_at=NOW + timedelta(days=30),
-                distribution_plan_digest=inbox_distribution_plan(
-                    "conversation-1", ModelSensitivity.RESTRICTED
-                ).plan_digest,
-            )
-            with pytest.raises(CapabilityInputError) as error:
-                await agent._embedded._capability_runtime.prepare_automation_grant(
-                    "data.upsert_rows",
-                    bad,
-                    2 if mode == "two_calls" else 1,
-                    proposal,
-                )
-            assert error.value.code in {
-                "automation_grant_scope_invalid",
-                "automation_grant_unsupported",
-            }
-            assert not await agent.list_routines()
-            assert not db.rows and not research.calls
-            return
         script(
             provider,
             binding,

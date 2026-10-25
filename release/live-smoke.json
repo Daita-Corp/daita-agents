@@ -1,6 +1,6 @@
 {
-  "surface_digest": "sha256:f49a0d31204dd537d4427e332a3f93624b63b1547a3875206e41c0d19884efb0",
-  "recorded_on": "2026-10-24",
+  "surface_digest": "sha256:77b3eabe3c0493d2b9508d52938cf4fe9c0913749eb4bd533e3e087ec842eb17",
+  "recorded_on": "2026-10-25",
   "cases": {
     "tests/live/analysis/test_public_journeys.py::test_real_model_dependent_cells_and_error_correction": "passed",
     "tests/live/analysis/test_public_journeys.py::test_real_model_tui_python_and_broker": "passed",
@@ -16,7 +16,7 @@
     "tests/live/jobs/test_jobs.py::test_live_two_part_analysis_job_delegates_and_delivers": "passed",
     "tests/live/mcp/test_actions.py::test_live_research_and_honest_action_evidence[openai:gpt-5.6-terra-0-success]": "passed",
     "tests/live/mcp/test_read_workflows.py::test_live_dependent_reads_discover_tools_and_bind_returned_account[0-2-2026-07-28-normal]": "passed",
-    "tests/live/routines/test_contract_authoring.py::test_model_saves_example_routine_with_one_call_and_one_confirm": "passed",
+    "tests/live/routines/test_contract_authoring.py::test_model_saves_example_routine_with_one_call_and_one_confirm": "passed_on_rerun",
     "tests/live/workspace/test_text_edit.py::test_live_model_reads_edits_approves_and_replaces_exact_bound_file": "passed"
   }
 }
