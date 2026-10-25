@@ -144,6 +144,24 @@ CASES: tuple[SmokeCase, ...] = (
         {"DAITA_RUN_LIVE_SCHEDULED_WRITE": "1"},
     ),
     SmokeCase(
+        "routines/injection",
+        "tests/live/routines/test_scheduled_write.py::"
+        "test_live_scheduled_research_cannot_start_an_unrequested_write",
+        {"DAITA_RUN_LIVE_SCHEDULED_WRITE": "1"},
+    ),
+    SmokeCase(
+        "routines/denial",
+        "tests/live/routines/test_scheduled_write.py::"
+        "test_live_denied_scheduled_write_is_reported_without_another_route",
+        {"DAITA_RUN_LIVE_SCHEDULED_WRITE": "1"},
+    ),
+    SmokeCase(
+        "routines/management",
+        "tests/live/routines/test_contract_authoring.py::"
+        "test_model_moves_pauses_and_resumes_a_routine_in_conversation",
+        {"DAITA_RUN_CONTRACT_QUALIFICATION": "1"},
+    ),
+    SmokeCase(
         "data/write_release",
         "tests/live/data/test_model_write_acceptance.py::"
         f"test_live_mixed_upsert_and_unchanged_repeat[{_MODEL}-0]",

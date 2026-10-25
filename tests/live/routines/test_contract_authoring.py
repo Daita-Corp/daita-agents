@@ -1,8 +1,9 @@
-"""A real model saves the example routine with one routine_save call and one confirm."""
+"""A real model saves the example routine and manages a routine by conversation."""
 
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -13,8 +14,12 @@ from daita import (
     Agent,
     ApprovalDecision,
     ApprovalRequest,
+    CalendarDaySelector,
+    CalendarSchedule,
     LoopLimits,
     OnceSchedule,
+    RoutineIntent,
+    RoutineState,
 )
 from daita.loop.models import LoopExitKind
 from tests.support.live_billing import cost_cap, live_provider
@@ -99,3 +104,92 @@ async def test_model_saves_example_routine_with_one_call_and_one_confirm(
     assert "data quality" in routine.authorized_instruction.casefold()
     assert routine.source_ids == ()
     assert inspection.recent_occurrences == ()
+
+
+async def test_model_moves_pauses_and_resumes_a_routine_in_conversation(
+    tmp_path: Path, record_property
+) -> None:
+    model_id = os.environ.get("DAITA_CONTRACT_MODEL_ID", "openai:gpt-5.6-terra")
+    profile, provider = live_provider(
+        model_id, api_key=_api_key, max_output_tokens=2_048
+    )
+    asked: list[ApprovalRequest] = []
+
+    async def approve(request: ApprovalRequest) -> ApprovalDecision:
+        asked.append(request)
+        return ApprovalDecision.APPROVE
+
+    nine_am = CalendarSchedule(
+        timezone="America/Chicago",
+        hour=9,
+        minute=0,
+        day_selector=CalendarDaySelector.EVERY_DAY,
+    )
+    root = tmp_path / "root"
+    agent = await Agent.create(
+        "routine-management",
+        root=root,
+        model=provider,
+        model_profile=profile,
+        limits=LoopLimits(max_estimated_cost_usd=cost_cap(Decimal("0.50"))),
+        workspace=workspace_for(root),
+        approval_handler=approve,
+    )
+    states = []
+    try:
+        created = await agent.create_routine(
+            RoutineIntent(
+                title="Daily sales report",
+                prompt="Summarize yesterday's sales in three bullet points.",
+                schedule=nine_am,
+            ),
+            confirmation_handler=approve,
+        )
+        conversation_id = None
+        for message in (
+            "Move my daily sales report to 8am.",
+            "Pause it for now.",
+            "Actually, resume it.",
+        ):
+            asked.clear()
+            result = await agent.run(message, conversation_id=conversation_id)
+            conversation_id = result.conversation_id
+            transcript = await agent.transcript(result.run_id)
+            inspection = await agent.inspect_routine(created.routine_id)
+            assert inspection is not None
+            states.append(
+                (
+                    result,
+                    [
+                        call.name
+                        for exchange in transcript.messages
+                        for call in exchange.tool_calls
+                    ],
+                    [item.capability_id for item in asked],
+                    inspection.routine,
+                )
+            )
+        routines = await agent.list_routines()
+    finally:
+        await agent.close()
+
+    record_property("tool_calls", [calls for _result, calls, _asked, _r in states])
+    record_property("approvals", [cards for _result, _calls, cards, _r in states])
+    moved, paused, resumed = states
+    for result, _calls, _asked, _routine in states:
+        assert result.kind is LoopExitKind.COMPLETED, result.reason
+    # The same routine changes; nothing is duplicated.
+    assert [item.routine_id for item in routines] == [created.routine_id]
+
+    moved_routine = moved[3]
+    # Moving the time is one confirmed update that keeps everything else.
+    assert moved[2] == ["routines.update"]
+    assert moved_routine.schedule == replace(nine_am, hour=8)
+    assert moved_routine.title == created.title
+    assert moved_routine.authorized_instruction == created.authorized_instruction
+    assert moved_routine.state is RoutineState.ACTIVE
+
+    assert paused[3].state is RoutineState.PAUSED
+    assert paused[3].schedule == moved_routine.schedule
+    assert resumed[3].state is RoutineState.ACTIVE
+    assert resumed[3].schedule == moved_routine.schedule
