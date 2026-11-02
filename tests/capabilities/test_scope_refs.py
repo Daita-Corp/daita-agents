@@ -28,6 +28,7 @@ from daita.capabilities import (
     ToolLoadMode,
     ToolOutput,
     ToolView,
+    resolve_identity_refs,
     resource_id_schema,
     source_id_schema,
 )
@@ -70,6 +71,8 @@ SCOPE = EffectiveSourceScope(
     frozenset({ORDERS_B, ORDERS_A, CUSTOMERS_A}),
     {SOURCE_A: ("Sales", "postgresql"), SOURCE_B: ("HR", "sqlite")},
 )
+# The shape runs stored before names were used: no labels, numbered handles.
+STORED_SCOPE = EffectiveSourceScope(SCOPE.source_ids, SCOPE.resource_ids)
 NAMES = {
     SOURCE_A: "Sales",
     SOURCE_B: "HR",
@@ -110,7 +113,7 @@ _OK_OUTPUT = _object(ok={"type": "boolean"})
 def test_stored_handles_still_number_the_frozen_scope():
     """Older transcripts carry ``s1``/``t1`` text; it resolves as it always did."""
 
-    refs = scope_refs(SCOPE)
+    refs = scope_refs(STORED_SCOPE)
     assert dict(refs.handles) == {
         SOURCE_A: "s1",
         SOURCE_B: "s2",
@@ -121,6 +124,8 @@ def test_stored_handles_still_number_the_frozen_scope():
     }
     assert refs.resolve("s", "s3") is None
     assert not scope_refs(None).handles
+    # A scope that froze display names was never shown a handle.
+    assert not scope_refs(SCOPE).handles
 
 
 def test_source_labels_are_frozen_with_the_scope():
@@ -368,6 +373,103 @@ def test_two_sources_with_one_display_name_are_refused_as_ambiguous(rig):
     assert "sha256" not in canonical_json(caught.value.details)
 
 
+def test_a_handle_shaped_value_in_a_new_run_is_only_a_name(rig):
+    """A source called ``s2`` is that source, and ``t1`` names no numbered table."""
+
+    runtime, _, _ = rig
+    # SOURCE_A sorts first, so as a handle ``s2`` would mean the other source.
+    table = catalog_resource_id(SOURCE_A, ResourceKind.TABLE, "t1")
+    scope = EffectiveSourceScope(
+        frozenset({SOURCE_A, SOURCE_B}),
+        frozenset({ORDERS_B, table}),
+        {SOURCE_A: ("s2", "sqlite"), SOURCE_B: ("HR", "sqlite")},
+    )
+    resolve = runtime._registry.resolve_call
+    named = resolve(
+        _call("n", "read", "s2", "t1"), result_refs=None, source_scope=scope
+    )
+    assert named.arguments == _frozen({"source_id": SOURCE_A, "resource_ids": (table,)})
+    for call, code in (
+        (_call("s", "read", "s1", "orders"), "source_unknown"),
+        (ToolCall("t", "tables", {"tables": ("t2",)}), "table_unknown"),
+    ):
+        with pytest.raises(CapabilityInputError) as refused:
+            resolve(call, result_refs=None, source_scope=scope)
+        assert refused.value.code == code
+
+
+def test_nested_tables_resolve_within_the_sources_their_parent_names():
+    """Two SQLite sources can share ``main.orders``; the subject says which it means."""
+
+    orders_a = catalog_resource_id(SOURCE_A, ResourceKind.TABLE, "main.orders")
+    orders_b = catalog_resource_id(SOURCE_B, ResourceKind.TABLE, "main.orders")
+    scope = EffectiveSourceScope(
+        frozenset({SOURCE_A, SOURCE_B}),
+        frozenset({orders_a, orders_b}),
+        {SOURCE_A: ("Sales", "sqlite"), SOURCE_B: ("HR", "sqlite")},
+    )
+    schema = _object(
+        subject=_object(
+            fields=_array(_object(resource_id=resource_id_schema()), 4),
+            resource_ids=_array(resource_id_schema(), 4),
+            source_ids=_array(source_id_schema(), 4),
+        )
+    )
+    field = {"table": "main.orders", "field_name": "total"}
+    named = {"sources": ["HR"], "tables": ["main.orders"], "fields": [field]}
+    resolved = resolve_identity_refs(schema, {"subject": named}, scope)["subject"]
+    assert isinstance(resolved, Mapping)
+    assert resolved["source_ids"] == [SOURCE_B]
+    assert resolved["resource_ids"] == [orders_b]
+    assert list(resolved["fields"]) == [
+        {"resource_id": orders_b, "field_name": "total"}
+    ]
+    # Naming no source leaves the shared name ambiguous rather than guessing.
+    with pytest.raises(CapabilityInputError) as ambiguous:
+        resolve_identity_refs(schema, {"subject": {"fields": [field]}}, scope)
+    assert ambiguous.value.code == "table_ambiguous"
+
+
+def test_table_names_resolve_by_their_exact_case(rig):
+    """``sales.Customers`` and ``sales.customers`` are two PostgreSQL tables."""
+
+    runtime, _, _ = rig
+    quoted = catalog_resource_id(SOURCE_A, ResourceKind.TABLE, "sales.Customers")
+    folded = catalog_resource_id(SOURCE_A, ResourceKind.TABLE, "sales.customers")
+    scope = EffectiveSourceScope(
+        frozenset({SOURCE_A}),
+        frozenset({quoted, folded}),
+        {SOURCE_A: ("Sales", "postgresql")},
+    )
+    resolve = runtime._registry.resolve_call
+    for name, identity in (("sales.Customers", quoted), ("sales.customers", folded)):
+        call = _call("c", "read", "Sales", name)
+        resolved = resolve(call, result_refs=None, source_scope=scope)
+        assert resolved.arguments["resource_ids"] == (identity,)
+    with pytest.raises(CapabilityInputError) as refused:
+        resolve(
+            _call("c", "read", "Sales", "SALES.CUSTOMERS"),
+            result_refs=None,
+            source_scope=scope,
+        )
+    assert refused.value.code == "table_unknown"
+
+
+def test_argument_problems_name_the_keys_the_model_sends(rig):
+    runtime, _, _ = rig
+    registry = runtime._registry
+    with pytest.raises(CapabilityInputError) as missing:
+        registry.validate_arguments("test.scope.read", {"resource_ids": (ORDERS_A,)})
+    assert "arguments.source is required" in str(missing.value)
+    assert "source_id" not in canonical_json(missing.value.details)
+    with pytest.raises(CapabilityInputError) as invalid:
+        registry.validate_arguments(
+            "test.scope.read", {"source_id": SOURCE_A, "resource_ids": (7,)}
+        )
+    assert "resource_ids" not in str(invalid.value)
+    assert "resource_ids" not in canonical_json(invalid.value.details)
+
+
 def test_rendered_results_show_names_and_never_ids():
     hits = [
         {"source_id": SOURCE_A, "resource_id": CUSTOMERS_A, "name": "customers"},
@@ -400,6 +502,46 @@ def test_rendered_results_show_names_and_never_ids():
     assert "sha256" not in canonical_json(rendered).replace("sha256:" + "0" * 64, "")
     # Stored output is unchanged; only the rendering carries names.
     assert ORDERS_A in canonical_json(block.output)
+
+    outside = "source:sha256:" + "f" * 64
+    relationship = "catalog-relationship:sha256:" + "1" * 64
+    link = "catalog-link:sha256:" + "2" * 64
+    embedded = model_tool_result(
+        ToolResultBlock(
+            "call-2",
+            {
+                "note": f"- Sources: {SOURCE_A}, {outside}",
+                "uri": f"sqlite://{SOURCE_B}/main/orders",
+                "by_table": {ORDERS_A: 1, outside: 2},
+                # A query result's own columns are data, whatever they are called.
+                "rows": [
+                    {"source": "web", "source_id": 7, "resource_ids": None},
+                    {"source_id": "unrelated text", "relationship_id": 9},
+                ],
+                # A relationship shows its tables and keys, and needs no identity.
+                "relationships": [
+                    {"relationship_id": relationship, "from_resource_id": ORDERS_A},
+                    {"relationship_id": link, "to_resource_id": CUSTOMERS_A},
+                ],
+                "paths": [{"relationship_ids": [relationship, link]}],
+                "matched_fields": [f"relationship:{relationship}", "name"],
+            },
+        ),
+        None,
+        NAMES,
+    )["output"]
+    assert embedded == {
+        "note": "- Sources: Sales, a source outside this run",
+        "uri": "sqlite://HR/main/orders",
+        "by_table": {"orders": 1},
+        "rows": [
+            {"source": "web", "source_id": 7, "resource_ids": None},
+            {"source_id": "unrelated text", "relationship_id": 9},
+        ],
+        "relationships": [{"from_table": "orders"}, {"to_table": "customers"}],
+        "paths": [{}],
+        "matched_fields": ["relationship", "name"],
+    }
 
     call = ToolCall("call-1", "read", {"source": "Sales"})
     request = ModelRequest(
@@ -600,13 +742,13 @@ def test_stored_transcripts_still_resolve_their_handles(rig):
 
     runtime, _, _ = rig
     registry = runtime._registry
-    handles = scope_refs(SCOPE).handles
+    handles = scope_refs(STORED_SCOPE).handles
     old = ToolCall(
         "old",
         "read",
         {"source_id": "s2", "resource_ids": (handles[ORDERS_B], ORDERS_A)},
     )
-    executed = registry.executed_call(old, messages=(), source_scope=SCOPE)
+    executed = registry.executed_call(old, messages=(), source_scope=STORED_SCOPE)
     assert executed.arguments == _frozen(
         {"source_id": SOURCE_B, "resource_ids": (ORDERS_B, ORDERS_A)}
     )
@@ -620,9 +762,9 @@ def test_stored_transcripts_still_resolve_their_handles(rig):
             }
         },
     )
-    task = registry.executed_call(nested, messages=(), source_scope=SCOPE).arguments[
-        "task"
-    ]
+    task = registry.executed_call(
+        nested, messages=(), source_scope=STORED_SCOPE
+    ).arguments["task"]
     assert isinstance(task, Mapping)
     assert task["arguments"] == _frozen(
         {"source_id": SOURCE_A, "resource_ids": (ORDERS_A,)}
@@ -631,4 +773,7 @@ def test_stored_transcripts_still_resolve_their_handles(rig):
     unissued = ToolCall(
         "unissued", "read", {"source_id": "s9", "resource_ids": ("t1",)}
     )
-    assert registry.executed_call(unissued, messages=(), source_scope=SCOPE) == unissued
+    assert (
+        registry.executed_call(unissued, messages=(), source_scope=STORED_SCOPE)
+        == unissued
+    )

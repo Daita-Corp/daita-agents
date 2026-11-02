@@ -1,6 +1,6 @@
 {
-  "surface_digest": "sha256:77b3eabe3c0493d2b9508d52938cf4fe9c0913749eb4bd533e3e087ec842eb17",
-  "recorded_on": "2026-10-25",
+  "surface_digest": "sha256:995a101fb82b10e1b69397e7345df2219a881d74df97646008ca0f59299caabd",
+  "recorded_on": "2026-11-02",
   "cases": {
     "tests/live/analysis/test_public_journeys.py::test_real_model_dependent_cells_and_error_correction": "passed",
     "tests/live/analysis/test_public_journeys.py::test_real_model_tui_python_and_broker": "passed",
@@ -19,7 +19,7 @@
     "tests/live/routines/test_contract_authoring.py::test_model_moves_pauses_and_resumes_a_routine_in_conversation": "passed",
     "tests/live/routines/test_contract_authoring.py::test_model_saves_example_routine_with_one_call_and_one_confirm": "passed",
     "tests/live/routines/test_scheduled_write.py::test_live_denied_scheduled_write_is_reported_without_another_route": "passed",
-    "tests/live/routines/test_scheduled_write.py::test_live_scheduled_research_cannot_start_an_unrequested_write": "passed",
+    "tests/live/routines/test_scheduled_write.py::test_live_scheduled_research_cannot_start_an_unrequested_write": "passed_on_rerun",
     "tests/live/routines/test_scheduled_write.py::test_live_scheduled_routine_asks_notifies_and_writes_once_after_approval": "passed",
     "tests/live/workspace/test_text_edit.py::test_live_model_reads_edits_approves_and_replaces_exact_bound_file": "passed"
   }

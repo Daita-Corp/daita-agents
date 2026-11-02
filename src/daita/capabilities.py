@@ -1476,6 +1476,27 @@ def _source_names(scope: EffectiveSourceScope | None) -> str:
     return ", ".join(repr(name) for name in names) if names else "none"
 
 
+def model_output_schema(schema: object) -> object:
+    """Rename a result contract's identity keys to the keys results render."""
+
+    if isinstance(schema, (list, tuple)):
+        return [model_output_schema(item) for item in schema]
+    if not isinstance(schema, Mapping):
+        return schema
+    projected: dict[str, object] = {}
+    for key, value in schema.items():
+        if key == "properties" and isinstance(value, Mapping):
+            projected[key] = {
+                model_identity_key(str(name)): model_output_schema(rule)
+                for name, rule in value.items()
+            }
+        elif key == "required" and isinstance(value, (list, tuple)):
+            projected[key] = [model_identity_key(str(name)) for name in value]
+        else:
+            projected[key] = model_output_schema(value)
+    return projected
+
+
 def _resolve_source_name(
     value: object, path: str, scope: EffectiveSourceScope | None, refs: ScopeRefs
 ) -> object:
@@ -1614,7 +1635,10 @@ def resolve_identity_refs(
             )
         return resolve(value, path)
 
-    def leaf_for(keys: list[tuple[str, str]]) -> _Leaf:
+    # The sources each parent named, so nested tables resolve within them.
+    named_by_parent: dict[str, set[str]] = {}
+
+    def leaf_for(parent: str, keys: list[tuple[str, str]]) -> _Leaf:
         def leaf(value: object, path: str) -> object:
             if not isinstance(value, Mapping):
                 return value
@@ -1641,7 +1665,19 @@ def resolve_identity_refs(
                         scope.source_ids if scope else ()
                     ):
                         named_sources.add(item)
-            candidates = named_sources or (scope.source_ids if scope else frozenset())
+            named_by_parent.setdefault(parent, set()).update(named_sources)
+            inherited = {
+                source_id
+                for ancestor, sources in named_by_parent.items()
+                if ancestor != parent
+                and (not ancestor or parent.startswith(f"{ancestor}."))
+                for source_id in sources
+            }
+            candidates = (
+                named_sources
+                or inherited
+                or (scope.source_ids if scope else frozenset())
+            )
             for spec, pattern in keys:
                 key = spec.removesuffix("[]")
                 if pattern != RESOURCE_ID_PATTERN or key not in resolved:
@@ -1657,8 +1693,11 @@ def resolve_identity_refs(
 
         return leaf
 
-    for parent, keys in by_parent.items():
-        leaf = leaf_for(keys)
+    # Parents first: a nested table resolves within the sources its parent names.
+    for parent, keys in sorted(
+        by_parent.items(), key=lambda item: item[0].count(".") if item[0] else -1
+    ):
+        leaf = leaf_for(parent, keys)
         if parent:
             arguments = _map_paths(arguments, ((parent, leaf),), base)
         else:
@@ -3353,7 +3392,8 @@ def _collect_object_issues(
         raise ValueError("tool schema required must contain strings")
     for name in required:
         if name not in value:
-            _issue(issues, "missing_arguments", name, f"{path}.{name}", "is required")
+            shown = model_identity_key(name)
+            _issue(issues, "missing_arguments", shown, f"{path}.{shown}", "is required")
     if additional is False:
         for name in value:
             if name not in properties:
@@ -3367,7 +3407,8 @@ def _collect_object_issues(
     for name, item in value.items():
         rule = properties.get(name)
         if isinstance(rule, Mapping):
-            _collect_issues(name, item, rule, issues, path=f"{path}.{name}")
+            shown = model_identity_key(name)
+            _collect_issues(shown, item, rule, issues, path=f"{path}.{shown}")
 
 
 def validate_tool_schema_value(
@@ -3573,6 +3614,7 @@ __all__ = [
     "identity_ref_paths",
     "model_identity_schema",
     "model_identity_key",
+    "model_output_schema",
     "RESOURCE_ID_PATTERN",
     "SOURCE_ID_PATTERN",
     "resource_id_schema",

@@ -9,15 +9,20 @@ the subscription before merge. See docs/TESTING.md, "Model-surface gate".
 from __future__ import annotations
 
 import os
-import re
+import sqlite3
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 
-from daita._json import canonical_json
-from daita.llm.models import TextBlock, ToolResultBlock, model_tool_result
+from daita import Agent, LocalWorkspace
+from daita.capabilities import ApprovalDecision, ApprovalRequest
+from daita.llm.models import FinishReason, ModelProfile, ModelResponse, ToolCall
+from daita.llm.providers.mock import MockModelProvider
+from daita.loop.models import LoopExitKind
+from daita.workspace import LocalFileAccess
 from scripts import live_smoke
 from tests.support.model_surface import (
     DIGEST_PATH,
@@ -28,6 +33,8 @@ from tests.support.model_surface import (
     compute_surface_text,
     describe_changes,
     digest_text,
+    identity_leaks,
+    model_visible_text,
 )
 from tests.support.paths import REPO_ROOT
 
@@ -53,51 +60,122 @@ def test_model_surface_snapshot_is_current() -> None:
     ), f"{DIGEST_PATH.name} does not match the snapshot; run {UPDATE_COMMAND}"
 
 
-# A resource ID, a source ID, or a run-local handle as a JSON string value.
-_IDENTITY_TEXT = re.compile(
-    r'catalog-resource:sha256:|source:(?:workspace:)?sha256:|"[st][1-9][0-9]{0,4}"'
-)
-
-
 def test_model_never_sees_an_id_or_a_handle() -> None:
     """Sources are named by display name, tables and files by native name.
 
-    Every tool definition, instruction paragraph and rendered tool result of
-    the fixture run (including toolbox_inspect contracts and the catalog
-    context) is free of IDs and handles; the resolver maps names back.
+    Every tool definition, instruction paragraph, tool call and rendered tool
+    result of the fixture run (including toolbox_inspect contracts and the
+    catalog context) is free of IDs and handles; the resolver maps names back.
     """
 
     requests, definitions = capture_requests()
-    shown: list[str] = [
-        canonical_json({"d": item.description, "s": item.input_schema})
-        for item in definitions
-    ]
-    for request in requests:
-        shown.extend(
-            canonical_json({"d": item.description, "s": item.input_schema})
-            for item in request.tools
+    assert any(
+        "toolbox_inspect" in text
+        for request in requests
+        for text in model_visible_text(request)
+    )
+    assert len(requests) >= 4 and identity_leaks(requests, definitions) == []
+
+
+async def test_later_turns_refusals_and_semantic_context_show_only_names(
+    tmp_path: Path,
+) -> None:
+    """History, the system prompt and argument refusals render names as well."""
+
+    database = tmp_path / "shop.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE customers(id INTEGER PRIMARY KEY)")
+        connection.execute(
+            "CREATE TABLE orders(id INTEGER, status TEXT, "
+            "customer_id INTEGER REFERENCES customers(id))"
         )
-        for message in request.messages:
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    shown.append(block.text)
-                elif isinstance(block, ToolResultBlock):
-                    shown.append(
-                        canonical_json(
-                            model_tool_result(
-                                block,
-                                request.tool_result_refs.get(block.call_id),
-                                request.scope_names,
-                            )
-                        )
-                    )
-    assert len(requests) >= 4 and any("toolbox_inspect" in text for text in shown)
-    offending = [
-        text[max(0, match.start() - 80) : match.end() + 20]
-        for text in shown
-        for match in _IDENTITY_TEXT.finditer(text)
-    ]
-    assert offending == []
+    connection.close()
+
+    def calls(name: str, arguments: Mapping[str, object]) -> ModelResponse:
+        return ModelResponse(
+            finish_reason=FinishReason.TOOL_CALLS,
+            tool_calls=(ToolCall(f"call-{name}", name, dict(arguments)),),
+        )
+
+    subject = {
+        "sources": ["shop"],
+        "tables": ["main.orders"],
+        "fields": [{"table": "main.orders", "field_name": "status"}],
+    }
+    provider = MockModelProvider(
+        (
+            calls("toolbox_load", {"tool_names": ["semantic_save", "semantic_view"]}),
+            calls("data_query", {"source": "shop", "sql": "SELECT id FROM orders"}),
+            calls(
+                "semantic_save",
+                {
+                    "id": "orders-meaning",
+                    "kind": "glossary",
+                    "statement": "An order is a sale.",
+                    "subject": subject,
+                    "evidence": [{"kind": "user_assertion"}],
+                },
+            ),
+            calls("semantic_view", {"id": "orders-meaning"}),
+            calls("catalog_describe", {}),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        "joined",
+                        "catalog_describe",
+                        {"tables": ["main.orders", "main.customers"]},
+                    ),
+                ),
+            ),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(ToolCall("no-source", "data_query", {"sql": "SELECT 1"}),),
+            ),
+            ModelResponse(finish_reason=FinishReason.STOP, text="Saved."),
+            ModelResponse(finish_reason=FinishReason.STOP, text="Noted."),
+        ),
+        provider_id="mock:names",
+    )
+
+    async def approve(request: ApprovalRequest) -> ApprovalDecision:
+        return ApprovalDecision.APPROVE
+
+    agent = await Agent.create(
+        "names",
+        root=tmp_path / "homes",
+        workspace=LocalWorkspace(tmp_path, access=LocalFileAccess.COMPUTER),
+        model=provider,
+        model_profile=ModelProfile(
+            id=provider.provider_id,
+            context_window_tokens=200_000,
+            max_output_tokens=8_000,
+            supports_tools=True,
+            supports_parallel_tools=True,
+        ),
+        approval_handler=approve,
+    )
+    try:
+        await agent.attach_sqlite(database, name="shop")
+        learned = await agent.learn("Orders are sales.")
+        assert learned.kind is LoopExitKind.COMPLETED, learned
+        follow_up = await agent.run(
+            "What do orders mean?", conversation_id=learned.conversation_id
+        )
+        assert follow_up.kind is LoopExitKind.COMPLETED, follow_up
+    finally:
+        await agent.close()
+
+    assert identity_leaks(provider.requests) == []
+    later = "\n".join(model_visible_text(provider.requests[-1]))
+    assert 'resources="main.orders"' in later
+    assert '{"source":"shop","sql":"SELECT id FROM orders"}' in later
+    assert '"source":"This computer"' in later
+    during = "\n".join(model_visible_text(provider.requests[-2]))
+    assert "Resources: main.orders" in during
+    assert "arguments.source is required" in during
+    assert "catalog_describe needs tables or a query" in during
+    assert '"from_table":"main.orders"' in during
 
 
 def test_live_smoke_record_covers_the_current_surface() -> None:

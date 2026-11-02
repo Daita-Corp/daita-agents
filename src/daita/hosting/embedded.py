@@ -110,7 +110,11 @@ from ..config import (
     HostCapacityLimits,
     PostgreSQLReadLimits,
 )
-from ..context import AgentContextBuilder, _project_completed_history
+from ..context import (
+    AgentContextBuilder,
+    _project_completed_history,
+    run_scope_names,
+)
 from ..distribution import (
     DISTRIBUTION_DOMAIN_OWNER_ID,
     DeliveryInspection,
@@ -1652,6 +1656,9 @@ class EmbeddedAgent:
                 artifact_store,
                 observer=observer,
                 **({"limits": analysis_limits} if analysis_limits is not None else {}),
+                scope_names=lambda agent_id, scope: run_scope_names(
+                    data_view, agent_id, scope
+                ),
             )
         )
         base_domains = (
@@ -1876,7 +1883,7 @@ class EmbeddedAgent:
                     else FrozenJsonObject.from_mapping(
                         {
                             **workspace_backend.model_context().to_dict(),
-                            "source_id": session_source.source_id,
+                            "source": session_source.display_name,
                         }
                     )
                 ),

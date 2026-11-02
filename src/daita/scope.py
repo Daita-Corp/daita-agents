@@ -100,13 +100,17 @@ class ScopeRefs:
 
 @lru_cache(maxsize=8)
 def scope_refs(scope: EffectiveSourceScope | None) -> ScopeRefs:
-    """Number one frozen scope deterministically; one shared definition."""
+    """Number one frozen scope deterministically; one shared definition.
+
+    A scope that froze display names belongs to a run addressed by name. It was
+    never shown a handle, so a value like ``s2`` there is only a name.
+    """
 
     handles = {
         identity: f"{prefix}{index}"
         for prefix, identities in (
             ()
-            if scope is None
+            if scope is None or scope.source_labels
             else (
                 (SOURCE_REF_PREFIX, scope.source_ids),
                 (RESOURCE_REF_PREFIX, scope.resource_ids),

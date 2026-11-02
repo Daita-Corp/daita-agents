@@ -65,6 +65,7 @@ class _EditWorkflowProvider:
         after_read: Callable[[], None] | None = None,
         after_edit: Callable[[], None] | None = None,
         target_path: str = "config.yaml",
+        source: str = "Working folder",
         save: bool = True,
         reference: Mapping[str, object] | None = None,
     ) -> None:
@@ -76,6 +77,7 @@ class _EditWorkflowProvider:
         self.after_read = after_read
         self.after_edit = after_edit
         self.target_path = target_path
+        self.source = source
         self.save = save
         self.requests: list[ModelRequest] = []
         self._load_count = 0
@@ -94,7 +96,7 @@ class _EditWorkflowProvider:
         read = results.get("read")
         if read is None:
             return _call(
-                "read", "file_read", {"source_id": "s1", "path": self.target_path}
+                "read", "file_read", {"source": self.source, "path": self.target_path}
             )
         if read.is_error:
             return _stop("read failed")
@@ -357,6 +359,7 @@ async def test_computer_mode_approved_edit_replaces_only_the_external_bound_file
             },
         ),
         target_path=str(target),
+        source="This computer",
     )
     approvals: list[ApprovalRequest] = []
 

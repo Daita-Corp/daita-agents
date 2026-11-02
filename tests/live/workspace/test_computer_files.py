@@ -605,9 +605,8 @@ async def test_live_model_recovers_from_invalid_glob_without_claiming_no_access(
             ToolCall(
                 id="injected-invalid-computer-search",
                 name="file_search",
-                # The session folder is this run's only source, so its handle is s1.
                 arguments={
-                    "source_id": "s1",
+                    "source": "This computer",
                     "path": str(locations.downloads),
                     "glob": "**/*.csv",
                     "mode": "paths",

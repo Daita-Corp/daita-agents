@@ -37,8 +37,9 @@ change:
 ### Tools
 
 Foreground runs get `job_start(objective, sources?)` (on demand, no confirm
-card: the job shows on the Work board at once and can be cancelled),
-`job_list`, `job_inspect` (checklist, delegations, question and final result)
+card: the job shows on the Work board at once and can be cancelled; `sources`
+resolve within the asking run's scope, and a run narrower than every current
+source passes that scope on when it names none), `job_list`, `job_inspect` (checklist, delegations, question and final result)
 and `job_cancel` (on demand). A job's main run, and only it, gets:
 
 - `checklist_write(items, merge?)`: replace the checklist or merge by id;

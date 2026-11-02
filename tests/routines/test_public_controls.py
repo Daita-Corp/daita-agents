@@ -23,9 +23,12 @@ from daita.llm.models import (
     ModelResponse,
     ModelSensitivity,
     ModelUsage,
+    ToolCall,
 )
 from daita.llm.pricing import CostEstimate
 from daita.llm.providers.mock import MockModelProvider
+from tests.support.jobs import JobModel, open_job_agent, reply, tool_result
+from tests.support.model_surface import identity_leaks
 from tests.support.workspace import workspace_for
 
 
@@ -42,7 +45,6 @@ def _profile(provider: MockModelProvider) -> ModelProfile:
 @pytest.mark.parametrize("update", [False, True])
 async def test_routine_input_error_precedes_approval(tmp_path, update):
     from daita.capabilities import ApprovalDecision
-    from daita.llm.models import ToolCall
     from tests.support.capability_runtime import execute_projected
 
     approvals = []
@@ -282,7 +284,6 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
 async def test_public_source_free_once_routine_commits_its_document(tmp_path):
     from daita import OnceSchedule
     from daita.distribution.models import OutcomeState
-    from daita.llm.models import ToolCall
     from tests.support.toolbox_model import ToolboxAwareMockModelProvider
 
     usage = ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0")))
@@ -380,7 +381,6 @@ async def test_routine_save_creates_with_code_defaults_and_updates_one_revision(
     tmp_path,
 ):
     from daita.capabilities import ApprovalDecision
-    from daita.llm.models import ToolCall
     from tests.support.capability_runtime import execute_projected
     from tests.support.toolbox_model import ToolboxAwareMockModelProvider
 
@@ -483,3 +483,61 @@ async def test_routine_save_creates_with_code_defaults_and_updates_one_revision(
         assert saved.routine.authorized_instruction == routine.authorized_instruction
     finally:
         await agent.close()
+
+
+async def test_a_routine_run_shows_only_names_and_cannot_name_its_way_out(
+    tmp_path: Path,
+) -> None:
+    shop, staff = tmp_path / "shop.db", tmp_path / "staff.db"
+    with sqlite3.connect(shop) as connection:
+        connection.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
+    with sqlite3.connect(staff) as connection:
+        connection.execute("CREATE TABLE people (id INTEGER PRIMARY KEY)")
+    model = JobModel()
+    reads = (
+        ("in-scope", "data_query", {"source": "shop", "sql": "SELECT id FROM orders"}),
+        ("source", "data_query", {"source": "staff", "sql": "SELECT id FROM people"}),
+        ("sql", "data_query", {"source": "shop", "sql": "SELECT id FROM people"}),
+        ("table", "catalog_describe", {"tables": ["main.people"]}),
+    )
+    model.script(
+        user=[
+            *(reply(ToolCall(call, name, args)) for call, name, args in reads),
+            reply(text="Reported."),
+        ]
+    )
+    agent = await open_job_agent(tmp_path, model)
+    try:
+        await agent.attach(SQLiteSource(shop, name="shop"))
+        await agent.attach(SQLiteSource(staff, name="staff"))
+        routine = await agent.create_routine(
+            RoutineIntent(
+                title="Orders",
+                prompt="Report the orders table.",
+                schedule=IntervalSchedule(
+                    3_600, datetime.now(UTC) + timedelta(hours=1)
+                ),
+                sources=("shop",),
+            )
+        )
+        await agent.run_routine_now(
+            routine.routine_id, expected_revision=routine.revision
+        )
+        for _ in range(1_000):
+            if await agent.list_deliveries(conversation_id=routine.conversation_id):
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        await agent.close()
+    last = model.requests[-1][1]
+    codes = {
+        call: tool_result(last, call).output.get("error", {}).get("code")  # type: ignore[attr-defined]
+        for call, _, _ in reads
+    }
+    assert codes == {
+        "in-scope": None,
+        "source": "source_unknown",
+        "sql": "resource_read_not_allowed",
+        "table": "table_unknown",
+    }
+    assert identity_leaks(request for _, request in model.requests) == []

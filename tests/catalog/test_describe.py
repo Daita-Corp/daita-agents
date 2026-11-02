@@ -464,17 +464,17 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
             (
                 CATALOG_SEARCH_CAPABILITY_ID,
                 {"query": "orders", "source_id": garbled_source},
-                "source_id",
+                "source",
             ),
             (
                 CATALOG_DESCRIBE_CAPABILITY_ID,
                 {"resource_ids": (garbled_resource,)},
-                "resource_ids[0]",
+                "tables[0]",
             ),
             (
                 CATALOG_DESCRIBE_CAPABILITY_ID,
                 {"source_id": "s1"},
-                "source_id",
+                "source",
             ),
         ):
             with pytest.raises(CapabilityInputError) as garbled:
@@ -518,9 +518,9 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
             (issue["constraint"], issue["name"])
             for issue in argument_issues(duplicate_resources.value.details)
         ] == [
-            ("uniqueItems", "resource_ids"),
-            ("pattern", "resource_ids[0]"),
-            ("pattern", "resource_ids[1]"),
+            ("uniqueItems", "tables"),
+            ("pattern", "tables[0]"),
+            ("pattern", "tables[1]"),
         ]
 
         assert CatalogSearchRequest(agent_id="agent", query="orders").limit == (

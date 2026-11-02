@@ -66,7 +66,7 @@ async def test_partial_broker_read_retains_coverage_and_contract_after_history_c
                 "partial",
                 "python_execute",
                 {
-                    "code": "import json\nr=tools.call('file_read', {'source_id':'s1', 'path':'partial.txt'})\nassert not r['is_error']\nd=r['output']['data']\nsummary={'captured_bytes':len(d['content'].encode()), 'complete':d['complete']}\nprint(summary)\nopen('coverage.json','w').write(json.dumps(summary))\noutputs.add('coverage','coverage.json')",
+                    "code": "import json\nr=tools.call('file_read', {'source':'Working folder', 'path':'partial.txt'})\nassert not r['is_error']\nd=r['output']['data']\nsummary={'captured_bytes':len(d['content'].encode()), 'complete':d['complete']}\nprint(summary)\nopen('coverage.json','w').write(json.dumps(summary))\noutputs.add('coverage','coverage.json')",
                     "save_output": "coverage",
                 },
             ),

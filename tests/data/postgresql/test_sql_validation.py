@@ -76,6 +76,23 @@ def _validate(
 
 
 @pytest.mark.parametrize(
+    ("sql", "expected"),
+    (
+        ("SELECT id FROM sales.customers", "resource-customers"),
+        ("SELECT id FROM SALES.CUSTOMERS", "resource-customers"),
+        ('SELECT id FROM sales."customers"', "resource-customers"),
+        ('SELECT id FROM sales."Customers"', "resource-quoted"),
+    ),
+)
+def test_a_quoted_mixed_case_table_is_not_its_lower_case_namesake(
+    sql: str, expected: str
+) -> None:
+    quoted = _resource("resource-quoted", "Customers", ("id",))
+    result = _validate(sql, resources=(_CUSTOMERS, quoted))
+    assert result.valid and result.resource_ids == (expected,)
+
+
+@pytest.mark.parametrize(
     ("sql", "expected_names"),
     (
         (

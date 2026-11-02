@@ -797,7 +797,7 @@ async def test_public_agent_queries_folder_files_through_data_query_route(
                 "query",
                 "data_query",
                 {
-                    "source_id": "s1",
+                    "source": "Working folder",
                     "path_pattern": "orders.csv",
                     "sql": (
                         "SELECT region, SUM(amount) AS total FROM data "
@@ -825,7 +825,7 @@ async def test_public_agent_queries_folder_files_through_data_query_route(
         )
         assert owner == "data"
         routed = agent._embedded._capabilities.call_capability(
-            "data_query", {"source_id": "s1", "path_pattern": "x", "sql": "x"}
+            "data_query", {"source": "Working folder", "path_pattern": "x", "sql": "x"}
         )
         assert routed.id == PATH_QUERY_CAPABILITY_ID
         assert routed.executor_id == PATH_QUERY_EXECUTOR_ID
@@ -864,7 +864,7 @@ async def test_invalid_folder_query_sql_fails_before_workspace_io(
                 "invalid-query",
                 "data_query",
                 {
-                    "source_id": "s1",
+                    "source": "Working folder",
                     "path_pattern": "orders.csv",
                     "sql": "SELECT * FROM read_csv('/etc/hosts')",
                 },

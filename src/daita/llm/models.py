@@ -690,8 +690,12 @@ _NAME_KEYS = (
     ("resource_ids", "tables"),
     ("resource_id", "table"),
 )
-_IDENTITY_VALUE = re.compile(
-    r"(source:(?:workspace:)?|catalog-resource:)sha256:[0-9a-f]{64}\Z"
+_IDENTITY_TEXT = re.compile(
+    r"(?:source:(?:workspace:)?|catalog-resource:)sha256:[0-9a-f]{64}"
+)
+# A relationship renders as its tables and key columns; no tool takes its ID.
+_RELATIONSHIP_TEXT = re.compile(
+    r"(?:relationship:)?catalog-(?:relationship|link):sha256:[0-9a-f]{64}"
 )
 
 
@@ -702,26 +706,65 @@ def _name_key(key: str) -> str:
     return key
 
 
+def _holds_relationships(value: object) -> bool:
+    if isinstance(value, str):
+        return _RELATIONSHIP_TEXT.fullmatch(value) is not None
+    return (
+        isinstance(value, (list, tuple))
+        and bool(value)
+        and all(_holds_relationships(item) for item in value)
+    )
+
+
+def _holds_identities(value: object) -> bool:
+    if isinstance(value, str):
+        return _IDENTITY_TEXT.fullmatch(value) is not None
+    return isinstance(value, (list, tuple)) and all(
+        isinstance(item, str) and _IDENTITY_TEXT.fullmatch(item) for item in value
+    )
+
+
+def _named_text(text: str, scope_names: Mapping[str, str]) -> str:
+    def named(match: re.Match[str]) -> str:
+        identity = match.group(0)
+        outside = "source" if identity.startswith("source:") else "table"
+        return scope_names.get(identity) or f"a {outside} outside this run"
+
+    return _RELATIONSHIP_TEXT.sub("relationship", _IDENTITY_TEXT.sub(named, text))
+
+
 def with_scope_names(value: object, scope_names: Mapping[str, str]) -> Any:
     """Project every source or resource ID to its name, recursively.
 
-    A key ``x_source_id`` becomes ``x_source`` and ``x_resource_ids`` becomes
-    ``x_tables``, holding the display or native name of each ID. An ID the
-    run's scope does not name, under any key, renders as null so the model
-    never sees an identity it cannot use. Other values are copied as they are.
+    A key ``x_source_id`` holding an ID becomes ``x_source`` and
+    ``x_resource_ids`` becomes ``x_tables``, with the display or native name of
+    each ID. An ID the run's scope does not name renders as null, or is dropped
+    as a key, so the model never sees an identity it cannot use; inside longer
+    text it is replaced by a phrase. A key holding a relationship or link ID is
+    dropped. Other values are copied as they are: a query result's own
+    ``source_id`` column keeps its name and its value.
     """
 
     if isinstance(value, Mapping):
-        return {
-            (_name_key(key) if isinstance(key, str) else key): with_scope_names(
-                item, scope_names
-            )
-            for key, item in value.items()
-        }
+        rendered: dict[object, object] = {}
+        for key, item in value.items():
+            if _holds_relationships(item):
+                continue
+            if isinstance(key, str):
+                if _IDENTITY_TEXT.fullmatch(key):
+                    if key not in scope_names:
+                        continue
+                    key = scope_names[key]
+                elif _holds_identities(item) and _name_key(key) not in value:
+                    key = _name_key(key)
+            rendered[key] = with_scope_names(item, scope_names)
+        return rendered
     if isinstance(value, (list, tuple)):
         return type(value)(with_scope_names(item, scope_names) for item in value)
-    if isinstance(value, str) and _IDENTITY_VALUE.match(value):
-        return scope_names.get(value)
+    if isinstance(value, str) and "sha256:" in value:
+        if _IDENTITY_TEXT.fullmatch(value):
+            return scope_names.get(value)
+        return _named_text(value, scope_names)
     return value
 
 

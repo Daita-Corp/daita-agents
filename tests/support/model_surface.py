@@ -23,7 +23,7 @@ import os
 import re
 import sqlite3
 import tempfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,7 +31,7 @@ from typing import Any
 from unittest.mock import patch
 
 from daita import Agent, LocalWorkspace
-from daita._json import FrozenJsonObject
+from daita._json import FrozenJsonObject, canonical_json
 from daita.capabilities import (
     RESERVED_TOOL_NAMES,
     TOOLBOX_DEFINITIONS,
@@ -83,6 +83,12 @@ LANES: tuple[tuple[str, CallTargetLane | None], ...] = (
     ("machine", None),
 )
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+# A resource, source, relationship or link ID, a run-local handle as a JSON string
+# value, or a canonical identity key the model never sends.
+_IDENTITY_TEXT = re.compile(
+    r"catalog-(?:resource|relationship|link):sha256:|source:(?:workspace:)?sha256:"
+    r'|"[st][1-9][0-9]{0,4}"|(?:source|resource)_(?:id|ref)s?\b|relationship_ids?\b'
+)
 
 
 def _script() -> tuple[ModelResponse, ...]:
@@ -360,6 +366,46 @@ async def _capture(root: Path) -> dict[str, object]:
         await agent.close()
 
 
+def model_visible_text(request: ModelRequest) -> Iterator[str]:
+    """Everything one request shows a model: tools, text, calls and rendered results."""
+
+    for tool in request.tools:
+        yield canonical_json({"d": tool.description, "s": tool.input_schema})
+    for message in request.messages:
+        for call in message.tool_calls:
+            yield canonical_json(call.arguments)
+        for block in message.content:
+            if isinstance(block, TextBlock):
+                yield block.text
+            elif isinstance(block, ToolResultBlock):
+                yield canonical_json(
+                    model_tool_result(
+                        block,
+                        request.tool_result_refs.get(block.call_id),
+                        request.scope_names,
+                    )
+                )
+
+
+def identity_leaks(
+    requests: Iterable[ModelRequest], definitions: Iterable[ToolDefinition] = ()
+) -> list[str]:
+    """Each ID, handle or canonical identity key shown to a model, with context."""
+
+    shown = [
+        *(
+            canonical_json({"d": d.description, "s": d.input_schema})
+            for d in definitions
+        ),
+        *(text for request in requests for text in model_visible_text(request)),
+    ]
+    return [
+        text[max(0, match.start() - 80) : match.end() + 20]
+        for text in shown
+        for match in _IDENTITY_TEXT.finditer(text)
+    ]
+
+
 def capture_requests() -> tuple[tuple[ModelRequest, ...], tuple[ToolDefinition, ...]]:
     """Return the fixture run's model requests and every registry tool definition.
 
@@ -493,5 +539,7 @@ __all__ = [
     "compute_surface_text",
     "describe_changes",
     "digest_text",
+    "identity_leaks",
+    "model_visible_text",
     "write_snapshot",
 ]

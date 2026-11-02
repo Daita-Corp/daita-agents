@@ -165,7 +165,7 @@ async def test_stale_raw_rpc_token_is_denied_before_read_dispatch(
 ):
     workspace = workspace_for(tmp_path)
     (workspace.root / "secret.txt").write_text("must never be read")
-    code = "import json, sys\nsys.__stdout__.write(json.dumps({'kind':'child','token':'forged','sequence':1,'name':'file_read','arguments':{'source_id':'s1','path':'secret.txt'}})+'\\n'); sys.__stdout__.flush()\nwhile True: pass"
+    code = "import json, sys\nsys.__stdout__.write(json.dumps({'kind':'child','token':'forged','sequence':1,'name':'file_read','arguments':{'source':'Working folder','path':'secret.txt'}})+'\\n'); sys.__stdout__.flush()\nwhile True: pass"
     agent = await make_agent(
         tmp_path,
         (
@@ -370,7 +370,7 @@ async def test_python_threads_serialize_broker_channel_and_keep_response_identit
     workspace = workspace_for(tmp_path)
     (workspace.root / "one.txt").write_text("one")
     (workspace.root / "two.txt").write_text("two")
-    code = "from concurrent.futures import ThreadPoolExecutor\nwith ThreadPoolExecutor(max_workers=2) as pool:\n for i in range(4):\n  results=list(pool.map(lambda p: tools.call('file_read', {'source_id':'s1', 'path':p}), ['one.txt','two.txt']))\n  assert all(not r['is_error'] for r in results)\n  print([r['output']['data']['content'] for r in results])"
+    code = "from concurrent.futures import ThreadPoolExecutor\nwith ThreadPoolExecutor(max_workers=2) as pool:\n for i in range(4):\n  results=list(pool.map(lambda p: tools.call('file_read', {'source':'Working folder', 'path':p}), ['one.txt','two.txt']))\n  assert all(not r['is_error'] for r in results)\n  print([r['output']['data']['content'] for r in results])"
     agent = await make_agent(
         tmp_path,
         (
@@ -459,7 +459,7 @@ async def test_broken_worker_input_counts_actual_os_transfers(
                 "close-input",
                 "python_execute",
                 {
-                    "code": "import sys\nsys.stdin.close()\ntry: tools.call('file_read', {'source_id':'s1', 'path':'value.txt'})\nexcept ValueError:\n while True: pass",
+                    "code": "import sys\nsys.stdin.close()\ntry: tools.call('file_read', {'source':'Working folder', 'path':'value.txt'})\nexcept ValueError:\n while True: pass",
                 },
             ),
         ),
@@ -855,7 +855,7 @@ async def test_broker_data_fidelity_null_decimal_large_integer_timezone_and_dupl
 import json, pyarrow as pa, pyarrow.parquet as pq
 from decimal import Decimal
 from datetime import datetime
-r=tools.call('file_read', {'source_id':'s1', 'path':'exact.json'})
+r=tools.call('file_read', {'source':'Working folder', 'path':'exact.json'})
 assert not r['is_error']
 assert r['output']['data']['complete']
 rows=json.loads(r['output']['data']['content'])
@@ -1016,7 +1016,9 @@ async def test_unrelated_foreground_read_progresses_with_running_and_queued_anal
                     "code": "print(9)",
                 },
             ),
-            _tool("quick", "file_read", {"source_id": "s1", "path": "quick.txt"}),
+            _tool(
+                "quick", "file_read", {"source": "Working folder", "path": "quick.txt"}
+            ),
         ),
         observer=events.append,
     )
@@ -1190,7 +1192,7 @@ async def test_cli_run_executes_python_through_the_broker_in_its_own_process(
     bootstrap = await Agent.create("cli-python", root=root, workspace=workspace)
     await bootstrap.close()
     code = (
-        "r=tools.call('file_read', {'source_id':'s1', 'path': 'numbers.txt'})\n"
+        "r=tools.call('file_read', {'source':'Working folder', 'path': 'numbers.txt'})\n"
         "assert not r['is_error']\n"
         "print({'sum': sum(int(n) for n in r['output']['data']['content'].split())})"
     )

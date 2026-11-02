@@ -1815,7 +1815,7 @@ def _query_declarations(
                         "Use with sql as one DuckDB SELECT over these aliases "
                         "to join sources. Each input is either sql in its own "
                         "source's dialect, or exact catalog columns of one "
-                        "resource_id with optional AND-combined filters "
+                        "table with optional AND-combined filters "
                         "(eq, in, lt, lte, gt, gte)."
                     ),
                 },

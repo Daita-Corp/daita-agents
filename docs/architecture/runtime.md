@@ -23,8 +23,8 @@ model-visible results, so the model can correct a call on the next step. Normal
 model text completes the run. There is no verifier, repair, synthesis, or
 resumable-session pass.
 
-Persisted tool calls keep the model's run-local handles. Code that reads call
-arguments uses the executed record (`CapabilityRegistry.executed_tool_pairs`,
+Persisted tool calls keep the names the model sent; runs stored before names
+were used keep its run-local handles. Code that reads call arguments uses the executed record (`CapabilityRegistry.executed_tool_pairs`,
 public `Agent.tool_evidence`), never per-reader re-resolution;
 `tests/architecture` enforces this.
 

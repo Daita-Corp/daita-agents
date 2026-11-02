@@ -12,7 +12,13 @@ import pytest
 from daita import Agent, SQLiteSource, WorkColumn, WorkKind
 from daita.distribution import DeliverySubjectKind, OutcomeState
 from daita.jobs import ChecklistStatus, DelegationState, JobState
-from daita.llm.models import ModelRequest, ModelResponse, TextBlock, ToolCall
+from daita.llm.models import (
+    ModelRequest,
+    ModelResponse,
+    TextBlock,
+    ToolCall,
+    model_tool_result,
+)
 from tests.support.jobs import (
     REQUEST_USAGE,
     JobModel,
@@ -25,6 +31,7 @@ from tests.support.jobs import (
     tool_result,
     wait_for_job,
 )
+from tests.support.model_surface import identity_leaks
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.integration
@@ -147,6 +154,202 @@ async def test_a_job_plans_delegates_two_parallel_subruns_and_delivers(
         assert card.kind is WorkKind.JOB and card.id == job.job_id
     finally:
         await agent.close()
+
+
+def _rendered(request: ModelRequest, call_id: str) -> dict[str, object]:
+    output = model_tool_result(
+        tool_result(request, call_id), None, request.scope_names
+    )["output"]
+    assert isinstance(output, dict)
+    return output
+
+
+def _two_databases(root: Path) -> tuple[Path, Path]:
+    shop, staff = root / "shop.db", root / "staff.db"
+    with sqlite3.connect(shop) as connection:
+        connection.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
+    with sqlite3.connect(staff) as connection:
+        connection.execute("CREATE TABLE people (id INTEGER PRIMARY KEY)")
+    return shop, staff
+
+
+async def test_job_runs_show_only_names_and_stay_inside_their_sources(
+    tmp_path: Path,
+) -> None:
+    shop, staff = _two_databases(tmp_path)
+    refusals: dict[str, dict[str, object]] = {}
+
+    def record(request: ModelRequest, *call_ids: str) -> None:
+        for call_id in call_ids:
+            refusals[call_id] = _rendered(request, call_id)
+
+    def keep_going(call: ToolCall, *call_ids: str):
+        def step(request: ModelRequest) -> ModelResponse:
+            record(request, *call_ids)
+            return reply(call)
+
+        return step
+
+    def finish(request: ModelRequest) -> ModelResponse:
+        record(request, "subrun")
+        return reply(text="Counted.")
+
+    model = JobModel()
+    sql = {"source": "shop", "sql": "SELECT COUNT(*) AS c FROM orders"}
+    model.script(
+        main=[
+            reply(ToolCall("read", "data_query", sql)),
+            keep_going(
+                ToolCall("other-source", "data_query", {**sql, "source": "staff"}),
+                "read",
+            ),
+            keep_going(
+                ToolCall(
+                    "other-table",
+                    "data_query",
+                    {"source": "shop", "sql": "SELECT * FROM people"},
+                ),
+                "other-source",
+            ),
+            keep_going(
+                ToolCall("describe", "catalog_describe", {"tables": ["main.people"]}),
+                "other-table",
+            ),
+            keep_going(
+                ToolCall(
+                    "sub-outside",
+                    "delegate",
+                    {"goal": "Other", "context": "", "sources": ["staff"]},
+                ),
+                "describe",
+            ),
+            keep_going(
+                ToolCall(
+                    "sub-unknown",
+                    "delegate",
+                    {"goal": "Unknown", "context": "", "sources": ["warehouse"]},
+                ),
+                "sub-outside",
+            ),
+            keep_going(
+                ToolCall(
+                    "subrun",
+                    "delegate",
+                    {"goal": "Count orders", "context": "", "sources": ["shop"]},
+                ),
+                "sub-unknown",
+            ),
+            finish,
+        ],
+        subruns={"Count orders": lambda request: reply(text="None yet.")},
+    )
+    agent = await open_job_agent(tmp_path, model)
+    try:
+        await agent.attach(SQLiteSource(shop, name="shop"))
+        await agent.attach(SQLiteSource(staff, name="staff"))
+        job = await agent.start_job("Count the orders table.", sources=("shop",))
+        await wait_for_job(agent, job.job_id, in_state(JobState.DONE), model=model)
+
+        model.script(
+            user=[
+                reply(ToolCall("inspect", "job_inspect", {"job_id": job.job_id})),
+                reply(text="Done."),
+            ]
+        )
+        await agent.run("How did the job go?")
+    finally:
+        await agent.close()
+
+    assert refusals["read"]["kind"] == "data.query_result"
+    assert refusals["other-source"]["error"]["code"] == "source_unknown"  # type: ignore[index]
+    assert refusals["other-table"]["error"]["code"] == "resource_read_not_allowed"  # type: ignore[index]
+    assert refusals["describe"]["error"]["code"] == "table_unknown"  # type: ignore[index]
+    for call_id in ("sub-outside", "sub-unknown"):
+        assert refusals[call_id]["error"]["code"] == "job_source_unknown"  # type: ignore[index]
+    # A refusal lists only what this run may read.
+    assert "staff" not in str(refusals["sub-unknown"])
+    assert refusals["subrun"]["data"]["summary"] == "None yet."  # type: ignore[index]
+    inspected = _rendered(model.requests[-1][1], "inspect")
+    assert inspected["data"]["sources"] == ["shop"]  # type: ignore[index]
+    assert identity_leaks(request for _, request in model.requests) == []
+
+
+async def test_a_job_started_from_a_narrowed_run_stays_inside_it(
+    tmp_path: Path,
+) -> None:
+    shop, staff = _two_databases(tmp_path)
+    load = {"tool_names": ["job_start"]}
+    start = {"objective": "Report."}
+    model = JobModel()
+    model.script(
+        user=[
+            reply(ToolCall("load", "toolbox_load", load)),
+            reply(
+                ToolCall("outside", "job_start", {**start, "sources": ["staff"]}),
+            ),
+            reply(ToolCall("unnamed", "job_start", start)),
+            reply(text="Narrowed."),
+            reply(ToolCall("load-all", "toolbox_load", load)),
+            reply(ToolCall("every-source", "job_start", start)),
+            reply(text="Everything."),
+        ],
+        main=[reply(text="Reported."), reply(text="Reported.")],
+    )
+    agent = await open_job_agent(tmp_path, model)
+    try:
+        first = await agent.attach(SQLiteSource(shop, name="shop"))
+        await agent.attach(SQLiteSource(staff, name="staff"))
+        await agent.run("Report on the shop.", source_scope_ids=(first.id,))
+        (narrowed,) = await agent.list_jobs()
+        assert narrowed.source_ids == (first.id,)
+        refused = next(
+            tool_result(request, "outside")
+            for kind, request in model.requests
+            if kind == "user" and "outside" in str(request.messages)
+        )
+        assert refused.output["error"]["code"] == "job_source_unknown"  # type: ignore[index]
+        assert refused.output["error"]["details"]["recovery"]["constraint"] == (  # type: ignore[index]
+            "Current sources: shop"
+        )
+        await wait_for_job(agent, narrowed.job_id, in_state(JobState.DONE), model=model)
+
+        # A run over every source keeps a job that reads every current source.
+        await agent.run("Report on everything.")
+        jobs = await agent.list_jobs()
+        assert {job.source_ids for job in jobs} == {(first.id,), ()}
+        for job in jobs:
+            await wait_for_job(agent, job.job_id, in_state(JobState.DONE), model=model)
+    finally:
+        await agent.close()
+
+
+async def test_job_start_refuses_a_name_two_sources_share(tmp_path: Path) -> None:
+    shop, staff = _two_databases(tmp_path)
+    model = JobModel()
+    model.script(
+        user=[
+            reply(ToolCall("load", "toolbox_load", {"tool_names": ["job_start"]})),
+            reply(
+                ToolCall(
+                    "shared",
+                    "job_start",
+                    {"objective": "Report.", "sources": ["sales"]},
+                )
+            ),
+            reply(text="Refused."),
+        ]
+    )
+    agent = await open_job_agent(tmp_path, model)
+    try:
+        await agent.attach(SQLiteSource(shop, name="Sales"))
+        await agent.attach(SQLiteSource(staff, name="SALES"))
+        await agent.run("Report on sales.")
+        assert await agent.list_jobs() == ()
+    finally:
+        await agent.close()
+    refused = tool_result(model.requests[-1][1], "shared")
+    assert refused.output["error"]["code"] == "source_ambiguous"  # type: ignore[index]
+    assert "SALES (sqlite)" in str(refused.output)
 
 
 async def test_job_runs_find_their_tables_from_the_objective_and_the_goal(

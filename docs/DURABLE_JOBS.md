@@ -17,7 +17,8 @@ A job is an ordinary agent run that keeps going in the Daita host. It:
   a Done card, with a notification when no window is watching.
 
 Reads just run, using the job's named sources or, without any, all of the
-agent's sources. Writes and external actions ask you at the time, exactly as
+agent's sources. A job the agent starts from a run limited to some sources stays
+inside them. Writes and external actions ask you at the time, exactly as
 in a scheduled routine: approve and the job continues; deny and it carries on
 with the refusal. An approval nobody answers within 24 hours stops the run and
 the job waits for you. Sub-runs cannot start further sub-runs, ask you

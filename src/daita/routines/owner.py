@@ -783,7 +783,25 @@ def _resolve_sources(
             for source in registrations
             if item == source.id or item.casefold() == source.display_name.casefold()
         }
-        if len(matches) != 1:
+        if len(matches) > 1:
+            raise RoutineError(
+                "source_ambiguous",
+                f"{len(matches)} sources are named {requested_item!r}.",
+                ToolRecovery(
+                    RecoveryKind.REQUIRES_HUMAN_PERMISSION,
+                    (
+                        "Ask the person to rename one of these sources: "
+                        + ", ".join(
+                            sorted(
+                                f"{source.display_name} ({source.adapter_id})"
+                                for source in registrations
+                                if source.id in matches
+                            )
+                        )
+                    )[:512],
+                ),
+            )
+        if not matches:
             names = ", ".join(sorted(source.display_name for source in registrations))
             raise RoutineError(
                 "routine_source_unknown",

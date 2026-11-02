@@ -59,6 +59,7 @@ from .capabilities import (
     ToolView,
     model_identity_key,
     model_identity_schema,
+    model_output_schema,
     omit_unset_arguments,
     recovery_details,
     tool_call_mode,
@@ -4433,7 +4434,7 @@ def _tool_contract(
         contract.update(
             complete=True,
             input_schema=model_identity_schema(entry.capability.input_schema),
-            output_schema=entry.capability.output_schema,
+            output_schema=model_output_schema(entry.capability.output_schema),
             output_kind=entry.capability.output_kind,
             data_access=entry.capability.access_mode.value,
             operational_effect=entry.capability.operational_effect.value,

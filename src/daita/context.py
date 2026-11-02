@@ -101,7 +101,11 @@ from .loop.models import (
 from .loop.session import RunSessionOptions
 from .memory.capabilities import MEMORY_SET_OUTPUT_KIND, MEMORY_SET_TOOL_NAME
 from .routines.temporal import system_user_timezone, valid_iana_timezone
-from .scope import SourceScopeCatalog, resolve_effective_source_scope
+from .scope import (
+    EffectiveSourceScope,
+    SourceScopeCatalog,
+    resolve_effective_source_scope,
+)
 from .semantics import (
     SEMANTIC_DELETE_OUTPUT_KIND,
     SEMANTIC_SAVE_CAPABILITY_ID,
@@ -762,17 +766,7 @@ class AgentContextBuilder:
         # Every source or resource ID the model would otherwise see renders as
         # its display or native name; the runtime resolves those names back
         # against the same frozen scope.
-        scope_names: dict[str, str] = {
-            str(fact["source_id"]): str(fact.get("display_name", ""))
-            for fact in source_presentations
-            if isinstance(fact.get("source_id"), str)
-        }
-        if source_scope.resource_ids:
-            scope_names.update(
-                await self._catalog.resource_names(
-                    run.agent_id, tuple(sorted(source_scope.source_ids))
-                )
-            )
+        scope_names = await run_scope_names(self._catalog, run.agent_id, source_scope)
         # Hash values have fixed length; price the real projection metadata
         # before the final static-context digest is known.
         provenance = FrozenJsonObject.from_mapping(
@@ -928,7 +922,7 @@ class AgentContextBuilder:
             or any(turn != prior_turns[index] for index, turn in selected)
         )
         selected_messages = (
-            *_flatten([turn for _, turn in selected]),
+            *_named_tool_calls(_flatten([turn for _, turn in selected]), scope_names),
             *current_messages,
         )
         initial = _request(
@@ -2526,6 +2520,41 @@ def _continuity_from_projected_turn(
     return bounded
 
 
+async def run_scope_names(
+    catalog: CatalogContextReader, agent_id: str, scope: EffectiveSourceScope
+) -> Mapping[str, str]:
+    """The display or native name of every source and resource ID in one scope."""
+
+    if not scope.source_ids:
+        return {}
+    source_ids = tuple(sorted(scope.source_ids))
+    names = {
+        str(fact["source_id"]): str(fact.get("display_name", ""))
+        for fact in await catalog.source_routing_facts(agent_id, source_ids)
+        if isinstance(fact.get("source_id"), str)
+    }
+    if scope.resource_ids:
+        names.update(await catalog.resource_names(agent_id, source_ids))
+    return names
+
+
+def _named_tool_calls(
+    messages: tuple[CanonicalMessage, ...], scope_names: Mapping[str, str]
+) -> tuple[CanonicalMessage, ...]:
+    """Show earlier calls by name; they are stored with the IDs they executed with."""
+
+    return tuple(
+        replace(
+            message,
+            tool_calls=tuple(
+                replace(call, arguments=with_scope_names(call.arguments, scope_names))
+                for call in message.tool_calls
+            ),
+        )
+        for message in messages
+    )
+
+
 def _redacted_arguments(call: ToolCall) -> Mapping[str, object]:
     if call.name in {
         "memory_set",
@@ -2910,7 +2939,8 @@ def _system_prompt(
         "Current catalog context:\n"
         + canonical_json(with_scope_names(catalog, scope_names or {}))
     )
-    return "\n\n".join(instructions)
+    # Semantic recall and notices cite the resources their annotations bind.
+    return cast(str, with_scope_names("\n\n".join(instructions), scope_names or {}))
 
 
 def _arrow_export_admitted(entries: tuple[RunToolCatalogEntry, ...]) -> bool:
@@ -3246,7 +3276,7 @@ def _tool_guidance(
             and local_file_context.get("access") == "computer"
         ):
             instructions.append(
-                "Local files: the session folder source (source_id below) reaches this "
+                "Local files: the session folder source (source below) reaches this "
                 "computer; connected sources are optional. file_search, file_read, and "
                 "data_query with path_pattern take that source name. The current working "
                 "directory is the default for relative paths; absolute paths and ~/ paths "

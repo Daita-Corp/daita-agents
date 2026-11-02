@@ -153,7 +153,7 @@ def _validate_describe_arguments(arguments: Mapping[str, object]) -> None:
     if query is None and not resource_ids and not (identity and source_id):
         raise CapabilityInputError(
             "catalog_invalid_describe",
-            "catalog_describe needs resource_ids or a query; detail=identity can "
+            "catalog_describe needs tables or a query; detail=identity can "
             "instead take only a source to list every admitted table.",
             {"detail": detail.value},
         )
@@ -1009,7 +1009,7 @@ class DataCapabilityDomain:
                 },
                 recovery=ToolRecovery(
                     RecoveryKind.REQUIRES_HUMAN_PERMISSION,
-                    "Use one of allowed_source_ids; another source needs the "
+                    "Use one of allowed_sources; another source needs the "
                     "person to add it to this conversation's scope.",
                 ),
             )
@@ -1300,7 +1300,7 @@ class DataCapabilityDomain:
             raise CapabilityInputError(
                 "tabular_source_adapter_unsupported",
                 "The selected source does not support tabular reads; send this "
-                "input as sql with resource_ids instead.",
+                "input as sql instead.",
                 {"source_id": source_id},
                 recovery=_CORRECT_SQL,
             )
