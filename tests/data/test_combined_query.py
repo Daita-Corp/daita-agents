@@ -49,7 +49,7 @@ from daita.domains.data.results import project_result_rows
 from daita.llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
-from daita.scope import EffectiveSourceScope, scope_refs
+from daita.scope import EffectiveSourceScope
 from tests.support.capability_runtime import execute_projected
 from tests.support.memory_source import MEMORY_ADAPTER_ID, MEMORY_TYPE, MemorySource
 from tests.support.workspace import workspace_for
@@ -296,29 +296,26 @@ async def test_combined_query_totals_revenue_by_region_across_two_sqlite_sources
     )
 
 
-async def test_tabular_input_named_by_run_handles_joins_a_sqlite_input(
+async def test_tabular_input_named_by_display_and_native_names_joins_a_sqlite_input(
     tmp_path: Path,
 ):
     shop = await _shop(tmp_path, _MEMORY)
     try:
         regions_source, regions = await _regions(shop)
-        # The model may name the tabular input's identities by run handles.
-        refs = scope_refs(
-            EffectiveSourceScope(
-                frozenset({shop.customers_source, regions_source}),
-                frozenset({shop.customers, regions}),
-            )
-        )
+        (table,) = await shop.agent.list_catalog_resources(source_id=regions_source)
+        # The model names the tabular input's source by display name and its
+        # table by native name; the resolver supplies the exact IDs.
         result = await _call(
             shop,
             {
                 "inputs": (
                     _inputs(shop)[1],
-                    _tabular_regions(
-                        refs.handles[regions_source],
-                        refs.handles[regions],
-                        filters=({"column": "revenue", "operator": "gte", "value": 5},),
-                    ),
+                    {
+                        **_tabular_regions("Regions", table.native_identity),
+                        "filters": (
+                            {"column": "revenue", "operator": "gte", "value": 5},
+                        ),
+                    },
                 ),
                 "sql": REGION_CUSTOMERS,
             },
@@ -478,7 +475,8 @@ async def test_definition_describes_only_the_routes_a_run_admits(tmp_path: Path)
     assert "Join sources" not in narrowed.description
     assert "Folder files" not in narrowed.description
     assert not {"inputs", "path_pattern"} & set(properties)
-    assert {"source_id", "resource_ids", "sql", "output"} <= set(properties)
+    assert {"source", "sql", "output"} <= set(properties)
+    assert "resource_ids" not in properties and "tables" not in properties
 
 
 async def test_two_inputs_on_one_sqlite_source_share_its_single_permit(tmp_path: Path):

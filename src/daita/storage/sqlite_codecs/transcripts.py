@@ -161,8 +161,10 @@ def _decode_resolved_source_scope(value: JsonValue) -> EffectiveSourceScope | No
     if value is None:
         return None
     fields = mapping(value, "resolved source scope")
-    if set(fields) != {"source_ids", "resource_ids"}:
+    # Scopes stored before sources were addressed by name carry no labels.
+    if set(fields) - {"source_labels"} != {"source_ids", "resource_ids"}:
         raise ValueError("resolved source scope fields are invalid")
+    labels = mapping(fields.get("source_labels", {}), "scope source labels")
     return EffectiveSourceScope(
         source_ids=frozenset(
             text(item, "scope source ID")
@@ -172,6 +174,19 @@ def _decode_resolved_source_scope(value: JsonValue) -> EffectiveSourceScope | No
             text(item, "scope resource ID")
             for item in sequence(fields["resource_ids"], "scope resource IDs")
         ),
+        source_labels={
+            text(source_id, "scope source ID"): _decode_source_label(label)
+            for source_id, label in labels.items()
+        },
+    )
+
+
+def _decode_source_label(value: JsonValue) -> tuple[str, str]:
+    label = sequence(value, "scope source label")
+    if len(label) != 2:
+        raise ValueError("scope source label must be [display name, adapter]")
+    return text(label[0], "scope source display name"), text(
+        label[1], "scope source adapter"
     )
 
 

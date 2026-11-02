@@ -283,6 +283,11 @@ class CatalogSpy:
             {"resource-unmatched"}
         )
 
+    async def resource_names(self, agent_id, source_ids=()):
+        return {
+            item["resource_id"]: str(item.get("name", "")) for item in self.resources
+        }
+
     def __init__(self, resources=(), sources=()):
         self.queries = []
         self.context_selections: list[

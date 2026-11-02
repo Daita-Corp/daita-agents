@@ -196,6 +196,9 @@ class _SnapshotCatalog:
     async def readable_resource_ids(self, agent_id, source_ids=()):
         return frozenset(("resource-snapshot",))
 
+    async def resource_names(self, agent_id, source_ids=()):
+        return {}
+
     def empty_catalog_context(self, *, prior_query=None):
         return _empty_catalog_context(prior_query is not None)
 

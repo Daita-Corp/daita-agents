@@ -98,7 +98,7 @@ def _response_envelope_schema(request: ModelRequest) -> dict[str, object]:
 def _project_message(
     message: CanonicalMessage,
     result_refs: Mapping[str, str] | None = None,
-    scope_refs: Mapping[str, str] | None = None,
+    scope_names: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     content: list[dict[str, object]] = []
     for block in message.content:
@@ -110,7 +110,7 @@ def _project_message(
                     "type": "tool_result",
                     "call_id": block.call_id,
                     **model_tool_result(
-                        block, (result_refs or {}).get(block.call_id), scope_refs
+                        block, (result_refs or {}).get(block.call_id), scope_names
                     ),
                 }
             )
@@ -135,7 +135,7 @@ def _request_document(request: ModelRequest, max_output_tokens: int) -> str:
 
     document = {
         "messages": [
-            _project_message(message, request.tool_result_refs, request.scope_refs)
+            _project_message(message, request.tool_result_refs, request.scope_names)
             for message in request.messages
         ],
         "tools": [

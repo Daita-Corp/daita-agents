@@ -141,6 +141,9 @@ class _StaticContextCatalog:
     async def readable_resource_ids(self, agent_id, source_ids=()):
         return frozenset(("untrusted-resource",))
 
+    async def resource_names(self, agent_id, source_ids=()):
+        return {}
+
     def empty_catalog_context(self, *, prior_query=None):
         return _NoSourceCatalog._empty_catalog_context(prior_query is not None)
 

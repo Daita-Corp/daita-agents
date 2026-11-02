@@ -679,7 +679,8 @@ async def test_identically_named_resources_remain_isolated_by_selected_source(
         )
         prompt = _request_text(provider, 1)
         assert "FIRST_SOURCE_ONLY_SENTINEL" not in prompt
-        assert first_resource.id not in prompt
-        assert second_resource.id in prompt
+        # Sources are shown by display name; no ID reaches the prompt.
+        assert '"label":"first"' not in prompt and '"label":"second"' in prompt
+        assert first_resource.id not in prompt and second_resource.id not in prompt
     finally:
         await agent.close()

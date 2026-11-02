@@ -489,9 +489,10 @@ class ModelRequest:
     # Run-scoped model-visible handles keyed by canonical ToolCall.id; adapters
     # render them beside each result and the stored transcript never holds them.
     tool_result_refs: Mapping[str, str] = field(default_factory=dict)
-    # Run-scoped source/resource handles keyed by full ID (``s1``, ``t1``...);
-    # adapters render each beside the ID it names in tool results.
-    scope_refs: Mapping[str, str] = field(default_factory=dict)
+    # Source display names and resource native names keyed by full ID; adapters
+    # render each in place of the ID in tool results, so the model never sees
+    # an ID and the stored transcript never holds a name.
+    scope_names: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         messages = tuple(self.messages)
@@ -569,8 +570,8 @@ class ModelRequest:
         ):
             raise ValueError("model-request tool_result_refs are invalid")
         object.__setattr__(self, "tool_result_refs", refs)
-        if not isinstance(self.scope_refs, Mapping):
-            raise TypeError("model-request scope_refs must be a mapping")
+        if not isinstance(self.scope_names, Mapping):
+            raise TypeError("model-request scope_names must be a mapping")
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
         object.__setattr__(self, "response_schema", response_schema)
@@ -668,7 +669,7 @@ def tool_result_refs(
 def model_tool_result(
     block: ToolResultBlock,
     result_ref: str | None,
-    scope_refs: Mapping[str, str] | None = None,
+    scope_names: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Return the one model-facing rendering of a tool result for every adapter."""
 
@@ -677,48 +678,50 @@ def model_tool_result(
     )
     rendered["is_error"] = block.is_error
     output = FrozenJsonObject.from_mapping(block.output).to_dict()
-    rendered["output"] = with_scope_refs(output, scope_refs) if scope_refs else output
+    rendered["output"] = with_scope_names(output, scope_names or {})
     return rendered
 
 
-def _ref_key(key: str) -> str | None:
-    """``source_id`` -> ``source_ref``; ``resource_ids`` -> ``resource_refs``."""
+# Canonical key suffix -> model-facing key, mirroring the argument keys the
+# model sends (``source``, ``tables``...) so results and arguments agree.
+_NAME_KEYS = (
+    ("source_ids", "sources"),
+    ("source_id", "source"),
+    ("resource_ids", "tables"),
+    ("resource_id", "table"),
+)
+_IDENTITY_VALUE = re.compile(
+    r"(source:(?:workspace:)?|catalog-resource:)sha256:[0-9a-f]{64}\Z"
+)
 
-    for suffix, replacement in (("ids", "refs"), ("id", "ref")):
+
+def _name_key(key: str) -> str:
+    for suffix, replacement in _NAME_KEYS:
         if key == suffix or key.endswith("_" + suffix):
             return key[: -len(suffix)] + replacement
-    return None
+    return key
 
 
-def with_scope_refs(value: object, scope_refs: Mapping[str, str]) -> Any:
-    """Add each issued handle beside the full ID it names, recursively.
+def with_scope_names(value: object, scope_names: Mapping[str, str]) -> Any:
+    """Project every source or resource ID to its name, recursively.
 
-    A key ``x_id`` whose value is an issued ID gains ``x_ref``; a key ``x_ids``
-    whose list holds issued IDs gains an aligned ``x_refs`` (null where none).
-    The full IDs stay unchanged; other values are copied as they are.
+    A key ``x_source_id`` becomes ``x_source`` and ``x_resource_ids`` becomes
+    ``x_tables``, holding the display or native name of each ID. An ID the
+    run's scope does not name, under any key, renders as null so the model
+    never sees an identity it cannot use. Other values are copied as they are.
     """
 
     if isinstance(value, Mapping):
-        rendered: dict[str, object] = {}
-        for key, item in value.items():
-            rendered[key] = with_scope_refs(item, scope_refs)
-            ref_key = _ref_key(key) if isinstance(key, str) else None
-            if ref_key is None or ref_key in value:
-                continue
-            if isinstance(item, str) and item in scope_refs:
-                rendered[ref_key] = scope_refs[item]
-            elif (
-                isinstance(item, (list, tuple))
-                and item
-                and all(isinstance(element, str) for element in item)
-                and any(element in scope_refs for element in item)
-            ):
-                rendered[ref_key] = type(item)(
-                    scope_refs.get(element) for element in item
-                )
-        return rendered
+        return {
+            (_name_key(key) if isinstance(key, str) else key): with_scope_names(
+                item, scope_names
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
-        return type(value)(with_scope_refs(item, scope_refs) for item in value)
+        return type(value)(with_scope_names(item, scope_names) for item in value)
+    if isinstance(value, str) and _IDENTITY_VALUE.match(value):
+        return scope_names.get(value)
     return value
 
 

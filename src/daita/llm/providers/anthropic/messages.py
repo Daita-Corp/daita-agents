@@ -26,7 +26,7 @@ def _message_input(
     messages: tuple[CanonicalMessage, ...],
     provider_id: str,
     result_refs: Mapping[str, str] | None = None,
-    scope_refs: Mapping[str, str] | None = None,
+    scope_names: Mapping[str, str] | None = None,
 ) -> tuple[str | None, list[dict[str, object]]]:
     system_parts: list[str] = []
     provider_messages: list[dict[str, object]] = []
@@ -80,7 +80,7 @@ def _message_input(
                             model_tool_result(
                                 block,
                                 (result_refs or {}).get(block.call_id),
-                                scope_refs,
+                                scope_names,
                             )
                         ),
                         "is_error": block.is_error,

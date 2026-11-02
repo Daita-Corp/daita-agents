@@ -442,7 +442,7 @@ class AnthropicMessagesProvider:
             request.messages,
             self.provider_id,
             request.tool_result_refs,
-            request.scope_refs,
+            request.scope_names,
         )
         arguments: dict[str, object] = {
             "model": self.model,

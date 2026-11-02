@@ -229,10 +229,6 @@ async def test_several_statements_share_one_row_budget_and_report_each(
             "sql_invalid_input",
         ),
         (
-            {"statements": ({"sql": "SELECT 1 FROM table_02"},)},
-            "sql_resource_target_mismatch",
-        ),
-        (
             {
                 "statements": (
                     {"sql": "SELECT 1 FROM table_02"},

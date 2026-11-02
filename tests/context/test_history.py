@@ -930,7 +930,7 @@ async def test_catalog_queries_keep_current_and_most_recent_prior_user_separate(
         "fresh source/tool evidence outrank stale historical claims" in system_text.text
     )
     assert (
-        "use its resource_id directly. Reuse authenticated current structure and "
+        "use its table name directly. Reuse authenticated current structure and "
         "values where sufficient" in system_text.text
     )
 

@@ -85,7 +85,7 @@ SEMANTIC_DELETE_OUTPUT_KIND = "semantic.deleted"
 # semantic_save routes action=save (default) to semantic.save and
 # action=delete to semantic.delete, each with its own approval.
 SEMANTIC_VIEW_DESCRIPTION = (
-    "Without id, list annotations (filter by source_id, resource_id, kind, "
+    "Without id, list annotations (filter by source, table, kind, "
     "limit); list before creating a duplicate. With id, load one annotation and "
     "current_sha256 before replacing, superseding, deleting or revalidating it. "
     "maintenance.state says whether its statement is current meaning; stale, "
@@ -97,7 +97,7 @@ SEMANTIC_SAVE_DESCRIPTION = (
     "the sole approval card. Use only for explicit user assertions or validated "
     "tool results: evidence kind tool_result names the result_ref of an earlier "
     "step; the runtime binds run and position. Global definitions belong in "
-    "MEMORY.md. Needs current catalog IDs and fields; Daita binds their "
+    "MEMORY.md. Needs current catalog table names and fields; Daita binds their "
     "revisions. To replace, supersede or action=delete, semantic_view the "
     "annotation earlier in this run; Daita binds that version."
 )
@@ -1472,7 +1472,7 @@ def semantic_declarations(
                 "binds the exact current run ID and transcript message position. "
                 "Never invent transcript IDs or positions. Tool-result evidence must "
                 "come from an earlier completed tool step in this run. "
-                "Global definitions belong in MEMORY.md. Current catalog IDs and "
+                "Global definitions belong in MEMORY.md. Current catalog table names and "
                 "fields are required; the runtime binds their current revisions. "
                 "Replacement and supersession need an earlier semantic_view of the "
                 "target in this run, whose version the runtime binds."

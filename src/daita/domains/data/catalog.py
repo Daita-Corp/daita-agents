@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from hashlib import sha256
 from typing import Protocol
 
@@ -179,6 +180,16 @@ class CatalogDataView:
 
         resources = await self._admitted_resources(agent_id, source_ids)
         return frozenset(resource.id for resource in resources)
+
+    async def resource_names(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> Mapping[str, str]:
+        """Map each current readable resource ID to the native name the model uses."""
+
+        resources = await self._admitted_resources(agent_id, source_ids)
+        return {resource.id: resource.native_identity for resource in resources}
 
     async def admitted_model_sensitivity(
         self,

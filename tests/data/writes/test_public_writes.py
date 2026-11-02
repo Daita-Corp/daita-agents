@@ -190,17 +190,17 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
                 if isinstance(block, ToolResultBlock) and block.call_id == "write"
             )
             if review_action in {"short_id", "unknown_id"}:
+                # A garbled ID is just a table name nothing in scope has.
                 assert write.is_error
                 error = write.output["error"]
                 assert isinstance(error, Mapping)
-                if review_action == "short_id":
-                    assert error["code"] == "invalid_arguments"
-                    assert error["details"]["issues"][0]["code"] == (
-                        "invalid_argument_value"
-                    )
-                else:
-                    assert error["code"] == "resource_read_not_allowed"
-                    assert "without shortening" in str(error["message"])
+                # A shortened ID is a name nothing in scope has; a full-length
+                # ID that names nothing is refused by the read gate.
+                assert error["code"] == (
+                    "table_unknown"
+                    if review_action == "short_id"
+                    else "resource_read_not_allowed"
+                )
                 assert resource.id not in canonical_json(error)
                 return response(text="The exact target is unresolved; no change made.")
             return response(text="Report the exact returned effect evidence.")
@@ -310,13 +310,13 @@ def script(
     research_name = binding.tools[0].local_name
 
     def named(request: ModelRequest) -> dict[str, object]:
-        # With handles, the model names the table by its run-scoped refs.
+        # By name, the model addresses the table as the request renders it.
         if not handles:
             return dict(batch)
         return {
-            **batch,
-            "source_id": request.scope_refs[batch["source_id"]],
-            "resource_id": request.scope_refs[batch["resource_id"]],
+            **{k: v for k, v in batch.items() if k not in ("source_id", "resource_id")},
+            "source": request.scope_names[batch["source_id"]],
+            "table": request.scope_names[batch["resource_id"]],
         }
 
     def upsert(call_id: str, **extra: object):
@@ -492,7 +492,7 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         assert approval_document is not None
         assert set(approval_document["target"]) == TARGET_KEYS
         assert set(approval_document["preview"]) == UPSERT_PREVIEW_KEYS
-        # The model named the table by handles; the executed record carries
+        # The model named the table by name; the executed record carries
         # the full identities the approval reviewed, in the tool's own shape.
         raw_write = next(
             call
@@ -500,7 +500,8 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
             for call in message.tool_calls
             if call.id == "write"
         )
-        assert raw_write.arguments["source_id"] != batch["source_id"]
+        assert raw_write.arguments["source"] == "Company research"
+        assert "source_id" not in raw_write.arguments
         write_call = next(
             call
             for call, _ in await agent.tool_evidence(result.run_id)

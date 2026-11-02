@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, tzinfo
@@ -41,7 +40,6 @@ from .models import (
 from .schedule import validate_schedule
 from .temporal import next_weekday_utc, system_user_timezone
 
-_SCOPE_REF_TOKEN = re.compile(r"\b[st][1-9][0-9]*\b")
 MAX_RELATIVE_SCHEDULE_SECONDS = 30 * 24 * 60 * 60
 SCHEDULE_KEYS = {
     "once": frozenset({"exact_at", "after_seconds"}),
@@ -304,7 +302,6 @@ class RoutineOwner:
         refs: ScopeRefs | None = None
         if origin_run_id is not None:
             origin = await self._store.load(origin_run_id)
-            _reject_scope_refs(prompt, origin)
             # The model names sources by the s# handles its own run shows it.
             refs = scope_refs(origin.run.resolved_source_scope)
         relative = isinstance(intent.schedule, FrozenJsonObject) and bool(
@@ -860,26 +857,6 @@ def _integers(values: Mapping[str, object], name: str) -> tuple[int, ...]:
             "routine_schedule_invalid", f"{name} must be an integer array."
         )
     return tuple(value)
-
-
-def _reject_scope_refs(instruction: str, origin: Transcript) -> None:
-    """Refuse run-local s#/t# handles that a later scheduled run would renumber."""
-
-    issued = scope_refs(origin.run.resolved_source_scope).ids
-    named = sorted(
-        {item for item in _SCOPE_REF_TOKEN.findall(instruction) if item in issued}
-    )
-    if named:
-        raise RoutineError(
-            "routine_instruction_scope_ref",
-            f"prompt names this run's handles {', '.join(named)}, "
-            "which later runs number differently.",
-            ToolRecovery(
-                RecoveryKind.CORRECT_ARGUMENTS,
-                "Name each source or resource in prompt by its catalog name or full "
-                "id: " + "; ".join(f"{item} is {issued[item]}" for item in named) + ".",
-            ),
-        )
 
 
 __all__ = [
