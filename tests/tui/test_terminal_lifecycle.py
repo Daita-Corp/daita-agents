@@ -247,10 +247,13 @@ def test_real_pty_normal_exit_restores_alternate_screen():
                 os.write(master, b"\x1b")
                 escape_sent = True
         return_code = process.wait(timeout=3)
-        while True:
-            readable, _, _ = select.select([master], [], [], 0)
+        # The child's last writes can still be crossing the pty after it exits,
+        # so read to end of file rather than only what is ready right now.
+        drain_deadline = time.monotonic() + 5
+        while time.monotonic() < drain_deadline:
+            readable, _, _ = select.select([master], [], [], 0.1)
             if not readable:
-                break
+                continue
             try:
                 chunk = os.read(master, 65_536)
             except OSError:
