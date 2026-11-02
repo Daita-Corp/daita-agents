@@ -1,4 +1,4 @@
-"""Static foreground discovery and logical-delivery read capabilities."""
+"""Static foreground logical-delivery read capabilities."""
 
 from __future__ import annotations
 
@@ -8,11 +8,8 @@ from dataclasses import dataclass
 from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
-    AutomationEligibility,
-    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
-    CapabilityInputError,
     Executor,
     ToolboxId,
     ToolExecution,
@@ -29,21 +26,17 @@ from .models import (
     MAX_DELIVERY_LIST_PAGE_SIZE,
     delivery_inspection_projection,
     delivery_view_projection,
-    distribution_destination_projection,
 )
 from .owner import DistributionOwner
 
 DISTRIBUTION_DOMAIN_OWNER_ID = "distribution"
 
-DISTRIBUTION_DESTINATION_LIST_CAPABILITY_ID = "distribution.destination.list"
 DELIVERY_LIST_CAPABILITY_ID = "distribution.delivery.list"
 DELIVERY_INSPECT_CAPABILITY_ID = "distribution.delivery.inspect"
 
-DISTRIBUTION_DESTINATION_LIST_EXECUTOR_ID = "distribution.destination.list.executor"
 DELIVERY_LIST_EXECUTOR_ID = "distribution.delivery.list.executor"
 DELIVERY_INSPECT_EXECUTOR_ID = "distribution.delivery.inspect.executor"
 
-DISTRIBUTION_DESTINATION_LIST_TOOL_NAME = "distribution_destination_list"
 DELIVERY_LIST_TOOL_NAME = "delivery_list"
 DELIVERY_INSPECT_TOOL_NAME = "delivery_inspect"
 
@@ -53,40 +46,6 @@ class DistributionCapabilityDeclarations:
     capabilities: tuple[Capability, ...]
     executors: tuple[Executor, ...]
     tool_views: tuple[ToolView, ...]
-
-
-class DistributionDestinationListExecutor:
-    executor_id = DISTRIBUTION_DESTINATION_LIST_EXECUTOR_ID
-
-    def __init__(self, owner: DistributionOwner) -> None:
-        self._owner = owner
-
-    async def execute(self, request: ToolExecution) -> ToolOutput:
-        if request.conversation_id is None:
-            raise ValueError(
-                "distribution destination discovery requires a conversation"
-            )
-        raw_sensitivity = request.arguments.get("_request_sensitivity")
-        if not isinstance(raw_sensitivity, str):
-            raise ValueError("distribution request sensitivity is missing")
-        destinations = self._owner.list_destinations(
-            request.conversation_id,
-            sensitivity_ceiling=ModelSensitivity(raw_sensitivity),
-        )
-        return ToolOutput(
-            kind="distribution.destination_list",
-            data={
-                "destinations": [
-                    distribution_destination_projection(item) for item in destinations
-                ],
-                "count": len(destinations),
-            },
-            sensitivity=ModelSensitivity.PUBLIC,
-            sensitivity_provenance={
-                "authority": "distribution_owner_destination_projection",
-                "agent_id": self._owner.agent_id,
-            },
-        )
 
 
 class DeliveryListExecutor:
@@ -194,28 +153,10 @@ class DistributionCapabilityDomain:
         *,
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
-        del call
+        del call, capability, request_sensitivity
         if run.agent_id != self._owner.agent_id or run.origin is not RunOrigin.USER:
             raise ValueError("distribution_foreground_required")
-        if capability.id == DISTRIBUTION_DESTINATION_LIST_CAPABILITY_ID:
-            if run.conversation_id is None:
-                raise ValueError("distribution_conversation_required")
-            prepared = arguments.to_dict()
-            prepared["_request_sensitivity"] = request_sensitivity.value
-            return FrozenJsonObject.from_mapping(prepared)
         return arguments
-
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject:
-        raise CapabilityInputError(
-            "automation_grant_unsupported",
-            "This domain does not admit unattended external effects.",
-        )
 
     async def side_effect_plan(
         self,
@@ -260,24 +201,6 @@ def distribution_capability_declarations(
 ) -> DistributionCapabilityDeclarations:
     capabilities = (
         Capability(
-            id=DISTRIBUTION_DESTINATION_LIST_CAPABILITY_ID,
-            description=(
-                "List exact currently selectable distribution destinations for "
-                "this foreground conversation. A destination receives Daita "
-                "reports; it is never a connector tool's target argument."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False,
-            },
-            output_kind="distribution.destination_list",
-            output_schema=_list_output_schema("destinations"),
-            executor_id=DISTRIBUTION_DESTINATION_LIST_EXECUTOR_ID,
-            access_mode=AccessMode.NONE,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
-        ),
-        Capability(
             id=DELIVERY_LIST_CAPABILITY_ID,
             description="List bounded logical deliveries owned by this agent.",
             input_schema={
@@ -301,7 +224,6 @@ def distribution_capability_declarations(
             output_schema=_list_output_schema("deliveries"),
             executor_id=DELIVERY_LIST_EXECUTOR_ID,
             access_mode=AccessMode.NONE,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
         Capability(
             id=DELIVERY_INSPECT_CAPABILITY_ID,
@@ -329,22 +251,13 @@ def distribution_capability_declarations(
             },
             executor_id=DELIVERY_INSPECT_EXECUTOR_ID,
             access_mode=AccessMode.NONE,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
     )
     executors: tuple[Executor, ...] = (
-        DistributionDestinationListExecutor(owner),
         DeliveryListExecutor(owner),
         DeliveryInspectExecutor(owner),
     )
     by_id = {
-        DISTRIBUTION_DESTINATION_LIST_CAPABILITY_ID: (
-            DISTRIBUTION_DESTINATION_LIST_TOOL_NAME,
-            "Discover exact current Inbox destinations.",
-            "Use before proposing a routine distribution plan.",
-            ("distribution", "destination", "inbox"),
-            ToolLoadMode.PINNED,
-        ),
         DELIVERY_LIST_CAPABILITY_ID: (
             DELIVERY_LIST_TOOL_NAME,
             "List logical deliveries owned by this agent.",
@@ -406,9 +319,6 @@ __all__ = [
     "DELIVERY_LIST_CAPABILITY_ID",
     "DELIVERY_LIST_EXECUTOR_ID",
     "DELIVERY_LIST_TOOL_NAME",
-    "DISTRIBUTION_DESTINATION_LIST_CAPABILITY_ID",
-    "DISTRIBUTION_DESTINATION_LIST_EXECUTOR_ID",
-    "DISTRIBUTION_DESTINATION_LIST_TOOL_NAME",
     "DISTRIBUTION_DOMAIN_OWNER_ID",
     "DistributionCapabilityDeclarations",
     "DistributionCapabilityDomain",

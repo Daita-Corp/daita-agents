@@ -18,8 +18,6 @@ def _confirm(host: Host, agent: str) -> object:
 TABLE = (
     Route("GET", "/routines", "list_routines"),
     Route("POST", "/routines", "create_routine", work=True, callback=_confirm),
-    Route("POST", "/routines/proposals", "propose_routine"),
-    Route("POST", "/routines/promotions", "promote_routine", work=True),
     Route("GET", "/routines/{routine_id}", "inspect_routine"),
     Route(
         "PUT", "/routines/{routine_id}", "update_routine", work=True, callback=_confirm

@@ -11,9 +11,14 @@ Rules for the human-facing controls built on the public `Agent` API.
 
 CLI and TUI routine inspection reuse the routine domain's current projections.
 Approval summaries derive only from the exact validated request and retain its
-complete bounded details. An explicit `confirmation_handler` reviews direct routine
-create/update controls before mutation; typed Python callers without that callback
-remain the authorizing owner. CLI create/update supplies this callback. Approval cannot grant missing connector permission.
+complete bounded details. Creating or updating a routine shows one confirm card,
+from the model tool, the CLI or the Python API alike: title, schedule in the
+person's local time, prompt and sources (or all current sources). Relative timing
+on the card is marked as counting from approval, and the save after approval
+resolves it then. An explicit `confirmation_handler` shows that card for direct
+`Agent.create_routine`/`update_routine` calls; typed Python callers without that
+callback remain the authorizing owner. CLI create/update supplies this callback.
+Approval cannot grant missing connector permission.
 
 Native approval documents contain the exact execution `arguments`, catalog-backed
 `target`, and bounded `preview` review facts. The data domain reuses its existing
@@ -22,9 +27,9 @@ remain separate from review labels and samples. The runtime still approves and
 rechecks one exact plan before reserving an effect. A positive count alone does not
 prove the selected business entity; there is no second target authorization record.
 
-Model-authored routine creation requires an explicit `run_immediately` boolean.
-Model-authored updates accept omission or false and reject true; typed owner defaults
-remain false. Immediate creation and later run-now use the existing owner/supervisor.
+`run_immediately` is optional and false by default; it adds one occurrence at
+creation for an interval or calendar schedule. An update rejects it; run-now
+covers an existing routine. Both use the existing owner and supervisor.
 
 The source permission editor authors one exact table scope through existing
 preview/apply APIs. Catalog-backed column/key choices are presentation, not a

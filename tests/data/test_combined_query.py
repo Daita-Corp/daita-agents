@@ -725,15 +725,15 @@ async def test_combining_sql_outside_the_input_aliases_is_rejected_before_execut
     [
         (
             {"filters": ({"column": "region", "operator": "ne", "value": "north"},)},
-            "invalid_argument_value",
+            "invalid_arguments",
         ),
         (
             {"filters": ({"column": "region", "operator": "like", "value": "n%"},)},
-            "invalid_argument_value",
+            "invalid_arguments",
         ),
         (
             {"filters": ({"column": "region", "operator": "is_null", "value": True},)},
-            "invalid_argument_value",
+            "invalid_arguments",
         ),
         (
             {"filters": ({"column": "region", "operator": "in", "value": "north"},)},

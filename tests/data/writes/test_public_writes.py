@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
-from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -13,26 +12,19 @@ import pytest
 from daita import (
     CalendarDaySelector,
     CalendarSchedule,
-    EffectRequirement,
-    MisfirePolicy,
-    ReportingMode,
-    RequestedCapabilityGrant,
-    ScheduledRoutineDraft,
+    RoutineIntent,
 )
-from daita._json import FrozenJsonObject, canonical_json
+from daita._json import canonical_json
 from daita.adapters import postgresql_write as native
 from daita.capabilities import (
     ApprovalDecision,
     CallTargetLane,
-    CapabilityInputError,
     EffectEvidenceBasis,
     EffectOutcome,
 )
 from daita.capability_runtime import APPROVED_TARGET_CHANGED
 from daita.distribution.models import OutcomeState
-from daita.jobs.graph.admission import START_GRAPH_JOB_TOOL_NAME
-from daita.jobs.graph.capabilities import TASK_COMPLETE_TOOL_NAME
-from daita.jobs.graph.models import GraphState
+from daita.jobs import JobState
 from daita.llm.models import (
     MessageRole,
     ModelRequest,
@@ -49,9 +41,8 @@ from tests.support.data_write_approval import (
     UPSERT_PREVIEW_KEYS,
     data_write_approval,
 )
-from tests.support.distribution import no_artifact_outcome_contract
+from tests.support.jobs import wait_for_job
 from tests.support.native_writes import (
-    NOW,
     ScriptedResearchModel,
     create_fixture,
     response,
@@ -191,42 +182,30 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
             "assignments": ({"column": "name", "value": "Updated"},),
         }
 
-        def apply(request):
-            preview = next(
+        def report(request):
+            write = next(
                 block
                 for message in request.messages
                 for block in message.content
-                if isinstance(block, ToolResultBlock) and block.call_id == "preview"
+                if isinstance(block, ToolResultBlock) and block.call_id == "write"
             )
             if review_action in {"short_id", "unknown_id"}:
-                assert preview.is_error
-                error = preview.output["error"]
+                assert write.is_error
+                error = write.output["error"]
                 assert isinstance(error, Mapping)
-                assert error["code"] == (
-                    "invalid_argument_value"
-                    if review_action == "short_id"
-                    else "resource_read_not_allowed"
-                )
-                if review_action == "unknown_id":
+                if review_action == "short_id":
+                    assert error["code"] == "invalid_arguments"
+                    assert error["details"]["issues"][0]["code"] == (
+                        "invalid_argument_value"
+                    )
+                else:
+                    assert error["code"] == "resource_read_not_allowed"
                     assert "without shortening" in str(error["message"])
                 assert resource.id not in canonical_json(error)
                 return response(text="The exact target is unresolved; no change made.")
-            assert not preview.is_error, preview.output
-            data = preview.output["data"]
-            assert isinstance(data, Mapping)
-            return response(
-                ToolCall(
-                    id="write",
-                    name="data_update_rows",
-                    arguments={
-                        **arguments,
-                        "mode": "apply",
-                        "preview_fingerprint": data["preview_fingerprint"],
-                        "expected_affected_rows": data["matched_rows"],
-                    },
-                )
-            )
+            return response(text="Report the exact returned effect evidence.")
 
+        # One call: Daita previews on the approval card and writes once.
         provider.replace_script(
             [
                 response(
@@ -237,14 +216,9 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
                     )
                 ),
                 response(
-                    ToolCall(
-                        id="preview",
-                        name="data_update_rows",
-                        arguments={**arguments, "mode": "preview"},
-                    )
+                    ToolCall(id="write", name="data_update_rows", arguments=arguments)
                 ),
-                apply,
-                response(text="Report the exact returned effect evidence."),
+                report,
             ]
         )
         result = await agent.run(
@@ -273,19 +247,14 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
         assert approval_document is not None
         assert set(approval_document["target"]) == TARGET_KEYS
         assert set(approval_document["preview"]) == UPDATE_PREVIEW_KEYS
-        assert (
-            approval_document["arguments"]["expected_affected_rows"]
-            == approval_document["preview"]["matched_rows"]
-        )
+        assert approval_document["preview"]["matched_rows"] == 1
         call = next(
             call
             for message in transcript.messages
             for call in message.tool_calls
-            if call.name == "data_update_rows" and call.arguments["mode"] == "apply"
+            if call.id == "write"
         )
-        assert dict(approval.arguments["arguments"]) == {
-            key: value for key, value in call.arguments.items() if key != "mode"
-        }
+        assert dict(approval.arguments["arguments"]) == dict(call.arguments)
         document, reviewable = approval_review_document(
             tool_name=approval.tool_name,
             capability_id=approval.capability_id,
@@ -350,32 +319,13 @@ def script(
             "resource_id": request.scope_refs[batch["resource_id"]],
         }
 
-    def apply(request):
-        previews = [
-            block
-            for message in request.messages
-            for block in message.content
-            if isinstance(block, ToolResultBlock)
-            and block.capability_id == "data.preview_upsert_rows"
-            and not block.is_error
-        ]
-        assert previews, [
-            block.output
-            for message in request.messages
-            for block in message.content
-            if isinstance(block, ToolResultBlock)
-        ]
-        data = previews[-1].output["data"]
-        assert isinstance(data, Mapping)
-        return response(
+    def upsert(call_id: str, **extra: object):
+        # A write is one call; mode=preview only shows the classification.
+        return lambda request: response(
             ToolCall(
-                id="write",
+                id=call_id,
                 name="data_upsert_rows",
-                arguments={
-                    **named(request),
-                    "mode": "apply",
-                    "preview_fingerprint": data["preview_fingerprint"],
-                },
+                arguments={**named(request), **extra},
             )
         )
 
@@ -401,13 +351,7 @@ def script(
                 },
             )
         ),
-        lambda request: response(
-            ToolCall(
-                id="preview",
-                name="data_upsert_rows",
-                arguments={**named(request), "mode": "preview"},
-            )
-        ),
+        upsert("write") if write else upsert("preview", mode="preview"),
     ]
     if schema:
         steps.insert(
@@ -420,26 +364,8 @@ def script(
                 )
             ),
         )
-    if write:
-        steps.append(apply)
     if duplicate:
-        steps.append(
-            response(
-                ToolCall(
-                    id="preview-again",
-                    name="data_upsert_rows",
-                    arguments={**batch, "mode": "preview"},
-                )
-            )
-        )
-
-        def repeat(request):
-            result = apply(request)
-            return replace(
-                result, tool_calls=(replace(result.tool_calls[0], id="write-again"),)
-            )
-
-        steps.append(repeat)
+        steps.append(upsert("write-again"))
     steps.append(
         response(
             text="Research found one reported relationship with Acme, based on one cited source. Coverage is incomplete; transaction evidence establishes storage, not truth of the researched claim."
@@ -580,7 +506,8 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
             for call, _ in await agent.tool_evidence(result.run_id)
             if call.id == "write"
         )
-        assert write_call.arguments["mode"] == "apply"
+        # The write was one call with mode omitted: apply is the default.
+        assert "mode" not in write_call.arguments
         assert write_call.arguments["source_id"] == batch["source_id"]
         assert write_call.arguments["resource_id"] == batch["resource_id"]
         assert dict(approval.arguments["arguments"]) == {
@@ -607,6 +534,53 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         assert "Connection: Company research" in document
         assert "Preview: 1 insert, 0 update, 0 unchanged" in document
         assert "Exact validated details:" in document
+    finally:
+        await agent.close()
+
+
+async def test_a_write_above_the_target_classification_is_refused_before_dispatch(
+    tmp_path, monkeypatch
+):
+    from daita.catalog.models import Sensitivity
+
+    (
+        agent,
+        provider,
+        db,
+        research,
+        binding,
+        resource,
+        constraints,
+        batch,
+        clock,
+        approvals,
+    ) = await create_fixture(tmp_path, monkeypatch, sensitivity=Sensitivity.INTERNAL)
+    try:
+        # Restricted context makes the whole request restricted; the internal
+        # target cannot receive it.
+        await agent.set_memory(
+            "A retained private research note.", sensitivity=ModelSensitivity.RESTRICTED
+        )
+        script(provider, binding, batch)
+        result = await agent.run(
+            "Research companies doing business with Acme and save cited findings now."
+        )
+        transcript = await agent._embedded._store.load(result.run_id)
+        (write,) = (
+            block
+            for message in transcript.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock) and block.call_id == "write"
+        )
+        assert write.is_error
+        error = write.output["error"]
+        assert isinstance(error, Mapping)
+        assert error["code"] == "write_sensitivity_denied"
+        assert not any(item.capability_id == "data.upsert_rows" for item in approvals)
+        assert not db.rows
+        assert not await agent._embedded._store.list_effect_receipts(
+            agent.id, run_id=result.run_id
+        )
     finally:
         await agent.close()
 
@@ -700,11 +674,10 @@ async def test_upsert_evidence_is_derived_from_earlier_reads_of_the_same_table(
         assert not outputs["schema"].is_error
         assert not outputs["research"].is_error
         # Only the authenticated read of the written table is evidence; the
-        # unrelated MCP research read and the write's own preview are not.
-        for call_id in ("preview", "write"):
-            data = outputs[call_id].output["data"]
-            assert isinstance(data, Mapping)
-            assert data["evidence_call_ids"] == ("schema",)
+        # unrelated MCP research read is not.
+        data = outputs["write"].output["data"]
+        assert isinstance(data, Mapping)
+        assert data["evidence_call_ids"] == ("schema",)
         approval = next(
             item for item in approvals if item.capability_id == "data.upsert_rows"
         )
@@ -719,17 +692,15 @@ async def test_upsert_evidence_is_derived_from_earlier_reads_of_the_same_table(
         await agent.close()
 
 
-async def test_exact_native_upsert_runs_once_as_a_preview_bound_graph_task(
-    tmp_path, monkeypatch
-) -> None:
+async def test_exact_native_upsert_runs_once_from_a_job(tmp_path, monkeypatch) -> None:
     (
         agent,
         provider,
         db,
         _research,
         _binding,
-        resource,
-        constraints,
+        _resource,
+        _constraints,
         batch,
         _clock,
         approvals,
@@ -739,73 +710,11 @@ async def test_exact_native_upsert_runs_once_as_a_preview_bound_graph_task(
         limits=LoopLimits(max_estimated_cost_usd=Decimal("10")),
     )
     intent = {key: value for key, value in batch.items() if key != "evidence_call_ids"}
-    grant_constraints = {
-        "source_id": batch["source_id"],
-        "resource_id": resource.id,
-        "resource_revision": resource.current_revision,
-        **{
-            key: value
-            for key, value in constraints.items()
-            if key != "allowed_operations"
-        },
-    }
+    objective = "Apply the exact company upsert once."
 
-    def apply_preview(request: ModelRequest) -> ModelResponse:
-        preview = next(
-            block
-            for message in request.messages
-            for block in message.content
-            if isinstance(block, ToolResultBlock) and block.call_id == "graph-preview"
-        )
-        assert not preview.is_error, preview.output
-        data = preview.output["data"]
-        assert isinstance(data, Mapping)
-        return response(
-            ToolCall(
-                "graph-write",
-                "data_upsert_rows",
-                {
-                    **intent,
-                    "mode": "apply",
-                    "preview_fingerprint": data["preview_fingerprint"],
-                },
-            )
-        )
-
+    # Only the job's main run calls the model; the write is one call.
     provider.replace_script(
         (
-            response(
-                ToolCall(
-                    "load-graph",
-                    "toolbox_load",
-                    {"tool_names": (START_GRAPH_JOB_TOOL_NAME,)},
-                )
-            ),
-            response(
-                ToolCall(
-                    "start-graph",
-                    START_GRAPH_JOB_TOOL_NAME,
-                    {
-                        "objective": "Apply the exact admitted company upsert once.",
-                        "outcome_contract": {"kind": "native_upsert_result"},
-                        "deadline_seconds": 600,
-                        "initial_task": {
-                            "capability_id": "data.upsert_rows",
-                            "arguments": intent,
-                            "expected_result_contract": {
-                                "result_kind": "native_upsert_result"
-                            },
-                            "retained_references": {
-                                "source_ids": (batch["source_id"],),
-                                "resource_ids": (resource.id,),
-                                "connector_binding_ids": (),
-                            },
-                            "effect_grant": {"constraints": grant_constraints},
-                        },
-                    },
-                )
-            ),
-            response(text="The exact grant-backed graph job was admitted."),
             response(
                 ToolCall(
                     "load-write",
@@ -813,74 +722,20 @@ async def test_exact_native_upsert_runs_once_as_a_preview_bound_graph_task(
                     {"tool_names": ("data_upsert_rows",)},
                 )
             ),
-            response(
-                ToolCall(
-                    "graph-preview", "data_upsert_rows", {**intent, "mode": "preview"}
-                )
-            ),
-            apply_preview,
-            response(
-                ToolCall(
-                    "complete-effect-task",
-                    TASK_COMPLETE_TOOL_NAME,
-                    {
-                        "result_kind": "native_upsert_result",
-                        "summary": "Applied the exact previewed company upsert.",
-                        "payload": {"input_count": 1},
-                        "downstream_constraints": {},
-                    },
-                )
-            ),
+            response(ToolCall("job-write", "data_upsert_rows", intent)),
+            response(text="Applied the exact company upsert."),
         )
     )
     try:
-        foreground = await agent.run("Run the exact durable graph upsert.")
-        for _ in range(500):
-            jobs = await agent.list_jobs(limit=5)
-            if jobs and jobs[0].state in {
-                GraphState.SUCCEEDED,
-                GraphState.FAILED,
-                GraphState.NEEDS_ATTENTION,
-            }:
-                break
-            await asyncio.sleep(0.01)
-        assert jobs
-        inspection = await agent.inspect_job(jobs[0].job_id)
-        assert inspection is not None
-        diagnostic: list[object] = []
-        for attempt in inspection.attempts:
-            try:
-                transcript = await agent.transcript(attempt.run_id)
-            except KeyError:
-                continue
-            diagnostic.extend(
-                block.output
-                for message in transcript.messages
-                for block in message.content
-                if isinstance(block, ToolResultBlock)
-            )
-        assert jobs[0].state is GraphState.SUCCEEDED, canonical_json(
-            {
-                "diagnostic": diagnostic,
-                "tasks": [
-                    item.specification.digest_material() for item in inspection.tasks
-                ],
-            }
+        job = await agent.start_job(objective, (batch["source_id"],))
+        current = await wait_for_job(
+            agent, job.job_id, lambda item: item.state is not JobState.RUNNING
         )
-        worker = next(
-            item
-            for item in inspection.tasks
-            if item.task_id != jobs[0].finalizer_task_id
+        assert current.state is JobState.DONE, canonical_json(
+            {"state": current.state.value, "failure": current.failure_code}
         )
-        result = await agent.read_task_result(jobs[0].job_id, worker.task_id)
-        assert result is not None and len(result.effect_receipt_ids) == 1
-        assert result.verification["evidence_call_ids"] == ("graph-write",)
-        assert result.downstream_constraints["effect_completion_evidence"] == (
-            "adapter_verified",
-        )
-        assert result.residual_risk is None
-        receipts = await agent._embedded._store.list_effect_receipts(
-            agent.id, run_id=result.run_id
+        receipts = await agent._embedded._store.job_effect_receipts(
+            agent.id, job.job_id
         )
         assert len(receipts) == 1
         assert receipts[0].outcome is EffectOutcome.SUCCEEDED
@@ -896,9 +751,9 @@ async def test_exact_native_upsert_runs_once_as_a_preview_bound_graph_task(
             )
             == 1
         )
-        assert len(approvals) == 1
-        assert approvals[0].capability_id == "jobs.graph.start"
-        assert foreground.reason == "completed"
+        # The job's write asks at the time, naming the job that asked.
+        assert [item.capability_id for item in approvals] == ["data.upsert_rows"]
+        assert approvals[0].requester == objective
     finally:
         await agent.close()
 
@@ -911,13 +766,6 @@ async def test_exact_native_upsert_runs_once_as_a_preview_bound_graph_task(
         "model_schema",
         "missing_effect",
         "commit_loss",
-        "zero_budget",
-        "two_calls",
-        "two_native",
-        "wrong_key",
-        "row_ceiling",
-        "stale_revision",
-        "insert_column",
     ],
 )
 @pytest.mark.acceptance
@@ -947,25 +795,9 @@ async def test_immediate_and_weekly_research_upsert_production_path(
         origin = await agent.run(
             "Research companies doing business with Acme, save cited findings now, and recheck every Monday. At least one verified write invocation is required."
         )
-        destination = (
-            await agent.distribution_destinations(
-                origin.conversation_id, sensitivity_ceiling=ModelSensitivity.RESTRICTED
-            )
-        )[0]
-        grant_constraints = {
-            "source_id": batch["source_id"],
-            "resource_id": resource.id,
-            "resource_revision": resource.current_revision,
-            **{
-                key: value
-                for key, value in constraints.items()
-                if key != "allowed_operations"
-            },
-        }
-        draft = ScheduledRoutineDraft(
-            origin_run_id=origin.run_id,
+        intent = RoutineIntent(
             title="Acme relationship research",
-            authorized_instruction="Research reported company relationships with Acme using the admitted research tool; preserve evidence URLs and describe source coverage. Preview and upsert one bounded batch into the exact companies target. A verified upsert invocation is required; no findings must report the missing effect.",
+            prompt="Research reported company relationships with Acme using the admitted research tool; preserve evidence URLs and describe source coverage. Preview and upsert one bounded batch into the exact companies target. If there are no findings, report that nothing was written.",
             schedule=CalendarSchedule(
                 timezone="America/Chicago",
                 hour=9,
@@ -973,99 +805,9 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                 day_selector=CalendarDaySelector.WEEKDAYS,
                 weekdays=(1,),
             ),
-            misfire_policy=MisfirePolicy.LATEST_ONLY,
-            reporting_mode=ReportingMode.ALWAYS,
-            precheck=None,
-            allowed_source_ids=(batch["source_id"],),
-            allowed_resource_ids=(resource.id,),
-            allowed_connector_binding_ids=(binding.binding_id,),
-            allowed_capability_ids=(
-                binding.tools[0].capability_id,
-                "data.preview_upsert_rows",
-                "data.upsert_rows",
-                *(
-                    ("catalog.describe",)
-                    if mode in {"natural_schema", "model_schema"}
-                    else ()
-                ),
-            ),
-            sensitivity_ceiling=ModelSensitivity.RESTRICTED,
-            outcome_contract=replace(
-                no_artifact_outcome_contract(sensitivity=ModelSensitivity.RESTRICTED),
-                effect_requirements=(
-                    EffectRequirement(
-                        "data.upsert_rows",
-                        1,
-                        frozenset({EffectEvidenceBasis.ADAPTER_VERIFIED}),
-                    ),
-                ),
-            ),
-            distribution_destination_id=destination.destination_id,
-            eligible_model_routes=(provider.provider_id,),
-            per_run_max_tokens=8000,
-            per_run_max_cost_usd=(
-                Decimal("0") if mode == "zero_budget" else Decimal("1")
-            ),
-            cumulative_max_tokens=40000,
-            cumulative_max_cost_usd=Decimal("5"),
-            cumulative_max_attempts=5,
-            cumulative_max_occurrences=5,
-            maximum_consecutive_failures=3,
-            expires_at=NOW + timedelta(days=30),
+            sources=(batch["source_id"],),
             run_immediately=True,
-            requested_capability_grants=(
-                RequestedCapabilityGrant(
-                    "data.upsert_rows",
-                    FrozenJsonObject.from_mapping(grant_constraints),
-                    1,
-                ),
-            ),
         )
-        if mode in {
-            "two_calls",
-            "two_native",
-            "wrong_key",
-            "row_ceiling",
-            "stale_revision",
-            "insert_column",
-        }:
-            bad = dict(grant_constraints)
-            if mode == "wrong_key":
-                bad["key_columns"] = ("id",)
-            elif mode == "row_ceiling":
-                bad["max_rows"] = 11
-            elif mode == "stale_revision":
-                bad["resource_revision"] = "sha256:" + "0" * 64
-            elif mode == "insert_column":
-                bad["allowed_insert_columns"] = (
-                    *bad["allowed_insert_columns"],
-                    "notes",
-                )
-            draft = replace(
-                draft,
-                allowed_capability_ids=(
-                    (*draft.allowed_capability_ids, "data.update_rows")
-                    if mode == "two_native"
-                    else draft.allowed_capability_ids
-                ),
-                requested_capability_grants=(
-                    RequestedCapabilityGrant(
-                        "data.upsert_rows",
-                        FrozenJsonObject.from_mapping(bad),
-                        2 if mode == "two_calls" else 1,
-                    ),
-                ),
-            )
-            with pytest.raises(CapabilityInputError) as error:
-                await agent.propose_routine(draft)
-            assert error.value.code in {
-                "automation_grant_scope_invalid",
-                "automation_grant_unsupported",
-            }
-            assert not await agent.list_routines()
-            assert not db.rows and not research.calls
-            return
-        proposal = await agent.propose_routine(draft)
         script(
             provider,
             binding,
@@ -1077,43 +819,19 @@ async def test_immediate_and_weekly_research_upsert_production_path(
         if mode == "commit_loss":
             db.commit_error = ConnectionError("commit response lost")
         if mode == "model_schema":
-            from daita.routines.capabilities import _spec_schema
-            from daita.routines.owner import _routine_proposal_payload
-
-            properties = _spec_schema(update=False)["properties"]
-            assert isinstance(properties, Mapping)
             arguments = {
-                key: value
-                for key, value in _routine_proposal_payload(proposal).items()
-                if key in properties and value is not None
+                "title": intent.title,
+                "prompt": intent.prompt,
+                "schedule": {
+                    "kind": "calendar",
+                    "timezone": "America/Chicago",
+                    "hour": 9,
+                    "minute": 0,
+                    "weekdays": [1],
+                },
+                "sources": [batch["source_id"]],
+                "run_immediately": True,
             }
-            arguments.update(
-                skill_names=[],
-                distribution_destination_id=destination.destination_id,
-                requested_capability_grants=[
-                    {
-                        "capability_id": "data.upsert_rows",
-                        "constraints": grant_constraints,
-                        "max_calls_per_occurrence": 1,
-                    }
-                ],
-            )
-
-            def correct_route(request):
-                errors = [
-                    block
-                    for message in request.messages
-                    for block in message.content
-                    if isinstance(block, ToolResultBlock)
-                    and block.call_id == "invalid-route"
-                ]
-                assert len(errors) == 1 and errors[0].is_error
-                error = errors[0].output["error"]
-                assert isinstance(error, Mapping)
-                assert error["code"] == "routine_model_route_revoked"
-                system = canonical_json(request.messages[0].content[0].text)
-                assert provider.provider_id in system
-                return response(ToolCall("create", "routine_save", arguments))
 
             def authoring_complete(request):
                 created = [
@@ -1137,14 +855,7 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                             {"tool_names": ["routine_save"]},
                         )
                     ),
-                    response(
-                        ToolCall(
-                            "invalid-route",
-                            "routine_save",
-                            {**arguments, "eligible_model_routes": ["current"]},
-                        )
-                    ),
-                    correct_route,
+                    response(ToolCall("create", "routine_save", arguments)),
                     authoring_complete,
                 )
             )
@@ -1158,18 +869,22 @@ async def test_immediate_and_weekly_research_upsert_production_path(
             inspection = await agent.inspect_routine(routines[0].routine_id)
             assert inspection is not None
             routine = inspection.routine
-            assert set(routine.allowed_capability_ids) == set(
-                draft.allowed_capability_ids
-            )
+            assert routine.source_ids == (batch["source_id"],)
         else:
-            routine = await agent.create_routine(proposal)
+            routine = await agent.create_routine(
+                intent, conversation_id=origin.conversation_id
+            )
         delivery = await wait_delivery(agent, origin.conversation_id, 1)
         assert delivery is not None
         inspection = await agent.inspect_routine(routine.routine_id)
         assert inspection is not None
         occurrence = inspection.recent_occurrences[0]
         assert occurrence.reserved_run_id is not None
-        if mode in {"success", "natural_schema", "model_schema"}:
+        if mode == "missing_effect":
+            # No write is a completed run that reports it; nothing was written.
+            assert delivery.delivery.outcome.conclusion_state is OutcomeState.SUCCEEDED
+            assert not occurrence.effect_receipt_ids and not db.rows
+        elif mode in {"success", "natural_schema", "model_schema"}:
             transcript = await agent._embedded._store.load(occurrence.reserved_run_id)
             assert (
                 delivery.delivery.outcome.conclusion_state is OutcomeState.SUCCEEDED
@@ -1209,7 +924,7 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                 unchanged_counts.append(count)
             assert sorted(unchanged_counts) == [0, 1]
             assert len(research.calls) == 2
-            for request in provider.requests[(5 if mode == "model_schema" else 1) :]:
+            for request in provider.requests[(4 if mode == "model_schema" else 1) :]:
                 system = "\n".join(
                     block.text
                     for message in request.messages
@@ -1218,13 +933,8 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                     if isinstance(block, TextBlock)
                 )
                 assert "Routine authoring facts" not in system
-                if mode == "success":
-                    assert "catalog_describe" not in {
-                        tool.name for tool in request.tools
-                    }
-                    assert "Missing structure is unknown" in system
-                else:
-                    assert "catalog_describe" in {tool.name for tool in request.tools}
+                # Scope is built at run start, so every run can describe its tables.
+                assert "catalog_describe" in {tool.name for tool in request.tools}
             inspection = await agent.inspect_routine(routine.routine_id)
             assert inspection is not None
             assert (
@@ -1250,8 +960,9 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                     for block in results
                     if block.capability_id == "data.upsert_rows"
                 ]
-                assert len(previews) == len(writes) == 1
-                assert not previews[0].is_error and not writes[0].is_error
+                # One call writes; no separate preview step.
+                assert not previews and len(writes) == 1
+                assert not writes[0].is_error
                 schemas = [
                     block
                     for block in results
@@ -1275,31 +986,22 @@ async def test_immediate_and_weekly_research_upsert_production_path(
             assert (
                 delivery.delivery.outcome.conclusion_state is not OutcomeState.SUCCEEDED
             )
-            if mode in {"missing_effect", "zero_budget"}:
-                if mode == "zero_budget":
-                    terminal = await agent._embedded._store.result(
-                        occurrence.reserved_run_id
-                    )
-                    assert terminal is not None
-                    assert terminal.reason == "cost_limit_reached"
-                assert not occurrence.effect_receipt_ids and not db.rows
-            else:
-                assert len(occurrence.effect_receipt_ids) == 1
-                assert db.rows["new.test"]["name"] == "New Co"
-                assert (
-                    len(
-                        [
-                            item
-                            for item in db.log
-                            if item[0] == "fetch" and item[1].startswith("INSERT")
-                        ]
-                    )
-                    == 1
+            assert len(occurrence.effect_receipt_ids) == 1
+            assert db.rows["new.test"]["name"] == "New Co"
+            assert (
+                len(
+                    [
+                        item
+                        for item in db.log
+                        if item[0] == "fetch" and item[1].startswith("INSERT")
+                    ]
                 )
-                with pytest.raises((ValueError, RuntimeError)):
-                    await agent.run_routine_now(
-                        routine.routine_id, expected_revision=routine.revision
-                    )
+                == 1
+            )
+            with pytest.raises((ValueError, RuntimeError)):
+                await agent.run_routine_now(
+                    routine.routine_id, expected_revision=routine.revision
+                )
     finally:
         await agent.close()
 

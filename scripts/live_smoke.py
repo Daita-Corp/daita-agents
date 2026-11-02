@@ -74,6 +74,7 @@ _PHASE_F = {
     "DAITA_PHASE_F_LIVE_PROFILE": "user_flow",
 }
 _POSTGRES = {"DAITA_RUN_POSTGRES_LIVE_LLM": "1"}
+_JOBS = {"DAITA_RUN_LIVE_JOBS": "1"}
 
 # The single smoke list: one representative case per live suite.
 CASES: tuple[SmokeCase, ...] = (
@@ -96,12 +97,6 @@ CASES: tuple[SmokeCase, ...] = (
         {"DAITA_RUN_LIVE_DATA_OPERATIONS": "1"},
     ),
     SmokeCase(
-        "acceptance/l8_graph",
-        "tests/live/acceptance/test_result_refs.py::"
-        "test_l8_graph_task_complete_cites_its_read[0]",
-        {"DAITA_RUN_LIVE_RESULT_REFS": "1"},
-    ),
-    SmokeCase(
         "mcp/reads",
         "tests/live/mcp/test_read_workflows.py::"
         "test_live_dependent_reads_discover_tools_and_bind_returned_account"
@@ -115,16 +110,56 @@ CASES: tuple[SmokeCase, ...] = (
         _PHASE_F,
     ),
     SmokeCase(
-        "jobs/graph_planner",
-        "tests/live/jobs/test_graph_planner.py::"
-        "test_live_planner_uses_typed_replacement_without_production_cutover",
-        {"DAITA_RUN_LIVE_GRAPH_PLANNER": "1"},
+        "jobs/delegate",
+        "tests/live/jobs/test_jobs.py::"
+        "test_live_two_part_analysis_job_delegates_and_delivers",
+        _JOBS,
     ),
     SmokeCase(
-        "routines/contract_authoring",
+        "jobs/restart",
+        "tests/live/jobs/test_jobs.py::"
+        "test_live_job_interrupted_by_a_restart_resumes_and_finishes",
+        _JOBS,
+    ),
+    SmokeCase(
+        "jobs/ask",
+        "tests/live/jobs/test_jobs.py::test_live_job_asks_and_uses_the_answer",
+        _JOBS,
+    ),
+    SmokeCase(
+        "jobs/write",
+        "tests/live/jobs/test_jobs.py::test_live_job_performs_one_approved_write",
+        _JOBS,
+    ),
+    SmokeCase(
+        "routines/creation",
         "tests/live/routines/test_contract_authoring.py::"
-        "test_model_authors_scheduled_contract_without_dispatch[0-familiar]",
-        {**_PHASE_F, "DAITA_RUN_CONTRACT_QUALIFICATION": "1"},
+        "test_model_saves_example_routine_with_one_call_and_one_confirm",
+        {"DAITA_RUN_CONTRACT_QUALIFICATION": "1"},
+    ),
+    SmokeCase(
+        "routines/scheduled_write",
+        "tests/live/routines/test_scheduled_write.py::"
+        "test_live_scheduled_routine_asks_notifies_and_writes_once_after_approval",
+        {"DAITA_RUN_LIVE_SCHEDULED_WRITE": "1"},
+    ),
+    SmokeCase(
+        "routines/injection",
+        "tests/live/routines/test_scheduled_write.py::"
+        "test_live_scheduled_research_cannot_start_an_unrequested_write",
+        {"DAITA_RUN_LIVE_SCHEDULED_WRITE": "1"},
+    ),
+    SmokeCase(
+        "routines/denial",
+        "tests/live/routines/test_scheduled_write.py::"
+        "test_live_denied_scheduled_write_is_reported_without_another_route",
+        {"DAITA_RUN_LIVE_SCHEDULED_WRITE": "1"},
+    ),
+    SmokeCase(
+        "routines/management",
+        "tests/live/routines/test_contract_authoring.py::"
+        "test_model_moves_pauses_and_resumes_a_routine_in_conversation",
+        {"DAITA_RUN_CONTRACT_QUALIFICATION": "1"},
     ),
     SmokeCase(
         "data/write_release",

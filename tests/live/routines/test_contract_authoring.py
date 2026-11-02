@@ -1,88 +1,195 @@
-"""Bounded real-model authoring comparisons; all connector effects are simulated."""
+"""A real model saves the example routine and manages a routine by conversation."""
 
 from __future__ import annotations
 
 import os
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-from daita.capabilities import EffectEvidenceBasis
-from tests.support.live_billing import live_model_id
-from tests.support.mcp_routine_harness import (
-    assert_completed,
-    evaluate,
-    live_provider,
-    report_path,
+from daita import (
+    Agent,
+    ApprovalDecision,
+    ApprovalRequest,
+    CalendarDaySelector,
+    CalendarSchedule,
+    LoopLimits,
+    OnceSchedule,
+    RoutineIntent,
+    RoutineState,
 )
+from daita.loop.models import LoopExitKind
+from tests.support.live_billing import cost_cap, live_provider
+from tests.support.workspace import workspace_for
 
 pytestmark = [
     pytest.mark.acceptance,
     pytest.mark.requires_llm,
     pytest.mark.skipif(
         os.environ.get("DAITA_RUN_CONTRACT_QUALIFICATION") != "1",
-        reason="requires explicit bounded contract qualification authorization",
+        reason="requires explicit bounded routine authoring authorization",
     ),
 ]
 
+_REQUEST = (
+    "Create a one-time routine 8 minutes from now that writes a two-sentence "
+    "note on why data quality matters."
+)
 
-@pytest.mark.parametrize("variant", ["familiar", "unfamiliar"])
-@pytest.mark.parametrize("repetition", [0, 1])
-async def test_model_authors_scheduled_contract_without_dispatch(
-    tmp_path: Path,
-    variant: str,
-    repetition: int,
-    request: pytest.FixtureRequest,
-    record_property,
+
+def _api_key() -> str:
+    key = os.environ.get("DAITA_CONTRACT_LLM_API_KEY", "")
+    if not key.strip():
+        pytest.fail("DAITA_CONTRACT_LLM_API_KEY is required under API billing")
+    return key
+
+
+async def test_model_saves_example_routine_with_one_call_and_one_confirm(
+    tmp_path: Path, record_property
 ) -> None:
-    """The shared harness and prompt are identical for baseline and candidate code."""
-    del repetition
     model_id = os.environ.get("DAITA_CONTRACT_MODEL_ID", "openai:gpt-5.6-terra")
-    profile, provider = live_provider(model_id)
-    path = report_path(request.node.nodeid)
-    record_property("contract_evidence", str(path.resolve()))
-    names = (
-        ("destination", "content")
-        if variant == "familiar"
-        else ("channel_ref", "body_text")
+    profile, provider = live_provider(
+        model_id, api_key=_api_key, max_output_tokens=2_048
     )
-    async with evaluate(
-        tmp_path,
-        provider,
-        profile,
-        path,
-        case_id=request.node.nodeid,
-        routine=True,
-        run_immediately=False,
-        action_argument_names=names,
-    ) as scenario:
-        creation, transcript = await scenario.run(scenario.routine_prompt())
-        assert_completed(creation, transcript)
-        scenario.check_answer(creation, status="routine_saved", research=False)
-        routines = await scenario.agent.list_routines()
-        assert len(routines) == 1, creation.final_text
-        inspection = await scenario.agent.inspect_routine(routines[0].routine_id)
-        assert inspection is not None
-        routine = inspection.routine
-        assert len(routine.capability_grants) == 1
-        assert scenario.grant_is_exact(routine.capability_grants[0].material())
-        assert routine.allowed_source_ids == routine.allowed_resource_ids == ()
-        assert routine.skill_bindings == ()
-        assert routine.eligible_model_routes == (live_model_id(model_id),)
-        assert routine.maximum_consecutive_failures == 1
-        assert len(routine.outcome_contract.effect_requirements) == 1
-        requirement = routine.outcome_contract.effect_requirements[0]
-        assert requirement.capability_id == scenario.action.capability_id
-        assert requirement.minimum_successful_calls == 1
-        assert requirement.accepted_evidence_bases == frozenset(
-            {EffectEvidenceBasis.SERVER_REPORTED}
+    approvals: list[ApprovalRequest] = []
+
+    async def approve(request: ApprovalRequest) -> ApprovalDecision:
+        approvals.append(request)
+        return ApprovalDecision.APPROVE
+
+    root = tmp_path / "root"
+    started = datetime.now(UTC)
+    agent = await Agent.create(
+        "routine-authoring",
+        root=root,
+        model=provider,
+        model_profile=profile,
+        limits=LoopLimits(max_estimated_cost_usd=cost_cap(Decimal("0.50"))),
+        workspace=workspace_for(root),
+        approval_handler=approve,
+    )
+    try:
+        result = await agent.run(_REQUEST)
+        transcript = await agent.transcript(result.run_id)
+        routines = await agent.list_routines()
+        inspection = (
+            await agent.inspect_routine(routines[0].routine_id) if routines else None
         )
-        assert routine.outcome_contract.require_exact_source_bindings
-        assert routine.outcome_contract.require_current_run_provenance
-        assert routine.outcome_contract.artifact_requirements == ()
-        assert (
-            len(scenario.approvals) == 1 and scenario.approvals[0]["approved"] is True
+    finally:
+        await agent.close()
+
+    calls = [call for message in transcript.messages for call in message.tool_calls]
+    record_property("tool_calls", [call.name for call in calls])
+    record_property("model_steps", result.steps)
+    assert result.kind is LoopExitKind.COMPLETED, result.reason
+    assert [call.name for call in calls if call.name == "routine_save"] == [
+        "routine_save"
+    ]
+    (confirm,) = approvals
+    assert confirm.capability_id == "routines.create"
+    card = confirm.arguments
+    assert set(card) == {"title", "schedule", "prompt", "sources"}
+    assert str(card["schedule"]).startswith("Once at ")
+    assert "data quality" in str(card["prompt"]).casefold()
+
+    assert inspection is not None and len(routines) == 1
+    routine = inspection.routine
+    assert isinstance(routine.schedule, OnceSchedule)
+    # Eight minutes after the request, counted from approval at creation.
+    assert started + timedelta(minutes=7) <= routine.schedule.exact_at
+    assert routine.schedule.exact_at <= datetime.now(UTC) + timedelta(minutes=9)
+    assert "data quality" in routine.authorized_instruction.casefold()
+    assert routine.source_ids == ()
+    assert inspection.recent_occurrences == ()
+
+
+async def test_model_moves_pauses_and_resumes_a_routine_in_conversation(
+    tmp_path: Path, record_property
+) -> None:
+    model_id = os.environ.get("DAITA_CONTRACT_MODEL_ID", "openai:gpt-5.6-terra")
+    profile, provider = live_provider(
+        model_id, api_key=_api_key, max_output_tokens=2_048
+    )
+    asked: list[ApprovalRequest] = []
+
+    async def approve(request: ApprovalRequest) -> ApprovalDecision:
+        asked.append(request)
+        return ApprovalDecision.APPROVE
+
+    nine_am = CalendarSchedule(
+        timezone="America/Chicago",
+        hour=9,
+        minute=0,
+        day_selector=CalendarDaySelector.EVERY_DAY,
+    )
+    root = tmp_path / "root"
+    agent = await Agent.create(
+        "routine-management",
+        root=root,
+        model=provider,
+        model_profile=profile,
+        limits=LoopLimits(max_estimated_cost_usd=cost_cap(Decimal("0.50"))),
+        workspace=workspace_for(root),
+        approval_handler=approve,
+    )
+    states = []
+    try:
+        created = await agent.create_routine(
+            RoutineIntent(
+                title="Daily sales report",
+                prompt="Summarize yesterday's sales in three bullet points.",
+                schedule=nine_am,
+            ),
+            confirmation_handler=approve,
         )
-        assert scenario.server.calls == []
-        assert await scenario.agent.list_effects() == ()
-        assert inspection.recent_occurrences == ()
+        conversation_id = None
+        for message in (
+            "Move my daily sales report to 8am.",
+            "Pause it for now.",
+            "Actually, resume it.",
+        ):
+            asked.clear()
+            result = await agent.run(message, conversation_id=conversation_id)
+            conversation_id = result.conversation_id
+            transcript = await agent.transcript(result.run_id)
+            inspection = await agent.inspect_routine(created.routine_id)
+            assert inspection is not None
+            states.append(
+                (
+                    result,
+                    [
+                        call.name
+                        for exchange in transcript.messages
+                        for call in exchange.tool_calls
+                    ],
+                    [item.capability_id for item in asked],
+                    inspection.routine,
+                )
+            )
+        routines = await agent.list_routines()
+    finally:
+        await agent.close()
+
+    record_property("tool_calls", [calls for _result, calls, _asked, _r in states])
+    record_property("approvals", [cards for _result, _calls, cards, _r in states])
+    moved, paused, resumed = states
+    for result, _calls, _asked, _routine in states:
+        assert result.kind is LoopExitKind.COMPLETED, result.reason
+    # The same routine changes; nothing is duplicated.
+    assert [item.routine_id for item in routines] == [created.routine_id]
+
+    moved_routine = moved[3]
+    # Moving the time is one confirmed update that keeps everything else.
+    assert moved[2] == ["routines.update"]
+    assert moved_routine.schedule == replace(nine_am, hour=8)
+    assert moved_routine.title == created.title
+    assert moved_routine.authorized_instruction == created.authorized_instruction
+    assert moved_routine.state is RoutineState.ACTIVE
+
+    assert paused[3].state is RoutineState.PAUSED
+    assert paused[3].schedule == moved_routine.schedule
+    assert resumed[3].state is RoutineState.ACTIVE
+    assert resumed[3].schedule == moved_routine.schedule

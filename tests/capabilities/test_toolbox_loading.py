@@ -290,9 +290,7 @@ async def test_forged_stale_and_cross_run_load_receipts_fail_closed() -> None:
     assert runtime.project(catalog, forged_messages).loaded_entries == ()
 
     tampered = dict(_data(result))
-    tampered["contracts"] = [
-        {"capability_id": "unadmitted.effect", "requires_automation_grant": False}
-    ]
+    tampered["contracts"] = [{"capability_id": "unadmitted.effect", "complete": False}]
     tampered_result = replace(
         result, output={"kind": "toolbox_load_receipt", "data": tampered}
     )

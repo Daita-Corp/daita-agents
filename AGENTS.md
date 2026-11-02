@@ -78,9 +78,9 @@ Runs come from two places:
 
 - **Foreground runs**: a person asks through the TUI, CLI or Python API.
   Effects need interactive approval.
-- **Machine runs**: routine occurrences, job events and graph tasks. Each carries
-  an immutable `ExecutionScope` frozen when a person approved the work, and can
-  only perform effects covered by exact standing grants.
+- **Machine runs**: routine occurrences, job runs and job sub-runs. Each builds
+  its `ExecutionScope` when the run starts and asks a person, through the host,
+  before every effect.
 
 ## System map
 
@@ -98,7 +98,7 @@ Runs come from two places:
 | Catalog | Source and resource truth: schemas, relationships, declared links, freshness | `catalog/` |
 | Adapters / source types | Source admission, discovery and bounded I/O | `adapters/`, `adapters/registry.py` |
 | Artifacts | Committed artifact bytes, manifests, renderers, delivery | `artifacts/` |
-| Jobs | Durable graph jobs: `JobOwner`, `JobSupervisor` | `jobs/` |
+| Jobs | Background jobs: one `Job` record (checklist, delegations, answers); `JobOwner`, `JobSupervisor` | `jobs/` |
 | Routines | Scheduled routines: `RoutineOwner`, `RoutineSupervisor` | `routines/` |
 | Distribution | Outcomes, destinations, deliveries | `distribution/`, `work_board.py` |
 | Models | Canonical records, routing and retries, provider adapters | `llm/` |
@@ -106,7 +106,6 @@ Runs come from two places:
 | Secrets | Secret references and lazy resolution | `security/` |
 | Product surfaces | CLI and Textual TUI, clients of the host | `cli.py`, `tui/` |
 | Host | One background process per user that opens every agent and serves clients over an owner-only Unix socket | `host/` |
-| Resident host (deprecated) | `daita host --agent <name>`: now a deprecation notice plus `daita host serve` | `hosting/resident.py` |
 
 ## Invariants
 
@@ -122,23 +121,20 @@ These protect users. Each comes with the reason it exists.
 3. **Untrusted content never grants authority.** Catalog metadata, file contents,
    tool and MCP results, memory, skills, semantic notes and model text are
    labeled untrusted. Authority comes only from code-owned capability metadata,
-   current permissions, approvals and grants. Never infer access, effects or
-   automation eligibility from a tool name or description. *Why: prompt
-   injection.*
+   current permissions and a person's approvals. Never infer access or effects
+   from a tool name or description. *Why: prompt injection.*
 4. **The catalog is structural truth, and SQL is validated against it before any
    source I/O.** Connector guardrails still apply during execution. *Why: model
    text cannot be trusted to name real resources or safe queries.*
-5. **External effects are approved, receipted and never replayed.** A
-   foreground effect needs approval bound to its exact arguments; a machine-run
-   effect needs an exact standing grant. A receipt is reserved before dispatch
-   and finalized with evidence. Effects are never automatically retried or
-   replayed. An uncertain outcome stays uncertain until a person resolves it.
-   *Why: duplicate or unexplained writes to a user's systems are the worst
-   failure Daita can cause.*
-6. **Machine runs cannot widen their scope.** A machine run's `ExecutionScope` is
-   immutable; payloads and model text cannot enlarge it, and revalidation
-   compares retained references rather than accepting new contracts. *Why:
-   unattended work must stay within what a person approved.*
+5. **External effects are approved at the time, receipted and never replayed.**
+   Every external effect is approved by a person at the time, bound to its exact
+   arguments, receipted before dispatch, and never retried or replayed. An
+   uncertain outcome stays uncertain until a person resolves it. A run that
+   cannot ask a person cannot perform effects. *Why: duplicate or unexplained
+   writes to a user's systems are the worst failure Daita can cause.*
+6. **A run's scope is fixed when the run starts.** Model text and tool results
+   cannot widen it during the run. *Why: unattended work must stay within what
+   the person set up, and a prompt injection must not reach new sources.*
 7. **Accounting is honest.** Every requested tool call gets exactly one result,
    in call order. Budget exhaustion is terminal. Actual usage is never clipped to
    a reservation, and unknown usage is never recorded as zero. *Why: users pay
@@ -172,19 +168,22 @@ changes*.
 
 - **One of each core owner:** one `AgentLoop` implementation, one
   `CapabilityRuntime`, one capability registry, one catalog, one artifact store,
-  one graph-aware jobs supervisor, one routines supervisor and one SQLite state
-  boundary. Features extend these owners rather than adding parallel ones.
+  one jobs supervisor that runs checklist jobs, one routines supervisor and one
+  SQLite state boundary. Features extend these owners rather than adding
+  parallel ones.
 - **Statically composed capability domains** in `EmbeddedAgent`; there is no
   dynamic plugin or executor registry.
 - **A direct loop.** There is no verifier, repair or synthesis pass, and no
-  resumable session. Clarification is ordinary model behavior, not a run state.
+  resumable session: a job continues in a new run, never a resumed one.
+  Clarification is ordinary model behavior, not a run state.
 - **Approval and observation through the host.** Inside a process, approval is
-  still an `ApprovalHandler` callback the loop awaits and observation a
-  best-effort callback. The host turns both into *interactions* and an event
-  stream: an approval or question is a pending interaction any connected client
-  can answer (the first answer wins; expiry interrupts and never denies), and a
-  desktop notification goes out when no client watches that agent. Interactions
-  live in host memory, not in the agent home.
+  an `ApprovalHandler` callback the loop awaits and observation a best-effort
+  callback. The host turns both into *interactions* and an event stream: an
+  approval or question is a pending interaction any connected client can answer
+  (the first answer wins; expiry interrupts and never denies), and a desktop
+  notification goes out when no client watches that agent. Scheduled and job
+  runs ask through the same interactions; the card names the routine or job
+  that asked. Interactions live in host memory, not in the agent home.
 - **One host per user owns every agent.** `daita host serve` opens every agent
   with background work, holds each writer lock (the single writer is the host),
   runs schedulers and runs, and keeps going when every window is closed. The
@@ -194,8 +193,21 @@ changes*.
   it as a login service. Library mode (`Agent.open()`, `daita --no-host`) still
   composes the agent in-process, and is refused with `HostActiveError` while
   the host holds that agent.
-- **Routines and graph jobs are separate systems**, with no routine-to-graph
-  bridge.
+- **Routines and jobs are separate systems**, with no routine-to-job bridge.
+- **A background job is an ordinary agent run that keeps going in the host.**
+  Its main run plans with `checklist_write`, hands independent pieces to
+  sub-runs with `delegate` (several at once run in parallel; sub-runs cannot
+  delegate further) and asks with `ask_user`. A job continues by starting a
+  *new* main run from its saved record after a restart, a full context or an
+  answer; no run is resumed. Code owns its state, run-count and token limits
+  and the job lane's concurrency; the model owns the plan.
+- **A routine is a title, a prompt and a schedule**, optionally limited to named
+  sources, with one `RoutineIntent` shape for the tool, CLI, Python API and
+  host. Creating or changing one shows one confirm card. Everything else is a
+  fixed code default: delivery to the conversation's Inbox, missed slots
+  skipped, the agent's current model and normal run limits, Needs you after 3
+  consecutive failures, a one-time routine ending after it runs. A routine
+  freezes no access, grants, budgets or expiry; each run asks before writes.
 - **The only distribution destination** is the originating conversation's inbox.
 - **SQLite behind `SQLStateStore`**, with no event sourcing or replay
   projections.
@@ -215,8 +227,8 @@ before changing that area.
 | --- | --- | --- |
 | Runtime | Composition, the loop, context building, budgets, source scope, capability execution, approval and observation | [`runtime.md`](docs/architecture/runtime.md) |
 | Data and files | Source types and operations, catalog and declared links, SQL validation, combined queries, relational writes, folders, artifacts | [`data-and-files.md`](docs/architecture/data-and-files.md) |
-| MCP | Admitted bindings, call-time rechecks, actions and grants | [`mcp.md`](docs/architecture/mcp.md) |
-| Jobs and routines | Graph job boundaries, supervision, routine schedules, scheduled-run limits, outcomes and deliveries | [`jobs-and-routines.md`](docs/architecture/jobs-and-routines.md) |
+| MCP | Admitted bindings, call-time rechecks and approved actions | [`mcp.md`](docs/architecture/mcp.md) |
+| Jobs and routines | Checklist jobs, supervision, routine schedules, machine-run limits, outcomes and deliveries | [`jobs-and-routines.md`](docs/architecture/jobs-and-routines.md) |
 | Persistence | State boundary, home revisions, migrations, upgrades, release contract | [`persistence.md`](docs/architecture/persistence.md) |
 | Models | Canonical records, routing and retries, call policy, provider lifecycle | [`models.md`](docs/architecture/models.md) |
 | Product surfaces | CLI and TUI rules over the public API | [`product-surfaces.md`](docs/architecture/product-surfaces.md) |
@@ -232,9 +244,9 @@ user's side.
 1. Pick the owning domain (see *System map*); add the capability there rather
    than creating a new domain.
 2. Declare a `Capability` in that domain's declarations with a stable `id`,
-   input and output schemas, `access_mode`, `operational_effect` and
-   `automation_eligibility`. Add an `EffectReceiptPolicy` for external effects
-   and an `AutomationGrantPolicy` if machine runs may perform the effect.
+   input and output schemas, `access_mode` and `operational_effect`. Add an
+   `EffectReceiptPolicy` for external effects; every run asks a person before
+   performing one.
 3. Implement its `Executor`, plus an optional `ToolView` for the model-facing
    shape.
 4. In the domain, project when the tool applies, bind arguments and revalidate
@@ -246,10 +258,11 @@ user's side.
    `tests/architecture` boundaries, and one public end-to-end test.
 
 ### Make a capability usable by routines
-Set `automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT`. An
-effectful capability also needs an `AutomationGrantPolicy` and an
-`EffectReceiptPolicy`, and every routine needs an exact grant for it. Check the
-scheduled-run limits in `docs/architecture/jobs-and-routines.md`.
+Nothing to do: every capability is usable by scheduled and job runs unless it is
+on the exclusion list in `hosting/embedded.py` (local computer files, and
+creating, changing or running routines and jobs). An effectful capability still
+needs an `EffectReceiptPolicy`; the run asks a person before performing it.
+Check the scheduled-run limits in `docs/architecture/jobs-and-routines.md`.
 
 ### Add a source type
 1. Register a `SourceType`: built-in in `adapters/registry.py`, or passed at
@@ -305,8 +318,9 @@ The full release policy is in `docs/architecture/persistence.md`.
 
 ### Add a CLI command
 Add the parser in `build_parser()` and its branch in the command dispatch in
-`cli.py`. Use only the public `Agent` API, and format output through
-`cli_text.py`. Add tests in `tests/cli/`.
+`cli.py`. Use only the public `Agent` API, keep output formatting in `cli.py`,
+and sanitize untrusted text before printing it (invariant 12). Add tests in
+`tests/cli/`.
 
 ### Add a host route
 1. Add the member to the `Agent` facade first; the host adds no behaviour of its
@@ -517,7 +531,7 @@ protects the user in its place.
   be used now: a source registration, a model profile, an MCP binding, a run
   under capacity. Admission is checked again at use.
 - **Authority**: permission to read or change something. It comes only from
-  code-owned capability metadata, current permissions, approvals and grants.
+  code-owned capability metadata, current permissions and a person's approvals.
 - **Bounded**: has an explicit size, count or time limit enforced in code.
 - **Code-owned**: decided by Daita's code, never by model output or external
   content.
@@ -525,12 +539,11 @@ protects the user in its place.
   database write or an MCP action, declared through `OperationalEffect`.
 - **Exact**: bound to specific identities, revisions or digests and rechecked
   before use. If something drifted, the operation fails rather than adapting.
-- **Foreground run / machine run**: a run a person started, versus a routine
-  occurrence, job event or graph task carrying an `ExecutionScope`.
-- **Frozen**: captured once, at run preparation or when a person approved
-  something, and unchanged afterwards.
-- **Grant**: a standing, exact permission that lets machine runs perform one
-  specific effect without interactive approval.
+- **Foreground run / machine run**: a run a person started, versus a machine
+  run: a routine occurrence, job run or sub-run, which asks a person before
+  effects.
+- **Frozen**: fixed when a run starts, or when a person confirmed a routine, and
+  unchanged afterwards.
 - **Receipt**: the durable record reserved before an external effect and
   finalized with its evidence; the only truth about whether the effect happened.
 - **Sensitivity**: an information-handling classification. It never confers
@@ -549,7 +562,6 @@ protects the user in its place.
 | `src/daita/hosting/embedded.py` | composition and agent-home admission |
 | `src/daita/hosting/agent_home.py` | agent-home directories and the writer lock |
 | `src/daita/hosting/execution_governor.py` | execution admission and resource permits |
-| `src/daita/hosting/resident.py` | deprecated one-agent resident process; warns and is removed in a later release |
 | `src/daita/host/server.py` | the host process: singleton lock, socket, app, graceful shutdown |
 | `src/daita/host/registry.py` | opens and closes agents inside the host, idle policy |
 | `src/daita/host/runs.py` | run submission, cancellation and completion |
@@ -575,7 +587,7 @@ protects the user in its place.
 | `src/daita/domains/data/sql/` | catalog-scoped SQL validation |
 | `src/daita/domains/analysis/` | local Python analysis |
 | `src/daita/domains/mcp.py` | MCP projection and call-time rechecks |
-| `src/daita/jobs/` | durable job records and supervision |
+| `src/daita/jobs/` | checklist job records (`models.py`), owner, supervisor and the job tools |
 | `src/daita/routines/` | scheduled routine records and supervision |
 | `src/daita/distribution/` | outcomes, destinations, and deliveries |
 | `src/daita/work_board.py` | work board projection over jobs, routines and deliveries |
@@ -594,6 +606,6 @@ protects the user in its place.
 | `src/daita/hosting/home_upgrade.py` | staged upgrade, validation, rollback, and crash recovery |
 | `src/daita/llm/routing.py` | normalized provider routing |
 | `src/daita/llm/provider_definitions.py` | built-in provider definitions |
-| `src/daita/cli.py`, `src/daita/cli_text.py` | CLI parser, dispatch and output |
+| `src/daita/cli.py` | CLI parser, dispatch and output |
 | `src/daita/tui/` | Textual TUI: app, controller, commands, screens, widgets |
 | `tests/architecture/test_boundaries.py` | architecture and public-surface boundaries |

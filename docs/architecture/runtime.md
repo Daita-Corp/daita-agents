@@ -96,8 +96,9 @@ one `RunSessionWriter`; the writer alone starts, appends to and terminates that 
 transcript with exact ordering and conversation-predecessor binding. The coordinator
 owns bounded execution admission, keyed conversation ordering, provider admission
 and shutdown drain. Compatibility defaults are five executions, two provider
-requests, strict foreground reserves of one, one graph task, two PostgreSQL reads
-per source and four SQLite-pressure permits. Host capacity is runtime configuration,
+requests, strict foreground reserves of one, two job sub-runs per agent, two
+PostgreSQL reads per source and four SQLite-pressure permits. Job main runs take
+a `WorkloadClass.JOB` lease; their sub-runs run inside it. Host capacity is runtime configuration,
 not execution authority. SQLite sources and MCP bindings remain capacity one;
 analysis retains one computation lane and an independent parser lane. A
 combined `data_query` holds each distinct input source's permit once, acquired
@@ -163,21 +164,27 @@ is authoritative only for the values it returned. Model text, prior assistant
 claims, preferences, and procedures cannot establish structural or source
 facts.
 
-Machine-originated runs carry one immutable `ExecutionScope` in their
-`RunStartEnvelope`. The scope binds the agent and principal, grant, job or
-routine identity, allowed sources, resources, connector bindings,
-capabilities, access modes, operational effects, sensitivity ceiling, model
-routes, per-run budgets, and distribution-plan digest. Scheduled instructions
-are foreground-authorized content; job-event instructions are code-owned.
-Untrusted payloads and model text cannot enlarge the scope. `contract_bindings`
-retains exact capability, MCP-origin, resource-structure and model-configuration
-digests. The composition supplies one bound current-contract reader to routine
-admission, runtime checks and code-owned graph-task construction; it cannot execute
-work. Every current scope states `JOB_EVENT`, `SCHEDULED_ROUTINE` or `GRAPH_TASK`;
-only the revision-1 migration decoder may infer an omitted legacy kind. Revalidation
-compares retained references, never accepts replacement current contracts implicitly.
-Local hints and refresh timestamps are presentation/freshness facts, not execution
-authority.
+Machine-originated runs carry one `ExecutionScope` in their `RunStartEnvelope`,
+built when the run starts and fixed for that run (invariant 6). The composition
+root's `machine_run_scope` builds it: the routine's or job's named sources, or
+every current source when none are named, never the live session folder; every
+readable resource of those sources; every registered capability except the
+machine-run exclusions in `hosting/embedded.py` (creating, changing or running
+routines and jobs, and the job-run tools outside a job's main run); every
+admitted MCP binding; and all access modes and effects. The agent's current
+model routes and normal run limits bound it. A job sub-run's scope is its main
+run's, narrowed to the sources it names and without the job-run tools.
+Scheduled instructions are foreground-authorized content; job instructions are
+code-owned. Untrusted
+payloads and model text cannot enlarge the scope. `contract_bindings` retains
+the exact capability, MCP-origin, resource-structure and model-configuration
+digests read at start, so a change during the run fails the call rather than
+widening it. New scopes state `SCHEDULED_ROUTINE` or `JOB`; `JOB_EVENT` and
+`GRAPH_TASK` (with its task binding) are decoded from stored runs only, and
+only the revision-1 migration decoder may infer an omitted legacy kind. Job
+runs and sub-runs are held to the job lane's per-call target ceiling (the
+policy's `graph_*` fields). Local hints and refresh timestamps are presentation/freshness facts, not
+execution authority.
 
 ## Capabilities and execution
 
@@ -203,17 +210,14 @@ capability execution contracts. `toolbox_load` accepts exact on-demand names
 directly; search is unnecessary when those names are known. `toolbox_inspect`
 reads an exact prepared contract without changing the callable set or executing
 a capability. These controls grant no authority and bypass no admission checks.
-Search includes the existing domain-owned automation contract for grant-requiring
-tools so scheduling can inspect constraints without activating execution schemas.
-Its `requires_automation_grant` flag refers to scheduled execution. Search,
-load receipts and exact inspection share one registered contract projection,
-with exact revision digests. Load retains compact incomplete references and grant
-metadata; explicit inspection supplies input/output schemas. Inspected contracts
-remain in the ordinary transcript after callable-set replacement. Foreground actions
+Load receipts and exact inspection share one registered contract projection,
+with exact revision digests. Load retains compact incomplete references;
+explicit inspection supplies input/output schemas. Inspected contracts
+remain in the ordinary transcript after callable-set replacement. Actions
 use ordinary approval at invocation.
-Byte pressure omits whole contracts with `automation_contract_omitted` before
-removing candidates. Load receipts omit their remaining grant metadata as a whole
-when byte/depth bounds require it, preserving exact inspection references. `toolbox_inspect` retrieves a complete
+Byte pressure removes search candidates from the end of a bounded page, and
+load receipts keep exact inspection references when byte/depth bounds require
+it. `toolbox_inspect` retrieves a complete
 contract or explicitly partial path/page/string fragments bound to its digest.
 Inspection intersects frozen candidates with current local domain applicability;
 it never refreshes remote state or replaces execution-time validation. The default
@@ -238,25 +242,21 @@ between model tool calls and execution. For each call it:
 `EmbeddedAgent` statically composes these domains: `DataCapabilityDomain`,
 `ArtifactCapabilityDomain`, `AnalysisCapabilityDomain`, `MemoryCapabilityDomain`,
 `SkillCapabilityDomain`, `SemanticCapabilityDomain`, `JobCapabilityDomain`,
-`GraphTaskCapabilityDomain`, `GraphAdmissionCapabilityDomain`,
-`DataProfileCapabilityDomain`, `RoutineCapabilityDomain`,
+`JobRunCapabilityDomain`, `RoutineCapabilityDomain`,
 `DistributionCapabilityDomain`, and the admitted `MCPCapabilityDomain`. The
 composition in `hosting/embedded.py` is the authoritative list. Applicability and current-state checks remain in the concrete
 domain.
 
-`CapabilityRuntime.execute_internal` is the typed code-owned path used by the
-job and routine supervisors. It resolves the same immutable registry contract
-and applies the ordinary validation, execution, artifact, sensitivity,
-provenance, result-bound, and observation rules. It is not a recursive model
-call or a second runtime.
-
 External native data effects and admitted external actions declare an
-`EffectReceiptPolicy`. Automation proposals also require an
-`AutomationGrantPolicy`; the runtime validates both requested and domain-normalized
-constraints. Effect-free and local management capabilities cannot use these
-external-effect policies. Unattended effects require concrete native/MCP admission
-and exact standing grants. Generic routine authority and outcome conformance alone
-do not enable them; eligibility metadata alone is not production authority.
+`EffectReceiptPolicy`. Effect-free and local management capabilities cannot use
+it. Every effect, in a foreground or a machine run, asks a person at the time
+through the agent's `ApprovalHandler`; a run with no handler refuses the effect
+with `approval_required`. There are no standing grants: a capability declares
+no unattended eligibility, and scheduled and job runs may use every capability
+except the exclusion list in `hosting/embedded.py` (routine and job management;
+local computer files are outside their scope). Older run scopes and receipts may
+still record a grant from an earlier release; they are decoded as history and
+never honoured.
 
 The runtime reserves a unique operation and call identity in SQLite before
 external dispatch, validates the resulting observation and ordinary output, and
@@ -277,8 +277,8 @@ receipt payloads. Current row values do not resolve prior operation uncertainty.
 The frozen context informs reporting; execution still rechecks the store.
 
 Do not call source clients or executors directly from `AgentLoop`, `Agent`, a
-tool view, or model-authored text. Do not infer access, effects, or automation
-eligibility from a tool name when capability metadata defines them.
+tool view, or model-authored text. Do not infer access or effects from a tool
+name when capability metadata defines them.
 
 ## Memory, skills, semantics, approval and observation
 
@@ -293,10 +293,16 @@ loop and explicit capabilities; there is no background learning agent.
 
 Operational effects use the fixed governance branch immediately before the
 effect in `CapabilityRuntime`. Approval is once-only and bound to exact frozen
-arguments; that binding is the invariant. Today approval is also in-process: the
-host calls an `ApprovalHandler` and waits, with no pending-approval record or
-resume API. A design that persists pending approvals must keep the exact-argument
-binding and the once-only decision.
+arguments; that binding is the invariant. Inside a process the runtime awaits
+an `ApprovalHandler`. In the host that handler opens an interaction
+(`host/interactions.py`) any connected client can answer, and a desktop
+notification goes out when nobody watches. Scheduled and job runs ask the same
+way; the `ApprovalRequest.requester` names the routine or job so the card can
+say what asked, while the notification text never carries titles or data. A
+denial is an ordinary tool result the model continues from. An interaction
+that expires (24 hours) or is dismissed interrupts the run: a routine
+occurrence then finishes as failed, and a job waits; both show as *Needs you*
+on the work board. There is no pending-approval record or resume API.
 
 Observation is one best-effort callback. It cannot direct execution. Today it is
 not persisted and is not a telemetry, tracing or replay source; durable truth

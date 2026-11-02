@@ -35,7 +35,6 @@ from daita._json import FrozenJsonObject
 from daita.capabilities import (
     RESERVED_TOOL_NAMES,
     TOOLBOX_DEFINITIONS,
-    AutomationEligibility,
     CallTargetLane,
     CapabilityRegistry,
     ToolDefinition,
@@ -76,11 +75,11 @@ ON_DEMAND_LOAD = (
     "routine_save",
     "skill_save",
 )
-# Lanes the model can be shown: foreground user runs, graph task workers, and
-# machine origins that carry no per-call target ceiling.
+# Lanes the model can be shown: foreground user runs, job runs and sub-runs,
+# and machine origins that carry no per-call target ceiling.
 LANES: tuple[tuple[str, CallTargetLane | None], ...] = (
     ("foreground", CallTargetLane.FOREGROUND),
-    ("graph_task", CallTargetLane.GRAPH_TASK),
+    ("job", CallTargetLane.JOB),
     ("machine", None),
 )
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
@@ -204,26 +203,8 @@ def _registry_tools(registry: CapabilityRegistry) -> dict[str, object]:
     for name in sorted(registry.tool_names):
         view, capability = registry.resolve_tool(name)
         presentation = view.presentation
-        # Scheduled machine runs admit only automation-direct routes.
-        automated = tuple(
-            mode
-            for mode, capability_id in view.mode_capability_ids
-            if registry.capability(capability_id).automation_eligibility
-            is AutomationEligibility.AUTOMATION_DIRECT
-        )
         rendered = {
-            lane_name: _definition(
-                registry.tool_definition(
-                    name,
-                    lane=lane,
-                    routes=(
-                        automated
-                        # A view with no such route is not offered there at all.
-                        if view.mode_capability_ids and lane is None and automated
-                        else None
-                    ),
-                )
-            )
+            lane_name: _definition(registry.tool_definition(name, lane=lane))
             for lane_name, lane in LANES
         }
         foreground = rendered.pop("foreground")

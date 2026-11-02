@@ -48,7 +48,8 @@ MAX_TOOL_PRESENTATION_KEYWORDS = 16
 MAX_TOOL_PRESENTATION_KEYWORD_CHARACTERS = 64
 RESERVED_TOOL_NAMES = frozenset({"toolbox_search", "toolbox_load", "toolbox_inspect"})
 TOOL_MODE_ARGUMENT = "mode"
-MAX_EXECUTION_SCOPE_IDENTITIES = 256
+# A run's scope now lists every readable resource; match EffectiveSourceScope.
+MAX_EXECUTION_SCOPE_IDENTITIES = 10_000
 MAX_EXECUTION_SCOPE_IDENTITY_CHARACTERS = 2_048
 
 
@@ -77,27 +78,20 @@ class OperationalEffect(str, Enum):
     MANAGE_SCHEDULED_ROUTINE = "manage_scheduled_routine"
 
 
-class AutomationEligibility(str, Enum):
-    """Code-owned unattended-execution eligibility, orthogonal to effect."""
-
-    INTERACTIVE_ONLY = "interactive_only"
-    AUTOMATION_DIRECT = "automation_direct"
-
-
 class ExecutionScopeKind(str, Enum):
     """Code-owned machine-run scope family."""
 
     JOB_EVENT = "job_event"
     SCHEDULED_ROUTINE = "scheduled_routine"
+    # Decoded from stored graph-task runs only; no new run uses it.
     GRAPH_TASK = "graph_task"
+    JOB = "job"
 
 
 class MachineRunDirectiveKind(str, Enum):
-    """Exclusive terminal transition emitted by a machine lifecycle tool."""
+    """A tool call that ends the machine run it was made in."""
 
-    COMPLETE = "task_completed"
-    BLOCK = "task_blocked"
-    REQUEST_REVIEW = "task_review_requested"
+    ASK_USER = "job_waiting_for_you"
 
 
 class ExecutionPreference(str, Enum):
@@ -110,12 +104,13 @@ class ExecutionPreference(str, Enum):
 class CallTargetLane(str, Enum):
     """Which enforced per-call target ceiling governs one run's calls.
 
-    Foreground user calls are bounded by the inline ceiling; graph task workers
-    by the graph ceiling. The runtime maps each run origin to at most one lane.
+    Foreground user calls are bounded by the inline ceiling; job runs and
+    sub-runs by the job ceiling (the policy's ``graph_*`` fields). The runtime
+    maps each run origin to at most one lane.
     """
 
     FOREGROUND = "foreground"
-    GRAPH_TASK = "graph_task"
+    JOB = "job"
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,56 +316,15 @@ class GraphTaskBinding:
 
 @dataclass(frozen=True, slots=True)
 class MachineRunDirective:
-    """Authenticated exclusive termination from one lifecycle capability."""
+    """The one call that ended a machine run, made alone in its step."""
 
     kind: MachineRunDirectiveKind
     tool_call_id: str
-    binding_digest: str
-    record_id: str
-    job_id: str
-    task_id: str
-    attempt_id: str
-    fencing_epoch: int
-    committed_task_revision: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, MachineRunDirectiveKind):
             raise TypeError("machine run directive kind is invalid")
-        for value, name in (
-            (self.tool_call_id, "machine directive tool call_id"),
-            (self.record_id, "machine directive record_id"),
-            (self.job_id, "machine directive job_id"),
-            (self.task_id, "machine directive task_id"),
-            (self.attempt_id, "machine directive attempt_id"),
-        ):
-            _text(value, name)
-        if re.fullmatch(r"sha256:[0-9a-f]{64}", self.binding_digest) is None:
-            raise ValueError("machine directive binding digest is invalid")
-        for numeric_value, name in (
-            (self.fencing_epoch, "machine directive fencing epoch"),
-            (self.committed_task_revision, "machine directive task revision"),
-        ):
-            if (
-                not isinstance(numeric_value, int)
-                or isinstance(numeric_value, bool)
-                or numeric_value < 1
-            ):
-                raise ValueError(f"{name} is invalid")
-
-
-class TaskAttemptGuard(Protocol):
-    """Revalidate one exact graph attempt immediately before meaningful work."""
-
-    @property
-    def binding(self) -> GraphTaskBinding: ...
-
-    @property
-    def claim_token(self) -> str: ...
-
-    @property
-    def run_id(self) -> str: ...
-
-    async def revalidate(self, *, capability_id: str, point: str) -> None: ...
+        _text(self.tool_call_id, "machine directive tool call_id")
 
 
 class EffectOutcome(str, Enum):
@@ -428,46 +382,6 @@ class EffectObservation:
 
 
 @dataclass(frozen=True, slots=True)
-class AutomationGrantPolicy:
-    """Grant shapes: what an author may request, and what is retained.
-
-    ``constraints_schema`` is the exact domain-normalized constraint shape that
-    approval retains and execution enforces; it is part of the capability
-    contract digest. ``request_schema`` is the authoring input the domain
-    normalizes from, defaulting to the retained shape. It may omit values the
-    domain derives itself and carry descriptions; because every requested value
-    is normalized and then validated against ``constraints_schema``, it is not
-    execution authority and is not part of the contract digest.
-    """
-
-    constraints_kind: str
-    constraints_schema: Mapping[str, object]
-    request_schema: Mapping[str, object] | None = None
-
-    def __post_init__(self) -> None:
-        _scope_identities((self.constraints_kind,), "constraints kind")
-        for name in ("constraints_schema", "request_schema"):
-            value = getattr(self, name)
-            if value is None:
-                continue
-            schema = FrozenJsonObject.from_mapping(value)
-            _check_schema(schema)
-            if (
-                schema.get("type") != "object"
-                or len(canonical_json(schema).encode("utf-8")) > 32 * 1024
-            ):
-                raise ValueError("grant constraints require a bounded object schema")
-            object.__setattr__(self, name, schema)
-        if self.request_schema is None:
-            object.__setattr__(self, "request_schema", self.constraints_schema)
-
-    @property
-    def requested_constraints_schema(self) -> Mapping[str, object]:
-        assert self.request_schema is not None
-        return self.request_schema
-
-
-@dataclass(frozen=True, slots=True)
 class EffectReceiptPolicy:
     receipt_kind: str
     payload_schema: Mapping[str, object]
@@ -492,7 +406,12 @@ class EffectReceiptPolicy:
 
 @dataclass(frozen=True, slots=True)
 class CapabilityGrant:
-    """One domain-normalized authorization embedded in an approved revision."""
+    """A standing grant recorded by an older routine run; decoded, never issued.
+
+    Released home revisions stored grants inside run scopes, and their
+    decoders still read them. No current code creates or honours one: every
+    effect is approved at the time (invariant 5).
+    """
 
     grant_id: str
     domain_owner_id: str
@@ -626,65 +545,6 @@ class ExecutionContractReader(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class AutomationScopeProposal:
-    """Immutable proposed ceilings for read-only grant preparation; grants nothing."""
-
-    agent_id: str
-    principal_id: str
-    allowed_source_ids: tuple[str, ...]
-    allowed_resource_ids: tuple[str, ...]
-    allowed_connector_binding_ids: tuple[str, ...]
-    allowed_capability_ids: tuple[str, ...]
-    allowed_access_modes: frozenset[AccessMode]
-    allowed_operational_effects: frozenset[OperationalEffect]
-    sensitivity_ceiling: ModelSensitivity
-    eligible_model_routes: tuple[str, ...]
-    per_run_max_cost_usd: Decimal | None
-    per_run_max_tokens: int
-    expires_at: datetime
-    distribution_plan_digest: str
-
-    def __post_init__(self) -> None:
-        for name in ("agent_id", "principal_id"):
-            _scope_identities((getattr(self, name),), name)
-        for name in (
-            "allowed_source_ids",
-            "allowed_resource_ids",
-            "allowed_connector_binding_ids",
-            "allowed_capability_ids",
-            "eligible_model_routes",
-        ):
-            object.__setattr__(self, name, _scope_identities(getattr(self, name), name))
-        if not self.allowed_capability_ids or not self.eligible_model_routes:
-            raise ValueError("automation proposal needs capability and model ceilings")
-        for name, enum in (
-            ("allowed_access_modes", AccessMode),
-            ("allowed_operational_effects", OperationalEffect),
-        ):
-            items = frozenset(getattr(self, name))
-            if not items or any(not isinstance(item, enum) for item in items):
-                raise ValueError("automation proposal access/effect ceiling is invalid")
-            object.__setattr__(self, name, items)
-        if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
-            raise TypeError("automation proposal sensitivity is invalid")
-        if self.per_run_max_cost_usd is not None and (
-            not isinstance(self.per_run_max_cost_usd, Decimal)
-            or not self.per_run_max_cost_usd.is_finite()
-            or self.per_run_max_cost_usd < 0
-        ):
-            raise ValueError("automation proposal cost ceiling is invalid")
-        if type(self.per_run_max_tokens) is not int or self.per_run_max_tokens < 1:
-            raise ValueError("automation proposal token ceiling is invalid")
-        if (
-            not isinstance(self.expires_at, datetime)
-            or self.expires_at.utcoffset() is None
-        ):
-            raise ValueError("automation proposal expiry must be timezone-aware")
-        if re.fullmatch(r"sha256:[0-9a-f]{64}", self.distribution_plan_digest) is None:
-            raise ValueError("automation proposal distribution digest is invalid")
-
-
-@dataclass(frozen=True, slots=True)
 class ExecutionScope:
     """One immutable, digestible ceiling carried by a bounded reasoning run."""
 
@@ -702,7 +562,7 @@ class ExecutionScope:
     allowed_operational_effects: frozenset[OperationalEffect]
     sensitivity_ceiling: ModelSensitivity
     eligible_model_routes: tuple[str, ...]
-    # Graph tasks and routines may omit it; steps, tokens and attempts still bound them.
+    # Routines and jobs may omit it; steps and tokens still bound them.
     per_run_max_cost_usd: Decimal | None
     per_run_max_tokens: int
     distribution_plan_digest: str
@@ -712,6 +572,7 @@ class ExecutionScope:
     routine_revision: int | None = None
     occurrence_id: str | None = None
     allowed_connector_binding_ids: tuple[str, ...] = ()
+    # Stored by older routine runs only; new scopes never carry grants.
     capability_grants: tuple[CapabilityGrant, ...] = ()
     graph_task_binding: GraphTaskBinding | None = None
 
@@ -816,6 +677,9 @@ class ExecutionScope:
         elif self.scope_kind is ExecutionScopeKind.SCHEDULED_ROUTINE:
             if self.routine_id is None:
                 raise ValueError("scheduled scope requires routine identity")
+        elif self.scope_kind is ExecutionScopeKind.JOB:
+            if self.job_id is None or self.routine_id is not None:
+                raise ValueError("job scope requires only its job identity")
         elif self.routine_id is not None:
             raise ValueError("routine identity requires a scheduled scope")
         if self.scope_kind is ExecutionScopeKind.JOB_EVENT:
@@ -824,10 +688,13 @@ class ExecutionScope:
                     "non-routine execution scope requires source/resource ceilings "
                     "and cannot contain connector bindings"
                 )
-        elif self.scope_kind is ExecutionScopeKind.SCHEDULED_ROUTINE:
+        elif self.scope_kind in {
+            ExecutionScopeKind.SCHEDULED_ROUTINE,
+            ExecutionScopeKind.JOB,
+        }:
             if bool(sources) != bool(resources):
                 raise ValueError(
-                    "scheduled source and resource ceilings must be present together"
+                    "machine source and resource ceilings must be present together"
                 )
         if not isinstance(self.contract_bindings, ExecutionContractBindings):
             raise TypeError(
@@ -895,16 +762,6 @@ class ExecutionScope:
             grant.max_calls_per_occurrence != 1 for grant in grants
         ):
             raise ValueError("graph effect grants permit exactly one invocation")
-        granted_effects = {
-            OperationalEffect.MUTATE_DATA,
-            OperationalEffect.EXTERNAL_ACTION,
-        }
-        if self.scope_kind is ExecutionScopeKind.GRAPH_TASK and (
-            bool(effects & granted_effects) != bool(grants)
-        ):
-            raise ValueError(
-                "graph effect authority and exact grants must be present together"
-            )
         if any(
             self.contract_bindings.capability_contracts[grant.capability_id]
             != grant.capability_contract_digest
@@ -1078,7 +935,7 @@ TOOLBOX_DEFINITIONS = (
     ToolboxDefinition(
         ToolboxId.ROUTINES,
         "Routines",
-        "Scheduled assignments and grants.",
+        "Scheduled routines and their results.",
     ),
     ToolboxDefinition(
         ToolboxId.ANALYSIS, "Analysis", "Python computation, data analysis and charts."
@@ -1176,6 +1033,8 @@ class ApprovalRequest:
     capability_id: str
     arguments: FrozenJsonObject
     reason: str
+    # The routine or job that asked, so the card can say so; None when a person did.
+    requester: str | None = None
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -1186,6 +1045,10 @@ class ApprovalRequest:
             (self.reason, "approval reason"),
         ):
             _text(value, name)
+        if self.requester is not None:
+            _text(self.requester, "approval requester")
+            if len(self.requester) > 256:
+                raise ValueError("approval requester must be bounded text")
         object.__setattr__(
             self,
             "arguments",
@@ -1367,7 +1230,7 @@ _IDENTITY_REFS: Mapping[str, tuple[str, str, str]] = MappingProxyType(
     }
 )
 _IDENTITY_HANDLE = re.compile(r"[st][1-9][0-9]{0,4}\Z")
-_DELEGATED_KINDS = frozenset({"input", "grant"})
+_DELEGATED_KINDS = frozenset({"input"})
 _Leaf = Callable[[object, str], object]
 
 
@@ -1601,11 +1464,7 @@ class Capability:
     executor_id: str
     access_mode: AccessMode = AccessMode.NONE
     operational_effect: OperationalEffect = OperationalEffect.NONE
-    automation_eligibility: AutomationEligibility = (
-        AutomationEligibility.INTERACTIVE_ONLY
-    )
     artifact_policy: ArtifactPolicy | None = None
-    automation_grant_policy: AutomationGrantPolicy | None = None
     effect_receipt_policy: EffectReceiptPolicy | None = None
     machine_run_directive_kind: MachineRunDirectiveKind | None = None
     execution_admission_policy: ExecutionAdmissionPolicy | None = None
@@ -1614,10 +1473,10 @@ class Capability:
     # Argument paths that name an earlier result by its model-visible
     # result_ref; the runtime resolves them to ToolCall.id before validation.
     result_ref_arguments: tuple[str, ...] = ()
-    # ``(container path, member path, kind)``: the member holds input arguments
-    # ("input") or grant constraints ("grant") for the capability that the
-    # container's ``capability_id`` names. The runtime resolves that
-    # capability's source/resource handles there before validation too.
+    # ``(container path, member path, "input")``: the member holds input
+    # arguments for the capability that the container's ``capability_id``
+    # names. The runtime resolves that capability's source/resource handles
+    # there before validation too.
     delegated_arguments: tuple[tuple[str, str, str], ...] = ()
     # The owning domain derives this call's evidence from the transcript.
     derives_call_provenance: bool = False
@@ -1634,12 +1493,6 @@ class Capability:
             raise TypeError("access_mode must be AccessMode")
         if not isinstance(self.operational_effect, OperationalEffect):
             raise TypeError("operational_effect must be OperationalEffect")
-        if not isinstance(self.automation_eligibility, AutomationEligibility):
-            raise TypeError("automation_eligibility must be AutomationEligibility")
-        if self.automation_grant_policy is not None and not isinstance(
-            self.automation_grant_policy, AutomationGrantPolicy
-        ):
-            raise TypeError("automation_grant_policy must be AutomationGrantPolicy")
         if self.effect_receipt_policy is not None and not isinstance(
             self.effect_receipt_policy, EffectReceiptPolicy
         ):
@@ -1650,24 +1503,8 @@ class Capability:
         }
         if external_effect and self.effect_receipt_policy is None:
             raise ValueError("external effects require a receipt policy")
-        if not external_effect and (
-            self.automation_grant_policy is not None
-            or self.effect_receipt_policy is not None
-        ):
+        if not external_effect and self.effect_receipt_policy is not None:
             raise ValueError("effect policies are only supported for external effects")
-        if self.automation_eligibility is AutomationEligibility.INTERACTIVE_ONLY:
-            if self.automation_grant_policy is not None:
-                raise ValueError(
-                    "interactive capabilities cannot declare a standing grant"
-                )
-        elif self.operational_effect is not OperationalEffect.NONE:
-            if (
-                self.automation_grant_policy is None
-                or self.effect_receipt_policy is None
-            ):
-                raise ValueError(
-                    "effectful automation requires grant and receipt policies"
-                )
         if self.artifact_policy is not None and not isinstance(
             self.artifact_policy, ArtifactPolicy
         ):
@@ -1689,21 +1526,15 @@ class Capability:
                 raise TypeError("execution_admission_policy is invalid")
             if (
                 self.execution_admission_policy.graph_v1_eligible
-                and self.operational_effect is not OperationalEffect.NONE
-                and (
-                    self.operational_effect
-                    not in {
-                        OperationalEffect.MUTATE_DATA,
-                        OperationalEffect.EXTERNAL_ACTION,
-                    }
-                    or self.automation_eligibility
-                    is not AutomationEligibility.AUTOMATION_DIRECT
-                    or self.automation_grant_policy is None
-                    or self.effect_receipt_policy is None
-                )
+                and self.operational_effect
+                not in {
+                    OperationalEffect.NONE,
+                    OperationalEffect.MUTATE_DATA,
+                    OperationalEffect.EXTERNAL_ACTION,
+                }
             ):
                 raise ValueError(
-                    "graph effect admission is not structurally effect-free and requires direct automation with exact grant and receipt policies"
+                    "job-lane admission requires a read or a receipted external effect"
                 )
         if not isinstance(self.durable_foreground_entrypoint, bool):
             raise TypeError("durable_foreground_entrypoint must be bool")
@@ -1764,15 +1595,6 @@ def capability_contract_digest(
         "executor_id": capability.executor_id,
         "access_mode": capability.access_mode.value,
         "operational_effect": capability.operational_effect.value,
-        "automation_eligibility": capability.automation_eligibility.value,
-        "automation_grant_policy": (
-            None
-            if capability.automation_grant_policy is None
-            else {
-                "constraints_kind": capability.automation_grant_policy.constraints_kind,
-                "constraints_schema": capability.automation_grant_policy.constraints_schema,
-            }
-        ),
         "effect_receipt_policy": (
             None
             if capability.effect_receipt_policy is None
@@ -2037,16 +1859,22 @@ class ToolExecution:
     request_sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
     effect_receipt_id: str | None = None
     one_time_artifact_destinations: tuple[object, ...] = ()
-    task_attempt_guard: TaskAttemptGuard | None = None
     caller_principal_id: str | None = None
     execution_scope: ExecutionScope | None = None
     caller_principal_verified: bool = True
     provenance: CallProvenance = CallProvenance()
+    # The preflight a person approved and the runtime rechecked; set only for
+    # the dispatch of a side effect, so the executor binds what was reviewed.
+    approved_preflight: FrozenJsonObject | None = None
 
     def __post_init__(self) -> None:
         _text(self.run_id, "tool run_id")
         if not isinstance(self.provenance, CallProvenance):
             raise TypeError("tool provenance must be CallProvenance")
+        if self.approved_preflight is not None and not isinstance(
+            self.approved_preflight, FrozenJsonObject
+        ):
+            raise TypeError("tool approved preflight must be FrozenJsonObject")
         _text(self.call_id, "tool call_id")
         _text(self.capability_id, "tool capability_id")
         if self.caller_principal_id is not None:
@@ -2070,10 +1898,6 @@ class ToolExecution:
             is None
         ):
             raise ValueError("tool effect receipt ID is invalid")
-        if self.task_attempt_guard is not None:
-            binding = getattr(self.task_attempt_guard, "binding", None)
-            if not isinstance(binding, GraphTaskBinding):
-                raise TypeError("tool task-attempt guard is invalid")
         object.__setattr__(
             self, "arguments", FrozenJsonObject.from_mapping(self.arguments)
         )
@@ -2331,9 +2155,6 @@ class CapabilityRegistry:
                                         "operational_effect": (
                                             capability.operational_effect.value
                                         ),
-                                        "automation_eligibility": (
-                                            capability.automation_eligibility.value
-                                        ),
                                         "artifact_policy": (
                                             None
                                             if capability.artifact_policy is None
@@ -2443,6 +2264,10 @@ class CapabilityRegistry:
     @property
     def tool_names(self) -> frozenset[str]:
         return frozenset(self._views)
+
+    @property
+    def capability_ids(self) -> frozenset[str]:
+        return frozenset(self._capabilities)
 
     def tool_capability_ids(self, name: str) -> tuple[str, ...]:
         """Return every capability one tool name can execute, primary first."""
@@ -2648,14 +2473,9 @@ class CapabilityRegistry:
                 if not isinstance(value, Mapping):
                     return value
                 target = self._capabilities.get(cast(str, value.get("capability_id")))
-                policy = None if target is None else target.automation_grant_policy
-                if target is None or (kind == "grant" and policy is None):
+                if target is None:
                     return value
-                schema = (
-                    target.input_schema
-                    if policy is None or kind == "input"
-                    else (policy.constraints_schema)
-                )
+                schema = target.input_schema
                 if not identity_ref_paths(schema):
                     return value
 
@@ -2865,21 +2685,6 @@ class CapabilityRegistry:
         except KeyError as error:
             raise KeyError(f"unknown capability: {capability_id}") from error
 
-    def resolve_internal_execution(
-        self,
-        capability_id: str,
-        contract_digest: str,
-    ) -> tuple[Capability, Executor, str]:
-        capability, executor = self.resolve_execution(capability_id)
-        if any(capability_id in self.tool_capability_ids(name) for name in self._views):
-            raise ValueError(
-                "trusted internal execution requires an internal-only capability"
-            )
-        expected = self.contract_digest(capability_id)
-        if contract_digest != expected:
-            raise ValueError("internal execution capability contract changed")
-        return capability, executor, self.resolve_domain_owner(capability_id)
-
     def validate_output(self, capability_id: str, output: object) -> ToolOutput:
         capability = self._capabilities[capability_id]
         if not isinstance(output, ToolOutput):
@@ -2899,38 +2704,6 @@ class CapabilityRegistry:
                 "only receipt-bearing executions may return effect observations"
             )
         return output
-
-    def validate_grant_constraints(
-        self,
-        capability_id: str,
-        constraints: Mapping[str, object],
-        *,
-        requested: bool = False,
-    ) -> FrozenJsonObject:
-        """Validate retained constraints, or an author's request when ``requested``."""
-
-        policy = self._capabilities[capability_id].automation_grant_policy
-        if policy is None:
-            raise CapabilityInputError(
-                "automation_grant_unsupported",
-                "This capability does not support standing grants.",
-            )
-        value = FrozenJsonObject.from_mapping(constraints)
-        if len(canonical_json(value).encode("utf-8")) > 32 * 1024:
-            raise CapabilityInputError(
-                "automation_grant_invalid", "Grant constraints exceed their byte bound."
-            )
-        _validate_rule(
-            "constraints",
-            value,
-            (
-                policy.requested_constraints_schema
-                if requested
-                else policy.constraints_schema
-            ),
-            CapabilityInputError,
-        )
-        return value
 
     def validate_effect_observation(
         self, capability_id: str, observation: EffectObservation
@@ -3139,7 +2912,11 @@ def _mode_input_schema(
     selectable = [mode for mode, _ in routes if mode not in view.presence_modes]
     # Routes narrowed to presence modes alone leave nothing to select.
     if not view.mode_by_presence and selectable:
-        properties[selector] = {"type": "string", "enum": selectable}
+        selector_schema: dict[str, object] = {"type": "string", "enum": selectable}
+        if view.default_mode is not None:
+            # An omitted selector takes this route; the model must see that.
+            selector_schema["default"] = view.default_mode
+        properties[selector] = selector_schema
     required: set[str] | None = None
     for index, (_mode, schema) in enumerate(routes):
         if (
@@ -3313,10 +3090,26 @@ def _check_rule(rule: Mapping[str, object]) -> None:
             _check_rule(nested)
 
 
-def _validate_object(
+MAX_ARGUMENT_ISSUES = 32
+
+
+def _issue(
+    issues: list[dict[str, object]],
+    code: str,
+    name: str,
+    path: str,
+    problem: str,
+    **facts: object,
+) -> None:
+    issues.append(
+        {"code": code, "name": name, "path": path, "problem": problem, **facts}
+    )
+
+
+def _collect_object_issues(
     schema: Mapping[str, object],
     value: Mapping[str, object],
-    error_type: type[ValueError] | type[RuntimeError],
+    issues: list[dict[str, object]],
     *,
     path: str,
 ) -> None:
@@ -3328,41 +3121,23 @@ def _validate_object(
         raise ValueError("tool schema required must be an array")
     if any(not isinstance(name, str) for name in required):
         raise ValueError("tool schema required must contain strings")
-    names = tuple(name for name in required if isinstance(name, str))
-    missing = [name for name in names if name not in value]
-    if missing:
-        if error_type is CapabilityInputError:
-            raise CapabilityInputError(
-                "missing_arguments",
-                "Missing required tool arguments.",
-                {"names": missing, "path": path},
-                recovery=ToolRecovery(
-                    RecoveryKind.CORRECT_ARGUMENTS,
-                    "Supply the required arguments: " + ", ".join(missing) + ".",
-                ),
-            )
-        raise error_type(f"missing output fields: {', '.join(missing)}")
+    for name in required:
+        if name not in value:
+            _issue(issues, "missing_arguments", name, f"{path}.{name}", "is required")
     if additional is False:
-        unexpected = [name for name in value if name not in properties]
-        if unexpected:
-            if error_type is CapabilityInputError:
-                raise CapabilityInputError(
+        for name in value:
+            if name not in properties:
+                _issue(
+                    issues,
                     "unexpected_arguments",
-                    "Unexpected tool arguments.",
-                    {"names": unexpected, "path": path},
-                    recovery=ToolRecovery(
-                        RecoveryKind.CORRECT_ARGUMENTS,
-                        "Remove the undeclared arguments: "
-                        + ", ".join(unexpected)
-                        + ".",
-                    ),
+                    name,
+                    f"{path}.{name}",
+                    "is not a declared field; remove it",
                 )
-            raise error_type(f"unexpected output fields: {', '.join(unexpected)}")
     for name, item in value.items():
         rule = properties.get(name)
-        if not isinstance(rule, Mapping):
-            continue
-        _validate_rule(name, item, rule, error_type, path=f"{path}.{name}")
+        if isinstance(rule, Mapping):
+            _collect_issues(name, item, rule, issues, path=f"{path}.{name}")
 
 
 def validate_tool_schema_value(
@@ -3383,112 +3158,137 @@ def _validate_rule(
     item: object,
     rule: Mapping[str, object],
     error_type: type[ValueError] | type[RuntimeError],
-    *,
-    path: str | None = None,
 ) -> None:
-    if path is None:
-        path = name
+    """Raise one error that lists every structural problem in ``item``."""
+
+    issues: list[dict[str, object]] = []
+    _collect_issues(name, item, rule, issues, path=name)
+    if not issues:
+        return
+    if error_type is not CapabilityInputError:
+        first = issues[0]
+        raise error_type(f"output field {first['name']} {first['problem']}")
+    shown = issues[:MAX_ARGUMENT_ISSUES]
+    problems = [f"{issue['path']} {issue['problem']}" for issue in shown]
+    raise CapabilityInputError(
+        "invalid_arguments",
+        f"{len(issues)} argument problem(s): " + "; ".join(problems[:4]) + ".",
+        {"issues": shown, "issue_count": len(issues)},
+        recovery=ToolRecovery(
+            RecoveryKind.CORRECT_ARGUMENTS,
+            "Fix every listed issue, then call the tool once more.",
+        ),
+    )
+
+
+def _collect_issues(
+    name: str,
+    item: object,
+    rule: Mapping[str, object],
+    issues: list[dict[str, object]],
+    *,
+    path: str,
+) -> None:
     alternatives = rule.get("oneOf")
     if isinstance(alternatives, (tuple, list)):
-        matched = 0
+        branches: list[tuple[bool, list[dict[str, object]]]] = []
         for alternative in alternatives:
             assert isinstance(alternative, Mapping)
-            try:
-                _validate_rule(name, item, alternative, error_type, path=path)
-            except error_type:
-                continue
-            matched += 1
-        if matched != 1:
-            _constraint_error(error_type, name, "exactly one declared shape", "oneOf")
+            branch: list[dict[str, object]] = []
+            _collect_issues(name, item, alternative, branch, path=path)
+            branches.append((_matches_type(item, alternative.get("type")), branch))
+        matched = sum(1 for _, branch in branches if not branch)
+        if matched > 1:
+            _issue(
+                issues,
+                "invalid_argument_value",
+                name,
+                path,
+                "must match exactly one declared shape",
+                constraint="oneOf",
+            )
+        elif not matched:
+            # Report the closest shape: the right type first, then fewest problems.
+            issues.extend(min(branches, key=lambda b: (not b[0], len(b[1])))[1])
     expected = rule.get("type")
     if expected is not None and not _matches_type(item, expected):
-        if error_type is CapabilityInputError:
-            raise CapabilityInputError(
-                "invalid_argument_type",
-                f"Tool argument {name} must be {expected}.",
-                {"name": name, "expected": expected},
-                recovery=ToolRecovery(
-                    RecoveryKind.CORRECT_ARGUMENTS,
-                    f"Send {name} as {expected}.",
-                ),
-            )
-        raise error_type(f"output field {name} must be {expected}")
+        _issue(
+            issues,
+            "invalid_argument_type",
+            name,
+            path,
+            f"must be {expected}",
+            expected=expected,
+        )
+        return
     enum = rule.get("enum")
     if isinstance(enum, (tuple, list)) and item not in enum:
-        _constraint_error(
-            error_type,
-            name,
-            "one of the declared enum values",
-            "enum",
-        )
+        _constraint_issue(issues, name, path, "one of the declared enum values", "enum")
     if isinstance(item, str):
         minimum = rule.get("minLength")
         maximum = rule.get("maxLength")
         pattern = rule.get("pattern")
         if isinstance(minimum, int) and len(item) < minimum:
-            _constraint_error(
-                error_type, name, f"at least {minimum} characters", "minLength"
+            _constraint_issue(
+                issues, name, path, f"at least {minimum} characters", "minLength"
             )
         if isinstance(maximum, int) and len(item) > maximum:
-            _constraint_error(
-                error_type, name, f"at most {maximum} characters", "maxLength"
+            _constraint_issue(
+                issues, name, path, f"at most {maximum} characters", "maxLength"
             )
         if isinstance(pattern, str) and re.search(pattern, item) is None:
-            _constraint_error(error_type, name, "the declared pattern", "pattern")
+            _constraint_issue(issues, name, path, "the declared pattern", "pattern")
     if isinstance(item, (int, float)) and not isinstance(item, bool):
         minimum = rule.get("minimum")
         maximum = rule.get("maximum")
         if isinstance(minimum, (int, float)) and item < minimum:
-            _constraint_error(error_type, name, f"at least {minimum}", "minimum")
+            _constraint_issue(issues, name, path, f"at least {minimum}", "minimum")
         if isinstance(maximum, (int, float)) and item > maximum:
-            _constraint_error(error_type, name, f"at most {maximum}", "maximum")
+            _constraint_issue(issues, name, path, f"at most {maximum}", "maximum")
     if isinstance(item, (tuple, list)):
         minimum = rule.get("minItems")
         maximum = rule.get("maxItems")
         if isinstance(minimum, int) and len(item) < minimum:
-            _constraint_error(error_type, name, f"at least {minimum} items", "minItems")
+            _constraint_issue(
+                issues, name, path, f"at least {minimum} items", "minItems"
+            )
         if isinstance(maximum, int) and len(item) > maximum:
-            _constraint_error(error_type, name, f"at most {maximum} items", "maxItems")
+            _constraint_issue(
+                issues, name, path, f"at most {maximum} items", "maxItems"
+            )
         if rule.get("uniqueItems") is True:
             projected = tuple(canonical_json(value) for value in item)
             if len(projected) != len(set(projected)):
-                _constraint_error(
-                    error_type,
-                    name,
-                    "unique items",
-                    "uniqueItems",
-                )
+                _constraint_issue(issues, name, path, "unique items", "uniqueItems")
         item_rule = rule.get("items")
         if isinstance(item_rule, Mapping):
             for index, value in enumerate(item):
-                _validate_rule(
+                _collect_issues(
                     f"{name}[{index}]",
                     value,
                     item_rule,
-                    error_type,
+                    issues,
                     path=f"{path}[{index}]",
                 )
     if isinstance(item, Mapping) and expected == "object":
-        _validate_object(rule, item, error_type, path=path)
+        _collect_object_issues(rule, item, issues, path=path)
 
 
-def _constraint_error(
-    error_type: type[ValueError] | type[RuntimeError],
+def _constraint_issue(
+    issues: list[dict[str, object]],
     name: str,
+    path: str,
     expected: str,
     constraint: str,
 ) -> None:
-    if error_type is CapabilityInputError:
-        raise CapabilityInputError(
-            "invalid_argument_value",
-            f"Tool argument {name} must satisfy {expected}.",
-            {"constraint": constraint, "name": name},
-            recovery=ToolRecovery(
-                RecoveryKind.CORRECT_ARGUMENTS,
-                f"{name} must satisfy {expected}.",
-            ),
-        )
-    raise error_type(f"output field {name} must satisfy {expected}")
+    _issue(
+        issues,
+        "invalid_argument_value",
+        name,
+        path,
+        f"must satisfy {expected}",
+        constraint=constraint,
+    )
 
 
 def _matches_type(value: object, expected: object) -> bool:

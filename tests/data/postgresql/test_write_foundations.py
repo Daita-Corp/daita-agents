@@ -43,13 +43,16 @@ def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> No
         ("preview", RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID),
         ("apply", RELATIONAL_UPDATE_CAPABILITY_ID),
     )
+    # One call writes; mode=preview is only for looking first.
+    assert view.default_mode == "apply"
     description = view.description
     assert len(description.encode()) <= 600
-    assert "mode=preview changes nothing" in description
-    assert "calling it is what requests approval" in description
+    assert "in one call" in description
+    assert "mode=preview only shows" in description
     assert "Only outcome=committed proves it" in description
     assert "asking for approval in chat" in description
-    assert "applying a zero-match preview" in description
+    assert "preview_fingerprint" not in description
+    assert "expected_affected_rows" not in description
 
     # The procedure lives in the tool description, not in run guidance.
     prompt = _tool_guidance(

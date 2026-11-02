@@ -7,7 +7,7 @@ model-visible read failure followed by correction, and instruction-like text in
 an untrusted query result. Every run must stay inside the ordinary scheduled
 scope and converge on one durable conversation-inbox delivery.
 
-Schedule arithmetic, DST handling, misfires, prechecks, crash recovery, fencing,
+Schedule arithmetic, DST handling, skipped misfires, crash recovery, fencing,
 failure escalation, and duplicate-finalization behavior remain deterministic
 tests. They do not become more trustworthy by spending another model call.
 """
@@ -33,23 +33,19 @@ from daita import (
     IntervalSchedule,
     LoopExit,
     LoopLimits,
-    MisfirePolicy,
-    ReportingMode,
+    RoutineIntent,
     RoutineState,
     ScheduledRoutine,
-    ScheduledRoutineDraft,
     SQLiteSource,
 )
 from daita._json import canonical_json
 from daita.capabilities import (
-    AccessMode,
     CapabilityInputError,
-    OperationalEffect,
     ToolExecution,
     ToolOutput,
 )
 from daita.catalog.capabilities import CATALOG_DESCRIBE_CAPABILITY_ID
-from daita.distribution import OutcomeState, conversation_inbox_destination_id
+from daita.distribution import OutcomeState
 from daita.domains.data import DATA_QUERY_CAPABILITY_ID
 from daita.llm._lifecycle import closing_stream
 from daita.llm.models import (
@@ -79,7 +75,6 @@ from daita.loop.models import (
     validate_completed_transcript,
 )
 from daita.routines import RoutineOccurrenceDisposition, RoutineSlotKind
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.live_billing import cost_cap, live_provider, subscription_billing
 from tests.support.workspace import workspace_for
 
@@ -418,41 +413,15 @@ async def _run_live_routine(
     origin = await agent.transcript(scenario.origin_run_id)
     assert origin.run.conversation_id is not None
     conversation_id = origin.run.conversation_id
-    now = datetime.now(UTC)
-    cost_limit = scenario.limits.max_estimated_cost_usd
-    proposal = await agent.propose_routine(
-        ScheduledRoutineDraft(
-            origin_run_id=scenario.origin_run_id,
+    created = await agent.create_routine(
+        RoutineIntent(
             title=title,
-            authorized_instruction=instruction,
-            schedule=IntervalSchedule(3_600, now + timedelta(hours=1)),
-            misfire_policy=MisfirePolicy.LATEST_ONLY,
-            reporting_mode=ReportingMode.ALWAYS,
-            precheck=None,
-            allowed_source_ids=(scenario.source_id,),
-            allowed_connector_binding_ids=(),
-            allowed_resource_ids=(scenario.resource_id,),
-            allowed_capability_ids=(
-                CATALOG_DESCRIBE_CAPABILITY_ID,
-                DATA_QUERY_CAPABILITY_ID,
-            ),
-            sensitivity_ceiling=ModelSensitivity.INTERNAL,
-            outcome_contract=no_artifact_outcome_contract(),
-            distribution_destination_id=conversation_inbox_destination_id(
-                conversation_id
-            ),
-            eligible_model_routes=(scenario.provider.provider_id,),
-            per_run_max_tokens=scenario.limits.max_total_tokens,
-            per_run_max_cost_usd=cost_limit,
-            cumulative_max_tokens=scenario.limits.max_total_tokens * 2,
-            cumulative_max_cost_usd=None if cost_limit is None else cost_limit * 2,
-            cumulative_max_attempts=2,
-            cumulative_max_occurrences=2,
-            maximum_consecutive_failures=1,
-            expires_at=now + timedelta(days=1),
-        )
+            prompt=instruction,
+            schedule=IntervalSchedule(3_600, datetime.now(UTC) + timedelta(hours=1)),
+            sources=(scenario.source_id,),
+        ),
+        conversation_id=conversation_id,
     )
-    created = await agent.create_routine(proposal)
     running = await agent.run_routine_now(
         created.routine_id,
         expected_revision=created.revision,
@@ -492,14 +461,16 @@ async def _run_live_routine(
     assert scope is not None
     assert scope.routine_id == running.routine_id
     assert scope.occurrence_id == item.subject_id
+    # The scope is fixed at run start: the named source, its readable
+    # resources, and every capability except the machine-run exclusions.
     assert scope.allowed_source_ids == (scenario.source_id,)
-    assert scope.allowed_resource_ids == (scenario.resource_id,)
-    assert scope.allowed_capability_ids == (
-        CATALOG_DESCRIBE_CAPABILITY_ID,
-        DATA_QUERY_CAPABILITY_ID,
+    assert scenario.resource_id in scope.allowed_resource_ids
+    assert {CATALOG_DESCRIBE_CAPABILITY_ID, DATA_QUERY_CAPABILITY_ID} <= set(
+        scope.allowed_capability_ids
     )
-    assert scope.allowed_access_modes == frozenset({AccessMode.READ})
-    assert scope.allowed_operational_effects == frozenset({OperationalEffect.NONE})
+    assert not any(
+        item.startswith(("routines.", "jobs.")) for item in scope.allowed_capability_ids
+    )
 
     scheduled_requests = _requests_for_transcript(
         scenario.provider.requests,

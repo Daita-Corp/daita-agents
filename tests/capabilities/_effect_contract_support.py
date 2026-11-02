@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from daita.capabilities import (
     AccessMode,
-    AutomationEligibility,
-    AutomationGrantPolicy,
     Capability,
     EffectEvidenceBasis,
     EffectReceiptPolicy,
@@ -21,7 +19,6 @@ _SCHEMA = {
 _RECEIPT = EffectReceiptPolicy(
     "test.action", _SCHEMA, EffectEvidenceBasis.SERVER_REPORTED
 )
-_GRANT = AutomationGrantPolicy("test.target", _SCHEMA)
 
 
 def _capability() -> Capability:
@@ -34,7 +31,5 @@ def _capability() -> Capability:
         executor_id="test.action.executor",
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.EXTERNAL_ACTION,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
-        automation_grant_policy=_GRANT,
         effect_receipt_policy=_RECEIPT,
     )

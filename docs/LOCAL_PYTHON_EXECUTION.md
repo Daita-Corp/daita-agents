@@ -34,17 +34,17 @@ there is one computation permit and one separately reserved parser permit. Each
 resident worker retains its finite memory and scratch reservation while suspended;
 parsers have an independent reservation and cannot be crowded out by residency.
 Changing any capacity requires the host to drain and reopen. Computation remains
-run-local, and raising host capacity does not admit Python into graph jobs.
+run-local; job runs use the same per-run lifecycle as routines.
 
 ## Cells and read tools
 
-The first call supplies `expected_state={"generation":0,"revision":0}`. Each
-accepted cell returns the exact state for the next call. A Python exception
-advances the revision and reports `state_may_have_changed`: assignments before
-the exception remain. Timeout, resource or protocol failure reports `state_lost`
-and closes the interpreter. An explicitly requested later cell can start a fresh
-generation using the returned state; the failed code is never replayed and its
-consumption remains charged. Reuse retained variables after successful cells and
+Each call sends only `code` (plus optional inputs, saves and timeout); Daita
+tracks the interpreter the run is using. A Python exception reports
+`state_may_have_changed`: assignments before the exception remain. Timeout,
+resource or protocol failure reports `state_lost` and closes the interpreter.
+A later cell then starts a fresh interpreter and its result says
+`state_reset: true`, so the model knows earlier variables are gone; the failed
+code is never replayed and its consumption remains charged. Reuse retained variables after successful cells and
 ordinary Python errors instead of rereading or recomputing sufficient inputs.
 Replacement is subject to remaining allowances and verified cleanup; it does not
 restore variables from the lost interpreter.
@@ -309,7 +309,7 @@ Reopen joins those facts to the abandoned run, removes only authenticated owned
 remnants and terminalizes once without replay. Unknown termination, changed
 remnant identity or failed deletion prevents successful acceptance and replacement.
 Exactly admitted local routines share this lifecycle and their frozen read scope.
-Graph tasks, hosted or remote execution and cross-run interpreter caches remain
+Hosted or remote execution and cross-run interpreter caches remain
 unavailable.
 
 See [testing instructions](TESTING.md#local-python-live-acceptance) for the

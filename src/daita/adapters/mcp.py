@@ -18,7 +18,6 @@ from ..capabilities import (
     MAX_TOOL_PRESENTATION_GUIDANCE_CHARACTERS,
     MAX_TOOL_PRESENTATION_SUMMARY_CHARACTERS,
     AccessMode,
-    AutomationEligibility,
     OperationalEffect,
     ToolboxId,
     ToolLoadMode,
@@ -297,7 +296,6 @@ class MCPToolSelection:
     result_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL
     access_mode: AccessMode = AccessMode.READ
     operational_effect: OperationalEffect = OperationalEffect.NONE
-    automation_eligibility: AutomationEligibility | None = None
     maximum_outbound_sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
     completion_semantics: MCPCompletionSemantics = MCPCompletionSemantics.DIRECT_RESULT
 
@@ -340,20 +338,9 @@ class MCPToolSelection:
         object.__setattr__(self, "keywords", presentation.keywords)
         if not isinstance(self.result_sensitivity, ModelSensitivity):
             raise TypeError("MCP result_sensitivity is invalid")
-        if self.automation_eligibility is None:
-            object.__setattr__(
-                self,
-                "automation_eligibility",
-                (
-                    AutomationEligibility.AUTOMATION_DIRECT
-                    if self.operational_effect is OperationalEffect.NONE
-                    else AutomationEligibility.INTERACTIVE_ONLY
-                ),
-            )
         _validate_local_admission(
             self.access_mode,
             self.operational_effect,
-            self.automation_eligibility,
             self.maximum_outbound_sensitivity,
             self.completion_semantics,
         )
@@ -523,7 +510,6 @@ class MCPToolBinding:
     result_sensitivity: ModelSensitivity
     access_mode: AccessMode
     operational_effect: OperationalEffect
-    automation_eligibility: AutomationEligibility
     maximum_outbound_sensitivity: ModelSensitivity
     completion_semantics: MCPCompletionSemantics
     task_support: str
@@ -533,17 +519,11 @@ class MCPToolBinding:
         _validate_local_admission(
             self.access_mode,
             self.operational_effect,
-            self.automation_eligibility,
             self.maximum_outbound_sensitivity,
             self.completion_semantics,
         )
         if self.task_support not in {"forbidden", "optional", "required"}:
             raise ValueError("MCP task support is invalid")
-        if (
-            self.task_support == "required"
-            and self.automation_eligibility is AutomationEligibility.AUTOMATION_DIRECT
-        ):
-            raise ValueError("MCP unattended task completion is unsupported")
         for value, label, maximum in (
             (self.capability_id, "MCP capability id", 512),
             (self.executor_id, "MCP executor id", 512),
@@ -755,7 +735,6 @@ def mcp_execution_origin_digest(binding: MCPServerBinding, tool: MCPToolBinding)
         "result_sensitivity": tool.result_sensitivity.value,
         "access_mode": tool.access_mode.value,
         "operational_effect": tool.operational_effect.value,
-        "automation_eligibility": tool.automation_eligibility.value,
         "tool_maximum_outbound_sensitivity": tool.maximum_outbound_sensitivity.value,
         "completion_semantics": tool.completion_semantics.value,
         "task_support": tool.task_support,
@@ -1087,9 +1066,6 @@ def mcp_binding_from_inspection(
                 result_sensitivity=selection.result_sensitivity,
                 access_mode=selection.access_mode,
                 operational_effect=selection.operational_effect,
-                automation_eligibility=cast(
-                    AutomationEligibility, selection.automation_eligibility
-                ),
                 maximum_outbound_sensitivity=selection.maximum_outbound_sensitivity,
                 completion_semantics=selection.completion_semantics,
                 task_support=inspected.task_support,
@@ -1249,7 +1225,6 @@ def _inspect_tool(value: object) -> MCPInspectedTool:
 def _validate_local_admission(
     access: AccessMode,
     effect: OperationalEffect,
-    eligibility: AutomationEligibility | None,
     outbound: ModelSensitivity,
     completion: MCPCompletionSemantics,
 ) -> None:
@@ -1267,19 +1242,10 @@ def _validate_local_admission(
         effect is OperationalEffect.MUTATE_DATA and access is not AccessMode.WRITE
     ):
         raise ValueError("MCP data access must agree with its locally admitted effect")
-    if (
-        not isinstance(eligibility, AutomationEligibility)
-        or not isinstance(outbound, ModelSensitivity)
-        or not isinstance(completion, MCPCompletionSemantics)
+    if not isinstance(outbound, ModelSensitivity) or not isinstance(
+        completion, MCPCompletionSemantics
     ):
-        raise TypeError(
-            "MCP local eligibility, sensitivity or completion admission is invalid"
-        )
-    if (
-        completion is MCPCompletionSemantics.ASYNCHRONOUS_ONLY
-        and eligibility is AutomationEligibility.AUTOMATION_DIRECT
-    ):
-        raise ValueError("MCP unattended asynchronous completion is unsupported")
+        raise TypeError("MCP local sensitivity or completion admission is invalid")
 
 
 def _bounded_text(value: str, label: str, *, maximum: int) -> None:

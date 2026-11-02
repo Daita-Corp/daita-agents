@@ -1,7 +1,8 @@
-"""Independent live scheduled execution, with a typed owner-authorized fixture.
+"""Independent live scheduled execution, with an owner-saved routine fixture.
 
-The original ten-case matrix remains unchanged. Only fixture authorization is
-seeded here; both scheduled runs use the real model and production composition.
+The original ten-case matrix remains unchanged. Only the routine is seeded here;
+both scheduled runs use the real model and production composition, and each
+action asks at the time.
 """
 
 import os
@@ -63,7 +64,12 @@ async def test_live_owner_admitted_routine_runs_immediate_and_weekly(
             scenario.check_answer(result, status="server_reported", research=True)
             await assert_action(scenario, count=count)
             assert result.usage.total_tokens > 0
-        assert scenario.approvals == []  # exact typed owner authorization is standing
+        # The owner saved the routine directly; each scheduled action asked.
+        assert [item["tool"] for item in scenario.approvals] == [
+            scenario.action.local_name,
+            scenario.action.local_name,
+        ]
+        assert all(item["approved"] is True for item in scenario.approvals)
         assert scenario.conversation_id is not None
         for item in await scenario.agent.list_deliveries(
             conversation_id=scenario.conversation_id

@@ -9,6 +9,7 @@ import shlex
 import sys
 import tempfile
 from contextlib import redirect_stdout
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,16 +32,15 @@ from daita._json import FrozenJsonObject
 from daita.distribution import (
     DeliveryInspection,
     DeliverySubjectKind,
-    DistributionDestination,
-    DistributionDestinationState,
     OutcomeConclusionKind,
     OutcomeState,
     delivery_inspection_projection,
     delivery_view,
     delivery_view_projection,
-    distribution_destination_projection,
 )
 from daita.distribution.owner import construct_logical_delivery
+from daita.jobs import JobState
+from daita.jobs.capabilities import job_payload
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -58,6 +58,7 @@ from tests.support.cli import (
     json_lines as _json_lines,
 )
 from tests.support.distribution import inbox_distribution_plan
+from tests.support.jobs import stored_job
 from tests.support.workspace import workspace_for
 
 
@@ -408,8 +409,6 @@ def test_chat_subcommand_is_a_strict_alias_of_the_textual_app():
             [
                 "chat",
                 "atlas",
-                "--model",
-                "mock:scripted",
                 "--conversation",
                 "conversation-1",
             ],
@@ -843,7 +842,7 @@ def test_future_cli_2_parser_adds_the_bounded_chat_surface():
     assert "chat" in commands
     assert _surface(commands["chat"]) == (
         ("name",),
-        frozenset({"-h", "--help", "--model", "--conversation"}),
+        frozenset({"-h", "--help", "--conversation"}),
     )
 
 
@@ -852,9 +851,7 @@ def test_cli_2_chat_rejects_non_tty_streams_before_provider_or_agent_open():
         patch.object(cli, "create_llm_provider") as provider_factory,
         patch.object(cli.Agent, "open", new_callable=AsyncMock) as agent_open,
     ):
-        code, stdout, stderr = _invoke(
-            ["chat", "not-opened", "--model", "mock:scripted"]
-        )
+        code, stdout, stderr = _invoke(["chat", "not-opened"])
 
     assert code == 1
     assert stdout == ""
@@ -1075,7 +1072,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
 
     assert _surface(commands["host"]) == (
         (),
-        frozenset({"-h", "--help", "--agent"}),
+        frozenset({"-h", "--help"}),
     )
     diagnostics = _subcommands(commands["diagnostics"])
     assert set(diagnostics) == {"summary"}
@@ -1088,13 +1085,11 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "list",
         "inspect",
         "create",
-        "promote",
         "update",
         "pause",
         "resume",
         "run-now",
         "disable",
-        "destinations",
     }
     assert _surface(routines["list"]) == (
         ("name",),
@@ -1104,9 +1099,35 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         ("name", "routine_id"),
         frozenset({"-h", "--help"}),
     )
-    assert _surface(routines["destinations"]) == (
-        ("name", "conversation_id"),
-        frozenset({"-h", "--help", "--sensitivity-ceiling"}),
+    assert _surface(routines["create"]) == (
+        ("name",),
+        frozenset(
+            {
+                "-h",
+                "--help",
+                "--title",
+                "--prompt",
+                "--schedule",
+                "--source",
+                "--spec",
+                "--run-immediately",
+            }
+        ),
+    )
+    assert _surface(routines["update"]) == (
+        ("name", "routine_id"),
+        frozenset(
+            {
+                "-h",
+                "--help",
+                "--expected-revision",
+                "--title",
+                "--prompt",
+                "--schedule",
+                "--source",
+                "--spec",
+            }
+        ),
     )
     work = _subcommands(commands["work"])
     assert set(work) == {"show", "inspect", "dismiss"}
@@ -1120,41 +1141,14 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
             frozenset({"-h", "--help"}),
         )
     jobs = _subcommands(commands["jobs"])
-    assert set(jobs) == {
-        "accept-review",
-        "answer",
-        "artifacts",
-        "attempts",
-        "blockers",
-        "board",
-        "cancel-graph",
-        "checkpoints",
-        "dependencies",
-        "inspect",
-        "list",
-        "reject",
-        "replace-task",
-        "request-changes",
-        "result",
-        "retry-control",
-        "tasks",
-        "timeline",
-    }
-    assert _surface(jobs["timeline"]) == (
-        ("name", "job_id"),
-        frozenset({"-h", "--help", "--after", "--limit", "--task-id"}),
+    assert set(jobs) == {"answer", "cancel", "inspect", "list"}
+    assert _surface(jobs["list"]) == (
+        ("name",),
+        frozenset({"-h", "--help", "--state", "--limit"}),
     )
-    assert _surface(jobs["accept-review"]) == (
-        ("name", "job_id", "task_id", "control_id"),
-        frozenset(
-            {
-                "-h",
-                "--help",
-                "--principal-id",
-                "--rationale",
-                "--idempotency-key",
-            }
-        ),
+    assert _surface(jobs["answer"]) == (
+        ("name", "job_id", "text"),
+        frozenset({"-h", "--help"}),
     )
 
 
@@ -1198,100 +1192,54 @@ def test_cli_routine_list_uses_public_agent_surface(tmp_path: Path) -> None:
     fake.close.assert_awaited_once()
 
 
-def test_cli_job_board_and_review_use_only_public_agent_surfaces(
+def test_cli_job_list_and_answer_use_only_public_agent_surfaces(
     tmp_path: Path,
 ) -> None:
-    diagnostics = SimpleNamespace(
-        blockers=({"kind": "open_control"},),
-        exhausted_budgets=(),
-        deadlocked=False,
-        deadlock_reason=None,
+    waiting = replace(
+        stored_job("job-1"),
+        state=JobState.WAITING_FOR_YOU,
+        question="Which month?",
     )
-    board = SimpleNamespace(
-        job_id="job-1",
-        graph_state=SimpleNamespace(value="blocked"),
-        graph_revision=7,
-        columns=(SimpleNamespace(name="blocked", task_ids=("worker",)),),
-        dependencies=(
-            SimpleNamespace(
-                upstream_task_id="worker",
-                downstream_task_id="finalizer",
-                edge_kind="requires_accepted_success",
-                satisfied=False,
-            ),
-        ),
-        diagnostics=diagnostics,
-    )
-    accepted = SimpleNamespace(
-        result_id="result-reviewed",
-        result_digest="sha256:" + "7" * 64,
-        task_id="worker",
-    )
+    running = replace(stored_job("job-1"), state=JobState.RUNNING, revision=2)
     fake = SimpleNamespace(
-        job_board=AsyncMock(return_value=board),
-        accept_task_review=AsyncMock(return_value=accepted),
+        list_jobs=AsyncMock(return_value=(waiting,)),
+        answer_job=AsyncMock(return_value=running),
         close=AsyncMock(),
     )
-    board_args = cli.build_parser().parse_args(
-        ["--no-host", "--root", str(tmp_path), "jobs", "board", "atlas", "job-1"]
-    )
-    review_args = cli.build_parser().parse_args(
+    list_args = cli.build_parser().parse_args(
         [
             "--no-host",
             "--root",
             str(tmp_path),
             "jobs",
-            "accept-review",
+            "list",
+            "atlas",
+            "--state",
+            "waiting_for_you",
+        ]
+    )
+    answer_args = cli.build_parser().parse_args(
+        [
+            "--no-host",
+            "--root",
+            str(tmp_path),
+            "jobs",
+            "answer",
             "atlas",
             "job-1",
-            "worker",
-            "review-control",
-            "--principal-id",
-            "principal-1",
-            "--rationale",
-            "Authenticated candidate accepted.",
-            "--idempotency-key",
-            "accept-once",
+            "September",
         ]
     )
     with patch.object(Agent, "open", new=AsyncMock(return_value=fake)):
-        board_result = asyncio.run(cli._execute(board_args))
-        review_result = asyncio.run(cli._execute(review_args))
+        listed = asyncio.run(cli._execute(list_args))
+        answered = asyncio.run(cli._execute(answer_args))
 
-    assert board_result == {
-        "job_id": "job-1",
-        "graph_state": "blocked",
-        "graph_revision": 7,
-        "columns": [{"name": "blocked", "task_ids": ("worker",)}],
-        "dependencies": [
-            {
-                "upstream_task_id": "worker",
-                "downstream_task_id": "finalizer",
-                "edge_kind": "requires_accepted_success",
-                "satisfied": False,
-            }
-        ],
-        "diagnostics": {
-            "blockers": ({"kind": "open_control"},),
-            "exhausted_budgets": (),
-            "deadlocked": False,
-            "deadlock_reason": None,
-        },
-    }
-    assert review_result == {
-        "result_id": "result-reviewed",
-        "result_digest": "sha256:" + "7" * 64,
-        "task_id": "worker",
-    }
-    fake.job_board.assert_awaited_once_with("job-1")
-    fake.accept_task_review.assert_awaited_once_with(
-        "job-1",
-        "worker",
-        "review-control",
-        principal_id="principal-1",
-        rationale="Authenticated candidate accepted.",
-        idempotency_key="accept-once",
+    assert listed == [job_payload(waiting, detailed=False)]
+    assert answered == job_payload(running, detailed=False)
+    fake.list_jobs.assert_awaited_once_with(
+        states=frozenset({JobState.WAITING_FOR_YOU}), limit=50
     )
+    fake.answer_job.assert_awaited_once_with("job-1", "September")
     assert fake.close.await_count == 2
 
 
@@ -1310,16 +1258,6 @@ def test_cli_host_offers_the_host_lifecycle_and_needs_a_command_or_an_agent() ->
     }
     with pytest.raises(ValueError, match="choose a host command"):
         asyncio.run(cli._execute(args))
-
-
-def test_cli_host_agent_warns_and_serves_every_agent(tmp_path: Path, capsys) -> None:
-    with patch.object(cli, "_host_command", return_value=0) as served:
-        code = cli.main(["--root", str(tmp_path), "host", "--agent", "atlas"])
-    assert code == 0
-    assert "daita host --agent is deprecated" in capsys.readouterr().err
-    served.assert_called_once()
-    args = served.call_args.args[0]
-    assert (args.host_command, args.root) == ("serve", tmp_path)
 
 
 def test_future_cli_4_direct_knowledge_commands_survive_reopen():
@@ -2021,40 +1959,102 @@ def test_work_inspect_and_dismiss_report_an_unknown_delivery(
     fake.close.assert_awaited_once()
 
 
-def test_routines_destinations_lists_one_conversation_destination(
-    tmp_path: Path,
-) -> None:
-    destination = DistributionDestination(
-        destination_id="conversation_inbox:conversation-1",
-        kind="conversation_inbox",
-        label="Conversation Inbox",
-        state=DistributionDestinationState.AVAILABLE,
-        revision=1,
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
-        supported_outcome_media=("text/csv",),
-        selectable=True,
-    )
-    fake = SimpleNamespace(
-        distribution_destinations=AsyncMock(return_value=(destination,)),
-        close=AsyncMock(),
-    )
-    args = cli.build_parser().parse_args(
-        [
-            "--no-host",
-            "--root",
-            str(tmp_path),
-            "routines",
-            "destinations",
-            "atlas",
-            "conversation-1",
-            "--sensitivity-ceiling",
-            "internal",
-        ]
-    )
-    with patch.object(Agent, "open", new=AsyncMock(return_value=fake)):
-        result = asyncio.run(cli._execute(args))
-    assert result == [distribution_destination_projection(destination)]
-    fake.distribution_destinations.assert_awaited_once_with(
-        "conversation-1", sensitivity_ceiling=ModelSensitivity.INTERNAL
-    )
-    fake.close.assert_awaited_once()
+async def _attach_folder(root: Path, name: str) -> str:
+    folder = root.parent / "drop"
+    folder.mkdir()
+    (folder / "orders.csv").write_text("region,amount\nnorth,10\n", encoding="utf-8")
+    agent = await Agent.open(name, root=root, workspace=workspace_for(root))
+    try:
+        return (await agent.attach(FolderSource(folder, name="Drop folder"))).id
+    finally:
+        await agent.close()
+
+
+def _routine_result(stdout: str) -> dict[str, Any]:
+    """The review and its prompt print first; the record ends the last line."""
+
+    last = stdout.strip().splitlines()[-1]
+    return json.loads(last[last.index("{") :])
+
+
+def test_cli_routines_create_and_update_round_trip_one_routine_intent() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve() / "state"
+        asyncio.run(_create_agent(root, "routine-agent"))
+        source_id = asyncio.run(_attach_folder(root, "routine-agent"))
+        base = ["--no-host", "--root", str(root), "routines"]
+        created_code, created_stdout, created_stderr = _invoke(
+            [
+                *base,
+                "create",
+                "routine-agent",
+                "--title",
+                "Hourly orders",
+                "--prompt",
+                "Report the order total.",
+                "--schedule",
+                '{"kind": "interval", "interval_seconds": 3600, '
+                '"anchor_after_seconds": 600}',
+                "--source",
+                "Drop folder",
+            ],
+            stdin="y\n",
+        )
+        spec = root / "routine.json"
+        spec.write_text(
+            json.dumps(
+                {
+                    "title": "Once from a file",
+                    "prompt": "Report the order total once.",
+                    "schedule": {"kind": "once", "after_seconds": 3600},
+                }
+            ),
+            encoding="utf-8",
+        )
+        spec_code, spec_stdout, _ = _invoke(
+            [*base, "create", "routine-agent", "--spec", str(spec)], stdin="y\n"
+        )
+        created = _routine_result(created_stdout)
+        updated_code, updated_stdout, updated_stderr = _invoke(
+            [
+                *base,
+                "update",
+                "routine-agent",
+                str(created["routine_id"]),
+                "--schedule",
+                '{"kind": "calendar", "timezone": "America/Chicago", '
+                '"hour": 9, "minute": 0}',
+            ],
+            stdin="y\n",
+        )
+
+    assert (created_code, created_stderr) == (0, "")
+    # One confirmation shows the title, local-time schedule, prompt and sources.
+    assert created_stdout.count("Approval required") == 1
+    for shown in (
+        "Hourly orders",
+        "Every 1 hour from",
+        "Report the order total.",
+        "Drop folder",
+    ):
+        assert shown in created_stdout
+    assert created["title"] == "Hourly orders"
+    assert created["prompt"] == "Report the order total."
+    assert created["source_ids"] == [source_id]
+    assert created["schedule"]["kind"] == "interval"
+    assert created["revision"] == 1
+
+    assert spec_code == 0
+    from_file = _routine_result(spec_stdout)
+    assert from_file["title"] == "Once from a file"
+    assert from_file["schedule"]["kind"] == "once"
+    assert from_file["source_ids"] == []
+
+    assert (updated_code, updated_stderr) == (0, "")
+    updated = _routine_result(updated_stdout)
+    assert updated["routine_id"] == created["routine_id"]
+    assert updated["revision"] == 2
+    assert updated["schedule"]["kind"] == "calendar"
+    # Fields the update omitted keep their stored values.
+    for kept in ("title", "prompt", "source_ids", "conversation_id"):
+        assert updated[kept] == created[kept]

@@ -9,20 +9,17 @@ from datetime import UTC, datetime
 import httpx2 as httpx
 import pytest
 
-from daita import Agent, ApprovalDecision, MCPAuthentication, MCPToolSelection
+from daita import Agent, MCPAuthentication, MCPToolSelection
 from daita._json import FrozenJsonObject
 from daita.adapters.mcp import SDKMCPClientFactory
 from daita.adapters.mcp_sdk import SDKMCPClient
 from daita.capabilities import (
     MAX_TOOL_PRESENTATION_GUIDANCE_CHARACTERS,
     MAX_TOOL_PRESENTATION_SUMMARY_CHARACTERS,
-    ApprovalRequest,
 )
 from daita.llm.models import (
-    CostEstimate,
     FinishReason,
     ModelResponse,
-    ModelUsage,
     ToolCall,
     ToolResultBlock,
 )
@@ -395,95 +392,3 @@ async def test_owned_mcp_credentials_cleanup_preserves_shared_secrets(tmp_path):
     assert owned.to_uri() not in keychain.values
     assert keychain.values == {shared.to_uri(): token}
     assert keychain.deleted == [unused.to_uri(), owned.to_uri()]
-
-
-async def test_graph_admission_sees_new_binding_and_retains_frozen_origin(tmp_path):
-    from decimal import Decimal
-
-    async def approve(request: ApprovalRequest) -> ApprovalDecision:
-        return ApprovalDecision.APPROVE
-
-    alpha, _ = conformance_identities()
-    model = ToolboxAwareMockModelProvider((), complete_pricing=True)
-    agent = await Agent.create(
-        "mcp-graph-activation",
-        root=tmp_path,
-        hosted=True,
-        approval_handler=approve,
-        model=model,
-        model_profile=model.model_profile,
-        limits=LoopLimits(max_estimated_cost_usd=Decimal("1")),
-        mcp_client_factory=SDKMCPClientFactory(http_transport=mock_transport(alpha)),
-    )
-    try:
-        # Admission is exercised separately from machine execution, which has
-        # its own runtime integration suite. Keep the new graph queued here.
-        await agent._embedded._job_supervisor.close()
-        status = await agent.attach_mcp_server(
-            endpoint=alpha.endpoint, selections=(MCPToolSelection("lookup"),)
-        )
-        tool = status.binding.tools[0]
-        model.replace_script(
-            (
-                ModelResponse(
-                    finish_reason=FinishReason.TOOL_CALLS,
-                    tool_calls=(
-                        ToolCall(
-                            "admit-graph",
-                            "start_graph_job",
-                            {
-                                "objective": "Read the admitted fixture.",
-                                "outcome_contract": {
-                                    "required_result_kind": "mcp.tool.result"
-                                },
-                                "deadline_seconds": 300,
-                                "initial_task": {
-                                    "capability_id": tool.capability_id,
-                                    "arguments": {"query": "x"},
-                                    "expected_result_contract": {
-                                        "result_kind": "mcp.tool.result"
-                                    },
-                                    "retained_references": {
-                                        "source_ids": (),
-                                        "resource_ids": (),
-                                        "connector_binding_ids": (
-                                            status.binding.binding_id,
-                                        ),
-                                    },
-                                },
-                            },
-                        ),
-                    ),
-                    usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
-                ),
-                ModelResponse(
-                    finish_reason=FinishReason.STOP,
-                    text="Graph admitted.",
-                    usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
-                ),
-            )
-        )
-        result = await agent.run("Admit this exact graph.")
-        transcript = await agent.transcript(result.run_id)
-        receipts = [
-            block
-            for message in transcript.messages
-            for block in message.content
-            if isinstance(block, ToolResultBlock) and block.call_id == "admit-graph"
-        ]
-        assert len(receipts) == 1 and not receipts[0].is_error
-        data = receipts[0].output["data"]
-        assert isinstance(data, FrozenJsonObject)
-        job_id = data["job_id"]
-        assert isinstance(job_id, str)
-        graph = await agent.inspect_job(job_id)
-        assert graph is not None
-        retained = graph.job.specification.authority.digest
-        await agent.refresh_mcp_server(status.binding.binding_id)
-        refreshed_graph = await agent.inspect_job(job_id)
-        assert refreshed_graph is not None
-        assert refreshed_graph.job.specification.authority.digest == retained
-        assert alpha.calls == []
-    finally:
-        await agent.close()
-        await model.close()

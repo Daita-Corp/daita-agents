@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from daita.jobs import ControlKind, ControlState
-from daita.tui.screens.jobs import JobControlScreen
+from daita.jobs import JobState
+from daita.llm.models import ToolCall
 from tests.support.host import StartHost, host_workspace, remote_agent
+from tests.support.jobs import JobModel, in_state, open_job_agent, reply, wait_for_job
 from tests.tui._support import (
     SLASH_COMMAND_COMPLETIONS,
     UTC,
@@ -12,20 +13,13 @@ from tests.tui._support import (
     AgentEvent,
     AgentEventKind,
     Button,
-    ConfirmScreen,
     DaitaApp,
     FrozenJsonObject,
-    GraphState,
     Input,
     JobsScreen,
     ObserverEvent,
-    OptionList,
-    SimpleNamespace,
     Static,
-    Text,
     TranscriptView,
-    _tui_job_inspection,
-    _tui_job_summary,
     datetime,
     workspace_for,
 )
@@ -162,248 +156,53 @@ async def test_machine_origin_observations_do_not_project_into_foreground_chat(
         await opened.close()
 
 
-async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypatch):
+async def test_jobs_screen_shows_the_checklist_and_answers_a_waiting_job(
+    tmp_path, monkeypatch
+):
+    model = JobModel()
+    model.script(
+        main=[
+            reply(
+                ToolCall(
+                    "plan",
+                    "checklist_write",
+                    {"items": [{"id": "a", "title": "Read \x1b[31mA"}]},
+                )
+            ),
+            reply(ToolCall("q", "ask_user", {"question": "Which month?"})),
+            reply(text="Used the answer."),
+        ]
+    )
+    agent = await open_job_agent(tmp_path, model)
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
-    running = _tui_job_summary(
-        "job-running-0123456789", GraphState.ACTIVE, result_available=False
-    )
-    succeeded = _tui_job_summary(
-        "job-succeeded-0123456789", GraphState.SUCCEEDED, result_available=True
-    )
-    jobs = [running, succeeded]
-    list_calls = 0
-    cancel_calls: list[str] = []
-    accepted_reviews: list[tuple[str, str, str, str]] = []
-    review_control = SimpleNamespace(
-        task_id="worker",
-        control_id="review-control",
-        kind=ControlKind.REVIEW_REQUESTED,
-        state=ControlState.OPEN,
-        created_at=datetime(2026, 8, 23, 14, 1, tzinfo=UTC),
-        payload_digest="sha256:" + "9" * 64,
-        payload=FrozenJsonObject.from_mapping(
-            {
-                "message": "Review the immutable candidate.",
-                "candidate_digest": "sha256:" + "8" * 64,
-            }
-        ),
-    )
-
-    async def list_jobs() -> tuple[object, ...]:
-        nonlocal list_calls
-        list_calls += 1
-        return tuple(jobs)
-
-    async def inspect_job(job_id: str) -> object | None:
-        inspection = next(
-            (
-                _tui_job_inspection(summary)
-                for summary in jobs
-                if summary.job_id == job_id
-            ),
-            None,
-        )
-        if inspection is not None and job_id == running.job_id:
-            inspection.controls = (review_control,)
-        return inspection
-
-    async def read_job_result(job_id: str) -> object | None:
-        if job_id != succeeded.job_id:
-            return None
-        observed = datetime(2026, 8, 23, 14, 1, tzinfo=UTC)
-        return SimpleNamespace(
-            job_id=job_id,
-            result_id="result-profile",
-            result_kind="data_profile.finalized",
-            summary="Profiled one resource.",
-            payload=FrozenJsonObject.from_mapping({"profiled_resources": 1}),
-            sensitivity=SimpleNamespace(value="internal"),
-            provenance=FrozenJsonObject.from_mapping(
-                {"authority": "job_owner_agent_scope"}
-            ),
-            artifact_ids=(),
-            completed_at=observed,
-        )
-
-    async def job_board(job_id: str) -> object | None:
-        assert job_id in {running.job_id, succeeded.job_id}
-        return SimpleNamespace(
-            job_id=job_id,
-            graph_state=next(item for item in jobs if item.job_id == job_id).state,
-            graph_revision=3,
-            columns=(
-                SimpleNamespace(name="in_progress", task_ids=("worker",)),
-                SimpleNamespace(name="blocked", task_ids=()),
-            ),
-            dependencies=(
-                SimpleNamespace(
-                    upstream_task_id="worker",
-                    downstream_task_id="finalizer",
-                    edge_kind="requires_accepted_success",
-                    satisfied=False,
-                ),
-            ),
-            diagnostics=SimpleNamespace(
-                blockers=(),
-                exhausted_budgets=(),
-                deadlocked=False,
-                deadlock_reason=None,
-            ),
-        )
-
-    async def job_timeline(
-        job_id: str, *, after_event_id: int, limit: int
-    ) -> object | None:
-        assert after_event_id == 0 and limit == 100
-        observed = datetime(2026, 8, 23, 14, 1, tzinfo=UTC)
-        return SimpleNamespace(
-            job_id=job_id,
-            graph_state=next(item for item in jobs if item.job_id == job_id).state,
-            graph_revision=3,
-            events=(
-                SimpleNamespace(
-                    event_id=11,
-                    created_at=observed,
-                    kind="task_claimed",
-                    task_id="worker",
-                ),
-            ),
-            next_cursor=None,
-            diagnostics=SimpleNamespace(
-                blockers=(),
-                exhausted_budgets=(),
-                deadlocked=False,
-                deadlock_reason=None,
-            ),
-        )
-
-    async def cancel_job(job_id: str) -> object | None:
-        cancel_calls.append(job_id)
-        if job_id != running.job_id:
-            return None
-        cancelled = _tui_job_summary(
-            running.job_id, GraphState.CANCEL_REQUESTED, result_available=False
-        )
-        jobs[0] = cancelled
-        return cancelled
-
-    async def accept_job_review(
-        job_id: str,
-        task_id: str,
-        control_id: str,
-        *,
-        rationale: str,
-        idempotency_key: str,
-    ) -> object:
-        assert idempotency_key.startswith("tui-")
-        accepted_reviews.append((job_id, task_id, control_id, rationale))
-        return SimpleNamespace(result_id="accepted-result")
-
-    monkeypatch.setattr(app.controller, "list_jobs", list_jobs)
-    monkeypatch.setattr(app.controller, "inspect_job", inspect_job)
-    monkeypatch.setattr(app.controller, "read_job_result", read_job_result)
-    monkeypatch.setattr(app.controller, "job_board", job_board)
-    monkeypatch.setattr(app.controller, "job_timeline", job_timeline)
-    monkeypatch.setattr(app.controller, "cancel_job", cancel_job)
-    monkeypatch.setattr(app.controller, "accept_job_review", accept_job_review)
-
-    async with app.run_test(size=(110, 36)) as pilot:
-        try:
+    app.controller.agent = agent  # type: ignore[assignment]
+    try:
+        job = await agent.start_job("Compare the months.")
+        await wait_for_job(agent, job.job_id, in_state(JobState.WAITING_FOR_YOU))
+        async with app.run_test(size=(110, 36)) as pilot:
             await app.push_screen(JobsScreen())
-            for _ in range(200):
+            for _ in range(40):
                 await pilot.pause(0.05)
-                if "2 jobs" in str(
-                    app.screen.query_one("#jobs-summary", Static).content
+                detail = str(app.screen.query_one("#jobs-detail", Static).content)
+                if "Which month?" in detail:
+                    break
+            assert "Question for you:" in detail and "Which month?" in detail
+            # Model-written checklist text is sanitized before it is shown.
+            assert "[ ] Read ?[31mA" in detail and "\x1b" not in detail
+            assert app.screen.query_one("#jobs-cancel", Button).disabled is False
+            answer = app.screen.query_one("#jobs-answer", Input)
+            assert answer.disabled is False
+            answer.value = "September"
+            answer.focus()
+            await pilot.press("enter")
+            for _ in range(40):
+                await pilot.pause(0.05)
+                if "Answered" in str(
+                    app.screen.query_one("#jobs-notice", Static).content
                 ):
                     break
-            manager = app.screen
-            assert isinstance(manager, JobsScreen)
-            panel = manager.query_one("#jobs-manager")
-            assert panel.styles.border_left[0] == "solid"
-            assert panel.styles.background.ansi == -1
-            listing = manager.query_one("#jobs-list", OptionList)
-            assert listing.option_count == 2
-            assert listing.has_focus is True
-            first_prompt = listing.get_option_at_index(0).prompt
-            assert isinstance(first_prompt, Text)
-            assert "ACTIVE" in first_prompt.plain
-            assert manager.query_one("#jobs-cancel", Button).disabled is False
-            assert manager.query_one("#jobs-results", Button).disabled is True
-
-            assert await pilot.click("#jobs-details") is True
-            await pilot.pause()
-            assert "Graph" in str(manager.query_one("#jobs-detail", Static).content)
-
-            assert await pilot.click("#jobs-board") is True
-            await pilot.pause()
-            assert "worker -> finalizer" in str(
-                manager.query_one("#jobs-detail", Static).content
-            )
-
-            assert await pilot.click("#jobs-timeline") is True
-            await pilot.pause()
-            timeline_text = str(manager.query_one("#jobs-detail", Static).content)
-            assert "task_claimed" in timeline_text
-            assert "Current state: active" in timeline_text
-
-            assert await pilot.click("#jobs-controls") is True
-            for _ in range(200):
-                await pilot.pause(0.05)
-                if isinstance(app.screen, JobControlScreen):
-                    break
-            assert isinstance(app.screen, JobControlScreen)
-            app.screen.query_one("#job-control-value", Input).value = (
-                "Authenticated candidate accepted."
-            )
-            assert await pilot.click("#job-control-submit") is True
-            for _ in range(200):
-                await pilot.pause(0.05)
-                if app.screen is manager and accepted_reviews:
-                    break
-            assert accepted_reviews == [
-                (
-                    running.job_id,
-                    "worker",
-                    "review-control",
-                    "Authenticated candidate accepted.",
-                )
-            ]
-            assert app.screen is manager
-
-            assert await pilot.click("#jobs-cancel") is True
-            for _ in range(200):
-                await pilot.pause(0.05)
-                if isinstance(app.screen, ConfirmScreen):
-                    break
-            assert isinstance(app.screen, ConfirmScreen)
-            await pilot.press("y")
-            for _ in range(200):
-                await pilot.pause(0.05)
-                if app.screen is manager and cancel_calls:
-                    break
-            assert app.screen is manager
-            assert cancel_calls == [running.job_id]
-            assert "Cancellation requested" in str(
-                manager.query_one("#jobs-notice", Static).content
-            )
-            assert manager.query_one("#jobs-cancel", Button).disabled is True
-
-            listing.highlighted = 1
-            await pilot.pause()
-            assert manager.query_one("#jobs-results", Button).disabled is False
-            assert await pilot.click("#jobs-results") is True
-            await pilot.pause()
-            result_text = str(manager.query_one("#jobs-detail", Static).content)
-            assert "profiled_resources" in result_text
-            assert "Artifacts (0)" in result_text
-
-            assert await pilot.click("#jobs-refresh") is True
-            await pilot.pause()
-            assert list_calls >= 3
-            assert "Job statuses refreshed" in str(
-                manager.query_one("#jobs-notice", Static).content
-            )
-            assert await pilot.click("#jobs-close") is True
+            done = await wait_for_job(agent, job.job_id, in_state(JobState.DONE))
+            assert [answer.text for answer in done.answers] == ["September"]
             app.exit(0)
-        finally:
-            app.exit(0)
+    finally:
+        await agent.close()

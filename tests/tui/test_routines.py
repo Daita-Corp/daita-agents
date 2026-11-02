@@ -7,7 +7,6 @@ from tests.tui._support import (
     Button,
     ConfirmScreen,
     DaitaApp,
-    ModelSensitivity,
     OptionList,
     RoutinesScreen,
     RoutineState,
@@ -21,55 +20,6 @@ from tests.tui._support import (
 )
 
 
-def test_routine_approval_summary_shows_relative_and_local_timing_intent() -> None:
-    import json
-
-    from daita.tui.projection import approval_summary
-
-    proposal = {
-        "title": "Follow up",
-        "revision": 1,
-        "authorized_instruction": "Report once.",
-        "schedule": {"kind": "once", "exact_at": "2026-09-23T22:00:00+00:00"},
-        "misfire_policy": "latest_only",
-    }
-    relative = approval_summary(
-        json.dumps(
-            {
-                "proposal": proposal,
-                "timing_intent": {
-                    "schedule": {"kind": "once", "after_seconds": 300},
-                    "expires_after_seconds": 3600,
-                },
-                "timing_note": "The exact time is resolved after approval.",
-            }
-        ),
-        "routines.create",
-    )
-    assert "Requested delay: 300 seconds after approval" in relative
-    assert "Requested lifetime: 3600 seconds after approval" in relative
-    assert "The exact time is resolved after approval" in relative
-
-    local = approval_summary(
-        json.dumps(
-            {
-                "proposal": proposal,
-                "timing_intent": {
-                    "schedule": {
-                        "kind": "once_next_weekday",
-                        "timezone": "America/Chicago",
-                        "weekday": 3,
-                        "hour": 17,
-                        "minute": 0,
-                    },
-                },
-            }
-        ),
-        "routines.create",
-    )
-    assert "next ISO weekday 3 at 17:00 in America/Chicago" in local
-
-
 async def test_routines_command_opens_records_and_routes_create_through_agent_loop():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     listing = await app.controller.dispatch_command("/routines")
@@ -80,20 +30,19 @@ async def test_routines_command_opens_records_and_routes_create_through_agent_lo
     )
     assert create.kind == "run"
     assert create.run_message is not None
-    assert "routine management tools" in create.run_message
+    assert "routine_save" in create.run_message
     update = await app.controller.dispatch_command(
         "/routines update routine-1 report the current invoice count every afternoon"
     )
     assert update.kind == "run"
     assert update.run_message is not None
-    assert "exact current revision" in update.run_message
+    assert "routine_save" in update.run_message
 
 
 async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatch):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     observed = datetime(2026, 8, 28, 12, tzinfo=UTC)
     summary = ScheduledRoutineSummary(
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
         routine_id="routine-ui",
         title="Invoice count",
         state=RoutineState.ACTIVE,

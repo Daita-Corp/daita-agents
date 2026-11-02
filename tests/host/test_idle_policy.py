@@ -46,7 +46,7 @@ async def test_an_unwatched_agent_without_background_work_closes_when_idle(
         await harness.create_agent(name)
     billing = await connect("billing", cwd=harness.work(), root=harness.root)
     try:
-        await scheduled_routine(billing, model.provider_id, due_in=timedelta(days=1))
+        await scheduled_routine(billing, due_in=timedelta(days=1))
     finally:
         await billing.close()
     async with harness.events("ops"):

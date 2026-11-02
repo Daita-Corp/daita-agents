@@ -7,16 +7,24 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 
 from .._json import canonical_json
 from ..artifacts.models import ArtifactError
 from ..artifacts.store import AgentHomeArtifactStore
-from ..capabilities import ExecutionScope, ExecutionScopeKind
-from ..capability_runtime import CapabilityRuntime, InternalCapabilityRequest
+from ..capabilities import (
+    AccessMode,
+    ExecutionScope,
+    ExecutionScopeKind,
+    OperationalEffect,
+)
+from ..capability_runtime import CapabilityRuntime, MachineScopeBuilder
 from ..distribution import DistributionOwner, OutcomeArtifactReference
+from ..distribution.owner import conversation_inbox_plan
 from ..hosting.execution_governor import AdmissionClosedError
 from ..llm.errors import ProviderErrorCode
+from ..llm.models import ModelSensitivity
 from ..loop.models import (
     InstructionAuthority,
     LoopExit,
@@ -32,7 +40,8 @@ from ..storage.errors import (
 )
 from ..storage.sqlite_records import EffectUnresolvedError
 from .models import (
-    ResourceRevisionObservation,
+    ROUTINE_INBOX_SENSITIVITY,
+    ROUTINE_OUTCOME,
     RoutineOccurrence,
     RoutineOccurrenceDisposition,
     RoutineState,
@@ -50,7 +59,7 @@ _QUOTA_HOLD_MAXIMUM = timedelta(hours=1)
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z")
 
 RoutineRunExecutor = Callable[
-    [RoutineOccurrence, RunInput, ResourceRevisionObservation | None],
+    [RoutineOccurrence, RunInput],
     Awaitable[LoopExit | None],
 ]
 
@@ -68,14 +77,24 @@ class RoutineSupervisor:
         distribution: DistributionOwner,
         artifacts: AgentHomeArtifactStore,
         execute_run: RoutineRunExecutor | None,
+        machine_scope: MachineScopeBuilder,
+        model_routes: tuple[str, ...],
+        per_run_max_tokens: int,
+        per_run_max_cost_usd: Decimal | None,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
         poll_seconds: float = _DEFAULT_POLL_SECONDS,
     ) -> None:
+        """The routes and per-run limits are the agent's own: every occurrence
+        runs with the current model and the normal run limits."""
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("routine supervisor agent_id must be non-empty text")
         if execute_run is not None and not callable(execute_run):
             raise TypeError("routine run executor must be callable or None")
+        if not callable(machine_scope):
+            raise TypeError("routine machine scope builder must be callable")
+        if per_run_max_tokens < 1:
+            raise ValueError("routine supervisor needs the agent's run limits")
         if not isinstance(poll_seconds, (int, float)) or not 0 < poll_seconds <= 30:
             raise ValueError("routine supervisor poll interval is outside its bound")
         self._agent_id = agent_id
@@ -85,6 +104,10 @@ class RoutineSupervisor:
         self._distribution = distribution
         self._artifacts = artifacts
         self._execute_run = execute_run
+        self._machine_scope = machine_scope
+        self._model_routes = tuple(model_routes)
+        self._per_run_max_tokens = per_run_max_tokens
+        self._per_run_max_cost_usd = per_run_max_cost_usd
         self._clock = clock
         self._id_factory = id_factory
         self._poll_seconds = float(poll_seconds)
@@ -259,7 +282,6 @@ class RoutineSupervisor:
                 and occurrence.disposition
                 in {
                     RoutineOccurrenceDisposition.CLAIMED,
-                    RoutineOccurrenceDisposition.PRECHECKING,
                     RoutineOccurrenceDisposition.RETRYABLE,
                 }
             ):
@@ -277,7 +299,7 @@ class RoutineSupervisor:
         )
         for routine in due:
             assert routine.next_due_at is not None
-            if self._quota_held(routine, now):
+            if self._quota_held(now):
                 continue
             try:
                 occurrence = await self._store.claim_due_routine_occurrence(
@@ -334,32 +356,16 @@ class RoutineSupervisor:
                 or routine.active_occurrence_id != occurrence.occurrence_id
             ):
                 return
-            await self._owner.authority_snapshot(routine)
-            scope = _execution_scope(routine, occurrence)
-            observation = await self._observe_precheck(routine, occurrence, scope)
-            if (
-                observation is not None
-                and routine.last_acknowledged_precheck_observation is not None
-                and observation.digest
-                == routine.last_acknowledged_precheck_observation.digest
-            ):
-                await self._store.finalize_routine_occurrence(
-                    self._agent_id,
-                    occurrence.occurrence_id,
-                    delivery_id=self._id_factory("delivery"),
-                    finalized_at=self._clock(),
-                    skipped_no_change_observation=observation,
-                )
-                return
+            scope = await self._execution_scope(routine, occurrence)
             run_id = self._id_factory("run")
             if _RUN_ID.fullmatch(run_id) is None:
                 raise ValueError("routine run identity is invalid")
-            run_input = _run_input(routine, occurrence, scope, run_id, observation)
+            run_input = _run_input(routine, occurrence, scope, run_id)
             assert self._execute_run is not None
-            result = await self._execute_run(occurrence, run_input, observation)
+            result = await self._execute_run(occurrence, run_input)
             if result is None:
                 return
-            self._observe_quota(routine, result)
+            self._observe_quota(result)
             terminal = await self._store.mark_routine_occurrence_run_terminal(
                 self._agent_id,
                 occurrence.occurrence_id,
@@ -375,7 +381,7 @@ class RoutineSupervisor:
                     await self._distribution.validate_outcome_artifacts(
                         self._artifacts,
                         result.artifacts,
-                        contract=routine.outcome_contract,
+                        contract=ROUTINE_OUTCOME,
                         resulting_run_id=run_id,
                         require_minimum_counts=False,
                     )
@@ -397,76 +403,34 @@ class RoutineSupervisor:
         except Exception as error:
             await self._fail_unbound(occurrence, error)
 
-    def _quota_held(self, routine: ScheduledRoutine, now: datetime) -> bool:
-        """Leave due slots unclaimed while any eligible route is over quota."""
+    def _quota_held(self, now: datetime) -> bool:
+        """Leave due slots unclaimed while any of the agent's routes is over quota."""
         return any(
             hold[0] > now
-            for route in routine.eligible_model_routes
+            for route in self._model_routes
             if (hold := self._quota_holds.get(route)) is not None
         )
 
-    def _observe_quota(self, routine: ScheduledRoutine, result: LoopExit) -> None:
+    def _observe_quota(self, result: LoopExit) -> None:
         if result.kind is LoopExitKind.COMPLETED:
-            # Completed exits carry no provider identity; any eligible route served.
-            for eligible in routine.eligible_model_routes:
-                self._quota_holds.pop(eligible, None)
+            # Completed exits carry no provider identity; any route served.
+            for route in self._model_routes:
+                self._quota_holds.pop(route, None)
             return
-        route = result.provider_id
+        provider = result.provider_id
         if (
-            route is not None
+            provider is not None
             and result.kind is LoopExitKind.FAILED
             and result.reason == ProviderErrorCode.RATE_LIMIT_ERROR.value
         ):
-            previous = self._quota_holds.get(route)
+            previous = self._quota_holds.get(provider)
             window = (
                 _QUOTA_HOLD_INITIAL
                 if previous is None
                 else min(previous[1] * 2, _QUOTA_HOLD_MAXIMUM)
             )
-            self._quota_holds[route] = (self._clock() + window, window)
+            self._quota_holds[provider] = (self._clock() + window, window)
             _logger.warning("routine model route over quota; holding new claims")
-
-    async def _observe_precheck(
-        self,
-        routine: ScheduledRoutine,
-        occurrence: RoutineOccurrence,
-        scope: ExecutionScope,
-    ) -> ResourceRevisionObservation | None:
-        precheck = routine.precheck
-        if precheck is None:
-            return None
-        run = _run_input(
-            routine,
-            occurrence,
-            scope,
-            f"run-{'0' * 32}",
-            None,
-        )
-        outcome = await self._runtime.execute_internal(
-            InternalCapabilityRequest(
-                run=run,
-                call_id=f"precheck:{occurrence.occurrence_id}",
-                capability_id=precheck.capability_id,
-                contract_digest=precheck.contract_digest,
-                arguments={
-                    "source_id": precheck.source_id,
-                    "resource_id": precheck.resource_id,
-                },
-                sensitivity=routine.sensitivity_ceiling,
-            )
-        )
-        data = outcome.output.data
-        try:
-            observed_at = datetime.fromisoformat(str(data["observed_at"]))
-            return ResourceRevisionObservation(
-                source_id=str(data["source_id"]),
-                resource_id=str(data["resource_id"]),
-                resource_revision=str(data["resource_revision"]),
-                catalog_revision=str(data["catalog_revision"]),
-                observed_at=observed_at,
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError("routine_precheck_output_invalid") from error
 
     async def _fail_unbound(
         self,
@@ -543,18 +507,14 @@ class RoutineSupervisor:
     ) -> tuple[tuple[OutcomeArtifactReference, ...], str | None]:
         if occurrence.terminal_run_id is None:
             return (), "outcome_artifact_contract_failed"
-        routine = await self._store.load_scheduled_routine(
-            self._agent_id,
-            occurrence.routine_id,
-        )
         result = await self._store.result(occurrence.terminal_run_id)
-        if routine is None or result is None:
+        if result is None:
             return (), "outcome_artifact_contract_failed"
         try:
             references = await self._distribution.validate_outcome_artifacts(
                 self._artifacts,
                 result.artifacts,
-                contract=routine.outcome_contract,
+                contract=ROUTINE_OUTCOME,
                 resulting_run_id=occurrence.terminal_run_id,
                 require_minimum_counts=False,
             )
@@ -562,37 +522,51 @@ class RoutineSupervisor:
             return (), "outcome_artifact_contract_failed"
         return references, None
 
+    async def _execution_scope(
+        self,
+        routine: ScheduledRoutine,
+        occurrence: RoutineOccurrence,
+    ) -> ExecutionScope:
+        """Fix the occurrence's scope now: current sources and capabilities.
 
-def _execution_scope(
-    routine: ScheduledRoutine,
-    occurrence: RoutineOccurrence,
-) -> ExecutionScope:
-    return ExecutionScope(
-        contract_bindings=routine.contract_bindings,
-        capability_grants=routine.capability_grants,
-        scope_id=f"scope:{occurrence.occurrence_id}",
-        revision=1,
-        agent_id=routine.agent_id,
-        principal_id=routine.owner_principal_id,
-        grant_id=f"routine:{routine.routine_id}:revision:{routine.revision}",
-        job_id=None,
-        job_revision=None,
-        routine_id=routine.routine_id,
-        routine_revision=routine.revision,
-        occurrence_id=occurrence.occurrence_id,
-        allowed_source_ids=routine.allowed_source_ids,
-        allowed_connector_binding_ids=routine.allowed_connector_binding_ids,
-        allowed_resource_ids=routine.allowed_resource_ids,
-        allowed_capability_ids=routine.allowed_capability_ids,
-        allowed_access_modes=routine.allowed_access_modes,
-        allowed_operational_effects=routine.allowed_operational_effects,
-        sensitivity_ceiling=routine.sensitivity_ceiling,
-        eligible_model_routes=routine.eligible_model_routes,
-        per_run_max_cost_usd=routine.per_run_max_cost_usd,
-        per_run_max_tokens=routine.per_run_max_tokens,
-        distribution_plan_digest=routine.distribution_plan.plan_digest,
-        scope_kind=ExecutionScopeKind.SCHEDULED_ROUTINE,
-    )
+        The routine's named sources narrow it; the agent's current model and
+        normal run limits bound it. Nothing else comes from the record
+        (invariant 6), and a routine has no sensitivity ceiling of its own.
+        """
+
+        fixed = await self._machine_scope(
+            RunOrigin.SCHEDULED_ROUTINE,
+            routine.source_ids,
+            self._model_routes,
+        )
+        return ExecutionScope(
+            contract_bindings=fixed.contract_bindings,
+            scope_id=f"scope:{occurrence.occurrence_id}",
+            revision=1,
+            agent_id=routine.agent_id,
+            principal_id=routine.owner_principal_id,
+            grant_id=f"routine:{routine.routine_id}:revision:{routine.revision}",
+            job_id=None,
+            job_revision=None,
+            routine_id=routine.routine_id,
+            routine_revision=routine.revision,
+            occurrence_id=occurrence.occurrence_id,
+            allowed_source_ids=fixed.source_ids,
+            allowed_connector_binding_ids=fixed.connector_binding_ids,
+            allowed_resource_ids=fixed.resource_ids,
+            allowed_capability_ids=fixed.capability_ids,
+            allowed_access_modes=frozenset(AccessMode),
+            allowed_operational_effects=frozenset(OperationalEffect),
+            sensitivity_ceiling=ModelSensitivity.RESTRICTED,
+            eligible_model_routes=self._model_routes,
+            per_run_max_cost_usd=self._per_run_max_cost_usd,
+            per_run_max_tokens=self._per_run_max_tokens,
+            distribution_plan_digest=conversation_inbox_plan(
+                routine.conversation_id,
+                sensitivity_ceiling=ROUTINE_INBOX_SENSITIVITY,
+            ).plan_digest,
+            scope_kind=ExecutionScopeKind.SCHEDULED_ROUTINE,
+        )
 
 
 def _run_input(
@@ -600,7 +574,6 @@ def _run_input(
     occurrence: RoutineOccurrence,
     scope: ExecutionScope,
     run_id: str,
-    observation: ResourceRevisionObservation | None,
 ) -> RunInput:
     payload = {
         "routine_id": routine.routine_id,
@@ -608,24 +581,6 @@ def _run_input(
         "occurrence_id": occurrence.occurrence_id,
         "scheduled_for": occurrence.scheduled_for.isoformat(),
         "slot_kind": occurrence.slot_kind.value,
-        "pinned_skills": tuple(
-            {
-                "name": binding.skill_name,
-                "content_digest": binding.content_digest,
-            }
-            for binding in routine.skill_bindings
-        ),
-        "precheck_observation": (
-            None
-            if observation is None
-            else {
-                "source_id": observation.source_id,
-                "resource_id": observation.resource_id,
-                "resource_revision": observation.resource_revision,
-                "catalog_revision": observation.catalog_revision,
-                "observed_at": observation.observed_at.isoformat(),
-            }
-        ),
     }
     return RunInput(
         id=run_id,
@@ -633,7 +588,7 @@ def _run_input(
         message=routine.authorized_instruction,
         created_at=occurrence.claimed_at or occurrence.created_at,
         conversation_id=routine.conversation_id,
-        source_scope_ids=routine.allowed_source_ids,
+        source_scope_ids=routine.source_ids,
         start=RunStartEnvelope(
             origin=RunOrigin.SCHEDULED_ROUTINE,
             instruction_authority=InstructionAuthority.FOREGROUND_AUTHORIZED,

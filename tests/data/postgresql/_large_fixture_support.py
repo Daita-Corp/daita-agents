@@ -181,10 +181,8 @@ class _BulkUpdateProvider:
             data = preview.output["data"]
             assert isinstance(data, Mapping)
             matched_rows = data["matched_rows"]
-            preview_fingerprint = data["preview_fingerprint"]
             assert isinstance(matched_rows, int)
             assert matched_rows > 1
-            assert isinstance(preview_fingerprint, str)
             self._matched_rows = matched_rows
             self._phase = 3
             return ModelResponse(
@@ -193,12 +191,7 @@ class _BulkUpdateProvider:
                     ToolCall(
                         id="bulk-update",
                         name="data_update_rows",
-                        arguments={
-                            **self._plan(),
-                            "mode": "apply",
-                            "preview_fingerprint": preview_fingerprint,
-                            "expected_affected_rows": matched_rows,
-                        },
+                        arguments=self._plan(),
                     ),
                 ),
             )

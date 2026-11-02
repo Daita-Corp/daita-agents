@@ -26,7 +26,7 @@ pytestmark = pytest.mark.integration
 
 @pytest.mark.parametrize(
     "name,operation",
-    [("jobs", "list_stale_graph_attempts"), ("routines", "next_routine_deadline")],
+    [("jobs", "list_jobs"), ("routines", "next_routine_deadline")],
 )
 async def test_supervisor_recovers_after_known_noncommit_failure(
     tmp_path, monkeypatch, name, operation
@@ -76,7 +76,7 @@ async def test_supervisor_recovers_after_known_noncommit_failure(
 )
 @pytest.mark.parametrize(
     "name,operation",
-    [("jobs", "expire_due_graphs"), ("routines", "next_routine_deadline")],
+    [("jobs", "list_jobs"), ("routines", "next_routine_deadline")],
 )
 async def test_supervisor_stops_on_unknown_commit_or_lost_ownership(
     tmp_path, monkeypatch, caplog, error_type, name, operation
@@ -111,7 +111,7 @@ async def test_supervisor_stops_on_unknown_commit_or_lost_ownership(
         await agent.close()
 
 
-async def test_idle_graph_polling_is_bounded_and_wake_is_prompt(
+async def test_idle_job_polling_is_bounded_and_wake_is_prompt(
     tmp_path: Path, monkeypatch
 ):
     agent = await Agent.create(
@@ -119,7 +119,7 @@ async def test_idle_graph_polling_is_bounded_and_wake_is_prompt(
     )
     counts: Counter[str] = Counter()
     woke = asyncio.Event()
-    original = SQLiteStateStore.list_stale_graph_attempts
+    original = SQLiteStateStore.list_jobs
 
     async def observe(self, *args, **kwargs):
         counts["poll"] += 1
@@ -127,7 +127,7 @@ async def test_idle_graph_polling_is_bounded_and_wake_is_prompt(
         return await original(self, *args, **kwargs)
 
     try:
-        monkeypatch.setattr(SQLiteStateStore, "list_stale_graph_attempts", observe)
+        monkeypatch.setattr(SQLiteStateStore, "list_jobs", observe)
         await asyncio.sleep(1.1)
         assert 1 <= counts["poll"] <= 6
         woke.clear()
@@ -150,7 +150,7 @@ async def test_host_admission_close_stops_supervisors_without_failure(
     try:
         if name == "jobs":
             supervisor = embedded._job_supervisor
-            # The next graph poll is refused its storage permit by admission.
+            # The next job poll is refused its storage permit by admission.
             await embedded._admission_coordinator.begin_draining()
         else:
             supervisor = embedded._routine_supervisor

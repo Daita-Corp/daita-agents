@@ -45,9 +45,8 @@ async def test_current_state_schema_and_conversation_index_are_exact(tmp_path):
             name: definition[0]
             for name, definition in CURRENT_SCHEMA.named_indexes.items()
         }
-        assert "job_graphs" in tables
-        assert "job_task_attempts" in tables
-        assert "job_task_results" in tables
+        assert "jobs" in tables
+        assert not {"job_graphs", "job_task_attempts", "job_task_results"} & tables
         assert "autonomous_followups" not in tables
         run_indexes = {
             str(row[1]): bool(row[2])

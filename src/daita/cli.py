@@ -14,8 +14,8 @@ import sys
 import tempfile
 import typing
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 
 from . import (
@@ -24,17 +24,13 @@ from . import (
     AgentEvent,
     AgentEventKind,
     AgentObserver,
-    AmbiguousTimePolicy,
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
     ArtifactError,
-    CalendarDaySelector,
-    CalendarSchedule,
     EffectReceipt,
     EffectResolutionDecision,
     FolderSource,
-    IntervalSchedule,
     LocalFileAccess,
     LocalWorkspace,
     LoopLimits,
@@ -42,14 +38,9 @@ from . import (
     MCPBindingStatus,
     MCPServerInspection,
     MCPToolSelection,
-    MisfirePolicy,
-    NonexistentTimePolicy,
-    OnceSchedule,
     PostgreSQLSource,
-    ReportingMode,
-    ResourceRevisionPrecheck,
+    RoutineIntent,
     RoutineState,
-    ScheduledRoutineDraft,
     SourceTypeRegistry,
     SQLiteSource,
     __version__,
@@ -57,21 +48,14 @@ from . import (
 )
 from ._json import FrozenJsonObject
 from .artifacts.models import (
-    ArtifactAuthorship,
     artifact_delivery_receipt_to_mapping,
     artifact_destination_to_mapping,
     artifact_ref_to_mapping,
 )
-from .distribution import (
-    ArtifactRequirement,
-    OutcomeContract,
-    delivery_inspection_projection,
-    delivery_view_projection,
-    distribution_destination_projection,
-)
+from .distribution import delivery_inspection_projection, delivery_view_projection
 from .errors import StateCompatibilityError
-from .jobs.graph.models import GraphInspection, GraphState, TaskState
-from .jobs.owner import GraphBlockerProjection
+from .jobs.capabilities import job_payload
+from .jobs.models import JobState
 from .llm import (
     ModelProfile,
     ModelSensitivity,
@@ -85,141 +69,6 @@ from .terminal import run_terminal_application
 from .tui.projection import run_failure_notice, tool_outcome_summary
 from .work_board import work_board_projection
 from .workspace import working_directory
-
-
-def _graph_inspection_mapping(inspection: GraphInspection) -> dict[str, object]:
-    """Project one bounded current graph inspection for the CLI."""
-
-    if not isinstance(inspection, GraphInspection):
-        raise TypeError("graph inspection projection requires GraphInspection")
-    attempts_by_task: dict[str, list[dict[str, object]]] = {}
-    for attempt in inspection.attempts:
-        attempts_by_task.setdefault(attempt.task_id, []).append(
-            {
-                "attempt_id": attempt.attempt_id,
-                "ordinal": attempt.ordinal,
-                "state": attempt.state.value,
-                "fencing_epoch": attempt.fencing_epoch,
-                "heartbeat_at": (
-                    None
-                    if attempt.heartbeat_at is None
-                    else attempt.heartbeat_at.isoformat()
-                ),
-                "checkpoint_ids": attempt.checkpoint_ids,
-                "artifact_ids": attempt.artifact_ids,
-                "error_code": attempt.error_code,
-            }
-        )
-    results = {item.task_id: item for item in inspection.results}
-    return {
-        "job_id": inspection.job.job_id,
-        "state": inspection.job.state.value,
-        "desired_state": inspection.job.desired_state.value,
-        "specification_digest": inspection.job.specification_digest,
-        "topology_revision": inspection.graph.revision,
-        "task_count": inspection.graph.task_count,
-        "edge_count": inspection.graph.edge_count,
-        "active_attempt_count": inspection.graph.active_attempt_count,
-        "terminal_result_id": inspection.job.terminal_result_id,
-        "tasks": [
-            {
-                "task_id": task.task_id,
-                "role": task.role.value,
-                "state": task.state.value,
-                "task_revision": task.task_revision,
-                "attempts": attempts_by_task.get(task.task_id, []),
-                "accepted_result": (
-                    None
-                    if task.task_id not in results
-                    else {
-                        "result_id": results[task.task_id].result_id,
-                        "result_digest": results[task.task_id].result_digest,
-                        "artifact_ids": results[task.task_id].artifact_ids,
-                    }
-                ),
-            }
-            for task in inspection.tasks
-        ],
-        "dependencies": [
-            {
-                "upstream_task_id": edge.upstream_task_id,
-                "downstream_task_id": edge.downstream_task_id,
-                "edge_kind": edge.edge_kind.value,
-            }
-            for edge in inspection.dependencies
-        ],
-        "controls": [
-            {
-                "control_id": control.control_id,
-                "task_id": control.task_id,
-                "kind": control.kind.value,
-                "state": control.state.value,
-                "payload_digest": control.payload_digest,
-                "payload": control.payload,
-                "resolution": control.resolution,
-                "resolved_by_kind": control.resolved_by_kind,
-                "resolved_by_id": control.resolved_by_id,
-            }
-            for control in inspection.controls
-        ],
-        "checkpoints": [
-            {
-                "checkpoint_id": checkpoint.checkpoint_id,
-                "task_id": checkpoint.task_id,
-                "attempt_id": checkpoint.attempt_id,
-                "ordinal": checkpoint.ordinal,
-                "milestone": checkpoint.milestone,
-                "payload_digest": checkpoint.payload_digest,
-            }
-            for checkpoint in inspection.checkpoints
-        ],
-        "comments": [
-            {
-                "comment_id": comment.comment_id,
-                "task_id": comment.task_id,
-                "author_kind": comment.author_kind,
-                "author_id": comment.author_id,
-                "body_digest": comment.body_digest,
-            }
-            for comment in inspection.comments
-        ],
-        "budgets": [
-            {
-                "dimension": item.dimension,
-                "task_id": item.task_id,
-                "ceiling": item.ceiling,
-                "settled": item.settled,
-                "reserved": item.reserved,
-                "control_reserved": item.control_reserved,
-            }
-            for item in inspection.budget_ledgers
-        ],
-        "events": [
-            {
-                "event_id": item.event_id,
-                "kind": item.kind,
-                "task_id": item.task_id,
-                "attempt_id": item.attempt_id,
-                "created_at": item.created_at.isoformat(),
-            }
-            for item in inspection.events
-        ],
-        "delivery_ids": inspection.delivery_ids,
-    }
-
-
-def _graph_blockers_mapping(
-    projection: GraphBlockerProjection,
-) -> dict[str, object]:
-    """Project the bounded typed blocker view without adding graph state ownership."""
-
-    if not isinstance(projection, GraphBlockerProjection):
-        raise TypeError("graph blocker projection requires GraphBlockerProjection")
-    return {
-        "job_id": projection.job_id,
-        "graph_state": projection.graph_state.value,
-        "blockers": projection.blockers,
-    }
 
 
 def _effect_receipt_mapping(receipt: EffectReceipt) -> dict[str, object]:
@@ -545,15 +394,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="open the same interactive Textual app as `daita`",
     )
     chat.add_argument("name")
-    chat.add_argument("--model", help="ignored; model setup happens inside the app")
     chat.add_argument("--conversation")
 
     host = commands.add_parser(
         "host",
         help="run the background Daita host that owns agents, runs and routines",
-    )
-    host.add_argument(
-        "--agent", dest="host_agent", help="deprecated; runs `daita host serve`"
     )
     host_commands = host.add_subparsers(dest="host_command")
     host_serve = host_commands.add_parser("serve", help="run the host in this process")
@@ -595,115 +440,25 @@ def build_parser() -> argparse.ArgumentParser:
     diagnostic_summary.add_argument("path", type=Path)
 
     jobs = commands.add_parser(
-        "jobs",
-        help="inspect and resolve bounded durable-job controls",
+        "jobs", help="list, inspect, answer or cancel background jobs"
     )
     job_commands = jobs.add_subparsers(dest="jobs_command", required=True)
     job_list = job_commands.add_parser("list")
     job_list.add_argument("name")
     job_list.add_argument(
-        "--state", action="append", choices=tuple(item.value for item in GraphState)
+        "--state", action="append", choices=tuple(item.value for item in JobState)
     )
     job_list.add_argument("--limit", type=int, default=50)
-    job_inspect = job_commands.add_parser("inspect")
-    job_inspect.add_argument("name")
-    job_inspect.add_argument("job_id")
-    job_tasks = job_commands.add_parser("tasks")
-    job_tasks.add_argument("name")
-    job_tasks.add_argument("job_id")
-    job_tasks.add_argument(
-        "--state", action="append", choices=tuple(item.value for item in TaskState)
+    for command in ("inspect", "cancel"):
+        job_command = job_commands.add_parser(command)
+        job_command.add_argument("name")
+        job_command.add_argument("job_id")
+    job_answer = job_commands.add_parser(
+        "answer", help="answer a waiting job, or raise the limits it stopped at"
     )
-    job_tasks.add_argument("--limit", type=int, default=64)
-    job_dependencies = job_commands.add_parser("dependencies")
-    job_dependencies.add_argument("name")
-    job_dependencies.add_argument("job_id")
-    job_dependencies.add_argument("--task-id")
-    job_dependencies.add_argument("--limit", type=int, default=100)
-    job_attempts = job_commands.add_parser("attempts")
-    job_attempts.add_argument("name")
-    job_attempts.add_argument("job_id")
-    job_attempts.add_argument("task_id")
-    job_attempts.add_argument("--limit", type=int, default=3)
-    job_result = job_commands.add_parser("result")
-    job_result.add_argument("name")
-    job_result.add_argument("job_id")
-    job_result.add_argument("task_id")
-    job_checkpoints = job_commands.add_parser("checkpoints")
-    job_checkpoints.add_argument("name")
-    job_checkpoints.add_argument("job_id")
-    job_checkpoints.add_argument("task_id")
-    job_checkpoints.add_argument("--limit", type=int, default=8)
-    job_artifacts = job_commands.add_parser("artifacts")
-    job_artifacts.add_argument("name")
-    job_artifacts.add_argument("job_id")
-    job_artifacts.add_argument("--task-id")
-    job_artifacts.add_argument("--limit", type=int, default=64)
-    job_timeline = job_commands.add_parser("timeline")
-    job_timeline.add_argument("name")
-    job_timeline.add_argument("job_id")
-    job_timeline.add_argument("--task-id")
-    job_timeline.add_argument("--after", type=int, default=0)
-    job_timeline.add_argument("--limit", type=int, default=100)
-    job_board = job_commands.add_parser("board")
-    job_board.add_argument("name")
-    job_board.add_argument("job_id")
-    job_blockers = job_commands.add_parser("blockers")
-    job_blockers.add_argument("name")
-    job_blockers.add_argument("job_id")
-    job_answer = job_commands.add_parser("answer")
     job_answer.add_argument("name")
     job_answer.add_argument("job_id")
-    job_answer.add_argument("task_id")
-    job_answer.add_argument("control_id")
-    job_answer.add_argument("--principal-id", required=True)
-    job_answer.add_argument("--answer-json", required=True)
-    job_answer.add_argument("--idempotency-key")
-    job_accept = job_commands.add_parser("accept-review")
-    job_accept.add_argument("name")
-    job_accept.add_argument("job_id")
-    job_accept.add_argument("task_id")
-    job_accept.add_argument("control_id")
-    job_accept.add_argument("--principal-id", required=True)
-    job_accept.add_argument("--rationale", required=True)
-    job_accept.add_argument("--idempotency-key", required=True)
-    job_changes = job_commands.add_parser("request-changes")
-    job_changes.add_argument("name")
-    job_changes.add_argument("job_id")
-    job_changes.add_argument("task_id")
-    job_changes.add_argument("control_id")
-    job_changes.add_argument("--principal-id", required=True)
-    job_changes.add_argument("--rationale", required=True)
-    job_changes.add_argument("--guidance", required=True)
-    job_changes.add_argument("--idempotency-key", required=True)
-    job_retry = job_commands.add_parser("retry-control")
-    job_retry.add_argument("name")
-    job_retry.add_argument("job_id")
-    job_retry.add_argument("task_id")
-    job_retry.add_argument("control_id")
-    job_retry.add_argument("--principal-id", required=True)
-    job_retry.add_argument("--note", required=True)
-    job_retry.add_argument("--idempotency-key", required=True)
-    job_reject = job_commands.add_parser("reject")
-    job_reject.add_argument("name")
-    job_reject.add_argument("job_id")
-    job_reject.add_argument("task_id")
-    job_reject.add_argument("control_id")
-    job_reject.add_argument("--principal-id", required=True)
-    job_reject.add_argument("--reason", required=True)
-    job_reject.add_argument("--idempotency-key")
-    job_cancel = job_commands.add_parser("cancel-graph")
-    job_cancel.add_argument("name")
-    job_cancel.add_argument("job_id")
-    job_cancel.add_argument("--principal-id", required=True)
-    job_replace = job_commands.add_parser("replace-task")
-    job_replace.add_argument("name")
-    job_replace.add_argument("job_id")
-    job_replace.add_argument("task_id")
-    job_replace.add_argument("expected_revision", type=int)
-    job_replace.add_argument("--principal-id", required=True)
-    job_replace.add_argument("--idempotency-key", required=True)
-    job_replace.add_argument("--note", required=True)
+    job_answer.add_argument("text")
 
     memory = commands.add_parser("memory", help="manage agent memory")
     memory_commands = memory.add_subparsers(dest="memory_command", required=True)
@@ -771,48 +526,79 @@ def build_parser() -> argparse.ArgumentParser:
 
     routines = commands.add_parser(
         "routines",
-        help="inspect and manage saved assignments (execution requires an open host)",
+        help=(
+            "scheduled routines: a title, a prompt and a schedule; each run asks "
+            "before any write (execution requires an open host)"
+        ),
     )
     routine_commands = routines.add_subparsers(
         dest="routines_command",
         required=True,
     )
-    routine_list = routine_commands.add_parser("list")
+    routine_list = routine_commands.add_parser("list", help="list routines")
     routine_list.add_argument("name")
     routine_list.add_argument(
         "--state",
         action="append",
         choices=tuple(item.value for item in RoutineState),
     )
-    routine_inspect = routine_commands.add_parser("inspect")
+    routine_inspect = routine_commands.add_parser(
+        "inspect", help="show a routine and its recent occurrences"
+    )
     routine_inspect.add_argument("name")
     routine_inspect.add_argument("routine_id")
-    for command in ("create", "promote"):
-        action = routine_commands.add_parser(command)
+    for command in ("create", "update"):
+        action = routine_commands.add_parser(
+            command,
+            help=(
+                "save a new routine after confirmation; results go to a new "
+                "conversation's Inbox"
+                if command == "create"
+                else "change a routine after confirmation; omitted fields keep "
+                "their values"
+            ),
+        )
         action.add_argument("name")
-        action.add_argument("--spec", type=Path, required=True)
-        if command == "promote":
-            action.add_argument("--basis-run-id", required=True)
-    routine_revision_parser = routine_commands.add_parser("update")
-    routine_revision_parser.add_argument("name")
-    routine_revision_parser.add_argument("routine_id")
-    routine_revision_parser.add_argument("expected_revision", type=int)
-    routine_revision_parser.add_argument("--spec", type=Path, required=True)
-    routine_revision_parser.add_argument("--basis-run-id")
+        if command == "update":
+            action.add_argument("routine_id")
+            action.add_argument(
+                "--expected-revision",
+                type=int,
+                help="refuse the change if the routine moved past this revision",
+            )
+        action.add_argument("--title")
+        action.add_argument("--prompt", help="what each run should do")
+        action.add_argument(
+            "--schedule",
+            help=(
+                'JSON schedule, e.g. \'{"kind": "once", "after_seconds": 480}\', '
+                '\'{"kind": "interval", "interval_seconds": 3600, '
+                '"anchor_after_seconds": 60}\' or \'{"kind": "calendar", '
+                '"timezone": "America/Chicago", "hour": 9, "minute": 0}\''
+            ),
+        )
+        action.add_argument(
+            "--source",
+            action="append",
+            help="source name or id to use; repeat for more (default: all sources)",
+        )
+        action.add_argument(
+            "--spec",
+            type=Path,
+            help="JSON file with title, prompt, schedule, sources and "
+            "run_immediately; flags override it",
+        )
+        if command == "create":
+            action.add_argument(
+                "--run-immediately",
+                action="store_true",
+                help="also run once now (interval and calendar schedules)",
+            )
     for command in ("pause", "resume", "run-now", "disable"):
-        action = routine_commands.add_parser(command)
+        action = routine_commands.add_parser(command, help=f"{command} a routine")
         action.add_argument("name")
         action.add_argument("routine_id")
         action.add_argument("expected_revision", type=int)
-
-    routine_destinations = routine_commands.add_parser("destinations")
-    routine_destinations.add_argument("name")
-    routine_destinations.add_argument("conversation_id")
-    routine_destinations.add_argument(
-        "--sensitivity-ceiling",
-        choices=tuple(item.value for item in ModelSensitivity),
-        default=ModelSensitivity.RESTRICTED.value,
-    )
 
     work = commands.add_parser(
         "work",
@@ -1216,238 +1002,35 @@ async def _deny_without_prompting(request: ApprovalRequest) -> ApprovalDecision:
     return ApprovalDecision.DENY
 
 
-def _routine_draft_from_file(path: Path) -> ScheduledRoutineDraft:
-    try:
-        value = json.loads(_read_input_document(str(path)))
-    except json.JSONDecodeError as error:
-        raise ValueError(f"routine spec is not valid JSON: {error.msg}") from error
-    document = _object_mapping(value, "routine spec")
-    schedule_document = _object_mapping(document.get("schedule"), "routine schedule")
-    schedule_kind = _required_text(schedule_document, "kind")
-    schedule: OnceSchedule | IntervalSchedule | CalendarSchedule
-    if schedule_kind == "once":
-        schedule = OnceSchedule(
-            _routine_datetime(_required_text(schedule_document, "exact_at"))
-        )
-    elif schedule_kind == "interval":
-        schedule = IntervalSchedule(
-            _required_integer(schedule_document, "interval_seconds"),
-            _routine_datetime(_required_text(schedule_document, "anchor_at")),
-        )
-    elif schedule_kind == "calendar":
-        schedule = CalendarSchedule(
-            timezone=_required_text(schedule_document, "timezone"),
-            hour=_required_integer(schedule_document, "hour"),
-            minute=_required_integer(schedule_document, "minute"),
-            day_selector=CalendarDaySelector(
-                _required_text(schedule_document, "day_selector")
-            ),
-            weekdays=_integer_tuple(schedule_document.get("weekdays", ()), "weekdays"),
-            month_days=_integer_tuple(
-                schedule_document.get("month_days", ()), "month_days"
-            ),
-            months=_integer_tuple(schedule_document.get("months", ()), "months"),
-            nonexistent_time_policy=NonexistentTimePolicy(
-                str(schedule_document.get("nonexistent_time_policy", "skip"))
-            ),
-            ambiguous_time_policy=AmbiguousTimePolicy(
-                str(schedule_document.get("ambiguous_time_policy", "first"))
-            ),
-        )
-    else:
-        raise ValueError("routine schedule kind must be once, interval, or calendar")
-    precheck_value = document.get("precheck")
-    precheck = (
-        None
-        if precheck_value is None
-        else _routine_precheck(_object_mapping(precheck_value, "routine precheck"))
-    )
-    return ScheduledRoutineDraft(
-        origin_run_id=_required_text(document, "origin_run_id"),
-        title=_required_text(document, "title"),
-        authorized_instruction=_required_text(document, "authorized_instruction"),
-        schedule=schedule,
-        misfire_policy=MisfirePolicy(_required_text(document, "misfire_policy")),
-        reporting_mode=ReportingMode(_required_text(document, "reporting_mode")),
-        precheck=precheck,
-        allowed_source_ids=_string_tuple(document, "allowed_source_ids"),
-        allowed_connector_binding_ids=_string_tuple(
-            document, "allowed_connector_binding_ids"
-        ),
-        allowed_resource_ids=_string_tuple(document, "allowed_resource_ids"),
-        allowed_capability_ids=_string_tuple(document, "allowed_capability_ids"),
-        sensitivity_ceiling=ModelSensitivity(
-            _required_text(document, "sensitivity_ceiling")
-        ),
-        outcome_contract=_routine_outcome_contract(
-            _object_mapping(document.get("outcome_contract"), "outcome contract")
-        ),
-        distribution_destination_id=_required_text(
-            document,
-            "distribution_destination_id",
-        ),
-        eligible_model_routes=_string_tuple(document, "eligible_model_routes"),
-        per_run_max_tokens=_required_integer(document, "per_run_max_tokens"),
-        per_run_max_cost_usd=_optional_routine_decimal(
-            document, "per_run_max_cost_usd"
-        ),
-        cumulative_max_tokens=_required_integer(document, "cumulative_max_tokens"),
-        cumulative_max_cost_usd=_optional_routine_decimal(
-            document, "cumulative_max_cost_usd"
-        ),
-        cumulative_max_attempts=_required_integer(document, "cumulative_max_attempts"),
-        cumulative_max_occurrences=_required_integer(
-            document, "cumulative_max_occurrences"
-        ),
-        maximum_consecutive_failures=_required_integer(
-            document, "maximum_consecutive_failures"
-        ),
-        expires_at=_routine_datetime(_required_text(document, "expires_at")),
-        skill_names=_string_tuple(document, "skill_names", default=()),
-    )
+def _routine_intent(args: argparse.Namespace) -> RoutineIntent:
+    """Read one routine from a small spec file and flags; flags win."""
 
-
-def _routine_precheck(value: Mapping[str, object]) -> ResourceRevisionPrecheck:
-    return ResourceRevisionPrecheck(
-        capability_id=_required_text(value, "capability_id"),
-        contract_digest=_required_text(value, "contract_digest"),
-        source_id=_required_text(value, "source_id"),
-        resource_id=_required_text(value, "resource_id"),
-    )
-
-
-def _routine_outcome_contract(value: Mapping[str, object]) -> OutcomeContract:
-    raw_requirements = value.get("artifact_requirements")
-    if not isinstance(raw_requirements, (list, tuple)):
-        raise ValueError("artifact_requirements must be an array")
-    requirements: list[ArtifactRequirement] = []
-    for raw_requirement in raw_requirements:
-        requirement = _object_mapping(raw_requirement, "artifact requirement")
-        requirements.append(
-            ArtifactRequirement(
-                required=_required_boolean(requirement, "required"),
-                minimum_count=_required_integer(requirement, "minimum_count"),
-                maximum_count=_required_integer(requirement, "maximum_count"),
-                allowed_media_types=_string_tuple(
-                    requirement,
-                    "allowed_media_types",
-                ),
-                allowed_authorships=tuple(
-                    ArtifactAuthorship(item)
-                    for item in _string_tuple(
-                        requirement,
-                        "allowed_authorships",
-                    )
-                ),
-                allowed_producer_capability_ids=_string_tuple(
-                    requirement,
-                    "allowed_producer_capability_ids",
-                ),
-                maximum_artifact_bytes=_required_integer(
-                    requirement,
-                    "maximum_artifact_bytes",
-                ),
-                maximum_total_bytes=_required_integer(
-                    requirement,
-                    "maximum_total_bytes",
-                ),
-                maximum_sensitivity=ModelSensitivity(
-                    _required_text(requirement, "maximum_sensitivity")
-                ),
-            )
-        )
-    return OutcomeContract(
-        require_terminal_conclusion=_required_boolean(
-            value,
-            "require_terminal_conclusion",
-        ),
-        artifact_requirements=tuple(requirements),
-        maximum_total_artifact_bytes=_required_integer(
-            value,
-            "maximum_total_artifact_bytes",
-        ),
-        maximum_effective_sensitivity=ModelSensitivity(
-            _required_text(value, "maximum_effective_sensitivity")
-        ),
-        require_current_run_provenance=_required_boolean(
-            value,
-            "require_current_run_provenance",
-        ),
-        require_exact_source_bindings=_required_boolean(
-            value,
-            "require_exact_source_bindings",
-        ),
-    )
+    document: dict[str, object] = {}
+    if args.spec is not None:
+        try:
+            value = json.loads(args.spec.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise ValueError(f"routine spec is not valid JSON: {error.msg}") from error
+        document.update(_object_mapping(value, "routine spec"))
+    if args.schedule is not None:
+        try:
+            document["schedule"] = json.loads(args.schedule)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"--schedule is not valid JSON: {error.msg}") from error
+    for name in ("title", "prompt"):
+        if getattr(args, name) is not None:
+            document[name] = getattr(args, name)
+    if args.source:
+        document["sources"] = args.source
+    if getattr(args, "run_immediately", False):
+        document["run_immediately"] = True
+    return RoutineIntent.from_mapping(document)
 
 
 def _object_mapping(value: object, name: str) -> Mapping[str, object]:
     if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
         raise ValueError(f"{name} must be a JSON object")
     return value
-
-
-def _required_text(value: Mapping[str, object], name: str) -> str:
-    item = value.get(name)
-    if not isinstance(item, str) or not item.strip():
-        raise ValueError(f"{name} must be non-empty text")
-    return item
-
-
-def _required_integer(value: Mapping[str, object], name: str) -> int:
-    item = value.get(name)
-    if not isinstance(item, int) or isinstance(item, bool):
-        raise ValueError(f"{name} must be an integer")
-    return item
-
-
-def _required_boolean(value: Mapping[str, object], name: str) -> bool:
-    item = value.get(name)
-    if not isinstance(item, bool):
-        raise ValueError(f"{name} must be a boolean")
-    return item
-
-
-def _string_tuple(
-    value: Mapping[str, object],
-    name: str,
-    *,
-    default: tuple[str, ...] | None = None,
-) -> tuple[str, ...]:
-    item = value.get(name, default)
-    if not isinstance(item, (list, tuple)) or any(
-        not isinstance(entry, str) for entry in item
-    ):
-        raise ValueError(f"{name} must be an array of strings")
-    return tuple(item)
-
-
-def _integer_tuple(value: object, name: str) -> tuple[int, ...]:
-    if not isinstance(value, (list, tuple)) or any(
-        not isinstance(entry, int) or isinstance(entry, bool) for entry in value
-    ):
-        raise ValueError(f"{name} must be an array of integers")
-    return tuple(value)
-
-
-def _routine_decimal(value: Mapping[str, object], name: str) -> Decimal:
-    item = value.get(name)
-    if isinstance(item, bool) or not isinstance(item, (str, int, float)):
-        raise ValueError(f"{name} must be a decimal string or number")
-    try:
-        return Decimal(str(item))
-    except InvalidOperation as error:
-        raise ValueError(f"{name} is not a decimal") from error
-
-
-def _optional_routine_decimal(value: Mapping[str, object], name: str) -> Decimal | None:
-    return None if value.get(name) is None else _routine_decimal(value, name)
-
-
-def _routine_datetime(value: str) -> datetime:
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as error:
-        raise ValueError("routine datetime must be ISO 8601") from error
 
 
 async def _execute(args: argparse.Namespace) -> object:
@@ -1496,276 +1079,17 @@ async def _execute(args: argparse.Namespace) -> object:
         agent = await _open_agent(args, workspace, {"config": AgentConfig()})
         try:
             if args.jobs_command == "list":
-                job_states = frozenset(GraphState(item) for item in (args.state or ()))
+                job_states = frozenset(JobState(item) for item in (args.state or ()))
                 jobs = await agent.list_jobs(states=job_states, limit=args.limit)
-                return [
-                    {
-                        "job_id": job.job_id,
-                        "state": job.state.value,
-                        "desired_state": job.desired_state.value,
-                        "updated_at": job.updated_at.isoformat(),
-                        "deadline_at": job.deadline_at.isoformat(),
-                    }
-                    for job in jobs
-                ]
+                return [job_payload(job, detailed=False) for job in jobs]
             if args.jobs_command == "inspect":
-                job_inspection = await agent.inspect_job(args.job_id)
-                return (
-                    None
-                    if job_inspection is None
-                    else _graph_inspection_mapping(job_inspection)
-                )
-            if args.jobs_command == "tasks":
-                task_states = frozenset(TaskState(item) for item in (args.state or ()))
-                tasks = await agent.list_job_tasks(
-                    args.job_id, states=task_states, limit=args.limit
-                )
-                return [
-                    {
-                        "task_id": task.task_id,
-                        "role": task.role.value,
-                        "state": task.state.value,
-                        "task_revision": task.task_revision,
-                        "current_attempt_id": task.current_attempt_id,
-                        "latest_result_id": task.latest_result_id,
-                        "latest_control_id": task.latest_control_id,
-                    }
-                    for task in tasks
-                ]
-            if args.jobs_command == "dependencies":
-                edges = await agent.list_job_dependencies(
-                    args.job_id, task_id=args.task_id, limit=args.limit
-                )
-                return [
-                    {
-                        "upstream_task_id": edge.upstream_task_id,
-                        "downstream_task_id": edge.downstream_task_id,
-                        "edge_kind": edge.edge_kind.value,
-                    }
-                    for edge in edges
-                ]
-            if args.jobs_command == "attempts":
-                attempts = await agent.list_task_attempts(
-                    args.job_id, args.task_id, limit=args.limit
-                )
-                return [
-                    {
-                        "attempt_id": attempt.attempt_id,
-                        "ordinal": attempt.ordinal,
-                        "state": attempt.state.value,
-                        "fencing_epoch": attempt.fencing_epoch,
-                        "run_id": attempt.run_id,
-                        "checkpoint_ids": attempt.checkpoint_ids,
-                        "artifact_ids": attempt.artifact_ids,
-                        "error_code": attempt.error_code,
-                    }
-                    for attempt in attempts
-                ]
-            if args.jobs_command == "result":
-                task_result = await agent.read_task_result(args.job_id, args.task_id)
-                return (
-                    None
-                    if task_result is None
-                    else {
-                        **task_result.candidate_material(),
-                        "completed_at": task_result.completed_at.isoformat(),
-                    }
-                )
-            if args.jobs_command == "checkpoints":
-                checkpoints = await agent.list_task_checkpoints(
-                    args.job_id, args.task_id, limit=args.limit
-                )
-                return [
-                    {
-                        "checkpoint_id": item.checkpoint_id,
-                        "attempt_id": item.attempt_id,
-                        "ordinal": item.ordinal,
-                        "milestone": item.milestone,
-                        "payload": item.payload,
-                        "payload_digest": item.payload_digest,
-                    }
-                    for item in checkpoints
-                ]
-            if args.jobs_command == "artifacts":
-                return await agent.list_task_artifacts(
-                    args.job_id, task_id=args.task_id, limit=args.limit
-                )
-            if args.jobs_command == "timeline":
-                timeline = await agent.job_timeline(
-                    args.job_id,
-                    after_event_id=args.after,
-                    limit=args.limit,
-                    task_id=args.task_id,
-                )
-                if timeline is None:
-                    return None
-                return {
-                    "job_id": timeline.job_id,
-                    "graph_state": timeline.graph_state.value,
-                    "graph_revision": timeline.graph_revision,
-                    "events": [
-                        {
-                            "event_id": item.event_id,
-                            "kind": item.kind,
-                            "task_id": item.task_id,
-                            "attempt_id": item.attempt_id,
-                            "created_at": item.created_at.isoformat(),
-                            "payload": item.payload,
-                        }
-                        for item in timeline.events
-                    ],
-                    "next_cursor": timeline.next_cursor,
-                    "diagnostics": {
-                        "blockers": timeline.diagnostics.blockers,
-                        "exhausted_budgets": timeline.diagnostics.exhausted_budgets,
-                        "deadlocked": timeline.diagnostics.deadlocked,
-                        "deadlock_reason": timeline.diagnostics.deadlock_reason,
-                    },
-                }
-            if args.jobs_command == "board":
-                board = await agent.job_board(args.job_id)
-                if board is None:
-                    return None
-                return {
-                    "job_id": board.job_id,
-                    "graph_state": board.graph_state.value,
-                    "graph_revision": board.graph_revision,
-                    "columns": [
-                        {"name": item.name, "task_ids": item.task_ids}
-                        for item in board.columns
-                    ],
-                    "dependencies": [
-                        {
-                            "upstream_task_id": item.upstream_task_id,
-                            "downstream_task_id": item.downstream_task_id,
-                            "edge_kind": item.edge_kind,
-                            "satisfied": item.satisfied,
-                        }
-                        for item in board.dependencies
-                    ],
-                    "diagnostics": {
-                        "blockers": board.diagnostics.blockers,
-                        "exhausted_budgets": board.diagnostics.exhausted_budgets,
-                        "deadlocked": board.diagnostics.deadlocked,
-                        "deadlock_reason": board.diagnostics.deadlock_reason,
-                    },
-                }
-            if args.jobs_command == "blockers":
-                blockers = await agent.graph_blockers(args.job_id)
-                return None if blockers is None else _graph_blockers_mapping(blockers)
+                job = await agent.inspect_job(args.job_id)
+                return None if job is None else job_payload(job, detailed=True)
             if args.jobs_command == "answer":
-                answer = _object_mapping(
-                    json.loads(args.answer_json), "task input answer"
-                )
-                control = await agent.answer_task_input(
-                    args.job_id,
-                    args.task_id,
-                    args.control_id,
-                    principal_id=args.principal_id,
-                    answer=answer,
-                    idempotency_key=args.idempotency_key,
-                )
-                return (
-                    None
-                    if control is None
-                    else {
-                        "control_id": control.control_id,
-                        "state": control.state.value,
-                        "resolved_by_id": control.resolved_by_id,
-                    }
-                )
-            if args.jobs_command == "accept-review":
-                reviewed_task_result = await agent.accept_task_review(
-                    args.job_id,
-                    args.task_id,
-                    args.control_id,
-                    principal_id=args.principal_id,
-                    rationale=args.rationale,
-                    idempotency_key=args.idempotency_key,
-                )
-                return {
-                    "result_id": reviewed_task_result.result_id,
-                    "result_digest": reviewed_task_result.result_digest,
-                    "task_id": reviewed_task_result.task_id,
-                }
-            if args.jobs_command == "request-changes":
-                control = await agent.request_task_review_changes(
-                    args.job_id,
-                    args.task_id,
-                    args.control_id,
-                    principal_id=args.principal_id,
-                    rationale=args.rationale,
-                    replacement_guidance=args.guidance,
-                    idempotency_key=args.idempotency_key,
-                )
-                return {
-                    "control_id": control.control_id,
-                    "kind": control.kind.value,
-                    "state": control.state.value,
-                }
-            if args.jobs_command == "retry-control":
-                control = await agent.retry_task_control(
-                    args.job_id,
-                    args.task_id,
-                    args.control_id,
-                    principal_id=args.principal_id,
-                    advisory_note=args.note,
-                    idempotency_key=args.idempotency_key,
-                )
-                return (
-                    None
-                    if control is None
-                    else {
-                        "control_id": control.control_id,
-                        "state": control.state.value,
-                    }
-                )
-            if args.jobs_command == "reject":
-                control = await agent.reject_task_control(
-                    args.job_id,
-                    args.task_id,
-                    args.control_id,
-                    principal_id=args.principal_id,
-                    reason=args.reason,
-                    idempotency_key=args.idempotency_key,
-                )
-                return (
-                    None
-                    if control is None
-                    else {
-                        "control_id": control.control_id,
-                        "state": control.state.value,
-                        "resolved_by_id": control.resolved_by_id,
-                    }
-                )
-            if args.jobs_command == "cancel-graph":
-                job = await agent.cancel_graph_job(
-                    args.job_id, principal_id=args.principal_id
-                )
-                return (
-                    None
-                    if job is None
-                    else {
-                        "job_id": job.job_id,
-                        "state": job.state.value,
-                        "desired_state": job.desired_state.value,
-                    }
-                )
-            mutation = await agent.replace_graph_task_by_policy(
-                args.job_id,
-                args.task_id,
-                principal_id=args.principal_id,
-                advisory_note=args.note,
-                idempotency_key=args.idempotency_key,
-                expected_revision=args.expected_revision,
-            )
-            return {
-                "mutation_id": mutation.mutation_id,
-                "decision": mutation.decision.value,
-                "failure_code": mutation.failure_code,
-                "committed_revision": mutation.committed_revision,
-                "task_ids": mutation.resulting_task_ids,
-            }
+                job = await agent.answer_job(args.job_id, args.text)
+                return job_payload(job, detailed=False)
+            cancelled = await agent.cancel_job(args.job_id)
+            return None if cancelled is None else job_payload(cancelled, detailed=False)
         finally:
             await agent.close()
     if args.command == "detach":
@@ -2128,14 +1452,6 @@ async def _execute(args: argparse.Namespace) -> object:
                 raise ValueError("delivery not found")
             return delivery_view_projection(dismissed)
         if args.command == "routines":
-            if args.routines_command == "destinations":
-                return [
-                    distribution_destination_projection(item)
-                    for item in await agent.distribution_destinations(
-                        args.conversation_id,
-                        sensitivity_ceiling=ModelSensitivity(args.sensitivity_ceiling),
-                    )
-                ]
             if args.routines_command == "list":
                 states = frozenset(RoutineState(item) for item in (args.state or ()))
                 return [
@@ -2160,28 +1476,19 @@ async def _execute(args: argparse.Namespace) -> object:
                 if routine_inspection is None:
                     raise ValueError("routine not found")
                 return routine_inspection_projection(routine_inspection)
-            if args.routines_command in {"create", "promote"}:
-                draft = _routine_draft_from_file(args.spec)
-                proposal = (
-                    await agent.promote_routine(
-                        draft,
-                        basis_run_id=args.basis_run_id,
-                    )
-                    if args.routines_command == "promote"
-                    else await agent.propose_routine(draft)
-                )
+            if args.routines_command == "create":
                 return routine_projection(
                     await agent.create_routine(
-                        proposal, confirmation_handler=_prompt_for_exact_approval
+                        _routine_intent(args),
+                        confirmation_handler=_prompt_for_exact_approval,
                     )
                 )
             if args.routines_command == "update":
                 return routine_projection(
                     await agent.update_routine(
                         args.routine_id,
+                        _routine_intent(args),
                         expected_revision=args.expected_revision,
-                        draft=_routine_draft_from_file(args.spec),
-                        basis_run_id=args.basis_run_id,
                         confirmation_handler=_prompt_for_exact_approval,
                     )
                 )
@@ -2383,14 +1690,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         result: object
         if args.no_host and args.command in (None, "chat"):
             raise ValueError("the terminal app always uses the Daita host")
-        if args.command == "host" and args.host_agent is not None:
-            print(
-                "daita host --agent is deprecated; the Daita host now serves every "
-                "agent. Running daita host serve.",
-                file=sys.stderr,
-            )
-            root = [] if args.root is None else ["--root", str(args.root)]
-            args = build_parser().parse_args([*root, "host", "serve"])
         if args.command == "host" and args.host_command is not None:
             return _host_command(args)
         if args.command is None:

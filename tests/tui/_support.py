@@ -37,7 +37,6 @@ __all__ = (
     "FrozenJsonObject",
     "Input",
     "Iterator",
-    "GraphState",
     "JobsScreen",
     "LoopExit",
     "LoopExitKind",
@@ -80,8 +79,7 @@ __all__ = (
     "_create_sqlite_source",
     "_mock_profile",
     "_tui_delivery_view",
-    "_tui_job_inspection",
-    "_tui_job_summary",
+    "_tui_job",
     "approval_review_document",
     "asyncio",
     "clipboard_mechanism",
@@ -112,7 +110,7 @@ import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -142,7 +140,6 @@ from daita import (
     DeliveryState,
     DeliverySubjectKind,
     DeliveryView,
-    GraphState,
     LoopExit,
     LoopExitKind,
     OutcomeConclusionKind,
@@ -153,6 +150,7 @@ from daita import (
     SQLiteSource,
 )
 from daita._json import FrozenJsonObject
+from daita.jobs import Job, JobState
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -255,64 +253,17 @@ def _tui_delivery_view(
     )
 
 
-def _tui_job_summary(
-    job_id: str,
-    status: GraphState,
-    *,
-    result_available: bool,
-) -> SimpleNamespace:
+def _tui_job(job_id: str, state: JobState = JobState.RUNNING) -> Job:
     observed = datetime(2026, 8, 23, 14, 0, tzinfo=UTC)
-    return SimpleNamespace(
+    return Job(
         job_id=job_id,
+        agent_id="agent-jobs",
         conversation_id="conversation-jobs",
-        state=status,
-        desired_state=SimpleNamespace(value="run"),
-        finalizer_task_id="task-finalizer",
-        deadline_at=observed + timedelta(minutes=5),
-        specification=SimpleNamespace(
-            objective="Profile the selected data.",
-            authority=SimpleNamespace(
-                source_ids=("source-one",),
-                resource_ids=("resource-one",),
-            ),
-        ),
+        objective="Profile the selected data.",
+        source_ids=("source-one",),
+        state=state,
         created_at=observed,
         updated_at=observed,
-        terminal_at=(observed if result_available else None),
-        terminal_result_id=("result-final" if result_available else None),
-        failure_code=None,
-    )
-
-
-def _tui_job_inspection(summary: SimpleNamespace) -> SimpleNamespace:
-    observed = datetime(2026, 8, 23, 14, 0, tzinfo=UTC)
-    return SimpleNamespace(
-        job=summary,
-        graph=SimpleNamespace(
-            revision=1,
-            task_count=0,
-            edge_count=0,
-            active_attempt_count=0,
-        ),
-        tasks=(),
-        dependencies=(),
-        attempts=(
-            SimpleNamespace(
-                ordinal=1,
-                fencing_epoch=1,
-                state=SimpleNamespace(value="running"),
-                started_at=observed,
-                ended_at=None,
-                error_code=None,
-            ),
-        ),
-        results=(),
-        controls=(),
-        checkpoints=(),
-        comments=(),
-        budget_ledgers=(),
-        events=(),
-        delivery_ids=(),
     )
 
 

@@ -66,12 +66,13 @@ from ..llm.protocols import (
 from ..observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
 from .analysis import AnalysisEvidence
 from .models import (
+    CONTEXT_THRESHOLD_REASON,
+    JOB_ORIGINS,
     ConversationRun,
     LoopExit,
     LoopExitKind,
     LoopLimits,
     RunInput,
-    RunOrigin,
     ToolBatchCertainty,
     ToolBatchInterruption,
     ToolBatchOutcome,
@@ -95,18 +96,6 @@ _EXPECTED_LOOP_FAILURE_REASONS: dict[type[Exception], str] = {
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
-
-
-def _task_checkpoint_warning_due(
-    step: int,
-    usage: ModelUsage,
-    limits: LoopLimits,
-) -> bool:
-    """Warn before a later request can cross a hard task-attempt limit."""
-
-    step_pressure = step * 5 >= limits.max_steps * 4
-    token_pressure = usage.total_tokens * 5 >= limits.max_total_tokens * 4
-    return step_pressure or token_pressure
 
 
 def _expected_loop_failure_reason(error: Exception) -> str:
@@ -386,8 +375,8 @@ def _normalize_run_invocation(
         raise TypeError("run must be RunInput or RunSession")
     if any(not isinstance(message, CanonicalMessage) for message in prior_messages):
         raise TypeError("prior_messages must contain CanonicalMessage records")
-    if run.origin is RunOrigin.JOB_TASK and prior_messages:
-        raise ValueError("graph task attempts cannot import conversation history")
+    if run.origin in JOB_ORIGINS and prior_messages:
+        raise ValueError("job runs cannot import conversation history")
     if prepared is not None and (
         prepared.run != run
         or prepared.prior_messages != prior_messages
@@ -450,8 +439,8 @@ class AgentLoop:
         if not isinstance(run_input, RunInput):
             raise TypeError("run must be RunInput or RunSession")
         run = run_input
-        if run.origin is RunOrigin.JOB_TASK and prior_messages:
-            raise ValueError("graph task attempts cannot import conversation history")
+        if run.origin in JOB_ORIGINS and prior_messages:
+            raise ValueError("job runs cannot import conversation history")
         if run.conversation_id is None:
             run = replace(run, conversation_id=run.id)
         start_message = run.start_message()
@@ -543,7 +532,6 @@ class AgentLoop:
         previous_request_input_tokens: int | None = None
         request_input_growth_tokens: int | None = None
         previous_response_output_tokens: int | None = None
-        checkpoint_warning_emitted = False
         run_route: object | None = None if prepared is None else prepared.run_route
         limits = (
             _effective_run_limits(self._limits, run)
@@ -925,26 +913,26 @@ class AgentLoop:
                 if terminal_batch is not None:
                     return terminal_batch
 
+                stop_at = session.options.stop_after_input_tokens
                 if (
-                    run.origin is RunOrigin.JOB_TASK
-                    and not checkpoint_warning_emitted
-                    and step < limits.max_steps
-                    and _task_checkpoint_warning_due(step, usage, limits)
+                    stop_at is not None
+                    and previous_request_input_tokens is not None
+                    and previous_request_input_tokens >= stop_at
                 ):
-                    warning = CanonicalMessage(
-                        role=MessageRole.SYSTEM,
-                        content=(
-                            TextBlock(
-                                "Code-owned task budget warning: the attempt is nearing "
-                                "a hard step or token limit. Persist a bounded checkpoint "
-                                "before continuing, then finish with exactly one lifecycle "
-                                "terminator. This warning grants no additional authority."
-                            ),
-                        ),
+                    # The context is full enough to start over: the job
+                    # continues in a new run from its saved checklist.
+                    return await self._finish(
+                        run,
+                        writer,
+                        LoopExitKind.MACHINE_TERMINATED,
+                        CONTEXT_THRESHOLD_REASON,
+                        step,
+                        usage,
+                        run_started,
+                        artifacts=tuple(artifacts),
+                        artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
                     )
-                    await writer.append(warning, position=writer.next_position)
-                    messages = (*messages, warning)
-                    checkpoint_warning_emitted = True
 
             return await self._finish(
                 run,
@@ -1232,25 +1220,10 @@ class AgentLoop:
         artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...],
         sensitivity: ModelSensitivity,
     ) -> LoopExit | None:
-        """Finalize a terminal provider response, including task protocol failure."""
+        """Finalize a terminal provider response."""
 
         if response.finish_reason is FinishReason.STOP:
             assert response.text is not None and not response.tool_calls
-            if run.origin is RunOrigin.JOB_TASK:
-                await writer.append(assistant, position=writer.next_position)
-                return await self._finish(
-                    run,
-                    writer,
-                    LoopExitKind.FAILED,
-                    "protocol_violation",
-                    step,
-                    usage,
-                    run_started,
-                    final_text=response.text,
-                    artifacts=artifacts,
-                    artifact_deliveries=artifact_deliveries,
-                    sensitivity=sensitivity,
-                )
             return await self._finish(
                 run,
                 writer,

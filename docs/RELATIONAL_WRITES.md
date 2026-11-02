@@ -6,8 +6,8 @@ preview and exact authority. Daita checks the live table, permissions, and
 preview again before a transaction. The model never writes mutation SQL.
 
 Updates can affect one row or many rows within an approved ceiling of at most
-10,000. Upserts use one uniform batch of at most 1,000 rows. Permissions and
-any standing grant may narrow these limits further. PostgreSQL is the initial
+10,000. Upserts use one uniform batch of at most 1,000 rows. Permissions may
+narrow these limits further. PostgreSQL is the initial
 native backend.
 
 For release evaluation with real model generation and a disposable PostgreSQL
@@ -41,10 +41,9 @@ Four independent controls must all permit an update:
    enabled by the user.
 3. **Current readiness:** the live table, role, grants, and catalog state must
    pass Daita's non-mutating checks.
-4. **Exact authority:** foreground writes need approval of the current-run
-   previewed call. Routines need an approved revision with one native write
-   grant and one invocation per occurrence. An effectful graph job needs
-   foreground approval and an exact grant for its initial task.
+4. **Exact authority:** every write is one call that a person approves at the
+   time. Daita builds the preview itself and shows it on the approval card;
+   routine occurrences, background jobs and their sub-runs ask the same way.
 
 The model cannot enable source permissions, grant database privileges, or
 approve its own update.
@@ -166,7 +165,8 @@ Set priority to high for support tickets where ticket_status is waiting and
 category is billing.
 ```
 
-Daita first runs a read-only preview. It identifies the complete matching
+The agent makes one `data_update_rows` call. Before asking you, Daita runs a
+read-only preview and puts it on the approval card. It identifies the complete matching
 primary-key set, reports the exact matched row count, and displays at most five
 bounded before/after samples. The samples help review the change; the matched
 count and complete target fingerprint cover every selected row, including rows
@@ -241,8 +241,8 @@ current application state when operational policy requires it.
 
 Daita established that the approved update did not commit. Common causes
 include target drift, constraint violations, permission changes, and statement
-or lock timeouts. Correct the underlying issue, then request a new preview. A
-previous approval is never reused.
+or lock timeouts. Correct the underlying issue, then ask again; the new call
+shows a new preview. A previous approval is never reused.
 
 ### `outcome_unknown`
 
@@ -281,16 +281,19 @@ credential, but it does not change database grants or restore data.
 
 ## Structured upsert
 
-The public tools are `data_update_rows` and `data_upsert_rows`. Each takes
-`mode`: `preview` runs the read-only preview and `apply` runs the write. Mode
+The public tools are `data_update_rows` and `data_upsert_rows`. A write is one
+call: `mode` defaults to `apply`, which builds its own preview, shows it on the
+approval card, re-checks it for drift after approval and writes once with a
+receipt. `mode=preview` stays for "show me first" and changes nothing. Mode
 selects the existing preview or write capability; it is not a separate
 execution path. The model supplies exact source/resource IDs and scalar values,
-never SQL. `mode=apply` requires a successful authenticated preview from the
-same run with matching intent.
+never SQL, and never a preview fingerprint or expected row count: Daita keeps
+the preview it showed you and checks the write against it. Routine, job and
+sub-run writes use the same one-call sequence.
 
 Compatibility: `data_preview_update_rows` and `data_preview_upsert_rows` were
 removed without aliases. Capability IDs (`data.preview_update_rows`,
-`data.update_rows`, `data.preview_upsert_rows`, `data.upsert_rows`), grants,
+`data.update_rows`, `data.preview_upsert_rows`, `data.upsert_rows`),
 receipts and approvals are unchanged, so saved routines and jobs keep
 revalidating normally.
 
@@ -338,10 +341,8 @@ recovery. A rollback describes table-row non-application; PostgreSQL identity
 sequence allocations can leave gaps and are not restored by rollback.
 
 Zero existing matches may legitimately insert the supplied upsert batch. Empty
-research findings are different from a nonempty unchanged batch: an empty result
-cannot satisfy a routine that requires a write invocation. Grants may permit new
-keys discovered in later research runs while retaining exact table, column,
-operation, row and call ceilings.
+research findings are different from a nonempty unchanged batch: with no rows
+there is nothing to write, and no write is attempted.
 
 ## Explicit relational write permissions
 
@@ -387,19 +388,11 @@ cannot be stored in a lower-classified target merely because columns are writabl
 
 ## Native routines and release limits
 
-A native routine grant uses `constraints_kind="data.relational_write"` and freezes
-`source_id`, `resource_id`, `resource_revision`, `key_columns`,
-`allowed_insert_columns`, `allowed_update_columns`, `generated_identity_columns`,
-and `max_rows`. The requested call ceiling must be one, and the routine may contain
-at most one native write capability. Current permissions and retained contracts
-revalidate before dispatch. Research tools must admit the full outbound sensitivity.
-
-An immediate-first weekly assignment creates one immediate occurrence and retains
-its calendar schedule. Each occurrence uses the ordinary loop, previews its current
-findings, reserves one native call, and reports authenticated transaction counts.
-A required write cannot be satisfied by model prose or an unrelated research result.
-An approved optional no-findings path can omit the effect; a required effect remains
-unsatisfied when research yields no batch.
+A routine occurrence or job run writes exactly as a foreground run does: one
+call, one approval at the time (the card names the routine or job), then the
+same drift check and receipt. There is no standing permission to write without
+asking. Current permissions and contracts revalidate before dispatch, and
+research tools must admit the full outbound sensitivity.
 
 This native implementation has deterministic acceptance coverage with fake external
 I/O. It is not production release approval or live PostgreSQL certification.
@@ -412,10 +405,3 @@ exercise real transactions and independent readback using the existing disposabl
 fixture and a scripted model. They cover conflict handling, rollback, locks,
 revocation, cancellation, lost commit confirmation, receipts, and human recovery.
 Their offline harness checks do not replace a passing authorized database run.
-
-During native grant admission, the data owner requires the matching preview
-capability in `allowed_capability_ids` before checking write readiness. A missing
-or opposite-operation preview produces `automation_grant_preview_required`.
-The automation constraint description exposes this prerequisite without loading
-execution tools. Schema access remains a separately requested read capability;
-neither grant admission nor preview permission grants structural discovery.

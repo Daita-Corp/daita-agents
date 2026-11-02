@@ -68,10 +68,6 @@ async def test_trace_exhaustion_stops_before_another_model_request(
                 "python_execute",
                 {
                     "code": code,
-                    "expected_state": {
-                        "generation": 0 if index == 0 else 1,
-                        "revision": index,
-                    },
                 },
             )
             for index in range(80)
@@ -132,10 +128,6 @@ async def test_artifact_quota_failure_preserves_execution_and_existing_candidate
                         else ""
                     )
                     + "n+=1; print(n)",
-                    "expected_state": {
-                        "generation": 0 if index == 0 else 1,
-                        "revision": index,
-                    },
                     **({"save_output": "value"} if index < 9 else {}),
                 },
             )
@@ -157,10 +149,8 @@ async def test_artifact_quota_failure_preserves_execution_and_existing_candidate
         continued = json.loads(canonical_json(cells[9].output))["data"]
         assert failed_save["save_status"] == "failed"
         assert failed_save["save_error"] == "artifact_quota_exceeded"
-        assert failed_save["expected_state"] == {
-            "generation": 1,
-            "revision": 9,
-        }
+        # A failed save keeps the interpreter; the next cell still sees it.
+        assert failed_save["state_reset"] is False
         assert continued["stdout"] == "10\n"
         for item in result.artifacts:
             assert (await agent.read_artifact(item.artifact_id)).content == b"42"
@@ -182,7 +172,9 @@ async def test_stale_raw_rpc_token_is_denied_before_read_dispatch(
             _tool(
                 "forged",
                 "python_execute",
-                {"code": code, "expected_state": {"generation": 0, "revision": 0}},
+                {
+                    "code": code,
+                },
             ),
         ),
     )
@@ -211,7 +203,6 @@ async def test_cell_deadline_includes_waiting_for_worker_admission(
                 "python_execute",
                 {
                     "code": "while True: pass",
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
             _tool(
@@ -220,7 +211,6 @@ async def test_cell_deadline_includes_waiting_for_worker_admission(
                 {
                     "code": "print(42)",
                     "timeout_seconds": 0.15,
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
         ),
@@ -314,7 +304,6 @@ async def test_revoked_candidate_cannot_be_saved_after_worker_replacement(
                     "python_execute",
                     {
                         "code": f"import json\nr=tools.call({name!r}, {{'query':'fixture'}})\nassert not r['is_error']\nopen('derived.json','w').write(json.dumps(r['output']))\noutputs.add('derived','derived.json')",
-                        "expected_state": {"generation": 0, "revision": 0},
                     },
                 ),
                 _tool(
@@ -322,7 +311,6 @@ async def test_revoked_candidate_cannot_be_saved_after_worker_replacement(
                     "python_execute",
                     {
                         "code": "while True: pass",
-                        "expected_state": {"generation": 1, "revision": 1},
                     },
                 ),
                 _tool(
@@ -331,7 +319,6 @@ async def test_revoked_candidate_cannot_be_saved_after_worker_replacement(
                     {
                         "code": "print('fresh')",
                         "save_output": "derived",
-                        "expected_state": {"generation": 1, "revision": 0},
                     },
                 ),
                 ModelResponse(finish_reason=FinishReason.STOP, text="revoked"),
@@ -390,7 +377,9 @@ async def test_python_threads_serialize_broker_channel_and_keep_response_identit
             _tool(
                 "thread-reads",
                 "python_execute",
-                {"code": code, "expected_state": {"generation": 0, "revision": 0}},
+                {
+                    "code": code,
+                },
             ),
         ),
     )
@@ -471,7 +460,6 @@ async def test_broken_worker_input_counts_actual_os_transfers(
                 "python_execute",
                 {
                     "code": "import sys\nsys.stdin.close()\ntry: tools.call('file_read', {'source_id':'s1', 'path':'value.txt'})\nexcept ValueError:\n while True: pass",
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
         ),
@@ -609,7 +597,9 @@ async def test_public_cancellation_settles_real_worker_and_child_io(
         _tool(
             "cancel-cell",
             "python_execute",
-            {"code": code, "expected_state": {"generation": 0, "revision": 0}},
+            {
+                "code": code,
+            },
         )
     )
     agent = await make_agent(tmp_path, script, **kwargs)
@@ -639,7 +629,6 @@ async def test_public_cancellation_settles_real_worker_and_child_io(
                         "python_execute",
                         {
                             "code": f"r = tools.call({local_name!r}, {{'query':'isolated fixture'}}); print(r)",
-                            "expected_state": {"generation": 0, "revision": 0},
                         },
                     ),
                     ModelResponse(finish_reason=FinishReason.STOP, text="done"),
@@ -692,7 +681,9 @@ async def test_public_shared_child_budget_and_forbidden_targets(
             _tool(
                 "denials",
                 "python_execute",
-                {"code": code, "expected_state": {"generation": 0, "revision": 0}},
+                {
+                    "code": code,
+                },
             ),
         ),
         config=AgentConfig(
@@ -729,7 +720,7 @@ from tests.support.workspace import workspace_for
 from pathlib import Path
 async def main():
  root=Path(sys.argv[1])
- model=ToolboxAwareMockModelProvider((_tool('abandoned','python_execute',{'code':'while True: pass','expected_state':{'generation':0,'revision':0}}),))
+ model=ToolboxAwareMockModelProvider((_tool('abandoned','python_execute',{'code':'while True: pass',}),))
  agent=await Agent.create('crashed', root=root, model=model, model_profile=_profile(model), workspace=workspace_for(root))
  task=asyncio.create_task(agent.run('Crash this disposable host.'))
  while True:
@@ -821,7 +812,6 @@ async def test_every_output_format_is_isolated_validated_saved_and_deleted(
                 "python_execute",
                 {
                     "code": source + f"\noutputs.add('fixture','output{extension}')",
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
             _tool(
@@ -829,7 +819,6 @@ async def test_every_output_format_is_isolated_validated_saved_and_deleted(
                 "python_execute",
                 {
                     "code": "",
-                    "expected_state": {"generation": 1, "revision": 1},
                     "save_output": "fixture",
                 },
             ),
@@ -886,7 +875,6 @@ print(sum(Decimal(row['amount']) for row in rows if row['amount'] is not None))
                 "python_execute",
                 {
                     "code": code,
-                    "expected_state": {"generation": 0, "revision": 0},
                     "save_output": "exact",
                 },
             ),
@@ -979,7 +967,6 @@ async def test_active_binding_revocation_closes_contaminated_interpreter(
                     "python_execute",
                     {
                         "code": f"r=tools.call({name!r}, {{'query':'fixture'}})\nassert not r['is_error']\nwhile True: pass",
-                        "expected_state": {"generation": 0, "revision": 0},
                     },
                 ),
                 ModelResponse(finish_reason=FinishReason.STOP, text="revoked"),
@@ -1020,7 +1007,6 @@ async def test_unrelated_foreground_read_progresses_with_running_and_queued_anal
                 "python_execute",
                 {
                     "code": "while True: pass",
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
             _tool(
@@ -1028,7 +1014,6 @@ async def test_unrelated_foreground_read_progresses_with_running_and_queued_anal
                 "python_execute",
                 {
                     "code": "print(9)",
-                    "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
             _tool("quick", "file_read", {"source_id": "s1", "path": "quick.txt"}),
@@ -1122,7 +1107,6 @@ async def test_completed_cpu_and_broker_wait_have_distinct_host_measurements(
                     "python_execute",
                     {
                         "code": f"import time\nstarted=time.process_time()\nwhile time.process_time()-started < .15: total=sum(range(10000))\nr=tools.call({name!r}, {{'query':'fixture'}})\nassert not r['is_error']\nprint(total)",
-                        "expected_state": {"generation": 0, "revision": 0},
                     },
                 ),
                 ModelResponse(finish_reason=FinishReason.STOP, text="measured"),
@@ -1183,7 +1167,6 @@ provider = ToolboxAwareMockModelProvider(
                     name="python_execute",
                     arguments={
                         "code": code,
-                        "expected_state": {"generation": 0, "revision": 0},
                     },
                 ),
             ),

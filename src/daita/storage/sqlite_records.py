@@ -737,10 +737,8 @@ class EffectReceipt:
             self.occurrence_id,
         )
         if any(item is not None for item in routine_fields):
-            if (
-                any(item is None for item in routine_fields)
-                or self.capability_grant_digest is None
-            ):
+            # A routine effect approved at the time carries no grant digest.
+            if any(item is None for item in routine_fields):
                 raise ValueError("receipt routine fields must be present together")
             effect_receipt_text(self.routine_id or "", "receipt routine_id")
             effect_receipt_text(self.occurrence_id or "", "receipt occurrence_id")

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 
+import pytest
+
 from daita.distribution import (
     Delivery,
     DeliveryState,
@@ -106,18 +108,23 @@ async def test_distribution_owner_projects_only_the_exact_current_inbox() -> Non
     store = FakeDistributionStore(())
     owner = DistributionOwner(agent_id="agent-1", store=store)
 
-    destinations = owner.list_destinations(
+    inbox = conversation_inbox_destination_id("conversation-1")
+    plan = owner.resolve_plan(
         "conversation-1",
+        destination_id=inbox,
         sensitivity_ceiling=ModelSensitivity.CONFIDENTIAL,
     )
 
-    assert len(destinations) == 1
-    assert destinations[0].destination_id == conversation_inbox_destination_id(
-        "conversation-1"
-    )
-    assert destinations[0].kind == "conversation_inbox"
-    assert destinations[0].selectable is True
-    assert destinations[0].sensitivity_ceiling is ModelSensitivity.CONFIDENTIAL
+    (target,) = plan.targets
+    assert target.destination_id == inbox
+    assert target.conversation_id == "conversation-1"
+    assert target.sensitivity_ceiling is ModelSensitivity.CONFIDENTIAL
+    with pytest.raises(ValueError):
+        owner.resolve_plan(
+            "conversation-1",
+            destination_id=conversation_inbox_destination_id("conversation-2"),
+            sensitivity_ceiling=ModelSensitivity.CONFIDENTIAL,
+        )
 
 
 async def test_distribution_owner_lists_inspects_and_acknowledges_safe_views() -> None:

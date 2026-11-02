@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
@@ -304,17 +305,14 @@ async def test_update_preflight_retains_bounded_review_without_another_read(
         run_id="run-review",
         call_id="call-review",
         capability_id="data.update_rows",
-        arguments={
-            **intent.to_payload(),
-            "preview_fingerprint": preview.fingerprint.preview_fingerprint,
-            "expected_affected_rows": 8,
-        },
+        arguments=intent.to_payload(),
     )
-    fingerprint = await RelationalUpdateExecutor(
+    executor = RelationalUpdateExecutor(
         "agent-preview",
         {"postgresql": cast(RelationalUpdateBackend, backend)},
         AsyncMock(return_value="postgresql"),
-    ).preflight(execution)
+    )
+    fingerprint = await executor.preflight(execution)
     review = fingerprint["review"]
     assert isinstance(review, FrozenJsonObject)
     assert review["matched_rows"] == 8
@@ -327,6 +325,14 @@ async def test_update_preflight_retains_bounded_review_without_another_read(
         agent_id="agent-preview", intent=intent
     )
     backend.execute_update.assert_not_awaited()
+    # Dispatch binds the reviewed preview, never a model-supplied fingerprint.
+    with pytest.raises(ValueError, match="approved preflight"):
+        await executor.execute(execution)
+    with pytest.raises(ValueError, match="different update identity"):
+        await executor.execute(replace(execution, approved_preflight=fingerprint))
+    command = backend.execute_update.await_args.kwargs["command"]
+    assert command.preview_fingerprint == preview.fingerprint.preview_fingerprint
+    assert command.expected_affected_rows == 8
 
 
 async def test_zero_row_preview_is_successful_but_warns(monkeypatch):

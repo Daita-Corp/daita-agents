@@ -14,19 +14,12 @@ import pytest
 
 from daita import (
     Agent,
-    ArtifactRequirement,
     IntervalSchedule,
-    MisfirePolicy,
-    OutcomeContract,
-    ReportingMode,
-    ScheduledRoutineDraft,
+    RoutineIntent,
     SQLiteSource,
 )
 from daita._json import canonical_json
-from daita.artifacts.models import ArtifactAuthorship
-from daita.context import AgentContextBuilder
-from daita.domains.data.export_capabilities import DATA_EXPORT_TABULAR_CAPABILITY_ID
-from daita.jobs.graph.models import TaskRole
+from daita.jobs import JobState
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
@@ -34,7 +27,6 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
-    ModelSensitivity,
     ModelUsage,
     TextBlock,
     ToolCall,
@@ -43,9 +35,8 @@ from daita.llm.models import (
 from daita.llm.pricing import CostEstimate
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.session import RunSessionEvidence
-from tests.support.conversations import CatalogSpy
-from tests.support.model_graph_integration import READ_TOOL_NAME, ModelGraphIntegration
-from tests.support.toolbox_model import ToolboxAwareMockModelProvider, result_ref
+from tests.support.jobs import JobModel, in_state, open_job_agent, reply, wait_for_job
+from tests.support.toolbox_model import ToolboxAwareMockModelProvider
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.acceptance
@@ -209,28 +200,6 @@ async def test_foreground_transcript_results_and_budgets_match_without_warnings(
     assert warned == silent
 
 
-def _artifact_contract() -> OutcomeContract:
-    requirement = ArtifactRequirement(
-        required=True,
-        minimum_count=1,
-        maximum_count=1,
-        allowed_media_types=("text/csv",),
-        allowed_authorships=(ArtifactAuthorship.EXACT_SOURCE_DATA,),
-        allowed_producer_capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
-        maximum_artifact_bytes=1024 * 1024,
-        maximum_total_bytes=1024 * 1024,
-        maximum_sensitivity=ModelSensitivity.INTERNAL,
-    )
-    return OutcomeContract(
-        require_terminal_conclusion=True,
-        artifact_requirements=(requirement,),
-        maximum_total_artifact_bytes=1024 * 1024,
-        maximum_effective_sensitivity=ModelSensitivity.INTERNAL,
-        require_current_run_provenance=True,
-        require_exact_source_bindings=True,
-    )
-
-
 async def _wait_for_deliveries(agent: Agent, conversation_id: str, count: int):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 15.0
@@ -243,7 +212,7 @@ async def _wait_for_deliveries(agent: Agent, conversation_id: str, count: int):
 
 
 async def _routine(tmp_path: Path) -> tuple[MockModelProvider, tuple[object, ...]]:
-    """Two consecutive occurrences; each misses its artifact and so fails."""
+    """Two consecutive occurrences, each refused a tool it tried to call."""
 
     tmp_path.mkdir()
     database = tmp_path / "orders.sqlite"
@@ -274,39 +243,17 @@ async def _routine(tmp_path: Path) -> tuple[MockModelProvider, tuple[object, ...
     )
     try:
         source = await agent.attach(SQLiteSource(database))
-        (resource,) = await agent.list_catalog_resources(source_id=source.id)
         origin = await agent.run("Authorize a scheduled export of orders.")
         assert origin.conversation_id is not None
-        (destination,) = await agent.distribution_destinations(
-            origin.conversation_id,
-            sensitivity_ceiling=ModelSensitivity.INTERNAL,
+        created = await agent.create_routine(
+            RoutineIntent(
+                title="Repeated refusal routine",
+                prompt="Export the orders table as CSV.",
+                schedule=IntervalSchedule(3_600, NOW + timedelta(hours=1)),
+                sources=(source.id,),
+            ),
+            conversation_id=origin.conversation_id,
         )
-        draft = ScheduledRoutineDraft(
-            origin_run_id=origin.run_id,
-            title="Repeated refusal routine",
-            authorized_instruction="Export the orders table as CSV.",
-            schedule=IntervalSchedule(3_600, NOW + timedelta(hours=1)),
-            misfire_policy=MisfirePolicy.LATEST_ONLY,
-            reporting_mode=ReportingMode.ALWAYS,
-            precheck=None,
-            allowed_source_ids=(source.id,),
-            allowed_connector_binding_ids=(),
-            allowed_resource_ids=(resource.id,),
-            allowed_capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
-            sensitivity_ceiling=ModelSensitivity.INTERNAL,
-            outcome_contract=_artifact_contract(),
-            distribution_destination_id=destination.destination_id,
-            eligible_model_routes=(provider.provider_id,),
-            per_run_max_tokens=2_000,
-            per_run_max_cost_usd=None,
-            cumulative_max_tokens=20_000,
-            cumulative_max_cost_usd=None,
-            cumulative_max_attempts=10,
-            cumulative_max_occurrences=10,
-            maximum_consecutive_failures=3,
-            expires_at=NOW + timedelta(days=30),
-        )
-        created = await agent.create_routine(await agent.propose_routine(draft))
         await agent.run_routine_now(
             created.routine_id, expected_revision=created.revision
         )
@@ -347,12 +294,10 @@ async def test_routine_occurrences_warn_separately_and_keep_their_failure_count(
         False,
         False,
     )
+    # No outcome contract: each occurrence completes with its final answer.
     consecutive_failures, failure_codes, _ = warned
-    assert consecutive_failures == 2
-    assert failure_codes == (
-        "outcome_artifact_contract_failed",
-        "outcome_artifact_contract_failed",
-    )
+    assert consecutive_failures == 0
+    assert failure_codes == ("", "")
 
     _disable_warnings(monkeypatch)
     silent_provider, silent = await _routine(tmp_path / "silent")
@@ -360,92 +305,62 @@ async def test_routine_occurrences_warn_separately_and_keep_their_failure_count(
     assert warned == silent
 
 
-def _graph_script() -> tuple[ModelResponse, ...]:
-    return (
-        _refused("attempt-1-a"),
-        _refused("attempt-1-b"),
-        # Plain text is a protocol violation; the task gets a second attempt.
-        _stop("Done without a lifecycle result."),
-        _refused("attempt-2-a"),
-        _tool(
-            "read-call",
-            READ_TOOL_NAME,
-            resource_ids=tuple(f"resource-{index}" for index in range(5)),
-        ),
-        _tool(
-            "complete-call",
-            "task_complete",
-            result_kind="test.graph.read",
-            summary="Read after correcting the call.",
-            payload={"value": 42},
-            evidence_refs=(result_ref("read-call"),),
-            artifact_ids=(),
-            residual_risk=None,
-            downstream_constraints={},
-        ),
+async def _job(tmp_path: Path) -> tuple[JobModel, tuple[object, ...]]:
+    model = JobModel()
+    model.script(
+        main=[
+            _refused("run-1-a"),
+            _refused("run-1-b"),
+            reply(ToolCall("ask", "ask_user", {"question": "Which table?"})),
+            # The answer starts a second main run, which counts afresh.
+            _refused("run-2-a"),
+            _stop("Read after correcting the call."),
+        ]
     )
-
-
-async def _graph(tmp_path: Path) -> tuple[MockModelProvider, tuple[object, ...]]:
-    integration = await ModelGraphIntegration.open(tmp_path, script=_graph_script())
-    loop = integration.supervisor._graph_model_loop
-    assert loop is not None
-    loop._context_builder = AgentContextBuilder(
-        CatalogSpy(), profile=integration.provider.model_profile
-    )
+    agent = await open_job_agent(tmp_path, model)
     try:
-        admission = integration.build()
-        await integration.admit_and_start(admission)
-        terminal = await integration.wait_terminal(admission.job.job_id)
-        work = next(item for item in terminal.tasks if item.role is TaskRole.WORKER)
-        attempts = tuple(
-            item for item in terminal.attempts if item.task_id == work.task_id
+        job = await agent.start_job("Count the warehouse rows.")
+        await wait_for_job(
+            agent, job.job_id, in_state(JobState.WAITING_FOR_YOU), model=model
         )
-        transcripts = []
-        for attempt in attempts:
-            transcript = await integration.store.load(attempt.run_id)
-            transcripts.append(_shape(transcript.messages))
-        integration.provider.assert_consumed()
-        return integration.provider, (
-            terminal.job.state,
-            work.attempt_count,
-            tuple(item.state for item in attempts),
+        await agent.answer_job(job.job_id, "orders")
+        done = await wait_for_job(
+            agent, job.job_id, in_state(JobState.DONE), model=model
+        )
+        assert not model.main
+        return model, (
+            done.state,
+            done.run_count,
+            done.tokens_used,
+            done.final_summary,
             tuple(
-                sorted(
-                    (
-                        item.task_id is None,
-                        item.dimension,
-                        item.ceiling,
-                        item.settled,
-                        item.reserved,
-                    )
-                    for item in terminal.budget_ledgers
-                )
+                _shape(request.messages[:-1])
+                for kind, request in model.requests
+                if kind == "job"
             ),
-            tuple(transcripts),
         )
     finally:
-        await integration.close()
+        await agent.close()
 
 
-async def test_graph_task_attempts_warn_separately_without_changing_limits(
+async def test_job_runs_warn_separately_without_changing_limits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    provider, warned = await _graph(tmp_path / "warned")
-    # Requests 0-2 are the first attempt; 3-5 the second, which starts fresh.
-    assert tuple(_warned(request) for request in provider.requests) == (
+    model, warned = await _job(tmp_path / "warned")
+    # Requests 0-2 are the first main run; 3-4 the second, which starts fresh.
+    requests = [request for kind, request in model.requests if kind == "job"]
+    assert tuple(_warned(request) for request in requests) == (
         False,
         False,
         True,
         False,
         False,
-        False,
     )
-    assert "`warehouse_row_count`" in _status(provider.requests[2])
+    assert "`warehouse_row_count`" in _status(requests[2])
 
     _disable_warnings(monkeypatch)
-    silent_provider, silent = await _graph(tmp_path / "silent")
-    assert not any(_warned(request) for request in silent_provider.requests)
+    silent_model, silent = await _job(tmp_path / "silent")
+    assert not any(_warned(request) for _kind, request in silent_model.requests)
     assert warned == silent
 
 

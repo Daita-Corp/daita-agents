@@ -2,31 +2,31 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 
 from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
-    AutomationEligibility,
-    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
     OperationalEffect,
+    RecoveryKind,
     SideEffectExecutor,
     ToolboxId,
     ToolExecution,
     ToolLoadMode,
     ToolOutput,
     ToolPresentation,
+    ToolRecovery,
     ToolTextTrust,
     ToolView,
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
-from ..llm.models import ModelSensitivity, ToolCall
-from ..loop.models import RunInput, RunOrigin
+from ..llm.models import ModelSensitivity, ToolCall, ToolResultBlock
+from ..loop.models import RunInput, RunOrigin, Transcript
 from ..loop.session import RunSession
 from .store import (
     SKILL_DESCRIPTION_MAX_CHARACTERS,
@@ -59,8 +59,8 @@ SKILL_SAVE_DESCRIPTION = (
     "Create/replace complete bounded procedural SKILL.md via the sole approval "
     "card. Use for reusable validated steps with use, verification, and failure "
     "guidance, not one-off results/schema. Description states when, "
-    "process/sources, exclusions, and result. Text ends run: call first. Replace "
-    "via skill_view current_sha256 as expected_sha256; blind/stale fails. "
+    "process/sources, exclusions, and result. Text ends run: call first. To "
+    "replace, skill_view it earlier in this run; a change since that view fails. "
     "action=delete removes one named skill after exact approval."
 )
 
@@ -231,8 +231,8 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
         Capability(
             id=SKILL_VIEW_CAPABILITY_ID,
             description=(
-                "Load one complete procedural skill and current_sha256; use that digest "
-                "as skill_save.expected_sha256 when replacing it."
+                "Load one complete procedural skill; view it before replacing it "
+                "with skill_save."
             ),
             input_schema=_view_input_schema(),
             output_kind=SKILL_VIEW_OUTPUT_KIND,
@@ -258,7 +258,6 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
             },
             executor_id=view.executor_id,
             access_mode=AccessMode.NONE,
-            automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         ),
         Capability(
             id=SKILL_SAVE_CAPABILITY_ID,
@@ -267,8 +266,8 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                 "approval card. Use for reusable validated steps with use, verification, "
                 "and failure guidance—not one-off results/schema. Description states "
                 "when, process/sources, exclusions, and result. Text ends run: call "
-                "first. Replace via skill_view current_sha256 as expected_sha256; "
-                "blind/stale fails."
+                "first. Replacing needs an earlier skill_view in this run; a change "
+                "since that view fails."
             ),
             input_schema={
                 "type": "object",
@@ -288,12 +287,6 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                         "minLength": 1,
                         "maxLength": SKILL_INSTRUCTIONS_MAX_CHARACTERS,
                     },
-                    "expected_sha256": {
-                        "type": "string",
-                        "pattern": "^[0-9a-f]{64}$",
-                        "minLength": 64,
-                        "maxLength": 64,
-                    },
                 },
                 "required": ["name", "description", "instructions"],
                 "additionalProperties": False,
@@ -311,7 +304,6 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
             executor_id=save.executor_id,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
         Capability(
             id=SKILL_DELETE_CAPABILITY_ID,
@@ -330,7 +322,6 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
             executor_id=delete.executor_id,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
     )
     return SkillDeclarations(
@@ -384,9 +375,12 @@ class SkillCapabilityDomain:
     def __init__(
         self,
         declarations: CapabilityDeclarations,
+        *,
+        transcript_loader: Callable[[str], Awaitable[Transcript]],
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("skill declarations have the wrong domain owner")
+        self._transcript_loader = transcript_loader
         if {item.id for item in declarations.capabilities} != {
             SKILL_VIEW_CAPABILITY_ID,
             SKILL_SAVE_CAPABILITY_ID,
@@ -460,21 +454,29 @@ class SkillCapabilityDomain:
                     "retained_skill_interactive_forbidden",
                     "Foreground skill reads use the current named skill.",
                 )
+        if capability.id == SKILL_SAVE_CAPABILITY_ID:
+            # A replacement is checked against the version this run last viewed.
+            try:
+                messages = (await self._transcript_loader(run.id)).messages
+            except KeyError:
+                messages = ()
+            viewed = [
+                data["current_sha256"]
+                for message in messages
+                for block in message.content
+                if isinstance(block, ToolResultBlock)
+                and not block.is_error
+                and block.capability_id == SKILL_VIEW_CAPABILITY_ID
+                and isinstance(data := block.output.get("data"), Mapping)
+                and data.get("name") == arguments["name"]
+            ]
+            if viewed:
+                return FrozenJsonObject.from_mapping(
+                    {**arguments.to_dict(), "expected_sha256": viewed[-1]}
+                )
         return arguments
 
     prepare_session_call = prepare_call
-
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject:
-        raise CapabilityInputError(
-            "automation_grant_unsupported",
-            "This domain does not admit unattended external effects.",
-        )
 
     async def side_effect_plan(
         self,
@@ -515,13 +517,21 @@ class SkillCapabilityDomain:
         call: ToolCall,
         error: BaseException,
     ) -> CapabilityFailure | None:
-        if (
-            isinstance(error, CapabilityInputError)
-            and error.details.get("name") == "name"
+        issues = (
+            error.details.get("issues", ())
+            if isinstance(error, CapabilityInputError)
+            else ()
+        )
+        if isinstance(issues, tuple) and any(
+            isinstance(issue, Mapping)
+            and issue.get("path") == "arguments.name"
+            and issue.get("code") != "missing_arguments"
+            for issue in issues
         ):
             return CapabilityFailure(
                 "skill_invalid_name",
                 "Skill names must match [a-z][a-z0-9-]{0,63}.",
+                {"issues": issues},
             )
         if isinstance(error, SkillNotFoundError):
             return CapabilityFailure(
@@ -599,12 +609,17 @@ def _validate_replacement_digest(
 ) -> None:
     if exists and expected_sha256 is None:
         raise CapabilityInputError(
-            "skill_expected_sha256_required",
+            "skill_view_required",
             (
-                "Replacing an existing skill requires expected_sha256 from a current "
-                "skill_view result."
+                "Replacing an existing skill needs an earlier skill_view of it in "
+                "this run; the replacement is checked against that version."
             ),
             {"name": name},
+            recovery=ToolRecovery(
+                RecoveryKind.CORRECT_ARGUMENTS,
+                f"Call skill_view with name={name}, then call skill_save again.",
+                tool_name=SKILL_VIEW_TOOL_NAME,
+            ),
         )
     if (exists and expected_sha256 != current_sha256) or (
         not exists and expected_sha256 is not None

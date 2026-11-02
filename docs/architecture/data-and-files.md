@@ -73,7 +73,7 @@ and `data_query` is offered only while a source with `SQL_READ` is in scope.
 A run withholds the `data_query` routes no in-scope source can serve: export
 needs a `TABULAR_EXPORT` source and `path_pattern` needs the session folder.
 A tool definition describes only the routes its run admits, so scheduled and
-graph runs never read about combined or live-folder queries.
+job runs never read about combined or live-folder queries.
 Inputs read at most an internal, model-invisible
 ceiling (`COMBINED_QUERY_INPUT_MAX_ROWS`/`_BYTES`); an input that reaches it
 refuses the whole call with `combined_input_truncated`, so no join ever sees
@@ -88,10 +88,15 @@ revisions, the highest input sensitivity and per-input lineage (`source_id`,
 inform discovery and join paths only; they grant no read authority.
 
 Data capabilities are reads except for explicitly admitted `data_update_rows` and
-`data_upsert_rows`, initially backed by PostgreSQL. Their read-only counterparts are
-`data_preview_update_rows` and `data_preview_upsert_rows`. Execution requires an
-authenticated current-run preview and matching intent. Update retains its exact
-selection, target-count, drift, rollback and receipt safeguards.
+`data_upsert_rows`, initially backed by PostgreSQL. A write is one call: `mode`
+defaults to `apply`, whose side-effect preflight builds the preview that the
+approval card shows. After approval the runtime runs the preflight again and
+refuses a drifted preview, then hands the approved preflight to the executor
+(`ToolExecution.approved_preflight`), so the locked transaction checks the same
+preview fingerprint and row count the person reviewed. The model never sends a
+fingerprint or count, and the preview is not stored. `mode=preview` routes to the
+read-only `data.preview_update_rows`/`data.preview_upsert_rows`. Update retains
+its exact selection, target-count, drift, rollback and receipt safeguards.
 
 `RelationalWriteScope` binds exact structural revision, explicit update/upsert
 operations, keys, insert/update columns, admitted identity generation and row limits.
@@ -103,14 +108,14 @@ inserts missing rows, updates changed rows, skips unchanged rows, and verifies e
 counts summing to the input count. Mismatches roll back the entire batch. Sequence
 allocations may leave gaps after rollback; receipts describe table-row effects.
 
-The data domain normalizes native standing grants and permits at most one native
-write capability per routine, with one invocation per occurrence and exact ceilings.
-An unchanged batch consumes its reservation and produces verified zero-mutation
-evidence. Full request sensitivity must fit the current target classification.
+A native write in a scheduled or job run asks a person at the time, exactly as a
+foreground write does; the approval card carries the routine or job title.
+An unchanged batch consumes its reservation and produces
+verified zero-mutation evidence. Full request sensitivity must fit the current target classification.
 Research lineage remains model-derived claims, distinct from transaction facts.
 Receipt reservation/finalization stays in CapabilityRuntime. No arbitrary SQL,
 insert-only tool, delete, DDL, chunking, automatic retry or replay is supported.
-Native graph release is limited to these same PostgreSQL update/upsert contracts.
+Machine runs use these same PostgreSQL update/upsert contracts, asking at the time.
 
 ## Local computer files and artifacts
 
@@ -129,7 +134,7 @@ folder source:
   budget; a discovery that reaches either commits a bounded snapshot with
   `CatalogSync.truncated`. Attached folders are always contained to their root;
   hosted compositions do not register the folder type. Like any source, they
-  can be granted to scheduled routines and graph jobs.
+  are in scope for scheduled and job runs; the session folder never is.
 - The **session folder source** is built by the composition root from the
   session's `LocalWorkspace`. Its `source:workspace:sha256:` ID is stable for the agent
   and workspace, sorts after every stored source, and is never written to the
@@ -159,8 +164,9 @@ the same worker and validator, binding typed copies of its complete inputs in
 private scratch and exposing only their aliases; homes without local scratch
 (`Agent.from_storage`) do not offer it.
 
-An authenticated current-run session-folder `file_read` binding can feed
-`artifact_edit_text`. That capability commits a complete replacement artifact
+`artifact_edit_text` names an earlier session-folder `file_read` of this run by
+its `result_ref` or path; the artifact domain takes that read's authenticated
+binding from the transcript, so the model never copies it. That capability commits a complete replacement artifact
 without changing the local file. `artifact_save_local` requires exact approval,
 revalidates the unchanged bound file, and atomically publishes the artifact.
 Drift requires a fresh read and edit. Attached folders are read-only sources:

@@ -26,15 +26,12 @@ from daita import (
     IntervalSchedule,
     LoopLimits,
     MCPToolSelection,
-    MisfirePolicy,
     PostgreSQLReadLimits,
-    ReportingMode,
-    ScheduledRoutineDraft,
+    RoutineIntent,
     SemanticAnnotationState,
 )
-from daita.artifacts.models import ArtifactAuthorship
-from daita.distribution import ArtifactRequirement, OutcomeContract, OutcomeState
-from daita.llm.models import MessageRole, ModelSensitivity, TextBlock
+from daita.distribution import OutcomeState
+from daita.llm.models import MessageRole, TextBlock
 from daita.loop.models import LoopExitKind, RunOrigin, validate_completed_transcript
 from daita.security import EnvironmentSecretProvider, SecretReference
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
@@ -49,7 +46,6 @@ from tests.support.data_operations import (
     parse_answer,
     score_answer,
 )
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.job_benchmarks import assert_completed, results_for
 from tests.support.live_billing import cost_cap
 from tests.support.mcp_read_harness import account_identity
@@ -418,68 +414,24 @@ async def test_live_mcp_binding_selection_and_schema_drift(dataops):
 
 
 async def routine_delivery(evaluation, origin, *, python: bool):
-    now = datetime.now(UTC)
     scope = source_scope(evaluation)
     capabilities: tuple[str, ...] = ("catalog.describe", "data.query")
-    outcome = no_artifact_outcome_contract()
     instruction = CASES[0].prompt
     if python:
         capabilities += ("analysis.execute",)
-        requirement = ArtifactRequirement(
-            required=True,
-            minimum_count=1,
-            maximum_count=1,
-            allowed_media_types=("image/png",),
-            allowed_authorships=(ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,),
-            allowed_producer_capability_ids=("analysis.execute",),
-            maximum_artifact_bytes=1_000_000,
-            maximum_total_bytes=1_000_000,
-            maximum_sensitivity=ModelSensitivity.INTERNAL,
-        )
-        outcome = OutcomeContract(
-            require_terminal_conclusion=True,
-            artifact_requirements=(requirement,),
-            maximum_total_artifact_bytes=1_000_000,
-            maximum_effective_sensitivity=ModelSensitivity.INTERNAL,
-            require_current_run_provenance=True,
-            require_exact_source_bindings=False,
-        )
         instruction += (
             " Use Python to compute the result from a programmatic data_query read "
             "inside tools.call, and save a PNG chart artifact."
         )
-    draft = ScheduledRoutineDraft(
-        origin_run_id=origin.result.run_id,
-        title="Weekly settlement acceptance",
-        authorized_instruction=instruction,
-        schedule=IntervalSchedule(604800, now + timedelta(days=7)),
-        misfire_policy=MisfirePolicy.LATEST_ONLY,
-        reporting_mode=ReportingMode.ALWAYS,
-        precheck=None,
-        allowed_source_ids=scope,
-        allowed_connector_binding_ids=(),
-        allowed_resource_ids=tuple(evaluation.setup["resource_ids"]),
-        allowed_capability_ids=capabilities,
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
-        outcome_contract=outcome,
-        distribution_destination_id=(
-            await evaluation.agent.distribution_destinations(
-                origin.result.conversation_id,
-                sensitivity_ceiling=ModelSensitivity.INTERNAL,
-            )
-        )[0].destination_id,
-        eligible_model_routes=(evaluation.provider.provider_id,),
-        per_run_max_tokens=100000,
-        per_run_max_cost_usd=cost_cap(evaluation.budget.per_run),
-        cumulative_max_tokens=100000,
-        cumulative_max_cost_usd=cost_cap(evaluation.budget.per_run),
-        cumulative_max_attempts=1,
-        cumulative_max_occurrences=1,
-        maximum_consecutive_failures=1,
-        expires_at=now + timedelta(days=8),
+    stored = await evaluation.agent.create_routine(
+        RoutineIntent(
+            title="Weekly settlement acceptance",
+            prompt=instruction,
+            schedule=IntervalSchedule(604800, datetime.now(UTC) + timedelta(days=7)),
+            sources=scope,
+        ),
+        conversation_id=origin.result.conversation_id,
     )
-    proposal = await evaluation.agent.propose_routine(draft)
-    stored = await evaluation.agent.create_routine(proposal)
     evaluation.budget.reserve()
     result = None
     try:
@@ -524,7 +476,8 @@ async def routine_delivery(evaluation, origin, *, python: bool):
                 assert transcript.run.origin is RunOrigin.SCHEDULED_ROUTINE
                 execution = transcript.run.execution_scope
                 assert execution and execution.allowed_source_ids == scope
-                assert set(execution.allowed_capability_ids) == set(capabilities)
+                # Fixed at run start: every capability except the exclusions.
+                assert set(capabilities) <= set(execution.allowed_capability_ids)
                 score = score_answer(result.final_text, expected_rows("paid_totals"))
                 evaluation.setup["results"][
                     "scheduled_python" if python else "scheduled_sql"

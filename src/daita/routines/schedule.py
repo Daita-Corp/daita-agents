@@ -16,7 +16,6 @@ from .models import (
     CalendarDaySelector,
     CalendarSchedule,
     IntervalSchedule,
-    MisfirePolicy,
     NonexistentTimePolicy,
     OnceSchedule,
     RoutineSchedule,
@@ -48,95 +47,18 @@ def validate_schedule(schedule: RoutineSchedule) -> None:
         raise ValueError("calendar schedule cannot produce a valid local date")
 
 
-def first_slot(
-    schedule: RoutineSchedule,
-    *,
-    not_before: datetime,
-    expires_at: datetime,
-) -> datetime | None:
-    """Return the first slot at or after ``not_before`` within expiration."""
+def first_slot(schedule: RoutineSchedule, *, not_before: datetime) -> datetime | None:
+    """Return the first slot at or after ``not_before``."""
 
     _utc(not_before, "schedule not_before")
-    _utc(expires_at, "schedule expires_at")
-    if expires_at < not_before:
-        return None
-    candidate = _next_slot(schedule, boundary=not_before, inclusive=True)
-    if candidate is None or candidate > expires_at:
-        return None
-    return candidate
+    return _next_slot(schedule, boundary=not_before, inclusive=True)
 
 
-@dataclass(frozen=True, slots=True)
-class ScheduleForecast:
-    """Code-computed upcoming slots, so authors never do calendar arithmetic.
-
-    ``first_unbounded_at`` ignores expiration; when it is later than the
-    expiration the schedule can never run. ``reachable_slots`` counts slots
-    before expiration, stopping once ``count_limit`` is reached.
-    """
-
-    occurrences: tuple[datetime, ...]
-    first_unbounded_at: datetime | None
-    reachable_slots: int
-
-
-def forecast_slots(
-    schedule: RoutineSchedule,
-    *,
-    not_before: datetime,
-    expires_at: datetime,
-    limit: int,
-    count_limit: int,
-) -> ScheduleForecast:
-    """Return the first ``limit`` slots and a bounded count before expiration."""
-
-    _utc(not_before, "schedule not_before")
-    _utc(expires_at, "schedule expires_at")
-    if not 1 <= limit <= count_limit <= MAX_ROUTINE_OCCURRENCES:
-        raise ValueError("schedule forecast bounds are invalid")
-    try:
-        unbounded = _next_slot(schedule, boundary=not_before, inclusive=True)
-    except ValueError:
-        unbounded = None
-    slots: list[datetime] = []
-    count = 0
-    cursor = unbounded
-    while cursor is not None and cursor <= expires_at and count < count_limit:
-        if len(slots) < limit:
-            slots.append(cursor)
-        count += 1
-        if isinstance(schedule, IntervalSchedule):
-            # Interval slots are arithmetic; count them without iterating.
-            remaining = _timedelta_microseconds(expires_at - cursor) // (
-                schedule.interval_seconds * 1_000_000
-            )
-            while len(slots) < limit and len(slots) <= remaining:
-                slots.append(
-                    cursor + timedelta(seconds=len(slots) * schedule.interval_seconds)
-                )
-            count = min(count_limit, 1 + remaining)
-            break
-        try:
-            cursor = _next_slot(schedule, boundary=cursor, inclusive=False)
-        except ValueError:
-            break
-    return ScheduleForecast(tuple(slots), unbounded, count)
-
-
-def next_slot(
-    schedule: RoutineSchedule,
-    *,
-    after: datetime,
-    expires_at: datetime,
-) -> datetime | None:
-    """Return the first slot strictly after ``after`` within expiration."""
+def next_slot(schedule: RoutineSchedule, *, after: datetime) -> datetime | None:
+    """Return the first slot strictly after ``after``."""
 
     _utc(after, "schedule after")
-    _utc(expires_at, "schedule expires_at")
-    candidate = _next_slot(schedule, boundary=after, inclusive=False)
-    if candidate is None or candidate > expires_at:
-        return None
-    return candidate
+    return _next_slot(schedule, boundary=after, inclusive=False)
 
 
 def select_due_slot(
@@ -144,26 +66,20 @@ def select_due_slot(
     *,
     materialized_due_at: datetime,
     now: datetime,
-    expires_at: datetime,
-    misfire_policy: MisfirePolicy,
 ) -> DueSlotSelection:
     """Select one bounded due slot and materialize the next future instant.
 
-    A single outstanding slot is eligible under both policies. If multiple
-    slots accumulated, ``skip`` omits all of them and ``latest_only`` selects
-    only the most recent. This distinguishes an ordinary late wake from a
-    missed backlog without introducing a wall-clock grace heuristic.
+    A single outstanding slot is eligible, so an ordinary late wake still
+    runs. Missed slots are skipped: when several accumulated, none runs and
+    the routine waits for its next future slot.
     """
 
     for value, name in (
         (materialized_due_at, "materialized due instant"),
         (now, "schedule now"),
-        (expires_at, "schedule expires_at"),
     ):
         _utc(value, name)
-    if not isinstance(misfire_policy, MisfirePolicy):
-        raise TypeError("misfire policy is invalid")
-    if materialized_due_at > now or materialized_due_at > expires_at:
+    if materialized_due_at > now:
         return DueSlotSelection(None, materialized_due_at, 0)
 
     due_count = 1
@@ -173,15 +89,14 @@ def select_due_slot(
         interval = timedelta(seconds=schedule.interval_seconds)
         first = _next_slot(schedule, boundary=materialized_due_at, inclusive=False)
         assert first is not None
-        limit = min(now, expires_at)
-        if first <= limit:
-            missed = (limit - first) // interval
+        if first <= now:
+            missed = (now - first) // interval
             latest = first + missed * interval
             due_count += missed + 1
-        following = next_slot(schedule, after=now, expires_at=expires_at)
+        following = next_slot(schedule, after=now)
     else:
         while True:
-            following = next_slot(schedule, after=latest, expires_at=expires_at)
+            following = next_slot(schedule, after=latest)
             if following is None or following > now:
                 break
             if due_count >= MAX_ROUTINE_OCCURRENCES:
@@ -190,8 +105,6 @@ def select_due_slot(
             due_count += 1
     if due_count == 1:
         return DueSlotSelection(latest, following, 0)
-    if misfire_policy is MisfirePolicy.LATEST_ONLY:
-        return DueSlotSelection(latest, following, due_count - 1)
     return DueSlotSelection(None, following, due_count)
 
 

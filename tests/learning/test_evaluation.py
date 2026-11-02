@@ -196,16 +196,6 @@ def _semantic_save_call(
         resources[name] for name in ("orders", "order_items", "products", "regions")
     )
     resource_ids = sorted(resource.id for resource in selected)
-    revisions = sorted(
-        (
-            {
-                "resource_id": resource.id,
-                "revision": resource.current_revision,
-            }
-            for resource in selected
-        ),
-        key=lambda item: str(item["resource_id"]),
-    )
     fields = sorted(
         (
             {
@@ -235,7 +225,6 @@ def _semantic_save_call(
             "kind": "metric_definition",
             "statement": statement,
             "evidence": [{"kind": "user_assertion"}],
-            "catalog_revisions": revisions,
         },
     )
 

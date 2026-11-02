@@ -10,24 +10,24 @@ from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 from html import escape
-from typing import Protocol
+from typing import Protocol, cast
 
 from ._json import FrozenJsonObject, canonical_json
 from .capabilities import (
     AccessMode,
-    AutomationEligibility,
-    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
     OperationalEffect,
+    RecoveryKind,
     SideEffectExecutor,
     ToolboxId,
     ToolExecution,
     ToolLoadMode,
     ToolOutput,
     ToolPresentation,
+    ToolRecovery,
     ToolTextTrust,
     ToolView,
     resource_id_schema,
@@ -97,8 +97,9 @@ SEMANTIC_SAVE_DESCRIPTION = (
     "the sole approval card. Use only for explicit user assertions or validated "
     "tool results: evidence kind tool_result names the result_ref of an earlier "
     "step; the runtime binds run and position. Global definitions belong in "
-    "MEMORY.md. Needs current catalog IDs, fields and exact revisions. View "
-    "first: replace, supersede and action=delete need expected_sha256."
+    "MEMORY.md. Needs current catalog IDs and fields; Daita binds their "
+    "revisions. To replace, supersede or action=delete, semantic_view the "
+    "annotation earlier in this run; Daita binds that version."
 )
 SEMANTIC_DOMAIN_OWNER_ID = "semantics"
 
@@ -1220,7 +1221,7 @@ class SemanticSaveExecutor:
             )
         annotation_id = request.arguments.get("id")
         if annotation_id is None:
-            annotation_id = _derived_annotation_id(request)
+            annotation_id = _derived_annotation_id(request.run_id, request.arguments)
         if not isinstance(annotation_id, str):
             raise TypeError("semantic annotation id must be text")
         existing = await self._store.load_semantic_annotation(
@@ -1313,15 +1314,13 @@ def _annotation_from_tool_arguments(
     return semantic_annotation_from_mapping(mapping)
 
 
-def _derived_annotation_id(request: ToolExecution) -> str:
+def _derived_annotation_id(run_id: str, arguments: Mapping[str, object]) -> str:
     content = {
         key: value
-        for key, value in request.arguments.items()
+        for key, value in arguments.items()
         if key not in {"id", "expected_sha256"}
     }
-    digest = sha256(
-        f"{request.run_id}\n{canonical_json(content)}".encode("utf-8")
-    ).hexdigest()
+    digest = sha256(f"{run_id}\n{canonical_json(content)}".encode("utf-8")).hexdigest()
     return f"semantic-{digest[:24]}"
 
 
@@ -1398,7 +1397,6 @@ def semantic_declarations(
                 "additionalProperties": False,
             },
             executor_id=listing.executor_id,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
         Capability(
             id=SEMANTIC_VIEW_CAPABILITY_ID,
@@ -1463,7 +1461,6 @@ def semantic_declarations(
                 "additionalProperties": False,
             },
             executor_id=view.executor_id,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
         Capability(
             id=SEMANTIC_SAVE_CAPABILITY_ID,
@@ -1475,9 +1472,10 @@ def semantic_declarations(
                 "binds the exact current run ID and transcript message position. "
                 "Never invent transcript IDs or positions. Tool-result evidence must "
                 "come from an earlier completed tool step in this run. "
-                "Global definitions belong in MEMORY.md. Current catalog IDs, fields, "
-                "and exact revisions are required. View first: replacement and "
-                "supersession require expected_sha256."
+                "Global definitions belong in MEMORY.md. Current catalog IDs and "
+                "fields are required; the runtime binds their current revisions. "
+                "Replacement and supersession need an earlier semantic_view of the "
+                "target in this run, whose version the runtime binds."
             ),
             input_schema=_save_input_schema(),
             output_kind=SEMANTIC_SAVE_OUTPUT_KIND,
@@ -1494,22 +1492,19 @@ def semantic_declarations(
             executor_id=save.executor_id,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
             result_ref_arguments=("evidence[].result_ref",),
         ),
         Capability(
             id=SEMANTIC_DELETE_CAPABILITY_ID,
             description=(
-                "Delete one semantic annotation through the sole approval card using "
-                "the exact current_sha256 returned by semantic_view."
+                "Delete one semantic annotation through the sole approval card. It "
+                "needs an earlier semantic_view of it in this run; the runtime binds "
+                "that version."
             ),
             input_schema={
                 "type": "object",
-                "properties": {
-                    "id": _identifier_schema(),
-                    "expected_sha256": _digest_schema(),
-                },
-                "required": ["id", "expected_sha256"],
+                "properties": {"id": _identifier_schema()},
+                "required": ["id"],
                 "additionalProperties": False,
             },
             output_kind=SEMANTIC_DELETE_OUTPUT_KIND,
@@ -1525,7 +1520,6 @@ def semantic_declarations(
             executor_id=delete.executor_id,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
-            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
     )
     return SemanticDeclarations(
@@ -1773,21 +1767,89 @@ class SemanticCapabilityDomain:
         await self._validate_read_scope(run, capability, arguments)
         if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
             arguments = await self._bind_current_evidence(run, arguments)
+            arguments = await self._bind_save_versions(run, arguments)
+        elif capability.id == SEMANTIC_DELETE_CAPABILITY_ID:
+            target = cast(str, arguments["id"])
+            arguments = FrozenJsonObject.from_mapping(
+                {
+                    **arguments.to_dict(),
+                    "expected_sha256": await self._viewed_sha256(run, target),
+                }
+            )
         return arguments
 
     prepare_session_call = prepare_call
 
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
+    async def _bind_save_versions(
+        self, run: RunInput, arguments: FrozenJsonObject
     ) -> FrozenJsonObject:
-        raise CapabilityInputError(
-            "automation_grant_unsupported",
-            "This domain does not admit unattended external effects.",
+        """Bind current catalog revisions and the version this run viewed."""
+
+        subject = cast(Mapping[str, object], arguments["subject"])
+        resource_ids = cast(tuple[str, ...], subject["resource_ids"])
+        facts = {
+            item.resource_id: item.revision
+            for item in await self._catalog.semantic_resource_facts(
+                run.agent_id, resource_ids
+            )
+        }
+        for resource_id in resource_ids:
+            if resource_id not in facts:
+                raise CapabilityInputError(
+                    "semantic_unknown_resource",
+                    "A semantic subject resource is not current for this agent.",
+                    {"resource_id": resource_id},
+                )
+        bound = arguments.to_dict()
+        bound["catalog_revisions"] = [
+            {"resource_id": resource_id, "revision": facts[resource_id]}
+            for resource_id in resource_ids
+        ]
+        annotation_id = arguments.get("id")
+        target = (
+            annotation_id
+            if isinstance(annotation_id, str)
+            and await self._store.load_semantic_annotation(run.agent_id, annotation_id)
+            is not None
+            else arguments.get("supersedes_id")
         )
+        # The approval card shows the id a new annotation will get.
+        bound.setdefault("id", _derived_annotation_id(run.id, bound))
+        if isinstance(target, str):
+            bound["expected_sha256"] = await self._viewed_sha256(run, target)
+        return FrozenJsonObject.from_mapping(bound)
+
+    async def _viewed_sha256(self, run: RunInput, annotation_id: str) -> str:
+        """Return the version of ``annotation_id`` this run last viewed."""
+
+        try:
+            messages = (await self._store.load(run.id)).messages
+        except KeyError:
+            messages = ()
+        viewed = [
+            data["current_sha256"]
+            for message in messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock)
+            and not block.is_error
+            and block.capability_id == SEMANTIC_VIEW_CAPABILITY_ID
+            and isinstance(data := block.output.get("data"), Mapping)
+            and isinstance(annotation := data.get("annotation"), Mapping)
+            and annotation.get("id") == annotation_id
+        ]
+        if not viewed:
+            raise CapabilityInputError(
+                "semantic_view_required",
+                "View this annotation with semantic_view in this run before "
+                "changing it; the change is checked against that version.",
+                {"id": annotation_id},
+                recovery=ToolRecovery(
+                    RecoveryKind.CORRECT_ARGUMENTS,
+                    f"Call semantic_view with id={annotation_id}, then call again.",
+                    tool_name=SEMANTIC_VIEW_TOOL_NAME,
+                ),
+            )
+        return cast(str, viewed[-1])
 
     async def side_effect_plan(
         self,
@@ -2476,31 +2538,9 @@ def _save_input_schema() -> dict[str, object]:
                     "additionalProperties": False,
                 },
             },
-            "catalog_revisions": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": SEMANTIC_MAX_REVISION_BINDINGS,
-                "uniqueItems": True,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "resource_id": resource_id_schema(),
-                        "revision": identifier,
-                    },
-                    "required": ["resource_id", "revision"],
-                    "additionalProperties": False,
-                },
-            },
             "supersedes_id": identifier,
-            "expected_sha256": _digest_schema(),
         },
-        "required": [
-            "subject",
-            "kind",
-            "statement",
-            "evidence",
-            "catalog_revisions",
-        ],
+        "required": ["subject", "kind", "statement", "evidence"],
         "additionalProperties": False,
     }
 

@@ -87,6 +87,30 @@ def scope_refs(scope: EffectiveSourceScope | None) -> ScopeRefs:
     )
 
 
+async def resolve_machine_source_scope(
+    agent_id: str,
+    source_ids: tuple[str, ...],
+    catalog: SourceScopeCatalog,
+) -> EffectiveSourceScope:
+    """The sources a machine run may read, fixed when it starts.
+
+    The named sources when the routine or job names any, else every current
+    source; never the live session folder, which belongs to a foreground run.
+    """
+
+    facts = await catalog.source_routing_facts(agent_id, tuple(sorted(source_ids)))
+    sources = frozenset(
+        value for fact in facts if isinstance(value := fact.get("source_id"), str)
+    )
+    if source_ids:
+        sources &= frozenset(source_ids)
+    sources -= {catalog.session_source_id}
+    if not sources:
+        return EffectiveSourceScope(frozenset(), frozenset())
+    resources = await catalog.readable_resource_ids(agent_id, tuple(sorted(sources)))
+    return EffectiveSourceScope(sources, resources)
+
+
 class SourceScopeCatalog(Protocol):
     async def source_routing_facts(
         self, agent_id: str, source_ids: tuple[str, ...] = ()

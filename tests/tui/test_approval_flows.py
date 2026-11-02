@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime, timedelta
+
+from daita import OnceSchedule, RoutineIntent
 from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.support.product_workflows import (
     ActionFixture,
@@ -12,7 +16,6 @@ from tests.support.product_workflows import (
     patch,
     pytest,
     pytestmark as _pytestmark,
-    replace,
     workspace_for,
 )
 
@@ -55,12 +58,27 @@ async def test_cli_routine_mutations_request_human_confirmation_before_saving(
 ):
     fixture = await ActionFixture(tmp_path).start()
     try:
-        draft = replace(await fixture.draft(), run_immediately=False)
+        due = datetime.now(UTC) + timedelta(days=1)
         routine = None
         if command == "update":
             routine = await fixture.agent.create_routine(
-                await fixture.agent.propose_routine(draft)
+                RoutineIntent(
+                    title="Saved routine",
+                    prompt="Report the latest result.",
+                    schedule=OnceSchedule(due),
+                )
             )
+        spec = tmp_path / "reviewed.json"
+        spec.write_text(
+            json.dumps(
+                {
+                    "title": "CLI proposal",
+                    "prompt": "Report the latest result.",
+                    "schedule": {"kind": "once", "exact_at": due.isoformat()},
+                }
+            ),
+            encoding="utf-8",
+        )
         arguments = [
             "--no-host",
             "--root",
@@ -72,16 +90,11 @@ async def test_cli_routine_mutations_request_human_confirmation_before_saving(
             "mcp-actions",
         ]
         if routine is not None:
-            arguments += [routine.routine_id, str(routine.revision)]
-        arguments += ["--spec", str(tmp_path / "reviewed.json")]
+            arguments += [routine.routine_id, "--expected-revision", "1"]
+        arguments += ["--spec", str(spec)]
         args = cli.build_parser().parse_args(arguments)
         with (
             patch.object(Agent, "open", return_value=fixture.agent),
-            patch.object(
-                cli,
-                "_routine_draft_from_file",
-                return_value=replace(draft, title="CLI proposal"),
-            ),
             patch("builtins.input", return_value="n") as confirm,
         ):
             with pytest.raises(PermissionError, match="not approved"):

@@ -106,7 +106,7 @@ async def test_a_routine_result_ready_while_nobody_watches_notifies(
     await harness.create_agent()
     agent = await connect("sales", cwd=harness.work(), root=harness.root)
     try:
-        await scheduled_routine(agent, model.provider_id, due_in=timedelta(seconds=2))
+        await scheduled_routine(agent, due_in=timedelta(seconds=2))
     finally:
         await agent.close()
 

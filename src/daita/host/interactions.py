@@ -210,6 +210,7 @@ def approval_handler(
             capability_id=request.capability_id,
             arguments_text=request.render_arguments_for_review(),
             reason=request.reason,
+            requester=request.requester,
         )
         ref = run_ref()
         waiting(ref, True)

@@ -38,6 +38,8 @@ from tests.support.approval_learning import (
     _skill_delete_call,
     _skill_digest,
     _skill_save_call,
+    _skill_view_call,
+    _step_results,
     _stop,
     _system_text,
     _tool_event_kinds,
@@ -135,12 +137,13 @@ async def test_learning_tool_descriptions_route_documents_and_require_write_firs
         assert "Replace instead of duplicating" in memory_description
         assert "never resend the whole document" in memory_description
         assert "sole approval card" in memory_description
-        assert "current_sha256" in skill_view_description
+        # Replacement is checked against this run's view; no digest is copied.
+        assert "current_sha256" not in skill_view_description
         assert "reusable validated steps with use, verification, and failure" in (
             skill_save_description
         )
         assert "Text ends run: call first" in skill_save_description
-        assert "expected_sha256" in skill_save_description
+        assert "expected_sha256" not in skill_save_description
         assert "sole approval card" in skill_save_description
     finally:
         await agent.close()
@@ -169,7 +172,6 @@ async def test_loaded_skill_is_replaced_instead_of_duplicated(tmp_path):
         instructions=(
             "Use the paid invoice date. Exclude voided invoices. Verify the month total."
         ),
-        expected_sha256=expected_sha256,
     )
     provider = MockModelProvider(
         (
@@ -270,21 +272,26 @@ async def test_denied_skill_save_and_delete_never_mutate(tmp_path, operation):
         approvals.append(request)
         return ApprovalDecision.DENY
 
-    agent = await _agent(tmp_path, f"deny-skill-{operation}", approval_handler=deny)
+    call = (
+        _skill_delete_call(name="target")
+        if operation == "delete"
+        else _skill_save_call(
+            name="target",
+            description="Denied replacement",
+            instructions="This replacement must not be persisted.",
+        )
+    )
+    agent = await _agent(
+        tmp_path,
+        f"deny-skill-{operation}",
+        approval_handler=deny,
+        responses=(_call(_skill_view_call("target")), _call(call), _stop()),
+    )
     try:
         await agent.save_skill("target", "Original", "Keep this exact skill.")
-        if operation == "delete":
-            call = _skill_delete_call(name="target")
-        else:
-            call = _skill_save_call(
-                name="target",
-                description="Denied replacement",
-                instructions="This replacement must not be persisted.",
-                expected_sha256=await _skill_digest(agent, "target"),
-            )
         before = agent.home / "skills" / "target" / "SKILL.md"
         before_bytes = before.read_bytes() if before.exists() else None
-        result = (await _execute(agent, call))[0]
+        result = (await _step_results(agent, "Change the target skill."))[call.id]
         assert _error_code(result) == "approval_denied"
         after_bytes = before.read_bytes() if before.exists() else None
         assert after_bytes == before_bytes
@@ -300,42 +307,40 @@ async def test_blind_and_stale_skill_replacements_fail_before_approval(tmp_path)
         approvals.append(request)
         return ApprovalDecision.APPROVE
 
+    # The second replacement still binds the run's only view, which the first
+    # replacement made stale.
     agent = await _agent(
         tmp_path,
         "blind-stale-replacement",
         approval_handler=approve,
+        responses=(
+            _call(
+                _skill_save_call(
+                    "blind", name="target", instructions="Blind replacement."
+                )
+            ),
+            _stop(),
+            _call(_skill_view_call("target")),
+            _call(_skill_save_call("fresh", name="target", instructions="Fresh one.")),
+            _call(_skill_save_call("stale", name="target", instructions="Stale one.")),
+            _stop(),
+        ),
     )
     try:
         await agent.save_skill("target", "Original", "Original instructions.")
         path = agent.home / "skills/target/SKILL.md"
         before = path.read_bytes()
 
-        blind = (
-            await _execute(
-                agent,
-                _skill_save_call(
-                    "blind",
-                    name="target",
-                    instructions="Blind replacement.",
-                ),
-            )
-        )[0]
-        stale = (
-            await _execute(
-                agent,
-                _skill_save_call(
-                    "stale",
-                    name="target",
-                    instructions="Stale replacement.",
-                    expected_sha256="0" * 64,
-                ),
-            )
-        )[0]
+        blind = (await _step_results(agent, "Replace without viewing."))["blind"]
+        assert _error_code(blind) == "skill_view_required"
+        assert approvals == [] and path.read_bytes() == before
+        results = await _step_results(agent, "Replace twice from one view.")
 
-        assert _error_code(blind) == "skill_expected_sha256_required"
-        assert _error_code(stale) == "skill_stale_replacement"
-        assert approvals == []
-        assert path.read_bytes() == before
+        assert not results["fresh"].is_error
+        assert _error_code(results["stale"]) == "skill_stale_replacement"
+        assert [request.call_id for request in approvals] == ["fresh"]
+        current = await agent.read_skill("target")
+        assert current is not None and current.instructions == "Fresh one."
     finally:
         await agent.close()
 
@@ -399,7 +404,7 @@ async def test_absent_model_delete_returns_not_found_without_approval(tmp_path):
         ),
         (
             _skill_save_call(instructions="x" * 12_001),
-            "invalid_argument_value",
+            "invalid_arguments",
         ),
     ),
 )
@@ -544,20 +549,24 @@ async def test_selected_skill_change_during_approval_returns_state_changed(
             assert await agent.delete_skill("target") is True
         return ApprovalDecision.APPROVE
 
-    agent = await _agent(tmp_path, f"selected-{change}", approval_handler=approve)
+    call = (
+        _skill_save_call(
+            name="target",
+            description="Model",
+            instructions="Stale model content.",
+        )
+        if change == "replace"
+        else _skill_delete_call(name="target")
+    )
+    agent = await _agent(
+        tmp_path,
+        f"selected-{change}",
+        approval_handler=approve,
+        responses=(_call(_skill_view_call("target")), _call(call), _stop()),
+    )
     try:
         await agent.save_skill("target", "Original", "Original content.")
-        call = (
-            _skill_save_call(
-                name="target",
-                description="Model",
-                instructions="Stale model content.",
-                expected_sha256=await _skill_digest(agent, "target"),
-            )
-            if change == "replace"
-            else _skill_delete_call(name="target")
-        )
-        result = (await _execute(agent, call))[0]
+        result = (await _step_results(agent, "Change the target skill."))[call.id]
         assert _error_code(result) == "state_changed"
         current = await agent.read_skill("target")
         if change == "replace":
@@ -600,13 +609,19 @@ async def test_approved_identical_save_reports_unchanged_without_replacement(tmp
         approvals.append(request)
         return ApprovalDecision.APPROVE
 
-    agent = await _agent(tmp_path, "identical-save", approval_handler=approve)
+    arguments = {
+        "name": "target",
+        "description": "Same description.",
+        "instructions": "Same instructions.",
+    }
+    call = _skill_save_call(**arguments)
+    agent = await _agent(
+        tmp_path,
+        "identical-save",
+        approval_handler=approve,
+        responses=(_call(_skill_view_call("target")), _call(call), _stop()),
+    )
     try:
-        arguments = {
-            "name": "target",
-            "description": "Same description.",
-            "instructions": "Same instructions.",
-        }
         assert (
             await agent.save_skill(
                 arguments["name"],
@@ -616,18 +631,9 @@ async def test_approved_identical_save_reports_unchanged_without_replacement(tmp
             )
             is True
         )
-        expected_sha256 = await _skill_digest(agent, "target")
         path = agent.home / "skills" / "target" / "SKILL.md"
         before = path.stat()
-        result = (
-            await _execute(
-                agent,
-                _skill_save_call(
-                    **arguments,
-                    expected_sha256=expected_sha256,
-                ),
-            )
-        )[0]
+        result = (await _step_results(agent, "Save the same skill."))[call.id]
         after = path.stat()
         assert not result.is_error
         assert result.output["data"] == FrozenJsonObject.from_mapping(
@@ -650,7 +656,13 @@ async def test_changed_skill_arguments_require_another_exact_callback(tmp_path):
         approvals.append(request)
         return ApprovalDecision.APPROVE
 
-    agent = await _agent(tmp_path, "changed-arguments", approval_handler=approve)
+    second = _skill_save_call("two", name="target", instructions="Second version.")
+    agent = await _agent(
+        tmp_path,
+        "changed-arguments",
+        approval_handler=approve,
+        responses=(_call(_skill_view_call("target")), _call(second), _stop()),
+    )
     try:
         first = (
             await _execute(
@@ -658,19 +670,8 @@ async def test_changed_skill_arguments_require_another_exact_callback(tmp_path):
                 _skill_save_call("one", name="target", instructions="First version."),
             )
         )[0]
-        expected_sha256 = await _skill_digest(agent, "target")
-        second = (
-            await _execute(
-                agent,
-                _skill_save_call(
-                    "two",
-                    name="target",
-                    instructions="Second version.",
-                    expected_sha256=expected_sha256,
-                ),
-            )
-        )[0]
-        results = (first, second)
+        replaced = (await _step_results(agent, "Replace the target skill."))["two"]
+        results = (first, replaced)
         assert all(not result.is_error for result in results)
         assert len(approvals) == 2
         assert approvals[0].arguments["instructions"] == "First version."
@@ -848,7 +849,10 @@ async def test_reopen_starts_no_learning_work_and_persists_no_skill_approval(tmp
     finally:
         await agent.close()
 
-    reopened_provider = MockModelProvider((_stop(),))
+    unapproved = _skill_save_call(name="persisted", instructions="Not approved.")
+    reopened_provider = MockModelProvider(
+        (_call(_skill_view_call("persisted")), _call(unapproved), _stop())
+    )
     reopened = await Agent.open(
         "skill-restart",
         root=tmp_path,
@@ -860,17 +864,7 @@ async def test_reopen_starts_no_learning_work_and_persists_no_skill_approval(tmp
     try:
         assert reopened_provider.requests == ()
         assert await reopened.read_skill("persisted") is not None
-        expected_sha256 = await _skill_digest(reopened, "persisted")
-        result = (
-            await _execute(
-                reopened,
-                _skill_save_call(
-                    name="persisted",
-                    instructions="Not approved.",
-                    expected_sha256=expected_sha256,
-                ),
-            )
-        )[0]
+        result = (await _step_results(reopened, "Replace the skill."))[unapproved.id]
         assert _error_code(result) == "approval_required"
         current = await reopened.read_skill("persisted")
         assert current is not None

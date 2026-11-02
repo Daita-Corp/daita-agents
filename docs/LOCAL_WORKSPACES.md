@@ -69,8 +69,8 @@ For bounded mode, the workspace and agent-state roots must not overlap in either
 direction, and filesystem root/home cannot be the workspace. Computer mode can
 use home or a directory that contains private state, but direct state access is
 rejected and broad searches prune state subtrees. Hosted compositions have no
-session folder source and no folder source type, and scheduled routines, graph
-tasks, and other machine-originated runs never receive the session folder
+session folder source and no folder source type, and scheduled routines, job
+runs, and other machine-originated runs never receive the session folder
 source.
 
 `Agent.session_source_id` is the session folder source's stable ID. It is never
@@ -138,11 +138,14 @@ worker and removes its private scratch state.
 
 For one bounded UTF-8 text file, Daita can perform the cohesive sequence
 `file_read` → `artifact_edit_text` → approval → `artifact_save_local`. The edit
-tool accepts only the authenticated current-run binding returned by a session
-folder `file_read`; it does not accept a path, revision, or file bytes. Attached
-folders are read-only sources, so their reads carry no edit binding. It applies
-ordered exact replacements, including exact-anchor insertion and deletion,
-then commits the complete replacement as an internal artifact. Preparing the
+tool names an earlier session-folder `file_read` of the same run, by its
+`result_ref` or its path, and Daita uses the authenticated binding that read
+returned; the edit does not accept a binding, revision, or file bytes, and a
+reference to anything other than such a read is refused. Attached folders are
+read-only sources, so their reads carry no edit binding. It applies ordered
+exact replacements, including exact-anchor insertion and deletion (each
+replacement expects one occurrence unless `expected_occurrences` says
+otherwise), then commits the complete replacement as an internal artifact. Preparing the
 artifact never changes the local file.
 
 The final save derives its only target from that committed binding and asks
@@ -184,7 +187,7 @@ session folder. Discovery is bounded; a folder with more data files than the
 limit, or too slow to finish within the discovery budget, is cataloged up to it
 and its catalog sync is marked truncated. `catalog_search` finds files by name
 or column, and declared catalog links can join a file to a database table.
-Scheduled routines and graph jobs can read an attached folder they are granted.
+Scheduled routines and background jobs can read an attached folder in their scope.
 
 An attached folder answers only for its readable cataloged files. `file_search`
 and `file_read` reach them by root-relative path; `data_query` takes their

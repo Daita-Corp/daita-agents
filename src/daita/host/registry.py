@@ -20,7 +20,7 @@ from ..hosting.errors import (
     AgentModelConfigurationError,
     HostActiveError,
 )
-from ..jobs.graph.models import TERMINAL_GRAPH_STATES, GraphState
+from ..jobs.models import LIVE_JOB_STATES
 from ..observation import AgentEvent, AgentEventKind
 from ..routines import RoutineState
 from ..workspace import LocalFileAccess, LocalWorkspace, working_directory
@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     from ..security import KeychainStore
 
 _LOGGER = logging.getLogger("daita.host")
-_UNFINISHED_JOBS = frozenset(GraphState) - TERMINAL_GRAPH_STATES
 
 
 @dataclass(slots=True)
@@ -283,7 +282,7 @@ class AgentRegistry:
 async def _has_background_work(agent: Agent) -> bool:
     return bool(
         await agent.list_routines(states=frozenset({RoutineState.ACTIVE}), limit=1)
-        or await agent.list_jobs(states=_UNFINISHED_JOBS, limit=1)
+        or await agent.list_jobs(states=LIVE_JOB_STATES, limit=1)
         or await agent.list_deliveries(limit=1)
     )
 

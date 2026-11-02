@@ -22,7 +22,7 @@ from daita import (
     MCPServerInspection,
     MCPToolSelection,
 )
-from daita.capabilities import AccessMode, AutomationEligibility, OperationalEffect
+from daita.capabilities import AccessMode, OperationalEffect
 from daita.llm.models import ModelSensitivity
 from daita.security import SecretReference
 
@@ -404,15 +404,6 @@ class MCPToolAdmissionScreen(ModalScreen[MCPToolSelection | None]):
                     allow_blank=False,
                     id="mcp-tool-effect",
                 )
-                yield Label("Unattended eligibility (still requires a standing grant)")
-                yield Select(
-                    [(item.value, item.value) for item in AutomationEligibility],
-                    value=cast(
-                        AutomationEligibility, selected.automation_eligibility
-                    ).value,
-                    allow_blank=False,
-                    id="mcp-tool-eligibility",
-                )
                 yield Label("Result sensitivity")
                 yield Select(
                     [(item.value, item.value) for item in ModelSensitivity],
@@ -435,7 +426,7 @@ class MCPToolAdmissionScreen(ModalScreen[MCPToolSelection | None]):
                     id="mcp-tool-completion",
                 )
                 yield Static(
-                    "Direct results prove server-reported invocation only. Fix nested arguments in full in standing grants. Shell, infrastructure, arbitrary execution and asynchronous completion are unsupported.",
+                    "Direct results prove server-reported invocation only. Every action asks for approval when it runs. Shell, infrastructure, arbitrary execution and asynchronous completion are unsupported.",
                     markup=False,
                 )
             yield Static("", id="mcp-admission-error", markup=False)
@@ -457,7 +448,6 @@ class MCPToolAdmissionScreen(ModalScreen[MCPToolSelection | None]):
                     for name in (
                         "access",
                         "effect",
-                        "eligibility",
                         "result",
                         "outbound",
                         "completion",
@@ -472,9 +462,6 @@ class MCPToolAdmissionScreen(ModalScreen[MCPToolSelection | None]):
                         ).value,
                         access_mode=AccessMode(values["access"]),
                         operational_effect=OperationalEffect(values["effect"]),
-                        automation_eligibility=AutomationEligibility(
-                            values["eligibility"]
-                        ),
                         result_sensitivity=ModelSensitivity(values["result"]),
                         maximum_outbound_sensitivity=ModelSensitivity(
                             values["outbound"]

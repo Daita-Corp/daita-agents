@@ -71,8 +71,6 @@ from ...artifacts.store import AgentHomeArtifactStore
 from ...capabilities import (
     AccessMode,
     ArtifactPolicy,
-    AutomationEligibility,
-    AutomationScopeProposal,
     CallProvenance,
     Capability,
     CapabilityDeclarations,
@@ -108,7 +106,7 @@ from ...scope import (
     SourceScopeCatalog,
     resolve_effective_source_scope,
 )
-from .controller import DATA_EXPORT_TABULAR_CAPABILITY_ID
+from .controller import DATA_EXPORT_TABULAR_CAPABILITY_ID, TEXT_READ_CAPABILITY_ID
 from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
@@ -1113,7 +1111,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=DOCUMENT_CREATE_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         derives_call_provenance=True,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"text/markdown", "text/plain"}),
@@ -1222,7 +1219,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_CREATE_TABULAR_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         result_ref_arguments=("evidence_refs[]",),
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset(
@@ -1285,7 +1281,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=RESULT_SNAPSHOT_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         result_ref_arguments=("result_ref",),
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({RESULT_SNAPSHOT_MEDIA_TYPE}),
@@ -1324,7 +1319,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_LIST_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     artifact_read = Capability(
         id=ARTIFACT_READ_CAPABILITY_ID,
@@ -1366,7 +1360,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_READ_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     convert = Capability(
         id=ARTIFACT_CONVERT_CAPABILITY_ID,
@@ -1411,7 +1404,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_CONVERT_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"text/csv"}),
             allowed_authorships=frozenset({ArtifactAuthorship.EXACT_SOURCE_DATA}),
@@ -1425,23 +1417,26 @@ def artifact_capability_declarations(
     artifact_edit_text = Capability(
         id=ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
         description=(
-            "Apply one bounded ordered exact UTF-8 text replacement family to an "
-            "authenticated current-run file_read binding and commit the complete "
-            "result as an internal artifact without changing the local file. "
-            "Copy file_read data.binding verbatim; it is opaque and must never be "
-            "decoded, normalized, or reconstructed."
+            "Apply one bounded ordered exact UTF-8 text replacement family to a "
+            "file read earlier in this run with file_read, named by that result's "
+            "result_ref or by its path, and commit the complete result as an "
+            "internal artifact without changing the local file. "
+            "expected_occurrences defaults to 1."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "binding": {
+                "result_ref": {
                     "type": "string",
                     "minLength": 1,
-                    "maxLength": 8 * 1024,
-                    "description": (
-                        "The exact opaque file_read data.binding string copied "
-                        "verbatim without decoding, normalization, or reconstruction."
-                    ),
+                    "maxLength": 256,
+                    "description": "The file_read result, like r3.",
+                },
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                    "description": "Or the path of the latest file_read of the file.",
                 },
                 "replacements": {
                     "type": "array",
@@ -1465,16 +1460,12 @@ def artifact_capability_declarations(
                                 "maximum": MAX_TEXT_EDIT_OCCURRENCES,
                             },
                         },
-                        "required": [
-                            "old_text",
-                            "new_text",
-                            "expected_occurrences",
-                        ],
+                        "required": ["old_text", "new_text"],
                         "additionalProperties": False,
                     },
                 },
             },
-            "required": ["binding", "replacements"],
+            "required": ["replacements"],
             "additionalProperties": False,
         },
         output_kind=ARTIFACT_EDIT_TEXT_OUTPUT_KIND,
@@ -1503,7 +1494,6 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_EDIT_TEXT_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=TEXT_EDIT_MEDIA_TYPES,
             allowed_authorships=frozenset({ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS}),
@@ -1514,6 +1504,7 @@ def artifact_capability_declarations(
             max_total_bytes_per_call=MAX_TEXT_EDIT_BYTES,
         ),
         access_mode=AccessMode.READ,
+        result_ref_arguments=("result_ref",),
     )
     save = Capability(
         id=ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
@@ -1554,7 +1545,6 @@ def artifact_capability_declarations(
         executor_id=ARTIFACT_SAVE_LOCAL_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.CHANGE_INFRASTRUCTURE,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     set_location = Capability(
         id=ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
@@ -1579,7 +1569,6 @@ def artifact_capability_declarations(
         executor_id=ARTIFACT_SET_EXPORT_LOCATION_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.CHANGE_INFRASTRUCTURE,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     capabilities = (
         document,
@@ -1658,10 +1647,7 @@ def artifact_capability_declarations(
                 load_mode=ToolLoadMode.PINNED,
                 text_trust=ToolTextTrust.CODE,
                 summary="Read a bounded safe preview of one exact agent-owned artifact.",
-                when_to_use=(
-                    "Use with an exact known artifact ID, including one returned by "
-                    "job_read_results."
-                ),
+                when_to_use=("Use with an exact known artifact ID."),
                 keywords=("artifact", "read", "preview", "file"),
             ),
         ),
@@ -1677,7 +1663,7 @@ def artifact_capability_declarations(
                         text_trust=ToolTextTrust.CODE,
                         summary="Prepare a bounded exact UTF-8 local-file edit artifact.",
                         when_to_use=(
-                            "Use only with an authenticated binding returned by file_read; "
+                            "Use only on a file read with file_read in this run; "
                             "then use artifact_save_local in replace_bound_file mode."
                         ),
                         keywords=("artifact", "edit", "text", "replace", "workspace"),
@@ -1993,12 +1979,19 @@ class ArtifactCapabilityDomain:
                     "workspace_unavailable",
                     "Local text editing is unavailable for this run.",
                 )
-            token = arguments.get("binding")
-            if not isinstance(token, str):
-                raise CapabilityInputError(
-                    "artifact_edit_binding_invalid",
-                    "Text editing requires an authenticated current-run file binding.",
-                )
+            token = await self._read_binding(run, arguments)
+            arguments = FrozenJsonObject.from_mapping(
+                {
+                    **arguments.to_dict(),
+                    "binding": token,
+                    "replacements": [
+                        {"expected_occurrences": 1, **item}
+                        for item in cast(
+                            tuple[Mapping[str, object], ...], arguments["replacements"]
+                        )
+                    ],
+                }
+            )
             try:
                 binding = self._workspace.authenticate_file_binding(
                     run_id=run.id,
@@ -2369,6 +2362,41 @@ class ArtifactCapabilityDomain:
             )
         return tuple(validated)
 
+    async def _read_binding(
+        self, run: RunInput, arguments: Mapping[str, object]
+    ) -> str:
+        """Return the binding of the earlier file_read the edit names."""
+
+        call_id, path = arguments.get("result_ref"), arguments.get("path")
+        if (call_id is None) == (path is None):
+            raise CapabilityInputError(
+                "artifact_edit_binding_invalid",
+                "Name the earlier file_read by result_ref or by path, not both.",
+            )
+        transcript = await self._transcripts.load(run.id)
+        bindings = [
+            data["binding"]
+            for message in transcript.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock)
+            and not block.is_error
+            and block.capability_id == TEXT_READ_CAPABILITY_ID
+            and isinstance(data := block.output.get("data"), Mapping)
+            and isinstance(data.get("binding"), str)
+            and (
+                block.call_id == call_id
+                if call_id is not None
+                else path in (data.get("path"), data.get("qualified_path"))
+            )
+        ]
+        if not bindings:
+            raise CapabilityInputError(
+                "artifact_edit_binding_invalid",
+                "No editable file_read of that file exists in this run; read it "
+                "with file_read first.",
+            )
+        return cast(str, bindings[-1])
+
     async def _prepare_result_snapshot(
         self,
         run: RunInput,
@@ -2540,18 +2568,6 @@ class ArtifactCapabilityDomain:
                 continue
             valid.append(call_id)
         return CallProvenance(tuple(valid))
-
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject:
-        raise CapabilityInputError(
-            "automation_grant_unsupported",
-            "This domain does not admit unattended external effects.",
-        )
 
     async def side_effect_plan(
         self,
@@ -3131,7 +3147,6 @@ def _tabular_export_capability(
         },
         executor_id=DATA_EXPORT_TABULAR_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset(
                 {

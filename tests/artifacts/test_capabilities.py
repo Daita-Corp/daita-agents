@@ -16,7 +16,7 @@ import daita.domains.data.controller as data_controller
 from daita import Agent, ApprovalDecision, ApprovalRequest, ArtifactError
 from daita._json import FrozenJsonObject
 from daita.artifacts.models import ArtifactRef
-from daita.capabilities import AccessMode, AutomationEligibility, OperationalEffect
+from daita.capabilities import AccessMode, OperationalEffect
 from daita.context import AgentContextBuilder
 from daita.domains.data.export_capabilities import (
     ARTIFACT_CONVERT_CAPABILITY_ID,
@@ -190,35 +190,25 @@ def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -
         assert schema["additionalProperties"] is False
 
 
-def test_d2_certifies_only_the_three_accepted_scheduled_artifact_capabilities() -> None:
+def test_artifact_and_export_capabilities_declare_their_access_and_no_effect() -> None:
     declarations = artifact_capability_declarations()
     data_declarations = exact_export_capability_declarations(
         adapter_ids=("sqlite", "postgresql")
     )
     capabilities = (*declarations.capabilities, *data_declarations.capabilities)
     by_id = {capability.id: capability for capability in capabilities}
-    scheduled = {
-        capability.id
-        for capability in capabilities
-        if capability.automation_eligibility is AutomationEligibility.AUTOMATION_DIRECT
-    }
 
-    assert scheduled == {
-        DOCUMENT_CREATE_CAPABILITY_ID,
-        RESULT_SNAPSHOT_CAPABILITY_ID,
-        DATA_EXPORT_TABULAR_CAPABILITY_ID,
-    }
     assert by_id[DATA_EXPORT_TABULAR_CAPABILITY_ID].access_mode is AccessMode.READ
-    assert (
-        by_id[ARTIFACT_CREATE_TABULAR_CAPABILITY_ID].automation_eligibility
-        is AutomationEligibility.INTERACTIVE_ONLY
-    )
     assert by_id[ARTIFACT_CREATE_TABULAR_CAPABILITY_ID].access_mode is AccessMode.NONE
     assert by_id[DOCUMENT_CREATE_CAPABILITY_ID].access_mode is AccessMode.NONE
     assert by_id[RESULT_SNAPSHOT_CAPABILITY_ID].access_mode is AccessMode.NONE
     assert all(
         by_id[capability_id].operational_effect is OperationalEffect.NONE
-        for capability_id in scheduled
+        for capability_id in (
+            DOCUMENT_CREATE_CAPABILITY_ID,
+            RESULT_SNAPSHOT_CAPABILITY_ID,
+            DATA_EXPORT_TABULAR_CAPABILITY_ID,
+        )
     )
 
 
@@ -667,7 +657,7 @@ def test_artifact_save_local_schema_rejects_bytes_paths_commands_and_overwrite()
     }
 
 
-def test_artifact_edit_binding_contract_requires_verbatim_opaque_reuse() -> None:
+def test_artifact_edit_names_its_read_instead_of_copying_a_binding() -> None:
     declarations = artifact_capability_declarations(include_local_edit=True)
     view = next(
         item
@@ -679,12 +669,9 @@ def test_artifact_edit_binding_contract_requires_verbatim_opaque_reuse() -> None
     )
     properties = capability.input_schema.get("properties")
     assert isinstance(properties, Mapping)
-    binding = properties.get("binding")
-    assert isinstance(binding, Mapping)
-    contract = f"{capability.description} {binding.get('description')}".casefold()
-    assert "verbatim" in contract
-    assert "opaque" in contract
-    assert "never be decoded" in contract
+    assert "binding" not in properties
+    assert {"result_ref", "path"} <= set(properties)
+    assert capability.result_ref_arguments == ("result_ref",)
 
 
 def test_artifact_set_export_location_schema_accepts_only_one_destination_id() -> None:

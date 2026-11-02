@@ -11,35 +11,20 @@ from typing import Any
 
 import pytest
 
-from daita import (
-    ApprovalDecision,
-    ApprovalRequest,
-    CalendarDaySelector,
-    CalendarSchedule,
-    EffectRequirement,
-    MisfirePolicy,
-    ReportingMode,
-    RequestedCapabilityGrant,
-    ScheduledRoutineDraft,
-)
+from daita import ApprovalDecision, ApprovalRequest
 from daita._json import FrozenJsonObject, canonical_json
-from daita.capabilities import CapabilityInputError, EffectEvidenceBasis
 from daita.catalog.models import Sensitivity
 from daita.llm import factory
 from daita.llm.models import (
     MessageRole,
-    ModelSensitivity,
     ModelStreamCompleted,
     TextBlock,
 )
 from daita.loop.models import LoopExitKind
 from daita.routines.capabilities import ROUTINE_CREATE_CAPABILITY_ID
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.native_writes import create_fixture, response
 from tests.support.postgresql_live_harness import (
     AUTHORIZATION,
-    EXPIRES,
-    FIXTURE_SENSITIVITY,
     KEY_ENV,
     LIMITS,
     MODEL_ENV,
@@ -58,204 +43,44 @@ from tests.support.postgresql_live_harness import (
 from tests.support.postgresql_write_release import DriverProbe, WriteModel
 
 
-@pytest.mark.parametrize(
-    "broaden,operation,prerequisite",
-    [
-        (False, "upsert", "matching"),
-        (True, "upsert", "matching"),
-        (False, "upsert", "omitted"),
-        (False, "upsert", "wrong"),
-        (False, "update", "matching"),
-        (False, "update", "omitted"),
-        (False, "update", "wrong"),
-    ],
-)
-async def test_native_routine_fixture_ceiling_must_fit_internal_target(
-    tmp_path, monkeypatch, broaden, operation, prerequisite
+async def test_owner_admitted_routine_fixture_saves_the_owner_intent(
+    tmp_path, monkeypatch
 ):
-    ceiling = ModelSensitivity.RESTRICTED if broaden else FIXTURE_SENSITIVITY
-    cost = LIMITS.max_estimated_cost_usd
-    assert cost is not None
+    from daita.routines.models import CalendarSchedule
+    from tests.support.postgresql_model_write import admit_owner_routine
+
     fixture = await create_fixture(
         tmp_path, monkeypatch, sensitivity=Sensitivity.INTERNAL
     )
-    agent, provider, db, _, binding, resource, constraints, batch, clock, _ = fixture
+    agent, provider, db, _, _, _, _, batch, clock, _ = fixture
     try:
-        if operation == "update":
-            constraints = {
-                **constraints,
-                "allowed_operations": ("update",),
-                "key_columns": ("id",),
-                "allowed_insert_columns": (),
-                "generated_identity_columns": (),
-            }
-            permission = await agent.preview_source_permissions(
-                source_id=batch["source_id"],
-                read_mode="all",
-                read_resource_ids=(),
-                relational_write_scopes={resource.id: constraints},
-            )
-            await agent.apply_source_permissions(
-                source_id=batch["source_id"],
-                confirmation_fingerprint=permission.confirmation_fingerprint,
-            )
-        await agent.revoke_mcp_server(binding.binding_id)
-        provider.replace_script(
-            (response(text="Prepare the owner-authorized native routine."),)
+        # Exercise the independent live-stage setup without starting its host.
+        await agent._embedded._routine_supervisor.close()
+        scenario = Evaluation(
+            SimpleNamespace(agent=agent),
+            SimpleNamespace(limits=LIMITS),
+            [],
+            2,
+            setup_mode="owner_admitted_routine",
         )
-        origin = await agent.run(
-            "Authorize an immediate and weekly native upsert of the fixture company."
-        )
-        destination = (
-            await agent.distribution_destinations(
-                origin.conversation_id, sensitivity_ceiling=ceiling
-            )
-        )[0]
-        grant = {
-            "source_id": batch["source_id"],
-            "resource_id": resource.id,
-            "resource_revision": resource.current_revision,
-            **{
-                key: value
-                for key, value in constraints.items()
-                if key != "allowed_operations"
-            },
-        }
-        draft = ScheduledRoutineDraft(
-            origin_run_id=origin.run_id,
-            title="Fixture native upsert",
-            authorized_instruction="Preview and upsert the owner-supplied cited company once per occurrence; preserve omitted columns. Report exact receipt evidence.",
-            schedule=CalendarSchedule(
-                timezone="America/Chicago",
-                hour=9,
-                minute=0,
-                day_selector=CalendarDaySelector.WEEKDAYS,
-                weekdays=(1,),
-            ),
-            misfire_policy=MisfirePolicy.LATEST_ONLY,
-            reporting_mode=ReportingMode.ALWAYS,
-            precheck=None,
-            allowed_source_ids=(batch["source_id"],),
-            allowed_resource_ids=(resource.id,),
-            allowed_connector_binding_ids=(),
-            allowed_capability_ids=("data.preview_upsert_rows", "data.upsert_rows"),
-            sensitivity_ceiling=ceiling,
-            outcome_contract=replace(
-                no_artifact_outcome_contract(ceiling),
-                require_exact_source_bindings=True,
-                effect_requirements=(
-                    EffectRequirement(
-                        "data.upsert_rows",
-                        1,
-                        frozenset({EffectEvidenceBasis.ADAPTER_VERIFIED}),
-                    ),
-                ),
-            ),
-            distribution_destination_id=destination.destination_id,
-            eligible_model_routes=(provider.provider_id,),
-            per_run_max_tokens=LIMITS.max_total_tokens,
-            per_run_max_cost_usd=cost,
-            cumulative_max_tokens=2 * LIMITS.max_total_tokens,
-            cumulative_max_cost_usd=2 * cost,
-            cumulative_max_attempts=2,
-            cumulative_max_occurrences=2,
-            maximum_consecutive_failures=1,
-            expires_at=EXPIRES,
-            run_immediately=True,
-            requested_capability_grants=(
-                RequestedCapabilityGrant(
-                    "data.upsert_rows", FrozenJsonObject.from_mapping(grant), 1
-                ),
-            ),
-        )
-        write = f"data.{operation}_rows"
-        preview_operation = "update" if operation == "upsert" else "upsert"
-        preview = f"data.preview_{operation if prerequisite == 'matching' else preview_operation}_rows"
-        draft = replace(
-            draft,
-            allowed_capability_ids=(
-                (write,) if prerequisite == "omitted" else (preview, write)
-            ),
-            requested_capability_grants=(
-                RequestedCapabilityGrant(
-                    write, FrozenJsonObject.from_mapping(grant), 1
-                ),
-            ),
-            outcome_contract=replace(
-                draft.outcome_contract,
-                effect_requirements=(
-                    EffectRequirement(
-                        write, 1, frozenset({EffectEvidenceBasis.ADAPTER_VERIFIED})
-                    ),
-                ),
-            ),
-        )
-        if prerequisite != "matching":
-            before = list(db.log)
-            with pytest.raises(CapabilityInputError) as failure:
-                await agent.propose_routine(draft)
-            assert failure.value.code == "automation_grant_preview_required"
-            assert f"data.preview_{operation}_rows" in str(failure.value)
-            assert db.log == before
-            assert not await agent.list_routines() and not await agent.list_effects()
-            assert not fixture[-1]
-            return
-        if broaden:
-            with pytest.raises(CapabilityInputError) as failure:
-                await agent.propose_routine(draft)
-            assert failure.value.code == "write_sensitivity_denied"
-        else:
-            proposal = await agent.propose_routine(draft)
-            assert proposal.sensitivity_ceiling is FIXTURE_SENSITIVITY
-            assert len(proposal.capability_grants) == 1
-        assert not await agent.list_routines() and not await agent.list_effects()
-        assert not db.rows and len(provider.requests) == 1
-        if not broaden and operation == "upsert":
-            from daita.routines.owner import _routine_proposal_payload
-            from tests.support.postgresql_model_write import admit_owner_routine
-
-            # Exercise the independent live-stage setup without starting its host.
-            await agent._embedded._routine_supervisor.close()
-            scenario = Evaluation(
-                SimpleNamespace(agent=agent),
-                SimpleNamespace(limits=LIMITS),
-                [],
-                2,
-                setup_mode="owner_admitted_routine",
-            )
-            scenario.routine_contract = _routine_proposal_payload(proposal)
-            scenario.routine_grant = grant
-            clock[0] = scenario.clock
-            routine = await admit_owner_routine(
-                scenario, "Owner authorizes the bounded fixture."
-            )
-            assert routine.run_immediately is True
-            assert routine.allowed_resource_ids == (resource.id,)
-            assert routine.capability_grants == proposal.capability_grants
-            assert (
-                routine.per_run_max_tokens
-                == scenario.routine_budgets["per_run_max_tokens"]
-            )
-            assert routine.cumulative_max_cost_usd == 2 * cost
-            assert set(routine.allowed_capability_ids) == {
-                "data.preview_upsert_rows",
-                "data.upsert_rows",
-            }
-            scenario.profile = "user_flow"
-            natural = await admit_owner_routine(
-                scenario, "Keep this company current now and each Monday."
-            )
-            assert set(natural.allowed_capability_ids) == {
-                "catalog.describe",
-                "data.preview_upsert_rows",
-                "data.upsert_rows",
-            }
-            assert natural.allowed_source_ids == routine.allowed_source_ids
-            assert natural.allowed_resource_ids == routine.allowed_resource_ids
-            assert natural.capability_grants == routine.capability_grants
-            assert "catalog_describe" not in natural.authorized_instruction
-            assert "preview_fingerprint" not in natural.authorized_instruction
-            assert len(provider.requests) == 1 and not await agent.list_effects()
+        clock[0] = scenario.clock
+        requests = len(provider.requests)
+        routine = await admit_owner_routine(scenario, batch["source_id"])
+        assert routine.source_ids == (batch["source_id"],)
+        assert isinstance(routine.schedule, CalendarSchedule)
+        assert routine.schedule.weekdays == (1,) and routine.schedule.hour == 9
+        assert scenario.conversation_id == routine.conversation_id
+        inspection = await agent.inspect_routine(routine.routine_id)
+        assert inspection is not None
+        # One immediate occurrence is claimed at creation.
+        assert len(inspection.recent_occurrences) == 1
+        scenario.profile = "user_flow"
+        natural = await admit_owner_routine(scenario, batch["source_id"])
+        assert natural.source_ids == routine.source_ids
+        assert "catalog_describe" not in natural.authorized_instruction
+        assert "preview_fingerprint" not in natural.authorized_instruction
+        assert len(provider.requests) == requests and not await agent.list_effects()
+        assert not db.rows
     finally:
         await agent.close()
 
@@ -306,15 +131,7 @@ def test_diagnostic_limits_are_explicit_and_do_not_replace_strict_defaults(monke
         LIMITS, max_total_tokens=50_000, max_estimated_cost_usd=Decimal("0.25")
     )
     config = live_config("openai:gpt-5.6-terra", limits=limits)
-    scenario = Evaluation(None, config, [], 3)
-    assert scenario.routine_budgets == {
-        "per_run_max_tokens": 50000,
-        "per_run_max_cost_usd": "0.25",
-        "cumulative_max_tokens": 100000,
-        "cumulative_max_cost_usd": "0.50",
-        "cumulative_max_attempts": 2,
-        "cumulative_max_occurrences": 2,
-    }
+    assert config.limits == limits
     assert live_config("openai:gpt-5.6-terra").limits == LIMITS
     with pytest.raises(ValueError, match="finite cost cap"):
         live_config(
@@ -376,7 +193,7 @@ async def test_exact_write_approval_fails_closed(tamper):
         ]
     )
     assert scenario.expected_write is not None
-    args = {**scenario.expected_write, "preview_fingerprint": "sha256:" + "a" * 64}
+    args = dict(scenario.expected_write)
     if tamper == "resource":
         args["resource_id"] = "other"
     elif tamper == "value":
@@ -463,7 +280,6 @@ async def test_update_approval_distinguishes_identity_from_a_positive_wrong_matc
                         {"column": column, "operator": "eq", "value": value}
                         for column, value in where
                     ],
-                    "preview_fingerprint": "sha256:" + "a" * 64,
                 },
                 "target": {"source_id": "source", "resource_id": "table"},
                 "preview": {
@@ -486,67 +302,38 @@ async def test_update_approval_distinguishes_identity_from_a_positive_wrong_matc
     )
 
 
-@pytest.mark.parametrize(
-    "tamper", ["key", "row_limit", "effect_proof", "source", "budget", "capability"]
-)
+@pytest.mark.parametrize("tamper", ["title", "schedule", "prompt", "sources"])
 @pytest.mark.parametrize("profile", ["strict", "user_flow"])
-async def test_routine_approval_checks_grant_and_validated_proposal(tamper, profile):
+async def test_routine_approval_checks_the_exact_confirmation_card(tamper, profile):
     scenario = Evaluation(None, None, [], 3, profile=profile)
-    scenario.routine_grant = {"key_columns": ["domain"], "max_rows": 1}
     scenario.routine_contract = {
-        "allowed_source_ids": ["source"],
-        "allowed_capability_ids": ["data.preview_upsert_rows", "data.upsert_rows"],
-        "per_run_max_cost_usd": "0.15",
-        "outcome_contract": {"effect_requirements": ["adapter_verified"]},
+        "title": "Company finding",
+        "schedule": "Now, then calendar on Mon at 09:00 America/Chicago",
+        "sources": ["companies"],
     }
-    assert scenario.routine_contract is not None
-    assert scenario.routine_grant is not None
-    proposal: dict[str, Any] = {
+    card: dict[str, Any] = {
         **scenario.routine_contract,
-        "capability_grants": [
-            {
-                "capability_id": "data.upsert_rows",
-                "max_calls_per_occurrence": 1,
-                "constraints": dict(scenario.routine_grant),
-            }
-        ],
+        "prompt": "Keep company new.test current.",
     }
-    if profile == "user_flow":
-        proposal["allowed_capability_ids"] = [
-            "catalog.describe",
-            "data.preview_upsert_rows",
-            "data.upsert_rows",
-        ]
     valid = ApprovalRequest(
         "run",
         "call",
         "routine_save",
         ROUTINE_CREATE_CAPABILITY_ID,
-        FrozenJsonObject.from_mapping({"proposal": proposal}),
-        "Exact proposal",
+        FrozenJsonObject.from_mapping(card),
+        "Save this routine?",
     )
     assert scenario.routine_is_exact(valid)
-    if tamper == "key":
-        proposal["capability_grants"][0]["constraints"]["key_columns"] = ["id"]
-    elif tamper == "row_limit":
-        proposal["capability_grants"][0]["constraints"]["max_rows"] = 2
-    elif tamper == "effect_proof":
-        proposal["outcome_contract"] = {"effect_requirements": []}
-    elif tamper == "source":
-        proposal["allowed_source_ids"] = ["other"]
-    elif tamper == "budget":
-        proposal["per_run_max_cost_usd"] = "0.16"
+    if tamper == "prompt":
+        # The prompt is the model's to write; only named card values are checked.
+        card["prompt"] = "Something else."
     else:
-        proposal["allowed_capability_ids"] = [
-            "data.preview_upsert_rows",
-            "data.upsert_rows",
-            "data.update_rows",
-        ]
-    changed = replace(
-        valid, arguments=FrozenJsonObject.from_mapping({"proposal": proposal})
-    )
-    assert await scenario.approve(changed) is ApprovalDecision.DENY
-    assert await scenario.approve(valid) is ApprovalDecision.APPROVE
+        card[tamper] = ["other"] if tamper == "sources" else f"changed {card[tamper]}"
+    changed = replace(valid, arguments=FrozenJsonObject.from_mapping(card))
+    expected = ApprovalDecision.APPROVE if tamper == "prompt" else ApprovalDecision.DENY
+    assert await scenario.approve(changed) is expected
+    if expected is ApprovalDecision.DENY:
+        assert await scenario.approve(valid) is ApprovalDecision.APPROVE
 
 
 @pytest.mark.parametrize(
@@ -840,7 +627,6 @@ async def test_user_flow_update_oracle_preserves_exact_guarded_identity(case):
     args = {
         **scenario.expected_write,
         "where": where,
-        "preview_fingerprint": "sha256:" + "a" * 64,
     }
     review: dict[str, Any] = {
         "arguments": args,

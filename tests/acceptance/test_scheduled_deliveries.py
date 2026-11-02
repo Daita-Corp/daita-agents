@@ -17,14 +17,10 @@ import pytest
 
 from daita import (
     Agent,
-    ArtifactRequirement,
     FolderSource,
     IntervalSchedule,
     MCPToolSelection,
-    MisfirePolicy,
-    OutcomeContract,
-    ReportingMode,
-    ScheduledRoutineDraft,
+    RoutineIntent,
     SQLiteSource,
 )
 from daita.adapters import (
@@ -61,25 +57,19 @@ from daita.catalog.models import (
     catalog_resource_id,
 )
 from daita.distribution import OutcomeState
-from daita.domains.data import DATA_QUERY_CAPABILITY_ID
 from daita.domains.data.export_capabilities import (
     ARTIFACT_CREATE_TOOL_NAME,
-    DATA_EXPORT_TABULAR_CAPABILITY_ID,
-    DOCUMENT_CREATE_CAPABILITY_ID,
-    RESULT_SNAPSHOT_CAPABILITY_ID,
 )
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
     ModelResponse,
-    ModelSensitivity,
     ModelUsage,
     ToolCall,
     ToolResultBlock,
 )
 from daita.llm.pricing import CostEstimate
 from daita.routines import RoutineOccurrenceDisposition
-from daita.routines.owner import RoutineError
 from daita.storage.home_migrations import CURRENT_HOME_REVISION
 from tests.support.home_revisions import undo_revision_4_schema
 from tests.support.mcp import (
@@ -119,68 +109,19 @@ def _tools(*calls: ToolCall) -> ModelResponse:
     )
 
 
-def _artifact_contract(
-    *,
-    media_type: str,
-    authorship: ArtifactAuthorship,
-    producer_capability_id: str,
-    exact_source: bool,
-) -> OutcomeContract:
-    requirement = ArtifactRequirement(
-        required=True,
-        minimum_count=1,
-        maximum_count=1,
-        allowed_media_types=(media_type,),
-        allowed_authorships=(authorship,),
-        allowed_producer_capability_ids=(producer_capability_id,),
-        maximum_artifact_bytes=8 * 1024 * 1024,
-        maximum_total_bytes=8 * 1024 * 1024,
-        maximum_sensitivity=ModelSensitivity.INTERNAL,
-    )
-    return OutcomeContract(
-        require_terminal_conclusion=True,
-        artifact_requirements=(requirement,),
-        maximum_total_artifact_bytes=8 * 1024 * 1024,
-        maximum_effective_sensitivity=ModelSensitivity.INTERNAL,
-        require_current_run_provenance=True,
-        require_exact_source_bindings=exact_source,
-    )
-
-
-def _text_contract() -> OutcomeContract:
-    return OutcomeContract(
-        require_terminal_conclusion=True,
-        artifact_requirements=(),
-        maximum_total_artifact_bytes=0,
-        maximum_effective_sensitivity=ModelSensitivity.INTERNAL,
-        require_current_run_provenance=True,
-        require_exact_source_bindings=False,
-    )
-
-
 async def _run_routine(
     agent: Agent,
     provider: ToolboxAwareMockModelProvider,
     *,
-    origin_run_id: str,
     conversation_id: str,
     source_ids: tuple[str, ...],
-    connector_binding_ids: tuple[str, ...],
-    resource_ids: tuple[str, ...],
-    capability_ids: tuple[str, ...],
-    outcome_contract: OutcomeContract,
     script: tuple[ModelResponse, ...],
 ):
     created = await _create_routine(
         agent,
         provider,
-        origin_run_id=origin_run_id,
         conversation_id=conversation_id,
         source_ids=source_ids,
-        connector_binding_ids=connector_binding_ids,
-        resource_ids=resource_ids,
-        capability_ids=capability_ids,
-        outcome_contract=outcome_contract,
         script=script,
     )
     await agent.run_routine_now(
@@ -202,46 +143,34 @@ async def _create_routine(
     agent: Agent,
     provider: ToolboxAwareMockModelProvider,
     *,
-    origin_run_id: str,
     conversation_id: str,
     source_ids: tuple[str, ...],
-    connector_binding_ids: tuple[str, ...],
-    resource_ids: tuple[str, ...],
-    capability_ids: tuple[str, ...],
-    outcome_contract: OutcomeContract,
     script: tuple[ModelResponse, ...],
 ):
-    (destination,) = await agent.distribution_destinations(
-        conversation_id,
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
-    )
     provider.replace_script(script)
-    draft = ScheduledRoutineDraft(
-        origin_run_id=origin_run_id,
-        title="D2 deterministic walking scenario",
-        authorized_instruction="Produce the exact frozen scheduled outcome.",
-        schedule=IntervalSchedule(3_600, NOW + timedelta(hours=1)),
-        misfire_policy=MisfirePolicy.LATEST_ONLY,
-        reporting_mode=ReportingMode.ALWAYS,
-        precheck=None,
-        allowed_source_ids=source_ids,
-        allowed_connector_binding_ids=connector_binding_ids,
-        allowed_resource_ids=resource_ids,
-        allowed_capability_ids=capability_ids,
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
-        outcome_contract=outcome_contract,
-        distribution_destination_id=destination.destination_id,
-        eligible_model_routes=(provider.provider_id,),
-        per_run_max_tokens=2_000,
-        per_run_max_cost_usd=Decimal("1"),
-        cumulative_max_tokens=20_000,
-        cumulative_max_cost_usd=Decimal("10"),
-        cumulative_max_attempts=10,
-        cumulative_max_occurrences=10,
-        maximum_consecutive_failures=3,
-        expires_at=NOW + timedelta(days=30),
+    return await agent.create_routine(
+        RoutineIntent(
+            title="D2 deterministic walking scenario",
+            prompt="Produce the scheduled outcome.",
+            schedule=IntervalSchedule(3_600, NOW + timedelta(hours=1)),
+            sources=source_ids,
+        ),
+        conversation_id=conversation_id,
     )
-    return await agent.create_routine(await agent.propose_routine(draft))
+
+
+def _released_routine(fields: dict[str, object]) -> None:
+    fields["allowed_source_ids"] = fields.pop("source_ids")
+
+
+def _released_occurrence(fields: dict[str, object]) -> None:
+    fields.update(
+        precheck_observation=None,
+        reserved_tokens=0,
+        reserved_cost_usd="0",
+        execution_scope=None,
+        execution_scope_digest=None,
+    )
 
 
 async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen(
@@ -273,18 +202,8 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
         delivery = await _run_routine(
             agent,
             provider,
-            origin_run_id=origin.run_id,
             conversation_id=origin.conversation_id,
             source_ids=(source.id,),
-            connector_binding_ids=(),
-            resource_ids=(resource.id,),
-            capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
-            outcome_contract=_artifact_contract(
-                media_type="text/csv",
-                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                producer_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
-                exact_source=True,
-            ),
             script=(
                 _tools(
                     ToolCall(
@@ -359,6 +278,23 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
                         row_key,
                     ),
                 )
+        # Restore the released routine fields the revision-4 rewrite reads.
+        for table, key, restore in (
+            ("scheduled_routines", "routine_id", _released_routine),
+            ("routine_occurrences", "occurrence_id", _released_occurrence),
+        ):
+            for row_key, encoded in connection.execute(
+                f"SELECT {key}, data FROM {table}"  # noqa: S608
+            ).fetchall():
+                record = json.loads(encoded)
+                restore(record["fields"])
+                connection.execute(
+                    f"UPDATE {table} SET data = ? WHERE {key} = ?",  # noqa: S608
+                    (
+                        json.dumps(record, sort_keys=True, separators=(",", ":")),
+                        row_key,
+                    ),
+                )
         undo_revision_4_schema(connection)
         connection.execute("DROP TABLE artifacts")
         connection.execute("DELETE FROM agent_home_migrations WHERE revision >= 3")
@@ -381,14 +317,17 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
         await migrated.close()
 
 
-async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
+async def test_scheduled_sqlite_export_rejects_a_source_the_routine_did_not_name(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "walking-resource-scope.sqlite"
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE allowed_value (value INTEGER NOT NULL)")
-        connection.execute("CREATE TABLE outside_value (value INTEGER NOT NULL)")
         connection.execute("INSERT INTO allowed_value VALUES (7)")
+    # A routine's scope is the sources it names; another readable source is outside.
+    outside_database = tmp_path / "walking-outside-scope.sqlite"
+    with sqlite3.connect(outside_database) as connection:
+        connection.execute("CREATE TABLE outside_value (value INTEGER NOT NULL)")
         connection.execute("INSERT INTO outside_value VALUES (99)")
 
     provider = ToolboxAwareMockModelProvider(
@@ -406,34 +345,26 @@ async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
     )
     try:
         source = await agent.attach(SQLiteSource(database))
+        outside = await agent.attach(SQLiteSource(outside_database))
         resources = {
             resource.name: resource
-            for resource in await agent.list_catalog_resources(source_id=source.id)
+            for source_id in (source.id, outside.id)
+            for resource in await agent.list_catalog_resources(source_id=source_id)
         }
         origin = await agent.run("Authorize only the allowed table for scheduling.")
         assert origin.conversation_id is not None
         delivery = await _run_routine(
             agent,
             provider,
-            origin_run_id=origin.run_id,
             conversation_id=origin.conversation_id,
             source_ids=(source.id,),
-            connector_binding_ids=(),
-            resource_ids=(resources["allowed_value"].id,),
-            capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
-            outcome_contract=_artifact_contract(
-                media_type="text/csv",
-                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                producer_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
-                exact_source=True,
-            ),
             script=(
                 _tools(
                     ToolCall(
                         id="outside-export",
                         name="data_query",
                         arguments={
-                            "source_id": source.id,
+                            "source_id": outside.id,
                             "resource_ids": (resources["outside_value"].id,),
                             "sql": "SELECT value FROM outside_value",
                             "output": "csv",
@@ -443,7 +374,7 @@ async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
                 _stop("The out-of-scope export was rejected."),
             ),
         )
-        assert delivery.failure_code == "outcome_artifact_contract_failed"
+        assert delivery.failure_code is None
         assert delivery.artifact_references == ()
         assert delivery.resulting_run_id is not None
         transcript = await agent.transcript(delivery.resulting_run_id)
@@ -456,7 +387,7 @@ async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
         assert block.is_error is True
         error = block.output.get("error")
         assert isinstance(error, Mapping)
-        assert error.get("code") == "execution_scope_resource_violation"
+        assert error.get("code") == "source_scope_violation"
     finally:
         await agent.close()
 
@@ -506,18 +437,8 @@ async def test_restart_after_artifact_and_terminal_commit_does_not_repeat_work(
         created = await _create_routine(
             agent,
             provider,
-            origin_run_id=origin.run_id,
             conversation_id=origin.conversation_id,
             source_ids=(source.id,),
-            connector_binding_ids=(),
-            resource_ids=(resource.id,),
-            capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
-            outcome_contract=_artifact_contract(
-                media_type="text/csv",
-                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                producer_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
-                exact_source=True,
-            ),
             script=(
                 _tools(
                     ToolCall(
@@ -809,18 +730,8 @@ async def test_scheduled_postgresql_xlsx_uses_the_same_inbox_path(
         delivery = await _run_routine(
             agent,
             provider,
-            origin_run_id=origin.run_id,
             conversation_id=origin.conversation_id,
             source_ids=(source.id,),
-            connector_binding_ids=(),
-            resource_ids=(resource.id,),
-            capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
-            outcome_contract=_artifact_contract(
-                media_type=XLSX_MEDIA_TYPE,
-                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                producer_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
-                exact_source=True,
-            ),
             script=(
                 _tools(
                     ToolCall(
@@ -895,18 +806,8 @@ async def test_scheduled_mcp_result_snapshot_uses_the_same_inbox_path(
         delivery = await _run_routine(
             agent,
             provider,
-            origin_run_id=origin.run_id,
             conversation_id=origin.conversation_id,
             source_ids=(),
-            connector_binding_ids=(status.binding.binding_id,),
-            resource_ids=(),
-            capability_ids=(tool.capability_id, RESULT_SNAPSHOT_CAPABILITY_ID),
-            outcome_contract=_artifact_contract(
-                media_type="application/json",
-                authorship=ArtifactAuthorship.VALIDATED_TOOL_RESULT,
-                producer_capability_id=RESULT_SNAPSHOT_CAPABILITY_ID,
-                exact_source=False,
-            ),
             script=(
                 _tools(
                     ToolCall(
@@ -1049,190 +950,6 @@ async def test_schema_less_mcp_result_cannot_be_snapshotted(
     assert schema_less.calls == [("lookup", {"query": "current"})]
 
 
-@pytest.mark.parametrize(
-    ("script", "committed_artifact_count"),
-    [
-        ((_stop("No required document was created."),), 0),
-        (
-            (
-                _tools(
-                    ToolCall(
-                        id="document-one",
-                        name=ARTIFACT_CREATE_TOOL_NAME,
-                        arguments={
-                            "from": "document",
-                            "format": "txt",
-                            "content": "one",
-                        },
-                    ),
-                    ToolCall(
-                        id="document-two",
-                        name=ARTIFACT_CREATE_TOOL_NAME,
-                        arguments={
-                            "from": "document",
-                            "format": "txt",
-                            "content": "two",
-                        },
-                    ),
-                ),
-                _stop("Two documents were created."),
-            ),
-            2,
-        ),
-    ],
-    ids=("missing", "multiple"),
-)
-async def test_required_artifact_cardinality_failure_is_one_failed_delivery(
-    tmp_path: Path,
-    script: tuple[ModelResponse, ...],
-    committed_artifact_count: int,
-) -> None:
-    database = tmp_path / "artifact-cardinality.sqlite"
-    with sqlite3.connect(database) as connection:
-        connection.execute("CREATE TABLE current_value (value INTEGER NOT NULL)")
-        connection.execute("INSERT INTO current_value VALUES (7)")
-    provider = ToolboxAwareMockModelProvider(
-        (_stop("Foreground authorization complete."),),
-        provider_id=f"mock:d2-artifact-cardinality-{committed_artifact_count}",
-        complete_pricing=True,
-    )
-    agent = await Agent.create(
-        f"d2-artifact-cardinality-{committed_artifact_count}",
-        root=tmp_path,
-        workspace=workspace_for(tmp_path),
-        model=provider,
-        model_profile=_profile(provider),
-        clock=lambda: NOW,
-    )
-    try:
-        source = await agent.attach(SQLiteSource(database))
-        (resource,) = await agent.list_catalog_resources(source_id=source.id)
-        origin = await agent.run("Authorize the required document outcome.")
-        assert origin.conversation_id is not None
-        delivery = await _run_routine(
-            agent,
-            provider,
-            origin_run_id=origin.run_id,
-            conversation_id=origin.conversation_id,
-            source_ids=(source.id,),
-            connector_binding_ids=(),
-            resource_ids=(resource.id,),
-            capability_ids=(DOCUMENT_CREATE_CAPABILITY_ID,),
-            outcome_contract=_artifact_contract(
-                media_type="text/plain",
-                authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
-                producer_capability_id=DOCUMENT_CREATE_CAPABILITY_ID,
-                exact_source=False,
-            ),
-            script=script,
-        )
-        assert delivery.conclusion_state is OutcomeState.FAILED
-        assert delivery.failure_code == "outcome_artifact_contract_failed"
-        assert delivery.artifact_references == ()
-        assert delivery.resulting_run_id is not None
-        terminal = await agent._embedded._store.result(delivery.resulting_run_id)
-        assert terminal is not None
-        assert len(terminal.artifacts) == committed_artifact_count
-    finally:
-        await agent.close()
-
-
-async def test_wrong_media_outcome_contract_is_rejected_before_admission(
-    tmp_path: Path,
-) -> None:
-    database = tmp_path / "wrong-media.sqlite"
-    with sqlite3.connect(database) as connection:
-        connection.execute("CREATE TABLE current_value (value INTEGER NOT NULL)")
-        connection.execute("INSERT INTO current_value VALUES (7)")
-    provider = ToolboxAwareMockModelProvider(
-        (_stop("Foreground authorization complete."),),
-        provider_id="mock:d2-wrong-media",
-        complete_pricing=True,
-    )
-    agent = await Agent.create(
-        "d2-wrong-media",
-        root=tmp_path,
-        workspace=workspace_for(tmp_path),
-        model=provider,
-        model_profile=_profile(provider),
-        clock=lambda: NOW,
-    )
-    try:
-        source = await agent.attach(SQLiteSource(database))
-        (resource,) = await agent.list_catalog_resources(source_id=source.id)
-        origin = await agent.run("Authorize the invalid media outcome.")
-        assert origin.conversation_id is not None
-        with pytest.raises(RoutineError) as rejected:
-            await _create_routine(
-                agent,
-                provider,
-                origin_run_id=origin.run_id,
-                conversation_id=origin.conversation_id,
-                source_ids=(source.id,),
-                connector_binding_ids=(),
-                resource_ids=(resource.id,),
-                capability_ids=(DOCUMENT_CREATE_CAPABILITY_ID,),
-                outcome_contract=_artifact_contract(
-                    media_type="application/json",
-                    authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
-                    producer_capability_id=DOCUMENT_CREATE_CAPABILITY_ID,
-                    exact_source=False,
-                ),
-                script=(_stop("must not execute"),),
-            )
-        assert rejected.value.code == "routine_outcome_artifact_contract_invalid"
-    finally:
-        await agent.close()
-
-
-async def test_impossible_authorship_contract_is_rejected_before_admission(
-    tmp_path: Path,
-) -> None:
-    database = tmp_path / "wrong-authorship.sqlite"
-    with sqlite3.connect(database) as connection:
-        connection.execute("CREATE TABLE current_value (value INTEGER NOT NULL)")
-        connection.execute("INSERT INTO current_value VALUES (7)")
-    provider = ToolboxAwareMockModelProvider(
-        (_stop("Foreground authorization complete."),),
-        provider_id="mock:d2-wrong-authorship",
-        complete_pricing=True,
-    )
-    agent = await Agent.create(
-        "d2-wrong-authorship",
-        root=tmp_path,
-        workspace=workspace_for(tmp_path),
-        model=provider,
-        model_profile=_profile(provider),
-        clock=lambda: NOW,
-    )
-    try:
-        source = await agent.attach(SQLiteSource(database))
-        (resource,) = await agent.list_catalog_resources(source_id=source.id)
-        origin = await agent.run("Authorize the invalid authorship outcome.")
-        assert origin.conversation_id is not None
-        with pytest.raises(RoutineError) as rejected:
-            await _create_routine(
-                agent,
-                provider,
-                origin_run_id=origin.run_id,
-                conversation_id=origin.conversation_id,
-                source_ids=(source.id,),
-                connector_binding_ids=(),
-                resource_ids=(resource.id,),
-                capability_ids=(DOCUMENT_CREATE_CAPABILITY_ID,),
-                outcome_contract=_artifact_contract(
-                    media_type="text/plain",
-                    authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                    producer_capability_id=DOCUMENT_CREATE_CAPABILITY_ID,
-                    exact_source=False,
-                ),
-                script=(_stop("must not execute"),),
-            )
-        assert rejected.value.code == "routine_outcome_artifact_contract_invalid"
-    finally:
-        await agent.close()
-
-
 async def test_corrupt_committed_artifact_is_one_failed_delivery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1262,18 +979,8 @@ async def test_corrupt_committed_artifact_is_one_failed_delivery(
         created = await _create_routine(
             agent,
             provider,
-            origin_run_id=origin.run_id,
             conversation_id=origin.conversation_id,
             source_ids=(source.id,),
-            connector_binding_ids=(),
-            resource_ids=(resource.id,),
-            capability_ids=(DOCUMENT_CREATE_CAPABILITY_ID,),
-            outcome_contract=_artifact_contract(
-                media_type="text/plain",
-                authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
-                producer_capability_id=DOCUMENT_CREATE_CAPABILITY_ID,
-                exact_source=False,
-            ),
             script=(
                 _tools(
                     ToolCall(
@@ -1347,13 +1054,8 @@ async def test_scheduled_text_report_uses_the_same_inbox_path(tmp_path: Path) ->
         delivery = await _run_routine(
             agent,
             provider,
-            origin_run_id=origin.run_id,
             conversation_id=origin.conversation_id,
             source_ids=(source.id,),
-            connector_binding_ids=(),
-            resource_ids=(resource.id,),
-            capability_ids=("catalog.describe",),
-            outcome_contract=_text_contract(),
             script=(_stop("Current value is 7."),),
         )
         assert delivery.conclusion_preview == "Current value is 7."
@@ -1414,13 +1116,8 @@ async def test_scheduled_routine_reads_an_attached_folder_and_refuses_a_changed_
         created = await _create_routine(
             agent,
             provider,
-            origin_run_id=origin.run_id,
             conversation_id=origin.conversation_id,
             source_ids=(source.id,),
-            connector_binding_ids=(),
-            resource_ids=(resource.id,),
-            capability_ids=(DATA_QUERY_CAPABILITY_ID,),
-            outcome_contract=_text_contract(),
             script=(_tools(query), _stop("The total is 15.")),
         )
 
@@ -1453,15 +1150,18 @@ async def test_scheduled_routine_reads_an_attached_folder_and_refuses_a_changed_
 
         read = await occurrence(1)
         assert not read.is_error, read.output
-        # The scheduled run is never told about routes it cannot call.
+        # Eligibility no longer narrows scheduled runs, so combined queries are
+        # offered; the live session folder's file route stays excluded.
         (scheduled_query,) = [
             tool for tool in provider.requests[-1].tools if tool.name == "data_query"
         ]
-        assert "Join sources" not in scheduled_query.description
-        assert "Folder files" not in scheduled_query.description
-        assert not {"inputs", "path_pattern"} & set(
+        properties = set(
             cast(Mapping[str, object], scheduled_query.input_schema["properties"])
         )
+        assert "Join sources" in scheduled_query.description
+        assert "inputs" in properties
+        assert "Folder files" not in scheduled_query.description
+        assert "path_pattern" not in properties
         data = cast(Mapping[str, object], read.output["data"])
         assert [dict(row) for row in cast(tuple[Any, ...], data["rows"])] == [
             {"total": 15}

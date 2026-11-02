@@ -544,7 +544,6 @@ async def test_skill_view_is_fixed_and_projected_without_sources(tmp_path):
             # The live session folder source answers SQL over local files.
             "data_query",
             "delivery_list",
-            "distribution_destination_list",
             "file_read",
             "file_search",
             "job_list",
@@ -782,7 +781,6 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
             # The live session folder source answers SQL over local files.
             "data_query",
             "delivery_list",
-            "distribution_destination_list",
             "file_read",
             "file_search",
             "job_list",
@@ -798,7 +796,9 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
             for block in message.content
             if isinstance(block, ToolResultBlock) and block.call_id == "write"
         )
-        assert _error_code(write_result) == "missing_arguments"
+        assert _error_code(write_result) == "invalid_arguments"
+        issues = write_result.output["error"]["details"]["issues"]  # type: ignore[index]
+        assert {issue["code"] for issue in issues} == {"missing_arguments"}
         assert await agent.read_skill("unsafe-claims") is not None
         assert await agent.list_sources() == ()
         assert await agent.list_catalog_resources() == ()

@@ -41,6 +41,8 @@ __all__ = (
     "_skill_delete_call",
     "_skill_digest",
     "_skill_save_call",
+    "_skill_view_call",
+    "_step_results",
     "_stop",
     "_system_text",
     "_tool_event_kinds",
@@ -206,6 +208,23 @@ async def _execute(agent: Agent, *calls: ToolCall):
         calls,
         sensitivity=ModelSensitivity.INTERNAL,
     )
+
+
+def _skill_view_call(name: str, call_id: str = "skill-view") -> ToolCall:
+    return ToolCall(id=call_id, name="skill_view", arguments={"name": name})
+
+
+async def _step_results(agent: Agent, message: str) -> dict[str, ToolResultBlock]:
+    """Run one scripted turn through the real loop; return results by call id."""
+
+    result = await agent.run(message)
+    transcript = await agent.transcript(result.run_id)
+    return {
+        block.call_id: block
+        for item in transcript.messages
+        for block in item.content
+        if isinstance(block, ToolResultBlock)
+    }
 
 
 async def _skill_digest(agent: Agent, name: str) -> str:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -25,6 +25,8 @@ from daita.llm.models import (
     ModelResponse,
     ModelSensitivity,
     ModelUsage,
+    ToolCall,
+    ToolResultBlock,
 )
 from daita.llm.pricing import CostEstimate
 from daita.loop.models import LoopLimits
@@ -78,6 +80,60 @@ def response(*calls, text=None):
         text=text,
         usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
     )
+
+
+def companies_structure(db: Database) -> pg.PostgreSQLStructure:
+    """The one public.companies table every native-write fixture writes."""
+
+    columns = tuple(
+        TabularColumn(
+            name=name,
+            native_type="bigint" if name == "id" else "text",
+            ordinal=i,
+            nullable=name == "notes",
+            native_type_namespace="pg_catalog",
+            native_type_name="int8" if name == "id" else "text",
+            primary_key_ordinal=1 if name == "id" else None,
+            identity=name == "id",
+            updatable=True,
+            collation="C" if name != "id" else None,
+        )
+        for i, name in enumerate(("id", "domain", "name", "evidence_url", "notes"))
+    )
+    table = pg._TableStructure(
+        "public",
+        "companies",
+        ResourceKind.TABLE,
+        columns,
+        (
+            TabularIndex(
+                "companies_domain_key",
+                "btree",
+                ("domain",),
+                True,
+                write_conflict_supported=True,
+            ),
+            TabularIndex(
+                "companies_pkey", "btree", ("id",), True, write_conflict_supported=True
+            ),
+        ),
+    )
+    return pg.PostgreSQLStructure((table,), (), db.structure_revision)
+
+
+def patch_fake_postgresql(
+    monkeypatch, db: Database, structure: pg.PostgreSQLStructure
+) -> None:
+    """Route native PostgreSQL I/O to the in-memory database."""
+
+    async def connect(*args, **kwargs):
+        return db.connect()
+
+    async def load_structure(*args, **kwargs):
+        return replace(structure, source_revision=db.structure_revision)
+
+    monkeypatch.setattr(native, "_connect", connect)
+    monkeypatch.setattr(native, "_load_structure", load_structure)
 
 
 async def create_fixture(
@@ -136,40 +192,7 @@ async def create_fixture(
         },
         attached_at=NOW,
     )
-    columns = tuple(
-        TabularColumn(
-            name=name,
-            native_type="bigint" if name == "id" else "text",
-            ordinal=i,
-            nullable=name == "notes",
-            native_type_namespace="pg_catalog",
-            native_type_name="int8" if name == "id" else "text",
-            primary_key_ordinal=1 if name == "id" else None,
-            identity=name == "id",
-            updatable=True,
-            collation="C" if name != "id" else None,
-        )
-        for i, name in enumerate(("id", "domain", "name", "evidence_url", "notes"))
-    )
-    table = pg._TableStructure(
-        "public",
-        "companies",
-        ResourceKind.TABLE,
-        columns,
-        (
-            TabularIndex(
-                "companies_domain_key",
-                "btree",
-                ("domain",),
-                True,
-                write_conflict_supported=True,
-            ),
-            TabularIndex(
-                "companies_pkey", "btree", ("id",), True, write_conflict_supported=True
-            ),
-        ),
-    )
-    structure = pg.PostgreSQLStructure((table,), (), db.structure_revision)
+    structure = companies_structure(db)
     snapshot = pg._catalog_snapshot(
         registration,
         DiscoveryRequest(
@@ -222,14 +245,7 @@ async def create_fixture(
     home = agent.home
     await agent.close()
 
-    async def connect(*args, **kwargs):
-        return db.connect()
-
-    async def load_structure(*args, **kwargs):
-        return replace(structure, source_revision=db.structure_revision)
-
-    monkeypatch.setattr(native, "_connect", connect)
-    monkeypatch.setattr(native, "_load_structure", load_structure)
+    patch_fake_postgresql(monkeypatch, db, structure)
     agent = await Agent.open(
         "native-acceptance",
         root=tmp_path,
@@ -267,3 +283,49 @@ async def create_fixture(
         clock,
         approvals,
     )
+
+
+USAGE = ModelUsage(
+    input_tokens=100,
+    output_tokens=10,
+    cost_estimate=CostEstimate.complete(Decimal("0")),
+)
+Step = ModelResponse | Callable[[ModelRequest], ModelResponse]
+
+
+def measured_step(step: Step) -> Step:
+    """Scheduled runs need measured usage; wrap a scripted step to report it."""
+
+    if isinstance(step, ModelResponse):
+        return replace(step, usage=USAGE)
+    return lambda request: replace(step(request), usage=USAGE)
+
+
+def tool_result(request: ModelRequest, call_id: str) -> ToolResultBlock:
+    return next(
+        block
+        for message in request.messages
+        for block in message.content
+        if isinstance(block, ToolResultBlock) and block.call_id == call_id
+    )
+
+
+def scheduled_write_script(batch: Mapping[str, object]) -> list[Step]:
+    """Write the fixture's one-row upsert in one call; report what happened."""
+
+    def report(request: ModelRequest) -> ModelResponse:
+        write = tool_result(request, "write")
+        if not write.is_error:
+            return response(text="Saved today's totals.")
+        error = write.output["error"]
+        assert isinstance(error, Mapping)
+        return response(text=f"The write was refused ({error['code']}).")
+
+    steps: list[Step] = [
+        response(
+            ToolCall("load", "toolbox_load", {"tool_names": ["data_upsert_rows"]})
+        ),
+        response(ToolCall("write", "data_upsert_rows", dict(batch))),
+        report,
+    ]
+    return [measured_step(step) for step in steps]

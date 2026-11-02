@@ -24,14 +24,17 @@ prices remain in `profiles.py` and `pricing.py`.
 
 One immutable `ModelCallPolicy` in `AgentConfig` and `ModelRequest` governs
 configured and conforming injected providers, both delivery modes, foreground,
-routines, graph tasks and validation. Defaults are 180 seconds
+routines, job runs and validation. Defaults are 180 seconds
 per logical request, 120 per attempt, 60 to first substantive progress, 30 idle,
 15 counting, 5 connect, 120 read, 30 write, 5 pool and 5 cleanup. Every logical
 request intersects its caller/run deadline before setup; retries retain that
 logical deadline and receive a fresh, narrower attempt deadline. Counting has
 its own phase cap (`call_policy.input_count_timeout_seconds`, at most 60).
 Monotonic deadlines are runtime-only; policy durations and both retry ceilings
-are serialized and included in frozen machine model-contract digests.
+are serialized and included in the machine model-contract digests that a run's
+scope fixes when it starts. Routines no longer freeze routes: each occurrence
+uses the agent's current model routes and normal run limits, bound when that
+run starts, and so does each job run and sub-run.
 Counting transport failures retain their canonical cause and proven zero generation
 usage; invalid count data and unsupported counting remain permanent admission
 failures. External cancellation remains cancellation.

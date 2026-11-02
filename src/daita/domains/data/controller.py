@@ -20,11 +20,9 @@ from ...artifacts.models import (
 from ...artifacts.renderers import ARROW_MEDIA_TYPE, arrow_schema
 from ...capabilities import (
     AccessMode,
-    AutomationScopeProposal,
     CallProvenance,
     Capability,
     CapabilityDeclarations,
-    CapabilityGrant,
     CapabilityInputError,
     CapabilityRegistry,
     OperationalEffect,
@@ -50,10 +48,8 @@ from ...loop.models import RunInput, RunOrigin, Transcript
 from ...loop.session import RunSession
 from ...scope import EffectiveSourceScope, resolve_effective_source_scope
 from ...storage.sqlite_records import RelationalWriteScope, SourcePermissionStateError
-from .routine_precheck import RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID
 from .sql import (
     DuckDBReadValidationError,
-    RelationalUpdateCommand,
     RelationalUpdateIntent,
     ResourceSchema,
     read_validator,
@@ -63,7 +59,6 @@ from .sql import (
 from .sql.relational_upsert import (
     RelationalUpsertIntent,
     validate_relational_upsert_intent,
-    validate_relational_upsert_scope,
 )
 
 DATA_DOMAIN_OWNER_ID = "data"
@@ -91,7 +86,6 @@ _CATALOG_CAPABILITIES = frozenset(
     {
         CATALOG_SEARCH_CAPABILITY_ID,
         CATALOG_DESCRIBE_CAPABILITY_ID,
-        RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID,
     }
 )
 _RELATIONAL_READ_CAPABILITIES = frozenset(
@@ -106,19 +100,9 @@ _NATIVE_WRITE_CAPABILITIES = frozenset(
 )
 
 
-def native_preview_capability(capability_id: str) -> str:
-    """The two native operations own their exact current-run preview prerequisite."""
-    if capability_id == RELATIONAL_UPDATE_CAPABILITY_ID:
-        return RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID
-    if capability_id == "data.upsert_rows":
-        return "data.preview_upsert_rows"
-    raise ValueError("not a native write capability")
-
-
 _RESOURCE_ARGUMENT_CAPABILITIES = frozenset(
     {
         *_UPSERT_CAPABILITIES,
-        RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID,
         RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
         RELATIONAL_UPDATE_CAPABILITY_ID,
     }
@@ -354,9 +338,6 @@ class DataCapabilityDomain:
         relational_export_available: bool = True,
         combined_query_available: bool = False,
         transcript_loader: Callable[[str], Awaitable[Transcript]] | None = None,
-        upsert_readiness: (
-            Callable[[str, FrozenJsonObject], Awaitable[FrozenJsonObject]] | None
-        ) = None,
         source_files_available: bool = False,
         path_query_available: bool = False,
     ) -> None:
@@ -386,7 +367,6 @@ class DataCapabilityDomain:
         ):
             if not callable(getattr(catalog, method_name, None)):
                 raise TypeError(f"data catalog must provide {method_name}")
-        self._upsert_readiness = upsert_readiness
         self._transcript_loader = transcript_loader
         self._registry: CapabilityRegistry | None = None
         self._declarations = declarations
@@ -617,25 +597,12 @@ class DataCapabilityDomain:
                 generated_identity_columns=permission.generated_identity_columns,
                 max_rows=permission.max_rows,
             )
-            await self._authenticate_native_lineage(
-                run,
-                call,
-                arguments,
-                capability,
-                intent.evidence_call_ids,
-                execution=capability.id == "data.upsert_rows",
+            await self._authenticate_upsert_evidence(
+                run, call, capability, intent.evidence_call_ids
             )
-            self._check_native_grant(run, capability, arguments, permission)
         if capability.id in _UPDATE_CAPABILITIES:
-            await self._validate_relational_update_call(
-                run,
-                arguments,
-                execution=capability.id == RELATIONAL_UPDATE_CAPABILITY_ID,
-            )
+            await self._validate_relational_update_call(run, arguments)
             if capability.id == RELATIONAL_UPDATE_CAPABILITY_ID:
-                await self._authenticate_native_lineage(
-                    run, call, arguments, capability, (), execution=True
-                )
                 permission = await self._catalog.load_relational_write_scope(
                     run.agent_id,
                     cast(str, arguments["source_id"]),
@@ -647,149 +614,9 @@ class DataCapabilityDomain:
                         "The current write permission is unavailable.",
                         recovery=_WRITE_PERMISSION_REQUIRED,
                     )
-                if cast(int, arguments["expected_affected_rows"]) > permission.max_rows:
-                    raise CapabilityInputError(
-                        "write_row_limit",
-                        "The exact update exceeds its permission row ceiling.",
-                    )
-                self._check_native_grant(run, capability, arguments, permission)
         return arguments
 
     prepare_session_call = prepare_call
-
-    async def prepare_automation_grant(
-        self,
-        capability: Capability,
-        constraints: FrozenJsonObject,
-        max_calls_per_occurrence: int,
-        proposal: AutomationScopeProposal,
-    ) -> FrozenJsonObject:
-        if (
-            capability.id not in _NATIVE_WRITE_CAPABILITIES
-            or max_calls_per_occurrence != 1
-        ):
-            raise CapabilityInputError(
-                "automation_grant_unsupported",
-                "Native writes permit exactly one invocation per occurrence.",
-            )
-        if len(set(proposal.allowed_capability_ids) & _NATIVE_WRITE_CAPABILITIES) != 1:
-            raise CapabilityInputError(
-                "automation_grant_unsupported",
-                "A routine may admit only one native write capability.",
-            )
-        required_preview = native_preview_capability(capability.id)
-        if required_preview not in proposal.allowed_capability_ids:
-            raise CapabilityInputError(
-                "automation_grant_preview_required",
-                f"Include {required_preview} in the proposed scope. A corrected proposal "
-                "requires foreground review; execution still needs its own successful current-run preview.",
-            )
-        source_id, resource_id = (
-            cast(str, constraints["source_id"]),
-            cast(str, constraints["resource_id"]),
-        )
-        if (
-            source_id not in proposal.allowed_source_ids
-            or resource_id not in proposal.allowed_resource_ids
-        ):
-            raise CapabilityInputError(
-                "automation_grant_scope_invalid",
-                "Native grant target is outside the proposed scope.",
-            )
-        permission = await self._catalog.load_relational_write_scope(
-            proposal.agent_id, source_id, resource_id
-        )
-        if permission is None:
-            raise CapabilityInputError(
-                "resource_write_not_allowed",
-                "An exact current native permission is required.",
-            )
-        operation = (
-            "update" if capability.id == RELATIONAL_UPDATE_CAPABILITY_ID else "upsert"
-        )
-        if (
-            operation not in permission.allowed_operations
-            or constraints["resource_revision"] != permission.resource_revision
-        ):
-            raise CapabilityInputError(
-                "automation_grant_scope_invalid",
-                "The operation or structural revision is not currently authorized.",
-            )
-        normalized = constraints.to_dict()
-        for name in (
-            "key_columns",
-            "allowed_insert_columns",
-            "allowed_update_columns",
-            "generated_identity_columns",
-        ):
-            values = cast(tuple[str, ...], constraints[name])
-            if not set(values) <= set(getattr(permission, name)):
-                raise CapabilityInputError(
-                    "automation_grant_scope_invalid",
-                    "Grant columns exceed current native permission.",
-                )
-            normalized[name] = tuple(sorted(values))
-        if set(cast(tuple[str, ...], constraints["key_columns"])) != set(
-            permission.key_columns
-        ):
-            raise CapabilityInputError(
-                "automation_grant_scope_invalid",
-                "Native grants require the exact admitted key.",
-            )
-        if (
-            cast(int, constraints["max_rows"]) > permission.max_rows
-            or not constraints["allowed_update_columns"]
-        ):
-            raise CapabilityInputError(
-                "automation_grant_scope_invalid",
-                "Grant row or column ceilings are invalid.",
-            )
-        if operation == "update" and (
-            constraints["allowed_insert_columns"]
-            or constraints["generated_identity_columns"]
-        ):
-            raise CapabilityInputError(
-                "automation_grant_scope_invalid",
-                "Update grants cannot authorize insertion or identity generation.",
-            )
-        await self._validate_target_sensitivity(
-            proposal.agent_id, constraints, proposal.sensitivity_ceiling
-        )
-        if operation == "upsert":
-            resource = next(
-                item
-                for item in await self._catalog.resource_schemas(
-                    proposal.agent_id, source_id
-                )
-                if item.resource_id == resource_id
-            )
-            validate_relational_upsert_scope(
-                resource,
-                key_columns=cast(tuple[str, ...], constraints["key_columns"]),
-                insert_columns=cast(
-                    tuple[str, ...], constraints["allowed_insert_columns"]
-                ),
-                update_columns=cast(
-                    tuple[str, ...], constraints["allowed_update_columns"]
-                ),
-                generated_identity_columns=cast(
-                    tuple[str, ...], constraints["generated_identity_columns"]
-                ),
-            )
-            if cast(int, constraints["max_rows"]) > 1000:
-                raise CapabilityInputError(
-                    "automation_grant_scope_invalid",
-                    "Upsert permits at most 1000 rows.",
-                )
-            if self._upsert_readiness is None:
-                raise CapabilityInputError(
-                    "automation_grant_unsupported",
-                    "Native upsert readiness is unavailable.",
-                )
-            await self._upsert_readiness(
-                proposal.agent_id, FrozenJsonObject.from_mapping(normalized)
-            )
-        return FrozenJsonObject.from_mapping(normalized)
 
     async def side_effect_plan(
         self,
@@ -804,65 +631,51 @@ class DataCapabilityDomain:
             or capability.operational_effect is not OperationalEffect.MUTATE_DATA
         ):
             raise ValueError("data domain received an unsupported side effect")
-        grant = (
-            None
-            if run.execution_scope is None
-            else next(
-                (
-                    item
-                    for item in run.execution_scope.capability_grants
-                    if item.capability_id == capability.id
-                ),
-                None,
-            )
-        )
-        approval_arguments = None
-        if run.execution_scope is None:
-            source_id = cast(str, execution.arguments["source_id"])
-            resource_id = cast(str, execution.arguments["resource_id"])
-            resource = next(
-                (
-                    item
-                    for item in await self._catalog.resource_schemas(
-                        run.agent_id, source_id
-                    )
-                    if item.resource_id == resource_id
-                ),
-                None,
-            )
-            source = next(
-                (
-                    item
-                    for item in await self._catalog.source_routing_facts(
-                        run.agent_id, (source_id,)
-                    )
-                    if item["source_id"] == source_id
-                ),
-                None,
-            )
-            if (
-                resource is None
-                or source is None
-                or resource.revision != fingerprint["resource_revision"]
-            ):
-                raise CapabilityInputError(
-                    "write_state_changed",
-                    "The exact review target is no longer current.",
+        source_id = cast(str, execution.arguments["source_id"])
+        resource_id = cast(str, execution.arguments["resource_id"])
+        resource = next(
+            (
+                item
+                for item in await self._catalog.resource_schemas(
+                    run.agent_id, source_id
                 )
-            approval_arguments = FrozenJsonObject.from_mapping(
-                {
-                    "arguments": execution.arguments,
-                    "target": {
-                        "source_id": source_id,
-                        "resource_id": resource_id,
-                        "name": resource.name,
-                        "aliases": resource.aliases,
-                        "source_name": source["display_name"],
-                        "revision": resource.revision,
-                    },
-                    "preview": fingerprint["review"],
-                }
+                if item.resource_id == resource_id
+            ),
+            None,
+        )
+        source = next(
+            (
+                item
+                for item in await self._catalog.source_routing_facts(
+                    run.agent_id, (source_id,)
+                )
+                if item["source_id"] == source_id
+            ),
+            None,
+        )
+        if (
+            resource is None
+            or source is None
+            or resource.revision != fingerprint["resource_revision"]
+        ):
+            raise CapabilityInputError(
+                "write_state_changed",
+                "The exact review target is no longer current.",
             )
+        approval_arguments = FrozenJsonObject.from_mapping(
+            {
+                "arguments": execution.arguments,
+                "target": {
+                    "source_id": source_id,
+                    "resource_id": resource_id,
+                    "name": resource.name,
+                    "aliases": resource.aliases,
+                    "source_name": source["display_name"],
+                    "revision": resource.revision,
+                },
+                "preview": fingerprint["review"],
+            }
+        )
         approval_reason = (
             "Review the exact batch. Execution briefly holds an EXCLUSIVE table lock; ordinary reads may continue."
             if capability.id == "data.upsert_rows"
@@ -876,8 +689,6 @@ class DataCapabilityDomain:
         ):
             approval_reason += " Identity sequence gaps can remain after rollback."
         return SideEffectPlan(
-            approval_required=run.execution_scope is None,
-            capability_grant_digest=None if grant is None else grant.grant_digest,
             approval_reason=approval_reason,
             approval_arguments=approval_arguments,
             recheck_after_approval=True,
@@ -1610,8 +1421,6 @@ class DataCapabilityDomain:
         self,
         run: RunInput,
         arguments: Mapping[str, object],
-        *,
-        execution: bool,
     ) -> None:
         source_id = arguments.get("source_id")
         if not isinstance(source_id, str):
@@ -1630,11 +1439,7 @@ class DataCapabilityDomain:
                 {"source_id": source_id},
             )
         try:
-            intent = (
-                RelationalUpdateCommand.from_mapping(arguments).intent
-                if execution
-                else RelationalUpdateIntent.from_mapping(arguments)
-            )
+            intent = RelationalUpdateIntent.from_mapping(arguments)
         except (TypeError, ValueError) as error:
             raise CapabilityInputError(
                 "write_assignment_invalid",
@@ -1699,97 +1504,18 @@ class DataCapabilityDomain:
                 "The request exceeds the target's current admitted classification.",
             )
 
-    def _check_native_grant(
-        self,
-        run: RunInput,
-        capability: Capability,
-        arguments: Mapping[str, object],
-        permission: RelationalWriteScope,
-    ) -> CapabilityGrant | None:
-        if run.execution_scope is None:
-            return None
-        capability_id = (
-            "data.upsert_rows"
-            if capability.id in _UPSERT_CAPABILITIES
-            else RELATIONAL_UPDATE_CAPABILITY_ID
-        )
-        grant = next(
-            (
-                item
-                for item in run.execution_scope.capability_grants
-                if item.capability_id == capability_id
-            ),
-            None,
-        )
-        if grant is None or grant.max_calls_per_occurrence != 1:
-            raise CapabilityInputError(
-                "automation_grant_scope_invalid",
-                "An exact once-per-occurrence native grant is required.",
-            )
-        c = grant.constraints
-        if (
-            c["source_id"] != arguments["source_id"]
-            or c["resource_id"] != arguments["resource_id"]
-            or c["resource_revision"] != permission.resource_revision
-        ):
-            raise CapabilityInputError(
-                "automation_grant_scope_invalid",
-                "The native target differs from its frozen grant.",
-            )
-        if capability_id == "data.upsert_rows":
-            intent = RelationalUpsertIntent.from_mapping(arguments)
-            updates, inserts, keys, count = (
-                intent.update_columns,
-                intent.insert_columns,
-                intent.key_columns,
-                len(intent.rows),
-            )
-        else:
-            update = RelationalUpdateIntent.from_mapping(
-                {
-                    key: arguments[key]
-                    for key in ("source_id", "resource_id", "where", "assignments")
-                }
-            )
-            updates, inserts, keys, count = (
-                tuple(item.column for item in update.assignments),
-                (),
-                permission.key_columns,
-                cast(int, arguments.get("expected_affected_rows", 0)),
-            )
-        if (
-            not set(updates) <= set(cast(tuple[str, ...], c["allowed_update_columns"]))
-            or not set(inserts)
-            <= set(cast(tuple[str, ...], c["allowed_insert_columns"]))
-            or set(keys) != set(cast(tuple[str, ...], c["key_columns"]))
-            or set(permission.generated_identity_columns)
-            != set(cast(tuple[str, ...], c["generated_identity_columns"]))
-            or count > cast(int, c["max_rows"])
-        ):
-            raise CapabilityInputError(
-                "automation_grant_scope_invalid",
-                "The batch exceeds its exact native grant.",
-            )
-        return grant
-
-    async def _authenticate_native_lineage(
+    async def _authenticate_upsert_evidence(
         self,
         run: RunInput,
         call: ToolCall,
-        arguments: Mapping[str, object],
         capability: Capability,
         evidence_ids: tuple[str, ...],
-        *,
-        execution: bool,
     ) -> None:
-        if not execution and not evidence_ids:
+        if not evidence_ids:
             return
-        calls, results = await self._authenticated_prior_results(run, call, capability)
+        _, results = await self._authenticated_prior_results(run, call, capability)
         if (
-            evidence_ids
-            and tuple(
-                block.call_id for block in results if block.call_id in evidence_ids
-            )
+            tuple(block.call_id for block in results if block.call_id in evidence_ids)
             != evidence_ids
         ):
             known = {block.call_id for block in results}
@@ -1803,54 +1529,6 @@ class DataCapabilityDomain:
                     else "; the call ids are out of order."
                 ),
             )
-        if not execution:
-            return
-        expected = native_preview_capability(capability.id)
-        for result in results:
-            data = result.output.get("data")
-            if (
-                result.capability_id != expected
-                or not isinstance(data, Mapping)
-                or data.get("preview_fingerprint") != arguments["preview_fingerprint"]
-            ):
-                continue
-            original = calls[result.call_id].arguments
-            if expected == "data.preview_upsert_rows":
-                current = RelationalUpsertIntent.from_mapping(arguments)
-                previewed = RelationalUpsertIntent.from_mapping(original)
-                # Typed validation and adapter preflight authenticate semantic equality; compare all requested values here.
-                a, b = current.to_payload(), previewed.to_payload()
-                a["rows"] = tuple(sorted(current.rows, key=canonical_json))
-                b["rows"] = tuple(sorted(previewed.rows, key=canonical_json))
-                if canonical_json(a) == canonical_json(b):
-                    return
-            else:
-                current_update = RelationalUpdateCommand.from_mapping(arguments).intent
-                original_update = RelationalUpdateIntent.from_mapping(original)
-                resources = await self._catalog.resource_schemas(
-                    run.agent_id, current_update.source_id
-                )
-                a_update = validate_relational_update_intent(
-                    current_update, resources=resources
-                ).validated
-                b_update = validate_relational_update_intent(
-                    original_update, resources=resources
-                ).validated
-                if (
-                    a_update is not None
-                    and b_update is not None
-                    and a_update.intent_sha256 == b_update.intent_sha256
-                ):
-                    return
-        raise CapabilityInputError(
-            "write_preview_not_authenticated",
-            "The write requires its exact successful current-run preview and matching intent.",
-            recovery=ToolRecovery(
-                RecoveryKind.CORRECT_ARGUMENTS,
-                "Call mode=preview with the same arguments in this run, then "
-                "apply with its preview_fingerprint.",
-            ),
-        )
 
     async def derive_call_provenance(
         self,
@@ -1904,7 +1582,7 @@ class DataCapabilityDomain:
         if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
             raise CapabilityInputError(
                 "write_preview_not_authenticated",
-                "The preview belongs to another run or agent.",
+                "The transcript belongs to another run or agent.",
             )
         registry = self._registry
 

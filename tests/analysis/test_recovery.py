@@ -44,7 +44,6 @@ def cell(name, code, **extra):
         "python_execute",
         {
             "code": code,
-            "expected_state": {"generation": 0, "revision": 0},
             **extra,
         },
     )
@@ -87,7 +86,6 @@ async def test_invalid_output_registration_preserves_state_for_correction(
             "python_execute",
             {
                 "code": "assert answer == 42\noutputs.add('answer','answer.txt')",
-                "expected_state": {"generation": 1, "revision": 1},
                 "save_output": "answer",
             },
         ),
@@ -102,7 +100,8 @@ async def test_invalid_output_registration_preserves_state_for_correction(
         assert cells[0]["status"] == "python_error"
         assert cells[0]["state_lost"] is False
         assert cells[1]["status"] == "success"
-        assert cells[1]["expected_state"] == {"generation": 1, "revision": 2}
+        # A python_error keeps the interpreter: the correction sees `answer`.
+        assert cells[1]["state_reset"] is False
         assert len(result.artifacts) == 1
         assert (
             await agent.read_artifact(result.artifacts[0].artifact_id)
@@ -525,7 +524,6 @@ async def test_parser_failures_keep_ownership_and_conserve_final_cpu(
                         "python_execute",
                         {
                             "code": "print('must not dispatch')",
-                            "expected_state": {"generation": 1, "revision": 0},
                         },
                     ),
                 )
@@ -700,7 +698,6 @@ async def test_multiple_parsers_and_replacement_preserve_cumulative_cpu(
             "python_execute",
             {
                 "code": "lost = 19\nwhile True: pass",
-                "expected_state": {"generation": 1, "revision": 1},
                 "timeout_seconds": 0.15,
             },
         ),
@@ -709,7 +706,6 @@ async def test_multiple_parsers_and_replacement_preserve_cumulative_cpu(
             "python_execute",
             {
                 "code": "assert 'lost' not in globals()\nprint(42)",
-                "expected_state": {"generation": 1, "revision": 0},
             },
         ),
     )
@@ -727,7 +723,13 @@ async def test_multiple_parsers_and_replacement_preserve_cumulative_cpu(
         assert len(cells) == 3
         assert cells[1] is not None and cells[2] is not None
         assert json.loads(canonical_json(cells[1].output))["data"]["state_lost"] is True
-        assert json.loads(canonical_json(cells[2].output))["data"]["stdout"] == "42\n"
+        replacement = json.loads(canonical_json(cells[2].output))["data"]
+        assert replacement["stdout"] == "42\n"
+        # Code tracks the interpreter: the model is told its variables are gone.
+        assert replacement["state_reset"] is True
+        assert json.loads(canonical_json(cells[0].output))["data"]["state_reset"] is (
+            False
+        )
         records = await agent.analysis_evidence(result.run_id)
         generations = [r for r in records if r.kind == "generation"]
         assert {r.evidence_id for r in generations} == {

@@ -17,7 +17,6 @@ from daita import Agent
 from daita.artifacts.models import (
     ArtifactDraft,
     ArtifactError,
-    ArtifactRef,
     ArtifactState,
 )
 from daita.capabilities import ArtifactPolicy
@@ -34,14 +33,6 @@ from tests.artifacts._public_surface_support import (
     workspace_for,
 )
 from tests.support.home_revisions import undo_revision_4_schema
-from tests.support.job_benchmarks import (
-    OFFLINE_EAGER_LIMITS,
-    TARGET_PROFILE_TABLE,
-    admit_profile_job,
-    create_probe_home,
-    stop_response,
-    wait_for_terminal,
-)
 
 pytestmark = pytest.mark.integration
 
@@ -373,127 +364,6 @@ async def test_malformed_registry_records_fail_home_admission(
         )
     with pytest.raises(StateCompatibilityError):
         await Agent.open("deletion", root=tmp_path, workspace=workspace_for(tmp_path))
-
-
-async def test_active_job_reservation_prevents_deletion_until_result_is_accepted(
-    tmp_path, monkeypatch
-):
-    home = await create_probe_home(tmp_path, "active-artifact")
-    provider = MockModelProvider((stop_response(),))
-    agent = await Agent.open(
-        home.name,
-        root=home.root,
-        model=provider,
-        model_profile=provider.model_profile,
-        limits=OFFLINE_EAGER_LIMITS,
-        workspace=workspace_for(home.root),
-    )
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    observed: list[ArtifactRef] = []
-    supervisor = agent._embedded._job_supervisor
-    promote = supervisor._promote_graph_artifact
-
-    async def pause_promotion(inspection, task, attempt, ref, content):
-        if not observed:
-            observed.append(ref)
-            entered.set()
-            await release.wait()
-        return await promote(inspection, task, attempt, ref, content)
-
-    monkeypatch.setattr(supervisor, "_promote_graph_artifact", pause_promotion)
-    try:
-        origin = await agent.run(
-            "Profile this table.", source_scope_ids=(home.source_id,)
-        )
-        await admit_profile_job(agent, home.resource_ids[TARGET_PROFILE_TABLE], origin)
-        await asyncio.wait_for(entered.wait(), timeout=10)
-        (ref,) = observed
-        with pytest.raises(ArtifactError) as busy:
-            await agent.delete_artifact(ref.artifact_id)
-        assert busy.value.code == "artifact_busy"
-        record = await agent._embedded._store.get_artifact_record(ref.artifact_id)
-        assert record is not None and record.state is ArtifactState.READY
-        assert (await agent.read_artifact(ref.artifact_id)).content
-        release.set()
-        (job,) = await agent.list_jobs()
-        await wait_for_terminal(agent, job.job_id)
-        assert await agent.delete_artifact(ref.artifact_id)
-        assert await agent._embedded._store.get_artifact_record(ref.artifact_id) is None
-    finally:
-        release.set()
-        await agent.close()
-
-
-@pytest.mark.parametrize("clear_history", [False, True])
-@pytest.mark.parametrize("source_revision", [2, "pre_registry_3", 3])
-async def test_graph_and_delivery_artifact_deletion_survives_reopen(
-    tmp_path, clear_history, source_revision
-):
-    home = await create_probe_home(tmp_path, "graph-deletion")
-    provider = MockModelProvider((stop_response(),))
-    agent = await Agent.open(
-        home.name,
-        root=home.root,
-        model=provider,
-        model_profile=provider.model_profile,
-        limits=OFFLINE_EAGER_LIMITS,
-        workspace=workspace_for(home.root),
-    )
-    try:
-        origin = await agent.run(
-            "Profile this table.", source_scope_ids=(home.source_id,)
-        )
-        await admit_profile_job(agent, home.resource_ids[TARGET_PROFILE_TABLE], origin)
-        (job,) = await agent.list_jobs()
-        await wait_for_terminal(agent, job.job_id)
-        result = await agent.read_job_result(job.job_id)
-        assert result is not None
-        (artifact_id,) = result.artifact_ids
-        task_artifacts = await agent.list_task_artifacts(job.job_id)
-        assert artifact_id in task_artifacts
-        if clear_history:
-            await agent.clear_conversations()
-        if source_revision != 3:
-            await agent.close()
-            with sqlite3.connect(agent.home / "state.db") as connection:
-                undo_revision_4_schema(connection)
-                connection.execute(
-                    "DELETE FROM agent_home_migrations WHERE revision > 3"
-                )
-                connection.execute("DROP TABLE artifacts")
-                if source_revision == 2:
-                    connection.execute(
-                        "DELETE FROM agent_home_migrations WHERE revision = 3"
-                    )
-                else:
-                    connection.execute(
-                        "UPDATE agent_home_migrations SET checksum = ? WHERE revision = 3",
-                        (PRE_REGISTRY_REVISION_3_CHECKSUM,),
-                    )
-            agent = await Agent.open(
-                home.name, root=home.root, workspace=workspace_for(home.root)
-            )
-            assert (await agent.read_artifact(artifact_id)).content
-        assert await agent.delete_artifact(artifact_id)
-        assert await agent.list_task_artifacts(job.job_id) == tuple(
-            item for item in task_artifacts if item != artifact_id
-        )
-        assert await agent._embedded._store.get_artifact_record(artifact_id) is None
-        assert await agent.read_job_result(job.job_id) == result
-    finally:
-        await agent.close()
-    reopened = await Agent.open(
-        home.name, root=home.root, workspace=workspace_for(home.root)
-    )
-    try:
-        assert await reopened.read_job_result(job.job_id) == result
-        assert await reopened.delete_artifact(artifact_id) is False
-        with pytest.raises(ArtifactError) as error:
-            await reopened.read_artifact(artifact_id)
-        assert error.value.code == "artifact_missing"
-    finally:
-        await reopened.close()
 
 
 @pytest.mark.parametrize("published", [False, True])

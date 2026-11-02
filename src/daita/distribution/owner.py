@@ -16,10 +16,7 @@ from .models import (
     DeliveryState,
     DeliverySubjectKind,
     DeliveryView,
-    DistributionDestination,
-    DistributionDestinationState,
     DistributionPlan,
-    GraphJobDelivery,
     OutcomeArtifactReference,
     OutcomeConclusionKind,
     OutcomeContract,
@@ -27,7 +24,6 @@ from .models import (
     OutcomeState,
     conversation_inbox_destination_id,
     distribution_plan_digest,
-    graph_job_delivery_key,
     logical_delivery_key,
     outcome_artifact_reference,
     target_fingerprint,
@@ -127,101 +123,42 @@ def construct_logical_delivery(
     )
 
 
-def construct_graph_job_delivery(
-    *,
-    delivery_id: str,
-    agent_id: str,
+def conversation_inbox_target(
     conversation_id: str,
-    job_id: str,
-    target: ConversationInboxTarget,
-    result_id: str,
-    result_digest: str,
-    result_summary: str,
-    artifact_references: tuple[OutcomeArtifactReference, ...],
-    effective_sensitivity: ModelSensitivity,
-    provenance_digest: str,
-    observed_at: datetime,
-) -> GraphJobDelivery:
-    """Construct one current graph-job delivery through distribution types."""
-
-    if target.conversation_id != conversation_id:
-        raise ValueError("graph delivery target conversation identity differs")
-    visibility_state = (
-        DeliveryState.AVAILABLE
-        if effective_sensitivity.routing_rank <= target.sensitivity_ceiling.routing_rank
-        else DeliveryState.BLOCKED
-    )
-    outcome = OutcomeReference(
-        conclusion_kind=OutcomeConclusionKind.NO_MODEL_OCCURRENCE,
-        conclusion_state=OutcomeState.SUCCEEDED,
-        conclusion_id=result_id,
-        conclusion_digest=result_digest,
-        conclusion_preview=(
-            result_summary if visibility_state is DeliveryState.AVAILABLE else ""
-        ),
-        conclusion_preview_truncated=False,
-        resulting_run_id=None,
-        artifact_references=artifact_references,
-        effective_sensitivity=effective_sensitivity,
-        provenance_digest=provenance_digest,
-        failure_code=None,
-        observed_at=observed_at,
-    )
-    return GraphJobDelivery(
-        delivery_id=delivery_id,
-        agent_id=agent_id,
-        conversation_id=conversation_id,
-        job_id=job_id,
-        logical_key=graph_job_delivery_key(
-            job_id=job_id,
-            outcome_digest=result_digest,
-        ),
-        target=target,
-        outcome=outcome,
-        visibility_state=visibility_state,
-        blocked_reason_code=(
-            "sensitivity_exceeds_destination"
-            if visibility_state is DeliveryState.BLOCKED
-            else None
-        ),
-        created_at=observed_at,
-        updated_at=observed_at,
-    )
-
-
-def construct_graph_attention_delivery(
     *,
-    delivery_id: str,
-    agent_id: str,
-    conversation_id: str,
-    transition_subject_id: str,
-    target: ConversationInboxTarget,
-    preview: str,
-    transition_digest: str,
-    effective_sensitivity: ModelSensitivity,
-    observed_at: datetime,
-) -> Delivery:
-    """Construct one code-owned, transition-scoped graph attention notice."""
+    sensitivity_ceiling: ModelSensitivity,
+) -> ConversationInboxTarget:
+    """The one destination: the conversation's own Inbox."""
 
-    return construct_logical_delivery(
-        delivery_id=delivery_id,
-        agent_id=agent_id,
+    destination_id = conversation_inbox_destination_id(conversation_id)
+    return ConversationInboxTarget(
         conversation_id=conversation_id,
-        subject_kind=DeliverySubjectKind.GRAPH_ATTENTION,
-        subject_id=transition_subject_id,
-        target=target,
-        conclusion_kind=OutcomeConclusionKind.NO_MODEL_OCCURRENCE,
-        conclusion_state=OutcomeState.SUCCEEDED,
-        conclusion_id=transition_subject_id,
-        conclusion_digest=transition_digest,
-        conclusion_preview=preview,
-        conclusion_preview_truncated=False,
-        resulting_run_id=None,
-        artifact_references=(),
-        effective_sensitivity=effective_sensitivity,
-        provenance_digest=transition_digest,
-        failure_code=None,
-        observed_at=observed_at,
+        destination_id=destination_id,
+        destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
+        sensitivity_ceiling=sensitivity_ceiling,
+        target_fingerprint=target_fingerprint(
+            conversation_id=conversation_id,
+            destination_id=destination_id,
+            destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
+            sensitivity_ceiling=sensitivity_ceiling,
+        ),
+    )
+
+
+def conversation_inbox_plan(
+    conversation_id: str,
+    *,
+    sensitivity_ceiling: ModelSensitivity,
+) -> DistributionPlan:
+    targets = (
+        conversation_inbox_target(
+            conversation_id, sensitivity_ceiling=sensitivity_ceiling
+        ),
+    )
+    return DistributionPlan(
+        targets=targets,
+        required_target_count=1,
+        plan_digest=distribution_plan_digest(targets=targets, required_target_count=1),
     )
 
 
@@ -279,66 +216,8 @@ class DistributionOwner:
         *,
         sensitivity_ceiling: ModelSensitivity,
     ) -> ConversationInboxTarget:
-        destination_id = conversation_inbox_destination_id(conversation_id)
-        fingerprint = target_fingerprint(
-            conversation_id=conversation_id,
-            destination_id=destination_id,
-            destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
-            sensitivity_ceiling=sensitivity_ceiling,
-        )
-        return ConversationInboxTarget(
-            conversation_id=conversation_id,
-            destination_id=destination_id,
-            destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
-            sensitivity_ceiling=sensitivity_ceiling,
-            target_fingerprint=fingerprint,
-        )
-
-    def list_destinations(
-        self,
-        conversation_id: str,
-        *,
-        sensitivity_ceiling: ModelSensitivity,
-    ) -> tuple[DistributionDestination, ...]:
-        target = self.resolve_conversation_inbox(
-            conversation_id,
-            sensitivity_ceiling=sensitivity_ceiling,
-        )
-        return (
-            DistributionDestination(
-                destination_id=target.destination_id,
-                kind="conversation_inbox",
-                label="Current conversation Inbox",
-                state=DistributionDestinationState.AVAILABLE,
-                revision=target.destination_revision,
-                sensitivity_ceiling=target.sensitivity_ceiling,
-                supported_outcome_media=(
-                    "application/json",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    "text/csv",
-                    "text/markdown",
-                    "text/plain",
-                ),
-                selectable=True,
-            ),
-        )
-
-    async def discover_destinations(
-        self,
-        conversation_id: str,
-        *,
-        sensitivity_ceiling: ModelSensitivity,
-    ) -> tuple[DistributionDestination, ...]:
-        """Return destinations only for one current agent-owned conversation."""
-
-        if not await self._store.conversation_exists(
-            self._agent_id,
-            conversation_id,
-        ):
-            return ()
-        return self.list_destinations(
-            conversation_id,
-            sensitivity_ceiling=sensitivity_ceiling,
+        return conversation_inbox_target(
+            conversation_id, sensitivity_ceiling=sensitivity_ceiling
         )
 
     def resolve_plan(
@@ -350,21 +229,12 @@ class DistributionOwner:
     ) -> DistributionPlan:
         """Resolve the exact currently selectable distribution plan."""
 
-        target = self.resolve_conversation_inbox(
-            conversation_id,
-            sensitivity_ceiling=sensitivity_ceiling,
+        plan = conversation_inbox_plan(
+            conversation_id, sensitivity_ceiling=sensitivity_ceiling
         )
-        if destination_id != target.destination_id:
+        if destination_id != plan.targets[0].destination_id:
             raise ValueError("distribution destination is not currently selectable")
-        targets = (target,)
-        return DistributionPlan(
-            targets=targets,
-            required_target_count=1,
-            plan_digest=distribution_plan_digest(
-                targets=targets,
-                required_target_count=1,
-            ),
-        )
+        return plan
 
     async def list(
         self,
@@ -456,8 +326,8 @@ __all__ = [
     "DistributionOwner",
     "DistributionStore",
     "OutcomeArtifactReader",
-    "construct_graph_attention_delivery",
-    "construct_graph_job_delivery",
     "construct_logical_delivery",
+    "conversation_inbox_plan",
+    "conversation_inbox_target",
     "delivery_view",
 ]

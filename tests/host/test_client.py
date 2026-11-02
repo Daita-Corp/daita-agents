@@ -28,9 +28,7 @@ from daita import (
     IntervalSchedule,
     LocalFileAccess,
     LocalWorkspace,
-    MisfirePolicy,
-    ReportingMode,
-    ScheduledRoutineDraft,
+    RoutineIntent,
 )
 from daita._json import FrozenJsonObject
 from daita.capabilities import ApprovalDecision, ApprovalRequest
@@ -58,7 +56,6 @@ from daita.llm.models import (
     FinishReason,
     ModelProfile,
     ModelResponse,
-    ModelSensitivity,
     ModelUsage,
     ToolCall,
 )
@@ -72,7 +69,6 @@ from tests.support.approval_learning import (
     _memory_call,
     _stop,
 )
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.host import (
     bounded,
     fake_openai_device_login,
@@ -343,9 +339,8 @@ async def _artifacts(agent: Any, seeded: Seeded) -> object:
 
 
 async def _deliveries(agent: Any, seeded: Seeded) -> object:
-    return await agent.distribution_destinations(
-        seeded.conversation_id, sensitivity_ceiling=ModelSensitivity.INTERNAL
-    )
+    del seeded
+    return await agent.inspect_delivery("delivery-missing")
 
 
 async def _work(agent: Any, _seeded: Seeded) -> object:
@@ -353,39 +348,29 @@ async def _work(agent: Any, _seeded: Seeded) -> object:
 
 
 async def _routines(agent: Any, seeded: Seeded) -> object:
-    (destination,) = await agent.distribution_destinations(
-        seeded.conversation_id, sensitivity_ceiling=ModelSensitivity.INTERNAL
-    )
-    draft = ScheduledRoutineDraft(
-        origin_run_id=seeded.run_id,
-        title="Order count report",
-        authorized_instruction="Report the number of orders.",
-        schedule=IntervalSchedule(3_600, NOW + timedelta(hours=1)),
-        misfire_policy=MisfirePolicy.LATEST_ONLY,
-        reporting_mode=ReportingMode.ALWAYS,
-        precheck=None,
-        allowed_source_ids=(seeded.source_id,),
-        allowed_connector_binding_ids=(),
-        allowed_resource_ids=(seeded.resource_id,),
-        allowed_capability_ids=("catalog.describe",),
-        sensitivity_ceiling=ModelSensitivity.INTERNAL,
-        outcome_contract=no_artifact_outcome_contract(),
-        distribution_destination_id=destination.destination_id,
-        eligible_model_routes=("mock:parity",),
-        per_run_max_tokens=2_000,
-        per_run_max_cost_usd=None,
-        cumulative_max_tokens=20_000,
-        cumulative_max_cost_usd=None,
-        cumulative_max_attempts=10,
-        cumulative_max_occurrences=10,
-        maximum_consecutive_failures=3,
-        expires_at=NOW + timedelta(days=30),
-    )
     routine = await agent.create_routine(
-        await agent.propose_routine(draft), confirmation_handler=_approve
+        RoutineIntent(
+            title="Order count report",
+            prompt="Report the number of orders.",
+            schedule=IntervalSchedule(3_600, NOW + timedelta(hours=1)),
+            sources=("Orders",),
+        ),
+        conversation_id=seeded.conversation_id,
+        confirmation_handler=_approve,
+    )
+    # The JSON schedule shape crosses the host; omitted fields keep their values.
+    updated = await agent.update_routine(
+        routine.routine_id,
+        RoutineIntent(
+            schedule=FrozenJsonObject.from_mapping(
+                {"kind": "once", "exact_at": (NOW + timedelta(hours=2)).isoformat()}
+            )
+        ),
+        confirmation_handler=_approve,
     )
     return (
         routine,
+        updated,
         await agent.list_routines(),
         await agent.inspect_routine(routine.routine_id),
     )

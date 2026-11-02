@@ -31,7 +31,6 @@ from daita.adapters.mcp import (
 )
 from daita.capabilities import (
     AccessMode,
-    AutomationEligibility,
     OperationalEffect,
     ToolboxId,
     ToolLoadMode,
@@ -554,7 +553,6 @@ async def test_mcp_storage_enforces_per_binding_and_agent_aggregate_bounds(tmp_p
                     result_sensitivity=ModelSensitivity.INTERNAL,
                     access_mode=AccessMode.READ,
                     operational_effect=OperationalEffect.NONE,
-                    automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
                     maximum_outbound_sensitivity=ModelSensitivity.RESTRICTED,
                     completion_semantics=MCPCompletionSemantics.DIRECT_RESULT,
                     task_support="forbidden",

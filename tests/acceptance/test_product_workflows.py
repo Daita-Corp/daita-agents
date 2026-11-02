@@ -6,11 +6,8 @@ from daita import connect
 from tests.support.host import StartHost, host_workspace, short_root
 from tests.support.product_workflows import (
     ActionFixture,
-    ArtifactAuthorship,
-    ArtifactRequirement,
     DaitaApp,
     Input,
-    ModelSensitivity,
     OnceSchedule,
     OutcomeState,
     PermissionsScreen,
@@ -113,42 +110,17 @@ async def test_once_mcp_research_creates_sourced_briefing_and_inbox_while_host_o
 ):
     fixture = await ActionFixture(tmp_path).start()
     try:
-        draft = await fixture.draft()
-        draft = replace(
-            draft,
+        intent = replace(
+            await fixture.draft(),
             title="Competitor briefing",
-            authorized_instruction="Research competitors using the admitted tool and create a sourced briefing with coverage limits.",
+            prompt="Research competitors using the admitted tool and create a sourced briefing with coverage limits.",
             schedule=OnceSchedule(fixture.clock + timedelta(hours=1)),
             run_immediately=False,
-            allowed_capability_ids=(
-                fixture.research.capability_id,
-                "artifact.create_document",
-            ),
-            requested_capability_grants=(),
-            outcome_contract=replace(
-                draft.outcome_contract,
-                effect_requirements=(),
-                maximum_total_artifact_bytes=4096,
-                artifact_requirements=(
-                    ArtifactRequirement(
-                        required=True,
-                        minimum_count=1,
-                        maximum_count=1,
-                        allowed_media_types=("text/markdown",),
-                        allowed_authorships=(
-                            ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
-                        ),
-                        allowed_producer_capability_ids=("artifact.create_document",),
-                        maximum_artifact_bytes=4096,
-                        maximum_total_bytes=4096,
-                        maximum_sensitivity=ModelSensitivity.INTERNAL,
-                    ),
-                ),
-            ),
         )
-        proposal = await fixture.agent.propose_routine(draft)
         routine = await fixture.agent.create_routine(
-            proposal, confirmation_handler=fixture.approve
+            intent,
+            conversation_id=fixture.origin.conversation_id,
+            confirmation_handler=fixture.approve,
         )
         assert len(fixture.approvals) == 1
         request = fixture.approvals[0]
@@ -161,8 +133,7 @@ async def test_once_mcp_research_creates_sourced_briefing_and_inbox_while_host_o
         )
         assert reviewable and exact is not None and document is not None
         assert document.endswith(exact)
-        assert "Competitor briefing" in document and "outbound ceiling" in document
-        assert "third-party service fees" in document
+        assert "Competitor briefing" in document
         assert fixture.server.calls == []
         await fixture.agent.close()
         fixture.clock += timedelta(hours=1)

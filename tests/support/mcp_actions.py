@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+import time
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -16,20 +16,13 @@ from daita import (
     Agent,
     CalendarDaySelector,
     CalendarSchedule,
-    EffectRequirement,
     MCPToolSelection,
-    MisfirePolicy,
-    ReportingMode,
-    RequestedCapabilityGrant,
-    ScheduledRoutineDraft,
+    RoutineIntent,
 )
-from daita._json import FrozenJsonObject
 from daita.adapters.mcp import SDKMCPClientFactory
 from daita.capabilities import (
     AccessMode,
     ApprovalDecision,
-    AutomationEligibility,
-    EffectEvidenceBasis,
     OperationalEffect,
 )
 from daita.llm.models import (
@@ -43,7 +36,6 @@ from daita.llm.models import (
 )
 from daita.llm.pricing import CostEstimate
 from daita.loop.models import LoopLimits
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.mcp import MCPConformanceTransport, MCPFixtureIdentity
 from tests.support.workspace import workspace_for
 
@@ -212,7 +204,6 @@ class ActionFixture:
             "Send the reviewed notification.",
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.EXTERNAL_ACTION,
-            automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         )
         status = await self.agent.attach_mcp_server(
             endpoint=self.server.endpoint,
@@ -288,25 +279,21 @@ class ActionFixture:
     async def receipts(self):
         return await self.agent._embedded._store.list_effect_receipts(self.agent.id)
 
-    async def draft(
-        self, *, minimum=1, ceiling=1, basis=EffectEvidenceBasis.SERVER_REPORTED
-    ):
+    async def draft(self) -> RoutineIntent:
+        """Ask once in a conversation, then return the immediate weekly routine.
+
+        Save it with ``create_routine(intent, conversation_id=self.origin.conversation_id)``.
+        """
+
         self.model.steps = [
             response(text="Prepare the exact immediate and recurring assignment.")
         ]
-        origin = await self.agent.run(
+        self.origin = await self.agent.run(
             "Research status and notify fixed-room now and every Monday."
         )
-        self.origin = origin
-        destination = (
-            await self.agent.distribution_destinations(
-                origin.conversation_id, sensitivity_ceiling=ModelSensitivity.INTERNAL
-            )
-        )[0]
-        return ScheduledRoutineDraft(
-            origin_run_id=origin.run_id,
+        return RoutineIntent(
             title="Weekly status",
-            authorized_instruction="Research current status with citations, then invoke the admitted notification tool for fixed-room. Preserve research and report invocation evidence honestly.",
+            prompt="Research current status with citations, then invoke the admitted notification tool for fixed-room. Preserve research and report invocation evidence honestly.",
             schedule=CalendarSchedule(
                 timezone="America/Chicago",
                 hour=9,
@@ -314,55 +301,18 @@ class ActionFixture:
                 day_selector=CalendarDaySelector.WEEKDAYS,
                 weekdays=(1,),
             ),
-            misfire_policy=MisfirePolicy.LATEST_ONLY,
-            reporting_mode=ReportingMode.ALWAYS,
-            precheck=None,
-            allowed_source_ids=(),
-            allowed_resource_ids=(),
-            allowed_connector_binding_ids=(self.binding.binding_id,),
-            allowed_capability_ids=(
-                self.tool.capability_id,
-                self.research.capability_id,
-            ),
-            sensitivity_ceiling=ModelSensitivity.INTERNAL,
-            outcome_contract=replace(
-                no_artifact_outcome_contract(sensitivity=ModelSensitivity.INTERNAL),
-                effect_requirements=(
-                    EffectRequirement(
-                        self.tool.capability_id, minimum, frozenset({basis})
-                    ),
-                ),
-            ),
-            distribution_destination_id=destination.destination_id,
-            eligible_model_routes=(self.model.provider_id,),
-            per_run_max_tokens=8000,
-            per_run_max_cost_usd=Decimal("1"),
-            cumulative_max_tokens=40000,
-            cumulative_max_cost_usd=Decimal("5"),
-            cumulative_max_attempts=5,
-            cumulative_max_occurrences=5,
-            maximum_consecutive_failures=3,
-            expires_at=NOW + timedelta(days=30),
             run_immediately=True,
-            requested_capability_grants=(
-                RequestedCapabilityGrant(
-                    self.tool.capability_id,
-                    FrozenJsonObject.from_mapping(
-                        {
-                            "binding_id": self.binding.binding_id,
-                            "binding_revision": self.binding.revision,
-                            "remote_tool_name": self.tool.remote_name,
-                            "fixed_arguments": {"destination": "fixed-room"},
-                            "variable_argument_names": ("content",),
-                        }
-                    ),
-                    ceiling,
-                ),
-            ),
+        )
+
+    async def create(self, intent: RoutineIntent):
+        return await self.agent.create_routine(
+            intent, conversation_id=self.origin.conversation_id
         )
 
     async def delivery(self, count=1):
-        for _ in range(1000):
+        # A routine run takes seconds here and more under parallel CI load.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
             deliveries = await self.agent.list_deliveries(
                 conversation_id=self.origin.conversation_id
             )

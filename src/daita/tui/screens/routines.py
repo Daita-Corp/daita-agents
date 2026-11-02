@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
 from typing import ClassVar
 
 from rich.text import Text
@@ -308,10 +307,6 @@ class RoutinesScreen(ModalScreen[None]):
         error.set_class(bool(message), "-visible")
 
 
-def _dollar_ceiling(value: object) -> str:
-    return "no dollar cap" if value is None else f"${value} estimated model cost"
-
-
 def render_routine_list_label(summary: ScheduledRoutineSummary) -> str:
     state = summary.state.value.replace("_", " ").upper()
     title = safe_display(summary.title, fallback="Assignment", maximum=40)
@@ -337,28 +332,10 @@ def render_routine_overview(summary: ScheduledRoutineSummary) -> str:
                 else summary.next_due_at.isoformat()
             ),
             f"Occurrences: {summary.occurrence_count}  ·  consecutive failures: {summary.consecutive_failures}",
-            "Sensitivity ceiling: " + summary.sensitivity_ceiling.value,
             "ID: " + safe_display(summary.routine_id, fallback="routine", maximum=256),
-            "\nChoose Details for the instruction and recent runs, or Full record for exact contracts and evidence.",
+            "\nChoose Details for the prompt and recent runs, or Full record for the stored record and evidence.",
         )
     )
-
-
-def _schedule_text(schedule: Mapping[str, object]) -> str:
-    kind = schedule.get("kind")
-    if kind == "once":
-        return f"Once at {schedule.get('exact_at')}"
-    if kind == "interval":
-        return (
-            f"Every {schedule.get('interval_seconds')} seconds "
-            f"from {schedule.get('anchor_at')}"
-        )
-    if kind == "calendar":
-        return (
-            f"Calendar at {schedule.get('hour')}:{str(schedule.get('minute')).zfill(2)} "
-            f"in {schedule.get('timezone')} · {schedule.get('day_selector')}"
-        )
-    return "Unknown schedule"
 
 
 def render_routine_details(inspection: ScheduledRoutineInspection) -> str:
@@ -366,33 +343,29 @@ def render_routine_details(inspection: ScheduledRoutineInspection) -> str:
     projection = routine_inspection_projection(inspection)
     routine = projection["routine"]
     assert isinstance(routine, dict)
-    schedule = routine["schedule"]
-    assert isinstance(schedule, dict)
-    instruction = sanitize_terminal_text(
-        routine["authorized_instruction"],
+    prompt = sanitize_terminal_text(
+        routine["prompt"],
         maximum=1200,
         preserve_lines=True,
-        fallback="(empty instruction)",
+        fallback="(empty prompt)",
     )
+    sources = routine["source_ids"]
+    assert isinstance(sources, tuple)
     lines = [
-        safe_display(routine["title"], fallback="Assignment", maximum=128),
+        safe_display(routine["title"], fallback="Routine", maximum=128),
         f"State: {routine['state']}  ·  revision {inspection.routine.revision}",
         f"ID: {safe_display(routine['routine_id'], fallback='routine', maximum=256)}",
         "",
         "Schedule",
-        _schedule_text(schedule),
-        f"Next run: {routine['next_due_at'] or 'none'}  ·  missed slots: {routine['misfire_policy']}",
-        f"Expires: {routine['expires_at']}",
+        safe_display(routine["schedule_text"], fallback="schedule", maximum=512),
+        f"Next run: {routine['next_due_at'] or 'none'}",
         "",
         "Instruction",
-        instruction,
+        prompt,
         "",
-        "Limits and access",
-        f"Per run: {routine['per_run_max_tokens']} tokens · {_dollar_ceiling(routine['per_run_max_cost_usd'])}",
-        f"Total: {routine['cumulative_max_tokens']} tokens · {_dollar_ceiling(routine['cumulative_max_cost_usd'])} · {routine['cumulative_max_attempts']} attempts · {routine['cumulative_max_occurrences']} occurrences",
+        "Sources: " + (f"{len(sources)} named" if sources else "all current sources"),
         f"Used: {routine['charged_tokens']} tokens · ${routine['charged_cost_usd']} · {routine['attempt_count']} attempts",
-        f"Scope: {len(routine['allowed_source_ids'])} sources · {len(routine['allowed_resource_ids'])} resources · {len(routine['allowed_connector_binding_ids'])} connectors · {len(routine['allowed_capability_ids'])} capabilities",
-        f"Sensitivity ceiling: {routine['sensitivity_ceiling']}",
+        "Each run uses the agent's current model and normal run limits, and asks before any write.",
         "",
         "Recent runs",
     ]

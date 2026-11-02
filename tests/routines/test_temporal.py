@@ -8,12 +8,10 @@ from pathlib import Path
 import pytest
 
 from daita import Agent, ApprovalDecision
-from daita.distribution import outcome_contract_projection
 from daita.llm.models import FinishReason, ModelResponse, TextBlock, ToolCall
 from daita.llm.providers.mock import MockModelProvider
 from daita.routines.temporal import next_weekday_utc, system_user_timezone
 from tests.support.capability_runtime import execute_projected
-from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.workspace import workspace_for
 
 NOW = datetime(2026, 9, 23, 16, 0, tzinfo=UTC)
@@ -162,33 +160,10 @@ async def test_relative_schedule_starts_after_approval_and_uses_trusted_local_ti
         system_text = system_block.text
         assert "user-local Wednesday 2026-09-23 11:00:00 -0500" in system_text
         assert "America/Chicago" in system_text
-        destinations = await agent.distribution_destinations(origin.conversation_id)
         arguments = {
             "title": "Five-minute follow-up",
-            "authorized_instruction": "Read the source and report one update.",
+            "prompt": "Read the source and report one update.",
             "schedule": schedule,
-            "misfire_policy": "latest_only",
-            "reporting_mode": "always",
-            "allowed_source_ids": (),
-            "allowed_resource_ids": (),
-            "allowed_connector_binding_ids": (),
-            "allowed_capability_ids": ("artifact.create_document",),
-            "sensitivity_ceiling": "internal",
-            "outcome_contract": outcome_contract_projection(
-                no_artifact_outcome_contract()
-            ),
-            "distribution_destination_id": destinations[0].destination_id,
-            "eligible_model_routes": (provider.provider_id,),
-            "per_run_max_tokens": 1000,
-            "per_run_max_cost_usd": "0.01",
-            "cumulative_max_tokens": 1000,
-            "cumulative_max_cost_usd": "0.01",
-            "cumulative_max_attempts": 1,
-            "cumulative_max_occurrences": 1,
-            "maximum_consecutive_failures": 1,
-            "expires_after_seconds": 86400,
-            "skill_names": (),
-            "run_immediately": False,
         }
         run = (await agent._embedded._store.load(origin.run_id)).run
         result = await execute_projected(
@@ -198,15 +173,13 @@ async def test_relative_schedule_starts_after_approval_and_uses_trusted_local_ti
         )
         assert not result.ordered_results[0].is_error, result.ordered_results[0].output
         assert len(approvals) == 1
-        if seconds_field is not None:
-            assert (
-                approvals[0].arguments["timing_intent"]["schedule"][seconds_field]
-                == 300
-            )
+        # The card says when relative timing starts counting.
+        assert ("(timed from approval)" in approvals[0].arguments["schedule"]) == (
+            seconds_field is not None
+        )
         summary = (await agent.list_routines())[0]
         inspection = await agent.inspect_routine(summary.routine_id)
         assert inspection is not None
         assert inspection.routine.next_due_at == expected_due
-        assert inspection.routine.expires_at == NOW + timedelta(minutes=2, days=1)
     finally:
         await agent.close()

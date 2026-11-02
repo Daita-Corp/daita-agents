@@ -11,7 +11,7 @@ How admitted MCP bindings are read and called.
 
 Remote MCP support uses one bounded server-neutral Streamable HTTP client.
 Every binding records an exact endpoint, negotiated identity, admitted
-tool allowlist, schema digests, local access/effect/eligibility and completion
+tool allowlist, schema digests, local access/effect and completion
 admission, sensitivity ceilings, and secret
 reference. Agent open reconstructs immutable declarations without network I/O.
 The first exact call initializes the client and rechecks the binding revision,
@@ -23,18 +23,16 @@ and takes effect immediately. A stale, changed, revoked, unavailable, or
 authentication-failed binding yields one bounded tool error without switching
 servers or retrying the remote call.
 
-MCP selections default to reads; explicit action selections default to interactive
-approval. Locally admitted unattended actions use the shared `mcp.tool_call` grant:
-exact binding/revision/tool, fixed top-level JSON values and bounded distinct scalar
-variable names. Fix nested values in full; arbitrary variable JSON cannot enforce
-nested recipient or target restrictions. Tool and binding outbound ceilings apply
-to the full request classification. No remote annotation grants authority.
+MCP selections default to reads; explicit action selections need approval at the
+time, in foreground and in scheduled and job runs alike. A selection records no
+unattended eligibility. Tool and binding outbound ceilings apply to the full
+request classification. No remote annotation grants authority.
 
 The existing MCP executor preflights without dispatch, then sends exactly one
 `tools/call` after the runtime's reservation. Valid plain-text results without an
 output schema establish server-reported invocation evidence only. Partial errors,
 unusable output, response loss or explicit task acceptance produce uncertainty;
 positive local non-dispatch can establish non-application. Known asynchronous-only
-completion cannot execute or enter an unattended proposal. No task polling, custom
+completion cannot execute, in any run. No task polling, custom
 remote receipts, status/idempotency extension, per-server action adapter or replay
 exists. Current MCP output/capability identities are `mcp.tool.result` / `mcp.tool`.
