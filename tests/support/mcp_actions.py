@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -309,7 +310,9 @@ class ActionFixture:
         )
 
     async def delivery(self, count=1):
-        for _ in range(1000):
+        # A routine run takes seconds here and more under parallel CI load.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
             deliveries = await self.agent.list_deliveries(
                 conversation_id=self.origin.conversation_id
             )

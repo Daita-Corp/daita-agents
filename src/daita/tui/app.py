@@ -206,24 +206,31 @@ class DaitaApp(App[int]):
             if self._modal_future is future:
                 self._modal_future = None
 
-    async def on_unmount(self) -> None:
-        await self._shutdown()
-
     async def _shutdown(self) -> None:
+        """Detach from the host, then finish Textual's own shutdown.
+
+        Textual's shutdown flushes and joins the writer that restores the
+        terminal; without it those last bytes can be lost at process exit.
+        """
+
         if self._shutting_down:
             return
         self._shutting_down = True
-        self._observer.close()
-        # Detach first: open questions stay pending and runs keep going in the
-        # host, so closing the panels and the run wait below cancels nothing.
-        await self.controller.close()
-        for screen in self.screen_stack:
-            for panel in screen.query(ApprovalPanel):
-                panel.action_cancel()
-        pending = self._modal_future
-        if pending is not None and not pending.done():
-            pending.set_result(None)
-        await self._settle_run()
+        try:
+            self._observer.close()
+            # Detach first: open questions stay pending and runs keep going in
+            # the host, so closing the panels and the run wait below cancels
+            # nothing.
+            await self.controller.close()
+            for screen in self.screen_stack:
+                for panel in screen.query(ApprovalPanel):
+                    panel.action_cancel()
+            pending = self._modal_future
+            if pending is not None and not pending.done():
+                pending.set_result(None)
+            await self._settle_run()
+        finally:
+            await super()._shutdown()
 
     async def _settle_run(self) -> None:
         task = self._run_task

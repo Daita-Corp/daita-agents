@@ -183,6 +183,28 @@ async def test_approval_presentation_failure_is_not_converted_to_denial():
 
 
 @pytest.mark.skipif(os.name != "posix", reason="real PTY certification is POSIX-only")
+async def test_exiting_finishes_textual_shutdown_that_flushes_the_terminal(
+    start_host: StartHost,
+):
+    # Textual's own shutdown unmounts widgets, then flushes and joins the writer
+    # that restores the terminal; skipping it can lose those bytes at exit.
+    harness = await start_host()
+    unmounted: list[bool] = []
+
+    class Recording(Static):
+        def on_unmount(self) -> None:
+            unmounted.append(True)
+
+    app = DaitaApp(
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
+    )
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app.mount(Recording())
+        await pilot.pause()
+        app.exit(0)
+    assert unmounted == [True]
+
+
 def test_real_pty_normal_exit_restores_alternate_screen():
     import fcntl
     import pty
