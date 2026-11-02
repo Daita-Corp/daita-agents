@@ -702,6 +702,17 @@ Textual rule: a body inside `App.run_test()` that raises without calling
 `app.exit()` hangs the run. Put `app.exit()` in a `finally`, or let the pilot
 drive the app to its own exit.
 
+### PostgreSQL schema baseline
+
+`tests/live/schema_baseline` measures PostgreSQL discovery limits, catalog
+coverage, per-query structural cost, staleness and question outcomes on a
+1,500-table messy schema. It runs only when `DAITA_SCHEMA_BASELINE_POSTGRES_URL`
+names a disposable `daita_schema_baseline` database. Its paid Daita-versus-Claude
+Code comparison also needs `DAITA_RUN_LIVE_SCHEMA_BASELINE_COMPARISON=1`. The offline report contains
+only synthetic fixture data; the committed results under
+`tests/live/schema_baseline/results/` are the comparison baseline. See its
+`README.md`.
+
 ## Model-surface gate
 
 Scripted models replay old behavior, so a change to what the model is shown

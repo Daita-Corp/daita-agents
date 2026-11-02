@@ -1,0 +1,3901 @@
+{
+  "categories": {
+    "q01-customer-count": "clean",
+    "q02-top-region": "clean",
+    "q03-top-product-units": "foreign_key_join",
+    "q04-item-revenue": "clean",
+    "q05-shipped-orders": "enum",
+    "q06-product-sales-view": "view",
+    "q07-invoice-total": "domain",
+    "q08-payments-2026": "clean",
+    "q09-page-views-day": "partition",
+    "q10-pricing-page-views": "partition",
+    "q11-gold-won-pipeline": "foreign_key_join",
+    "q12-example-com-contacts": "extension_type",
+    "q13-crm-note-count": "unsupported_builtin_type",
+    "q14-mixed-case-accounts": "quoted_identifier",
+    "q15-customers-with-account": "cross_schema_join"
+  },
+  "claude_code_version": "2.1.306 (Claude Code)",
+  "environment": {
+    "base_tables_by_schema": {
+      "crm": 300,
+      "events": 125,
+      "finance": 200,
+      "legacy": 350,
+      "ops": 513,
+      "sales": 12
+    },
+    "branch": "claude/angry-mendel-f410f3",
+    "citext_available": true,
+    "commit": "8547f09e",
+    "dirty": false,
+    "generated_at": "2026-10-21T20:35:09+00:00",
+    "python": "3.11.16",
+    "seed_seconds": 2.07,
+    "server_version": "16.14"
+  },
+  "limits": {
+    "claude_code": {
+      "max_budget_usd": "0.50"
+    },
+    "daita": {
+      "max_steps": 24,
+      "max_total_tokens": 100000,
+      "max_wall_time_seconds": 300.0
+    }
+  },
+  "question_ids": [
+    "q01-customer-count",
+    "q02-top-region",
+    "q03-top-product-units",
+    "q04-item-revenue",
+    "q05-shipped-orders",
+    "q06-product-sales-view",
+    "q07-invoice-total",
+    "q08-payments-2026",
+    "q09-page-views-day",
+    "q10-pricing-page-views",
+    "q11-gold-won-pipeline",
+    "q12-example-com-contacts",
+    "q13-crm-note-count",
+    "q14-mixed-case-accounts",
+    "q15-customers-with-account"
+  ],
+  "repeats": 3,
+  "systems": {
+    "claude_code": {
+      "attach": [],
+      "model": "claude-sonnet-5",
+      "questions": [
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 13870,
+          "category": "clean",
+          "commands": [
+            "psql -X -A -t -c \"SELECT COUNT(*) FROM sales.customers;\""
+          ],
+          "cost_usd": 0.0394045,
+          "error": null,
+          "exit": "success",
+          "expected": "2000",
+          "final_text": "There are 2000 customers in sales.customers.\n\n2000",
+          "id": "q01-customer-count",
+          "input_tokens": 27955,
+          "outcome": "correct",
+          "output_tokens": 142,
+          "repeat": 0,
+          "run_seconds": 4.722,
+          "tool_calls": 1,
+          "total_tokens": 28097,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 113517,
+          "category": "clean",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1 | head -50",
+            "psql -l 2>&1; echo \"---\"; psql -c \"\\dn\" 2>&1; echo \"---env---\"; env | grep -i pg",
+            "psql -l 2>&1",
+            "psql -d daita_schema_baseline -c \"\\dt\" 2>&1",
+            "psql -d daita_schema_baseline -c \"\\dn\" 2>&1; psql -d daita_schema_baseline -c \"select table_schema, table_name from information_schema.tables where table_schema not in ('pg_catalog','information_schema');\" 2>&1",
+            "psql -d daita_schema_baseline -c \"\\d sales.\\\"Customers\\\"\" 2>&1",
+            "psql -d daita_schema_baseline -c \"select region, count(*) from sales.\\\"Customers\\\" group by region order by count(*) desc;\" 2>&1"
+          ],
+          "cost_usd": 0.0522904,
+          "error": null,
+          "exit": "success",
+          "expected": "west",
+          "final_text": "The \"west\" region has the most customers, with 15.\n\nwest",
+          "id": "q02-top-region",
+          "input_tokens": 122375,
+          "outcome": "correct",
+          "output_tokens": 745,
+          "repeat": 0,
+          "run_seconds": 13.013,
+          "tool_calls": 7,
+          "total_tokens": 123120,
+          "turns": 8
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 81997,
+          "category": "foreign_key_join",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\l\" 2>&1; echo \"---\"; psql -c \"\\dn\" 2>&1",
+            "psql -c \"\\dt sales.*\" 2>&1",
+            "psql -c \"\\d sales.order_items\" 2>&1; echo \"---\"; psql -c \"\\d sales.products\" 2>&1; echo \"---\"; psql -c \"\\d sales.products_v2\" 2>&1",
+            "psql -c \"SELECT p.name, SUM(oi.quantity) AS total_units FROM sales.order_items oi JOIN sales.products p ON p.product_id = oi.product_id GROUP BY p.name ORDER BY total_units DESC LIMIT 5;\" 2>&1"
+          ],
+          "cost_usd": 0.0453534,
+          "error": null,
+          "exit": "success",
+          "expected": "Product 42",
+          "final_text": "\"Product 42\" is the clear leader with 6,321 total units sold across all order items, far ahead of the next closest products (~556 units each).\n\nProduct 42",
+          "id": "q03-top-product-units",
+          "input_tokens": 90553,
+          "outcome": "correct",
+          "output_tokens": 757,
+          "repeat": 0,
+          "run_seconds": 13.005,
+          "tool_calls": 5,
+          "total_tokens": 91310,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 21927,
+          "category": "clean",
+          "commands": [
+            "psql -c \"SELECT SUM(quantity * unit_price) FROM sales.order_items;\""
+          ],
+          "cost_usd": 0.020560900000000003,
+          "error": null,
+          "exit": "success",
+          "expected": "2681250",
+          "final_text": "Total order-item revenue:\n\n2681250.00",
+          "id": "q04-item-revenue",
+          "input_tokens": 27978,
+          "outcome": "correct",
+          "output_tokens": 105,
+          "repeat": 0,
+          "run_seconds": 3.812,
+          "tool_calls": 1,
+          "total_tokens": 28083,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 88295,
+          "category": "enum",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\dn\" 2>&1; echo \"---\"; psql -c \"\\dt *.*\" 2>&1",
+            "psql -c \"\\dt *.*\" 2>&1 | grep -i order",
+            "psql -c \"\\d sales.orders\" 2>&1",
+            "psql -c \"SELECT status, count(*) FROM sales.orders GROUP BY status;\" 2>&1"
+          ],
+          "cost_usd": 0.053053,
+          "error": null,
+          "exit": "success",
+          "expected": "2000",
+          "final_text": "Found it in `sales.orders` (the current orders table, excluding `sales.orders_archive` and `legacy` schema).\n\n2000",
+          "id": "q05-shipped-orders",
+          "input_tokens": 99495,
+          "outcome": "correct",
+          "output_tokens": 740,
+          "repeat": 0,
+          "run_seconds": 12.976,
+          "tool_calls": 5,
+          "total_tokens": 100235,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 50580,
+          "category": "view",
+          "commands": [
+            "psql -c \"SELECT SUM(quantity) FROM sales.product_sales WHERE product_id = 42;\"",
+            "psql -c \"\\d sales.product_sales\"",
+            "psql -c \"SELECT units_sold FROM sales.product_sales WHERE product_id = 42;\""
+          ],
+          "cost_usd": 0.030509500000000002,
+          "error": null,
+          "exit": "success",
+          "expected": "6321",
+          "final_text": "6321",
+          "id": "q06-product-sales-view",
+          "input_tokens": 57263,
+          "outcome": "correct",
+          "output_tokens": 369,
+          "repeat": 0,
+          "run_seconds": 7.538,
+          "tool_calls": 3,
+          "total_tokens": 57632,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 21917,
+          "category": "domain",
+          "commands": [
+            "psql -c \"SELECT SUM(amount) FROM finance.invoices;\""
+          ],
+          "cost_usd": 0.021131399999999998,
+          "error": null,
+          "exit": "success",
+          "expected": "217040",
+          "final_text": "The total invoiced amount in finance.invoices is 217040.00.\n\n217040.00",
+          "id": "q07-invoice-total",
+          "input_tokens": 27997,
+          "outcome": "correct",
+          "output_tokens": 155,
+          "repeat": 0,
+          "run_seconds": 4.637,
+          "tool_calls": 1,
+          "total_tokens": 28152,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 83254,
+          "category": "clean",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\l\" 2>&1; echo \"---\"; psql -c \"\\dn\" 2>&1",
+            "psql -c \"SELECT table_schema, table_name FROM information_schema.tables WHERE table_name ILIKE '%payment%';\" 2>&1",
+            "psql -c \"\\d finance.payments\" 2>&1",
+            "psql -c \"SELECT SUM(paid_amount) FROM finance.payments WHERE paid_on >= '2026-01-01';\" 2>&1"
+          ],
+          "cost_usd": 0.045162299999999996,
+          "error": null,
+          "exit": "success",
+          "expected": "136290",
+          "final_text": "The total paid amount for payments made on or after 2026-01-01, from `finance.payments`, is:\n\n136290.00",
+          "id": "q08-payments-2026",
+          "input_tokens": 91993,
+          "outcome": "correct",
+          "output_tokens": 667,
+          "repeat": 0,
+          "run_seconds": 11.429,
+          "tool_calls": 5,
+          "total_tokens": 92660,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 68390,
+          "category": "partition",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1 | head -50",
+            "psql -c \"\\dn\" 2>&1; echo \"---\"; psql -c \"SELECT table_schema, table_name FROM information_schema.tables WHERE table_name ILIKE '%page%view%';\" 2>&1",
+            "psql -c \"\\d events.page_views\" 2>&1\necho \"---partition info---\"\npsql -c \"SELECT pg_get_expr(c.relpartbound, c.oid) FROM pg_class c WHERE c.relname = 'page_views_20260315';\" 2>&1\necho \"---show timezone---\"\npsql -c \"SHOW timezone;\" 2>&1",
+            "psql -c \"SELECT count(*) FROM events.page_views_20260315;\" 2>&1\necho \"---cross-check via parent with explicit UTC bounds---\"\npsql -c \"SELECT count(*) FROM events.page_views WHERE viewed_at >= '2026-03-15 00:00:00+00' AND viewed_at < '2026-03-16 00:00:00+00';\" 2>&1"
+          ],
+          "cost_usd": 0.042802999999999994,
+          "error": null,
+          "exit": "success",
+          "expected": "500",
+          "final_text": "Both the dedicated partition `events.page_views_20260315` and a direct UTC-bounded query against the parent table agree.\n\n500",
+          "id": "q09-page-views-day",
+          "input_tokens": 77222,
+          "outcome": "correct",
+          "output_tokens": 705,
+          "repeat": 0,
+          "run_seconds": 11.038,
+          "tool_calls": 4,
+          "total_tokens": 77927,
+          "turns": 5
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 21924,
+          "category": "partition",
+          "commands": [
+            "psql -c \"SELECT COUNT(*) FROM events.page_views WHERE path = '/pricing';\""
+          ],
+          "cost_usd": 0.0204628,
+          "error": null,
+          "exit": "success",
+          "expected": "15000",
+          "final_text": "15000",
+          "id": "q10-pricing-page-views",
+          "input_tokens": 27972,
+          "outcome": "correct",
+          "output_tokens": 96,
+          "repeat": 0,
+          "run_seconds": 3.98,
+          "tool_calls": 1,
+          "total_tokens": 28068,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 116914,
+          "category": "foreign_key_join",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\l\" 2>&1; echo \"---\"; psql -c \"\\dn\" 2>&1",
+            "psql -c \"\\dt crm.*\" 2>&1; echo \"---sales---\"; psql -c \"\\dt sales.*\" 2>&1",
+            "psql -c \"\\d crm.accounts\" 2>&1; echo \"---\"; psql -c \"\\d crm.opportunities\" 2>&1",
+            "psql -c \"SELECT DISTINCT tier FROM crm.accounts;\" 2>&1; echo \"---\"; psql -c \"SELECT DISTINCT stage FROM crm.opportunities;\" 2>&1",
+            "psql -c \"SELECT SUM(o.amount) AS total_won_gold FROM crm.opportunities o JOIN crm.accounts a ON o.account_id = a.account_id WHERE a.tier = 'gold' AND o.stage = 'won';\" 2>&1"
+          ],
+          "cost_usd": 0.0703433,
+          "error": null,
+          "exit": "success",
+          "expected": "278100",
+          "final_text": "The total amount of won opportunities for gold-tier CRM accounts, joining `crm.opportunities` to `crm.accounts` on `account_id` filtering `tier = 'gold'` and `stage = 'won'`.\n\n278100.00",
+          "id": "q11-gold-won-pipeline",
+          "input_tokens": 131741,
+          "outcome": "correct",
+          "output_tokens": 990,
+          "repeat": 0,
+          "run_seconds": 14.939,
+          "tool_calls": 6,
+          "total_tokens": 132731,
+          "turns": 7
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 117331,
+          "category": "extension_type",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\dn\" 2>&1; echo \"---\"; psql -c \"select table_schema, table_name from information_schema.tables where table_type='BASE TABLE' and table_schema not in ('pg_catalog','information_schema');\" 2>&1",
+            "psql -c \"\\dt crm.*\" 2>&1",
+            "psql -c \"\\d crm.contacts\" 2>&1",
+            "psql -c \"select count(*) from crm.contacts where email ilike '%@example.com';\" 2>&1",
+            "psql -c \"select count(*) from crm.contacts where lower(split_part(email::text, '@', 2)) = 'example.com';\" 2>&1"
+          ],
+          "cost_usd": 0.06882920000000001,
+          "error": null,
+          "exit": "success",
+          "expected": "600",
+          "final_text": "Both query methods agree.\n\n600",
+          "id": "q12-example-com-contacts",
+          "input_tokens": 131915,
+          "outcome": "correct",
+          "output_tokens": 891,
+          "repeat": 0,
+          "run_seconds": 16.526,
+          "tool_calls": 6,
+          "total_tokens": 132806,
+          "turns": 7
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 21914,
+          "category": "unsupported_builtin_type",
+          "commands": [
+            "psql -t -c \"SELECT COUNT(*) FROM crm.notes;\""
+          ],
+          "cost_usd": 0.0208783,
+          "error": null,
+          "exit": "success",
+          "expected": "1200",
+          "final_text": "There are 1200 notes in crm.notes.\n\n1200",
+          "id": "q13-crm-note-count",
+          "input_tokens": 27965,
+          "outcome": "correct",
+          "output_tokens": 137,
+          "repeat": 0,
+          "run_seconds": 4.486,
+          "tool_calls": 1,
+          "total_tokens": 28102,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 21949,
+          "category": "quoted_identifier",
+          "commands": [
+            "psql -At -c 'SELECT COUNT(*) FROM legacy.\"Accounts\";'"
+          ],
+          "cost_usd": 0.020985300000000002,
+          "error": null,
+          "exit": "success",
+          "expected": "33",
+          "final_text": "33",
+          "id": "q14-mixed-case-accounts",
+          "input_tokens": 28048,
+          "outcome": "correct",
+          "output_tokens": 135,
+          "repeat": 0,
+          "run_seconds": 4.717,
+          "tool_calls": 1,
+          "total_tokens": 28183,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 72104,
+          "category": "cross_schema_join",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\dn\" 2>&1; echo \"---\"; psql -c \"SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') ORDER BY 1,2;\" 2>&1",
+            "echo \"=== sales tables ===\"; psql -c \"SELECT table_name FROM information_schema.tables WHERE table_schema='sales' ORDER BY 1;\" 2>&1\necho \"=== crm.accounts columns ===\"; psql -c \"\\d crm.accounts\" 2>&1\necho \"=== sales.customers columns ===\"; psql -c \"\\d sales.customers\" 2>&1",
+            "psql -c \"SELECT COUNT(*) FROM sales.customers c JOIN crm.accounts a ON a.customer_id = c.customer_id;\" 2>&1"
+          ],
+          "cost_usd": 0.054425799999999996,
+          "error": null,
+          "exit": "success",
+          "expected": "900",
+          "final_text": "900",
+          "id": "q15-customers-with-account",
+          "input_tokens": 85092,
+          "outcome": "correct",
+          "output_tokens": 754,
+          "repeat": 0,
+          "run_seconds": 12.958,
+          "tool_calls": 4,
+          "total_tokens": 85846,
+          "turns": 5
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 13870,
+          "category": "clean",
+          "commands": [
+            "psql -t -c \"SELECT COUNT(*) FROM sales.customers;\""
+          ],
+          "cost_usd": 0.0388095,
+          "error": null,
+          "exit": "success",
+          "expected": "2000",
+          "final_text": "2000",
+          "id": "q01-customer-count",
+          "input_tokens": 27921,
+          "outcome": "correct",
+          "output_tokens": 91,
+          "repeat": 1,
+          "run_seconds": 4.814,
+          "tool_calls": 1,
+          "total_tokens": 28012,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 120960,
+          "category": "clean",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\l\" 2>&1; echo \"---\"; psql -c \"\\dn\" 2>&1",
+            "psql -c \"select table_schema, table_name from information_schema.tables where table_schema not in ('pg_catalog','information_schema') order by 1,2;\" 2>&1",
+            "psql -c \"\\d crm.customers\" 2>&1",
+            "psql -c \"select table_schema, table_name from information_schema.tables where table_name like '%customer%' and table_name !~ '_[0-9]+$' order by 1,2;\" 2>&1",
+            "echo \"=== sales.customers ===\"; psql -c \"\\d sales.customers\" 2>&1\necho \"=== legacy.customers ===\"; psql -c \"\\d legacy.customers\" 2>&1\necho \"=== legacy.customer ===\"; psql -c \"\\d legacy.customer\" 2>&1",
+            "psql -c \"select region, count(*) from sales.customers group by region order by count(*) desc;\" 2>&1"
+          ],
+          "cost_usd": 0.071154,
+          "error": null,
+          "exit": "success",
+          "expected": "west",
+          "final_text": "The region with the most customers is \"west\" with 600 customers.\n\nwest",
+          "id": "q02-top-region",
+          "input_tokens": 134908,
+          "outcome": "correct",
+          "output_tokens": 1210,
+          "repeat": 1,
+          "run_seconds": 17.247,
+          "tool_calls": 7,
+          "total_tokens": 136118,
+          "turns": 8
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 87997,
+          "category": "foreign_key_join",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\l\" 2>&1; echo \"---\"; psql -c \"\\dn\" 2>&1; echo \"---\"; psql -c \"SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema');\" 2>&1",
+            "psql -c \"SELECT table_schema, table_name FROM information_schema.tables WHERE table_name ILIKE '%order%' OR table_name ILIKE '%product%';\" 2>&1",
+            "psql -c \"\\d sales.order_items\" 2>&1; echo \"---\"; psql -c \"\\d sales.products\" 2>&1",
+            "psql -c \"\nSELECT p.name, SUM(oi.quantity) AS total_units\nFROM sales.order_items oi\nJOIN sales.products p ON p.product_id = oi.product_id\nGROUP BY p.name\nORDER BY total_units DESC\nLIMIT 5;\n\" 2>&1"
+          ],
+          "cost_usd": 0.053930900000000004,
+          "error": null,
+          "exit": "success",
+          "expected": "Product 42",
+          "final_text": "\"Product 42\" has sold the most units (6,321) across all order items, far ahead of the rest.\n\nProduct 42",
+          "id": "q03-top-product-units",
+          "input_tokens": 99108,
+          "outcome": "correct",
+          "output_tokens": 856,
+          "repeat": 1,
+          "run_seconds": 14.11,
+          "tool_calls": 5,
+          "total_tokens": 99964,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 21927,
+          "category": "clean",
+          "commands": [
+            "psql -t -c \"SELECT SUM(quantity * unit_price) FROM sales.order_items;\""
+          ],
+          "cost_usd": 0.0208034,
+          "error": null,
+          "exit": "success",
+          "expected": "2681250",
+          "final_text": "2681250.00",
+          "id": "q04-item-revenue",
+          "input_tokens": 27995,
+          "outcome": "correct",
+          "output_tokens": 125,
+          "repeat": 1,
+          "run_seconds": 4.184,
+          "tool_calls": 1,
+          "total_tokens": 28120,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 86743,
+          "category": "enum",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\dn\" 2>&1; echo \"---\"; psql -c \"SELECT schemaname, tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema');\" 2>&1",
+            "psql -c \"SELECT schemaname, tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema','events') AND tablename ILIKE '%order%';\" 2>&1",
+            "psql -c \"\\d sales.orders\" 2>&1",
+            "psql -c \"SELECT status, count(*) FROM sales.orders GROUP BY status ORDER BY status;\" 2>&1"
+          ],
+          "cost_usd": 0.0504251,
+          "error": null,
+          "exit": "success",
+          "expected": "2000",
+          "final_text": "The real `sales.orders` table (not archive/legacy) has 2000 orders with status `shipped`.\n\n2000",
+          "id": "q05-shipped-orders",
+          "input_tokens": 96996,
+          "outcome": "correct",
+          "output_tokens": 745,
+          "repeat": 1,
+          "run_seconds": 11.432,
+          "tool_calls": 5,
+          "total_tokens": 97741,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 50518,
+          "category": "view",
+          "commands": [
+            "psql -X -A -t -c \"SELECT SUM(quantity) FROM sales.product_sales WHERE product_id = 42;\"",
+            "psql -X -A -t -c \"\\d sales.product_sales\"",
+            "psql -X -A -t -c \"SELECT units_sold FROM sales.product_sales WHERE product_id = 42;\""
+          ],
+          "cost_usd": 0.0302446,
+          "error": null,
+          "exit": "success",
+          "expected": "6321",
+          "final_text": "6321",
+          "id": "q06-product-sales-view",
+          "input_tokens": 57104,
+          "outcome": "correct",
+          "output_tokens": 368,
+          "repeat": 1,
+          "run_seconds": 8.6,
+          "tool_calls": 3,
+          "total_tokens": 57472,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 36358,
+          "category": "domain",
+          "commands": [
+            "psql -X -c \"SELECT SUM(total_amount) FROM finance.invoices;\" 2>&1 || psql -X -c \"\\d finance.invoices\" 2>&1",
+            "psql -X -t -c \"SELECT SUM(amount) FROM finance.invoices;\""
+          ],
+          "cost_usd": 0.0258686,
+          "error": null,
+          "exit": "success",
+          "expected": "217040",
+          "final_text": "The total invoiced amount in finance.invoices is:\n\n217040.00",
+          "id": "q07-invoice-total",
+          "input_tokens": 42938,
+          "outcome": "correct",
+          "output_tokens": 215,
+          "repeat": 1,
+          "run_seconds": 6.457,
+          "tool_calls": 2,
+          "total_tokens": 43153,
+          "turns": 3
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 133334,
+          "category": "clean",
+          "commands": [
+            "psql -c \"\\dt\" && psql -c \"\\d payments\"",
+            "env | grep -i pg; psql -l",
+            "psql -l",
+            "psql -d daita_schema_baseline -c \"\\dt\"",
+            "psql -d daita_schema_baseline -c \"\\dn\" && psql -d daita_schema_baseline -c \"SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema');\"",
+            "psql -d daita_schema_baseline -c \"SELECT table_schema, table_name FROM information_schema.tables WHERE table_name ILIKE '%payment%';\"",
+            "psql -d daita_schema_baseline -c \"\\d finance.payments\"",
+            "psql -d daita_schema_baseline -c \"SELECT SUM(paid_amount) FROM finance.payments WHERE paid_on >= '2026-01-01';\""
+          ],
+          "cost_usd": 0.0640878,
+          "error": null,
+          "exit": "success",
+          "expected": "136290",
+          "final_text": "The total paid amount for payments made on or after 2026-01-01, from `finance.payments`, is:\n\n136290.00",
+          "id": "q08-payments-2026",
+          "input_tokens": 143886,
+          "outcome": "correct",
+          "output_tokens": 1105,
+          "repeat": 1,
+          "run_seconds": 17.42,
+          "tool_calls": 8,
+          "total_tokens": 144991,
+          "turns": 9
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 84720,
+          "category": "partition",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1 | head -50",
+            "psql -c \"\\dn\" 2>&1",
+            "psql -c \"\\dt events.*\" 2>&1",
+            "psql -c \"\\d events.page_views\" 2>&1",
+            "psql -c \"SHOW timezone;\" -c \"SELECT count(*) FROM events.page_views WHERE viewed_at >= '2026-03-15 00:00:00+00' AND viewed_at < '2026-03-16 00:00:00+00';\" 2>&1"
+          ],
+          "cost_usd": 0.0474705,
+          "error": null,
+          "exit": "success",
+          "expected": "500",
+          "final_text": "500 page views were recorded on 2026-03-15 (UTC).\n\n500",
+          "id": "q09-page-views-day",
+          "input_tokens": 94373,
+          "outcome": "correct",
+          "output_tokens": 640,
+          "repeat": 1,
+          "run_seconds": 11.112,
+          "tool_calls": 5,
+          "total_tokens": 95013,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 21924,
+          "category": "partition",
+          "commands": [
+            "psql -c \"SELECT COUNT(*) FROM events.page_views WHERE path = '/pricing';\""
+          ],
+          "cost_usd": 0.0205153,
+          "error": null,
+          "exit": "success",
+          "expected": "15000",
+          "final_text": "15000",
+          "id": "q10-pricing-page-views",
+          "input_tokens": 27977,
+          "outcome": "correct",
+          "output_tokens": 100,
+          "repeat": 1,
+          "run_seconds": 4.316,
+          "tool_calls": 1,
+          "total_tokens": 28077,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 147917,
+          "category": "foreign_key_join",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\l\" 2>&1",
+            "psql -d daita_schema_baseline -c \"\\dt\" 2>&1",
+            "psql -d daita_schema_baseline -c \"\\dn\" 2>&1; echo \"---\"; psql -d daita_schema_baseline -c \"select schema_name from information_schema.schemata;\" 2>&1",
+            "psql -d daita_schema_baseline -c \"\\dt crm.*\" 2>&1; echo \"---sales---\"; psql -d daita_schema_baseline -c \"\\dt sales.*\" 2>&1",
+            "psql -d daita_schema_baseline -c \"\\d crm.accounts\" 2>&1; echo \"---opportunities---\"; psql -d daita_schema_baseline -c \"\\d crm.opportunities\" 2>&1",
+            "psql -d daita_schema_baseline -c \"select distinct tier from crm.accounts;\" 2>&1; echo \"---stage---\"; psql -d daita_schema_baseline -c \"select distinct stage from crm.opportunities;\" 2>&1",
+            "psql -d daita_schema_baseline -c \"select sum(o.amount) from crm.opportunities o join crm.accounts a on o.account_id = a.account_id where a.tier = 'gold' and o.stage = 'won';\" 2>&1"
+          ],
+          "cost_usd": 0.07948940000000002,
+          "error": null,
+          "exit": "success",
+          "expected": "278100",
+          "final_text": "The total amount of won opportunities for gold-tier CRM accounts, from `crm.opportunities` joined with `crm.accounts` (filtering `stage = 'won'` and `tier = 'gold'`), is:\n\n278100.00",
+          "id": "q11-gold-won-pipeline",
+          "input_tokens": 163191,
+          "outcome": "correct",
+          "output_tokens": 1173,
+          "repeat": 1,
+          "run_seconds": 16.627,
+          "tool_calls": 8,
+          "total_tokens": 164364,
+          "turns": 9
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 126415,
+          "category": "extension_type",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\l\" 2>&1",
+            "psql -d daita_schema_baseline -c \"\\dt\" 2>&1",
+            "psql -d daita_schema_baseline -c \"\\dn\" 2>&1; psql -d daita_schema_baseline -c \"select table_schema, table_name from information_schema.tables where table_schema not in ('pg_catalog','information_schema');\" 2>&1",
+            "psql -d daita_schema_baseline -c \"\\dt crm.*\" 2>&1",
+            "psql -d daita_schema_baseline -c \"\\d crm.contacts\" 2>&1",
+            "psql -d daita_schema_baseline -c \"select count(*) from crm.contacts where lower(email) like '%@example.com';\" 2>&1"
+          ],
+          "cost_usd": 0.0719425,
+          "error": null,
+          "exit": "success",
+          "expected": "600",
+          "final_text": "600 CRM contacts have an email address at example.com (case-insensitive).\n\n600",
+          "id": "q12-example-com-contacts",
+          "input_tokens": 141386,
+          "outcome": "correct",
+          "output_tokens": 924,
+          "repeat": 1,
+          "run_seconds": 14.136,
+          "tool_calls": 7,
+          "total_tokens": 142310,
+          "turns": 8
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 21914,
+          "category": "unsupported_builtin_type",
+          "commands": [
+            "psql -t -c \"SELECT COUNT(*) FROM crm.notes;\""
+          ],
+          "cost_usd": 0.0205683,
+          "error": null,
+          "exit": "success",
+          "expected": "1200",
+          "final_text": "1200",
+          "id": "q13-crm-note-count",
+          "input_tokens": 27953,
+          "outcome": "correct",
+          "output_tokens": 109,
+          "repeat": 1,
+          "run_seconds": 4.851,
+          "tool_calls": 1,
+          "total_tokens": 28062,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 21949,
+          "category": "quoted_identifier",
+          "commands": [
+            "psql -c 'SELECT COUNT(*) FROM legacy.\"Accounts\";'"
+          ],
+          "cost_usd": 0.0210453,
+          "error": null,
+          "exit": "success",
+          "expected": "33",
+          "final_text": "The table legacy.\"Accounts\" contains 33 rows.\n\n33",
+          "id": "q14-mixed-case-accounts",
+          "input_tokens": 28048,
+          "outcome": "correct",
+          "output_tokens": 141,
+          "repeat": 1,
+          "run_seconds": 4.627,
+          "tool_calls": 1,
+          "total_tokens": 28189,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 97524,
+          "category": "cross_schema_join",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\dn\" 2>&1; echo \"---\"; psql -c \"select current_database();\" 2>&1",
+            "psql -c \"\\dt sales.*\" 2>&1; echo \"---\"; psql -c \"\\dt crm.*\" 2>&1",
+            "psql -c '\\d sales.customers' 2>&1; echo \"---\"; psql -c '\\d crm.accounts' 2>&1",
+            "psql -c \"SELECT COUNT(*) FROM sales.customers c JOIN crm.accounts a ON a.customer_id = c.customer_id;\" 2>&1"
+          ],
+          "cost_usd": 0.0727938,
+          "error": null,
+          "exit": "success",
+          "expected": "900",
+          "final_text": "900 sales customers have a CRM account (joining `sales.customers` with `crm.accounts` on `customer_id`).\n\n900",
+          "id": "q15-customers-with-account",
+          "input_tokens": 115910,
+          "outcome": "correct",
+          "output_tokens": 733,
+          "repeat": 1,
+          "run_seconds": 12.116,
+          "tool_calls": 5,
+          "total_tokens": 116643,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 13870,
+          "category": "clean",
+          "commands": [
+            "psql -c \"SELECT COUNT(*) FROM sales.customers;\""
+          ],
+          "cost_usd": 0.03937449999999999,
+          "error": null,
+          "exit": "success",
+          "expected": "2000",
+          "final_text": "There are 2000 customers in sales.customers.\n\n2000",
+          "id": "q01-customer-count",
+          "input_tokens": 27967,
+          "outcome": "correct",
+          "output_tokens": 136,
+          "repeat": 2,
+          "run_seconds": 5.423,
+          "tool_calls": 1,
+          "total_tokens": 28103,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 66929,
+          "category": "clean",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\dn\" 2>&1; echo \"---\"; psql -c \"SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema');\" 2>&1",
+            "psql -c '\\d sales.\"Customers\"' 2>&1",
+            "psql -c 'SELECT region, COUNT(*) AS cnt FROM sales.\"Customers\" GROUP BY region ORDER BY cnt DESC;' 2>&1"
+          ],
+          "cost_usd": 0.0389783,
+          "error": null,
+          "exit": "success",
+          "expected": "west",
+          "final_text": "The \"west\" region has the most customers (15).\n\nwest",
+          "id": "q02-top-region",
+          "input_tokens": 74844,
+          "outcome": "correct",
+          "output_tokens": 581,
+          "repeat": 2,
+          "run_seconds": 10.946,
+          "tool_calls": 4,
+          "total_tokens": 75425,
+          "turns": 5
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 87934,
+          "category": "foreign_key_join",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\dn\" 2>&1; psql -c \"SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema');\" 2>&1",
+            "psql -c \"SELECT table_schema, table_name FROM information_schema.tables WHERE table_name ILIKE '%order%' OR table_name ILIKE '%product%' OR table_name ILIKE '%item%';\" 2>&1",
+            "psql -c \"\\d sales.order_items\" 2>&1; echo \"---\"; psql -c \"\\d sales.products\" 2>&1",
+            "psql -c \"SELECT p.name, SUM(oi.quantity) AS total_units FROM sales.order_items oi JOIN sales.products p ON p.product_id = oi.product_id GROUP BY p.name ORDER BY total_units DESC LIMIT 5;\" 2>&1"
+          ],
+          "cost_usd": 0.0539233,
+          "error": null,
+          "exit": "success",
+          "expected": "Product 42",
+          "final_text": "The product named \"Product 42\" has sold the most units (6,321) across all order items in `sales.order_items`, far ahead of the next closest products (~556 units each).\n\nProduct 42",
+          "id": "q03-top-product-units",
+          "input_tokens": 98995,
+          "outcome": "correct",
+          "output_tokens": 869,
+          "repeat": 2,
+          "run_seconds": 13.083,
+          "tool_calls": 5,
+          "total_tokens": 99864,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 21927,
+          "category": "clean",
+          "commands": [
+            "psql -t -A -c \"SELECT SUM(quantity * unit_price) FROM sales.order_items;\""
+          ],
+          "cost_usd": 0.0210009,
+          "error": null,
+          "exit": "success",
+          "expected": "2681250",
+          "final_text": "2681250.00",
+          "id": "q04-item-revenue",
+          "input_tokens": 28010,
+          "outcome": "correct",
+          "output_tokens": 141,
+          "repeat": 2,
+          "run_seconds": 4.899,
+          "tool_calls": 1,
+          "total_tokens": 28151,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 86732,
+          "category": "enum",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\dn\" 2>&1; echo \"---\"; psql -c \"SELECT schemaname, tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema');\" 2>&1",
+            "psql -c \"SELECT schemaname, tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema','events') AND tablename ILIKE '%order%';\" 2>&1",
+            "psql -c \"\\d sales.orders\" 2>&1",
+            "psql -c \"SELECT COUNT(*) FROM sales.orders WHERE status = 'shipped';\" 2>&1"
+          ],
+          "cost_usd": 0.05116539999999999,
+          "error": null,
+          "exit": "success",
+          "expected": "2000",
+          "final_text": "The current orders table is `sales.orders` (the `legacy` schema and `orders_archive`/`order_v2` tables were excluded as instructed).\n\n2000",
+          "id": "q05-shipped-orders",
+          "input_tokens": 96994,
+          "outcome": "correct",
+          "output_tokens": 817,
+          "repeat": 2,
+          "run_seconds": 16.454,
+          "tool_calls": 5,
+          "total_tokens": 97811,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 50573,
+          "category": "view",
+          "commands": [
+            "psql -c \"SELECT SUM(quantity) FROM sales.product_sales WHERE product_id = 42;\"",
+            "psql -c \"\\d sales.product_sales\"",
+            "psql -c \"SELECT units_sold FROM sales.product_sales WHERE product_id = 42;\""
+          ],
+          "cost_usd": 0.0302181,
+          "error": null,
+          "exit": "success",
+          "expected": "6321",
+          "final_text": "6321",
+          "id": "q06-product-sales-view",
+          "input_tokens": 57228,
+          "outcome": "correct",
+          "output_tokens": 347,
+          "repeat": 2,
+          "run_seconds": 7.17,
+          "tool_calls": 3,
+          "total_tokens": 57575,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 36351,
+          "category": "domain",
+          "commands": [
+            "psql -c \"SELECT SUM(total_amount) FROM finance.invoices;\" 2>&1 || psql -c \"\\d finance.invoices\" 2>&1",
+            "psql -c \"SELECT SUM(amount) FROM finance.invoices;\""
+          ],
+          "cost_usd": 0.0257972,
+          "error": null,
+          "exit": "success",
+          "expected": "217040",
+          "final_text": "The total invoiced amount in finance.invoices is:\n\n217040.00",
+          "id": "q07-invoice-total",
+          "input_tokens": 42935,
+          "outcome": "correct",
+          "output_tokens": 207,
+          "repeat": 2,
+          "run_seconds": 5.912,
+          "tool_calls": 2,
+          "total_tokens": 43142,
+          "turns": 3
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 89290,
+          "category": "clean",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\l\" 2>&1; echo \"---\"; psql -c \"\\dn\" 2>&1",
+            "psql -c \"\\dt finance.*\" 2>&1; echo \"---\"; psql -c \"\\dt sales.*\" 2>&1",
+            "psql -c \"\\d finance.payments\" 2>&1",
+            "psql -c \"SELECT SUM(paid_amount) FROM finance.payments WHERE paid_on >= '2026-01-01';\" 2>&1"
+          ],
+          "cost_usd": 0.0545895,
+          "error": null,
+          "exit": "success",
+          "expected": "136290",
+          "final_text": "The total paid amount for payments made on or after 2026-01-01, from `finance.payments`, is:\n\n136290.00",
+          "id": "q08-payments-2026",
+          "input_tokens": 101053,
+          "outcome": "correct",
+          "output_tokens": 733,
+          "repeat": 2,
+          "run_seconds": 12.224,
+          "tool_calls": 5,
+          "total_tokens": 101786,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 83831,
+          "category": "partition",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1 | head -50",
+            "psql -c \"\\dn\" 2>&1; echo \"---\"; psql -c \"SELECT schemaname, tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema');\" 2>&1",
+            "psql -c \"\\d events.page_views\" 2>&1 | head -40; echo \"---partition for 0315---\"; psql -c \"SELECT * FROM pg_tables WHERE schemaname='events' AND tablename='page_views_20260315';\" 2>&1; echo \"---pg_partition_tree---\"; psql -c \"SELECT relname, pg_get_expr(relpartbound, oid) FROM pg_class c WHERE relname = 'page_views_20260315';\" 2>&1",
+            "psql -c \"SELECT count(*) FROM events.page_views WHERE viewed_at >= '2026-03-15 00:00:00+00' AND viewed_at < '2026-03-16 00:00:00+00';\" 2>&1",
+            "psql -c \"SELECT count(*) FROM events.page_views_20260315;\" 2>&1"
+          ],
+          "cost_usd": 0.0471877,
+          "error": null,
+          "exit": "success",
+          "expected": "500",
+          "final_text": "Confirmed consistent across both query methods.\n\n500",
+          "id": "q09-page-views-day",
+          "input_tokens": 92438,
+          "outcome": "correct",
+          "output_tokens": 891,
+          "repeat": 2,
+          "run_seconds": 13.553,
+          "tool_calls": 5,
+          "total_tokens": 93329,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 21924,
+          "category": "partition",
+          "commands": [
+            "psql -c \"SELECT COUNT(*) FROM events.page_views WHERE path = '/pricing';\""
+          ],
+          "cost_usd": 0.0209028,
+          "error": null,
+          "exit": "success",
+          "expected": "15000",
+          "final_text": "15000",
+          "id": "q10-pricing-page-views",
+          "input_tokens": 28008,
+          "outcome": "correct",
+          "output_tokens": 131,
+          "repeat": 2,
+          "run_seconds": 4.846,
+          "tool_calls": 1,
+          "total_tokens": 28139,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 140617,
+          "category": "foreign_key_join",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -l 2>&1",
+            "psql -d daita_schema_baseline -c \"\\dt\" 2>&1",
+            "psql -d daita_schema_baseline -c \"\\dn\" 2>&1; echo \"---\"; psql -d daita_schema_baseline -c \"SELECT schemaname, tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema');\" 2>&1",
+            "psql -d daita_schema_baseline -c \"SELECT tablename FROM pg_tables WHERE schemaname='crm';\" 2>&1",
+            "psql -d daita_schema_baseline -c \"\\d crm.opportunities\" 2>&1; echo \"---\"; psql -d daita_schema_baseline -c \"\\d crm.accounts\" 2>&1",
+            "psql -d daita_schema_baseline -c \"SELECT DISTINCT stage FROM crm.opportunities;\" 2>&1; echo \"---\"; psql -d daita_schema_baseline -c \"SELECT DISTINCT tier FROM crm.accounts;\" 2>&1",
+            "psql -d daita_schema_baseline -c \"SELECT SUM(o.amount) FROM crm.opportunities o JOIN crm.accounts a ON o.account_id = a.account_id WHERE a.tier = 'gold' AND o.stage = 'won';\" 2>&1"
+          ],
+          "cost_usd": 0.07131190000000001,
+          "error": null,
+          "exit": "success",
+          "expected": "278100",
+          "final_text": "The total amount of won opportunities for gold-tier CRM accounts is:\n\n278100.00",
+          "id": "q11-gold-won-pipeline",
+          "input_tokens": 153188,
+          "outcome": "correct",
+          "output_tokens": 1177,
+          "repeat": 2,
+          "run_seconds": 15.517,
+          "tool_calls": 8,
+          "total_tokens": 154365,
+          "turns": 9
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 88393,
+          "category": "extension_type",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1 | head -50",
+            "psql -c \"\\dn\" 2>&1; echo \"---\"; psql -c \"SELECT schemaname, tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema');\" 2>&1",
+            "psql -c \"SELECT tablename FROM pg_tables WHERE schemaname='crm';\"",
+            "psql -c \"\\d crm.contacts\"",
+            "psql -c \"SELECT count(*) FROM crm.contacts WHERE lower(email) LIKE '%@example.com';\""
+          ],
+          "cost_usd": 0.0520051,
+          "error": null,
+          "exit": "success",
+          "expected": "600",
+          "final_text": "600 CRM contacts have an email address at example.com (case-insensitive).\n\n600",
+          "id": "q12-example-com-contacts",
+          "input_tokens": 99346,
+          "outcome": "correct",
+          "output_tokens": 695,
+          "repeat": 2,
+          "run_seconds": 11.01,
+          "tool_calls": 5,
+          "total_tokens": 100041,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 21914,
+          "category": "unsupported_builtin_type",
+          "commands": [
+            "psql -t -c \"SELECT COUNT(*) FROM crm.notes;\""
+          ],
+          "cost_usd": 0.020940800000000002,
+          "error": null,
+          "exit": "success",
+          "expected": "1200",
+          "final_text": "There are 1200 notes in crm.notes.\n\n1200",
+          "id": "q13-crm-note-count",
+          "input_tokens": 27970,
+          "outcome": "correct",
+          "output_tokens": 142,
+          "repeat": 2,
+          "run_seconds": 4.392,
+          "tool_calls": 1,
+          "total_tokens": 28112,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 21949,
+          "category": "quoted_identifier",
+          "commands": [
+            "psql -Atc 'SELECT COUNT(*) FROM legacy.\"Accounts\";'"
+          ],
+          "cost_usd": 0.0210353,
+          "error": null,
+          "exit": "success",
+          "expected": "33",
+          "final_text": "33",
+          "id": "q14-mixed-case-accounts",
+          "input_tokens": 28052,
+          "outcome": "correct",
+          "output_tokens": 139,
+          "repeat": 2,
+          "run_seconds": 4.762,
+          "tool_calls": 1,
+          "total_tokens": 28191,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "api_error_status": null,
+          "asked_clarification": false,
+          "cache_read_tokens": 88431,
+          "category": "cross_schema_join",
+          "commands": [
+            "psql -c \"\\dt\" 2>&1",
+            "psql -c \"\\dn\" 2>&1; echo \"---\"; psql -c \"select table_schema, table_name from information_schema.tables where table_schema not in ('pg_catalog','information_schema') order by 1,2;\" 2>&1",
+            "psql -c \"select table_schema, table_name from information_schema.tables where table_schema='sales' order by 1,2;\" 2>&1",
+            "echo \"=== sales.customers ===\"; psql -c '\\d sales.customers' 2>&1\necho \"=== sales.\\\"Customers\\\" ===\"; psql -c '\\d sales.\"Customers\"' 2>&1\necho \"=== crm.accounts ===\"; psql -c '\\d crm.accounts' 2>&1\necho \"=== crm.customers ===\"; psql -c '\\d crm.customers' 2>&1",
+            "psql -c \"select count(*) from sales.customers c join crm.accounts a on a.customer_id = c.customer_id;\" 2>&1"
+          ],
+          "cost_usd": 0.061637700000000004,
+          "error": null,
+          "exit": "success",
+          "expected": "900",
+          "final_text": "900 sales customers have a CRM account (joining `sales.customers` to `crm.accounts` on `customer_id`).\n\n900",
+          "id": "q15-customers-with-account",
+          "input_tokens": 101970,
+          "outcome": "correct",
+          "output_tokens": 1011,
+          "repeat": 2,
+          "run_seconds": 15.168,
+          "tool_calls": 5,
+          "total_tokens": 102981,
+          "turns": 6
+        }
+      ],
+      "summary": {
+        "answer_elsewhere": 0,
+        "mean_input_tokens_per_turn": 16078,
+        "mean_run_seconds": 9.7,
+        "outcomes": {
+          "confident_wrong": 0,
+          "correct": 45,
+          "incomplete": 0,
+          "no_answer": 0
+        },
+        "runs": 45,
+        "total_cost_usd": "1.9054",
+        "total_tokens": 3368196,
+        "total_tool_calls": 163,
+        "total_turns": 208
+      }
+    },
+    "daita": {
+      "attach": [
+        {
+          "relationships": 37,
+          "resources": 962,
+          "round_trips": {
+            "metadata": 1952,
+            "metadata_by_statement": {
+              "columns": 987,
+              "estimates": 1,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 3,
+            "user_query": 0
+          },
+          "schemas": [
+            "crm",
+            "events",
+            "finance",
+            "legacy",
+            "sales"
+          ],
+          "seconds": 1.222,
+          "status": "attached"
+        },
+        {
+          "relationships": 37,
+          "resources": 962,
+          "round_trips": {
+            "metadata": 1952,
+            "metadata_by_statement": {
+              "columns": 987,
+              "estimates": 1,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 3,
+            "user_query": 0
+          },
+          "schemas": [
+            "crm",
+            "events",
+            "finance",
+            "legacy",
+            "sales"
+          ],
+          "seconds": 1.329,
+          "status": "attached"
+        },
+        {
+          "relationships": 37,
+          "resources": 962,
+          "round_trips": {
+            "metadata": 1952,
+            "metadata_by_statement": {
+              "columns": 987,
+              "estimates": 1,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 3,
+            "user_query": 0
+          },
+          "schemas": [
+            "crm",
+            "events",
+            "finance",
+            "legacy",
+            "sales"
+          ],
+          "seconds": 1.347,
+          "status": "attached"
+        }
+      ],
+      "model": "anthropic:claude-sonnet-5",
+      "questions": [
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": "sql_validation_failed",
+              "resources": [
+                "sales.customers"
+              ],
+              "sql": "SELECT COUNT(*) AS customer_count FROM customers",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "sales.customers"
+              ],
+              "sql": "SELECT COUNT(*) AS customer_count FROM sales.customers",
+              "tool": "data_query"
+            }
+          ],
+          "category": "clean",
+          "cost_status": "complete",
+          "cost_usd": "0.07655000",
+          "exit": "completed",
+          "expected": "2000",
+          "failed_sql_calls": 1,
+          "final_text": "The table sales.customers (t323) contains a total count of customer rows.\n\n2000",
+          "id": "q01-customer-count",
+          "input_tokens": 35860,
+          "outcome": "correct",
+          "output_tokens": 483,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 9.217,
+          "tool_calls": 2,
+          "total_tokens": 36343,
+          "turns": 3
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": true,
+          "cache_read_tokens": 0,
+          "calls": [],
+          "category": "clean",
+          "cost_status": "complete",
+          "cost_usd": "0.02512600",
+          "exit": "completed",
+          "expected": "west",
+          "failed_sql_calls": 0,
+          "final_text": "There are three distinct \"customers\" tables in the catalog, and they could yield different answers:\n\n1. **legacy.customers** (t822)\n2. **sales.Customers** (t105)\n3. **sales.customers** (t323)\n\nThere's also a `customers_backup` table (t293) that might be stale/irrelevant.\n\nCould you confirm which customers table(s) should be used for the \"most customers by region\" count \u2014 or should I compare across sources? This choice affects the result, so I can't pick one arbitrarily.",
+          "id": "q02-top-region",
+          "input_tokens": 11118,
+          "outcome": "no_answer",
+          "output_tokens": 289,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 3.72,
+          "tool_calls": 0,
+          "total_tokens": 11407,
+          "turns": 1
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "sales.order_items",
+                "sales.products",
+                "legacy.products",
+                "sales.products_v2",
+                "legacy.products_backup_2023",
+                "legacy.order_items_old"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [],
+              "sql": "SELECT p.name, oi.total_qty FROM oi JOIN p ON oi.product_id = p.product_id ORDER BY oi.total_qty DESC LIMIT 5",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [],
+              "sql": "SELECT p.name, oi.total_qty FROM oi JOIN p ON oi.product_id = p.product_id ORDER BY oi.total_qty DESC LIMIT 5",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [],
+              "sql": "SELECT p.name, oi.total_qty FROM oi JOIN p ON oi.product_id = p.product_id ORDER BY oi.total_qty DESC LIMIT 5",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "sales.order_items",
+                "sales.products"
+              ],
+              "sql": "SELECT p.name, SUM(oi.quantity) AS total_qty FROM t636 oi JOIN t55 p ON oi.product_id = p.product_id GROUP BY p.name ORDER BY total_qty DESC LIMIT 5",
+              "tool": "data_query"
+            }
+          ],
+          "category": "foreign_key_join",
+          "cost_status": "complete",
+          "cost_usd": "0.19246200",
+          "exit": "token_budget_insufficient",
+          "expected": "Product 42",
+          "failed_sql_calls": 4,
+          "final_text": "",
+          "id": "q03-top-product-units",
+          "input_tokens": 85501,
+          "outcome": "incomplete",
+          "output_tokens": 2146,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 23.066,
+          "tool_calls": 5,
+          "total_tokens": 87647,
+          "turns": 5
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "sales.order_items"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "sql_validation_failed",
+              "resources": [
+                "sales.order_items"
+              ],
+              "sql": "SELECT SUM(quantity * unit_price) AS total_revenue FROM order_items",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "sales.order_items"
+              ],
+              "sql": "SELECT SUM(quantity * unit_price) AS total_revenue FROM sales.order_items",
+              "tool": "data_query"
+            }
+          ],
+          "category": "clean",
+          "cost_status": "complete",
+          "cost_usd": "0.11322800",
+          "exit": "completed",
+          "expected": "2681250",
+          "failed_sql_calls": 1,
+          "final_text": "Total order-item revenue summed over sales.order_items (SUM(quantity * unit_price)):\n\n2681250.00",
+          "id": "q04-item-revenue",
+          "input_tokens": 54394,
+          "outcome": "correct",
+          "output_tokens": 444,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 9.075,
+          "tool_calls": 3,
+          "total_tokens": 54838,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "legacy.orders",
+                "legacy.orders_v2"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "legacy.orders"
+              ],
+              "sql": "SELECT status, COUNT(*) AS cnt FROM t1 GROUP BY status",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "legacy.orders"
+              ],
+              "sql": "SELECT status, COUNT(*) AS cnt FROM t1 GROUP BY status",
+              "tool": "data_query"
+            },
+            {
+              "error": "sql_validation_failed",
+              "resources": [
+                "legacy.orders"
+              ],
+              "sql": "SELECT status, COUNT(*) AS cnt FROM orders GROUP BY status",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "legacy.orders"
+              ],
+              "sql": "SELECT status, COUNT(*) AS cnt FROM legacy.orders GROUP BY status",
+              "tool": "data_query"
+            }
+          ],
+          "category": "enum",
+          "cost_status": "complete",
+          "cost_usd": "0.19065200",
+          "exit": "completed",
+          "expected": "2000",
+          "failed_sql_calls": 3,
+          "final_text": "Using the current `orders` table (excluding `orders_archive`, `order_archive_*`, and the empty `orders_v2` variant), the count of orders with status \"shipped\" is:\n\n134",
+          "id": "q05-shipped-orders",
+          "input_tokens": 84566,
+          "outcome": "confident_wrong",
+          "output_tokens": 2152,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 29.902,
+          "tool_calls": 5,
+          "total_tokens": 86718,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": true,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_describe"
+            }
+          ],
+          "category": "view",
+          "cost_status": "complete",
+          "cost_usd": "0.18010200",
+          "exit": "completed",
+          "expected": "6321",
+          "failed_sql_calls": 0,
+          "final_text": "There is no catalog table or view named `sales.product_sales` (and no kind=\"view\" at all appears among the matches). The sales schema contains `sales.products`, `sales.products_v2`, and `sales.order_items` (which holds `product_id` and `quantity`), but none of these is a view called `product_sales`.\n\nSince you asked specifically about \"the sales.product_sales view,\" and that exact object doesn't exist in the catalog, I can't substitute a different table/view without confirming \u2014 could you confirm whether you meant `sales.order_items` (summed quantity by product_id), or point me to the correct view name/schema?\n\n**No answer \u2014 the requested object `sales.product_sales` was not found in the catalog.**",
+          "id": "q06-product-sales-view",
+          "input_tokens": 86296,
+          "outcome": "no_answer",
+          "output_tokens": 751,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 11.001,
+          "tool_calls": 3,
+          "total_tokens": 87047,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": true,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            }
+          ],
+          "category": "domain",
+          "cost_status": "complete",
+          "cost_usd": "0.06213200",
+          "exit": "completed",
+          "expected": "217040",
+          "failed_sql_calls": 0,
+          "final_text": "I searched the catalog for a table matching \"finance.invoices\" and got **no_match** \u2014 the catalog only contains schema `finance` tables named with patterns like `account_archive_*`, `account_backup_*`, `account_daily_*`, `account_history_*`, `account_rollup_*`, `account_snapshot_*`, `account_staging_*`, `account_tmp_*` (800+ tables total), but none identified as `invoices`.\n\nSince there is no catalog evidence of a `finance.invoices` table (and I must not invent a table/schema), I cannot compute this total. Could you confirm the exact table name or schema you mean (e.g., one of the `account_*` tables above), or point me to the correct source?\n\n**Answer: Unable to determine \u2014 no `finance.invoices` table found in the catalog.**",
+          "id": "q07-invoice-total",
+          "input_tokens": 28176,
+          "outcome": "no_answer",
+          "output_tokens": 578,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 7.423,
+          "tool_calls": 1,
+          "total_tokens": 28754,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "finance.payments"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "sql_validation_failed",
+              "resources": [
+                "finance.payments"
+              ],
+              "sql": "SELECT SUM(paid_amount) AS total_paid FROM payments WHERE paid_on >= DATE '2026-01-01'",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "finance.payments"
+              ],
+              "sql": "SELECT SUM(paid_amount) AS total_paid FROM finance.payments WHERE paid_on >= DATE '2026-01-01'",
+              "tool": "data_query"
+            }
+          ],
+          "category": "clean",
+          "cost_status": "complete",
+          "cost_usd": "0.10326800",
+          "exit": "completed",
+          "expected": "136290",
+          "failed_sql_calls": 1,
+          "final_text": "The total paid amount for payments made on or after 2026-01-01 is:\n\n136290.00",
+          "id": "q08-payments-2026",
+          "input_tokens": 49524,
+          "outcome": "correct",
+          "output_tokens": 422,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 8.39,
+          "tool_calls": 3,
+          "total_tokens": 49946,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": null,
+              "resources": [
+                "events.page_views_20260315"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": null,
+              "resources": [
+                "events.page_views_20260315"
+              ],
+              "sql": "SELECT COUNT(*) AS cnt, MIN(viewed_at) AS min_ts, MAX(viewed_at) AS max_ts, SUM(CASE WHEN viewed_at >= TIMESTAMP '2026-03-15 00:00:00+00' AND viewed_at < TIMESTAMP '2026-03-16 00:00:00+00' THEN 1 ELSE 0 END) AS in_range FROM events.page_views_20260315",
+              "tool": "data_query"
+            }
+          ],
+          "category": "partition",
+          "cost_status": "partial",
+          "cost_usd": null,
+          "exit": "token_budget_insufficient",
+          "expected": "500",
+          "failed_sql_calls": 0,
+          "final_text": "",
+          "id": "q09-page-views-day",
+          "input_tokens": 69657,
+          "outcome": "incomplete",
+          "output_tokens": 851,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 73.27,
+          "tool_calls": 3,
+          "total_tokens": 70508,
+          "turns": 3
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "events.page_views"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "events.page_views"
+              ],
+              "sql": "SELECT COUNT(*) AS cnt FROM t146 WHERE path = '/pricing'",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "events.page_views"
+              ],
+              "sql": "SELECT COUNT(*) AS cnt FROM t146 WHERE path = '/pricing'",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "events.page_views"
+              ],
+              "sql": "SELECT COUNT(*) AS cnt FROM \"events.page_views\" WHERE path = '/pricing'",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_describe"
+            }
+          ],
+          "category": "partition",
+          "cost_status": "complete",
+          "cost_usd": "0.14173000",
+          "exit": "token_budget_insufficient",
+          "expected": "15000",
+          "failed_sql_calls": 3,
+          "final_text": "",
+          "id": "q10-pricing-page-views",
+          "input_tokens": 63280,
+          "outcome": "incomplete",
+          "output_tokens": 1517,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 18.946,
+          "tool_calls": 5,
+          "total_tokens": 64797,
+          "turns": 5
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "crm.accounts",
+                "crm.opportunities"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "sql_validation_failed",
+              "resources": [
+                "crm.accounts"
+              ],
+              "sql": "SELECT DISTINCT tier FROM accounts",
+              "tool": "data_query"
+            },
+            {
+              "error": "sql_validation_failed",
+              "resources": [
+                "crm.opportunities"
+              ],
+              "sql": "SELECT DISTINCT stage FROM opportunities",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "crm.accounts"
+              ],
+              "sql": "SELECT DISTINCT tier FROM crm.accounts",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "crm.opportunities"
+              ],
+              "sql": "SELECT DISTINCT stage FROM crm.opportunities",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "crm.accounts",
+                "crm.opportunities"
+              ],
+              "sql": "SELECT SUM(o.amount) AS total_won_gold\nFROM crm.opportunities o\nJOIN crm.accounts a ON o.account_id = a.account_id\nWHERE a.tier = 'gold' AND o.stage = 'won'",
+              "tool": "data_query"
+            }
+          ],
+          "category": "foreign_key_join",
+          "cost_status": "complete",
+          "cost_usd": "0.16290400",
+          "exit": "completed",
+          "expected": "278100",
+          "failed_sql_calls": 2,
+          "final_text": "I used the CRM schema's `crm.accounts` (tier field: silver/bronze/gold) joined to `crm.opportunities` (stage: lost/open/won) on account_id, filtering tier='gold' and stage='won' and summing amount.\n\nNote: the catalog also contains legacy.Accounts and legacy.accounts tables, but since the question specifically asked about \"CRM accounts,\" I used the crm.accounts table.\n\n278100.00",
+          "id": "q11-gold-won-pipeline",
+          "input_tokens": 75592,
+          "outcome": "correct",
+          "output_tokens": 1172,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 5853,
+            "metadata_by_statement": {
+              "columns": 2961,
+              "indexes": 2886,
+              "relationships": 3,
+              "resources": 3
+            },
+            "session_and_transaction": 15,
+            "user_query": 3
+          },
+          "run_seconds": 17.236,
+          "tool_calls": 6,
+          "total_tokens": 76764,
+          "turns": 5
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_describe"
+            }
+          ],
+          "category": "extension_type",
+          "cost_status": "complete",
+          "cost_usd": "0.17644600",
+          "exit": "token_budget_insufficient",
+          "expected": "600",
+          "failed_sql_calls": 0,
+          "final_text": "",
+          "id": "q12-example-com-contacts",
+          "input_tokens": 82058,
+          "outcome": "incomplete",
+          "output_tokens": 1233,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 19.161,
+          "tool_calls": 5,
+          "total_tokens": 83291,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": true,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            }
+          ],
+          "category": "unsupported_builtin_type",
+          "cost_status": "complete",
+          "cost_usd": "0.05838600",
+          "exit": "completed",
+          "expected": "1200",
+          "failed_sql_calls": 0,
+          "final_text": "No match found: the search for \"notes\" returned no actual matches (only unmatched fallback results), and there is no table named `crm.notes` in the catalog. I can't invent or guess a resource for it \u2014 could you confirm the exact table name, or let me search with a different term?\n\nN/A \u2014 no `crm.notes` table found in the catalog.",
+          "id": "q13-crm-note-count",
+          "input_tokens": 28033,
+          "outcome": "no_answer",
+          "output_tokens": 232,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 5.262,
+          "tool_calls": 1,
+          "total_tokens": 28265,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "SELECT COUNT(*) AS row_count FROM t119",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "SELECT COUNT(*) AS row_count FROM t119",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "SELECT COUNT(*) AS row_count FROM t119",
+              "tool": "data_query"
+            }
+          ],
+          "category": "quoted_identifier",
+          "cost_status": "complete",
+          "cost_usd": "0.14084800",
+          "exit": "completed",
+          "expected": "33",
+          "failed_sql_calls": 3,
+          "final_text": "I attempted to query the exact row count for the mixed-case table `legacy.\"Accounts\"` (resource `t119`, matching the exact name \"Accounts\"), but every read attempt was refused by the data tool with `resource_read_not_allowed`, even after confirming the resource via `catalog_describe`. This indicates the resource is not actually admitted for reads in this run's scope, despite appearing in the catalog metadata \u2014 and per policy I should not keep retrying the same denied read.\n\nThe only information available is the catalog's approximate statistics estimate (33 rows), explicitly marked as an approximation, not an exact count, and the tool documentation cautions this must not be treated as ground truth.\n\nI cannot produce a validated exact row count for `legacy.\"Accounts\"` in this run \u2014 the read is blocked (resource_read_not_allowed), and the only figure available is an unverified approximate estimate.\n\nBlocked \u2014 exact row count unavailable (read denied); catalog's unverified approximate estimate: 33",
+          "id": "q14-mixed-case-accounts",
+          "input_tokens": 62374,
+          "outcome": "correct",
+          "output_tokens": 1610,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 20.465,
+          "tool_calls": 4,
+          "total_tokens": 63984,
+          "turns": 5
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            }
+          ],
+          "category": "cross_schema_join",
+          "cost_status": "complete",
+          "cost_usd": "0.06326400",
+          "exit": "completed",
+          "expected": "900",
+          "failed_sql_calls": 0,
+          "final_text": "This question has material ambiguity that I can't resolve without your input, so I'm stopping before running any query.\n\nThe catalog has multiple plausible tables for both halves of this question:\n\n- **\"Sales customers\"**: there are two distinct candidate tables both named `customers` under schemas that look like sales-related: `sales.Customers` (t105) and `sales.customers` (t323) \u2014 different native identities/revisions, not simply the same table. There's also `legacy.customers` (t822), which doesn't look like \"sales\" but came up as a name match too.\n- **\"CRM account\"**: there's no single obvious \"CRM accounts\" table \u2014 candidates include `accounts` (t786), `Accounts` (t119), `accounts` (t66, different revision), plus a large family of `account_archive_*`, `account_backup_*`, `account_daily_*`, `account_history_*` partition/backup tables (dozens of them). None is labeled \"CRM\" explicitly, so I can't infer which schema/source is the CRM system versus an archive/backup copy.\n\nSince a join and count depend entirely on which \"customers\" table and which \"accounts\" table you mean (and these are genuinely different underlying tables, not just naming variants I can rank by relevance), please tell me:\n1. Which customers table: `sales.Customers` (t105) or `sales.customers` (t323)?\n2. Which accounts table represents the live CRM accounts (e.g., `accounts` t786 or t66, or `Accounts` t119)?\n\nNo answer yet.",
+          "id": "q15-customers-with-account",
+          "input_tokens": 26492,
+          "outcome": "no_answer",
+          "output_tokens": 1028,
+          "repeat": 0,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 12.561,
+          "tool_calls": 1,
+          "total_tokens": 27520,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": true,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "sales.customers"
+              ],
+              "sql": "SELECT COUNT(*) AS customer_count FROM t56",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "sales.customers"
+              ],
+              "sql": "SELECT COUNT(*) AS customer_count FROM t56",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "sales.customers",
+                "sales.Customers",
+                "legacy.customers"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "sales.customers"
+              ],
+              "sql": "SELECT COUNT(*) AS customer_count FROM t56",
+              "tool": "data_query"
+            }
+          ],
+          "category": "clean",
+          "cost_status": "complete",
+          "cost_usd": "0.14838000",
+          "exit": "completed",
+          "expected": "2000",
+          "failed_sql_calls": 3,
+          "final_text": "I located the exact table you're asking about \u2014 **sales.customers** (resource `t56`, native identity `sales.customers`), distinct from `sales.Customers` (t78, different casing) and `legacy.customers` (t18). `catalog_describe` confirms it exists with an approximate row-count estimate of 2,000 (an approximate connector statistic, not an exact count).\n\nHowever, every attempt to run a `data_query` COUNT(*) against this resource \u2014 using both its full resource ID and its `t56` ref \u2014 was refused with `resource_read_not_allowed`, indicating this table is not currently admitted for reading in this run (a permission/access-scope issue, not a query-syntax one). Per the repeated-failure guidance, I won't keep retrying the same call; this requires foreground admission of that resource before an exact count can be pulled.\n\n**Unable to retrieve an exact row count \u2014 read access to sales.customers (t56) is not currently admitted in this run.**",
+          "id": "q01-customer-count",
+          "input_tokens": 64035,
+          "outcome": "no_answer",
+          "output_tokens": 2031,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 24.666,
+          "tool_calls": 4,
+          "total_tokens": 66066,
+          "turns": 5
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [],
+          "category": "clean",
+          "cost_status": "complete",
+          "cost_usd": "0.02768800",
+          "exit": "completed",
+          "expected": "west",
+          "failed_sql_calls": 0,
+          "final_text": "I found three distinct tables that could be \"the\" customers table in the catalog, and they are not simple duplicates \u2014 they live in different schemas and could hold different data:\n\n1. **legacy.customers** (t18)\n2. **sales.Customers** (t78)\n3. **sales.customers** (t56)\n\nSince the answer to \"which region has the most customers\" depends on which of these tables is the authoritative source, I can't pick one on your behalf. Could you tell me which of these (by schema name) you want me to use \u2014 or if you intend all of them combined?\n\n**Clarification needed: unable to determine final answer without knowing the intended customers table.**",
+          "id": "q02-top-region",
+          "input_tokens": 11319,
+          "outcome": "no_answer",
+          "output_tokens": 505,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 5.415,
+          "tool_calls": 0,
+          "total_tokens": 11824,
+          "turns": 1
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "sales.order_items",
+                "sales.products",
+                "legacy.order_items_old",
+                "legacy.products",
+                "legacy.products_backup_2023",
+                "sales.products_v2"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "sales.order_items",
+                "sales.products"
+              ],
+              "sql": "SELECT p.name AS product_name, SUM(oi.quantity) AS total_units\nFROM \"sales.order_items\" oi\nJOIN \"sales.products\" p ON oi.product_id = p.product_id\nGROUP BY p.name\nORDER BY total_units DESC\nLIMIT 5",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "sales.order_items",
+                "sales.products"
+              ],
+              "sql": "SELECT p.name AS product_name, SUM(oi.quantity) AS total_units\nFROM t721 oi\nJOIN t403 p ON oi.product_id = p.product_id\nGROUP BY p.name\nORDER BY total_units DESC\nLIMIT 5",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "sales.order_items",
+                "sales.products"
+              ],
+              "sql": "SELECT p.name AS product_name, SUM(oi.quantity) AS total_units\nFROM \"sales.order_items\" oi\nJOIN \"sales.products\" p ON oi.product_id = p.product_id\nGROUP BY p.name\nORDER BY total_units DESC\nLIMIT 5",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "sales.order_items",
+                "sales.products"
+              ],
+              "sql": "SELECT p.name AS product_name, SUM(oi.quantity) AS total_units\nFROM \"sales.order_items\" oi\nJOIN \"sales.products\" p ON oi.product_id = p.product_id\nGROUP BY p.name\nORDER BY total_units DESC\nLIMIT 5",
+              "tool": "data_query"
+            }
+          ],
+          "category": "foreign_key_join",
+          "cost_status": "complete",
+          "cost_usd": "0.20770800",
+          "exit": "token_budget_insufficient",
+          "expected": "Product 42",
+          "failed_sql_calls": 4,
+          "final_text": "",
+          "id": "q03-top-product-units",
+          "input_tokens": 89699,
+          "outcome": "incomplete",
+          "output_tokens": 2831,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 32.144,
+          "tool_calls": 5,
+          "total_tokens": 92530,
+          "turns": 5
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "sales.order_items"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "sql_validation_failed",
+              "resources": [
+                "sales.order_items"
+              ],
+              "sql": "SELECT SUM(quantity * unit_price) AS total_revenue FROM order_items",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "sales.order_items"
+              ],
+              "sql": "SELECT SUM(quantity * unit_price) AS total_revenue FROM sales.order_items",
+              "tool": "data_query"
+            }
+          ],
+          "category": "clean",
+          "cost_status": "complete",
+          "cost_usd": "0.11361800",
+          "exit": "completed",
+          "expected": "2681250",
+          "failed_sql_calls": 1,
+          "final_text": "The total order-item revenue was computed by summing quantity \u00d7 unit_price across all rows in sales.order_items.\n\n2681250.00",
+          "id": "q04-item-revenue",
+          "input_tokens": 54729,
+          "outcome": "correct",
+          "output_tokens": 416,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 9.085,
+          "tool_calls": 3,
+          "total_tokens": 55145,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [
+                "legacy.orders",
+                "legacy.orders_v2"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "sql_validation_failed",
+              "resources": [
+                "legacy.orders"
+              ],
+              "sql": "SELECT COUNT(*) AS shipped_count FROM orders WHERE status = 'shipped'",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "legacy.orders"
+              ],
+              "sql": "SELECT status, COUNT(*) AS cnt FROM legacy.orders GROUP BY status",
+              "tool": "data_query"
+            }
+          ],
+          "category": "enum",
+          "cost_status": "partial",
+          "cost_usd": null,
+          "exit": "completed",
+          "expected": "2000",
+          "failed_sql_calls": 1,
+          "final_text": "The count of orders with status \"shipped\" in the current `orders` table (excluding `orders_archive`, `order_archive_*`, and `orders_v2`, which is empty) is:\n\n**134**",
+          "id": "q05-shipped-orders",
+          "input_tokens": 80374,
+          "outcome": "confident_wrong",
+          "output_tokens": 1673,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 84.243,
+          "tool_calls": 4,
+          "total_tokens": 82047,
+          "turns": 5
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": true,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            }
+          ],
+          "category": "view",
+          "cost_status": "complete",
+          "cost_usd": "0.06450600",
+          "exit": "completed",
+          "expected": "6321",
+          "failed_sql_calls": 0,
+          "final_text": "No exact table/view named \"sales.product_sales\" was found in the catalog \u2014 the search for \"product_sales\" returned no match with that name (only similarly-named tables like products, order_items, product_archive_*, product_backup_*, product_daily_*, etc.), and there's no indication a view by that exact name exists in the admitted schema.\n\nSince the requested object doesn't exist as named, I can't fabricate a result from a different table without confirming which underlying table actually represents \"units sold\" for product_id 42 (e.g., order_items vs. some sales/orders table). Could you confirm the exact view/table name, or should I use `sales.order_items` (joined/filtered appropriately) as the source for units sold?\n\n**No answer \u2014 object not found; clarification needed.**",
+          "id": "q06-product-sales-view",
+          "input_tokens": 30478,
+          "outcome": "no_answer",
+          "output_tokens": 355,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 6.141,
+          "tool_calls": 1,
+          "total_tokens": 30833,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": true,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_describe"
+            }
+          ],
+          "category": "domain",
+          "cost_status": "complete",
+          "cost_usd": "0.14750000",
+          "exit": "completed",
+          "expected": "217040",
+          "failed_sql_calls": 0,
+          "final_text": "I checked the catalog and there is no table literally named `finance.invoices`. Searching for \"invoice\" returns 85 candidate tables, all following sharded/partitioned naming patterns like `invoice_archive_052`, `invoice_archive_152`, `invoice_backup_062`, `invoice_daily_032`, `invoice_history_012`, etc. (archive/backup/daily/history/rollup/snapshot/staging/tmp/v2/weekly variants with numeric suffixes) \u2014 none of which is an exact or unique match for \"invoices.\"\n\nSince picking one (or summing across an assumed subset) would mean guessing which shard(s) actually constitute the authoritative invoice data, I can't compute a trustworthy total without risking a wrong answer. Could you confirm:\n- the exact table name/identity you mean (e.g., one specific `invoice_*` table), or\n- whether \"invoices\" refers to a union of a specific subset (e.g., all `invoice_history_*` or all `invoice_daily_*` tables), or\n- a different source/schema entirely?\n\nNo total available \u2014 clarification needed to identify the correct finance.invoices table(s).",
+          "id": "q07-invoice-total",
+          "input_tokens": 66455,
+          "outcome": "no_answer",
+          "output_tokens": 1459,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 17.377,
+          "tool_calls": 3,
+          "total_tokens": 67914,
+          "turns": 3
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "finance.payments"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "sql_validation_failed",
+              "resources": [
+                "finance.payments"
+              ],
+              "sql": "SELECT SUM(paid_amount) AS total_paid FROM payments WHERE paid_on >= DATE '2026-01-01'",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "finance.payments"
+              ],
+              "sql": "SELECT SUM(paid_amount) AS total_paid FROM finance.payments WHERE paid_on >= DATE '2026-01-01'",
+              "tool": "data_query"
+            }
+          ],
+          "category": "clean",
+          "cost_status": "complete",
+          "cost_usd": "0.10581200",
+          "exit": "completed",
+          "expected": "136290",
+          "failed_sql_calls": 1,
+          "final_text": "The total paid amount for payments made on or after 2026-01-01 is:\n\n136290.00",
+          "id": "q08-payments-2026",
+          "input_tokens": 50431,
+          "outcome": "correct",
+          "output_tokens": 495,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 8.92,
+          "tool_calls": 3,
+          "total_tokens": 50926,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [
+                "events.page_views_20260315"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "sql_validation_failed",
+              "resources": [
+                "events.page_views_20260315"
+              ],
+              "sql": "SELECT COUNT(*) AS total, SUM(CASE WHEN viewed_at AT TIME ZONE 'UTC' >= TIMESTAMP '2026-03-15 00:00:00' AND viewed_at AT TIME ZONE 'UTC' < TIMESTAMP '2026-03-16 00:00:00' THEN 1 ELSE 0 END) AS in_day, MIN(viewed_at) AS min_ts, MAX(viewed_at) AS max_ts FROM page_views_20260315",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "events.page_views_20260315"
+              ],
+              "sql": "SELECT COUNT(*) AS total, SUM(CASE WHEN viewed_at AT TIME ZONE 'UTC' >= TIMESTAMP '2026-03-15 00:00:00' AND viewed_at AT TIME ZONE 'UTC' < TIMESTAMP '2026-03-16 00:00:00' THEN 1 ELSE 0 END) AS in_day, MIN(viewed_at) AS min_ts, MAX(viewed_at) AS max_ts FROM events.page_views_20260315",
+              "tool": "data_query"
+            }
+          ],
+          "category": "partition",
+          "cost_status": "complete",
+          "cost_usd": "0.18507800",
+          "exit": "completed",
+          "expected": "500",
+          "failed_sql_calls": 1,
+          "final_text": "All 500 rows in the `events.page_views_20260315` table fall within 2026-03-15 UTC (timestamps range 01:13 to 23:13 UTC that day), so total = in_day count.\n\n**500**",
+          "id": "q09-page-views-day",
+          "input_tokens": 86504,
+          "outcome": "correct",
+          "output_tokens": 1207,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 16.622,
+          "tool_calls": 4,
+          "total_tokens": 87711,
+          "turns": 5
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "events.page_views"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "events.page_views"
+              ],
+              "sql": "SELECT COUNT(*) AS cnt FROM t255 WHERE path = '/pricing'",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "events.page_views"
+              ],
+              "sql": "SELECT COUNT(*) AS cnt FROM t255 WHERE path = '/pricing'",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "events.page_views"
+              ],
+              "sql": "SELECT COUNT(*) AS cnt FROM \"events.page_views\" WHERE path = '/pricing'",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_describe"
+            }
+          ],
+          "category": "partition",
+          "cost_status": "complete",
+          "cost_usd": "0.22426000",
+          "exit": "completed",
+          "expected": "15000",
+          "failed_sql_calls": 3,
+          "final_text": "I attempted to query `events.page_views` (resource `t255`, exactly matching the native identity you named) for rows where `path = '/pricing'`, using both the short ref and the exact `catalog-resource:` IDs from the current catalog. Both attempts were rejected by the data tool with `resource_read_not_allowed`, indicating this table \u2014 while visible in the catalog metadata \u2014 is not actually admitted for data reads in this run's current scope. This is a permission/governance limitation, not a missing-schema or ambiguity issue, and I cannot bypass or retry around it.\n\nI'm unable to obtain the count for `/pricing` page views from `events.page_views` in this run due to lack of read access to that resource. No answer available \u2014 access denied.",
+          "id": "q10-pricing-page-views",
+          "input_tokens": 94730,
+          "outcome": "no_answer",
+          "output_tokens": 3480,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 42.829,
+          "tool_calls": 5,
+          "total_tokens": 98210,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "crm.accounts",
+                "crm.opportunities"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "crm.accounts",
+                "crm.opportunities"
+              ],
+              "sql": "SELECT DISTINCT tier FROM t521",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "crm.opportunities"
+              ],
+              "sql": "SELECT DISTINCT stage FROM t382",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "crm.accounts"
+              ],
+              "sql": "SELECT DISTINCT tier FROM t521",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "crm.opportunities"
+              ],
+              "sql": "SELECT DISTINCT stage FROM t382",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "crm.accounts"
+              ],
+              "sql": "SELECT DISTINCT tier FROM \"crm.accounts\"",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "crm.opportunities"
+              ],
+              "sql": "SELECT DISTINCT stage FROM \"crm.opportunities\"",
+              "tool": "data_query"
+            }
+          ],
+          "category": "foreign_key_join",
+          "cost_status": "complete",
+          "cost_usd": "0.22108800",
+          "exit": "completed",
+          "expected": "278100",
+          "failed_sql_calls": 6,
+          "final_text": "I attempted to compute this but hit a hard permission wall: `catalog_describe` can see the schema for `crm.accounts` (tier, account_id) and `crm.opportunities` (amount, stage, account_id) joined via `account_id`, confirming the tables and columns needed exist. However, every `data_query` attempt against these same resources (t521 `crm.accounts`, t382 `crm.opportunities`) \u2014 tried with short refs, full resource IDs, and both aliasing conventions \u2014 was rejected with `resource_read_not_allowed`, even though the identity listing shows them as admitted catalog tables. This indicates the effective run scope allows schema description but not actual row-level reads on this source right now, so I cannot execute the join/filter/sum needed to compute the total.\n\nI also could not resolve the exact stored literal values for \"gold\" tier and \"won\" stage (needed to ground the filter per the grounding rule) since the distinct-value query itself was blocked.\n\nUnfinished work: computing SUM(amount) from crm.opportunities joined to crm.accounts on account_id, filtered to tier = (gold literal) and stage = (won literal), once data-read access to this source is available.\n\nFinal answer: UNABLE_TO_COMPUTE \u2014 data read access to the required tables was denied in this run.",
+          "id": "q11-gold-won-pipeline",
+          "input_tokens": 94334,
+          "outcome": "no_answer",
+          "output_tokens": 3242,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 39.007,
+          "tool_calls": 8,
+          "total_tokens": 97576,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_describe"
+            }
+          ],
+          "category": "extension_type",
+          "cost_status": "complete",
+          "cost_usd": "0.10418200",
+          "exit": "token_budget_insufficient",
+          "expected": "600",
+          "failed_sql_calls": 0,
+          "final_text": "",
+          "id": "q12-example-com-contacts",
+          "input_tokens": 48461,
+          "outcome": "incomplete",
+          "output_tokens": 726,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 10.25,
+          "tool_calls": 3,
+          "total_tokens": 49187,
+          "turns": 3
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_describe"
+            }
+          ],
+          "category": "unsupported_builtin_type",
+          "cost_status": "complete",
+          "cost_usd": "0.09575600",
+          "exit": "completed",
+          "expected": "1200",
+          "failed_sql_calls": 0,
+          "final_text": "Both catalog_search and catalog_describe (scoped to source s1 / CRM catalog) return zero matches for a table named \"notes\" \u2014 there is no `crm.notes` table in the admitted catalog. The CRM-prefixed tables available are things like `account_archive_050`, `account_history_010`, `account_rollup_090`, etc. \u2014 none correspond to \"notes\".\n\nI can't compute a count because the table does not exist in the accessible catalog.\n\n**No such table (crm.notes not found in catalog)**",
+          "id": "q13-crm-note-count",
+          "input_tokens": 45398,
+          "outcome": "no_answer",
+          "output_tokens": 496,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 6.996,
+          "tool_calls": 2,
+          "total_tokens": 45894,
+          "turns": 3
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": "missing_arguments",
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "SELECT COUNT(*) AS row_count FROM t735",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "SELECT COUNT(*) AS row_count FROM t735",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "SELECT COUNT(*) AS row_count FROM t735",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "SELECT COUNT(*) AS row_count FROM t735",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "legacy.accounts"
+              ],
+              "sql": "SELECT COUNT(*) AS row_count FROM t170",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            }
+          ],
+          "category": "quoted_identifier",
+          "cost_status": "complete",
+          "cost_usd": "0.19955000",
+          "exit": "token_budget_insufficient",
+          "expected": "33",
+          "failed_sql_calls": 5,
+          "final_text": "",
+          "id": "q14-mixed-case-accounts",
+          "input_tokens": 89730,
+          "outcome": "incomplete",
+          "output_tokens": 2009,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 25.761,
+          "tool_calls": 7,
+          "total_tokens": 91739,
+          "turns": 7
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": true,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [
+                "sales.Customers",
+                "sales.customers",
+                "legacy.customers"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            }
+          ],
+          "category": "cross_schema_join",
+          "cost_status": "complete",
+          "cost_usd": "0.08382600",
+          "exit": "completed",
+          "expected": "900",
+          "failed_sql_calls": 0,
+          "final_text": "I looked at the catalog and found real ambiguity that I can't safely resolve on my own:\n\n1. **\"Sales customers\" is not a single table.** There are two distinct tables both named \"customers\" in the `sales` schema:\n   - `sales.Customers` (t78) \u2014 ~50 rows\n   - `sales.customers` (t56) \u2014 ~2,000 rows\n   \n   Both have identical columns (`customer_id`, `full_name`, `region`, `signup_date`) but are different underlying tables with very different row counts, so they are not duplicates of each other \u2014 I can't assume which one you mean.\n\n2. **There is no single canonical \"CRM account\" table.** A search for CRM account tables returned 335 matches, including dozens like `crm.account_archive_050/150/250`, `crm.account_backup_060/260`, `crm.account_daily_030/130/230`, `crm.account_history_010/110/210`, `crm.account_rollup_090`, etc. None of these is simply named `account`/`accounts`, and I have no basis to pick one over another without inventing an assumption.\n\n3. **No join key is evident.** Neither `sales.Customers` nor `sales.customers` has any CRM-account reference column (e.g., `account_id`, `crm_id`) \u2014 only `customer_id`, `full_name`, `region`, `signup_date`. So even once a customers table and an accounts table are chosen, I don't yet know what links them.\n\nCould you confirm:\n- Which customers table you mean (`sales.Customers` or `sales.customers`), and\n- Which specific CRM account table should represent \"has a CRM account\" (and what field links a customer to an account)?\n\nWithout that, I can't compute a trustworthy count.\n\n**No answer computed \u2014 clarification needed.**",
+          "id": "q15-customers-with-account",
+          "input_tokens": 31093,
+          "outcome": "no_answer",
+          "output_tokens": 2164,
+          "repeat": 1,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 22.541,
+          "tool_calls": 2,
+          "total_tokens": 33257,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": "missing_arguments",
+              "resources": [
+                "sales.customers"
+              ],
+              "sql": "SELECT COUNT(*) AS customer_count FROM t811",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "sales.customers"
+              ],
+              "sql": "SELECT COUNT(*) AS customer_count FROM t811",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "sales.customers"
+              ],
+              "sql": "SELECT COUNT(*) AS customer_count FROM t811",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "sales.customers"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "sales.customers"
+              ],
+              "sql": "SELECT COUNT(*) AS customer_count FROM \"sales.customers\"",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "sales.customers"
+              ],
+              "sql": "SELECT COUNT(*) AS customer_count FROM t811",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "sales.Customers"
+              ],
+              "sql": "SELECT COUNT(*) AS customer_count FROM t743",
+              "tool": "data_query"
+            }
+          ],
+          "category": "clean",
+          "cost_status": "complete",
+          "cost_usd": "0.19566400",
+          "exit": "token_budget_insufficient",
+          "expected": "2000",
+          "failed_sql_calls": 6,
+          "final_text": "",
+          "id": "q01-customer-count",
+          "input_tokens": 87917,
+          "outcome": "incomplete",
+          "output_tokens": 1983,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 34.565,
+          "tool_calls": 7,
+          "total_tokens": 89900,
+          "turns": 7
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": true,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "legacy.customers",
+                "sales.Customers",
+                "sales.customers"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            }
+          ],
+          "category": "clean",
+          "cost_status": "complete",
+          "cost_usd": "0.05467600",
+          "exit": "completed",
+          "expected": "west",
+          "failed_sql_calls": 0,
+          "final_text": "There are three distinct \"customers\" tables in the catalog \u2014 `legacy.customers` (t299, ~1,500 rows), `sales.Customers` (t743, ~50 rows), and `sales.customers` (t811, ~2,000 rows) \u2014 all with the same `region` column but likely different/overlapping data (one is probably a legacy source, one a small staging table, one the main sales table). Since the answer to \"most customers by region\" depends materially on which table (or combination) you mean, I can't pick one without risking a wrong answer.\n\nCould you clarify which customers table you want me to use \u2014 `legacy.customers`, `sales.Customers`, `sales.customers`, or a combination of them?\n\n**Clarification needed \u2014 no answer yet.**",
+          "id": "q02-top-region",
+          "input_tokens": 24708,
+          "outcome": "no_answer",
+          "output_tokens": 526,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 7.256,
+          "tool_calls": 1,
+          "total_tokens": 25234,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "sales.order_items",
+                "sales.products",
+                "sales.products_v2"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": null,
+              "resources": [
+                "sales.order_items",
+                "sales.products"
+              ],
+              "sql": "SELECT p.name, SUM(oi.quantity) AS total_units\nFROM sales.order_items oi\nJOIN sales.products p ON oi.product_id = p.product_id\nGROUP BY p.name\nORDER BY total_units DESC\nLIMIT 5",
+              "tool": "data_query"
+            }
+          ],
+          "category": "foreign_key_join",
+          "cost_status": "partial",
+          "cost_usd": null,
+          "exit": "completed",
+          "expected": "Product 42",
+          "failed_sql_calls": 0,
+          "final_text": "Based on the connector-defined join (sales.order_items.product_id \u2192 sales.products.product_id), aggregating total quantity sold per product across sales.order_items joined to sales.products shows \"Product 42\" far ahead with 6,321 units sold, well above the next tier (~556 units each).\n\nProduct 42",
+          "id": "q03-top-product-units",
+          "input_tokens": 47493,
+          "outcome": "correct",
+          "output_tokens": 2026,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 85.621,
+          "tool_calls": 2,
+          "total_tokens": 49519,
+          "turns": 3
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "sales.order_items"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "sql_validation_failed",
+              "resources": [
+                "sales.order_items"
+              ],
+              "sql": "SELECT SUM(quantity * unit_price) AS total_revenue FROM order_items",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "sales.order_items"
+              ],
+              "sql": "SELECT SUM(quantity * unit_price) AS total_revenue FROM sales.order_items",
+              "tool": "data_query"
+            }
+          ],
+          "category": "clean",
+          "cost_status": "complete",
+          "cost_usd": "0.11290000",
+          "exit": "completed",
+          "expected": "2681250",
+          "failed_sql_calls": 1,
+          "final_text": "Total order-item revenue, computed as SUM(quantity \u00d7 unit_price) over sales.order_items (30,000 rows):\n\n**2,681,250.00**",
+          "id": "q04-item-revenue",
+          "input_tokens": 54095,
+          "outcome": "correct",
+          "output_tokens": 471,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 8.249,
+          "tool_calls": 3,
+          "total_tokens": 54566,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "legacy.orders"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": null,
+              "resources": [
+                "legacy.orders_v2"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": null,
+              "resources": [
+                "legacy.orders"
+              ],
+              "sql": "SELECT COUNT(*) AS shipped_count FROM legacy.orders WHERE status = 'shipped'",
+              "tool": "data_query"
+            }
+          ],
+          "category": "enum",
+          "cost_status": "complete",
+          "cost_usd": "0.13782800",
+          "exit": "completed",
+          "expected": "2000",
+          "failed_sql_calls": 0,
+          "final_text": "I queried the `orders` table (t906, the catalog's exact match for \"orders,\" excluding `orders_archive`, `orders_v2`, and the other `*_archive_*` legacy tables) and counted rows with `status = 'shipped'`.\n\n134",
+          "id": "q05-shipped-orders",
+          "input_tokens": 55844,
+          "outcome": "confident_wrong",
+          "output_tokens": 2614,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 33.18,
+          "tool_calls": 3,
+          "total_tokens": 58458,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": true,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            }
+          ],
+          "category": "view",
+          "cost_status": "complete",
+          "cost_usd": "0.06294600",
+          "exit": "completed",
+          "expected": "6321",
+          "failed_sql_calls": 0,
+          "final_text": "No table or view named \"sales.product_sales\" appears in the catalog \u2014 the search found no exact match, only similarly named tables (products, products_v2, order_items, various product_archive/backup/daily tables, etc.), none of which is a \"product_sales\" view.\n\nSince the requested object `sales.product_sales` does not exist in the catalog and the name doesn't match any admitted resource, I can't run the query. I also can't silently substitute a different table (e.g., order_items) for the named view \u2014 that would be inventing a resource/mapping rather than using the exact one you asked about.\n\nCould you confirm whether `sales.product_sales` is the correct view name, or point me to the right table/view that holds unit-sold quantities for products (e.g., is it `sales.order_items` joined with `sales.products`)?\n\n**No answer \u2014 requested view not found in catalog.**",
+          "id": "q06-product-sales-view",
+          "input_tokens": 29553,
+          "outcome": "no_answer",
+          "output_tokens": 384,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 5.747,
+          "tool_calls": 1,
+          "total_tokens": 29937,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            }
+          ],
+          "category": "domain",
+          "cost_status": "complete",
+          "cost_usd": "0.05983200",
+          "exit": "completed",
+          "expected": "217040",
+          "failed_sql_calls": 0,
+          "final_text": "The catalog search for \"invoices\" returned no actual matches \u2014 only unmatched fallback results (all `account_*` tables with no genuine relevance to \"invoices\"), and `match_outcome` explicitly reports `no_match`. There is no table named or resembling `finance.invoices` in the catalog; the only `finance.*` tables present are the various `account_*` archive/backup/daily/history/rollup/snapshot/staging/tmp tables shown earlier, none of which is an invoices table.\n\nI can't fabricate a table or its data, so I'm unable to compute this total.\n\n**No `finance.invoices` table exists in the catalog \u2014 unable to compute a total invoiced amount.**",
+          "id": "q07-invoice-total",
+          "input_tokens": 28041,
+          "outcome": "no_answer",
+          "output_tokens": 375,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 5.367,
+          "tool_calls": 1,
+          "total_tokens": 28416,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "finance.payments"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "sql_validation_failed",
+              "resources": [
+                "finance.payments"
+              ],
+              "sql": "SELECT SUM(paid_amount) AS total_paid FROM payments WHERE paid_on >= DATE '2026-01-01'",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "finance.payments"
+              ],
+              "sql": "SELECT SUM(paid_amount) AS total_paid FROM finance.payments WHERE paid_on >= DATE '2026-01-01'",
+              "tool": "data_query"
+            }
+          ],
+          "category": "clean",
+          "cost_status": "complete",
+          "cost_usd": "0.10378400",
+          "exit": "completed",
+          "expected": "136290",
+          "failed_sql_calls": 1,
+          "final_text": "Total paid amount for payments on or after 2026-01-01, summed from finance.payments.paid_amount where paid_on >= '2026-01-01':\n\n136290.00",
+          "id": "q08-payments-2026",
+          "input_tokens": 49527,
+          "outcome": "correct",
+          "output_tokens": 473,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 8.133,
+          "tool_calls": 3,
+          "total_tokens": 50000,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [
+                "events.page_views_20260315"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": null,
+              "resources": [
+                "events.page_views_20260315"
+              ],
+              "sql": "SELECT COUNT(*) AS total_rows, COUNT(*) FILTER (WHERE viewed_at AT TIME ZONE 'UTC' >= TIMESTAMP '2026-03-15 00:00:00' AND viewed_at AT TIME ZONE 'UTC' < TIMESTAMP '2026-03-16 00:00:00') AS in_range, MIN(viewed_at) AS min_t, MAX(viewed_at) AS max_t FROM events.page_views_20260315",
+              "tool": "data_query"
+            }
+          ],
+          "category": "partition",
+          "cost_status": "complete",
+          "cost_usd": "0.13970200",
+          "exit": "completed",
+          "expected": "500",
+          "failed_sql_calls": 0,
+          "final_text": "All 500 rows in the `events.page_views_20260315` partition fall within 2026-03-15 00:00:00\u201323:59:59 UTC (min/max timestamps confirm the full day is contained, no spillover), so the count matches the total partition size.\n\n**500**",
+          "id": "q09-page-views-day",
+          "input_tokens": 65116,
+          "outcome": "correct",
+          "output_tokens": 947,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 1951,
+            "metadata_by_statement": {
+              "columns": 987,
+              "indexes": 962,
+              "relationships": 1,
+              "resources": 1
+            },
+            "session_and_transaction": 5,
+            "user_query": 1
+          },
+          "run_seconds": 12.297,
+          "tool_calls": 3,
+          "total_tokens": 66063,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "events.page_views"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "events.page_views"
+              ],
+              "sql": "SELECT COUNT(*) AS cnt FROM t446 WHERE path = '/pricing'",
+              "tool": "data_query"
+            },
+            {
+              "error": "sql_validation_failed",
+              "resources": [
+                "events.page_views"
+              ],
+              "sql": "SELECT COUNT(*) AS cnt FROM page_views WHERE path = '/pricing'",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "events.page_views"
+              ],
+              "sql": "SELECT COUNT(*) AS cnt FROM events.page_views WHERE path = '/pricing'",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "events.page_views"
+              ],
+              "sql": "SELECT path, COUNT(*) AS cnt FROM events.page_views WHERE path ILIKE '%pricing%' GROUP BY path",
+              "tool": "data_query"
+            }
+          ],
+          "category": "partition",
+          "cost_status": "complete",
+          "cost_usd": "0.17075000",
+          "exit": "completed",
+          "expected": "15000",
+          "failed_sql_calls": 2,
+          "final_text": "Confirmed: no rows in `events.page_views` (t446) contain \"pricing\" in the `path` value at all, so there are zero exact matches for `/pricing` as well.\n\n0",
+          "id": "q10-pricing-page-views",
+          "input_tokens": 79480,
+          "outcome": "confident_wrong",
+          "output_tokens": 1179,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 3902,
+            "metadata_by_statement": {
+              "columns": 1974,
+              "indexes": 1924,
+              "relationships": 2,
+              "resources": 2
+            },
+            "session_and_transaction": 10,
+            "user_query": 2
+          },
+          "run_seconds": 17.285,
+          "tool_calls": 5,
+          "total_tokens": 80659,
+          "turns": 6
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [
+                "crm.accounts",
+                "crm.opportunities"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "crm.accounts",
+                "crm.opportunities"
+              ],
+              "sql": "SELECT (SELECT string_agg(DISTINCT tier, ',') FROM \"crm.accounts\") AS tiers, (SELECT string_agg(DISTINCT stage, ',') FROM \"crm.opportunities\") AS stages",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "crm.accounts"
+              ],
+              "sql": "SELECT DISTINCT tier FROM \"crm.accounts\"",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "crm.opportunities"
+              ],
+              "sql": "SELECT DISTINCT stage FROM \"crm.opportunities\"",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "crm.accounts"
+              ],
+              "sql": "SELECT DISTINCT tier FROM \"crm.accounts\"",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "crm.opportunities"
+              ],
+              "sql": "SELECT DISTINCT stage FROM \"crm.opportunities\"",
+              "tool": "data_query"
+            }
+          ],
+          "category": "foreign_key_join",
+          "cost_status": "complete",
+          "cost_usd": "0.16772000",
+          "exit": "completed",
+          "expected": "278100",
+          "failed_sql_calls": 5,
+          "final_text": "I attempted to query the CRM tables (`crm.accounts` for tier and `crm.opportunities` for stage/amount, resolved via the join `opportunities.account_id \u2192 accounts.account_id`), using the exact catalog resource IDs (t617 and t159) returned by `catalog_describe`. However, every `data_query` attempt against these resources \u2014 whether referenced by short ref (t617/t159) or by their full `catalog-resource:sha256:...` IDs \u2014 was rejected with `resource_read_not_allowed`, indicating these resources are not currently admitted for data reads in this run (a permissions/admission gap, not a query-syntax issue).\n\nI cannot fabricate the \"gold\" tier value, the \"won\" stage value, or any amount total without a successful validated read. Since this is a missing-permission situation, it requires foreground admission of read access to these resources before the question can be answered \u2014 I cannot expand that scope myself via further search or retries.\n\nUnable to compute \u2014 read access to the required CRM tables (accounts, opportunities) is not currently admitted in this run.",
+          "id": "q11-gold-won-pipeline",
+          "input_tokens": 71025,
+          "outcome": "no_answer",
+          "output_tokens": 2567,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 31.535,
+          "tool_calls": 6,
+          "total_tokens": 73592,
+          "turns": 5
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_describe"
+            }
+          ],
+          "category": "extension_type",
+          "cost_status": "complete",
+          "cost_usd": "0.20493600",
+          "exit": "token_budget_insufficient",
+          "expected": "600",
+          "failed_sql_calls": 0,
+          "final_text": "",
+          "id": "q12-example-com-contacts",
+          "input_tokens": 96683,
+          "outcome": "incomplete",
+          "output_tokens": 1157,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 15.601,
+          "tool_calls": 4,
+          "total_tokens": 97840,
+          "turns": 4
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": true,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            }
+          ],
+          "category": "unsupported_builtin_type",
+          "cost_status": "complete",
+          "cost_usd": "0.06005400",
+          "exit": "completed",
+          "expected": "1200",
+          "failed_sql_calls": 0,
+          "final_text": "No table named `crm.notes` exists in the catalog \u2014 the search for \"notes\" returned no actual matches (only an unmatched fallback list of unrelated `account_*` tables), and the identity/schema listing likewise has no `notes` table under the `crm` schema. I can't infer a nonexistent table or substitute a similarly-named one.\n\nCould you confirm the exact table name, or would you like me to list all tables in the `crm` schema so you can pick the correct one?\n\n**Answer: N/A \u2014 no `crm.notes` table found in the catalog**",
+          "id": "q13-crm-note-count",
+          "input_tokens": 28087,
+          "outcome": "no_answer",
+          "output_tokens": 388,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 5.512,
+          "tool_calls": 1,
+          "total_tokens": 28475,
+          "turns": 2
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": false,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "SELECT COUNT(*) AS row_count FROM t209",
+              "tool": "data_query"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "SELECT COUNT(*) AS row_count FROM t209",
+              "tool": "data_query"
+            },
+            {
+              "error": null,
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            },
+            {
+              "error": "resource_read_not_allowed",
+              "resources": [
+                "legacy.Accounts"
+              ],
+              "sql": "SELECT COUNT(*) AS row_count FROM t209",
+              "tool": "data_query"
+            }
+          ],
+          "category": "quoted_identifier",
+          "cost_status": "complete",
+          "cost_usd": "0.13782200",
+          "exit": "completed",
+          "expected": "33",
+          "failed_sql_calls": 3,
+          "final_text": "I attempted to query row counts for `legacy.\"Accounts\"` (catalog resource `t209` / `catalog-resource:sha256:39109d033e7ada45f3bf4f455ce4cdc31e9a93fbf20e3605b9d788776068e604`). I confirmed via `catalog_describe` that this resource is cataloged (approximate row count estimate: 33, not exact), but every `data_query` read attempt against it \u2014 using both the short ref (`t209`) and the full resource ID \u2014 was refused with `resource_read_not_allowed`, and the system flagged this as a repeated, non-recoverable failure for this scope.\n\nThis means an exact row count cannot be obtained in this run: the table is visible in the catalog but not currently readable for SQL execution. I won't keep retrying the same blocked call.\n\n**Blocked \u2014 exact row count unavailable; only an approximate catalog estimate exists: ~33**",
+          "id": "q14-mixed-case-accounts",
+          "input_tokens": 61246,
+          "outcome": "correct",
+          "output_tokens": 1533,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 19.451,
+          "tool_calls": 4,
+          "total_tokens": 62779,
+          "turns": 5
+        },
+        {
+          "answer_elsewhere": false,
+          "asked_clarification": true,
+          "cache_read_tokens": 0,
+          "calls": [
+            {
+              "error": null,
+              "resources": [],
+              "sql": "",
+              "tool": "catalog_search"
+            },
+            {
+              "error": null,
+              "resources": [
+                "sales.Customers",
+                "sales.customers",
+                "legacy.customers"
+              ],
+              "sql": "",
+              "tool": "catalog_describe"
+            }
+          ],
+          "category": "cross_schema_join",
+          "cost_status": "complete",
+          "cost_usd": "0.07036400",
+          "exit": "completed",
+          "expected": "900",
+          "failed_sql_calls": 0,
+          "final_text": "I found multiple plausible candidates for both halves of this question, and no established join path between any of them \u2014 this is a case of material ambiguity I need you to resolve before I run anything:\n\n**\"Sales customers\" could be:**\n- `sales.Customers` (t743)\n- `sales.customers` (t811) \u2014 a separate table, same name, different case\n- `legacy.customers` (t299) \u2014 also surfaced as a \"customers\" match\n\n**\"CRM account\" could be any of dozens of tables:**, e.g. `accounts` (t617), `Accounts` (t209), another `accounts` (t151), plus many dated/numbered variants (`account_archive_050/150/250`, `account_backup_060/260`, `account_daily_030/130/230`, `account_history_010`, etc.) \u2014 962 total matches for \"crm accounts.\"\n\nCritically, `catalog_describe` relationships returned **no join path** between any of the three customer tables and anything else \u2014 so I can't infer how \"has a CRM account\" would even be determined without you specifying:\n1. Which exact sales customers table you mean (t743, t811, or t299/legacy), and\n2. Which exact CRM accounts table counts as \"the\" CRM account table, and\n3. What the join key/relationship is (since none is cataloged automatically).\n\nCould you confirm the specific sales-customers table and CRM-accounts table (and how they relate, e.g. a shared customer/account ID) so I can run the count accurately?\n\n**No answer computed \u2014 clarification required.**",
+          "id": "q15-customers-with-account",
+          "input_tokens": 27912,
+          "outcome": "no_answer",
+          "output_tokens": 1454,
+          "repeat": 2,
+          "round_trips": {
+            "metadata": 0,
+            "metadata_by_statement": {},
+            "session_and_transaction": 0,
+            "user_query": 0
+          },
+          "run_seconds": 16.254,
+          "tool_calls": 2,
+          "total_tokens": 29366,
+          "turns": 2
+        }
+      ],
+      "summary": {
+        "answer_elsewhere": 1,
+        "mean_input_tokens_per_turn": 15043,
+        "mean_run_seconds": 20.6,
+        "outcomes": {
+          "confident_wrong": 4,
+          "correct": 13,
+          "incomplete": 9,
+          "no_answer": 19
+        },
+        "runs": 45,
+        "total_cost_usd": null,
+        "total_tokens": 2643492,
+        "total_tool_calls": 147,
+        "total_turns": 172
+      }
+    }
+  }
+}

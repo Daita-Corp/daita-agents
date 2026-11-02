@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from functools import cache
 from pathlib import Path
 
+import pytest
+
 import daita
 from daita.capabilities import AccessMode, CallTargetLane, OperationalEffect
 from daita.host.protocol import CLIENT_ONLY_MEMBERS
@@ -2790,3 +2792,31 @@ def test_raw_tool_call_detector_catches_each_raw_reader_form():
         "    call.arguments\n"
     )
     assert _raw_tool_call_reads("reader.py", ast.parse(identity_only)) == []
+
+
+@pytest.mark.xfail(strict=True, reason="source I/O still consults the catalog")
+def test_source_io_never_consults_the_catalog():
+    """Catalog IDs can be derived from a name; catalog state is never read."""
+
+    source_io = (
+        PACKAGE / "adapters" / "postgresql_query.py",
+        PACKAGE / "adapters" / "postgresql_write.py",
+        PACKAGE / "adapters" / "sqlite_query.py",
+        *sorted((PACKAGE / "domains" / "data" / "sql").glob("*.py")),
+    )
+    consulting: dict[str, set[str]] = {}
+    for path in source_io:
+        names: set[str] = set()
+        for node in ast.walk(_tree(path)):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module is not None
+                and "catalog" in node.module.split(".")
+            ):
+                names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.arg) and node.arg == "catalog":
+                names.add("catalog parameter")
+        consulting_names = names - {"ResourceKind", "catalog_resource_id"}
+        if consulting_names:
+            consulting[path.name] = consulting_names
+    assert consulting == {}
