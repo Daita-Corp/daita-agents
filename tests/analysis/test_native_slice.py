@@ -929,7 +929,7 @@ async def test_batch_uses_distinct_source_lanes_and_rechecks_revoked_authority(
         agent.run("Use Python to read the connected numbers tables.")
     )
     try:
-        await asyncio.wait_for(second.wait(), timeout=5)
+        await asyncio.wait_for(asyncio.gather(first.wait(), second.wait()), timeout=5)
         assert calls.count(sources[0].id) == calls.count(sources[1].id) == 1
         preview = await agent.preview_source_permissions(
             source_id=sources[0].id,
@@ -1283,7 +1283,6 @@ async def test_exact_arrow_export_bind_compute_and_reopen(tmp_path, handoff):
         "parser",
         "parser_bound",
         "decoded_bound",
-        "drift",
         "revocation",
         "deletion",
         "cancel",
@@ -1409,9 +1408,6 @@ async def test_capture_failure_retains_publication_without_query_replay(
             ),
         )
     )
-    if failure == "drift":
-        with sqlite3.connect(database) as connection:
-            connection.execute("ALTER TABLE numbers ADD COLUMN extra TEXT")
     task = asyncio.create_task(
         agent.run("Use Python with the connected numbers table.")
     )

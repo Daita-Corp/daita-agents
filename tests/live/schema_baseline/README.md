@@ -1,8 +1,8 @@
 # PostgreSQL schema baseline
 
 A reproducible yardstick for how Daita's PostgreSQL source handles a large,
-messy schema: discovery cost and limits, catalog coverage, the per-query
-structural recheck, staleness after unrelated schema changes, and answer
+messy schema: discovery cost and limits, catalog coverage, the effect of
+unrelated schema changes, and answer
 outcomes on a fixed question set. Rerun it after every change to PostgreSQL
 discovery or query revalidation and compare against the committed results in
 `results/`.
@@ -42,9 +42,8 @@ head-to-head) can run the same set.
 4. Runs each question through `Agent.run` with a scripted oracle model that
    issues the known-correct SQL. This isolates the catalog gate and source cost
    from model reasoning. Per question: outcome (`correct`, `confident_wrong`,
-   `refused`), refusal codes, run seconds, `structural_seconds` vs
-   `query_seconds` (pool enabled so the backend records them), metadata round
-   trips, loop steps and tokens.
+   `refused`), refusal codes, run seconds, `query_seconds` (pool enabled so the
+   backend records them), metadata round trips, loop steps and tokens.
 5. Adds a partition, then an unrelated table, and reruns question 1 after each
    change and again after `refresh_source`, recording `catalog_source_stale`.
 

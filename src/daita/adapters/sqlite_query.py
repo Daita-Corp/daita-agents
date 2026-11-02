@@ -1,4 +1,4 @@
-"""Execute catalog-validated, bounded reads against admitted SQLite files."""
+"""Execute policy-checked, bounded reads against admitted SQLite files."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +22,7 @@ from ..artifacts.renderers import (
     ExactXlsxRenderer,
     arrow_schema,
 )
-from ..domains.data.capabilities import SQLiteReadResult
+from ..domains.data.capabilities import SQLiteReadResult, refused_read_details
 from ..domains.data.controller import ReadScopedCatalogReader
 from ..domains.data.export_capabilities import (
     ExactTabularExportResult,
@@ -30,7 +30,7 @@ from ..domains.data.export_capabilities import (
     resolved_exact_export_sensitivity,
 )
 from ..domains.data.results import project_result_rows
-from ..domains.data.sql import ResourceSchema, validate_sqlite_read
+from ..domains.data.sql import CheckedRead, denied_relations
 from ..errors import DaitaError
 from ..storage.sqlite_records import SourcePermissionStateError
 from .protocols import SourceStore
@@ -42,15 +42,14 @@ _MAX_STATEMENT_TIMEOUT_SECONDS = 60.0
 class SQLiteQueryError(DaitaError):
     """Normalized query-boundary failure without connector error leakage."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
         self.code = code
-        super().__init__(message, error_code=code)
-
-
-class SQLiteReadPermissionError(DaitaError):
-    """Stable model-visible failure for a permission recheck at source I/O."""
-
-    def __init__(self, code: str, message: str) -> None:
+        self.details = dict(details or {})
         super().__init__(message, error_code=code)
 
 
@@ -62,149 +61,20 @@ class _AdmittedSQLiteFile:
 
 
 class SQLiteQueryBackend:
-    """Revalidate catalog scope, then perform one bounded read-only query."""
+    """Perform one bounded read-only query that already passed policy."""
 
     def __init__(self, sources: SourceStore, catalog: ReadScopedCatalogReader) -> None:
         if not isinstance(sources, SourceStore):
             raise TypeError("sources must implement SourceStore")
-        for method_name in ("resource_schemas", "readable_resource_ids"):
-            if not callable(getattr(catalog, method_name, None)):
-                raise TypeError(f"catalog must provide {method_name}")
+        if not callable(getattr(catalog, "readable_resource_ids", None)):
+            raise TypeError("catalog must provide readable_resource_ids")
         self._sources = sources
         self._catalog = catalog
 
-    async def execute_read(
-        self,
-        *,
-        agent_id: str,
-        source_id: str,
-        sql: str,
-        parameters: tuple[object, ...],
-        max_rows: int,
-        max_bytes: int,
-        expected_resource_revisions: tuple[tuple[str, str], ...] | None = None,
-        timeout_seconds: float | None = None,
-    ) -> SQLiteReadResult:
-        statement_timeout = (
-            _DEFAULT_STATEMENT_TIMEOUT_SECONDS
-            if timeout_seconds is None
-            else float(timeout_seconds)
-        )
-        if not 0 < statement_timeout <= _MAX_STATEMENT_TIMEOUT_SECONDS:
-            raise ValueError("timeout_seconds must be from 0 through 60")
-        registration = await self._sources.load_source(agent_id, source_id)
-        if registration is None or not registration.active:
-            raise SQLiteQueryError(
-                "source_not_available",
-                "The SQLite source is not attached to this agent.",
-            )
-        if registration.adapter_id != "sqlite":
-            raise SQLiteQueryError(
-                "source_adapter_mismatch",
-                "The selected source is not a SQLite source.",
-            )
-        resources = await self._catalog.resource_schemas(agent_id, source_id)
-        if expected_resource_revisions is not None:
-            current = {item.resource_id: item.revision for item in resources}
-            if any(
-                current.get(resource_id) != revision
-                for resource_id, revision in expected_resource_revisions
-            ):
-                raise SQLiteQueryError(
-                    "query_binding_stale",
-                    "A validated resource revision changed before source dispatch.",
-                )
-        try:
-            readable = await self._catalog.readable_resource_ids(
-                agent_id,
-                (source_id,),
-            )
-        except SourcePermissionStateError:
-            raise SQLiteReadPermissionError(
-                "source_permission_state_invalid",
-                "Stored source permission state is missing or invalid.",
-            ) from None
-        validation = validate_sqlite_read(
-            sql,
-            source_id=source_id,
-            resources=resources,
-            parameters=parameters,
-            allowed_resource_ids=readable,
-        )
-        if not validation.valid or validation.analysis is None:
-            if "resource_out_of_scope" in validation.issue_codes:
-                raise SQLiteReadPermissionError(
-                    "resource_read_not_allowed",
-                    "One or more requested resources are not available for reading.",
-                )
-            codes = ",".join(validation.issue_codes[:8]) or "invalid_sql"
-            raise SQLiteQueryError(
-                "query_revalidation_failed",
-                f"SQLite query failed deterministic revalidation: {codes}",
-            )
-        if not validation.resource_ids:
-            raise SQLiteQueryError(
-                "query_resource_scope_empty",
-                "SQLite query must reference a current catalog resource.",
-            )
-        if validation.source_revision is None or len(
-            validation.resource_revisions
-        ) != len(validation.resource_ids):
-            raise SQLiteQueryError(
-                "catalog_provenance_missing",
-                "SQLite query requires complete current catalog provenance.",
-            )
-        expected_schema_version = _expected_schema_version(validation.source_revision)
-        configured_path = registration.configuration.get("path")
-        if not isinstance(configured_path, str):
-            raise SQLiteQueryError(
-                "source_configuration_invalid",
-                "SQLite source configuration is missing its path.",
-            )
-        path = _regular_unaliased_path(configured_path)
-        columns, rows, live_source_revision = await _run_query(
-            path,
-            validation.analysis.canonical_sql,
-            parameters,
-            expected_schema_version=expected_schema_version,
-            max_rows=max_rows,
-            max_bytes=max_bytes,
-            timeout_seconds=statement_timeout,
-        )
-        projection = project_result_rows(
-            rows,
-            max_rows=max_rows,
-            max_bytes=max_bytes,
-        )
-        return SQLiteReadResult(
-            source_id=source_id,
-            canonical_sql=validation.analysis.canonical_sql,
-            sql_fingerprint=validation.analysis.sql_fingerprint,
-            resource_ids=validation.resource_ids,
-            resource_revisions=validation.resource_revisions,
-            source_revision=live_source_revision,
-            columns=columns,
-            projection=projection,
-            resource_names=_resource_names(resources, validation.resource_ids),
-        )
-
-    async def execute_exact_tabular(
-        self,
-        *,
-        agent_id: str,
-        source_id: str,
-        sql: str,
-        parameters: tuple[object, ...],
-        format_name: str,
-        parameters_sha256: str,
-        created_at: datetime,
-        max_rows: int,
-        max_columns: int,
-        max_bytes: int,
-        timeout_seconds: float,
-        progress: ExactTabularProgress | None = None,
-    ) -> ExactTabularExportResult:
-        """Run one fresh exact read through the selected fixed renderer."""
+    async def _configured_path(
+        self, agent_id: str, source_id: str, read: CheckedRead
+    ) -> str:
+        """Recheck current permission, since a read can queue after it was prepared."""
 
         registration = await self._sources.load_source(agent_id, source_id)
         if (
@@ -222,66 +92,97 @@ class SQLiteQueryBackend:
                 "source_adapter_mismatch",
                 "The selected source is not a SQLite source.",
             )
-        resources = await self._catalog.resource_schemas(agent_id, source_id)
-        try:
-            readable = await self._catalog.readable_resource_ids(
-                agent_id,
-                (source_id,),
-            )
-        except SourcePermissionStateError:
-            raise SQLiteReadPermissionError(
-                "source_permission_state_invalid",
-                "Stored source permission state is missing or invalid.",
-            ) from None
-        validation = validate_sqlite_read(
-            sql,
-            source_id=source_id,
-            resources=resources,
-            parameters=parameters,
-            allowed_resource_ids=readable,
-        )
-        if not validation.valid or validation.analysis is None:
-            if "resource_out_of_scope" in validation.issue_codes:
-                raise SQLiteReadPermissionError(
-                    "resource_read_not_allowed",
-                    "One or more requested resources are not available for reading.",
-                )
-            codes = ",".join(validation.issue_codes[:8]) or "invalid_sql"
-            raise SQLiteQueryError(
-                "query_revalidation_failed",
-                f"SQLite query failed deterministic revalidation: {codes}",
-            )
-        if not validation.resource_ids:
-            raise SQLiteQueryError(
-                "query_resource_scope_empty",
-                "SQLite query must reference a current catalog resource.",
-            )
-        if validation.source_revision is None or len(
-            validation.resource_revisions
-        ) != len(validation.resource_ids):
-            raise SQLiteQueryError(
-                "catalog_provenance_missing",
-                "SQLite query requires complete current catalog provenance.",
-            )
         configured_path = registration.configuration.get("path")
         if not isinstance(configured_path, str):
             raise SQLiteQueryError(
                 "source_configuration_invalid",
                 "SQLite source configuration is missing its path.",
             )
-        sensitivity = resolved_exact_export_sensitivity(
-            tuple(
-                item.sensitivity_class
-                for item in resources
-                if item.resource_id in validation.resource_ids
+        try:
+            readable = await self._catalog.readable_resource_ids(agent_id, (source_id,))
+        except SourcePermissionStateError:
+            raise SQLiteQueryError(
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            ) from None
+        denied = denied_relations(read, frozenset(readable))
+        if denied:
+            raise SQLiteQueryError(
+                "resource_read_not_allowed",
+                f"{', '.join(denied)} is not available for reading in this run.",
             )
+        return configured_path
+
+    async def execute_read(
+        self,
+        *,
+        agent_id: str,
+        source_id: str,
+        read: CheckedRead,
+        max_rows: int,
+        max_bytes: int,
+        timeout_seconds: float | None = None,
+    ) -> SQLiteReadResult:
+        statement_timeout = (
+            _DEFAULT_STATEMENT_TIMEOUT_SECONDS
+            if timeout_seconds is None
+            else float(timeout_seconds)
         )
+        if not 0 < statement_timeout <= _MAX_STATEMENT_TIMEOUT_SECONDS:
+            raise ValueError("timeout_seconds must be from 0 through 60")
+        path = _regular_unaliased_path(
+            await self._configured_path(agent_id, source_id, read)
+        )
+        columns, rows, live_source_revision = await _run_query(
+            path,
+            read.canonical_sql,
+            read.parameters,
+            max_rows=max_rows,
+            max_bytes=max_bytes,
+            timeout_seconds=statement_timeout,
+        )
+        projection = project_result_rows(
+            rows,
+            max_rows=max_rows,
+            max_bytes=max_bytes,
+        )
+        return SQLiteReadResult(
+            source_id=source_id,
+            canonical_sql=read.canonical_sql,
+            sql_fingerprint=read.sql_fingerprint,
+            resource_ids=read.resource_ids,
+            resource_revisions=read.resource_revisions,
+            source_revision=live_source_revision,
+            columns=columns,
+            projection=projection,
+            resource_names=read.resource_names,
+        )
+
+    async def execute_exact_tabular(
+        self,
+        *,
+        agent_id: str,
+        source_id: str,
+        read: CheckedRead,
+        format_name: str,
+        parameters_sha256: str,
+        created_at: datetime,
+        max_rows: int,
+        max_columns: int,
+        max_bytes: int,
+        timeout_seconds: float,
+        progress: ExactTabularProgress | None = None,
+    ) -> ExactTabularExportResult:
+        """Run one fresh read through the selected fixed renderer."""
+
+        configured_path = await self._configured_path(agent_id, source_id, read)
+        sensitivity = resolved_exact_export_sensitivity(read.sensitivity_classes)
         xlsx_provenance = (
             ExactXlsxProvenance(
                 source_id=source_id,
-                source_revision=validation.source_revision,
-                resource_revisions=validation.resource_revisions,
-                sql_fingerprint=validation.analysis.sql_fingerprint,
+                source_revision=read.source_revision,
+                resource_revisions=read.resource_revisions,
+                sql_fingerprint=read.sql_fingerprint,
                 parameters_sha256=parameters_sha256,
                 sensitivity=sensitivity,
                 created_at=created_at,
@@ -291,13 +192,10 @@ class SQLiteQueryBackend:
         )
         content, columns, row_count, live_source_revision = await _run_exact_tabular(
             _regular_unaliased_path(configured_path),
-            validation.analysis.canonical_sql,
-            parameters,
+            read.canonical_sql,
+            read.parameters,
             format_name=format_name,
             xlsx_provenance=xlsx_provenance,
-            expected_schema_version=_expected_schema_version(
-                validation.source_revision
-            ),
             max_rows=max_rows,
             max_columns=max_columns,
             max_bytes=max_bytes,
@@ -309,36 +207,14 @@ class SQLiteQueryBackend:
             adapter_id="sqlite",
             source_id=source_id,
             source_revision=live_source_revision,
-            sql_fingerprint=validation.analysis.sql_fingerprint,
-            resource_revisions=validation.resource_revisions,
+            sql_fingerprint=read.sql_fingerprint,
+            resource_revisions=read.resource_revisions,
             columns=columns,
             row_count=row_count,
             content=content,
             sensitivity=sensitivity,
             column_types=arrow_schema(content)[1] if format_name == "arrow" else (),
         )
-
-
-def _expected_schema_version(source_revision: str) -> int:
-    prefix = "schema_version:"
-    if not source_revision.startswith(prefix):
-        raise SQLiteQueryError(
-            "catalog_source_revision_invalid",
-            "SQLite catalog source revision is malformed.",
-        )
-    raw_version = source_revision.removeprefix(prefix)
-    if not raw_version.isascii() or not raw_version.isdecimal():
-        raise SQLiteQueryError(
-            "catalog_source_revision_invalid",
-            "SQLite catalog source revision is malformed.",
-        )
-    version = int(raw_version)
-    if version < 0 or str(version) != raw_version:
-        raise SQLiteQueryError(
-            "catalog_source_revision_invalid",
-            "SQLite catalog source revision is malformed.",
-        )
-    return version
 
 
 def _regular_unaliased_path(value: str) -> _AdmittedSQLiteFile:
@@ -368,7 +244,6 @@ async def _run_query(
     sql: str,
     parameters: tuple[object, ...],
     *,
-    expected_schema_version: int,
     max_rows: int,
     max_bytes: int,
     timeout_seconds: float = 5.0,
@@ -380,7 +255,6 @@ async def _run_query(
             path,
             sql,
             parameters,
-            expected_schema_version,
             max_rows,
             max_bytes,
             cancellation,
@@ -408,7 +282,6 @@ async def _run_exact_tabular(
     *,
     format_name: str,
     xlsx_provenance: ExactXlsxProvenance | None,
-    expected_schema_version: int,
     max_rows: int,
     max_columns: int,
     max_bytes: int,
@@ -424,7 +297,6 @@ async def _run_exact_tabular(
             parameters,
             format_name,
             xlsx_provenance,
-            expected_schema_version,
             max_rows,
             max_columns,
             max_bytes,
@@ -453,7 +325,6 @@ def _run_exact_tabular_sync(
     parameters: tuple[object, ...],
     format_name: str,
     xlsx_provenance: ExactXlsxProvenance | None,
-    expected_schema_version: int,
     max_rows: int,
     max_columns: int,
     max_bytes: int,
@@ -492,11 +363,6 @@ def _run_exact_tabular_sync(
                 "SQLite source revision could not be read.",
             )
         live_schema_version = version_row[0]
-        if live_schema_version != expected_schema_version:
-            raise SQLiteQueryError(
-                "catalog_source_stale",
-                "SQLite source schema changed after its catalog snapshot.",
-            )
         connection.set_authorizer(_read_only_authorizer)
         cursor = connection.execute(sql, parameters)
         if cursor.description is None:
@@ -574,10 +440,7 @@ def _run_exact_tabular_sync(
                     "completed_bytes": completed_bytes,
                 },
             ) from error
-        raise SQLiteQueryError(
-            "sqlite_query_failed",
-            "SQLite could not complete the exact bounded read.",
-        ) from error
+        raise _classified_failure(error) from None
     finally:
         if connection is not None:
             connection.set_authorizer(None)
@@ -593,7 +456,6 @@ def _run_query_sync(
     path: _AdmittedSQLiteFile,
     sql: str,
     parameters: tuple[object, ...],
-    expected_schema_version: int,
     max_rows: int,
     max_bytes: int,
     cancellation: threading.Event,
@@ -627,11 +489,6 @@ def _run_query_sync(
                 "SQLite source revision could not be read.",
             )
         live_schema_version = version_row[0]
-        if live_schema_version != expected_schema_version:
-            raise SQLiteQueryError(
-                "catalog_source_stale",
-                "SQLite source schema changed after its catalog snapshot.",
-            )
         connection.set_authorizer(_read_only_authorizer)
         columns, rows = _execute_user_query(
             connection,
@@ -651,10 +508,7 @@ def _run_query_sync(
                 "The bounded SQLite read exceeded its statement deadline of "
                 f"{timeout_seconds:g} seconds.",
             ) from None
-        raise SQLiteQueryError(
-            "sqlite_query_failed",
-            "SQLite could not complete the bounded read.",
-        ) from error
+        raise _classified_failure(error) from None
     finally:
         if connection is not None:
             connection.set_authorizer(None)
@@ -666,12 +520,26 @@ def _run_query_sync(
             os.close(admitted_descriptor)
 
 
-def _resource_names(
-    resources: Iterable[ResourceSchema],
-    resource_ids: Iterable[str],
-) -> tuple[tuple[str, str], ...]:
-    names = {item.resource_id: item.name for item in resources}
-    return tuple((resource_id, names[resource_id]) for resource_id in resource_ids)
+def _classified_failure(error: sqlite3.Error) -> SQLiteQueryError:
+    """Sort one SQLite failure; only names and syntax text cross the boundary."""
+
+    name = str(getattr(error, "sqlite_errorname", "") or "")
+    details: dict[str, object] = {"sqlite_error": name} if name else {}
+    text = str(error)[:1_024]
+    if name == "SQLITE_AUTH" or "not authorized" in text:
+        return SQLiteQueryError("not_permitted", text, details)
+    if name.startswith("SQLITE_READONLY") or "readonly" in text:
+        return SQLiteQueryError(
+            "read_only_violation", "A read cannot modify data.", details
+        )
+    if name == "SQLITE_ERROR":
+        # Unknown tables and columns, ambiguity and syntax: names, never values.
+        return SQLiteQueryError("query_invalid", text, refused_read_details(details))
+    return SQLiteQueryError(
+        "sqlite_query_failed",
+        "SQLite could not complete the bounded read" + (f" ({name})." if name else "."),
+        details,
+    )
 
 
 def _connect_admitted_read_only(
@@ -819,10 +687,12 @@ def _execute_user_query(
 def _read_only_authorizer(
     action: int,
     _arg1: str | None,
-    _arg2: str | None,
+    arg2: str | None,
     _database: str | None,
     _trigger: str | None,
 ) -> int:
+    if action == sqlite3.SQLITE_FUNCTION and (arg2 or "").lower() == "load_extension":
+        return sqlite3.SQLITE_DENY
     denied_names = (
         "SQLITE_ALTER_TABLE",
         "SQLITE_ANALYZE",
@@ -901,5 +771,4 @@ def _json_value(value: object) -> object:
 __all__ = [
     "SQLiteQueryBackend",
     "SQLiteQueryError",
-    "SQLiteReadPermissionError",
 ]

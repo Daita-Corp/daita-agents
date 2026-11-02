@@ -110,7 +110,9 @@ from .controller import DATA_EXPORT_TABULAR_CAPABILITY_ID, TEXT_READ_CAPABILITY_
 from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
+    CheckedRead,
     ResourceSchema,
+    checked_reads,
 )
 
 DOCUMENT_CREATE_CAPABILITY_ID = "artifact.create_document"
@@ -292,8 +294,7 @@ class ExactTabularExportBackend(Protocol):
         *,
         agent_id: str,
         source_id: str,
-        sql: str,
-        parameters: tuple[object, ...],
+        read: CheckedRead,
         format_name: str,
         parameters_sha256: str,
         created_at: datetime,
@@ -485,22 +486,19 @@ class DataExportTabularExecutor:
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         source_id = request.arguments["source_id"]
-        sql = request.arguments["sql"]
         parameters = request.arguments.get("parameters", ())
-        resource_ids = request.arguments["resource_ids"]
         adapter_id = request.arguments["_adapter_id"]
         format_name = request.arguments["output"]
         filename = request.arguments.get("filename")
         assert isinstance(source_id, str)
-        assert isinstance(sql, str)
         assert isinstance(parameters, tuple)
-        assert isinstance(resource_ids, tuple)
         assert isinstance(adapter_id, str)
         assert isinstance(format_name, str) and format_name in {"csv", "xlsx", "arrow"}
         assert filename is None or isinstance(filename, str)
         if format_name == "arrow" and self._arrow_bounds is None:
             raise ValueError("Arrow is not admitted by this runtime")
         bounds = self._arrow_bounds if format_name == "arrow" else None
+        (read,) = checked_reads(request.arguments)
         completed = {"rows": 0, "columns": 0, "bytes": 0}
         backend = self._backends.get(adapter_id)
         if backend is None:
@@ -517,8 +515,7 @@ class DataExportTabularExecutor:
                 result = await backend.execute_exact_tabular(
                     agent_id=self._agent_id,
                     source_id=source_id,
-                    sql=sql,
-                    parameters=parameters,
+                    read=read,
                     format_name=format_name,
                     parameters_sha256=parameters_sha256,
                     created_at=self._clock(),
@@ -553,8 +550,6 @@ class DataExportTabularExecutor:
             result.adapter_id != adapter_id
             or result.source_id != source_id
             or result.format != format_name
-            or frozenset(item[0] for item in result.resource_revisions)
-            != frozenset(resource_ids)
         ):
             raise ValueError("exact tabular backend returned different execution facts")
         media_type = {

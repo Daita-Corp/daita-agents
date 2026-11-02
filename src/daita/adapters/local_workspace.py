@@ -533,7 +533,7 @@ class _SearchState:
     cancellation: threading.Event
     deadline: float
     matches: list[LocalFileSearchMatch]
-    allowed_revisions: Mapping[str, str] | None = None
+    allowed_paths: frozenset[str] | None = None
     structured_only: bool = False
     scanned_entries: int = 0
     scanned_content_bytes: int = 0
@@ -759,13 +759,12 @@ class LocalWorkspaceBackend:
         mode: str = "paths",
         glob: str | None = None,
         order_by: str = "path",
-        allowed_revisions: Mapping[str, str] | None = None,
+        allowed_paths: frozenset[str] | None = None,
         structured_only: bool = False,
     ) -> LocalFileSearchResult:
-        """Search admitted files; ``allowed_revisions`` limits matches to exact
-        root-relative files still at their physical revision, checked before
-        any content is read, and ``structured_only`` to files with a query
-        format."""
+        """Search admitted files; ``allowed_paths`` limits matches to exact
+        root-relative files, checked before any content is read, and
+        ``structured_only`` to files with a query format."""
 
         _required_run_id(run_id)
         raw_paths = _search_roots(path, paths)
@@ -814,7 +813,7 @@ class LocalWorkspaceBackend:
             self._limits,
             self._protected_identities,
             self._protected_paths,
-            allowed_revisions,
+            allowed_paths,
             structured_only,
             cancellation,
             timeout=self._limits.max_search_seconds + 1.0,
@@ -829,10 +828,10 @@ class LocalWorkspaceBackend:
         path: str | None = None,
         cursor: str | None = None,
         position: str | None = None,
-        allowed_revisions: Mapping[str, str] | None = None,
+        allowed_paths: frozenset[str] | None = None,
     ) -> LocalFileReadResult:
-        """Read one bounded chunk; ``allowed_revisions`` admits only those
-        root-relative files at those physical revisions, before any I/O."""
+        """Read one bounded chunk; ``allowed_paths`` admits only those
+        root-relative files, before any I/O."""
 
         _required_run_id(run_id)
         if (path is None) == (cursor is None):
@@ -872,17 +871,10 @@ class LocalWorkspaceBackend:
             location = self._resolve_location(path, allow_root=False)
             relative_path = location.relative_path
             direction = "backward" if position == "end" else "forward"
-        if allowed_revisions is not None:
-            allowed = allowed_revisions.get(relative_path)
-            if allowed is None:
-                raise LocalWorkspaceError(
-                    "path_not_allowed", "The file is not admitted for this read."
-                )
-            if expected_revision not in (None, allowed):
-                raise LocalWorkspaceError(
-                    "file_changed", "The file changed after the previous read chunk."
-                )
-            expected_revision = allowed
+        if allowed_paths is not None and relative_path not in allowed_paths:
+            raise LocalWorkspaceError(
+                "path_not_allowed", "The file is not admitted for this read."
+            )
         if cursor is not None:
             anchor_id = _token_text(payload, "workspace_id")
             root = self._anchor_for_workspace_id(anchor_id)
@@ -2194,7 +2186,7 @@ def _search_many_sync(
     limits: LocalWorkspaceLimits,
     protected_identities: frozenset[tuple[int, int]],
     protected_paths: tuple[Path, ...],
-    allowed_revisions: Mapping[str, str] | None,
+    allowed_paths: frozenset[str] | None,
     structured_only: bool,
     cancellation: threading.Event,
 ) -> LocalFileSearchResult:
@@ -2209,7 +2201,7 @@ def _search_many_sync(
         cancellation=cancellation,
         deadline=time.monotonic() + limits.max_search_seconds,
         matches=[],
-        allowed_revisions=allowed_revisions,
+        allowed_paths=allowed_paths,
         structured_only=structured_only,
     )
     coverage = dict(initial_coverage)
@@ -2479,9 +2471,7 @@ def _scan_directory(
         if state.structured_only and structured_file_format(name) is None:
             continue
         relative_path = PurePosixPath(*parents, name).as_posix()
-        if state.allowed_revisions is not None and state.allowed_revisions.get(
-            relative_path
-        ) != _physical_revision(before):
+        if state.allowed_paths is not None and relative_path not in state.allowed_paths:
             continue
         path_matches = state.query_folded in relative_path.casefold()
         if state.mode in {"paths", "both"} and path_matches:

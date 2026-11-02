@@ -4,7 +4,7 @@ from daita.domains.data.sql import (
     MAX_SQL_CHARACTERS,
     ResourceSchema,
     analyze_sqlite_sql,
-    validate_sqlite_read,
+    validate_read,
 )
 
 _REVISION = "sha256:" + "3" * 64
@@ -44,8 +44,9 @@ def _validate(
     *,
     parameters: tuple[object, ...] = (),
 ):
-    return validate_sqlite_read(
+    return validate_read(
         sql,
+        dialect="sqlite",
         source_id="source-sqlite",
         resources=_RESOURCES,
         parameters=parameters,
@@ -62,9 +63,11 @@ def _validate(
         "SELECT recent.id FROM recent UNION ALL SELECT o.id FROM orders o",
         "SELECT o.status, count(*), sum(o.total_amount) FROM orders o "
         "GROUP BY o.status HAVING count(*) > 0",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) "
+        "SELECT r.n FROM r, orders",
     ),
 )
-def test_catalog_scoped_sqlite_query_shapes_are_valid(sql: str) -> None:
+def test_ordinary_sqlite_query_shapes_are_valid(sql: str) -> None:
     result = _validate(sql)
 
     assert result.valid, result.issues
@@ -72,53 +75,32 @@ def test_catalog_scoped_sqlite_query_shapes_are_valid(sql: str) -> None:
     assert result.source_revision == "schema_version:1"
 
 
-def test_cte_order_by_output_alias_wins_before_parent_scope_lookup() -> None:
-    result = _validate("""
-        WITH selected AS (
-          SELECT c.name AS customer_id
-          FROM customers AS c
-          ORDER BY customer_id
-        )
-        SELECT selected.customer_id
-        FROM orders AS o
-        CROSS JOIN selected
-        """)
-
-    assert result.valid, result.issues
-
-
-def test_cte_cannot_escape_to_same_named_parent_column_without_local_alias() -> None:
-    result = _validate("""
-        WITH selected AS (
-          SELECT c.name
-          FROM customers AS c
-          ORDER BY customer_id
-        )
-        SELECT selected.name
-        FROM orders AS o
-        CROSS JOIN selected
-        """)
-
-    assert not result.valid
-    assert "column_scope_escape" in result.issue_codes
-
-
 @pytest.mark.parametrize(
     ("sql", "issue_code"),
     (
         ("SELECT 1", "resource_scope_empty"),
         ("DELETE FROM orders", "mutation_not_allowed"),
-        ("SELECT o.missing FROM orders o", "missing_column"),
-        ("SELECT o.id FROM absent o", "unknown_resource"),
+        ("INSERT INTO orders (id) VALUES (1)", "mutation_not_allowed"),
+        ("UPDATE orders SET id = 1", "mutation_not_allowed"),
+        ("DROP TABLE orders", "mutation_not_allowed"),
+        ("CREATE TABLE copy AS SELECT * FROM orders", "mutation_not_allowed"),
         (
-            "SELECT id FROM orders o JOIN customers c ON o.customer_id = c.id",
-            "ambiguous_column",
+            "WITH d AS (DELETE FROM orders RETURNING id) SELECT id FROM d",
+            "mutation_not_allowed",
         ),
+        ("/* SELECT 1; */ DROP TABLE orders", "mutation_not_allowed"),
+        ("SELECT o.id FROM absent o", "resource_out_of_scope"),
+        ("SELECT * FROM sqlite_schema", "resource_out_of_scope"),
+        ("SELECT * FROM pragma_database_list", "resource_out_of_scope"),
+        ("SELECT * FROM pragma_table_info('orders')", "function_not_allowed"),
         ("SELECT o.id FROM orders o; SELECT 1", "multiple_statements"),
         ("ATTACH DATABASE '/tmp/value.db' AS value", "mutation_not_allowed"),
+        ("PRAGMA writable_schema = 1", "read_statement_required"),
+        ("COMMIT", "read_statement_required"),
+        ("SELECT id FROM orders ORDER BY 1 USING <", "sql_parse_error"),
     ),
 )
-def test_invalid_sqlite_statement_and_catalog_shapes_fail_closed(
+def test_invalid_sqlite_statements_fail_closed_before_any_source_io(
     sql: str,
     issue_code: str,
 ) -> None:

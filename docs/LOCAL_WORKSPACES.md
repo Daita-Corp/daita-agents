@@ -190,10 +190,10 @@ or column, and declared catalog links can join a file to a database table.
 Scheduled routines and background jobs can read an attached folder in their scope.
 
 An attached folder answers only for its readable cataloged files. `file_search`
-and `file_read` reach them by root-relative path; `data_query` takes their
-`resource_ids` and reads them as one relation named `data`; a combined
-`data_query` accepts them as SQL inputs. Changing a file makes it stale until
-the source is refreshed: search skips it, and a read or query of it is refused
-with `query_binding_stale`.
+and `file_read` reach them by root-relative path; `data_query` with `path_pattern`
+matches the folder's current files and reads them as one relation named `data`;
+a combined `data_query` input takes the same `path_pattern`. Every match must be
+readable in the run, or the whole read is refused naming the file. A file that
+changed since the last refresh is read as it is now.
 Attached folders are always contained to their root and are unavailable in
 hosted compositions.

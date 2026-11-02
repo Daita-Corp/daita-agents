@@ -3,27 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
 from ...._installation import repair_guidance
 from .contracts import (
-    _ASCII_IDENTIFIER_CASE_TRANSLATION,
     MAX_SQL_CHARACTERS,
     SqlAnalysis,
     SqlAnalysisError,
-    SqlColumnReference,
     SqlTableReference,
-    SqlValidationIssue,
     _dialect_identifier_key,
     _SqlDialect,
     normalize_sql,
-    sqlite_identifier_key,
 )
 
-_MAX_CANDIDATES = 8
+_LOGGER = logging.getLogger("daita.data")
 _SQL_CALL_PREFIX = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_$]*)\s*\(",
 )
@@ -44,68 +39,15 @@ _VOLATILE_CONTEXT_EXPRESSIONS = frozenset(
         "USER",
     }
 )
-_POSTGRESQL_SAFE_DATA_TYPES = frozenset(
-    {
-        "ARRAY",
-        "BIGINT",
-        "BINARY",
-        "BIT",
-        "BOOLEAN",
-        "BPCHAR",
-        "BYTEA",
-        "CHAR",
-        "CIDR",
-        "DATE",
-        "DECIMAL",
-        "DOUBLE",
-        "FLOAT",
-        "INET",
-        "INT",
-        "INTERVAL",
-        "JSON",
-        "JSONB",
-        "MACADDR",
-        "MONEY",
-        "REAL",
-        "SMALLINT",
-        "TEXT",
-        "TIME",
-        "TIMESTAMP",
-        "TIMESTAMPTZ",
-        "TIMETZ",
-        "TINYINT",
-        "UUID",
-        "VARBINARY",
-        "VARCHAR",
-    }
-)
-
-
-@dataclass(frozen=True, slots=True)
-class _LexicalRelation:
-    """One relation visible inside one sqlglot lexical scope."""
-
-    qualifier: str
-    columns: tuple[str, ...]
-    lineage: tuple[str, ...]
-    kind: Literal["base", "cte", "subquery", "set"]
-    scope_id: str
-
-
-@dataclass(frozen=True, slots=True)
-class _LexicalScope:
-    """The projected schema and local environment for one sqlglot scope."""
-
-    columns: tuple[str, ...]
-    lineage: tuple[str, ...]
-    relations: tuple[_LexicalRelation, ...]
-    scope_id: str
 
 
 def _load_sqlglot(dialect: _SqlDialect = "sqlite") -> tuple[Any, Any]:
     try:
         import sqlglot
         from sqlglot import exp
+
+        # Its warnings echo whole statements, which can hold literal values.
+        logging.getLogger("sqlglot").setLevel(logging.ERROR)
     except ImportError as error:
         if dialect == "postgresql":
             raise ImportError(
@@ -172,25 +114,13 @@ def _analyze_sql(sql: str, *, dialect: _SqlDialect) -> SqlAnalysis:
         )
         if not normalized_error_types or not isinstance(error, normalized_error_types):
             raise
-        raise SqlAnalysisError(
-            "sql_parse_error",
-            f"SQL could not be parsed for {display_name}.",
-        ) from error
+        raise _parse_refusal(error, parse_sql, dialect, display_name) from error
     if not expressions:
         raise SqlAnalysisError("empty_sql", "SQL must not be empty.")
 
     root = expressions[0]
-    if any(bool(item.args.get("recursive", False)) for item in root.find_all(exp.With)):
-        raise SqlAnalysisError(
-            "recursive_cte_not_supported",
-            "Recursive common-table expressions are not supported.",
-        )
     try:
-        cte_table_ids, column_resources = _lexical_scope_facts(
-            root,
-            exp,
-            dialect=dialect,
-        )
+        cte_table_ids = _cte_table_ids(root, exp, dialect=dialect)
     except Exception as error:
         errors = getattr(sqlglot, "errors", None)
         optimize_error = getattr(errors, "OptimizeError", None)
@@ -206,29 +136,13 @@ def _analyze_sql(sql: str, *, dialect: _SqlDialect) -> SqlAnalysis:
         cte_table_ids,
         dialect=dialect,
     )
-    columns = _column_references(
-        root,
-        exp,
-        column_resources,
-        dialect=dialect,
-    )
-    if dialect == "postgresql":
-        # PostgreSQL includes inheritance/partition descendants unless ONLY is
-        # present.  The catalog provenance names one exact relation, so execute
-        # the exact relation represented by that provenance.
-        for table in root.find_all(exp.Table):
-            if id(table) not in cte_table_ids and _table_identifier_parts(table):
-                table.set("only", True)
     function_names, unresolved_functions, table_functions = _function_facts(
         root,
         exp,
         dialect=dialect,
     )
-    cast_types, unsafe_cast_types, explicit_operators = _expression_boundary_facts(
-        root,
-        exp,
-        dialect=dialect,
-    )
+    explicit_operators = _explicit_operators(root, exp, dialect=dialect)
+    attribute_names = _attribute_names(root, exp, dialect=dialect)
     mutation_types = _mutation_types(root, exp)
     read_roots = tuple(
         cls
@@ -281,7 +195,6 @@ def _analyze_sql(sql: str, *, dialect: _SqlDialect) -> SqlAnalysis:
         if dialect == "postgresql"
         else placeholder_count
     )
-    selected_columns, select_aliases = _selection_facts(root, exp)
     return SqlAnalysis(
         sql=normalized,
         canonical_sql=canonical_sql,
@@ -291,12 +204,8 @@ def _analyze_sql(sql: str, *, dialect: _SqlDialect) -> SqlAnalysis:
         ),
         statement_count=len(parsed),
         is_read=is_read,
-        has_limit=root.find(exp.Limit) is not None,
         mutation_types=mutation_types,
         tables=tables,
-        columns=columns,
-        selected_columns=selected_columns,
-        select_aliases=select_aliases,
         positional_parameter_count=positional_parameter_count,
         parameter_ordinals=parameter_ordinals,
         anonymous_parameter_count=placeholder_count,
@@ -304,9 +213,32 @@ def _analyze_sql(sql: str, *, dialect: _SqlDialect) -> SqlAnalysis:
         function_names=function_names,
         unresolved_function_names=unresolved_functions,
         table_function_names=table_functions,
-        cast_type_names=cast_types,
-        unsafe_cast_type_names=unsafe_cast_types,
         explicit_operator_names=explicit_operators,
+        attribute_names=attribute_names,
+    )
+
+
+def _parse_refusal(
+    error: Exception, sql: str, dialect: _SqlDialect, display_name: str
+) -> SqlAnalysisError:
+    """Refuse unparseable SQL with its position; it is never run raw."""
+
+    first: dict[str, object] = next(iter(getattr(error, "errors", None) or ()), {})
+    line, column = first.get("line"), first.get("col")
+    # shortcut: logs the position and fingerprint, not SQL text that can hold
+    # literal values; the statement itself stays in the run's transcript.
+    _LOGGER.info(
+        "sql_parse_refused dialect=%s line=%s column=%s fingerprint=sha256:%s",
+        dialect,
+        line,
+        column,
+        hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+    )
+    position = "" if line is None else f" at line {line}, column {column}"
+    return SqlAnalysisError(
+        "sql_parse_error",
+        f"SQL could not be parsed for {display_name}{position}. Rewrite the "
+        "statement with standard syntax; SQL that cannot be parsed is never run.",
     )
 
 
@@ -320,6 +252,9 @@ def _table_references(
     references: list[SqlTableReference] = []
     seen: set[tuple[tuple[str, ...], str | None, bool]] = set()
     for table in root.find_all(exp.Table):
+        # A relation-position call is a function fact, not a relation name.
+        if not isinstance(table.this, exp.Identifier):
+            continue
         part_records = tuple(
             (str(part.name), bool(part.args.get("quoted", False)))
             for part in table.parts
@@ -381,32 +316,21 @@ def _table_identifier_parts(table: Any) -> tuple[tuple[str, bool], ...]:
     )
 
 
-def _lexical_scope_facts(
+def _cte_table_ids(
     root: Any,
     exp: Any,
     *,
     dialect: _SqlDialect,
-) -> tuple[set[int], dict[int, str]]:
-    """Resolve CTEs and qualified columns using sqlglot's lexical scopes."""
+) -> set[int]:
+    """Resolve which table nodes name CTEs, using sqlglot's lexical scopes."""
 
     from sqlglot.optimizer.scope import traverse_scope
 
     cte_table_ids: set[int] = set()
-    column_resources: dict[int, str] = {}
     for scope in traverse_scope(root):
         for _, (selected, source) in scope.selected_sources.items():
             if isinstance(selected, exp.Table) and not isinstance(source, exp.Table):
                 cte_table_ids.add(id(selected))
-        for column in scope.columns:
-            qualifier = str(column.table or "").strip()
-            if not qualifier:
-                continue
-            resolved_source = scope.sources.get(qualifier)
-            if not isinstance(resolved_source, exp.Table):
-                continue
-            parts = _table_identifier_parts(resolved_source)
-            if parts:
-                column_resources[id(column)] = ".".join(item[0] for item in parts)
     # sqlglot's scope graph intentionally omits some dialect-invalid shapes,
     # including a mutation nested in a CTE.  Mutation detection must still see
     # the CTE reference accurately, so fill only those unresolved identities
@@ -418,7 +342,7 @@ def _lexical_scope_facts(
             dialect=dialect,
         ):
             cte_table_ids.add(id(table))
-    return cte_table_ids, column_resources
+    return cte_table_ids
 
 
 def _is_visible_cte_reference(
@@ -505,11 +429,13 @@ def _function_facts(
             name = f"{namespace.upper()[:128]}.{name}"[:256]
         functions.add(name)
         if dialect == "postgresql":
-            # The PostgreSQL executor fixes search_path to pg_catalog and
-            # requires every data relation to be schema-qualified.  Therefore
-            # unqualified calls resolve only against pg_catalog; an explicit
-            # non-pg_catalog namespace is never admitted.
-            if namespace is not None and not name.startswith("PG_CATALOG."):
+            # An explicit namespace other than pg_catalog is never admitted, and
+            # canonical SQL upper-cases a quoted name, so it could run another
+            # function than the one the lookup checked.
+            if (namespace is not None and not name.startswith("PG_CATALOG.")) or (
+                isinstance(function.this, exp.Identifier)
+                and bool(function.this.args.get("quoted", False))
+            ):
                 unresolved.add(name)
         elif is_anonymous:
             unresolved.add(name)
@@ -557,9 +483,16 @@ def _rendered_callable_name(
 
 def _function_namespace(function: Any, exp: Any) -> str | None:
     parent = function.parent
-    if not isinstance(parent, exp.Dot) or parent.expression is not function:
+    if isinstance(parent, exp.Table) and parent.this is function:
+        namespace = parent.args.get("db")
+        if namespace is None:
+            return None
+        if parent.args.get("catalog") is not None:
+            return "invalid"
+    elif isinstance(parent, exp.Dot) and parent.expression is function:
+        namespace = parent.this
+    else:
         return None
-    namespace = parent.this
     if not isinstance(namespace, exp.Identifier):
         return "invalid"
     value = str(namespace.name or "").strip()
@@ -570,48 +503,59 @@ def _function_namespace(function: Any, exp: Any) -> str | None:
     return value
 
 
-def _expression_boundary_facts(
+def _explicit_operators(
     root: Any,
     exp: Any,
     *,
     dialect: _SqlDialect,
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    if dialect != "postgresql":
-        return (), (), ()
-
-    cast_types: set[str] = set()
-    unsafe_cast_types: set[str] = set()
-    for cast in root.find_all(exp.Cast):
-        target = cast.args.get("to")
-        if not isinstance(target, exp.DataType):
-            unsafe_cast_types.add("INVALID")
-            continue
-        rendered = target.sql(dialect="postgres")[:256].upper()
-        cast_types.add(rendered)
-        data_types = (target, *tuple(target.find_all(exp.DataType)))
-        for data_type in data_types:
-            raw_kind = getattr(data_type.this, "value", data_type.this)
-            if str(raw_kind).upper() not in _POSTGRESQL_SAFE_DATA_TYPES:
-                unsafe_cast_types.add(rendered)
-                break
-
+) -> tuple[str, ...]:
     operator_type = getattr(exp, "Operator", None)
-    explicit_operators = (
-        ()
-        if operator_type is None
-        else tuple(
-            sorted(
-                {
-                    str(operator.args.get("operator") or "invalid").upper()[:256]
-                    for operator in root.find_all(operator_type)
-                }
-            )
+    if dialect != "postgresql" or operator_type is None:
+        return ()
+    return tuple(
+        sorted(
+            {
+                str(operator.args.get("operator") or "invalid").upper()[:256]
+                for operator in root.find_all(operator_type)
+            }
         )
     )
-    return (
-        tuple(sorted(cast_types)),
-        tuple(sorted(unsafe_cast_types)),
-        explicit_operators,
+
+
+def _attribute_names(
+    root: Any,
+    exp: Any,
+    *,
+    dialect: _SqlDialect,
+) -> tuple[str, ...]:
+    """Names read as ``x.name`` or ``(x).name``, in server spelling.
+
+    PostgreSQL resolves either form to ``name(x)`` when no such column exists,
+    so what parses as a column can be a function call.
+    """
+
+    if dialect != "postgresql":
+        return ()
+    identifiers = (
+        *(
+            column.this
+            for column in root.find_all(exp.Column)
+            if str(column.table or "").strip()
+        ),
+        *(dot.expression for dot in root.find_all(exp.Dot)),
+    )
+    return tuple(
+        sorted(
+            {
+                (
+                    str(item.name)
+                    if item.args.get("quoted", False)
+                    else str(item.name).lower()
+                )[:256]
+                for item in identifiers
+                if isinstance(item, exp.Identifier) and str(item.name).strip()
+            }
+        )
     )
 
 
@@ -637,62 +581,6 @@ def _is_table_function(function: Any, exp: Any) -> bool:
             return parent.this is current
         return False
     return False
-
-
-def _column_references(
-    root: Any,
-    exp: Any,
-    column_resources: Mapping[int, str],
-    *,
-    dialect: _SqlDialect,
-) -> tuple[SqlColumnReference, ...]:
-    references: list[SqlColumnReference] = []
-    seen: set[tuple[str, str | None, str | None]] = set()
-    for column in root.find_all(exp.Column):
-        name = str(column.name or "").strip()
-        if not name or name == "*":
-            continue
-        qualifier = str(column.table or "").strip() or None
-        resource_name = column_resources.get(id(column))
-        name_identifier = column.this
-        name_quoted = bool(getattr(name_identifier, "args", {}).get("quoted", False))
-        key = (
-            _dialect_identifier_key(name, dialect=dialect, quoted=name_quoted),
-            _dialect_identifier_key(qualifier, dialect=dialect) if qualifier else None,
-            (
-                _dialect_identifier_key(resource_name, dialect=dialect)
-                if resource_name
-                else None
-            ),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        references.append(
-            SqlColumnReference(
-                name=name,
-                qualifier=qualifier,
-                resource_name=resource_name,
-                name_quoted=name_quoted,
-            )
-        )
-    return tuple(references)
-
-
-def _selection_facts(root: Any, exp: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    select = root if isinstance(root, exp.Select) else root.find(exp.Select)
-    if select is None:
-        return (), ()
-    names: list[str] = []
-    aliases: list[str] = []
-    for item in select.expressions:
-        alias = str(item.alias_or_name or "").strip()
-        if alias and alias != "*" and alias not in names:
-            names.append(alias)
-        explicit_alias = str(item.alias or "").strip()
-        if explicit_alias and explicit_alias not in aliases:
-            aliases.append(explicit_alias)
-    return tuple(names), tuple(aliases)
 
 
 def _mutation_types(root: Any, exp: Any) -> tuple[str, ...]:
@@ -727,260 +615,3 @@ def _mutation_types(root: Any, exp: Any) -> tuple[str, ...]:
             }
         )
     )
-
-
-def _semantic_identifier(
-    value: str,
-    *,
-    dialect: _SqlDialect,
-    quoted: bool = False,
-) -> str:
-    """Return the identifier spelling exposed by the selected SQL dialect."""
-
-    normalized = value.strip().strip('"`[]')
-    if dialect == "postgresql" and not quoted:
-        return normalized.translate(_ASCII_IDENTIFIER_CASE_TRANSLATION)
-    if dialect == "sqlite":
-        return sqlite_identifier_key(normalized)
-    return normalized
-
-
-def _selected_source_qualifier(
-    selected: Any,
-    fallback: str,
-    exp: Any,
-    *,
-    dialect: _SqlDialect,
-) -> str:
-    alias = selected.args.get("alias") if hasattr(selected, "args") else None
-    identifier = getattr(alias, "this", None)
-    if identifier is None and isinstance(selected, exp.Table):
-        identifier = selected.this
-    if identifier is None:
-        parent = getattr(selected, "parent", None)
-        if parent is not None and isinstance(parent, exp.Subquery):
-            parent_alias = parent.args.get("alias")
-            identifier = getattr(parent_alias, "this", None)
-    value = str(getattr(identifier, "name", None) or fallback)
-    return _semantic_identifier(
-        value,
-        dialect=dialect,
-        quoted=bool(getattr(identifier, "args", {}).get("quoted", False)),
-    )
-
-
-def _projection_alias(
-    expression: Any,
-    *,
-    dialect: _SqlDialect,
-) -> str:
-    alias = expression.args.get("alias") if hasattr(expression, "args") else None
-    identifier = getattr(alias, "this", None)
-    if identifier is None and hasattr(expression, "this"):
-        candidate = expression.this
-        if type(candidate).__name__ == "Identifier":
-            identifier = candidate
-    value = str(
-        getattr(identifier, "name", None)
-        or getattr(expression, "alias_or_name", None)
-        or ""
-    ).strip()
-    if not value or value == "*":
-        return ""
-    return _semantic_identifier(
-        value,
-        dialect=dialect,
-        quoted=bool(getattr(identifier, "args", {}).get("quoted", False)),
-    )
-
-
-def _outer_projection_columns(
-    scope: Any,
-    *,
-    dialect: _SqlDialect,
-) -> tuple[str, ...]:
-    if not scope.outer_columns:
-        return ()
-    owner = scope.expression.parent
-    alias = owner.args.get("alias") if hasattr(owner, "args") else None
-    identifiers = tuple(alias.args.get("columns") or ()) if alias is not None else ()
-    if len(identifiers) != len(scope.outer_columns):
-        return tuple(
-            _semantic_identifier(item, dialect=dialect) for item in scope.outer_columns
-        )
-    return tuple(
-        _semantic_identifier(
-            str(identifier.name),
-            dialect=dialect,
-            quoted=bool(identifier.args.get("quoted", False)),
-        )
-        for identifier in identifiers
-    )
-
-
-def _relation_column_matches(
-    relation: _LexicalRelation,
-    column: Any,
-    *,
-    dialect: _SqlDialect,
-) -> tuple[str, ...]:
-    identifier = column.this
-    expected = _semantic_identifier(
-        str(column.name),
-        dialect=dialect,
-        quoted=bool(getattr(identifier, "args", {}).get("quoted", False)),
-    )
-    return tuple(item for item in relation.columns if item == expected)
-
-
-def _scope_projection(
-    scope: Any,
-    relations: tuple[_LexicalRelation, ...],
-    states: Mapping[int, _LexicalScope],
-    exp: Any,
-    issues: list[SqlValidationIssue],
-    *,
-    dialect: _SqlDialect,
-) -> tuple[str, ...]:
-    if isinstance(
-        scope.expression,
-        tuple(
-            item
-            for item in (
-                getattr(exp, "Union", None),
-                getattr(exp, "Intersect", None),
-                getattr(exp, "Except", None),
-            )
-            if item is not None
-        ),
-    ):
-        branches = tuple(states[id(item)] for item in scope.union_scopes)
-        if not branches:
-            return ()
-        expected = len(branches[0].columns)
-        received = tuple(len(item.columns) for item in branches)
-        if any(count != expected for count in received[1:]):
-            issues.append(
-                SqlValidationIssue(
-                    "set_projection_arity_mismatch",
-                    "SQL set-operation branches must expose the same column count.",
-                    {"branch_column_counts": received[:_MAX_CANDIDATES]},
-                )
-            )
-        projected = branches[0].columns
-    else:
-        projected_items: list[str] = []
-        for expression in getattr(scope.expression, "expressions", ()):
-            if isinstance(expression, exp.Star):
-                for relation in relations:
-                    projected_items.extend(relation.columns)
-                continue
-            if isinstance(expression, exp.Column) and str(expression.name) == "*":
-                table_identifier = expression.args.get("table")
-                qualifier = _semantic_identifier(
-                    str(expression.table),
-                    dialect=dialect,
-                    quoted=bool(
-                        getattr(table_identifier, "args", {}).get("quoted", False)
-                    ),
-                )
-                star_relation = next(
-                    (item for item in relations if item.qualifier == qualifier),
-                    None,
-                )
-                if star_relation is not None:
-                    projected_items.extend(star_relation.columns)
-                else:
-                    issues.append(
-                        SqlValidationIssue(
-                            "unknown_relation_qualifier",
-                            "SQL references a relation qualifier not visible in this scope.",
-                            {"qualifier": str(expression.table)},
-                        )
-                    )
-                continue
-            projected_items.append(_projection_alias(expression, dialect=dialect))
-        projected = tuple(projected_items)
-
-    outer_columns = _outer_projection_columns(scope, dialect=dialect)
-    if outer_columns:
-        if len(outer_columns) != len(projected):
-            issues.append(
-                SqlValidationIssue(
-                    "derived_projection_arity_mismatch",
-                    "A derived relation column list must match its projection count.",
-                    {
-                        "declared_column_count": len(outer_columns),
-                        "projected_column_count": len(projected),
-                    },
-                )
-            )
-        else:
-            projected = outer_columns
-    return projected
-
-
-def _direct_scope_columns(
-    scope: Any,
-    expression_scope_ids: frozenset[int],
-    exp: Any,
-) -> tuple[Any, ...]:
-    """Return columns whose nearest query owner is exactly ``scope``."""
-
-    columns: list[Any] = []
-    for column in scope.expression.find_all(exp.Column):
-        owner = column.parent
-        while owner is not None and id(owner) not in expression_scope_ids:
-            owner = owner.parent
-        if owner is scope.expression:
-            columns.append(column)
-    return tuple(columns)
-
-
-def _is_legal_output_alias(
-    column: Any,
-    scope: Any,
-    state: _LexicalScope,
-    exp: Any,
-    *,
-    dialect: _SqlDialect,
-) -> bool:
-    if str(column.table or "").strip():
-        return False
-    identifier = column.this
-    name = _semantic_identifier(
-        str(column.name),
-        dialect=dialect,
-        quoted=bool(getattr(identifier, "args", {}).get("quoted", False)),
-    )
-    explicit_aliases = {
-        _projection_alias(expression, dialect=dialect)
-        for expression in getattr(scope.expression, "expressions", ())
-        if bool(str(getattr(expression, "alias", "") or "").strip())
-    }
-    if isinstance(
-        scope.expression,
-        tuple(
-            item
-            for item in (
-                getattr(exp, "Union", None),
-                getattr(exp, "Intersect", None),
-                getattr(exp, "Except", None),
-            )
-            if item is not None
-        ),
-    ):
-        explicit_aliases.update(state.columns)
-    if name not in explicit_aliases:
-        return False
-    ancestor = column.parent
-    while ancestor is not None and ancestor is not scope.expression:
-        if isinstance(ancestor, (exp.Order, exp.Ordered, exp.Group)):
-            return True
-        if dialect == "sqlite" and isinstance(
-            ancestor,
-            (exp.Where, exp.Having, exp.Join),
-        ):
-            return True
-        ancestor = ancestor.parent
-    return False

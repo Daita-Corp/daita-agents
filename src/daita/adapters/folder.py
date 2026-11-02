@@ -28,7 +28,6 @@ from ..catalog.models import (
     CatalogResourceRevision,
     CatalogSync,
     CatalogSyncStatus,
-    FacetKind,
     FileFacet,
     RelationshipKind,
     RelationshipProvenance,
@@ -43,7 +42,11 @@ from ..catalog.protocols import CatalogStore
 from ..errors import DaitaError
 from ..llm.models import ModelSensitivity
 from ..workspace import LocalFileAccess, LocalWorkspace
-from .local_file_query import LocalFileQueryError, LocalFileQueryLimits
+from .local_file_query import (
+    LocalFileQueryError,
+    LocalFileQueryLimits,
+    LocalFileQueryResult,
+)
 from .local_workspace import (
     LocalWorkspaceBackend,
     LocalWorkspaceError,
@@ -68,14 +71,13 @@ from .protocols import (
 
 if TYPE_CHECKING:
     from ..domains.data.capabilities import SqlReadResult
-    from ..domains.data.results import BoundedResultProjection
     from ..domains.data.source_files import (
         FileSearchRequest,
         PathPatternQueryRequest,
         SourceFileResult,
         TextReadRequest,
     )
-    from ..domains.data.sql import ResourceSchema
+    from ..domains.data.sql import CheckedRead
     from .registry import SourceBackendContext
 
 FOLDER_ADAPTER_ID = "folder"
@@ -669,8 +671,8 @@ class FolderBackend:
 
     async def _cataloged_files(
         self, agent_id: str, source_id: str, resource_ids: frozenset[str]
-    ) -> dict[str, str]:
-        """Map each readable cataloged file's path to its physical revision.
+    ) -> frozenset[str]:
+        """The paths of this run's readable cataloged files.
 
         One cached snapshot load per call, not one lookup per resource.
         """
@@ -678,36 +680,11 @@ class FolderBackend:
         refs = await self._store.list_current_snapshot_refs(agent_id, (source_id,))
         snapshot = await self._store.load_current_snapshot(refs[0]) if refs else None
         if snapshot is None:
-            return {}
-        revisions = {
-            facet.resource_id: cast(str, facet.payload["physical_revision"])
-            for facet in snapshot.facets
-            if facet.kind is FacetKind.FILE
-        }
-        files: dict[str, str] = {}
-        for resource in snapshot.resources:
-            if (
-                resource.kind is not ResourceKind.FILE
-                or resource.id not in resource_ids
-            ):
-                continue
-            if resource.id not in revisions:
-                raise FolderSourceError(
-                    "catalog_provenance_missing",
-                    "The file has no current catalog facts; refresh the source.",
-                )
-            files[resource.native_identity] = revisions[resource.id]
-        return files
-
-    async def _physical_revision(self, agent_id: str, resource: CatalogResource) -> str:
-        for facet in await self._store.load_facets(
-            agent_id, resource.id, resource.current_revision
-        ):
-            if facet.kind is FacetKind.FILE:
-                return cast(str, facet.payload["physical_revision"])
-        raise FolderSourceError(
-            "catalog_provenance_missing",
-            "The file has no current catalog facts; refresh the source.",
+            return frozenset()
+        return frozenset(
+            resource.native_identity
+            for resource in snapshot.resources
+            if resource.kind is ResourceKind.FILE and resource.id in resource_ids
         )
 
     def _result(
@@ -765,7 +742,7 @@ class FolderBackend:
             mode=request.mode,
             glob=request.glob,
             order_by=request.order_by,
-            allowed_revisions=files,
+            allowed_paths=files,
         )
         return self._result(
             request.source_id,
@@ -803,13 +780,11 @@ class FolderBackend:
                 path=request.path,
                 cursor=request.cursor,
                 position=request.position,
-                allowed_revisions=files,
+                allowed_paths=files,
             )
         except LocalWorkspaceError as error:
             if error.code == "path_not_allowed":
                 raise _not_readable() from error
-            if error.code == "file_changed":
-                raise _stale() from error
             raise
         # Cataloged folders are read-only sources: no edit binding.
         return self._result(
@@ -824,22 +799,32 @@ class FolderBackend:
         self, request: PathPatternQueryRequest
     ) -> SourceFileResult:
         live = self._live(request.source_id)
-        if live is None:
-            raise FolderSourceError(
-                "path_pattern_unsupported",
-                "A cataloged source is queried by its catalog resources.",
+        if live is not None:
+            result = await live.query(
+                run_id=request.run_id,
+                path_pattern=request.path_pattern,
+                canonical_sql=request.canonical_sql,
+                sql_fingerprint=request.sql_fingerprint,
             )
-        result = await live.query(
-            run_id=request.run_id,
-            path_pattern=request.path_pattern,
-            canonical_sql=request.canonical_sql,
-            sql_fingerprint=request.sql_fingerprint,
+            return self._result(
+                request.source_id,
+                result.data,
+                result.sensitivity_provenance,
+                live.sensitivity,
+            )
+        result, _paths, source = await self._query_attached(
+            request.agent_id,
+            request.source_id,
+            request.path_pattern,
+            request.canonical_sql,
+            request.sql_fingerprint,
+            request.resource_ids or frozenset(),
         )
         return self._result(
             request.source_id,
             result.data,
             result.sensitivity_provenance,
-            live.sensitivity,
+            source.sensitivity,
         )
 
     async def execute_read(
@@ -847,116 +832,52 @@ class FolderBackend:
         *,
         agent_id: str,
         source_id: str,
-        sql: str,
-        parameters: tuple[object, ...],
+        read: CheckedRead,
         max_rows: int,
         max_bytes: int,
-        expected_resource_revisions: tuple[tuple[str, str], ...] | None = None,
         timeout_seconds: float | None = None,
     ) -> SqlReadResult:
-        """Run one DuckDB read over the union of exact cataloged files."""
+        """Serve a combined-query input through the same attached-folder route."""
 
         from ..domains.data.capabilities import SqlReadResult
-        from ..domains.data.sql import validate_duckdb_read
+        from ..domains.data.results import BoundedResultProjection
 
-        if parameters or not expected_resource_revisions:
+        if read.path_pattern is None or read.parameters:
             raise FolderSourceError(
                 "sql_invalid_input",
-                "SQL over folder files takes bound catalog resources and no "
-                "parameters.",
+                "SQL over folder files takes path_pattern and no parameters.",
             )
-        validated = validate_duckdb_read(sql)
-        expected = dict(expected_resource_revisions)
-        schemas, files = await self._bound_files(agent_id, source_id, expected)
-        projection, columns = await self._query(
+        result, paths, _source = await self._query_attached(
             agent_id,
             source_id,
-            files,
-            validated.canonical_sql,
-            validated.sql_fingerprint,
-            max_rows=max_rows,
-            max_bytes=max_bytes,
-            timeout_seconds=timeout_seconds,
+            read.path_pattern,
+            read.canonical_sql,
+            read.sql_fingerprint,
+            frozenset(read.allowed_resource_ids),
+            LocalFileQueryLimits(
+                max_result_rows=max_rows,
+                max_result_bytes=max_bytes,
+                max_query_seconds=min(30.0, timeout_seconds or 30.0),
+            ),
         )
-        return SqlReadResult(
-            source_id=source_id,
-            canonical_sql=validated.canonical_sql,
-            sql_fingerprint=validated.sql_fingerprint,
-            resource_ids=tuple(expected),
-            resource_revisions=tuple(expected.items()),
-            source_revision=cast(str, schemas[0].source_revision),
-            columns=columns,
-            projection=projection,
-            resource_names=tuple((item.resource_id, item.name) for item in schemas),
-        )
-
-    async def _bound_files(
-        self, agent_id: str, source_id: str, expected: Mapping[str, str]
-    ) -> tuple[list[ResourceSchema], dict[str, str]]:
-        """Recheck exact catalog revisions before any file I/O."""
-
-        current = {
+        data = result.data
+        rows = cast(tuple[Mapping[str, object], ...], data["rows"])
+        schemas = {
             item.resource_id: item
             for item in await self._catalog.resource_schemas(agent_id, source_id)
         }
-        schemas: list[ResourceSchema] = []
-        files: dict[str, str] = {}
-        for resource_id, revision in expected.items():
-            schema = current.get(resource_id)
-            resource = await self._store.load_resource(agent_id, resource_id)
-            if (
-                schema is None
-                or resource is None
-                or schema.revision != revision
-                or resource.current_revision != revision
-            ):
-                raise _stale()
-            schemas.append(schema)
-            files[resource.native_identity] = await self._physical_revision(
-                agent_id, resource
-            )
-        return schemas, files
-
-    async def _query(
-        self,
-        agent_id: str,
-        source_id: str,
-        files: Mapping[str, str],
-        canonical_sql: str,
-        sql_fingerprint: str,
-        *,
-        max_rows: int,
-        max_bytes: int,
-        timeout_seconds: float | None,
-    ) -> tuple[BoundedResultProjection, tuple[str, ...]]:
-        from ..domains.data.results import BoundedResultProjection
-
-        backend, _source = await self._attached_backend(agent_id, source_id)
-        manifest = await backend.bind_exact_manifest(
-            run_id=_RUN_ID, paths=tuple(sorted(files))
-        )
-        try:
-            if any(
-                binding.physical_revision != files[binding.relative_path]
-                for binding in manifest.bindings
-            ):
-                raise _stale()
-            result = await backend.query_manifest(
-                manifest=manifest,
-                canonical_sql=canonical_sql,
-                sql_fingerprint=sql_fingerprint,
-                limits=LocalFileQueryLimits(
-                    max_result_rows=max_rows,
-                    max_result_bytes=max_bytes,
-                    max_query_seconds=min(30.0, timeout_seconds or 30.0),
-                ),
-            )
-        finally:
-            manifest.close()
-        data = result.data
-        rows = cast(tuple[Mapping[str, object], ...], data["rows"])
-        return (
-            BoundedResultProjection(
+        matched = [schemas[_file_resource_id(source_id, path)] for path in paths]
+        return SqlReadResult(
+            source_id=source_id,
+            canonical_sql=read.canonical_sql,
+            sql_fingerprint=read.sql_fingerprint,
+            resource_ids=tuple(item.resource_id for item in matched),
+            resource_revisions=tuple(
+                (item.resource_id, cast(str, item.revision)) for item in matched
+            ),
+            source_revision=cast(str, matched[0].source_revision),
+            columns=cast(tuple[str, ...], data["columns"]),
+            projection=BoundedResultProjection(
                 rows=tuple(FrozenJsonObject.from_mapping(row) for row in rows),
                 total_rows=cast(int, data["observed_rows"]),
                 returned_rows=cast(int, data["returned_rows"]),
@@ -966,8 +887,49 @@ class FolderBackend:
                 truncated=cast(bool, data["truncated"]),
                 truncation_reasons=cast(tuple[str, ...], data["truncation_reasons"]),
             ),
-            cast(tuple[str, ...], data["columns"]),
+            resource_names=tuple((item.resource_id, item.name) for item in matched),
         )
+
+    async def _query_attached(
+        self,
+        agent_id: str,
+        source_id: str,
+        path_pattern: str,
+        canonical_sql: str,
+        sql_fingerprint: str,
+        allowed: frozenset[str],
+        limits: LocalFileQueryLimits | None = None,
+    ) -> tuple[LocalFileQueryResult, tuple[str, ...], FolderSource]:
+        """Match the pattern against current files; each must be in this run's scope."""
+
+        backend, source = await self._attached_backend(agent_id, source_id)
+        # A read can queue after it was prepared; revoked permission still counts.
+        allowed &= await self._catalog.readable_resource_ids(agent_id, (source_id,))
+        manifest = await backend.bind_query_manifest(
+            run_id=_RUN_ID, path_pattern=path_pattern
+        )
+        try:
+            paths = tuple(binding.relative_path for binding in manifest.bindings)
+            denied = [
+                path
+                for path in paths
+                if _file_resource_id(source_id, path) not in allowed
+            ]
+            if denied:
+                raise FolderSourceError(
+                    "resource_read_not_allowed",
+                    f"{', '.join(denied[:8])} is not available for reading in "
+                    "this run.",
+                )
+            result = await backend.query_manifest(
+                manifest=manifest,
+                canonical_sql=canonical_sql,
+                sql_fingerprint=sql_fingerprint,
+                limits=limits,
+            )
+        finally:
+            manifest.close()
+        return result, paths, source
 
     async def retire_source(self, agent_id: str, source_id: str) -> None:
         del agent_id
@@ -985,12 +947,8 @@ class FolderBackend:
             await backend.close()
 
 
-def _stale() -> FolderSourceError:
-    return FolderSourceError(
-        "query_binding_stale",
-        "The file changed since the source was last refreshed; refresh the "
-        "source and retry.",
-    )
+def _file_resource_id(source_id: str, path: str) -> str:
+    return catalog_resource_id(source_id, ResourceKind.FILE, path)
 
 
 def _not_readable() -> FolderSourceError:

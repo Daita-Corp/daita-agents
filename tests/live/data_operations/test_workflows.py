@@ -611,7 +611,6 @@ async def test_live_existing_postgresql_fixture_independent_oracle(
         assert diagnostics.connections_created == 1
         assert diagnostics.active == diagnostics.waiting == 0
         assert diagnostics.completed == diagnostics.acquired
-        assert diagnostics.structural_seconds > 0
     assert await evaluation.agent.list_effects() == ()
 
 

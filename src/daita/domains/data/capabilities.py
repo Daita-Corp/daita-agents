@@ -34,6 +34,7 @@ from ...capabilities import (
     ToolRecovery,
     ToolTextTrust,
     ToolView,
+    recovery_details,
     resource_id_schema,
     source_id_schema,
 )
@@ -59,10 +60,12 @@ from .source_files import (
 from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
+    CheckedRead,
     RelationalUpdateCell,
     RelationalUpdateCommand,
     RelationalUpdateFilter,
     RelationalUpdateIntent,
+    checked_reads,
 )
 from .sql.relational_upsert import RelationalUpsertIntent
 
@@ -110,13 +113,14 @@ _DATA_QUERY_COMBINED_CAPABILITY_DESCRIPTION = (
 )
 _DATA_QUERY_COMBINED_USAGE = (
     " Join sources: inputs is 2-4 {alias, source, sql} in each "
-    "source's dialect, or {alias, source, table, columns, filters} for "
+    "source's dialect, with path_pattern for a folder, or {alias, source, table, "
+    "columns, filters} for "
     "a source without SQL; sql is one DuckDB SELECT or UNION over the aliases "
     "(8 KiB). Aggregate or filter in each input: one too large refuses the call."
 )
 _DATA_QUERY_PATH_USAGE = (
-    " Folder files: query relation data by path_pattern (live folder); an "
-    "attached folder reads its cataloged files as relation data."
+    " Folder files: query relation data by path_pattern, matched against the "
+    "folder's current files."
 )
 
 
@@ -521,17 +525,32 @@ class RelationalUpdateResult:
         )
 
 
+_CORRECT_READ = ToolRecovery(
+    RecoveryKind.CORRECT_ARGUMENTS,
+    "Fix the SQL using this message; the same call fails the same way.",
+)
+
+
+def refused_read_details(details: Mapping[str, object]) -> dict[str, object]:
+    """Details for a read the source refused before reading a row.
+
+    Marking it undispatched lets the loop warn when the model repeats it.
+    """
+
+    return recovery_details(
+        _CORRECT_READ, {**details, "execution_disposition": "not_dispatched"}
+    )
+
+
 class SqlReadBackend(Protocol):
     async def execute_read(
         self,
         *,
         agent_id: str,
         source_id: str,
-        sql: str,
-        parameters: tuple[object, ...],
+        read: CheckedRead,
         max_rows: int,
         max_bytes: int,
-        expected_resource_revisions: tuple[tuple[str, str], ...] | None = None,
         timeout_seconds: float | None = None,
     ) -> SqlReadResult: ...
 
@@ -591,16 +610,11 @@ class TabularFilter:
 
 @dataclass(frozen=True, slots=True)
 class ReadTabularRequest:
-    """One bounded read of named columns from one catalog resource.
-
-    The backend refuses the read when ``expected_revision`` is no longer the
-    resource's current catalog revision.
-    """
+    """One bounded read of named columns from one catalog resource."""
 
     agent_id: str
     source_id: str
     resource_id: str
-    expected_revision: str
     columns: tuple[str, ...]
     filters: tuple[TabularFilter, ...]
     limit: int
@@ -612,7 +626,6 @@ class ReadTabularRequest:
             (self.agent_id, "agent_id"),
             (self.source_id, "source_id"),
             (self.resource_id, "resource_id"),
-            (self.expected_revision, "expected_revision"),
         ):
             if not isinstance(value, str) or not value:
                 raise ValueError(f"tabular read {name} must be non-empty text")
@@ -718,11 +731,10 @@ class DataQueryError(DaitaError):
 
 
 class DataQueryExecutor:
-    """Run catalog-bound read-only statements against one relational source.
+    """Run read-only statements that passed policy against one relational source.
 
     Every statement shares one row budget, one UTF-8 byte budget and one total
-    deadline, and each statement also has its own statement deadline. All
-    statements must observe the catalog revisions validated before dispatch.
+    deadline, and each statement also has its own statement deadline.
     """
 
     executor_id = DATA_QUERY_EXECUTOR_ID
@@ -750,13 +762,10 @@ class DataQueryExecutor:
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         source_id = request.arguments["source_id"]
-        resource_ids = request.arguments["resource_ids"]
         adapter_id = request.arguments["_adapter_id"]
         assert isinstance(source_id, str)
-        assert isinstance(resource_ids, tuple)
         assert isinstance(adapter_id, str)
-        statements = data_query_statements(request.arguments)
-        expected = _expected_resource_revisions(request.arguments)
+        reads = checked_reads(request.arguments)
         backend = self._backends.get(adapter_id)
         if backend is None:
             raise ValueError("relational query adapter binding is unsupported")
@@ -765,7 +774,7 @@ class DataQueryExecutor:
         remaining_rows = self._max_rows
         remaining_bytes = self._max_bytes
         results: list[tuple[SqlReadResult | None, int]] = []
-        for sql, parameters in statements:
+        for read in reads:
             if remaining_rows < 1 or remaining_bytes < 2:
                 # The shared budget is spent; later statements are reported as
                 # skipped rather than silently omitted.
@@ -782,43 +791,24 @@ class DataQueryExecutor:
             result = await backend.execute_read(
                 agent_id=self._agent_id,
                 source_id=source_id,
-                sql=sql,
-                parameters=parameters,
+                read=read,
                 max_rows=remaining_rows,
                 max_bytes=remaining_bytes,
-                expected_resource_revisions=expected,
                 timeout_seconds=min(self._statement_timeout_seconds, remaining_seconds),
             )
             elapsed_ms = _elapsed_ms(statement_started, self._clock())
-            if (
-                not isinstance(result, SqlReadResult)
-                or result.source_id != source_id
-                or not frozenset(result.resource_ids) <= frozenset(resource_ids)
-            ):
-                raise ValueError("SQL backend returned different catalog binding facts")
-            if results and any(
-                earlier is not None
-                and earlier.source_revision != result.source_revision
-                for earlier, _ in results
-            ):
-                raise DataQueryError(
-                    "query_binding_stale",
-                    "The source changed between statements of one read.",
-                )
+            if not isinstance(result, SqlReadResult) or result.source_id != source_id:
+                raise ValueError("SQL backend returned a different source")
             results.append((result, elapsed_ms))
             remaining_rows -= result.projection.returned_rows
             remaining_bytes -= result.projection.utf8_bytes
         executed = tuple(result for result, _ in results if result is not None)
-        if frozenset(
-            resource_id for result in executed for resource_id in result.resource_ids
-        ) != frozenset(resource_ids):
-            raise ValueError("SQL backend returned different catalog binding facts")
         timing = {
             "elapsed_ms": _elapsed_ms(started, self._clock()),
             "statement_timeout_ms": int(self._statement_timeout_seconds * 1_000),
             "total_timeout_ms": int(self._total_timeout_seconds * 1_000),
         }
-        if len(statements) == 1:
+        if len(reads) == 1:
             data = executed[0].tool_data().to_dict()
             data["adapter_id"] = adapter_id
             data["timing"] = timing
@@ -834,32 +824,6 @@ class DataQueryExecutor:
                 byte_limit=self._max_bytes,
             ),
         )
-
-
-def data_query_statements(
-    arguments: Mapping[str, object],
-) -> tuple[tuple[str, tuple[object, ...]], ...]:
-    """Return the ordered statements of one data_query call."""
-
-    raw_statements = arguments.get("statements")
-    if raw_statements is None:
-        sql = arguments.get("sql")
-        parameters = arguments.get("parameters", ())
-        if not isinstance(sql, str) or not isinstance(parameters, tuple):
-            raise ValueError("data_query requires sql or statements")
-        return ((sql, parameters),)
-    if not isinstance(raw_statements, tuple) or not raw_statements:
-        raise ValueError("data_query statements must be a non-empty array")
-    statements: list[tuple[str, tuple[object, ...]]] = []
-    for item in raw_statements:
-        if not isinstance(item, Mapping):
-            raise ValueError("data_query statements must be objects")
-        sql = item.get("sql")
-        parameters = item.get("parameters", ())
-        if not isinstance(sql, str) or not isinstance(parameters, tuple):
-            raise ValueError("data_query statements need sql and parameters")
-        statements.append((sql, parameters))
-    return tuple(statements)
 
 
 COMBINED_QUERY_MAX_INPUTS = 4
@@ -906,8 +870,7 @@ class DataQueryCombinedExecutor:
     """Join complete bounded per-source reads in the private DuckDB worker.
 
     Each input runs through its source's registry backend, as SQL or as a
-    tabular read, under the catalog revisions validated before dispatch,
-    within one shared input deadline.
+    tabular read, within one shared input deadline.
     """
 
     executor_id = DATA_QUERY_COMBINED_EXECUTOR_ID
@@ -1034,20 +997,13 @@ class DataQueryCombinedExecutor:
         result = await backend.execute_read(
             agent_id=self._agent_id,
             source_id=source_id,
-            sql=cast(str, item["sql"]),
-            parameters=(),
+            read=checked_reads(item)[0],
             max_rows=COMBINED_QUERY_INPUT_MAX_ROWS,
             max_bytes=COMBINED_QUERY_INPUT_MAX_BYTES,
-            expected_resource_revisions=_expected_resource_revisions(item),
             timeout_seconds=timeout,
         )
-        if (
-            not isinstance(result, SqlReadResult)
-            or result.source_id != source_id
-            or frozenset(result.resource_ids)
-            != frozenset(cast(tuple[str, ...], item["resource_ids"]))
-        ):
-            raise ValueError("SQL backend returned different catalog binding facts")
+        if not isinstance(result, SqlReadResult) or result.source_id != source_id:
+            raise ValueError("SQL backend returned a different source")
         return _InputRead(
             columns=result.columns,
             projection=result.projection,
@@ -1071,9 +1027,7 @@ class DataQueryCombinedExecutor:
         if backend is None:
             raise ValueError("tabular read adapter binding is unsupported")
         resource_id = cast(str, item["resource_id"])
-        ((_, revision),) = cast(
-            tuple[tuple[str, str], ...], item["_resource_revisions"]
-        )
+        revision = cast(str, item["_resource_revision"])
         columns = cast(tuple[str, ...], item["columns"])
         filters = tuple(
             TabularFilter.from_mapping(cast(Mapping[str, object], value))
@@ -1084,7 +1038,6 @@ class DataQueryCombinedExecutor:
                 agent_id=self._agent_id,
                 source_id=cast(str, item["source_id"]),
                 resource_id=resource_id,
-                expected_revision=revision,
                 columns=columns,
                 filters=filters,
                 limit=COMBINED_QUERY_INPUT_MAX_ROWS,
@@ -1104,8 +1057,6 @@ class DataQueryCombinedExecutor:
             resource_names=((resource_id, cast(str, item["_resource_name"])),),
             lineage={
                 "source_id": item["source_id"],
-                # The backend confirmed the bound revision, so the catalog
-                # source revision bound with it is the one that was read.
                 "source_revision": item["_source_revision"],
                 "columns": columns,
                 "filters": tuple(value.to_payload() for value in filters),
@@ -1123,26 +1074,6 @@ def _revision_payload(
         {"resource_id": resource_id, "revision": revision}
         for resource_id, revision in revisions
     )
-
-
-def _expected_resource_revisions(
-    arguments: Mapping[str, object],
-) -> tuple[tuple[str, str], ...] | None:
-    raw = arguments.get("_resource_revisions")
-    if raw is None:
-        return None
-    if not isinstance(raw, tuple):
-        raise ValueError("validated resource revisions are malformed")
-    revisions: list[tuple[str, str]] = []
-    for item in raw:
-        if (
-            not isinstance(item, tuple)
-            or len(item) != 2
-            or not all(isinstance(value, str) for value in item)
-        ):
-            raise ValueError("validated resource revisions are malformed")
-        revisions.append((item[0], item[1]))
-    return tuple(revisions)
 
 
 def _elapsed_ms(started: float, finished: float) -> int:
@@ -1760,6 +1691,11 @@ def _query_declarations(
                                     "source_id": source_id_schema(),
                                     "resource_ids": resource_ids_rule,
                                     "sql": sql_rule,
+                                    "path_pattern": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 2_048,
+                                    },
                                 },
                                 "required": [
                                     "alias",

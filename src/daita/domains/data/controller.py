@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
+from difflib import get_close_matches
 from hashlib import sha256
 from typing import Protocol, cast
 
@@ -15,7 +16,6 @@ from ...artifacts.models import (
     ArtifactAuthorship,
     ArtifactDraft,
     ArtifactError,
-    ArtifactResourceBinding,
 )
 from ...artifacts.renderers import ARROW_MEDIA_TYPE, arrow_schema
 from ...capabilities import (
@@ -49,13 +49,16 @@ from ...loop.session import RunSession
 from ...scope import EffectiveSourceScope, resolve_effective_source_scope
 from ...storage.sqlite_records import RelationalWriteScope, SourcePermissionStateError
 from .sql import (
+    CheckedRead,
     DuckDBReadValidationError,
     RelationalUpdateIntent,
     ResourceSchema,
-    read_validator,
+    checked_reads,
     validate_duckdb_read,
+    validate_read,
     validate_relational_update_intent,
 )
+from .sql.contracts import _SqlDialect
 from .sql.relational_upsert import (
     RelationalUpsertIntent,
     validate_relational_upsert_intent,
@@ -278,6 +281,10 @@ class DataDomainCatalog(
 
     async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None: ...
 
+    async def source_schemas(
+        self, agent_id: str, source_id: str
+    ) -> tuple[str, ...]: ...
+
     async def resource_identity(
         self,
         agent_id: str,
@@ -487,8 +494,6 @@ class DataCapabilityDomain:
                 for adapter_id in active_adapter_ids
             )
         }
-        if self._catalog.session_source_id not in scope.source_ids:
-            withheld.add(PATH_QUERY_CAPABILITY_ID)
         return tuple(names), frozenset(withheld)
 
     async def project_call(
@@ -546,7 +551,6 @@ class DataCapabilityDomain:
                 run,
                 arguments,
                 operation=_CAPABILITY_OPERATIONS[capability.id],
-                bind_revisions=capability.id == DATA_QUERY_CAPABILITY_ID,
             )
         if capability.id in _UPDATE_CAPABILITIES | _UPSERT_CAPABILITIES:
             await self._validate_target_sensitivity(
@@ -775,16 +779,10 @@ class DataCapabilityDomain:
         draft: ArtifactDraft,
     ) -> ArtifactDraft:
         source_id = arguments.get("source_id")
-        resource_ids = arguments.get("resource_ids")
-        sql = arguments.get("sql")
         parameters = arguments.get("parameters", ())
         adapter_id = arguments.get("_adapter_id")
         if (
             not isinstance(source_id, str)
-            or not isinstance(resource_ids, tuple)
-            or not resource_ids
-            or any(not isinstance(item, str) for item in resource_ids)
-            or not isinstance(sql, str)
             or not isinstance(parameters, tuple)
             or not isinstance(adapter_id, str)
             or not self._source_types.supports(
@@ -794,6 +792,7 @@ class DataCapabilityDomain:
             raise ToolOutputValidationError(
                 "relational export execution arguments are unavailable"
             )
+        (read,) = checked_reads(arguments)
         if await self._catalog.source_adapter_id(run.agent_id, source_id) != adapter_id:
             raise _incomplete_export(draft, "catalog_changed")
         resources = await self._catalog.resource_schemas(run.agent_id, source_id)
@@ -808,64 +807,40 @@ class DataCapabilityDomain:
             readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
-        validator = read_validator(self._source_types.require(adapter_id).sql_dialect)
-        if validator is None:
-            raise _incomplete_export(draft, "catalog_changed")
-        validation = validator(
-            sql,
-            source_id=source_id,
-            resources=resources,
-            parameters=parameters,
-            allowed_resource_ids=readable,
-        )
-        if (
-            not validation.valid
-            or validation.analysis is None
-            or validation.source_revision is None
-            or not validation.resource_ids
-            or frozenset(validation.resource_ids) != frozenset(resource_ids)
-            or len(validation.resource_revisions) != len(validation.resource_ids)
+        schemas = {item.resource_id: item for item in resources}
+        if not frozenset(read.resource_ids) <= readable or any(
+            resource_id not in schemas or schemas[resource_id].revision != revision
+            for resource_id, revision in read.resource_revisions
         ):
             raise _incomplete_export(draft, "catalog_changed")
-        bindings = tuple(
-            ArtifactResourceBinding(
-                source_id=source_id,
-                source_revision=validation.source_revision,
-                resource_id=resource_id,
-                resource_revision=revision,
-            )
-            for resource_id, revision in sorted(validation.resource_revisions)
-        )
         parameters_sha256 = (
             "sha256:" + sha256(canonical_json(parameters).encode("utf-8")).hexdigest()
         )
         provenance = draft.provenance
         if (
-            provenance.resource_bindings != bindings
-            or provenance.sql_fingerprint != validation.analysis.sql_fingerprint
+            {
+                (item.source_id, item.resource_id, item.resource_revision)
+                for item in provenance.resource_bindings
+            }
+            != {
+                (source_id, resource_id, revision)
+                for resource_id, revision in read.resource_revisions
+            }
+            or provenance.sql_fingerprint != read.sql_fingerprint
             or provenance.parameters_sha256 != parameters_sha256
         ):
             raise ToolOutputValidationError(
                 "exact artifact provenance differs from current runtime facts"
             )
-        schemas = {item.resource_id: item for item in resources}
         current: list[Sensitivity] = []
-        for resource_id in validation.resource_ids:
-            schema = schemas.get(resource_id)
-            if schema is None:
-                raise ToolOutputValidationError(
-                    "exact artifact resource is absent from current catalog facts"
-                )
+        for resource_id in read.resource_ids:
             try:
-                current.append(Sensitivity(schema.sensitivity_class))
+                current.append(Sensitivity(schemas[resource_id].sensitivity_class))
             except ValueError:
                 current.append(Sensitivity.RESTRICTED)
         if draft.sensitivity is not _resolved_sensitivity(tuple(current)):
             raise _incomplete_export(draft, "catalog_changed")
-        return replace(
-            draft,
-            provenance=replace(provenance, resource_bindings=bindings),
-        )
+        return draft
 
     def normalize_error(
         self,
@@ -905,30 +880,13 @@ class DataCapabilityDomain:
     ) -> FrozenJsonObject:
         """Bind one folder-file read to its source type before any file I/O.
 
-        The live session source answers only its own foreground user; a
-        cataloged folder answers only for its readable cataloged files.
+        The live session source answers only its own foreground user; an
+        attached folder answers only for the files this run may read.
         """
 
         source_id = cast(str, arguments["source_id"])
         adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
         live = source_id == self._catalog.session_source_id
-        if (
-            capability.id == PATH_QUERY_CAPABILITY_ID
-            and adapter_id is not None
-            and not live
-        ):
-            # Any cataloged source answers by catalog resources instead.
-            raise CapabilityInputError(
-                "path_pattern_unsupported",
-                "A cataloged source is queried by its catalog resources, "
-                "not by path_pattern.",
-                {"source_id": source_id},
-                recovery=ToolRecovery(
-                    RecoveryKind.CORRECT_ARGUMENTS,
-                    "Query an attached folder with data_query source and sql over "
-                    "the relation data; path_pattern applies to the live folder only.",
-                ),
-            )
         if adapter_id is None or not self._source_types.supports(
             adapter_id, _CAPABILITY_OPERATIONS[capability.id]
         ):
@@ -970,22 +928,29 @@ class DataCapabilityDomain:
                 ) from error
             prepared["sql"] = validated.canonical_sql
             prepared["sql_fingerprint"] = validated.sql_fingerprint
-        elif not live:
-            try:
-                readable = await self._catalog.readable_resource_ids(
-                    run.agent_id, (source_id,)
-                )
-            except SourcePermissionStateError as error:
-                raise CapabilityInputError(
-                    "source_permission_state_invalid",
-                    "Stored source permission state is missing or invalid.",
-                ) from error
-            if run.resolved_source_scope is not None:
-                readable &= run.resolved_source_scope.resource_ids
-            if run.execution_scope is not None:
-                readable &= frozenset(run.execution_scope.allowed_resource_ids)
-            prepared["_resource_ids"] = tuple(sorted(readable))
+        if not live:
+            prepared["_resource_ids"] = tuple(
+                sorted(await self._readable_in_run(run, source_id))
+            )
         return FrozenJsonObject.from_mapping(prepared)
+
+    async def _readable_in_run(self, run: RunInput, source_id: str) -> frozenset[str]:
+        """The resources of one source this run may read."""
+
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                run.agent_id, (source_id,)
+            )
+        except SourcePermissionStateError as error:
+            raise CapabilityInputError(
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            ) from error
+        if run.resolved_source_scope is not None:
+            readable &= run.resolved_source_scope.resource_ids
+        if run.execution_scope is not None:
+            readable &= frozenset(run.execution_scope.allowed_resource_ids)
+        return readable
 
     async def _validate_source_scope(
         self,
@@ -1083,8 +1048,9 @@ class DataCapabilityDomain:
         arguments: Mapping[str, object],
         *,
         operation: SourceOperation,
-        bind_revisions: bool = False,
     ) -> FrozenJsonObject:
+        """Parse each statement once and hand the executor what passed policy."""
+
         source_id = arguments.get("source_id")
         statements = _sql_statements(arguments)
         if not isinstance(source_id, str) or statements is None:
@@ -1106,66 +1072,45 @@ class DataCapabilityDomain:
                 {"source_id": source_id},
             )
         source_type = self._source_types.get(adapter_id)
-        validator = (
-            None if source_type is None else read_validator(source_type.sql_dialect)
-        )
-        if validator is None or not self._source_types.supports(adapter_id, operation):
+        dialect = None if source_type is None else source_type.sql_dialect
+        if dialect is None or not self._source_types.supports(adapter_id, operation):
             raise CapabilityInputError(
                 "sql_source_adapter_unsupported",
                 "The selected source does not support relational SQL reads.",
                 {"source_id": source_id},
             )
-        resources = await self._catalog.resource_schemas(run.agent_id, source_id)
-        try:
-            readable = await self._catalog.readable_resource_ids(
-                run.agent_id,
-                (source_id,),
-            )
-        except SourcePermissionStateError as error:
+        if dialect == "duckdb":
             raise CapabilityInputError(
-                "source_permission_state_invalid",
-                "Stored source permission state is missing or invalid.",
-            ) from error
-        if run.resolved_source_scope is not None:
-            readable = readable & run.resolved_source_scope.resource_ids
-        if run.execution_scope is not None:
-            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
-        # The tables a read touches come from the SQL. A folder's files are not
-        # named in SQL (it reads the relation ``data``), so an attached folder
-        # reads every readable cataloged file.
-        # shortcut: a folder above the per-call table bound is refused by the
-        # executor schema; Phase 2 names files by path in the SQL instead.
-        requested_resource_ids: tuple[str, ...] = (
-            tuple(
-                sorted(
-                    item.resource_id
-                    for item in resources
-                    if item.source_id == source_id and item.resource_id in readable
-                )
+                "path_pattern_required",
+                "A folder source is queried with path_pattern and sql over the "
+                "relation data.",
+                {"source_id": source_id},
+                recovery=_CORRECT_SQL,
             )
-            if source_type is not None and source_type.sql_dialect == "duckdb"
-            else ()
-        )
-        referenced: set[str] = set()
-        revisions: dict[str, str] = {}
+        resources = await self._catalog.resource_schemas(run.agent_id, source_id)
+        readable = await self._readable_in_run(run, source_id)
+        schemas = await self._catalog.source_schemas(run.agent_id, source_id)
+        reads: list[CheckedRead] = []
         for index, (sql, parameters) in enumerate(statements):
-            result = validator(
+            result = validate_read(
                 sql,
+                dialect=cast(_SqlDialect, dialect),
                 source_id=source_id,
                 resources=resources,
                 parameters=parameters,
                 allowed_resource_ids=readable,
-                requested_resource_ids=requested_resource_ids,
+                schemas=schemas,
             )
-            if not result.valid:
-                if {item.code for item in result.issues} & {
-                    "resource_out_of_scope",
-                    "unknown_resource",
-                }:
-                    raise CapabilityInputError(
-                        "resource_read_not_allowed",
-                        _RESOURCE_READ_DENIED_MESSAGE,
-                        recovery=_COPY_CATALOG_IDS,
+            if not result.valid or result.analysis is None:
+                # A scope denial only when scope is all that is wrong: SELECT INTO's
+                # target is out of scope too, but its fault is the write.
+                if result.issues and all(
+                    item.code == "resource_out_of_scope" for item in result.issues
+                ):
+                    raise _read_denied(
+                        [cast(str, item.details["relation"]) for item in result.issues],
+                        resources,
+                        readable,
                     )
                 details: dict[str, object] = {
                     "issues": [
@@ -1187,16 +1132,27 @@ class DataCapabilityDomain:
                     details,
                     recovery=_CORRECT_SQL,
                 )
-            referenced.update(result.resource_ids)
-            revisions.update(result.resource_revisions)
+            reads.append(
+                CheckedRead(
+                    canonical_sql=result.analysis.canonical_sql,
+                    sql_fingerprint=result.analysis.sql_fingerprint,
+                    parameters=parameters,
+                    function_lookups=result.function_lookups,
+                    attribute_lookups=result.attribute_lookups,
+                    resource_ids=result.resource_ids,
+                    resource_names=result.resource_names,
+                    resource_revisions=result.resource_revisions,
+                    source_revision=result.source_revision or "",
+                    sensitivity_classes=result.sensitivity_classes,
+                )
+            )
         prepared = dict(arguments)
         prepared["_adapter_id"] = adapter_id
-        # The executor and the admission policy read the touched tables here.
-        prepared["resource_ids"] = tuple(sorted(referenced))
-        if bind_revisions and len(revisions) == len(referenced):
-            # The executor rechecks these exact catalog revisions before every
-            # statement reaches the source.
-            prepared["_resource_revisions"] = tuple(sorted(revisions.items()))
+        prepared["_reads"] = tuple(read.to_mapping() for read in reads)
+        # The admission policy reads the touched tables here.
+        prepared["resource_ids"] = tuple(
+            sorted({item for read in reads for item in read.resource_ids})
+        )
         return FrozenJsonObject.from_mapping(prepared)
 
     async def _prepare_combined_query(
@@ -1204,8 +1160,8 @@ class DataCapabilityDomain:
     ) -> FrozenJsonObject:
         """Validate every input as one single-source read, then the combining SQL.
 
-        Each input takes the exact data_query scope, catalog, dialect and
-        revision path; declared catalog links grant no read authority here.
+        Each input takes the data_query scope and policy path; declared catalog
+        links grant no read authority here.
         """
 
         single = self._capabilities[DATA_QUERY_CAPABILITY_ID]
@@ -1237,23 +1193,13 @@ class DataCapabilityDomain:
                 await self._validate_source_scope(run, single, read)
                 self._validate_execution_resource_scope(run, single, read)
                 await self._validate_resource_read_scope(run, single, read)
-                validated = (
-                    await self._validate_tabular_read(run, item)
-                    if tabular
-                    else await self._validate_sql(
-                        run,
-                        read,
-                        operation=SourceOperation.SQL_READ,
-                        bind_revisions=True,
-                    )
-                )
-                if "_resource_revisions" not in validated:
-                    # A join never reads an input it cannot recheck for staleness.
-                    raise CapabilityInputError(
-                        "catalog_provenance_missing",
-                        "A resource has no current catalog revision; refresh "
-                        "the source.",
-                        {"resource_ids": validated.get("resource_ids", ())},
+                if tabular:
+                    validated = await self._validate_tabular_read(run, item)
+                elif "path_pattern" in item:
+                    validated = await self._validate_folder_input(run, item)
+                else:
+                    validated = await self._validate_sql(
+                        run, read, operation=SourceOperation.SQL_READ
                     )
             except CapabilityInputError as error:
                 raise CapabilityInputError(
@@ -1276,6 +1222,50 @@ class DataCapabilityDomain:
                 "inputs": tuple(prepared),
                 "sql": combining.canonical_sql,
                 "_sql_fingerprint": combining.sql_fingerprint,
+            }
+        )
+
+    async def _validate_folder_input(
+        self, run: RunInput, item: Mapping[str, object]
+    ) -> FrozenJsonObject:
+        """Check one attached folder's input; its files bind when the read runs."""
+
+        source_id = cast(str, item["source_id"])
+        adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
+        if (
+            adapter_id is None
+            or source_id == self._catalog.session_source_id
+            or not self._source_types.supports(adapter_id, SourceOperation.PATH_QUERY)
+        ):
+            raise CapabilityInputError(
+                "combined_query_invalid",
+                "path_pattern applies to an attached folder source.",
+                {"source_id": source_id},
+                recovery=_CORRECT_SQL,
+            )
+        try:
+            validated = validate_duckdb_read(cast(str, item["sql"]))
+        except DuckDBReadValidationError as error:
+            raise CapabilityInputError(
+                "folder_query_invalid",
+                error.message,
+                {"reason": error.reason},
+                recovery=_CORRECT_SQL,
+            ) from error
+        read = CheckedRead(
+            canonical_sql=validated.canonical_sql,
+            sql_fingerprint=validated.sql_fingerprint,
+            path_pattern=cast(str, item["path_pattern"]),
+            allowed_resource_ids=tuple(
+                sorted(await self._readable_in_run(run, source_id))
+            ),
+        )
+        return FrozenJsonObject.from_mapping(
+            {
+                "source_id": source_id,
+                "sql": item["sql"],
+                "_adapter_id": adapter_id,
+                "_reads": (read.to_mapping(),),
             }
         )
 
@@ -1359,8 +1349,8 @@ class DataCapabilityDomain:
             {
                 **item,
                 "_adapter_id": adapter_id,
-                # The backend rechecks this exact revision before reading.
-                "_resource_revisions": ((resource_id, resource.revision),),
+                # Lineage only; nothing compares it before the read.
+                "_resource_revision": resource.revision,
                 "_source_revision": resource.source_revision,
                 "_resource_name": resource.name,
             }
@@ -1796,6 +1786,35 @@ def _endpoint_source_ids(data: Mapping[str, object]) -> set[str]:
             cast(Mapping[str, object], relationship).get("unselected_endpoints", ()),
         )
     }
+
+
+def _read_denied(
+    relations: list[str],
+    resources: tuple[ResourceSchema, ...],
+    readable: frozenset[str],
+) -> CapabilityInputError:
+    """Name the tables outside this run's scope, with the closest readable names."""
+
+    names = [
+        next((alias for alias in item.aliases if "." in alias), item.name)
+        for item in resources
+        if item.resource_id in readable
+    ]
+    return CapabilityInputError(
+        "resource_read_not_allowed",
+        f"{', '.join(relations)} is not available for reading in this run.",
+        {
+            "tables": tuple(relations),
+            "did_you_mean": tuple(
+                dict.fromkeys(
+                    match
+                    for relation in relations
+                    for match in get_close_matches(relation, names, n=4, cutoff=0.45)
+                )
+            ),
+        },
+        recovery=_COPY_CATALOG_IDS,
+    )
 
 
 def _incomplete_export(draft: ArtifactDraft, reason: str) -> ArtifactError:

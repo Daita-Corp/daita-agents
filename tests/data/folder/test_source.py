@@ -20,13 +20,22 @@ from daita.adapters.models import DiscoveryRequest
 from daita.adapters.protocols import ResourceAdapterError
 from daita.adapters.registry import SourceOperation, SourceTypeRegistry
 from daita.catalog import CatalogSearchRequest
-from daita.catalog.models import FacetKind, RelationshipKind, ResourceKind
+from daita.catalog.models import (
+    FacetKind,
+    RelationshipKind,
+    ResourceKind,
+    catalog_resource_id,
+)
 from daita.domains.data.source_files import (
     FileSearchBackend,
     FileSearchRequest,
+    PathPatternQueryRequest,
+    PathPatternReadBackend,
+    SourceFileResult,
     TextReadBackend,
     TextReadRequest,
 )
+from daita.domains.data.sql import validate_duckdb_read
 from daita.security import EmptySecretProvider
 from tests.support.source_contract import (
     assert_live_source_contract,
@@ -297,7 +306,7 @@ async def test_unsafe_entries_are_never_cataloged_searched_or_read(
         await agent.close()
 
 
-async def test_attached_file_changed_since_refresh_is_never_searched_or_read(
+async def test_attached_file_changed_since_refresh_is_read_as_it_is_now(
     tmp_path: Path,
 ) -> None:
     folder = tmp_path / "data"
@@ -314,19 +323,17 @@ async def test_attached_file_changed_since_refresh_is_never_searched_or_read(
         first = await _read(agent, source.id, "orders.csv")
         cursor = first["cursor"]
         assert isinstance(cursor, str)
-        assert await _search(agent, source.id, "needle", mode="content")
 
         orders.write_text("id,note\n1,needle changed\n", encoding="utf-8")
-        for mode in ("paths", "content"):
-            assert await _search(agent, source.id, "needle", mode=mode) == ()
-        with pytest.raises(FolderSourceError) as by_path:
-            await _read(agent, source.id, "orders.csv")
-        assert by_path.value.error_code == "query_binding_stale"
+        assert await _search(agent, source.id, "needle", mode="content")
+        current = await _read(agent, source.id, "orders.csv")
+        assert "needle changed" in cast(str, current["content"])
+        # A continuation cursor still belongs to the bytes it started on.
         backend = cast(
             TextReadBackend,
             agent._embedded._source_backends[SourceOperation.TEXT_READ]["folder"],
         )
-        with pytest.raises(FolderSourceError) as by_cursor:
+        with pytest.raises(LocalWorkspaceError) as by_cursor:
             await backend.read_text(
                 TextReadRequest(
                     agent_id=agent.id,
@@ -340,7 +347,63 @@ async def test_attached_file_changed_since_refresh_is_never_searched_or_read(
                     ),
                 )
             )
-        assert by_cursor.value.error_code == "query_binding_stale"
+        assert by_cursor.value.code == "file_changed"
+    finally:
+        await agent.close()
+
+
+def _rows(result: SourceFileResult) -> list[dict[str, object]]:
+    rows = cast(tuple[Mapping[str, object], ...], result.data["rows"])
+    return [dict(row) for row in rows]
+
+
+async def _path_query(
+    agent: Agent, source_id: str, pattern: str, resource_ids: frozenset[str]
+) -> SourceFileResult:
+    backend = cast(
+        PathPatternReadBackend,
+        agent._embedded._source_backends[SourceOperation.PATH_QUERY]["folder"],
+    )
+    validated = validate_duckdb_read("SELECT count(*) AS n FROM data")
+    return await backend.query_path_pattern(
+        PathPatternQueryRequest(
+            agent_id=agent.id,
+            run_id="folder-test",
+            source_id=source_id,
+            path_pattern=pattern,
+            canonical_sql=validated.canonical_sql,
+            sql_fingerprint=validated.sql_fingerprint,
+            resource_ids=resource_ids,
+        )
+    )
+
+
+async def test_attached_folder_path_pattern_matches_current_files_within_scope(
+    tmp_path: Path,
+) -> None:
+    folder = tmp_path / "data"
+    folder.mkdir()
+    (folder / "a.csv").write_text("id\n1\n2\n", encoding="utf-8")
+    (folder / "b.csv").write_text("id\n3\n", encoding="utf-8")
+    agent = await _agent(tmp_path, "folder-pattern")
+    try:
+        source = await agent.attach(FolderSource(folder))
+        readable = await agent._embedded._data_view.readable_resource_ids(
+            agent.id, (source.id,)
+        )
+        result = await _path_query(agent, source.id, "*.csv", readable)
+        assert _rows(result) == [{"n": 3}]
+        # The rows reflect the file now, not the catalog's view of it.
+        (folder / "a.csv").write_text("id\n1\n2\n3\n", encoding="utf-8")
+        result = await _path_query(agent, source.id, "*.csv", readable)
+        assert _rows(result) == [{"n": 4}]
+
+        # A match outside the run's scope refuses the whole read, naming the file.
+        only_a = frozenset({catalog_resource_id(source.id, ResourceKind.FILE, "a.csv")})
+        with pytest.raises(FolderSourceError) as denied:
+            await _path_query(agent, source.id, "*.csv", only_a)
+        assert denied.value.code == "resource_read_not_allowed"
+        assert "b.csv" in str(denied.value)
     finally:
         await agent.close()
 

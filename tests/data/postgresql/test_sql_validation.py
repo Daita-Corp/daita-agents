@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Mapping
 
 import pytest
@@ -12,7 +13,7 @@ from daita.domains.data.sql import (
     MAX_SQL_PARAMETERS,
     ResourceSchema,
     analyze_postgresql_sql,
-    validate_postgresql_read,
+    validate_read,
 )
 
 _REVISION = "sha256:" + "1" * 64
@@ -65,13 +66,16 @@ def _validate(
     parameters: tuple[object, ...] = (),
     resources: tuple[ResourceSchema, ...] = _RESOURCES,
     allowed_resource_ids: tuple[str, ...] | None = None,
+    schemas: tuple[str, ...] = ("sales",),
 ):
-    return validate_postgresql_read(
+    return validate_read(
         sql,
+        dialect="postgresql",
         source_id="source-postgresql",
         resources=resources,
         parameters=parameters,
         allowed_resource_ids=allowed_resource_ids,
+        schemas=schemas,
     )
 
 
@@ -202,37 +206,6 @@ def test_latest_order_dates_export_regression_is_valid() -> None:
     assert result.analysis.table_function_names == ()
 
 
-def test_cte_order_by_output_alias_wins_before_parent_scope_lookup() -> None:
-    result = _validate("""
-        WITH selected AS (
-          SELECT c.name AS customer_id
-          FROM sales.customers AS c
-          ORDER BY customer_id
-        )
-        SELECT selected.customer_id
-        FROM sales.orders AS o
-        CROSS JOIN selected
-        """)
-
-    assert result.valid, result.issues
-
-
-def test_cte_cannot_escape_to_same_named_parent_column_without_local_alias() -> None:
-    result = _validate("""
-        WITH selected AS (
-          SELECT c.name
-          FROM sales.customers AS c
-          ORDER BY customer_id
-        )
-        SELECT selected.name
-        FROM sales.orders AS o
-        CROSS JOIN selected
-        """)
-
-    assert not result.valid
-    assert "column_scope_escape" in result.issue_codes
-
-
 def test_scalar_function_inside_join_predicate_is_not_a_table_function() -> None:
     analysis = analyze_postgresql_sql(
         "SELECT o.id FROM sales.orders o JOIN sales.customers c "
@@ -264,103 +237,6 @@ def test_only_outer_relation_callable_is_classified_as_table_function() -> None:
 
 
 @pytest.mark.parametrize(
-    ("sql", "function_name"),
-    (
-        (
-            "SELECT o.id FROM sales.orders o "
-            "JOIN LATERAL lower(o.status) AS value ON true",
-            "LOWER",
-        ),
-        (
-            "SELECT o.id FROM sales.orders o JOIN LATERAL "
-            "pg_catalog.generate_series(1, 3) AS value ON true",
-            "PG_CATALOG.GENERATE_SERIES",
-        ),
-    ),
-)
-def test_relation_producing_function_position_is_rejected(
-    sql: str,
-    function_name: str,
-) -> None:
-    result = _validate(sql)
-
-    assert not result.valid
-    assert "function_not_allowed" in result.issue_codes
-    assert result.analysis is not None
-    assert function_name in result.analysis.table_function_names
-
-
-@pytest.mark.parametrize(
-    ("sql", "function_name"),
-    (
-        (
-            "SELECT pg_catalog.pg_read_file('/etc/passwd') FROM sales.orders o",
-            "PG_CATALOG.PG_READ_FILE",
-        ),
-        (
-            "SELECT pg_catalog.pg_sleep(1) FROM sales.orders o",
-            "PG_CATALOG.PG_SLEEP",
-        ),
-        (
-            "SELECT pg_catalog.lo_export(1, '/tmp/value') FROM sales.orders o",
-            "PG_CATALOG.LO_EXPORT",
-        ),
-        (
-            "SELECT pg_catalog.lo_import('/tmp/value') FROM sales.orders o",
-            "PG_CATALOG.LO_IMPORT",
-        ),
-        (
-            "SELECT pg_catalog.pg_advisory_lock(1) FROM sales.orders o",
-            "PG_CATALOG.PG_ADVISORY_LOCK",
-        ),
-        (
-            "SELECT pg_catalog.pg_terminate_backend(1) FROM sales.orders o",
-            "PG_CATALOG.PG_TERMINATE_BACKEND",
-        ),
-        (
-            "SELECT pg_catalog.set_config('search_path', 'public', false) "
-            "FROM sales.orders o",
-            "PG_CATALOG.SET_CONFIG",
-        ),
-        (
-            "SELECT pg_catalog.nextval('sales.sequence') FROM sales.orders o",
-            "PG_CATALOG.NEXTVAL",
-        ),
-        (
-            "SELECT pg_catalog.pg_ls_dir('/tmp') FROM sales.orders o",
-            "PG_CATALOG.PG_LS_DIR",
-        ),
-        (
-            "SELECT pg_catalog.current_setting('search_path') FROM sales.orders o",
-            "PG_CATALOG.CURRENT_SETTING",
-        ),
-        (
-            "SELECT pg_catalog.query_to_xml('SELECT 1', true, false, '') "
-            "FROM sales.orders o",
-            "PG_CATALOG.QUERY_TO_XML",
-        ),
-        ("SELECT random() FROM sales.orders o", "RANDOM"),
-        ("SELECT CURRENT_TIMESTAMP FROM sales.orders o", "CURRENT_TIMESTAMP"),
-        (
-            "SELECT public.custom_function(o.id) FROM sales.orders o",
-            "PUBLIC.CUSTOM_FUNCTION",
-        ),
-    ),
-)
-def test_external_state_and_untrusted_namespace_functions_fail_closed(
-    sql: str,
-    function_name: str,
-) -> None:
-    result = _validate(sql)
-
-    assert not result.valid
-    issue = next(item for item in result.issues if item.code == "function_not_allowed")
-    denied_functions = issue.details["functions"]
-    assert isinstance(denied_functions, tuple)
-    assert function_name in denied_functions
-
-
-@pytest.mark.parametrize(
     "sql",
     (
         "SELECT c.id FROM sales.customers c WHERE EXISTS "
@@ -369,9 +245,17 @@ def test_external_state_and_untrusted_namespace_functions_fail_closed(
         "SELECT recent.id FROM recent UNION ALL SELECT o.id FROM sales.orders o",
         "SELECT DISTINCT ON (o.customer_id) o.customer_id, o.id "
         "FROM sales.orders o ORDER BY o.customer_id, o.ordered_at DESC",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) "
+        "SELECT r.n FROM r, sales.orders o",
+        "SELECT o.id FROM sales.orders o JOIN LATERAL "
+        "pg_catalog.generate_series(1, 3) AS value ON true",
+        "SELECT 'sales.orders'::regclass, o.status::public.custom_type "
+        "FROM sales.orders o",
+        "SELECT o.total_amount OPERATOR(pg_catalog.+) 1 FROM sales.orders o",
+        "SELECT o.id FROM ONLY sales.orders o",
     ),
 )
-def test_catalog_scoped_postgresql_query_shapes_remain_valid(sql: str) -> None:
+def test_ordinary_postgresql_query_shapes_remain_valid(sql: str) -> None:
     result = _validate(sql)
 
     assert result.valid, result.issues
@@ -381,28 +265,21 @@ def test_catalog_scoped_postgresql_query_shapes_remain_valid(sql: str) -> None:
     ("sql", "issue_code"),
     (
         ("SELECT 1", "resource_scope_empty"),
-        ("SELECT id FROM orders", "schema_qualification_required"),
-        ("SELECT o.missing FROM sales.orders o", "missing_column"),
-        (
-            "SELECT id FROM sales.orders o JOIN sales.customers c "
-            "ON o.customer_id = c.id",
-            "ambiguous_column",
-        ),
-        ("SELECT o.id FROM private.orders o", "unknown_resource"),
+        ("SELECT o.id FROM private.orders o", "resource_out_of_scope"),
         ("SELECT o.id FROM sales.orders o FOR UPDATE", "mutation_not_allowed"),
+        ("SELECT * INTO sales.copy FROM sales.orders", "mutation_not_allowed"),
         ("SELECT o.id FROM sales.orders o; SELECT 1", "multiple_statements"),
+        ("/* SELECT 1; */ DROP TABLE sales.orders", "mutation_not_allowed"),
+        ("TRUNCATE sales.orders", "mutation_not_allowed"),
+        ("COPY sales.orders TO '/tmp/out'", "read_statement_required"),
+        ("SET search_path = private", "read_statement_required"),
+        ("DO $$ BEGIN DELETE FROM sales.orders; END $$", "read_statement_required"),
+        ("COMMIT", "read_statement_required"),
+        ("VALUES (1)", "read_statement_required"),
         ("EXPLAIN SELECT o.id FROM sales.orders o", "explain_not_allowed"),
         (
             "SELECT o.total_amount OPERATOR(public.+) 1 FROM sales.orders o",
             "operator_not_allowed",
-        ),
-        (
-            "SELECT 'sales.orders'::regclass FROM sales.orders o",
-            "cast_type_not_allowed",
-        ),
-        (
-            "SELECT o.status::public.custom_type FROM sales.orders o",
-            "cast_type_not_allowed",
         ),
         (
             "WITH changed AS (DELETE FROM sales.orders RETURNING id) "
@@ -411,7 +288,7 @@ def test_catalog_scoped_postgresql_query_shapes_remain_valid(sql: str) -> None:
         ),
     ),
 )
-def test_invalid_statement_and_catalog_shapes_fail_closed(
+def test_invalid_statements_fail_closed_before_any_source_io(
     sql: str,
     issue_code: str,
 ) -> None:
@@ -419,6 +296,176 @@ def test_invalid_statement_and_catalog_shapes_fail_closed(
 
     assert not result.valid
     assert issue_code in result.issue_codes
+
+
+@pytest.mark.parametrize(
+    "call",
+    (
+        "query_to_xml('select * from private.salaries', true, true, '')",
+        "pg_catalog.query_to_xml('select 1', true, true, '')",
+        "query_to_xmlschema('select 1', true, true, '')",
+        "query_to_xml_and_xmlschema('select 1', true, true, '')",
+        "table_to_xml('private.salaries', true, true, '')",
+        "table_to_xmlschema('private.salaries', true, true, '')",
+        "table_to_xml_and_xmlschema('private.salaries', true, true, '')",
+        "schema_to_xml('private', true, true, '')",
+        "database_to_xml(true, true, '')",
+        "cursor_to_xml('c', 1, true, true, '')",
+        "cursor_to_xmlschema('c', true, true, '')",
+        "ts_stat('select 1')",
+        "ts_rewrite('a'::tsquery, 'select 1')",
+        "QUERY_TO_XML('select 1', true, true, '')",
+        "public.custom_function(o.id)",
+        '"pg_read_file"(1)',
+    ),
+)
+def test_functions_refused_in_every_scope_never_reach_the_server(call: str) -> None:
+    result = _validate(f"SELECT {call} FROM sales.orders o")
+
+    assert not result.valid
+    assert "function_not_allowed" in result.issue_codes
+
+
+@pytest.mark.parametrize(
+    "relation",
+    (
+        "public.custom_function(1)",
+        '"my schema".custom_function(1)',
+        "a.b.custom_function(1)",
+        '"custom_function"(1)',
+    ),
+)
+def test_a_relation_position_call_outside_pg_catalog_is_refused(relation: str) -> None:
+    result = _validate(f"SELECT * FROM sales.orders o, {relation} AS shown")
+
+    assert not result.valid
+    assert "function_not_allowed" in result.issue_codes
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT 1 ORDER BY 1 USING <",
+        "SELECT pg_read_file('/etc/passwd') FROM sales.orders ORDER BY 1 USING <",
+        "SELECT * FROM",
+    ),
+)
+def test_sql_that_fails_to_parse_is_refused_with_its_position(sql: str) -> None:
+    result = _validate(sql)
+
+    assert not result.valid and result.analysis is None
+    assert result.issue_codes == ("sql_parse_error",)
+    assert "line 1, column" in result.issues[0].message
+    assert "Rewrite" in result.issues[0].message
+
+
+def test_a_parse_refusal_is_logged_by_position_without_the_sql_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.INFO, logger="daita.data"):
+        _validate("SELECT 'private-value' ORDER BY 1 USING <")
+
+    assert "sql_parse_refused" in caplog.text and "column=" in caplog.text
+    assert "private-value" not in caplog.text
+
+
+def test_the_read_transaction_checks_called_functions_except_grammar_forms() -> None:
+    result = _validate(
+        "SELECT lower(o.status), coalesce(o.status, ''), CAST(o.id AS text), "
+        "pg_catalog.upper(o.status), now() FROM sales.orders o"
+    )
+
+    assert result.valid, result.issues
+    assert result.function_lookups == ("LOWER", "PG_CATALOG.UPPER")
+
+
+@pytest.mark.parametrize(
+    ("sql", "names"),
+    (
+        ("SELECT o.peek FROM sales.orders o", ("peek",)),
+        ("SELECT O.PEEK FROM sales.orders o", ("peek",)),
+        ('SELECT o."Peek" FROM sales.orders o', ("Peek",)),
+        ("SELECT (o).peek FROM sales.orders o", ("peek",)),
+        ("SELECT ((o)).peek FROM sales.orders o", ("peek",)),
+        ("SELECT (o.*).peek FROM sales.orders o", ("peek",)),
+        ("SELECT sales.orders.peek FROM sales.orders", ("peek",)),
+        ("SELECT id FROM sales.orders o WHERE o.peek = 'x'", ("peek",)),
+        ("SELECT (SELECT o2 FROM sales.orders o2 LIMIT 1).peek", ("peek",)),
+        ("SELECT id FROM sales.orders", ()),
+    ),
+)
+def test_every_attribute_form_reaches_the_server_lookup(
+    sql: str, names: tuple[str, ...]
+) -> None:
+    result = _validate(sql)
+
+    assert result.valid, result.issues
+    assert result.attribute_lookups == names
+
+
+def test_a_table_function_is_a_function_fact_and_not_a_relation() -> None:
+    result = _validate("SELECT * FROM sales.orders o, generate_series(1, 3) AS g")
+
+    assert result.valid, result.issues
+    assert result.resource_ids == ("resource-orders",)
+    assert result.function_lookups == ("GENERATE_SERIES",)
+
+
+@pytest.mark.parametrize(
+    ("sql", "schemas", "valid"),
+    (
+        ("SELECT id FROM orders", ("sales",), True),
+        ("SELECT id FROM ORDERS", ("sales",), True),
+        ("SELECT id FROM orders", ("sales", "legacy"), False),
+        ("SELECT id FROM sales.orders", ("sales", "legacy"), True),
+    ),
+)
+def test_an_unqualified_name_needs_exactly_one_configured_schema(
+    sql: str, schemas: tuple[str, ...], valid: bool
+) -> None:
+    result = _validate(sql, schemas=schemas)
+
+    assert result.valid is valid
+    if not valid:
+        assert result.issue_codes == ("unqualified_relation",)
+        assert result.issues[0].details["candidates"] == ("sales.orders",)
+        assert result.issues[0].details["schemas"] == schemas
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT * FROM pg_tables",
+        "SELECT * FROM pg_catalog.pg_class",
+        "SELECT * FROM information_schema.tables",
+        "SELECT * FROM legacy.orders",
+        'SELECT * FROM sales."ORDERS"',
+        'SELECT * FROM "SALES".orders',
+        "SELECT * FROM db.sales.orders",
+        "WITH sales AS (SELECT 1) SELECT * FROM private.salaries",
+    ),
+)
+def test_scope_escapes_are_refused(sql: str) -> None:
+    result = _validate(sql)
+
+    assert not result.valid
+    assert "resource_out_of_scope" in result.issue_codes
+
+
+def test_an_unqualified_system_catalog_name_never_means_a_namesake_table() -> None:
+    namesake = _resource("resource-namesake", "pg_tables", ("id",))
+
+    result = _validate("SELECT * FROM pg_tables", resources=(namesake,))
+
+    assert "resource_out_of_scope" in result.issue_codes
+
+
+def test_a_cte_shadowing_a_table_name_cannot_hide_its_inner_read() -> None:
+    result = _validate(
+        "WITH orders AS (SELECT * FROM private.salaries) SELECT * FROM orders"
+    )
+
+    assert "resource_out_of_scope" in result.issue_codes
 
 
 def test_allowed_resource_scope_is_enforced() -> None:
@@ -467,11 +514,11 @@ def test_postgresql_parameters_are_contiguous_and_numbered(
         assert issue_code in result.issue_codes
 
 
-def test_canonical_sql_is_schema_exact_and_format_stable() -> None:
+def test_canonical_sql_keeps_partitions_and_is_format_stable() -> None:
     first = analyze_postgresql_sql("SELECT o.id FROM sales.orders o")
     second = analyze_postgresql_sql("  SELECT o.id\nFROM sales.orders AS o;  ")
 
-    assert "FROM ONLY sales.orders" in first.canonical_sql
+    assert "ONLY" not in first.canonical_sql
     assert second.canonical_sql == first.canonical_sql
     assert second.sql_fingerprint == first.sql_fingerprint
 

@@ -408,8 +408,8 @@ async def test_repeated_invalid_sql_warns_on_the_second_identical_query(
             if isinstance(block, ToolResultBlock)
         }
         assert codes == {
-            "sql-1": "sql_validation_failed",
-            "sql-2": "sql_validation_failed",
+            "sql-1": "query_invalid",
+            "sql-2": "query_invalid",
         }
         assert tuple(_warned(request) for request in provider.requests) == (
             False,

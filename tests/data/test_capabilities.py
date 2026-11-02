@@ -46,6 +46,7 @@ from daita.domains.data import (
 )
 from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import RunInput
+from tests.support.checked_read import checked_read
 
 
 def test_data_query_is_one_backend_neutral_model_tool() -> None:
@@ -161,6 +162,10 @@ class _Catalog:
     @property
     def session_source_id(self) -> str | None:
         return None
+
+    async def source_schemas(self, agent_id: str, source_id: str) -> tuple[str, ...]:
+        del agent_id
+        return ("public",) if source_id == "source-postgresql" else ()
 
     def __init__(self) -> None:
         self.write_applicability_calls: list[str] = []
@@ -430,7 +435,7 @@ async def test_folder_file_tools_project_only_with_a_folder_source_in_scope(
                 "path_pattern": "x.csv",
                 "sql": "SELECT * FROM data",
             },
-            "path_pattern_unsupported",
+            "source_operation_unsupported",
         ),
         (
             "data_query",
@@ -556,6 +561,12 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
     assert unknown_resource.value.code == "resource_read_not_allowed"
 
 
+def _prepared_read(resource_id: str) -> dict[str, object]:
+    return checked_read(
+        "SELECT id FROM items", resource_id=resource_id, name="items"
+    ).to_mapping()
+
+
 class _ReadBackend:
     def __init__(
         self,
@@ -614,6 +625,7 @@ async def test_data_query_routes_each_catalog_binding_to_exactly_one_backend() -
                     "resource_ids": (f"resource-{adapter_id}",),
                     "sql": "SELECT id FROM items",
                     "_adapter_id": adapter_id,
+                    "_reads": (_prepared_read(f"resource-{adapter_id}"),),
                 },
             )
         )
@@ -646,6 +658,7 @@ async def test_data_query_inline_byte_limit_reports_truncation() -> None:
                 "resource_ids": ("resource-sqlite",),
                 "sql": "SELECT id, detail FROM items",
                 "_adapter_id": "sqlite",
+                "_reads": (_prepared_read("resource-sqlite"),),
             },
         )
     )
@@ -708,6 +721,7 @@ async def test_data_export_routes_each_catalog_binding_to_exactly_one_backend() 
                     "sql": "SELECT id FROM items",
                     "output": "csv",
                     "_adapter_id": adapter_id,
+                    "_reads": (_prepared_read(f"resource-{adapter_id}"),),
                 },
             )
         )

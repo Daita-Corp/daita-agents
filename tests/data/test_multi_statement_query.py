@@ -20,6 +20,7 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
 from tests.catalog._schema_support import _OBSERVED_AT
 from tests.support.capability_runtime import execute_projected
+from tests.support.checked_read import checked_read
 from tests.support.wide_catalog import MANIFEST, TABLE_COUNT, quote, seed_wide_sqlite
 from tests.support.workspace import workspace_for
 
@@ -296,8 +297,7 @@ async def test_sqlite_statement_deadline_interrupts_and_releases_the_source(
             await backend.execute_read(
                 agent_id=agent.id,
                 source_id=source_id,
-                sql=slow,
-                parameters=(),
+                read=checked_read(slow, resource_id=by_table["table_10"]),
                 max_rows=10,
                 max_bytes=1_024,
                 timeout_seconds=0.2,
@@ -313,25 +313,67 @@ async def test_sqlite_statement_deadline_interrupts_and_releases_the_source(
         await agent.close()
 
 
-async def test_validated_revisions_are_rechecked_before_source_dispatch(
+async def test_each_statement_is_parsed_once_for_one_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import sqlglot
+
+    agent, source_id, _by_table, _database = await _wide_agent(tmp_path)
+    parse = sqlglot.parse
+    parses: list[str] = []
+
+    def counted(sql: str, *args: object, **kwargs: object) -> object:
+        parses.append(sql)
+        return parse(sql, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sqlglot, "parse", counted)
+    try:
+        statements = (
+            {"sql": "SELECT record_id FROM table_02"},
+            {"sql": "SELECT record_id FROM table_03"},
+        )
+        output = await _call(
+            agent, source_id, {"source": source_id, "statements": statements}
+        )
+    finally:
+        await agent.close()
+
+    assert "error" not in output, output
+    assert sorted(parses) == sorted(item["sql"] for item in statements)
+
+
+async def test_sqlite_reads_ignore_unrelated_ddl_and_report_errors_by_category(
     tmp_path: Path,
 ):
-    agent, source_id, by_table, _database = await _wide_agent(tmp_path)
+    agent, source_id, _by_table, database = await _wide_agent(tmp_path)
+    sql = "SELECT count(*) AS n FROM table_02"
     try:
-        backend = _sqlite_backend(agent)
-        with pytest.raises(SQLiteQueryError) as stale:
-            await backend.execute_read(
-                agent_id=agent.id,
-                source_id=source_id,
-                sql="SELECT record_id FROM table_02",
-                parameters=(),
-                max_rows=10,
-                max_bytes=1_024,
-                expected_resource_revisions=(
-                    (by_table["table_02"], "sha256:" + "0" * 64),
-                ),
-            )
-        assert stale.value.code == "query_binding_stale"
+        before = await _call(agent, source_id, {"source": source_id, "sql": sql})
+        assert "error" not in before, before
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE unrelated (id INTEGER)")
+            connection.execute("ALTER TABLE table_03 ADD COLUMN later TEXT")
+        after = await _call(agent, source_id, {"source": source_id, "sql": sql})
+        assert cast(Mapping[str, object], after["data"])["rows"] == (
+            cast(Mapping[str, object], before["data"])["rows"]
+        )
+        typo = await _call(
+            agent,
+            source_id,
+            {"source": source_id, "sql": "SELECT nope FROM table_02"},
+        )
+        typo_error = cast(Mapping[str, object], typo["error"])
+        assert typo_error["code"] == "query_invalid"
+        assert "nope" in cast(str, typo_error["message"])
+        extension = await _call(
+            agent,
+            source_id,
+            {
+                "source": source_id,
+                "sql": "SELECT load_extension('evil') FROM table_02",
+            },
+        )
+        assert cast(Mapping[str, object], extension["error"])["code"] == "not_permitted"
     finally:
         await agent.close()
 
@@ -342,6 +384,11 @@ async def test_total_deadline_stops_remaining_statements(tmp_path: Path):
         registry: CapabilityRegistry = agent._embedded._capabilities
         _capability, executor = registry.resolve_execution(DATA_QUERY_CAPABILITY_ID)
         ticks = iter((0.0, 0.0, 1.0, 20.0, 20.0))
+        read = checked_read(
+            "SELECT record_id FROM table_02",
+            resource_id=by_table["table_02"],
+            name="table_02",
+        ).to_mapping()
         executor._clock = lambda: next(ticks)  # type: ignore[attr-defined]
         with pytest.raises(Exception) as limited:
             await executor.execute(
@@ -352,11 +399,8 @@ async def test_total_deadline_stops_remaining_statements(tmp_path: Path):
                     arguments={
                         "source_id": source_id,
                         "resource_ids": (by_table["table_02"],),
-                        "statements": (
-                            {"sql": "SELECT record_id FROM table_02", "parameters": ()},
-                            {"sql": "SELECT record_id FROM table_02", "parameters": ()},
-                        ),
                         "_adapter_id": "sqlite",
+                        "_reads": (read, read),
                     },
                 )
             )

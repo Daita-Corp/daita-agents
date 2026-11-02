@@ -69,7 +69,7 @@ supervisors, and closes them in drain-safe order. Composition belongs here rathe
 than in the loop or a dependency-injection framework. The default
 PostgreSQL read backend owns optional lazy bounded native pools and closes them
 after drain, before credentials and state. Every read/export retains a fresh
-read-only transaction and full structural revalidation; reuse grants no authority.
+read-only transaction with its own pinned `search_path`; reuse grants no authority.
 Pool configuration and resolved credentials are runtime-only; retired or uncertain
 connections are never reused or replayed.
 

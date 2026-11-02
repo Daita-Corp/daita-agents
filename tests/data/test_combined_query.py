@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -46,10 +46,10 @@ from daita.domains.data import (
 )
 from daita.domains.data.capabilities import ReadTabularRequest, SqlReadResult
 from daita.domains.data.results import project_result_rows
+from daita.domains.data.sql import CheckedRead
 from daita.llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
-from daita.scope import EffectiveSourceScope
 from tests.support.capability_runtime import execute_projected
 from tests.support.memory_source import MEMORY_ADAPTER_ID, MEMORY_TYPE, MemorySource
 from tests.support.workspace import workspace_for
@@ -367,32 +367,6 @@ async def test_an_input_with_no_rows_still_aggregates(tmp_path: Path):
     )
 
 
-async def test_sql_input_without_catalog_revisions_is_refused_before_any_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    shop = await _shop(tmp_path)
-    view = shop.agent._embedded._data_view
-    schemas = view.resource_schemas
-
-    async def without_revisions(agent_id: str, source_id: str, *args, **kwargs):
-        found = await schemas(agent_id, source_id, *args, **kwargs)
-        if source_id != shop.customers_source:
-            return found
-        return tuple(replace(item, revision=None) for item in found)
-
-    monkeypatch.setattr(view, "resource_schemas", without_revisions)
-    try:
-        reads = _wrap_sqlite_reads(shop.agent)
-        result = await _call(shop, {"inputs": _inputs(shop), "sql": REVENUE_BY_REGION})
-    finally:
-        await shop.agent.close()
-
-    error = _error(result)
-    assert error["code"] == "catalog_provenance_missing"
-    assert cast(Mapping[str, object], error["details"])["input_alias"] == "c"
-    assert reads.reads == []
-
-
 async def test_combining_sql_may_self_join_and_stack_inputs(tmp_path: Path):
     shop = await _shop(tmp_path)
     try:
@@ -624,7 +598,7 @@ async def test_input_past_its_internal_ceiling_refuses_the_whole_call(
     assert details["truncation_reasons"] == ("row_limit",)
 
 
-async def test_schema_change_after_validation_fails_the_whole_call_as_stale(
+async def test_schema_change_during_a_call_does_not_disturb_the_join(
     tmp_path: Path,
 ):
     shop = await _shop(tmp_path)
@@ -642,7 +616,7 @@ async def test_schema_change_after_validation_fails_the_whole_call_as_stale(
         await shop.agent.close()
 
     assert reads.reads == [shop.orders_source, shop.customers_source]
-    assert _error(result)["code"] == "catalog_source_stale"
+    assert not result.is_error, result.output
 
 
 @pytest.mark.parametrize("customers_form", ["sql", "tabular"])
@@ -903,15 +877,13 @@ class _TargetsSource:
 
 class _TargetsBackend:
     async def execute_read(self, **request: object) -> SqlReadResult:
-        revisions = cast(
-            tuple[tuple[str, str], ...], request["expected_resource_revisions"]
-        )
+        read = cast(CheckedRead, request["read"])
         return SqlReadResult(
             source_id=str(request["source_id"]),
-            canonical_sql=str(request["sql"]),
+            canonical_sql=read.canonical_sql,
             sql_fingerprint="sha256:" + "2" * 64,
-            resource_ids=tuple(resource_id for resource_id, _ in revisions),
-            resource_revisions=revisions,
+            resource_ids=read.resource_ids,
+            resource_revisions=read.resource_revisions,
             source_revision="targets:v1",
             columns=("region", "target"),
             projection=project_result_rows(

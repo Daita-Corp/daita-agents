@@ -40,7 +40,7 @@ operation backends. `SourceOperation` names those backends: `SQL_READ`,
 `TABULAR_READ`, `TABULAR_EXPORT`, `PROFILE`, `RELATIONAL_UPDATE`,
 `RELATIONAL_UPSERT`, `FILE_SEARCH`, `TEXT_READ` and `PATH_QUERY`; every
 operation except `TABULAR_READ`, `FILE_SEARCH` and `TEXT_READ` requires an SQL
-dialect the validators in `domains/data/sql` support, checked at registration.
+dialect the read policy in `domains/data/sql` supports, checked at registration.
 A stored source whose type is not registered stays listed
 but unavailable: it gets no tools or source capacity, and refresh or edit fails.
 Pass the composing `AgentConfig` to `Agent.delete` so credentials of its source
@@ -51,29 +51,50 @@ symlink, traversal, secret-file, and special-file access. PostgreSQL and MCP
 credentials remain secret references and are resolved only at the integration
 boundary.
 
-SQL validation belongs in `daita.domains.data.sql`; connector guardrails still
-apply during execution. Do not duplicate either mechanism in a generic policy
+The read policy belongs in `daita.domains.data.sql`; connector guardrails still
+apply during execution. The data domain parses each statement once, before any
+source I/O, and the backend receives the result as a `CheckedRead`, runs its
+canonical SQL and never validates again. SQL that cannot be parsed is refused with
+its position and never run. Policy allows one `SELECT` or `WITH` statement, with
+no data-modifying CTE, `SELECT INTO` or locking clause, and refuses relations
+outside the run's readable set, naming them. The source reports everything else:
+a missing table or column comes back as `query_invalid` with the server's message,
+hint and position. Other failures cross by SQLSTATE category only, because their
+text can echo a value (`postgresql_query.py`, `sqlite_query.py`).
+
+PostgreSQL reads run in a read-only transaction with `search_path` pinned to the
+source's configured schemas; `pg_catalog` stays implicitly first. With one schema
+an unqualified name means that schema, and with several it is refused with
+`unqualified_relation`, listing the candidates. Functions in `*_to_xml*`,
+`cursor_to_*`, `ts_stat` and `ts_rewrite` are refused in every scope, because they
+run SQL the parser cannot see. For the rest, one tagged `pg_proc` lookup in the
+read transaction allows a called name only when it is in `pg_catalog`, no overload
+of it is volatile (except `random`, `clock_timestamp`, `timeofday`,
+`gen_random_uuid` and `timezone`) and, for an unqualified call, no schema on the
+path has a namesake. The same lookup covers `x.name` and `(x).name`, which
+PostgreSQL resolves to `name(x)` when `x` has no such column: such a read is refused
+if `name` takes a row and is outside `pg_catalog` or volatile, even when a real
+column has that name. SQLite keeps its `mode=ro` connection and authorizer, which
+also refuses `load_extension`. Do not duplicate any of this in a generic policy
 layer.
 
 `data_query` with `inputs` routes to `data.query_combined`, a foreground-only
-read that joins two to four sources. Each SQL input `{alias, source_id,
-resource_ids, sql}` takes the single-source path unchanged: run scope, catalog
-validation by the source type's `sql_dialect`, bound resource revisions and that
-type's registry backend. A tabular input `{alias, source_id, resource_id,
+read that joins two to four sources. Each SQL input `{alias, source_id, sql}`
+takes the single-source path unchanged: run scope, the read policy for the source
+type's `sql_dialect` and that type's registry backend. A folder input adds
+`path_pattern` and takes the folder route below. A tabular input `{alias, source_id, resource_id,
 columns, filters}` names one resource of a type that declares `TABULAR_READ`; it
 takes the same scope checks, every column and filter column must be in the
 current catalog schema, and filters are only AND-combined `eq`, `in`, `lt`,
 `lte`, `gt` and `gte` on scalar values. Its backend receives one
-`ReadTabularRequest` bound to the validated resource revision, refuses a stale
-revision with `query_binding_stale`, and returns a `BoundedResultProjection`.
+`ReadTabularRequest` and returns a `BoundedResultProjection`.
 It serves types without SQL; the built-in types read through SQL inputs instead,
 which can aggregate before the join. A type with `TABULAR_READ` but no `SQL_READ` is usable
 only as a combined-query input; single-source `data_query` is refused for it,
 and `data_query` is offered only while a source with `SQL_READ` is in scope.
 A run withholds the `data_query` routes no in-scope source can serve: export
-needs a `TABULAR_EXPORT` source and `path_pattern` needs the session folder.
-A tool definition describes only the routes its run admits, so scheduled and
-job runs never read about combined or live-folder queries.
+needs a `TABULAR_EXPORT` source and `path_pattern` needs a folder source.
+A tool definition describes only the routes its run admits.
 Inputs read at most an internal, model-invisible
 ceiling (`COMBINED_QUERY_INPUT_MAX_ROWS`/`_BYTES`); an input that reaches it
 refuses the whole call with `combined_input_truncated`, so no join ever sees
@@ -153,12 +174,13 @@ refused as an attached root. `file_search` and `file_read` take a folder
 shared budget, qualified matches, and per-root coverage, and `file_read` returns
 bounded chunks, `position=end` tail windows and opaque cursors. `data_query` with
 `source_id`, `path_pattern` and `sql` queries one homogeneous dataset matched
-live in the session folder and exposes only the relation `data`. An attached
-folder answers only for its readable cataloged files at their cataloged
-physical revision: search skips any other file and read refuses it before any
-file content is read, `data_query` takes their `resource_ids` as the one
-relation `data`, combined queries accept them as SQL inputs, and a changed
-file is refused with `query_binding_stale` until the source is refreshed. Every result carries the
+against a folder's current files and exposes only the relation `data`; live and
+attached folders share this one route. An attached folder answers only for the
+files readable in the run: search skips any other file, read refuses it before any
+file content is read, and a `path_pattern` that matches one is refused whole,
+naming it, because its ID hashes outside the run's readable set. A changed file is
+read as it is now; only a read cursor stays bound to the bytes it started on and
+fails with `file_changed`. Every result carries the
 source's sensitivity and its binding provenance. A combined `data_query` uses
 the same worker and validator, binding typed copies of its complete inputs in
 private scratch and exposing only their aliases; homes without local scratch

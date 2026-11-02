@@ -41,7 +41,7 @@ from daita.domains.data.export_capabilities import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
     exact_export_capability_declarations,
 )
-from daita.domains.data.sql import ResourceSchema
+from daita.domains.data.sql import CheckedRead, ResourceSchema
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -531,7 +531,7 @@ class _BackendConnection:
 
 
 @pytest.mark.parametrize("format_name", ("csv", "xlsx"))
-async def test_postgresql_backend_contract_revalidates_and_executes_once_without_live_db(
+async def test_postgresql_backend_executes_the_checked_read_once_without_live_db(
     monkeypatch: pytest.MonkeyPatch,
     format_name: str,
 ) -> None:
@@ -541,7 +541,7 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
         adapter_id="postgresql",
         native_identity="offline-contract",
         display_name="Offline PostgreSQL",
-        configuration={},
+        configuration={"schemas": ("public",)},
         attached_at=datetime(2026, 8, 1, tzinfo=UTC),
     )
     source_revision = "sha256:" + "3" * 64
@@ -564,10 +564,6 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
         del args, kwargs
         return connection
 
-    async def load_structure(*args: object, **kwargs: object):
-        del args, kwargs
-        return SimpleNamespace(source_revision=source_revision)
-
     async def execute_exact(*args: object, **kwargs: object):
         nonlocal exact_calls
         exact_calls += 1
@@ -582,7 +578,6 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
         closed = True
 
     monkeypatch.setattr(postgresql_query_module, "_connect", connect)
-    monkeypatch.setattr(postgresql_query_module, "_load_structure", load_structure)
     monkeypatch.setattr(
         postgresql_query_module, "_execute_exact_tabular_query", execute_exact
     )
@@ -595,8 +590,15 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
     result = await backend.execute_exact_tabular(
         agent_id=agent_id,
         source_id=registration.id,
-        sql="SELECT amount FROM public.orders WHERE amount = $1",
-        parameters=(Decimal("1.20"),),
+        read=CheckedRead(
+            canonical_sql="SELECT amount FROM public.orders WHERE amount = $1",
+            sql_fingerprint="sha256:" + "1" * 64,
+            parameters=(Decimal("1.20"),),
+            resource_ids=(resource.resource_id,),
+            resource_revisions=((resource.resource_id, cast(str, resource.revision)),),
+            source_revision=source_revision,
+            sensitivity_classes=(resource.sensitivity_class,),
+        ),
         format_name=format_name,
         parameters_sha256="sha256:" + "0" * 64,
         created_at=datetime(2026, 8, 1, tzinfo=UTC),
@@ -1052,10 +1054,11 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
         )
         with sqlite3.connect(database) as connection:
             connection.execute("ALTER TABLE records ADD COLUMN changed TEXT")
+        # Unrelated DDL no longer stops an export: the source answers.
         stale = await agent.run("Export this as CSV.")
         stale_block = _result_for_call(await agent.transcript(stale.run_id), "stale")
-        assert _error_code(stale_block) == "catalog_source_stale"
-        assert stale.artifacts == ()
+        assert not stale_block.is_error, stale_block.output
+        assert len(stale.artifacts) == 1
 
         await agent.detach(source_id)
         provider.replace_script(

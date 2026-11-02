@@ -21,6 +21,7 @@ from daita.adapters import postgresql_query as module
 from daita.adapters.models import SourceRegistration
 from daita.domains.data.sql import ResourceSchema
 from daita.security import EmptySecretProvider
+from tests.support.checked_read import checked_read
 from tests.support.job_benchmarks import p95_bootstrap_interval
 
 pytestmark = pytest.mark.slow
@@ -126,11 +127,10 @@ async def test_postgresql_transport_component_campaign(monkeypatch):
         adapter_id="postgresql",
         native_identity="fixture",
         display_name="Injected fixture",
-        configuration={},
+        configuration={"schemas": ("public",)},
         attached_at=datetime(2026, 8, 1, tzinfo=UTC),
     )
     connections: list[_Connection] = []
-    structure_seconds = 0.0
 
     async def connect(*args):
         await asyncio.sleep(0.002)
@@ -138,15 +138,7 @@ async def test_postgresql_transport_component_campaign(monkeypatch):
         connections.append(connection)
         return connection
 
-    async def structure(*args, **kwargs):
-        nonlocal structure_seconds
-        at = perf_counter()
-        await asyncio.sleep(0.001)
-        structure_seconds += perf_counter() - at
-        return SimpleNamespace(source_revision="sha256:" + "3" * 64)
-
     monkeypatch.setattr(module, "_connect", connect)
-    monkeypatch.setattr(module, "_load_structure", structure)
     backend = module.PostgreSQLQueryBackend(
         _Sources(registration), _Catalog(registration), EmptySecretProvider()
     )
@@ -157,8 +149,9 @@ async def test_postgresql_transport_component_campaign(monkeypatch):
             result = await backend.execute_read(
                 agent_id=registration.agent_id,
                 source_id=registration.id,
-                sql="SELECT amount FROM public.records",
-                parameters=(),
+                read=checked_read(
+                    "SELECT amount FROM public.records", resource_id="resource-fixture"
+                ),
                 max_rows=100,
                 max_bytes=16384,
             )
@@ -173,9 +166,7 @@ async def test_postgresql_transport_component_campaign(monkeypatch):
     report = {
         "campaign": campaign,
         "evidence_kind": "PostgreSQL backend with injected transport; no live database",
-        "fixture_sha256": sha256(
-            b"amount:int64=42;connect-delay=.002;structure-delay=.001;v1"
-        ).hexdigest(),
+        "fixture_sha256": sha256(b"amount:int64=42;connect-delay=.002;v1").hexdigest(),
         "configuration": {
             "pool_enabled": False,
             "statement_timeout_seconds": 5,
@@ -191,7 +182,6 @@ async def test_postgresql_transport_component_campaign(monkeypatch):
         "fresh_transactions": sum(
             connection.transactions for connection in connections
         ),
-        "fixture_structure_seconds": structure_seconds,
         "model_requests": 0,
         "tokens": None,
         "cost_usd": None,
@@ -223,7 +213,6 @@ async def test_postgresql_transport_component_campaign(monkeypatch):
             lambda: SimpleNamespace(create_pool=create_pool),
         )
         connections.clear()
-        structure_seconds = 0.0
         backend = module.PostgreSQLQueryBackend(
             _Sources(registration),
             _Catalog(registration),
@@ -238,8 +227,10 @@ async def test_postgresql_transport_component_campaign(monkeypatch):
                     result = await backend.execute_read(
                         agent_id=registration.agent_id,
                         source_id=registration.id,
-                        sql="SELECT amount FROM public.records",
-                        parameters=(),
+                        read=checked_read(
+                            "SELECT amount FROM public.records",
+                            resource_id="resource-fixture",
+                        ),
                         max_rows=100,
                         max_bytes=16384,
                     )
@@ -264,7 +255,6 @@ async def test_postgresql_transport_component_campaign(monkeypatch):
                 "fresh_transactions": sum(
                     connection.transactions for connection in connections
                 ),
-                "fixture_structure_seconds": structure_seconds,
                 "pool_metrics": asdict(backend.diagnostics()),
                 "cleanup": {
                     "connections_closed": all(

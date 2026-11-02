@@ -77,7 +77,7 @@ def _backend() -> tuple[
         adapter_id="postgresql",
         native_identity="offline-query-contract",
         display_name="Offline PostgreSQL",
-        configuration={},
+        configuration={"schemas": ("public",)},
         attached_at=datetime(2026, 8, 5, tzinfo=UTC),
     )
     source_revision = "sha256:" + "3" * 64

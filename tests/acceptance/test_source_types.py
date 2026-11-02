@@ -21,6 +21,7 @@ from daita.domains.data.capabilities import (
     SqlReadResult,
 )
 from daita.domains.data.results import project_result_rows
+from daita.domains.data.sql import CheckedRead
 from daita.hosting.errors import AgentHomeError
 from daita.llm.models import (
     FinishReason,
@@ -55,14 +56,13 @@ class _StubReadBackend:
 
     async def execute_read(self, **request: object) -> SqlReadResult:
         self.calls.append(request)
-        revisions = request["expected_resource_revisions"]
-        assert isinstance(revisions, tuple)
+        read = cast(CheckedRead, request["read"])
         return SqlReadResult(
             source_id=str(request["source_id"]),
-            canonical_sql=str(request["sql"]),
+            canonical_sql=read.canonical_sql,
             sql_fingerprint="sha256:" + "1" * 64,
-            resource_ids=tuple(resource_id for resource_id, _ in revisions),
-            resource_revisions=revisions,
+            resource_ids=read.resource_ids,
+            resource_revisions=read.resource_revisions,
             source_revision="memory:v1",
             columns=("region", "revenue"),
             projection=project_result_rows(

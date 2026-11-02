@@ -536,9 +536,6 @@ async def _measured_run(
     run_measurement = measure_observer_events(tuple(events[before_events:]))
     return result, {
         "run_seconds": round(seconds, 3),
-        "structural_seconds": round(
-            after.structural_seconds - diagnostics.structural_seconds, 3
-        ),
         "query_seconds": round(after.query_seconds - diagnostics.query_seconds, 3),
         "round_trips": trips.since(before_trips),
         "turns": result.steps,
@@ -632,7 +629,6 @@ def _brief(run: Mapping[str, object]) -> dict[str, object]:
         "outcome",
         "refusal_codes",
         "run_seconds",
-        "structural_seconds",
         "query_seconds",
         "round_trips",
     )
@@ -673,9 +669,6 @@ def _summary(runs: Sequence[Mapping[str, Any]]) -> dict[str, object]:
         "refusal_codes": dict(sorted(codes.items())),
         "mean_run_seconds": round(
             sum(float(run["run_seconds"]) for run in runs) / max(len(runs), 1), 3
-        ),
-        "total_structural_seconds": round(
-            sum(float(run["structural_seconds"]) for run in runs), 3
         ),
         "total_query_seconds": round(
             sum(float(run["query_seconds"]) for run in runs), 3
@@ -741,15 +734,14 @@ def _markdown(report: Mapping[str, Any]) -> str:
             "",
             f"Outcomes: {summary['outcomes']} · refusal codes: "
             f"{summary['refusal_codes'] or 'none'}",
-            f"Mean run {summary['mean_run_seconds']}s · structural "
-            f"{summary['total_structural_seconds']}s vs query "
+            f"Mean run {summary['mean_run_seconds']}s · query "
             f"{summary['total_query_seconds']}s in total · mean metadata round "
             f"trips per question {summary['mean_metadata_round_trips']} · turns "
             f"{summary['total_turns']} · tokens {summary['total_tokens']}",
             "",
-            "| Question | Category | Outcome | Codes | Run s | Structural s | "
+            "| Question | Category | Outcome | Codes | Run s | "
             "Query s | Metadata trips | Loop steps | Tokens |",
-            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
         ]
         for run in report["questions"]:
             codes = ", ".join(run["refusal_codes"]) or "—"
@@ -758,8 +750,7 @@ def _markdown(report: Mapping[str, Any]) -> str:
                 codes += f" (not cataloged: {missing})"
             lines.append(
                 f"| {run['id']} | {run['category']} | {run['outcome']} | "
-                f"{codes} | {run['run_seconds']} | "
-                f"{run['structural_seconds']} | {run['query_seconds']} | "
+                f"{codes} | {run['run_seconds']} | {run['query_seconds']} | "
                 f"{run['round_trips']['metadata']} | {run['turns']} | "
                 f"{run['total_tokens']} |"
             )
@@ -1055,8 +1046,7 @@ async def _run_daita(
                 # is a setup failure; budget exhaustion later is a real outcome.
                 if result.steps == 0 and result.kind is not LoopExitKind.COMPLETED:
                     pytest.fail(f"Daita could not run: {result.reason}")
-                for unmeasured in ("structural_seconds", "query_seconds"):
-                    measured.pop(unmeasured)  # Recorded only with the pool enabled.
+                measured.pop("query_seconds")  # Recorded only with the pool enabled.
                 estimate = result.usage.cost_estimate
                 entry["questions"].append(
                     {

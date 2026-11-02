@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from hashlib import sha256
-from typing import Protocol
+from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject
 from ...adapters.folder import SessionFolderSource
@@ -492,6 +492,17 @@ class CatalogDataView:
         ):
             return None
         return registration.adapter_id
+
+    async def source_schemas(self, agent_id: str, source_id: str) -> tuple[str, ...]:
+        """The source's configured schemas in search order; empty when it has none."""
+
+        registration = await self._sources.load_source(agent_id, source_id)
+        schemas = (
+            None if registration is None else registration.configuration.get("schemas")
+        )
+        return (
+            tuple(cast(tuple[str, ...], schemas)) if isinstance(schemas, tuple) else ()
+        )
 
     async def resource_identity(
         self,

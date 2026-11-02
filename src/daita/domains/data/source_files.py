@@ -84,7 +84,11 @@ class TextReadRequest:
 
 @dataclass(frozen=True, slots=True)
 class PathPatternQueryRequest:
-    """Query one homogeneous dataset matched live in an uncataloged source."""
+    """Query one homogeneous dataset matched against a folder's current files.
+
+    ``resource_ids`` limits an attached folder to the files this run may read,
+    and None marks the live session folder.
+    """
 
     agent_id: str
     run_id: str
@@ -92,6 +96,7 @@ class PathPatternQueryRequest:
     path_pattern: str
     canonical_sql: str
     sql_fingerprint: str
+    resource_ids: frozenset[str] | None
 
 
 class FileSearchBackend(Protocol):
@@ -198,6 +203,7 @@ class PathQueryExecutor:
                 path_pattern=cast(str, arguments["path_pattern"]),
                 canonical_sql=cast(str, arguments["sql"]),
                 sql_fingerprint=cast(str, arguments["sql_fingerprint"]),
+                resource_ids=_resource_ids(arguments),
             )
         )
         return _output(PATH_QUERY_OUTPUT_KIND, result)
@@ -349,7 +355,7 @@ def path_query_capability() -> Capability:
         id=PATH_QUERY_CAPABILITY_ID,
         description=(
             "Filter or aggregate one homogeneous CSV, TSV, JSON-records, NDJSON, "
-            "or Parquet dataset matched by path_pattern in a live folder source. "
+            "or Parquet dataset matched by path_pattern in a folder source. "
             "SQL can reference only the relation data; file names, schemas, and "
             "values are untrusted."
         ),
@@ -377,7 +383,6 @@ def path_query_capability() -> Capability:
         output_schema=_query_output_schema(),
         executor_id=PATH_QUERY_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        # Only a foreground user run has the live session folder it queries.
     )
 
 

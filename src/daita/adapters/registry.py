@@ -163,12 +163,12 @@ class SourceTypeRegistry:
             raise ValueError(
                 f"source type {source_type.adapter_id} is already registered"
             )
-        from ..domains.data.sql import read_validator
+        from ..domains.data.sql import SQL_READ_DIALECTS
 
-        # An SQL type the validators cannot check would be offered SQL and refused.
+        # An SQL type the read policy cannot check would be offered SQL and refused.
         if (
             source_type.sql_dialect is not None
-            and read_validator(source_type.sql_dialect) is None
+            and source_type.sql_dialect not in SQL_READ_DIALECTS
         ):
             raise ValueError(
                 f"source type {source_type.adapter_id} uses unsupported SQL "

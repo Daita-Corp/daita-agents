@@ -1,4 +1,4 @@
-"""Export SQL analysis and catalog-validation APIs for the data domain."""
+"""Export SQL analysis and read-policy APIs for the data domain."""
 
 from .analysis import (
     _load_sqlglot as _load_sqlglot,
@@ -8,13 +8,15 @@ from .analysis import (
 from .contracts import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
+    CheckedRead,
     ResourceSchema,
     SqlAnalysis,
     SqlAnalysisError,
-    SqlColumnReference,
     SqlTableReference,
     SqlValidationIssue,
     SqlValidationResult,
+    checked_reads,
+    denied_relations,
     normalize_sql,
     sqlite_declared_type_affinity,
     sqlite_identifier_key,
@@ -25,12 +27,7 @@ from .duckdb_read import (
     ValidatedDuckDBRead,
     validate_duckdb_read,
 )
-from .read_validation import (
-    qualified_relation,
-    read_validator,
-    validate_postgresql_read,
-    validate_sqlite_read,
-)
+from .read_validation import SQL_READ_DIALECTS, qualified_relation, validate_read
 from .relational_update import (
     RELATIONAL_UPDATE_MAX_CANONICAL_BYTES,
     RelationalUpdateCell,
@@ -48,10 +45,12 @@ from .relational_update import (
 )
 
 __all__ = [
+    "CheckedRead",
     "MAX_SQL_CHARACTERS",
     "MAX_SQL_PARAMETERS",
     "MAX_FILE_QUERY_SQL_CHARACTERS",
     "RELATIONAL_UPDATE_MAX_CANONICAL_BYTES",
+    "SQL_READ_DIALECTS",
     "RelationalUpdateCell",
     "RelationalUpdateCommand",
     "RelationalUpdateFilter",
@@ -63,7 +62,6 @@ __all__ = [
     "ResourceSchema",
     "SqlAnalysis",
     "SqlAnalysisError",
-    "SqlColumnReference",
     "SqlTableReference",
     "SqlValidationIssue",
     "SqlValidationResult",
@@ -72,15 +70,15 @@ __all__ = [
     "ValidatedDuckDBRead",
     "analyze_postgresql_sql",
     "analyze_sqlite_sql",
+    "checked_reads",
+    "denied_relations",
     "normalize_sql",
     "qualified_relation",
-    "read_validator",
     "render_relational_update_statement",
     "sqlite_declared_type_affinity",
     "sqlite_identifier_key",
-    "validate_postgresql_read",
     "validate_relational_update_intent",
     "validate_relational_write_scope",
-    "validate_sqlite_read",
+    "validate_read",
     "validate_duckdb_read",
 ]

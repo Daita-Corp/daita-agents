@@ -20,6 +20,7 @@ from tests.data.postgresql._query_support import (
     _Pool,
     _SourceStore,
 )
+from tests.support.checked_read import checked_read
 
 
 class _Secret:
@@ -81,8 +82,8 @@ class _Connection:
 
 @pytest.fixture
 def transport(monkeypatch):
-    created, pools, structures, queries, passwords = [], [], [], [], []
-    state = SimpleNamespace(query=None, structure=None, connect=None, fail_init=False)
+    created, pools, queries, passwords = [], [], [], []
+    state = SimpleNamespace(query=None, connect=None, fail_init=False)
 
     async def connect(registration, provider):
         if state.connect is not None:
@@ -100,13 +101,6 @@ def transport(monkeypatch):
         pools.append(pool)
         return pool
 
-    async def structure(connection, registration, **kwargs):
-        assert connection.transaction_active
-        structures.append(connection)
-        if state.structure is not None:
-            return await state.structure(connection, registration)
-        return SimpleNamespace(source_revision="sha256:" + "3" * 64)
-
     async def query(connection, sql, parameters, **kwargs):
         assert connection.transaction_active
         queries.append(connection)
@@ -123,13 +117,11 @@ def transport(monkeypatch):
     monkeypatch.setattr(
         source_module, "_load_asyncpg", lambda: SimpleNamespace(create_pool=create_pool)
     )
-    monkeypatch.setattr(module, "_load_structure", structure)
     monkeypatch.setattr(module, "_execute_user_query", query)
     monkeypatch.setattr(module, "_execute_exact_tabular_query", export)
-    state.created, state.pools, state.structures, state.queries, state.passwords = (
+    state.created, state.pools, state.queries, state.passwords = (
         created,
         pools,
-        structures,
         queries,
         passwords,
     )
@@ -152,12 +144,11 @@ def _pooled(
     return backend, registration
 
 
-async def _read(backend, registration):
+async def _read(backend, registration, resource_id="resource-orders"):
     return await backend.execute_read(
         agent_id=registration.agent_id,
         source_id=registration.id,
-        sql="SELECT amount FROM public.orders",
-        parameters=(),
+        read=checked_read("SELECT amount FROM public.orders", resource_id=resource_id),
         max_rows=10,
         max_bytes=16384,
     )
@@ -173,8 +164,7 @@ async def test_repeated_queries_and_exports_share_connections_and_fresh_transact
         exported = await backend.execute_exact_tabular(
             agent_id=registration.agent_id,
             source_id=registration.id,
-            sql="SELECT amount FROM public.orders",
-            parameters=(),
+            read=checked_read("SELECT amount FROM public.orders"),
             format_name="csv",
             parameters_sha256="sha256:" + "0" * 64,
             created_at=datetime.now(UTC),
@@ -185,14 +175,14 @@ async def test_repeated_queries_and_exports_share_connections_and_fresh_transact
         )
         assert exported.row_count == 1
     assert len(transport.created) == 1
-    assert len(transport.structures) == len(transport.queries) == 20
+    assert len(transport.queries) == 20
     assert len(transport.created[0].transactions) == 20
     assert all(t.committed for t in transport.created[0].transactions)
     assert transport.created[0].resets == 20
     assert len(transport.created[0].settings) == 40
     metrics = backend.diagnostics()
     assert metrics.active == 0 and metrics.connections_created == 1
-    assert metrics.structural_seconds >= 0 and metrics.query_seconds >= 0
+    assert metrics.query_seconds >= 0
     await backend.close()
     await backend.close()
     assert (
@@ -237,22 +227,6 @@ async def test_checkout_overlap_is_clamped_to_source_capacity(transport, capacit
         await backend.close()
 
 
-async def test_reused_connection_detects_schema_drift_before_query(transport):
-    backend, registration = _pooled()
-    await _read(backend, registration)
-
-    async def changed(connection, registration):
-        return SimpleNamespace(source_revision="sha256:" + "9" * 64)
-
-    transport.structure = changed
-    with pytest.raises(module.PostgreSQLQueryError, match="structure changed"):
-        await _read(backend, registration)
-    assert len(transport.created) == 1 and len(transport.queries) == 1
-    assert transport.created[0].closed
-    assert transport.created[0].transactions[-1].aborted
-    await backend.close()
-
-
 @pytest.mark.parametrize("failure", ("query", "reset"))
 async def test_poisoned_connection_is_discarded_without_query_replay(
     transport, failure
@@ -292,7 +266,11 @@ async def test_exact_source_and_credential_admission_retire_idle_pools(
     store = backend._sources
     assert isinstance(store, _SourceStore)
     registration = replace(
-        registration, configuration={"credential_ref": "env:POOL_TEST_PASSWORD"}
+        registration,
+        configuration={
+            "schemas": ("public",),
+            "credential_ref": "env:POOL_TEST_PASSWORD",
+        },
     )
     store.registration = registration
     await _read(backend, registration)
@@ -334,7 +312,11 @@ async def test_rotation_during_checkout_blocks_dispatch(transport):
     store = backend._sources
     assert isinstance(store, _SourceStore)
     registration = replace(
-        registration, configuration={"credential_ref": "env:POOL_TEST_PASSWORD"}
+        registration,
+        configuration={
+            "schemas": ("public",),
+            "credential_ref": "env:POOL_TEST_PASSWORD",
+        },
     )
     store.registration = registration
     entered, release = asyncio.Event(), asyncio.Event()
@@ -478,7 +460,7 @@ async def test_host_connection_budget_retires_idle_sources(transport):
                 adapter_id="postgresql",
                 native_identity=f"source-{i}",
                 display_name=f"Source {i}",
-                configuration={},
+                configuration={"schemas": ("public",)},
                 attached_at=datetime.now(UTC),
             )
             for i in (2, 3)
@@ -523,10 +505,15 @@ async def test_host_connection_budget_retires_idle_sources(transport):
             active -= 1
 
     transport.query = blocked
-    tasks = [asyncio.create_task(_read(backend, r)) for r in registrations[:2]]
+    tasks = [
+        asyncio.create_task(_read(backend, r, f"resource-{i}"))
+        for i, r in enumerate(registrations[:2])
+    ]
     try:
         await asyncio.wait_for(entered.wait(), 2)
-        tasks.append(asyncio.create_task(_read(backend, registrations[2])))
+        tasks.append(
+            asyncio.create_task(_read(backend, registrations[2], "resource-2"))
+        )
         while backend.diagnostics().waiting != 1:
             await asyncio.sleep(0)
         assert count == 2 and backend.diagnostics().reserved_connections == 2

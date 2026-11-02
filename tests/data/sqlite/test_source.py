@@ -35,8 +35,6 @@ async def test_sqlite_execution_fails_closed_when_admitted_path_is_replaced(
         with sqlite3.connect(path) as connection:
             connection.execute("CREATE TABLE records (value TEXT)")
             connection.execute("INSERT INTO records VALUES (?)", (value,))
-    with sqlite3.connect(database) as connection:
-        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
     admitted = sqlite_query_module._regular_unaliased_path(str(database))
     original_connect = sqlite_query_module.sqlite3.connect
     replaced = False
@@ -63,7 +61,6 @@ async def test_sqlite_execution_fails_closed_when_admitted_path_is_replaced(
                 admitted,
                 "SELECT value FROM records",
                 (),
-                expected_schema_version=schema_version,
                 max_rows=10,
                 max_bytes=10_000,
             )
@@ -74,7 +71,6 @@ async def test_sqlite_execution_fails_closed_when_admitted_path_is_replaced(
                 (),
                 format_name="csv",
                 xlsx_provenance=None,
-                expected_schema_version=schema_version,
                 max_rows=10,
                 max_columns=10,
                 max_bytes=10_000,
@@ -91,8 +87,6 @@ async def test_sqlite_execution_fails_closed_on_symlink_substitution(
     for path in (database, replacement):
         with sqlite3.connect(path) as connection:
             connection.execute("CREATE TABLE records (value TEXT)")
-    with sqlite3.connect(database) as connection:
-        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
     admitted = sqlite_query_module._regular_unaliased_path(str(database))
     original_connect = sqlite_query_module.sqlite3.connect
     substituted = False
@@ -119,7 +113,6 @@ async def test_sqlite_execution_fails_closed_on_symlink_substitution(
             admitted,
             "SELECT value FROM records",
             (),
-            expected_schema_version=schema_version,
             max_rows=10,
             max_bytes=10_000,
         )
@@ -135,8 +128,6 @@ async def test_sqlite_connect_failure_rechecks_admitted_path_identity(
         with sqlite3.connect(path) as connection:
             connection.execute("CREATE TABLE records (value TEXT)")
             connection.execute("INSERT INTO records VALUES (?)", (value,))
-    with sqlite3.connect(database) as connection:
-        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
     admitted = sqlite_query_module._regular_unaliased_path(str(database))
 
     def replace_then_fail(*args, **kwargs):
@@ -154,7 +145,6 @@ async def test_sqlite_connect_failure_rechecks_admitted_path_identity(
             admitted,
             "SELECT value FROM records",
             (),
-            expected_schema_version=schema_version,
             max_rows=10,
             max_bytes=10_000,
         )
@@ -172,7 +162,6 @@ async def test_sqlite_execution_fails_closed_for_live_wal_database(
         connection.execute("CREATE TABLE records (value TEXT)")
         connection.execute("INSERT INTO records VALUES ('visible-in-wal')")
         connection.commit()
-        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
         assert Path(f"{database}-wal").exists()
 
         admitted = sqlite_query_module._regular_unaliased_path(str(database))
@@ -182,7 +171,6 @@ async def test_sqlite_execution_fails_closed_for_live_wal_database(
                     admitted,
                     "SELECT value FROM records",
                     (),
-                    expected_schema_version=schema_version,
                     max_rows=10,
                     max_bytes=10_000,
                 )
@@ -193,7 +181,6 @@ async def test_sqlite_execution_fails_closed_for_live_wal_database(
                     (),
                     format_name="csv",
                     xlsx_provenance=None,
-                    expected_schema_version=schema_version,
                     max_rows=10,
                     max_columns=10,
                     max_bytes=10_000,
@@ -217,8 +204,6 @@ async def test_sqlite_execution_remains_bound_during_aba_path_substitution(
         with sqlite3.connect(path) as connection:
             connection.execute("CREATE TABLE records (value TEXT)")
             connection.execute("INSERT INTO records VALUES (?)", (value,))
-    with sqlite3.connect(database) as connection:
-        schema_version = connection.execute("PRAGMA schema_version").fetchone()[0]
     admitted = sqlite_query_module._regular_unaliased_path(str(database))
     original_connect = sqlite_query_module.sqlite3.connect
 
@@ -242,7 +227,6 @@ async def test_sqlite_execution_remains_bound_during_aba_path_substitution(
             admitted,
             "SELECT value FROM records",
             (),
-            expected_schema_version=schema_version,
             max_rows=10,
             max_bytes=10_000,
         )
@@ -255,7 +239,6 @@ async def test_sqlite_execution_remains_bound_during_aba_path_substitution(
                 (),
                 format_name="csv",
                 xlsx_provenance=None,
-                expected_schema_version=schema_version,
                 max_rows=10,
                 max_columns=10,
                 max_bytes=10_000,

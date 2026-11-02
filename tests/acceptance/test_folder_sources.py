@@ -128,7 +128,7 @@ async def test_customer_file_links_to_database_orders_and_joins_in_one_query(
                 {
                     "alias": "c",
                     "source_id": files.id,
-                    "resource_ids": [customers.id],
+                    "path_pattern": "customers.csv",
                     "sql": "SELECT id, region FROM data",
                 },
             ],
@@ -147,7 +147,7 @@ async def test_customer_file_links_to_database_orders_and_joins_in_one_query(
             dict(row) for row in cast(tuple[Mapping[str, object], ...], data["rows"])
         ] == [{"region": "north", "revenue": 140}, {"region": "south", "revenue": 40}]
 
-        # A changed file no longer matches its cataloged revision.
+        # The source answers: a changed file is read as it is now.
         customers_file.write_text(
             "id,region\n1,west\n2,south\n3,north\n", encoding="utf-8"
         )
@@ -155,33 +155,27 @@ async def test_customer_file_links_to_database_orders_and_joins_in_one_query(
             (_call("again", "data_query", combined), _stop("The file changed."))
         )
         changed = await agent.run("Recompute revenue by customer region.")
-        stale = _result(await agent.transcript(changed.run_id), "again")
-        assert stale.is_error
-        assert cast(Mapping[str, object], stale.output["error"])["code"] == (
-            "query_binding_stale"
-        )
+        again = _result(await agent.transcript(changed.run_id), "again")
+        assert not again.is_error, again.output
+        assert "west" in str(cast(Mapping[str, object], again.output["data"])["rows"])
 
-        await agent.refresh_source(files.id)
-        (refreshed,) = [
-            item
-            for item in await agent.list_catalog_resources(source_id=files.id)
-            if item.kind is ResourceKind.FILE
-        ]
-        assert refreshed.current_revision != customers.current_revision
-        backend = agent._embedded._source_backends[SourceOperation.SQL_READ]["folder"]
-        with pytest.raises(FolderSourceError) as pinned:
-            await backend.execute_read(
-                agent_id=agent.id,
-                source_id=files.id,
-                sql="SELECT id, region FROM data",
-                parameters=(),
-                max_rows=100,
-                max_bytes=16_384,
-                expected_resource_revisions=(
-                    (customers.id, customers.current_revision),
+        # A folder is read by pattern; plain SQL says so rather than guessing files.
+        provider.replace_script(
+            (
+                _call(
+                    "plain",
+                    "data_query",
+                    {"source_id": files.id, "sql": "SELECT * FROM data"},
                 ),
+                _stop("It needs a pattern."),
             )
-        assert pinned.value.error_code == "query_binding_stale"
+        )
+        plain = await agent.run("Show the customers file.")
+        refused = _result(await agent.transcript(plain.run_id), "plain")
+        assert refused.is_error
+        assert cast(Mapping[str, object], refused.output["error"])["code"] == (
+            "path_pattern_required"
+        )
     finally:
         await agent.close()
 

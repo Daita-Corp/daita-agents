@@ -107,7 +107,6 @@ from .sql import (
     ResourceSchema,
     SqlAnalysis,
     SqlAnalysisError,
-    SqlColumnReference,
     SqlTableReference,
     SqlValidationIssue,
     SqlValidationResult,
@@ -119,10 +118,9 @@ from .sql import (
     render_relational_update_statement,
     sqlite_declared_type_affinity,
     sqlite_identifier_key,
-    validate_postgresql_read,
+    validate_read,
     validate_relational_update_intent,
     validate_relational_write_scope,
-    validate_sqlite_read,
 )
 
 __all__ = [
@@ -210,7 +208,6 @@ __all__ = [
     "SQLiteReadResult",
     "SqlAnalysis",
     "SqlAnalysisError",
-    "SqlColumnReference",
     "SqlTableReference",
     "SqlValidationIssue",
     "SqlValidationResult",
@@ -238,8 +235,7 @@ __all__ = [
     "render_relational_update_statement",
     "sqlite_declared_type_affinity",
     "sqlite_identifier_key",
-    "validate_postgresql_read",
+    "validate_read",
     "validate_relational_update_intent",
     "validate_relational_write_scope",
-    "validate_sqlite_read",
 ]

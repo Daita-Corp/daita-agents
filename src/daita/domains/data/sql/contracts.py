@@ -367,27 +367,6 @@ class SqlTableReference:
 
 
 @dataclass(frozen=True, slots=True)
-class SqlColumnReference:
-    name: str
-    qualifier: str | None = None
-    resource_name: str | None = None
-    name_quoted: bool = False
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _required_text(self.name, "column name"))
-        for field_name in ("qualifier", "resource_name"):
-            value = getattr(self, field_name)
-            if value is not None:
-                object.__setattr__(
-                    self,
-                    field_name,
-                    _required_text(value, f"column {field_name}"),
-                )
-        if not isinstance(self.name_quoted, bool):
-            raise TypeError("column name_quoted must be a boolean")
-
-
-@dataclass(frozen=True, slots=True)
 class SqlAnalysis:
     sql: str
     canonical_sql: str
@@ -395,12 +374,8 @@ class SqlAnalysis:
     statement_type: str
     statement_count: int
     is_read: bool
-    has_limit: bool
     mutation_types: tuple[str, ...]
     tables: tuple[SqlTableReference, ...]
-    columns: tuple[SqlColumnReference, ...]
-    selected_columns: tuple[str, ...]
-    select_aliases: tuple[str, ...]
     positional_parameter_count: int
     parameter_ordinals: tuple[int, ...] = ()
     anonymous_parameter_count: int = 0
@@ -408,9 +383,8 @@ class SqlAnalysis:
     function_names: tuple[str, ...] = ()
     unresolved_function_names: tuple[str, ...] = ()
     table_function_names: tuple[str, ...] = ()
-    cast_type_names: tuple[str, ...] = ()
-    unsafe_cast_type_names: tuple[str, ...] = ()
     explicit_operator_names: tuple[str, ...] = ()
+    attribute_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sql", _required_text(self.sql, "analysis sql"))
@@ -442,9 +416,8 @@ class SqlAnalysis:
             "function_names",
             "unresolved_function_names",
             "table_function_names",
-            "cast_type_names",
-            "unsafe_cast_type_names",
             "explicit_operator_names",
+            "attribute_names",
         ):
             values = tuple(getattr(self, field_name))
             if values != tuple(sorted(set(values))):
@@ -486,6 +459,10 @@ class SqlValidationResult:
     resource_revisions: tuple[tuple[str, str], ...]
     source_revision: str | None
     issues: tuple[SqlValidationIssue, ...]
+    resource_names: tuple[tuple[str, str], ...] = ()
+    sensitivity_classes: tuple[str, ...] = ()
+    function_lookups: tuple[str, ...] = ()
+    attribute_lookups: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.valid, bool):
@@ -530,3 +507,51 @@ class SqlValidationResult:
     @property
     def issue_codes(self) -> tuple[str, ...]:
         return tuple(issue.code for issue in self.issues)
+
+
+@dataclass(frozen=True, slots=True)
+class CheckedRead:
+    """One read that passed policy; a backend executes it without validating it."""
+
+    canonical_sql: str
+    sql_fingerprint: str
+    parameters: tuple[object, ...] = ()
+    # Names the read transaction checks against the live server: called
+    # functions, and ``x.name`` reads the server could resolve to ``name(x)``.
+    function_lookups: tuple[str, ...] = ()
+    attribute_lookups: tuple[str, ...] = ()
+    # What the read touched. Revisions are echoed into results, never compared.
+    resource_ids: tuple[str, ...] = ()
+    resource_names: tuple[tuple[str, str], ...] = ()
+    resource_revisions: tuple[tuple[str, str], ...] = ()
+    source_revision: str = ""
+    sensitivity_classes: tuple[str, ...] = ()
+    # A folder read names its files by pattern and the IDs it may match.
+    path_pattern: str | None = None
+    allowed_resource_ids: tuple[str, ...] = ()
+
+    def to_mapping(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in self.__slots__}
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> CheckedRead:
+        return cls(**value)  # type: ignore[arg-type]
+
+
+def checked_reads(arguments: Mapping[str, object]) -> tuple[CheckedRead, ...]:
+    """The reads the data domain prepared for one executor call, in order."""
+
+    items = arguments["_reads"]
+    assert isinstance(items, tuple)
+    return tuple(CheckedRead.from_mapping(item) for item in items)
+
+
+def denied_relations(read: CheckedRead, readable: frozenset[str]) -> tuple[str, ...]:
+    """The tables of a prepared read that current permission no longer admits."""
+
+    names = dict(read.resource_names)
+    return tuple(
+        names.get(resource_id, resource_id)
+        for resource_id in read.resource_ids
+        if resource_id not in readable
+    )
