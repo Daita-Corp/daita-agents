@@ -29,6 +29,13 @@ _CONTINUATION_KEY = "gemini_continuation"
 
 _PORTABLE_FUNCTION_CALL_SIGNATURE = b"skip_thought_signature_validator"
 
+# A machine run starts from a system message, which moves to the system instruction.
+# Contents must still open a model turn with a user turn and cannot end on a model one.
+_RUN_START_TURN: dict[str, object] = {
+    "role": "user",
+    "parts": [{"text": "Begin the run the system instruction describes."}],
+}
+
 
 def _count_request(arguments: Mapping[str, object]) -> dict[str, object]:
     """Project prepared SDK arguments into countTokens' full REST input shape.
@@ -149,6 +156,8 @@ def _gemini_contents(
                     parts.append(native_part)
             if not parts:
                 raise ValueError("assistant message produced no Gemini parts")
+            if _awaits_user_turn(contents):
+                contents.append(_RUN_START_TURN)
             contents.append({"role": "model", "parts": parts})
             continue
         if message.role is MessageRole.TOOL:
@@ -182,12 +191,18 @@ def _gemini_contents(
         if not text:
             raise ValueError("user message produced no text")
         contents.append({"role": "user", "parts": [{"text": text}]})
-    if not contents:
+    if not contents and not system_parts:
         raise ModelProviderError(
             ProviderErrorCode.INVALID_REQUEST,
             "canonical request produced no Gemini contents",
         )
+    if _awaits_user_turn(contents):
+        contents.append(_RUN_START_TURN)
     return contents, "\n".join(system_parts) or None
+
+
+def _awaits_user_turn(contents: list[dict[str, object]]) -> bool:
+    return not contents or contents[-1]["role"] == "model"
 
 
 def _same_origin_continuation(
