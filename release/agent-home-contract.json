@@ -272,7 +272,8 @@
         "content",
         "tool_calls",
         "provider_id",
-        "provider_metadata"
+        "provider_metadata",
+        "run_note"
       ],
       "CapabilityGrant": [
         "grant_id",
@@ -2096,7 +2097,7 @@
       }
     }
   },
-  "contract_sha256": "22f2cb9063378be9bcd75a287117c364038555cbe8b9a73f8e34004b713c1217",
+  "contract_sha256": "5db85a8ff12836b92db3ec4f07da9b0c13d220a6cbffd2f0464766e78635bd1a",
   "home_revision": 4,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1

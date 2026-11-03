@@ -59,7 +59,11 @@ from .common import (
     sequence,
     text,
 )
-from .execution_scope import decode_execution_scope, encode_execution_scope
+from .execution_scope import (
+    _with_field,
+    decode_execution_scope,
+    encode_execution_scope,
+)
 
 
 def encode_run_input(value: RunInput) -> str:
@@ -409,15 +413,25 @@ def _encode_message(value: CanonicalMessage) -> dict[str, JsonValue]:
             "tool_calls": [_encode_tool_call(item) for item in value.tool_calls],
             "provider_id": value.provider_id,
             "provider_metadata": plain_encode(value.provider_metadata),
+            # Omitted when absent, so messages without one stay byte-identical.
+            **({} if value.run_note is None else {"run_note": value.run_note}),
         },
     )
 
 
 def _decode_message(value: JsonValue) -> CanonicalMessage:
     fields = record_fields(
-        value,
+        # Omitted when absent, so older messages decode as they were.
+        _with_field(value, "run_note", None),
         "CanonicalMessage",
-        ("role", "content", "tool_calls", "provider_id", "provider_metadata"),
+        (
+            "role",
+            "content",
+            "tool_calls",
+            "provider_id",
+            "provider_metadata",
+            "run_note",
+        ),
     )
     content: list[TextBlock | ToolResultBlock] = []
     for item in sequence(fields["content"], "message content"):
@@ -441,6 +455,7 @@ def _decode_message(value: JsonValue) -> CanonicalMessage:
         ),
         provider_id=optional_text(fields["provider_id"], "message provider_id"),
         provider_metadata=metadata,
+        run_note=optional_text(fields["run_note"], "message run_note"),
     )
 
 

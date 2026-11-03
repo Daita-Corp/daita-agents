@@ -1337,7 +1337,6 @@ class EmbeddedAgent:
         data_view = CatalogDataView(
             store, catalog_service, store, registry, session_source=session_source
         )
-        catalog = catalog_declarations(identity.id, data_view)
         host_capacity = host_capacity or HostCapacityLimits()
         backend_context = SourceBackendContext(
             store=store,
@@ -1360,6 +1359,9 @@ class EmbeddedAgent:
         for source_type in registry.types():
             for operation, backend in source_type.backends(backend_context).items():
                 source_backends[operation][source_type.adapter_id] = backend
+        catalog = catalog_declarations(
+            identity.id, data_view, source_backends[SourceOperation.LIVE_LOOKUP]
+        )
         if admission_cleanup is not None:
             for backend in _backends_with(source_backends, "close"):
                 admission_cleanup.push_async_callback(backend.close)

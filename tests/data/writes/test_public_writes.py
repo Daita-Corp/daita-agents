@@ -194,13 +194,8 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
                 assert write.is_error
                 error = write.output["error"]
                 assert isinstance(error, Mapping)
-                # A shortened ID is a name nothing in scope has; a full-length
-                # ID that names nothing is refused by the read gate.
-                assert error["code"] == (
-                    "table_unknown"
-                    if review_action == "short_id"
-                    else "resource_read_not_allowed"
-                )
+                # Either way it names no readable table, so the read gate refuses.
+                assert error["code"] == "resource_read_not_allowed"
                 assert resource.id not in canonical_json(error)
                 return response(text="The exact target is unresolved; no change made.")
             return response(text="Report the exact returned effect evidence.")
@@ -356,11 +351,14 @@ def script(
     if schema:
         steps.insert(
             1,
-            response(
+            lambda request: response(
                 ToolCall(
                     id="schema",
                     name="catalog_describe",
-                    arguments={"resource_ids": [batch["resource_id"]]},
+                    arguments={
+                        "source": request.scope_names[batch["source_id"]],
+                        "name": request.scope_names[batch["resource_id"]],
+                    },
                 )
             ),
         )

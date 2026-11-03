@@ -9,13 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent, SQLiteSource, WorkColumn, WorkKind
+from daita import SQLiteSource, WorkColumn, WorkKind
 from daita.distribution import DeliverySubjectKind, OutcomeState
 from daita.jobs import ChecklistStatus, DelegationState, JobState
 from daita.llm.models import (
     ModelRequest,
     ModelResponse,
-    TextBlock,
     ToolCall,
     model_tool_result,
 )
@@ -32,7 +31,6 @@ from tests.support.jobs import (
     wait_for_job,
 )
 from tests.support.model_surface import identity_leaks
-from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.integration
 
@@ -212,7 +210,11 @@ async def test_job_runs_show_only_names_and_stay_inside_their_sources(
                 "other-source",
             ),
             keep_going(
-                ToolCall("describe", "catalog_describe", {"tables": ["main.people"]}),
+                ToolCall(
+                    "describe",
+                    "catalog_describe",
+                    {"source": "shop", "name": "main.people"},
+                ),
                 "other-table",
             ),
             keep_going(
@@ -350,58 +352,3 @@ async def test_job_start_refuses_a_name_two_sources_share(tmp_path: Path) -> Non
     refused = tool_result(model.requests[-1][1], "shared")
     assert refused.output["error"]["code"] == "source_ambiguous"  # type: ignore[index]
     assert "SALES (sqlite)" in str(refused.output)
-
-
-async def test_job_runs_find_their_tables_from_the_objective_and_the_goal(
-    tmp_path: Path,
-) -> None:
-    """A job run cannot search the catalog, so its context matches the work."""
-
-    database = tmp_path / "sales.db"
-    with sqlite3.connect(database) as connection:
-        connection.executescript(
-            "CREATE TABLE orders (id INTEGER PRIMARY KEY, amount REAL);"
-            "CREATE TABLE refunds (id INTEGER PRIMARY KEY, amount REAL);"
-        )
-    created = await Agent.create(
-        "jobs", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
-    await created.attach(SQLiteSource(database, name="Sales"))
-    await created.close()
-
-    def tables(request: ModelRequest) -> set[str]:
-        text = "".join(
-            block.text
-            for message in request.messages
-            for block in message.content
-            if isinstance(block, TextBlock)
-        )
-        return {name for name in ("orders", "refunds") if f'"name":"{name}"' in text}
-
-    seen: dict[str, set[str]] = {}
-
-    def main(request: ModelRequest) -> ModelResponse:
-        seen["main"] = tables(request)
-        return reply(
-            ToolCall(
-                "d", "delegate", {"goal": "Total the refunds table.", "context": ""}
-            )
-        )
-
-    def subrun(request: ModelRequest) -> ModelResponse:
-        seen["subrun"] = tables(request)
-        return reply(text="Refunds total 0.")
-
-    model = JobModel()
-    model.script(
-        main=[main, reply(text="Compared.")],
-        subruns={"Total the refunds table.": subrun},
-    )
-    agent = await open_job_agent(tmp_path, model, reopen=True)
-    try:
-        job = await agent.start_job("Compare the orders table with the refunds table.")
-        await wait_for_job(agent, job.job_id, in_state(JobState.DONE), model=model)
-        assert seen["main"] == {"orders", "refunds"}
-        assert "refunds" in seen["subrun"]
-    finally:
-        await agent.close()

@@ -9,10 +9,11 @@ import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TypeVar
 
 from ..artifacts.models import ArtifactError
 from ..artifacts.renderers import (
@@ -29,11 +30,27 @@ from ..domains.data.export_capabilities import (
     resolved_exact_export_sensitivity,
 )
 from ..domains.data.results import project_result_rows
-from ..domains.data.sql import CheckedRead, denied_relations
+from ..domains.data.sql import CheckedRead, denied_relations, sqlite_identifier_key
 from ..errors import DaitaError
-from ..storage.sqlite_records import SourcePermissionStateError
+from ..storage.sqlite_records import (
+    SourcePermissionStateError,
+    SourceReadMode,
+    SourceReadScope,
+)
 from .models import SourceRegistration
-from .protocols import SourceReadScopeStore
+from .protocols import (
+    DESCRIBE_MAX_COLUMNS,
+    DESCRIBE_MAX_LISTED_TABLES,
+    SUMMARY_MAX_COLUMNS,
+    SourceReadScopeStore,
+    column_summary,
+)
+
+_T = TypeVar("_T")
+_LOOKUP_SECONDS = 5.0
+_RELATIONS_SQL = """SELECT name, type FROM sqlite_schema
+WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+ORDER BY name LIMIT 10000"""
 
 _DEFAULT_STATEMENT_TIMEOUT_SECONDS = 5.0
 _MAX_STATEMENT_TIMEOUT_SECONDS = 60.0
@@ -73,6 +90,21 @@ class SQLiteQueryBackend:
     ) -> tuple[str, SourceRegistration]:
         """Recheck current permission, since a read can queue after it was prepared."""
 
+        configured_path, registration, read_scope = await self._current_source(
+            agent_id, source_id
+        )
+        denied = denied_relations(read, read_scope)
+        if denied is None or denied:
+            raise SQLiteQueryError(
+                "resource_read_not_allowed",
+                f"{', '.join(denied or ('This source',))} is not available for "
+                "reading in this run.",
+            )
+        return configured_path, registration
+
+    async def _current_source(
+        self, agent_id: str, source_id: str
+    ) -> tuple[str, SourceRegistration, SourceReadScope | None]:
         registration = await self._sources.load_source(agent_id, source_id)
         if (
             registration is None
@@ -102,14 +134,43 @@ class SQLiteQueryBackend:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from None
-        denied = denied_relations(read, read_scope)
-        if denied is None or denied:
+        return configured_path, registration, read_scope
+
+    async def _lookup(
+        self, agent_id: str, source_id: str, work: Callable[[sqlite3.Connection], _T]
+    ) -> _T:
+        """Run code-owned schema reads on one bounded read-only connection."""
+
+        configured_path, _registration, read_scope = await self._current_source(
+            agent_id, source_id
+        )
+        if read_scope is None or read_scope.mode is SourceReadMode.NONE:
             raise SQLiteQueryError(
                 "resource_read_not_allowed",
-                f"{', '.join(denied or ('This source',))} is not available for "
-                "reading in this run.",
+                "This source is not available for reading in this run.",
             )
-        return configured_path, registration
+        path = _regular_unaliased_path(configured_path)
+        return await asyncio.wait_for(
+            asyncio.to_thread(_lookup_sync, path, work), _LOOKUP_SECONDS + 1
+        )
+
+    async def search_names(
+        self, *, agent_id: str, source_id: str, words: tuple[str, ...], limit: int
+    ) -> tuple[Mapping[str, object], ...]:
+        """Match words against table and column names read from sqlite_schema."""
+
+        return await self._lookup(
+            agent_id, source_id, lambda connection: _search(connection, words, limit)
+        )
+
+    async def describe_name(
+        self, *, agent_id: str, source_id: str, name: str
+    ) -> Mapping[str, object] | None:
+        """Describe one table or view, or list ``main``; None when absent."""
+
+        return await self._lookup(
+            agent_id, source_id, lambda connection: _describe(connection, name)
+        )
 
     async def execute_read(
         self,
@@ -210,6 +271,152 @@ class SQLiteQueryBackend:
             sensitivity=sensitivity,
             column_types=arrow_schema(content)[1] if format_name == "arrow" else (),
         )
+
+
+def _lookup_sync(
+    path: _AdmittedSQLiteFile, work: Callable[[sqlite3.Connection], _T]
+) -> _T:
+    deadline = time.monotonic() + _LOOKUP_SECONDS
+    connection, descriptor = _connect_admitted_read_only(path)
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA trusted_schema = OFF")
+        connection.enable_load_extension(False)
+        connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 500)
+        return work(connection)
+    except sqlite3.Error:
+        raise SQLiteQueryError(
+            "source_unreachable", "The SQLite source could not be inspected."
+        ) from None
+    finally:
+        connection.close()
+        os.close(descriptor)
+
+
+def _table_columns(
+    connection: sqlite3.Connection, table: str
+) -> list[tuple[object, ...]]:
+    """Visible columns; a view over a dropped table has none rather than failing."""
+
+    try:
+        return [
+            row
+            for row in connection.execute(
+                'SELECT name, type, "notnull", pk, hidden '
+                "FROM pragma_table_xinfo(?) ORDER BY cid",
+                (table,),
+            )
+            if row[4] != 1
+        ]
+    except sqlite3.OperationalError:
+        return []
+
+
+def _search(
+    connection: sqlite3.Connection, words: tuple[str, ...], limit: int
+) -> tuple[Mapping[str, object], ...]:
+    scored: list[tuple[tuple[int, int, int, str], Mapping[str, object]]] = []
+    for table, kind in connection.execute(_RELATIONS_SQL).fetchall():
+        folded = sqlite_identifier_key(table)
+        columns = _table_columns(connection, table)
+        names = [sqlite_identifier_key(str(row[0])) for row in columns]
+        named = sum(word in folded for word in words)
+        columned = sum(any(word in name for name in names) for word in words)
+        if not named and not columned:
+            continue
+        shown = ", ".join(
+            f"{row[0]} {row[1] or 'UNKNOWN'}" for row in columns[:SUMMARY_MAX_COLUMNS]
+        )
+        scored.append(
+            (
+                (-sum(word == folded for word in words), -named, -columned, folded),
+                {
+                    "name": f"main.{folded}",
+                    "kind": kind,
+                    "columns": column_summary(shown, len(columns)),
+                    "row_estimate": None,
+                },
+            )
+        )
+    return tuple(hit for _, hit in sorted(scored, key=lambda item: item[0])[:limit])
+
+
+def _describe(connection: sqlite3.Connection, name: str) -> Mapping[str, object] | None:
+    folded = sqlite_identifier_key(name.replace('"', "")).removeprefix("main.")
+    if folded == "main":
+        relations = connection.execute(_RELATIONS_SQL).fetchall()
+        return {
+            "name": "main",
+            "kind": "schema",
+            "tables": [
+                {
+                    "name": f"main.{sqlite_identifier_key(table)}",
+                    "kind": kind,
+                    "row_estimate": None,
+                }
+                for table, kind in relations[:DESCRIBE_MAX_LISTED_TABLES]
+            ],
+            "total_tables": len(relations),
+        }
+    table, kind = next(
+        (
+            (table, kind)
+            for table, kind in connection.execute(_RELATIONS_SQL).fetchall()
+            if sqlite_identifier_key(table) == folded
+        ),
+        (None, None),
+    )
+    if table is None:
+        return None
+    columns = _table_columns(connection, table)
+    primary = sorted(
+        (row for row in columns if row[3]), key=lambda row: int(str(row[3]))
+    )
+    unique = [
+        [
+            column[2]
+            for column in connection.execute(
+                "SELECT seqno, cid, name FROM pragma_index_info(?)", (index[1],)
+            )
+        ]
+        for index in connection.execute(
+            'SELECT seq, name, "unique", origin FROM pragma_index_list(?)', (table,)
+        ).fetchall()
+        if index[2] and index[3] != "pk"
+    ]
+    keys: dict[int, tuple[str, list[list[object]]]] = {}
+    for row in connection.execute(
+        'SELECT id, "table", "from", "to" FROM pragma_foreign_key_list(?) '
+        "ORDER BY id, seq",
+        (table,),
+    ):
+        keys.setdefault(row[0], (row[1], []))[1].append([row[2], row[3]])
+    return {
+        "name": f"main.{sqlite_identifier_key(table)}",
+        "kind": kind,
+        "comment": None,
+        "row_estimate": None,
+        "partitions": 0,
+        "columns": [
+            {
+                "name": row[0],
+                "type": row[1] or "UNKNOWN",
+                "nullable": not row[2] and not row[3],
+            }
+            for row in columns[:DESCRIBE_MAX_COLUMNS]
+        ],
+        "columns_truncated": len(columns) > DESCRIBE_MAX_COLUMNS,
+        "primary_key": [row[0] for row in primary],
+        "unique_keys": unique,
+        "relationships": [
+            {
+                "from": f"main.{sqlite_identifier_key(table)}",
+                "to": f"main.{sqlite_identifier_key(target)}",
+                "columns": pairs,
+            }
+            for target, pairs in keys.values()
+        ],
+    }
 
 
 def _regular_unaliased_path(value: str) -> _AdmittedSQLiteFile:

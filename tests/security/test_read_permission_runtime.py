@@ -19,7 +19,6 @@ from daita.catalog import (
 )
 from daita.catalog.capabilities import CatalogProjection, catalog_declarations
 from daita.catalog.models import CatalogResource, ResourceKind, catalog_resource_id
-from daita.catalog.protocols import CatalogResourceNotFoundError
 from daita.llm.models import ToolCall
 from daita.loop.models import RunInput
 from daita.storage.sqlite_codecs import encode_source_read_scope
@@ -171,36 +170,15 @@ async def test_model_catalog_surfaces_filter_before_limits_totals_and_graphs(
     )
     try:
         view = agent._embedded._data_view
-        context = await view.catalog_context(
-            agent.id,
-            "table",
-            limit=1,
-            source_ids=(source_id,),
-        )
-        context_resources = cast(tuple[FrozenJsonObject, ...], context["resources"])
-        assert context["total_matches"] == 2
-        assert context["returned_count"] == 1
-        assert context["truncated"] is True
-        assert context_resources[0]["resource_id"] in {
-            resources["parent"].id,
-            resources["public_tail"].id,
-        }
-
-        search = await view.search(
-            CatalogSearchRequest(agent_id=agent.id, query="table", limit=1)
+        readable = await view.readable_resource_ids(agent.id)
+        search = await agent._embedded._catalog_service.search(
+            CatalogSearchRequest(agent_id=agent.id, query="table", limit=1),
+            readable_resource_ids=readable,
         )
         assert search.total_matches == 2
         assert search.returned_count == 1
         assert search.truncated is True
         assert len(search.hits) == 1
-
-        with pytest.raises(CatalogResourceNotFoundError):
-            await view.catalog_context(
-                agent.id,
-                "parent",
-                resource_ids=(resources["child"].id,),
-                limit=12,
-            )
 
         schema = await view.schema_slice(
             CatalogSchemaRequest(
@@ -242,30 +220,6 @@ async def test_model_catalog_surfaces_filter_before_limits_totals_and_graphs(
                     to_resource_ids=(resources["child"].id,),
                 )
             )
-    finally:
-        await agent.close()
-
-
-async def test_initial_model_context_contains_only_readable_resources(
-    tmp_path: Path,
-) -> None:
-    agent, _path, source_id, resources = await _agent_with_scope(
-        tmp_path,
-        mode=SourceReadMode.SELECTED,
-        selected_names=("parent",),
-    )
-    try:
-        context = await agent._embedded._data_view.catalog_context(
-            agent.id,
-            "tables parent child",
-            limit=12,
-            source_ids=(source_id,),
-        )
-        context_resources = cast(tuple[FrozenJsonObject, ...], context["resources"])
-        assert tuple(item["resource_id"] for item in context_resources) == (
-            resources["parent"].id,
-        )
-        assert resources["child"].id not in str(context)
     finally:
         await agent.close()
 

@@ -498,7 +498,7 @@ async def test_a_routine_run_shows_only_names_and_cannot_name_its_way_out(
         ("in-scope", "data_query", {"source": "shop", "sql": "SELECT id FROM orders"}),
         ("source", "data_query", {"source": "staff", "sql": "SELECT id FROM people"}),
         ("sql", "data_query", {"source": "shop", "sql": "SELECT id FROM people"}),
-        ("table", "catalog_describe", {"tables": ["main.people"]}),
+        ("table", "catalog_describe", {"source": "shop", "name": "main.people"}),
     )
     model.script(
         user=[
@@ -543,3 +543,59 @@ async def test_a_routine_run_shows_only_names_and_cannot_name_its_way_out(
         "table": "table_unknown",
     }
     assert identity_leaks(request for _, request in model.requests) == []
+
+
+@pytest.mark.parametrize("read_mode", ("all", "selected"))
+async def test_a_routine_can_search_only_sources_it_reads_in_full(
+    tmp_path: Path, read_mode: str
+) -> None:
+    shop = tmp_path / "shop.sqlite"
+    with sqlite3.connect(shop) as connection:
+        connection.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
+    model = JobModel()
+    model.script(
+        user=[
+            reply(ToolCall("find", "catalog_search", {"query": "orders"})),
+            reply(text="Reported."),
+        ]
+    )
+    agent = await open_job_agent(tmp_path, model)
+    try:
+        source = await agent.attach(SQLiteSource(shop, name="shop"))
+        if read_mode == "selected":
+            (orders,) = await agent.list_catalog_resources(source_id=source.id)
+            preview = await agent.preview_source_permissions(
+                source_id=source.id,
+                read_mode="selected",
+                read_resource_ids=(orders.id,),
+                relational_write_scopes={},
+            )
+            await agent.apply_source_permissions(
+                source_id=source.id,
+                confirmation_fingerprint=preview.confirmation_fingerprint,
+            )
+        routine = await agent.create_routine(
+            RoutineIntent(
+                title="Orders",
+                prompt="Report the orders table.",
+                schedule=IntervalSchedule(
+                    3_600, datetime.now(UTC) + timedelta(hours=1)
+                ),
+                sources=("shop",),
+            )
+        )
+        await agent.run_routine_now(
+            routine.routine_id, expected_revision=routine.revision
+        )
+        for _ in range(1_000):
+            if await agent.list_deliveries(conversation_id=routine.conversation_id):
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        await agent.close()
+    output = tool_result(model.requests[-1][1], "find").output
+    if read_mode == "all":
+        assert "error" not in output, output
+        assert "main.orders" in repr(output)
+    else:
+        assert output["error"]["code"] == "execution_scope_resource_violation"  # type: ignore[index]

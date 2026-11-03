@@ -5,14 +5,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import re
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 from uuid import UUID
 
 from .._json import FrozenJsonObject, canonical_json
@@ -36,17 +37,31 @@ from ..domains.data.sql import CheckedRead, denied_relations, resource_id_in_sco
 from ..errors import DaitaError, ErrorRetryability
 from ..observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
 from ..security import SecretProvider, SecretReference, default_secret_provider
-from ..storage.sqlite_records import SourcePermissionStateError, SourceReadScope
+from ..storage.sqlite_records import (
+    SourcePermissionStateError,
+    SourceReadMode,
+    SourceReadScope,
+)
 from .models import SourceRegistration
 from .postgresql import (
+    COLUMNS_SQL,
+    INDEXES_SQL,
+    ROW_ESTIMATE_SQL,
     PostgreSQLSourceError,
     _close_postgresql_connection,
     _configuration_schemas,
     _connect,
     _rollback_postgresql_transaction,
+    column_from_row,
 )
-from .protocols import SourceReadScopeStore
+from .protocols import (
+    DESCRIBE_MAX_COLUMNS,
+    DESCRIBE_MAX_LISTED_TABLES,
+    SourceReadScopeStore,
+    column_summary,
+)
 
+_T = TypeVar("_T")
 _MAX_QUERY_ROWS = 10_000
 _MAX_QUERY_BYTES = 16 * 1_024 * 1_024
 _MAX_RESULT_COLUMNS = 512
@@ -69,6 +84,74 @@ JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
 WHERE c.relname = ANY($1::text[])
   AND n.nspname = ANY($2::text[])
   AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+ORDER BY 1, 2
+LIMIT 32"""
+_LOOKUP_SECONDS = 5.0
+_RELATION_FILTER = "c.relkind IN ('r', 'p', 'f', 'v', 'm')"
+_LIVE_SEARCH = f"""/* daita:postgresql.live_search */
+WITH words AS (
+  SELECT * FROM unnest($2::text[], $3::text[]) AS w(word, pattern)
+), matched AS (
+  SELECT c.oid, n.nspname, c.relname, c.relkind,
+    {ROW_ESTIMATE_SQL} AS estimate,
+    (SELECT count(*) FROM words WHERE lower(c.relname) = word) AS exact,
+    (SELECT count(*) FROM words WHERE c.relname ILIKE pattern) AS named,
+    (SELECT count(*) FROM words WHERE EXISTS (
+       SELECT 1 FROM pg_attribute AS a
+       WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+         AND a.attname ILIKE pattern)) AS columned
+  FROM pg_class AS c
+  JOIN pg_namespace AS n ON n.oid = c.relnamespace
+  WHERE n.nspname = ANY($1::text[]) AND {_RELATION_FILTER} AND NOT c.relispartition
+)
+SELECT m.nspname, m.relname, m.relkind, m.estimate,
+  (SELECT string_agg(a.attname || ' ' || format_type(a.atttypid, a.atttypmod), ', ')
+   FROM (SELECT * FROM pg_attribute
+         WHERE attrelid = m.oid AND attnum > 0 AND NOT attisdropped
+         ORDER BY attnum LIMIT 12) AS a) AS columns,
+  (SELECT count(*) FROM pg_attribute
+   WHERE attrelid = m.oid AND attnum > 0 AND NOT attisdropped) AS column_count
+FROM matched AS m
+WHERE m.named + m.columned > 0
+ORDER BY m.exact DESC, m.named DESC, m.columned DESC, m.estimate DESC NULLS LAST,
+         m.nspname, m.relname
+LIMIT $4"""
+_LIVE_RELATIONS = f"""/* daita:postgresql.live_relations */
+SELECT c.oid, n.nspname, c.relname, c.relkind, obj_description(c.oid, 'pg_class'),
+  {ROW_ESTIMATE_SQL} AS estimate,
+  (SELECT count(*) FROM pg_inherits WHERE inhparent = c.oid) AS children
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE n.nspname = ANY($1::text[]) AND c.relname = ANY($2::text[]) AND {_RELATION_FILTER}
+ORDER BY c.relname = $3 DESC, n.nspname
+LIMIT 8"""
+_LIVE_SCHEMA = f"""/* daita:postgresql.live_schema */
+SELECT n.nspname, c.relname, c.relkind, {ROW_ESTIMATE_SQL} AS estimate,
+  count(*) OVER () AS total
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE n.nspname = $1 AND {_RELATION_FILTER} AND NOT c.relispartition
+ORDER BY c.relname
+LIMIT $2"""
+_LIVE_RELATIONSHIPS = """/* daita:postgresql.live_relationships */
+SELECT src_ns.nspname || '.' || src.relname, dst_ns.nspname || '.' || dst.relname,
+  array_agg(src_att.attname::text ORDER BY keys.ordinality),
+  array_agg(dst_att.attname::text ORDER BY keys.ordinality)
+FROM pg_constraint AS con
+JOIN pg_class AS src ON src.oid = con.conrelid
+JOIN pg_namespace AS src_ns ON src_ns.oid = src.relnamespace
+JOIN pg_class AS dst ON dst.oid = con.confrelid
+JOIN pg_namespace AS dst_ns ON dst_ns.oid = dst.relnamespace
+CROSS JOIN LATERAL unnest(con.conkey, con.confkey)
+    WITH ORDINALITY AS keys(source_attnum, target_attnum, ordinality)
+JOIN pg_attribute AS src_att
+  ON src_att.attrelid = src.oid AND src_att.attnum = keys.source_attnum
+JOIN pg_attribute AS dst_att
+  ON dst_att.attrelid = dst.oid AND dst_att.attnum = keys.target_attnum
+WHERE con.contype = 'f' AND con.conparentid = 0
+  AND (con.conrelid = $1 OR con.confrelid = $1)
+  AND src_ns.nspname = ANY($2::text[]) AND dst_ns.nspname = ANY($2::text[])
+GROUP BY con.oid, src_ns.nspname, src.relname, dst_ns.nspname, dst.relname
 ORDER BY 1, 2
 LIMIT 32"""
 # Volatile in pg_catalog, yet they only read a clock or a random source.
@@ -792,6 +875,19 @@ class PostgreSQLQueryBackend:
         Also retires a pool the current registration no longer matches.
         """
 
+        registration, read_scope = await self._current_source(agent_id, source_id)
+        denied = denied_relations(read, read_scope)
+        if denied is None or denied:
+            raise PostgreSQLQueryError(
+                "resource_read_not_allowed",
+                f"{', '.join(denied or ('This source',))} is not available for "
+                "reading in this run.",
+            )
+        return registration, read_scope
+
+    async def _current_source(
+        self, agent_id: str, source_id: str
+    ) -> tuple[SourceRegistration, SourceReadScope | None]:
         registration = await self._sources.load_source(agent_id, source_id)
         if (
             registration is None
@@ -822,14 +918,153 @@ class PostgreSQLQueryBackend:
                 cached.registration != registration or cached.read_scope != read_scope
             ):
                 await self.retire_source(agent_id, source_id)
-        denied = denied_relations(read, read_scope)
-        if denied is None or denied:
+        return registration, read_scope
+
+    async def _lookup(
+        self,
+        agent_id: str,
+        source_id: str,
+        work: Callable[[Any, tuple[str, ...]], Awaitable[_T]],
+    ) -> _T:
+        """Run code-owned catalog queries in one bounded read-only transaction."""
+
+        registration, read_scope = await self._current_source(agent_id, source_id)
+        if read_scope is None or read_scope.mode is SourceReadMode.NONE:
             raise PostgreSQLQueryError(
                 "resource_read_not_allowed",
-                f"{', '.join(denied or ('This source',))} is not available for "
-                "reading in this run.",
+                "This source is not available for reading in this run.",
             )
-        return registration, read_scope
+        connection = None
+        pool_entry = None
+        read_deadline = None
+        transaction = None
+        finished = False
+        try:
+            async with self._operation(_LOOKUP_SECONDS) as read_deadline:
+                connection, pool_entry = await self._connection(
+                    registration, read_scope
+                )
+                transaction = connection.transaction(
+                    isolation="repeatable_read", readonly=True
+                )
+                await transaction.start()
+                await connection.execute(
+                    "SELECT set_config('statement_timeout', $1, true)",
+                    f"{int(_LOOKUP_SECONDS * 1_000)}ms",
+                )
+                await connection.execute(
+                    "SELECT set_config('search_path', 'pg_catalog', true)"
+                )
+                result = await work(
+                    connection, _configuration_schemas(registration.configuration)
+                )
+                await transaction.commit()
+                finished = True
+                return result
+        except (asyncio.CancelledError, ImportError, PostgreSQLQueryError):
+            raise
+        except Exception:
+            # Driver and server text can carry DSNs; none of it crosses.
+            raise PostgreSQLQueryError(
+                "source_unreachable", "The PostgreSQL source could not be inspected."
+            ) from None
+        finally:
+            await self._finish_read(
+                connection, pool_entry, transaction, finished, read_deadline
+            )
+
+    async def search_names(
+        self, *, agent_id: str, source_id: str, words: tuple[str, ...], limit: int
+    ) -> tuple[Mapping[str, object], ...]:
+        """Match words against relation and column names in the configured schemas."""
+
+        async def work(
+            connection: Any, schemas: tuple[str, ...]
+        ) -> tuple[Mapping[str, object], ...]:
+            rows = await connection.fetch(
+                _LIVE_SEARCH,
+                list(schemas),
+                list(words),
+                [f"%{_like_literal(word)}%" for word in words],
+                limit,
+            )
+            return tuple(
+                {
+                    "name": f"{row[0]}.{row[1]}",
+                    "kind": _relation_kind(row[2]),
+                    "columns": column_summary(row[4], int(row[5])),
+                    "row_estimate": _row_estimate(row[3]),
+                }
+                for row in rows
+            )
+
+        return await self._lookup(agent_id, source_id, work)
+
+    async def describe_name(
+        self, *, agent_id: str, source_id: str, name: str
+    ) -> Mapping[str, object] | None:
+        """Describe one relation or one configured schema live; None when absent."""
+
+        async def work(
+            connection: Any, schemas: tuple[str, ...]
+        ) -> Mapping[str, object] | None:
+            parts = _name_parts(name)
+            bare = parts[-1]
+            searched = (
+                tuple(schema for schema in schemas if schema in {parts[0]})
+                or tuple(s for s in schemas if s == parts[0].lower())
+                if len(parts) == 2
+                else schemas
+            )
+            rows = (
+                await connection.fetch(
+                    _LIVE_RELATIONS,
+                    list(searched),
+                    list({bare, bare.lower()}),
+                    bare,
+                )
+                if len(parts) <= 2 and searched
+                else ()
+            )
+            if rows:
+                exact = [row for row in rows if row[2] == bare] or rows
+                if len({row[1] for row in exact}) > 1:
+                    return {
+                        "name": name,
+                        "kind": "ambiguous",
+                        "tables": [
+                            {
+                                "name": f"{row[1]}.{row[2]}",
+                                "kind": _relation_kind(row[3]),
+                                "row_estimate": _row_estimate(row[5]),
+                            }
+                            for row in exact
+                        ],
+                    }
+                return await _describe_relation(connection, exact[0], schemas)
+            schema = next(
+                (item for item in schemas if item in {name, name.lower()}), None
+            )
+            if schema is None:
+                return None
+            listed = await connection.fetch(
+                _LIVE_SCHEMA, schema, DESCRIBE_MAX_LISTED_TABLES
+            )
+            return {
+                "name": schema,
+                "kind": "schema",
+                "tables": [
+                    {
+                        "name": f"{row[0]}.{row[1]}",
+                        "kind": _relation_kind(row[2]),
+                        "row_estimate": _row_estimate(row[3]),
+                    }
+                    for row in listed
+                ],
+                "total_tables": int(listed[0][4]) if listed else 0,
+            }
+
+        return await self._lookup(agent_id, source_id, work)
 
     async def _finish_read(
         self,
@@ -1003,6 +1238,87 @@ class PostgreSQLQueryBackend:
             sensitivity=sensitivity,
             column_types=arrow_schema(content)[1] if format_name == "arrow" else (),
         )
+
+
+def _like_literal(word: str) -> str:
+    return word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _relation_kind(relkind: object) -> str:
+    return "view" if relkind in (b"v", b"m", "v", "m") else "table"
+
+
+def _row_estimate(value: object) -> int | None:
+    # PostgreSQL reports 0 or -1 until a table has been analyzed: unknown, not empty.
+    return int(value) if isinstance(value, (int, float)) and value > 0 else None
+
+
+def _name_parts(name: str) -> tuple[str, ...]:
+    """Split a dotted name: quoted parts are exact, others keep their spelling."""
+
+    return tuple(
+        quoted.replace('""', '"') or bare
+        for quoted, bare in re.findall(r'"((?:[^"]|"")+)"|([^.]+)', name)
+    )
+
+
+async def _describe_relation(
+    connection: Any, row: Any, schemas: tuple[str, ...]
+) -> Mapping[str, object]:
+    oid, schema, relation, relkind, comment, estimate, children = row
+    column_rows = await connection.fetch(
+        COLUMNS_SQL, schema, relation, DESCRIBE_MAX_COLUMNS + 1
+    )
+    index_rows = await connection.fetch(INDEXES_SQL, schema, relation, 64)
+    foreign_keys = await connection.fetch(_LIVE_RELATIONSHIPS, oid, list(schemas))
+    columns = [column_from_row(item) for item in column_rows]
+    enums = {item["column_name"]: item["enum_values"] for item in column_rows}
+    primary_key = [
+        column.name
+        for column in sorted(
+            (item for item in columns if item.primary_key_ordinal),
+            key=lambda item: cast(int, item.primary_key_ordinal),
+        )
+    ]
+    return {
+        "name": f"{schema}.{relation}",
+        "kind": _relation_kind(relkind),
+        "comment": comment,
+        "row_estimate": _row_estimate(estimate),
+        "partitions": int(children),
+        "columns": [
+            {
+                "name": column.name,
+                "type": column.native_type,
+                "nullable": column.nullable,
+                **({"comment": column.comment} if column.comment else {}),
+                **(
+                    {"enum_values": list(enums[column.name])}
+                    if enums.get(column.name)
+                    else {}
+                ),
+            }
+            for column in columns[:DESCRIBE_MAX_COLUMNS]
+        ],
+        "columns_truncated": len(columns) > DESCRIBE_MAX_COLUMNS,
+        "primary_key": primary_key,
+        "unique_keys": [
+            list(item["columns"])
+            for item in index_rows
+            if item["is_unique"]
+            and item["predicate"] is None
+            and item["columns"]
+            and list(item["columns"]) != primary_key
+        ],
+        "relationships": [
+            {
+                "from": item[0],
+                "to": item[1],
+                "columns": [list(pair) for pair in zip(item[2], item[3], strict=True)],
+            }
+            for item in foreign_keys
+        ],
+    }
 
 
 async def _prepare_read_transaction(

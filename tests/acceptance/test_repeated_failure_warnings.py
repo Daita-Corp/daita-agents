@@ -23,7 +23,6 @@ from daita.jobs import JobState
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
-    MessageRole,
     ModelProfile,
     ModelRequest,
     ModelResponse,
@@ -84,12 +83,10 @@ def _profile(
 
 
 def _status(request: ModelRequest) -> str:
-    # Per-step status, including progress warnings, follows the transcript.
-    status = request.messages[-1]
-    assert status.role is MessageRole.SYSTEM
-    text = status.content[0]
-    assert isinstance(text, TextBlock)
-    return text.text
+    # Status, including progress warnings, is written once beside a tool result.
+    return "\n".join(
+        message.run_note for message in request.messages if message.run_note
+    )
 
 
 def _warned(request: ModelRequest) -> bool:

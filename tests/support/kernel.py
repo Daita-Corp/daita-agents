@@ -168,22 +168,8 @@ class _RuntimeCatalog:
         del agent_id, source_ids
         return ()
 
-    def empty_catalog_context(self, *, prior_query=None):
-        return _empty_catalog_context(prior_query is not None)
-
-    async def catalog_context(
-        self,
-        agent_id,
-        query,
-        *,
-        prior_query=None,
-        limit,
-        source_ids=(),
-        resource_ids=(),
-        readable_resource_ids=None,
-    ):
-        del agent_id, query, limit, source_ids, resource_ids, readable_resource_ids
-        return _empty_catalog_context(prior_query is not None)
+    async def source_directory(self, agent_id, source_ids):
+        return await self.source_routing_facts(agent_id, source_ids)
 
 
 class _SnapshotCatalog:
@@ -205,8 +191,9 @@ class _SnapshotCatalog:
     async def resource_names(self, agent_id, source_ids=()):
         return {}
 
-    def empty_catalog_context(self, *, prior_query=None):
-        return _empty_catalog_context(prior_query is not None)
+    async def source_directory(self, agent_id, source_ids):
+        self.context_reads += 1
+        return await self.source_routing_facts(agent_id, source_ids)
 
     def __init__(self) -> None:
         self.context_reads = 0
@@ -217,94 +204,6 @@ class _SnapshotCatalog:
         del agent_id, source_ids
         self.sensitivity_reads += 1
         return ModelSensitivity.PUBLIC
-
-    async def catalog_context(
-        self,
-        agent_id,
-        query,
-        *,
-        prior_query=None,
-        limit,
-        source_ids=(),
-        resource_ids=(),
-        readable_resource_ids=None,
-    ):
-        del agent_id, query, prior_query, limit
-        del source_ids, resource_ids, readable_resource_ids
-        self.context_reads += 1
-        return FrozenJsonObject.from_mapping(
-            {
-                "resources": (
-                    {
-                        "kind": "table",
-                        "match_reasons": ("resource_name_exact_mention",),
-                        "name": "snapshot",
-                        "resource_id": "resource-snapshot",
-                        "revision": self.revision,
-                        "sensitivity": "public",
-                        "source_id": "source-snapshot",
-                    },
-                ),
-                "sources": (
-                    {
-                        "source_id": "source-snapshot",
-                        "source_revision": "catalog:one",
-                        "sync_id": "sync-one",
-                    },
-                ),
-                "match_outcomes": {
-                    "current_query": {
-                        "binding_status": "unique",
-                        "source_status": "unique",
-                        "evidence_tier": "exact_resource",
-                        "candidate_count": 1,
-                        "candidate_bindings": (
-                            {
-                                "source_id": "source-snapshot",
-                                "resource_id": "resource-snapshot",
-                            },
-                        ),
-                        "omitted_candidate_count": 0,
-                        "ambiguity_reasons": (),
-                        "assessment_provenance": "catalog_service",
-                        "trust_classification": "untrusted_external_data",
-                    },
-                    "prior_query": None,
-                },
-                "total_matches": 1,
-                "returned_count": 1,
-                "truncated": False,
-                "trust_classification": "untrusted_external_data",
-            }
-        )
-
-
-def _empty_catalog_context(has_prior: bool = False) -> FrozenJsonObject:
-    no_match = {
-        "binding_status": "no_match",
-        "source_status": "no_match",
-        "evidence_tier": "none",
-        "candidate_count": 0,
-        "candidate_bindings": (),
-        "omitted_candidate_count": 0,
-        "ambiguity_reasons": (),
-        "assessment_provenance": "catalog_service",
-        "trust_classification": "untrusted_external_data",
-    }
-    return FrozenJsonObject.from_mapping(
-        {
-            "resources": (),
-            "sources": (),
-            "match_outcomes": {
-                "current_query": no_match,
-                "prior_query": no_match if has_prior else None,
-            },
-            "total_matches": 0,
-            "returned_count": 0,
-            "truncated": False,
-            "trust_classification": "untrusted_external_data",
-        }
-    )
 
 
 class _ReadExecutor:

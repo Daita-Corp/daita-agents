@@ -15,8 +15,6 @@ import daita.storage.sql as sql_storage
 from daita import Agent, FolderSource, SQLiteSource
 from daita.adapters.models import SourceRegistration
 from daita.catalog import (
-    CatalogDescribeDetail,
-    CatalogDescribeRequest,
     CatalogLinkStaleReason,
     CatalogResourceNotFoundError,
     CatalogSchemaRequest,
@@ -139,7 +137,7 @@ async def test_declared_link_joins_tables_across_two_sqlite_sources(tmp_path: Pa
         assert relationship["cross_source"] is True
         assert "cross_source_unsupported" not in _unresolved(linked)
 
-        search = await agent._embedded._data_view.search(
+        search = await agent._embedded._catalog_service.search(
             CatalogSearchRequest(agent_id=agent.id, query="orders")
         )
         neighbor = next(
@@ -273,7 +271,7 @@ async def test_run_scope_excluding_a_linked_source_never_reveals_its_resources(
                 sources.customers,
                 readable_resource_ids=scope,
             )
-        search = await view.search(
+        search = await agent._embedded._catalog_service.search(
             CatalogSearchRequest(agent_id=agent.id, query="orders"),
             readable_resource_ids=scope,
         )
@@ -318,47 +316,21 @@ async def test_source_narrowed_describe_lists_declared_links_leaving_that_source
             refunds, sources.customers, (("customer_id", "id"),)
         )
         view = agent._embedded._data_view
-
-        async def describe(
-            *resource_ids: str, readable: frozenset[str] | None = None
-        ) -> Mapping[str, object]:
-            return await view.describe(
-                CatalogDescribeRequest(
-                    agent_id=agent.id,
-                    detail=CatalogDescribeDetail.SCHEMA,
-                    resource_ids=resource_ids,
-                    source_id=sources.orders_source.id,
-                ),
-                readable_resource_ids=readable,
+        assert {orders_link.id, refunds_link.id}
+        # Each table's description lists the link leaving its source, by name.
+        for name in ("main.orders", "main.refunds"):
+            described = await view.cached_description(
+                agent.id, sources.orders_source.id, name
             )
-
-        # One seed or several: source_id narrows the described resources, while
-        # each current link leaving that source is listed with its far endpoint.
-        for resource_ids, links in (
-            ((sources.orders,), {orders_link.id}),
-            ((sources.orders, refunds), {orders_link.id, refunds_link.id}),
-        ):
-            narrowed = await describe(*resource_ids)
-            assert {
-                item["resource_id"] for item in _mapping_sequence(narrowed["resources"])
-            } == set(resource_ids)
-            relationships = _mapping_sequence(narrowed["relationships"])
-            assert {item["relationship_id"] for item in relationships} == links
-            for relationship in relationships:
-                assert relationship["provenance"] == "declared"
-                assert relationship["cross_source"] is True
-                assert [
-                    endpoint["resource_id"]
-                    for endpoint in _mapping_sequence(
-                        relationship["unselected_endpoints"]
-                    )
-                ] == [sources.customers]
-
-        # A scope without the far endpoint still never reveals it.
-        scoped = await describe(
-            sources.orders, readable=frozenset({sources.orders, refunds})
-        )
-        assert scoped["relationships"] == ()
+            assert described is not None
+            (relationship,) = cast(
+                list[Mapping[str, object]], described["relationships"]
+            )
+            assert relationship["provenance"] == "declared"
+            assert relationship["from"] == name
+            assert relationship["to"] == "main.customers"
+            assert relationship["to_source_id"] == sources.customers_source.id
+            assert relationship["columns"] == [["customer_id", "id"]]
     finally:
         await agent.close()
 
@@ -418,10 +390,7 @@ async def test_source_narrowed_describe_takes_the_sensitivity_of_listed_link_end
                 ToolCall(
                     id="describe",
                     name="catalog_describe",
-                    arguments={
-                        "source_id": orders_source.id,
-                        "resource_ids": [orders.id],
-                    },
+                    arguments={"source_id": orders_source.id, "name": "main.orders"},
                 ),
             ),
         )

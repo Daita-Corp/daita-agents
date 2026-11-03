@@ -16,6 +16,7 @@ import os
 import platform
 import re
 import shutil
+import sqlite3
 import subprocess
 import time
 from collections import Counter
@@ -374,7 +375,11 @@ async def _coverage(
         columns = json.loads(row["columns"])
         resource = catalog.get(identity)
         if resource is None:
-            why = _missing_reason(row["relkind"], columns)
+            why = (
+                ["partition_of_listed_parent"]
+                if row["is_partition"]
+                else _missing_reason(row["relkind"], columns)
+            )
             reasons.update(item.split(" (")[0] for item in why)
             missing.append(
                 {"table": identity, "relkind": row["relkind"], "reasons": why}
@@ -871,6 +876,52 @@ async def test_postgresql_schema_baseline(
 
 
 _OUTCOMES = ("correct", "confident_wrong", "no_answer", "incomplete")
+
+
+async def test_the_question_set_answers_from_the_source_with_an_empty_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target, admin, trips, _environment, questions, truth = await _prepare(monkeypatch)
+    model = _OracleModel()
+    events: list[AgentEvent] = []
+    try:
+        async with await Agent.create(
+            "schema-baseline-empty-catalog",
+            root=tmp_path,
+            model=model,
+            model_profile=model.model_profile,
+            secret_provider=_Secrets(target.password),
+            workspace=workspace_for(tmp_path),
+            observer=events.append,
+        ) as agent:
+            source_id, _attached = await _attach(agent, target, _BOUNDED_SCHEMAS, trips)
+            assert source_id is not None
+            with sqlite3.connect(next(tmp_path.rglob("state.db"))) as connection:
+                connection.execute("DELETE FROM snapshots")
+            runs = [
+                await _ask_oracle(
+                    agent,
+                    model,
+                    question,
+                    source_id,
+                    truth[question["id"]],
+                    events,
+                    trips,
+                )
+                for question in questions
+            ]
+    finally:
+        await admin.close()
+    assert {run["id"]: run["outcome"] for run in runs} == {
+        question["id"]: "correct" for question in questions
+    }
+    for run in runs:
+        round_trips = cast(Mapping[str, Any], run["round_trips"])
+        # A read may check the functions it calls; it never rediscovers the source.
+        assert round_trips["metadata_by_statement"] in (
+            {},
+            {"function_policy": 1},
+        ), run["id"]
 
 
 def _last_line(text: str) -> str:

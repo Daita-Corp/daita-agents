@@ -361,10 +361,7 @@ async def test_connected_schema_dispatch_uses_one_catalog_call(
             _tool(
                 "customer-schema",
                 "catalog_describe",
-                {
-                    "query": "customer table columns",
-                    "limit": 5,
-                },
+                {"source": "Customers", "name": "customers"},
             ),
             _stop("The customer columns are customer_id, name, and segment."),
         ),
@@ -555,10 +552,7 @@ async def test_mixed_file_and_source_dispatch_keeps_results_separate(
                 _tool(
                     "mixed-schema",
                     "catalog_describe",
-                    {
-                        "query": "customer segment",
-                        "limit": 5,
-                    },
+                    {"source_id": source.id, "name": "customers"},
                 ),
                 _tool(
                     "mixed-source-query",

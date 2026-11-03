@@ -175,6 +175,8 @@ def _gemini_contents(
                         "function_response": function_response,
                     }
                 )
+            if message.run_note is not None:
+                parts.append({"text": message.run_note})
             contents.append({"role": "user", "parts": parts})
             continue
         if not text:

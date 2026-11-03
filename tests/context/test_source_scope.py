@@ -5,7 +5,6 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
 
 import pytest
 
@@ -334,13 +333,6 @@ async def test_runtime_binds_catalog_scope_without_injection_and_rejects_outside
         assert isinstance(blocked_result, ToolResultBlock)
         catalog_data = catalog_result.output["data"]
         assert isinstance(catalog_data, Mapping)
-        match_outcome = catalog_data["match_outcome"]
-        assert isinstance(match_outcome, Mapping)
-        assert match_outcome["binding_status"] == "unique"
-        assert match_outcome["candidate_count"] == 1
-        bindings = match_outcome["candidate_bindings"]
-        assert isinstance(bindings, tuple)
-        assert bindings[0]["source_id"] == first_source.id
         hits = catalog_data["hits"]
         assert isinstance(hits, tuple)
         assert hits
@@ -480,21 +472,13 @@ async def test_frozen_catalog_ceiling_blocks_expansion_and_revocation_narrows(
             source_id=source.id,
             confirmation_fingerprint=expanded.confirmation_fingerprint,
         )
-        expanded_context = await agent._embedded._data_view.catalog_context(
-            agent.id,
-            run.message,
-            limit=12,
-            source_ids=tuple(sorted(frozen_scope.source_ids)),
-            resource_ids=(),
-            readable_resource_ids=frozen_scope.resource_ids,
+        # The run keeps what it froze even though the source now allows more.
+        frozen_run = replace(run, resolved_source_scope=frozen_scope)
+        expanded_scope = await resolve_effective_source_scope(
+            frozen_run, agent._embedded._data_view
         )
-        expanded_resources = expanded_context["resources"]
-        assert isinstance(expanded_resources, tuple)
-        expanded_records = cast(tuple[Mapping[str, object], ...], expanded_resources)
-        assert tuple(item["resource_id"] for item in expanded_records) == (
-            resources["frozen_record"].id,
-        )
-        assert resources["later_target"].id not in str(expanded_context)
+        assert expanded_scope.resource_ids == frozenset({resources["frozen_record"].id})
+        assert expanded_scope.unrestricted_source_ids == frozenset()
 
         revoked = await agent.preview_source_permissions(
             source_id=source.id,
@@ -506,16 +490,10 @@ async def test_frozen_catalog_ceiling_blocks_expansion_and_revocation_narrows(
             source_id=source.id,
             confirmation_fingerprint=revoked.confirmation_fingerprint,
         )
-        revoked_context = await agent._embedded._data_view.catalog_context(
-            agent.id,
-            run.message,
-            limit=12,
-            source_ids=tuple(sorted(frozen_scope.source_ids)),
-            resource_ids=(),
-            readable_resource_ids=frozen_scope.resource_ids,
+        revoked_scope = await resolve_effective_source_scope(
+            frozen_run, agent._embedded._data_view
         )
-        assert revoked_context["resources"] == ()
-        assert revoked_context["total_matches"] == 0
+        assert revoked_scope.resource_ids == frozenset()
     finally:
         await agent.close()
 
@@ -643,10 +621,15 @@ async def test_one_foreground_run_compares_two_exact_sources_without_selection(
         ModelResponse(
             finish_reason=FinishReason.TOOL_CALLS,
             tool_calls=(
-                ToolCall(
-                    "structure",
-                    "catalog_describe",
-                    {"resource_ids": tuple(resource.id for resource in resources)},
+                *(
+                    ToolCall(
+                        f"structure-{index}",
+                        "catalog_describe",
+                        {"source_id": source.id, "name": resource.native_identity},
+                    )
+                    for index, (source, resource) in enumerate(
+                        zip(sources, resources, strict=True)
+                    )
                 ),
             ),
         ),
@@ -685,7 +668,7 @@ async def test_one_foreground_run_compares_two_exact_sources_without_selection(
             if isinstance(block, ToolResultBlock)
         ]
         assert all(not block.is_error for block in results)
-        assert len(results) == 4
+        assert len(results) == 5
         catalog_data = results[0].output["data"]
         assert isinstance(catalog_data, Mapping)
         hits = catalog_data["hits"]
@@ -693,9 +676,9 @@ async def test_one_foreground_run_compares_two_exact_sources_without_selection(
         assert {hit["source_id"] for hit in hits if isinstance(hit, Mapping)} == {
             source.id for source in sources
         }
-        structure = canonical_json(results[1].output)
+        structure = canonical_json([results[1].output, results[2].output])
         assert all(key in structure for key in keys)
-        for block, count in zip(results[2:], (2, 3), strict=True):
+        for block, count in zip(results[3:], (2, 3), strict=True):
             data = block.output["data"]
             assert isinstance(data, Mapping)
             rows = data["rows"]
@@ -717,5 +700,26 @@ async def test_one_foreground_run_compares_two_exact_sources_without_selection(
         assert narrowed.sensitivity is result.sensitivity
         narrowed_transcript = await agent.transcript(narrowed.run_id)
         assert narrowed_transcript.run.source_scope_ids == (sources[0].id,)
+    finally:
+        await agent.close()
+
+
+async def test_a_source_read_in_full_lists_no_tables_in_the_frozen_scope(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "wide.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
+    agent = await Agent.create(
+        "scope-lists-nothing", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        scope = await resolve_effective_source_scope(
+            RunInput("full", agent.id, "Look.", datetime.now(UTC)),
+            agent._embedded._data_view,
+        )
+        assert source.id in scope.unrestricted_source_ids
+        assert scope.resource_ids == frozenset()
     finally:
         await agent.close()

@@ -114,6 +114,8 @@ def _project_message(
                     ),
                 }
             )
+    if message.run_note is not None:
+        content.append({"type": "text", "text": message.run_note})
     projected: dict[str, object] = {
         "role": message.role.value,
         "content": content,

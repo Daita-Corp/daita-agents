@@ -63,6 +63,8 @@ from .models import (
     SourceRegistration,
 )
 from .protocols import (
+    DESCRIBE_MAX_COLUMNS,
+    DESCRIBE_MAX_LISTED_TABLES,
     ResourceAdapterError,
     ResourceNotFoundError,
     SourceClosedError,
@@ -725,6 +727,94 @@ class FolderBackend:
                 {**provenance.to_dict(), "source_id": source_id}
             ),
         )
+
+    async def _lookup_backend(
+        self, agent_id: str, source_id: str
+    ) -> tuple[
+        LocalWorkspaceBackend, Callable[[str], bool] | None, tuple[str, ...] | None
+    ]:
+        live = self._live(source_id)
+        if live is not None:
+            return live, None, None
+        backend, source = await self._attached_backend(agent_id, source_id)
+        admitted = await self._path_admission(agent_id, source_id, source, None)
+        return backend, admitted, source.subpaths or None
+
+    async def search_names(
+        self, *, agent_id: str, source_id: str, words: tuple[str, ...], limit: int
+    ) -> tuple[Mapping[str, object], ...]:
+        """Match words against the current listing of this folder's data files."""
+
+        backend, admitted, paths = await self._lookup_backend(agent_id, source_id)
+        result = await backend.search(
+            run_id=_RUN_ID,
+            paths=paths,
+            mode="paths",
+            glob="*",
+            order_by="path",
+            admit_path=admitted,
+            structured_only=True,
+        )
+        scored = (
+            (sum(word in match.path.lower() for word in words), match.path)
+            for match in result.matches
+        )
+        return tuple(
+            {"name": path, "kind": "file", "columns": None, "row_estimate": None}
+            for _, path in sorted(
+                (item for item in scored if item[0]),
+                key=lambda item: (-item[0], item[1]),
+            )[:limit]
+        )
+
+    async def describe_name(
+        self, *, agent_id: str, source_id: str, name: str
+    ) -> Mapping[str, object] | None:
+        """Read one data file's columns live, or list one subfolder's data files."""
+
+        backend, admitted, _paths = await self._lookup_backend(agent_id, source_id)
+        try:
+            if structured_file_format(name) is not None:
+                if admitted is not None and not admitted(name):
+                    return None
+                schema = (await backend.describe(run_id=_RUN_ID, paths=(name,)))[0]
+                return {
+                    "name": name,
+                    "kind": "file",
+                    "comment": None,
+                    "row_estimate": None,
+                    "partitions": 0,
+                    "columns": [
+                        {"name": column, "type": kind, "nullable": True}
+                        for column, kind in (schema or ())[:DESCRIBE_MAX_COLUMNS]
+                    ],
+                    "columns_truncated": len(schema or ()) > DESCRIBE_MAX_COLUMNS,
+                    "primary_key": [],
+                    "unique_keys": [],
+                    "relationships": [],
+                }
+            result = await backend.search(
+                run_id=_RUN_ID,
+                path=name,
+                mode="paths",
+                glob="*",
+                order_by="path",
+                admit_path=admitted,
+                structured_only=True,
+            )
+        except (LocalWorkspaceError, LocalFileQueryError):
+            return None
+        if not result.matches:
+            return None
+        return {
+            "name": name,
+            "kind": "folder",
+            "tables": [
+                {"name": match.path, "kind": "file", "row_estimate": None}
+                for match in result.matches[:DESCRIBE_MAX_LISTED_TABLES]
+            ],
+            "total_tables": len(result.matches),
+        }
 
     async def search_files(self, request: FileSearchRequest) -> SourceFileResult:
         live = self._live(request.source_id)

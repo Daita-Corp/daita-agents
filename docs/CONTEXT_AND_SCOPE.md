@@ -13,37 +13,18 @@ A source you have made fully readable lets a run read anything PostgreSQL or
 SQLite resolves in it, cataloged or not. A source limited to selected tables stays
 limited to them, checked from the name in the SQL with no catalog lookup.
 
-For catalog results, the frozen readable resource set is a candidate ceiling, not
-an exact selection.
-Initial catalog context ranks only within that ceiling and reports separate
-`match_outcomes.current_query` and `match_outcomes.prior_query` assessments. The
-prior assessment may be null and is continuity evidence only; the two assessments
-are never merged into an effective source or persisted as sticky selection state.
-An explicit catalog-context `resource_ids` request retains its separate exact-ID
-semantics and fails when any requested ID is not currently readable.
+The prompt never carries catalog results ranked for the question. It holds a short
+directory of each source's name, type, dialect, schemas and approximate object count,
+the same for every question. `catalog_search` and `catalog_describe` find tables when
+the model needs them, asking the live source as well as the catalog, and show only
+what the run may read.
 
-Each catalog-owned match outcome reports `binding_status` and `source_status` as
-`unique`, `ambiguous`, or `no_match`. It also names the strongest evidence tier,
-the exact candidate count, up to 12 `(source_id, resource_id)` bindings, an omitted
-count, and deterministic ambiguity reasons. Exact resource evidence outranks broad
-catalog metadata, which outranks source hints. Scores order candidates within the
-presentation but never turn a multi-candidate tier into a silent winner.
-Relationship neighbors and `unmatched_fallback` inventory are not target
-candidates. A unique source can still contain several ambiguous resource bindings.
-The `assessment_provenance="catalog_service"` field identifies the code owner of
-the calculation; it is not authorization. Outcome content remains classified as
-untrusted external data.
-
-For a single-target read, a unique current binding can be used by exact ID after
-any missing schema is obtained. An ambiguous single-target request should be
-clarified instead of choosing the first hit. An explicit comparison may use the
-candidate set, with separate exact relational calls grouped by source before
-synthesis. A no-match result can be refined with a grounded `catalog_search` query;
-fallback inventory is not a match. A prior unique binding is reusable only when the
-current wording clearly refers to it. Ambiguous update or upsert intent should be
-clarified before preview. These are model-facing presentation rules, not a runtime
-clarification gate; exact scope, ID, schema, permission, approval, and receipt checks
-remain the execution authority.
+For a read, the model chooses the best-supported table from the evidence available
+(schema, row estimates, keys, comments, a quick query), says which it used, and
+answers. It asks only when the evidence cannot separate the options and the choice
+would change the answer. Rank or relevance never selects a write target, connector,
+account or destination. These are model-facing rules, not a runtime clarification
+gate; scope, permission, approval and receipt checks remain the execution authority.
 
 The same material-ambiguity rule applies to admitted MCP connectors and accounts,
 recipients, artifact or delivery destinations, and other consequential foreground
@@ -58,8 +39,7 @@ but never substitutes for identifying the intended target.
 Initial context contains a bounded connector directory drawn from current source
 registrations, admitted MCP bindings, and eligible skills. A separate compact
 manifest lists applicable toolboxes; the directory does not repeat those entries.
-An omitted count makes truncation visible. `catalog_search` and `toolbox_search`
-return `next_cursor` when more candidates remain. Supply it with the same query
+An omitted count makes truncation visible. `toolbox_search` returns `next_cursor` when more candidates remain. Supply it with the same query
 to continue. Matching candidates come first; unmatched fallback candidates are
 explicitly labeled. `total_matches` and `total_candidates` describe different
 counts. A cursor is valid only for its current prepared scope and discovery
@@ -216,7 +196,7 @@ exact transcript or weakening the retained contracts.
 Procedure guidance follows the authenticated callable working set. When a needed
 tool is a prepared candidate but is not loaded, guidance names the exact load and
 requires invocation on a later step. Missing access is a scope limitation; search
-cannot grant it. Missing columns and keys remain unknown. Current catalog evidence
+cannot grant it. Missing columns and keys remain unknown. Current source evidence
 can be reused without a redundant schema call. Denied, failed or uncertain effects
 are reported without retry or replacement; recovery performs no action.
 

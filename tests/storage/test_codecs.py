@@ -494,6 +494,18 @@ def test_classified_tool_result_provenance_round_trips_without_entering_output()
     assert block.sensitivity_provenance["resource_ids"] == ("resource-1",)
 
 
+def test_a_run_note_round_trips_and_messages_without_one_keep_their_bytes() -> None:
+    result = ToolResultBlock(call_id="noted-call", output={"value": 1})
+    noted = CanonicalMessage(
+        MessageRole.TOOL, content=(result,), run_note="Budget pressure."
+    )
+    plain = CanonicalMessage(MessageRole.TOOL, content=(result,))
+
+    assert decode_message(encode_message(noted)) == noted
+    assert decode_message(encode_message(plain)) == plain
+    assert "run_note" not in encode_message(plain)
+
+
 def test_source_permission_codecs_reject_unknown_fields_and_noncanonical_sets() -> None:
     read_scope = SourceReadScope.allow_all(
         agent_id="agent-codec",

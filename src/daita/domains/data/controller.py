@@ -37,11 +37,7 @@ from ...catalog.capabilities import (
     CATALOG_DESCRIBE_CAPABILITY_ID,
     CATALOG_SEARCH_CAPABILITY_ID,
 )
-from ...catalog.models import (
-    CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT,
-    CATALOG_MAX_LIMIT,
-    CatalogDescribeDetail,
-)
+from ...catalog.models import ResourceKind, catalog_resource_id
 from ...catalog.protocols import CatalogStoreError
 from ...llm.models import ModelSensitivity, ToolCall, ToolResultBlock
 from ...loop.models import RunInput, RunOrigin, Transcript
@@ -137,48 +133,6 @@ _SOURCE_CAPABILITIES = frozenset().union(
     _CAPABILITY_OPERATIONS,
     {DATA_QUERY_COMBINED_CAPABILITY_ID},
 )
-
-
-def _validate_describe_arguments(arguments: Mapping[str, object]) -> None:
-    """Reject catalog_describe shapes that cannot select a bounded description."""
-
-    raw_detail = arguments.get("detail", CatalogDescribeDetail.SCHEMA.value)
-    detail = CatalogDescribeDetail(cast(str, raw_detail))
-    query = cast(str | None, arguments.get("query"))
-    resource_ids = cast(tuple[str, ...], arguments.get("resource_ids", ()))
-    source_id = cast(str | None, arguments.get("source_id"))
-    cursor = arguments.get("cursor")
-    limit = arguments.get("limit")
-    identity = detail is CatalogDescribeDetail.IDENTITY
-    if (
-        (query is not None and not query.strip())
-        or any(not item.strip() for item in resource_ids)
-        or (source_id is not None and not source_id.strip())
-    ):
-        raise CapabilityInputError(
-            "catalog_invalid_describe",
-            "catalog_describe arguments must be non-empty exact catalog values.",
-        )
-    if query is None and not resource_ids and not (identity and source_id):
-        raise CapabilityInputError(
-            "catalog_invalid_describe",
-            "catalog_describe needs tables or a query; detail=identity can "
-            "instead take only a source to list every admitted table.",
-            {"detail": detail.value},
-        )
-    if cursor is not None and not identity:
-        raise CapabilityInputError(
-            "catalog_invalid_describe",
-            "cursor continues only a detail=identity listing.",
-            {"detail": detail.value},
-        )
-    maximum = CATALOG_DESCRIBE_IDENTITY_MAX_LIMIT if identity else CATALOG_MAX_LIMIT
-    if isinstance(limit, int) and limit > maximum:
-        raise CapabilityInputError(
-            "catalog_invalid_describe",
-            f"detail={detail.value} accepts a limit of at most {maximum}.",
-            {"detail": detail.value, "maximum_limit": maximum},
-        )
 
 
 def _sql_statements(
@@ -317,14 +271,23 @@ def _reads_resource(
 ) -> bool:
     """Whether one read result covers the exact source resource.
 
-    Query results name their source and the tables they read; catalog results
-    list resources that each carry their own source.
+    Query results name their source and the tables they read; a description names
+    the one table it read, and older ones list resources with their own source.
     """
 
     touched = data.get("resource_ids", ())
     if data.get("source_id") == source_id and (
         data.get("resource_id") == resource_id
         or (isinstance(touched, tuple) and resource_id in touched)
+    ):
+        return True
+    name, kind = data.get("name"), data.get("kind")
+    if (
+        isinstance(source_id, str)
+        and data.get("source_id") == source_id
+        and isinstance(name, str)
+        and kind in {"table", "view"}
+        and catalog_resource_id(source_id, ResourceKind(str(kind)), name) == resource_id
     ):
         return True
     resources = data.get("resources", ())
@@ -545,8 +508,6 @@ class DataCapabilityDomain:
                     "catalog_invalid_search",
                     "Catalog search requires a non-empty query.",
                 )
-        if capability.id == CATALOG_DESCRIBE_CAPABILITY_ID:
-            _validate_describe_arguments(arguments)
         if capability.id == DATA_QUERY_COMBINED_CAPABILITY_ID:
             arguments = await self._prepare_combined_query(run, arguments)
         if capability.id in SOURCE_FILE_CAPABILITY_IDS:
@@ -964,9 +925,6 @@ class DataCapabilityDomain:
         elif capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
-        elif capability.id == CATALOG_DESCRIBE_CAPABILITY_ID:
-            raw = arguments.get("resource_ids", ())
-            resource_ids = raw if isinstance(raw, tuple) else ()
         for resource_id in resource_ids:
             if not isinstance(resource_id, str):
                 continue
@@ -993,9 +951,6 @@ class DataCapabilityDomain:
         elif capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
-        elif capability.id == CATALOG_DESCRIBE_CAPABILITY_ID:
-            raw = arguments.get("resource_ids", ())
-            resource_ids = raw if isinstance(raw, tuple) else ()
         requested = tuple(item for item in resource_ids if isinstance(item, str))
         if not requested:
             return
@@ -1011,12 +966,10 @@ class DataCapabilityDomain:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from error
-        # Names resolved for these tools are cataloged, so the frozen listing holds
-        # them even for an unrestricted source.
-        if run.resolved_source_scope is not None:
-            readable = readable & run.resolved_source_scope.resource_ids
-        if run.execution_scope is not None:
-            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
+        # These tools name one source; a source read in full lists no tables.
+        for narrowing in run_read_narrowings(run):
+            if source_id not in narrowing[0]:
+                readable = readable & narrowing[1]
         if any(resource_id not in readable for resource_id in requested):
             raise CapabilityInputError(
                 "resource_read_not_allowed",
@@ -1383,25 +1336,29 @@ class DataCapabilityDomain:
         scope = run.execution_scope
         if scope is None:
             return
+        unrestricted = frozenset(scope.unrestricted_source_ids)
+        source_id = arguments.get("source_id")
         if capability.id == CATALOG_SEARCH_CAPABILITY_ID:
-            raise CapabilityInputError(
-                "execution_scope_resource_violation",
-                "This autonomous run cannot perform open-ended catalog discovery.",
+            # Discovery is fine where the run may read everything anyway.
+            touched = (
+                {source_id}
+                if isinstance(source_id, str)
+                else set(scope.allowed_source_ids)
             )
+            if not touched <= unrestricted:
+                raise CapabilityInputError(
+                    "execution_scope_resource_violation",
+                    "This autonomous run can search only sources it reads in full.",
+                )
+            return
         resource_ids: tuple[object, ...] = ()
         if capability.id in _RESOURCE_ARGUMENT_CAPABILITIES:
             resource_ids = (arguments.get("resource_id"),)
         elif capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
-        elif capability.id == CATALOG_DESCRIBE_CAPABILITY_ID:
-            raw = arguments.get("resource_ids", ())
-            resource_ids = raw if isinstance(raw, tuple) else ()
-            if not resource_ids:
-                raise CapabilityInputError(
-                    "execution_scope_resource_violation",
-                    "This autonomous run requires exact table names.",
-                )
+        if source_id in unrestricted:
+            return
         allowed = frozenset(scope.allowed_resource_ids)
         if any(
             not isinstance(resource_id, str) or resource_id not in allowed
@@ -1740,7 +1697,6 @@ class DataCapabilityDomain:
         source_id = arguments.get("source_id")
         inputs = arguments.get("inputs")
         source_ids = (
-            # A narrowed describe still lists link endpoints in other sources.
             tuple(sorted({source_id, *_endpoint_source_ids(output.data)}))
             if isinstance(source_id, str)
             else (
@@ -1766,23 +1722,16 @@ class DataCapabilityDomain:
                 "The current admitted result scope cannot be classified safely.",
                 {"capability_id": capability.id},
             )
-        # A read reports what it touched; catalog tools report what they could show.
+        # A read reports what it touched. Catalog tools list what they show by name,
+        # so their classification rests on the sources alone.
         reported = output.data.get("resource_ids")
-        if capability.id in _RELATIONAL_READ_CAPABILITIES | {
-            DATA_QUERY_COMBINED_CAPABILITY_ID
-        } and isinstance(reported, tuple):
-            readable = frozenset(cast(tuple[str, ...], reported))
-        else:
-            readable = await self._catalog.readable_resource_ids(
-                run.agent_id,
-                source_ids,
-            )
-            if run.resolved_source_scope is not None:
-                readable = readable & run.resolved_source_scope.resource_ids
-            if run.execution_scope is not None:
-                readable = readable & frozenset(
-                    run.execution_scope.allowed_resource_ids
-                )
+        readable = (
+            frozenset(cast(tuple[str, ...], reported))
+            if capability.id
+            in _RELATIONAL_READ_CAPABILITIES | {DATA_QUERY_COMBINED_CAPABILITY_ID}
+            and isinstance(reported, tuple)
+            else frozenset()
+        )
         return replace(
             output,
             sensitivity=sensitivity,
@@ -1800,18 +1749,17 @@ class DataCapabilityDomain:
 
 
 def _endpoint_source_ids(data: Mapping[str, object]) -> set[str]:
-    """Sources of the relationship endpoints a result returns outside its seeds."""
+    """Other sources a description names through its declared links."""
 
     relationships = data.get("relationships")
     return {
-        cast(str, endpoint["source_id"])
-        for relationship in (
-            relationships if isinstance(relationships, (tuple, list)) else ()
-        )
-        for endpoint in cast(
+        cast(str, relationship[key])
+        for relationship in cast(
             tuple[Mapping[str, object], ...],
-            cast(Mapping[str, object], relationship).get("unselected_endpoints", ()),
+            relationships if isinstance(relationships, (tuple, list)) else (),
         )
+        for key in ("from_source_id", "to_source_id")
+        if key in relationship
     }
 
 

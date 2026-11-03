@@ -607,7 +607,7 @@ async def test_every_model_facing_identity_argument_takes_a_name(tmp_path: Path)
     assert id_patterns == set()
     assert {
         "data_query:input.source",
-        "catalog_describe:input.tables",
+        "catalog_describe:input.source",
         "data_update_rows:input.table",
         "semantic_save:input.subject.fields[items].table",
     } <= identity_keys
@@ -782,3 +782,47 @@ def test_stored_transcripts_still_resolve_their_handles(rig):
         registry.executed_call(unissued, messages=(), source_scope=STORED_SCOPE)
         == unissued
     )
+
+
+def test_a_source_read_in_full_resolves_names_by_hash_alone():
+    scope = EffectiveSourceScope(
+        frozenset({SOURCE_A}),
+        frozenset(),
+        {SOURCE_A: ("Sales", "postgresql")},
+        frozenset({SOURCE_A}),
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "source_id": source_id_schema(),
+            "resource_id": resource_id_schema(),
+        },
+    }
+    resolved = resolve_identity_refs(
+        schema, {"source": "Sales", "table": "sales.Orders"}, scope
+    )
+    # Exact, so sales.Orders and sales.orders stay two tables, and the same on replay.
+    assert resolved["resource_id"] == catalog_resource_id(
+        SOURCE_A, ResourceKind.TABLE, "sales.Orders"
+    )
+    assert scope.to_mapping()["resource_ids"] == ()
+
+
+def test_a_stored_scope_that_lists_tables_still_resolves_a_view_as_a_view():
+    stored = EffectiveSourceScope(
+        frozenset({SOURCE_A}),
+        frozenset({CUSTOMERS_A}),
+        {SOURCE_A: ("Sales", "postgresql")},
+        frozenset({SOURCE_A}),
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "source_id": source_id_schema(),
+            "resource_id": resource_id_schema(),
+        },
+    }
+    resolved = resolve_identity_refs(
+        schema, {"source": "Sales", "table": "customers"}, stored
+    )
+    assert resolved["resource_id"] == CUSTOMERS_A

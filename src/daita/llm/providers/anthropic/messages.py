@@ -86,6 +86,8 @@ def _message_input(
                         "is_error": block.is_error,
                     }
                 )
+            if message.run_note is not None:
+                content.append({"type": "text", "text": message.run_note})
         if not content:
             raise ModelProviderError(
                 ProviderErrorCode.INVALID_REQUEST,

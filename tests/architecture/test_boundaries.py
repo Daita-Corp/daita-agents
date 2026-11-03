@@ -2047,12 +2047,11 @@ def test_catalog_summary_is_not_loop_or_storage_state():
 
 def test_catalog_describe_extends_existing_catalog_and_capability_owners():
     assert _class_owners("CatalogSchemaRequest") == {"catalog/models.py"}
-    assert _class_owners("CatalogDescribeRequest") == {"catalog/models.py"}
     service_methods = _class_methods(
         PACKAGE / "catalog" / "service.py",
         "CatalogService",
     )
-    assert {"describe", "schema_slice"} <= service_methods
+    assert "schema_slice" in service_methods
     capabilities = (PACKAGE / "catalog" / "capabilities.py").read_text(encoding="utf-8")
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     loop = _python_text(PACKAGE / "loop")
@@ -2060,7 +2059,7 @@ def test_catalog_describe_extends_existing_catalog_and_capability_owners():
     assert 'CATALOG_DESCRIBE_EVIDENCE_KIND = "catalog.description"' in capabilities
     for removed in ("catalog_schema", "catalog_inspect", "catalog_traverse"):
         assert f'name="{removed}"' not in capabilities
-    assert "catalog_declarations(identity.id, data_view)" in embedded
+    assert "catalog_declarations(" in embedded
     assert "catalog_service = CatalogService(store, store)" in embedded
     assert "catalog_describe" not in loop
     for prohibited in (
@@ -2107,23 +2106,12 @@ def test_catalog_indexed_retrieval_is_private_and_catalog_owned():
     service = (PACKAGE / "catalog" / "service.py").read_text(encoding="utf-8")
     storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
     loop = _python_text(PACKAGE / "loop")
-    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
-    context_tree = ast.parse(context)
-    toolbox = (PACKAGE / "capabilities.py").read_text(encoding="utf-8")
 
-    assert _class_owners("CatalogMatchOutcome") == {"catalog/models.py"}
     assert "search" not in protocol_methods
     assert "search" not in storage_methods
     assert "_SourceCatalogIndex" in service
     assert "_source_indexes" in service
     assert "_compile_source_index" in service
-    assert "_catalog_match_outcome" in service
-    assert "_catalog_match_outcome" not in {
-        node.name
-        for node in ast.walk(context_tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    assert "CatalogMatchOutcome" not in toolbox
     assert "_catalog_search_reason" not in storage
     assert "_SourceCatalogIndex" not in storage
     assert "CatalogSearchHit" not in storage

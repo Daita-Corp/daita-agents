@@ -74,6 +74,8 @@ def _chat_messages(
                         ),
                     }
                 )
+            if message.run_note is not None:
+                result.append({"role": "user", "content": message.run_note})
             continue
         if not text:
             raise ValueError("canonical text message produced no content")

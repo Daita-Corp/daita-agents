@@ -125,9 +125,14 @@ cumulative run limit. Fixed instructions, current input, and pinned schemas form
 the mandatory baseline; they do not consume the optional-addition allowance. This
 presentation target cannot truncate the exact current
 transcript, lower sensitivity, grant authority, or replace provider token admission.
-The same projection reports remaining steps and an advisory two-request budget
-forecast using measured input growth and output allowances. Forecasts cannot reserve
-credit, alter hard admission, or guarantee completion with unknown future results.
+Run status is append-only. The driver writes a note only when it matters (budget
+pressure from an advisory two-request forecast, the last step, a new progress
+warning), stores it on the batch's last tool-result message as `run_note`, and every
+adapter renders it after that result, unchanged on later requests, so no per-step text
+edits provider history. Forecasts cannot reserve credit, alter hard admission, or
+guarantee completion with unknown future results. Prior turns drop their notes.
+`_estimate_input_tokens` prices only what a provider receives: provenance stays local
+and tool results are priced as rendered.
 
 Foreground `RunInput.source_scope_ids=()` admits all currently readable sources
 as candidates at preparation; a nonempty tuple narrows them to exact caller IDs.

@@ -34,7 +34,7 @@ from .capabilities import (
     source_id_schema,
 )
 from .capability_runtime import CapabilityFailure, SideEffectPlan
-from .catalog.models import CATALOG_CONTEXT_DEFAULT_LIMIT
+from .catalog.protocols import CatalogStoreError
 from .llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
 from .loop.models import RunInput, Transcript
 from .loop.session import RunSession
@@ -1121,10 +1121,8 @@ class SemanticListExecutor:
             and (kind is None or item.kind is kind)
             and (
                 request.source_scope is None
-                or (
-                    set(item.subject.source_ids) <= request.source_scope.source_ids
-                    and set(item.subject.resource_ids)
-                    <= request.source_scope.resource_ids
+                or request.source_scope.covers(
+                    item.subject.source_ids, item.subject.resource_ids
                 )
             )
         )[:limit]
@@ -1597,15 +1595,7 @@ class SemanticDomainCatalog(Protocol):
         source_ids: tuple[str, ...] = (),
     ) -> tuple[Mapping[str, object], ...]: ...
 
-    async def catalog_context(
-        self,
-        agent_id: str,
-        query: str,
-        *,
-        limit: int,
-        source_ids: tuple[str, ...] = (),
-        resource_ids: tuple[str, ...] = (),
-    ) -> FrozenJsonObject: ...
+    async def non_table_resource_ids(self, agent_id: str) -> Mapping[str, str]: ...
 
     async def readable_resource_ids(
         self,
@@ -1669,10 +1659,15 @@ class SemanticCapabilityDomain:
         use the existing semantic owner and its exact revision/evidence checks.
         """
         scope = await resolve_effective_source_scope(run, self._catalog)
-        if not scope.resource_ids:
+        known = scope.resource_ids
+        if scope.unrestricted_source_ids:
+            known |= await self._catalog.readable_resource_ids(
+                run.agent_id, tuple(sorted(scope.unrestricted_source_ids))
+            )
+        if not known:
             return
         facts = await self._catalog.semantic_resource_facts(
-            run.agent_id, tuple(sorted(scope.resource_ids))
+            run.agent_id, tuple(sorted(known))[:2_048]
         )
         qualified_fields = set(re.findall(r"\b[A-Za-z_]\w*\.([A-Za-z_]\w*)\b", content))
         quoted_identifiers = set(re.findall(r"`([A-Za-z_]\w*)`", content))
@@ -1767,6 +1762,7 @@ class SemanticCapabilityDomain:
         session: RunSession | None = None,
     ) -> FrozenJsonObject:
         del request_sensitivity
+        arguments = await self._with_cataloged_kinds(run, arguments)
         await self._validate_source_scope(run, capability, arguments)
         await self._validate_read_scope(run, capability, arguments)
         if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
@@ -1783,6 +1779,27 @@ class SemanticCapabilityDomain:
         return arguments
 
     prepare_session_call = prepare_call
+
+    async def _with_cataloged_kinds(
+        self, run: RunInput, arguments: FrozenJsonObject
+    ) -> FrozenJsonObject:
+        """A name in a source read in full hashes as a table; annotations bind the
+        catalog entry, which may be a view or file."""
+
+        aliases = await self._catalog.non_table_resource_ids(run.agent_id)
+
+        def rewrite(value: object) -> object:
+            if isinstance(value, str):
+                return aliases.get(value, value)
+            if isinstance(value, Mapping):
+                return {key: rewrite(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [rewrite(item) for item in value]
+            return value
+
+        return FrozenJsonObject.from_mapping(
+            cast(Mapping[str, object], rewrite(arguments.to_dict()))
+        )
 
     async def _bind_save_versions(
         self, run: RunInput, arguments: FrozenJsonObject
@@ -2107,8 +2124,9 @@ class SemanticCapabilityDomain:
             view
             for view in await self._current_views(run.agent_id)
             if view.state is SemanticAnnotationState.ACTIVE
-            and set(view.annotation.subject.source_ids) <= scope.source_ids
-            and set(view.annotation.subject.resource_ids) <= scope.resource_ids
+            and scope.covers(
+                view.annotation.subject.source_ids, view.annotation.subject.resource_ids
+            )
             and (source_id is None or source_id in view.annotation.subject.source_ids)
             and (
                 resource_id is None
@@ -2395,7 +2413,11 @@ class SemanticCapabilityDomain:
                 )
 
     async def _maintenance_requested(self, run: RunInput) -> bool:
-        views = await self._current_views(run.agent_id)
+        # Semantic notes advise: a failing catalog only leaves their review for later.
+        try:
+            views = await self._current_views(run.agent_id)
+        except CatalogStoreError:
+            return False
         if not any(
             view.requires_revalidation
             or view.state is SemanticAnnotationState.DUPLICATE
@@ -2403,24 +2425,10 @@ class SemanticCapabilityDomain:
             for view in views
         ):
             return False
-        catalog = await self._catalog.catalog_context(
-            run.agent_id,
-            run.message[:4_000],
-            limit=CATALOG_CONTEXT_DEFAULT_LIMIT,
-            source_ids=(
-                tuple(sorted(run.resolved_source_scope.source_ids))
-                if run.resolved_source_scope is not None
-                else run.source_scope_ids
-            ),
-        )
-        resources = catalog.get("resources")
-        if not isinstance(resources, tuple):
-            return False
         selected_ids = tuple(
             resource_id
-            for resource in resources
-            if isinstance(resource, FrozenJsonObject)
-            and isinstance((resource_id := resource.get("resource_id")), str)
+            for view in views
+            for resource_id in view.annotation.subject.resource_ids
         )
         return semantic_maintenance_intersects(
             views,

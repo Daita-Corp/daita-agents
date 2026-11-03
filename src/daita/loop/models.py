@@ -311,12 +311,54 @@ class RunInput:
         return self.start.canonical_message()
 
 
+LAST_REQUEST_NOTE = (
+    "Run status from Daita: this is the last model request in this run. A tool "
+    "call now cannot be followed by a model answer."
+)
+_FORECAST_OUTPUT_FLOOR = 2_048
+
+
+def build_run_note(
+    *,
+    remaining_tokens: int,
+    remaining_steps: int,
+    request_input_tokens: int | None,
+    request_input_growth_tokens: int | None,
+    response_output_tokens: int,
+    new_warnings: tuple[str, ...] = (),
+) -> str | None:
+    """Status worth telling the model after one tool batch, or None when all is well.
+
+    Stored with the batch's last result and never rewritten, so nothing per-step
+    edits a provider's cached history. The forecast is advisory and measured: this
+    request plus its continuation, each repeating the latest growth and allowing
+    twice the latest output. Unseen schemas and results can grow faster.
+    """
+
+    parts: list[str] = []
+    if request_input_tokens is not None:
+        growth = request_input_growth_tokens or 0
+        output = max(_FORECAST_OUTPUT_FLOOR, 2 * response_output_tokens)
+        forecast = 2 * request_input_tokens + 3 * growth + 2 * output
+        if forecast > remaining_tokens:
+            parts.append(
+                f"Run status from Daita: {remaining_tokens} tokens are left in this "
+                f"run and the next round trip is forecast at {forecast}. Budget "
+                "pressure: another round trip may not fit. Answer from available "
+                "evidence and identify unfinished work."
+            )
+    if remaining_steps == 1:
+        parts.append(LAST_REQUEST_NOTE)
+    parts.extend(new_warnings)
+    return "\n\n".join(parts) if parts else None
+
+
 @dataclass(frozen=True, slots=True)
 class LoopLimits:
     """Outer safety limits; normal tool recovery uses ordinary loop steps."""
 
     max_steps: int = 24
-    max_total_tokens: int = 100_000
+    max_total_tokens: int = 200_000
     max_wall_time_seconds: float = 300.0
     max_estimated_cost_usd: Decimal | None = None
     max_tool_calls_per_response: int = 16

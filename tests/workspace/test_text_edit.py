@@ -214,7 +214,7 @@ async def test_offline_text_edit_report_captures_complete_workflow(
     assert report["requests"] and report["physical_attempts"]
     assert report["result"] is not None
     assert report["evaluation_profile"] == profile
-    assert report["limits"]["max_tokens"] == 100000
+    assert report["limits"]["max_tokens"] == 200000
 
 
 def _call(call_id: str, name: str, arguments: Mapping[str, object]) -> ModelResponse:

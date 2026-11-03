@@ -59,7 +59,7 @@ tables in the five bounded schemas and nothing in `ops`, so their scope matches.
 
 - Daita attaches the source with a fresh agent per repeat and answers each
   question with `Agent.run`, using its default configuration and loop limits
-  (24 steps, 100k tokens, 300 s). `DAITA_SCHEMA_BASELINE_DAITA_MAX_TOKENS`
+  (24 steps, 200k tokens, 300 s). `DAITA_SCHEMA_BASELINE_DAITA_MAX_TOKENS`
   raises the token budget for a matched-budget run. Dollar caps are off for
   Anthropic models because Daita cannot price an Anthropic request before it
   is sent.

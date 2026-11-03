@@ -72,75 +72,65 @@ _MAX_PROBE_ROW_FIELDS = 16
 _CONNECT_TIMEOUT_SECONDS = 8.0
 _COMMAND_TIMEOUT_SECONDS = 8.0
 _CLEANUP_TIMEOUT_SECONDS = 1.0
-_SUPPORTED_QUERY_TYPE_NAMES = frozenset(
-    {
-        "bit",
-        "bool",
-        "bpchar",
-        "bytea",
-        "cidr",
-        "date",
-        "float4",
-        "float8",
-        "inet",
-        "int2",
-        "int4",
-        "int8",
-        "interval",
-        "json",
-        "jsonb",
-        "name",
-        "numeric",
-        "text",
-        "time",
-        "timestamp",
-        "timestamptz",
-        "timetz",
-        "uuid",
-        "varbit",
-        "varchar",
-    }
-)
 
-_RESOURCES_SQL = """
+# Tables r, p and f map to TABLE; views v and m to VIEW. A partition folds under
+# its parent, which is what queries read.
+_RELATION_KINDS = "('r', 'p', 'f', 'v', 'm')"
+ROW_ESTIMATE_SQL = """CASE WHEN c.relkind = 'p' THEN (
+        SELECT sum(GREATEST(child.reltuples, 0))
+        FROM pg_inherits AS part
+        JOIN pg_class AS child ON child.oid = part.inhrelid
+        WHERE part.inhparent = c.oid
+    ) ELSE c.reltuples END::double precision"""
+
+_RESOURCES_SQL = f"""
 /* daita:postgresql.resources */
 SELECT
-    table_schema AS schema_name,
-    table_name AS resource_name,
-    CASE table_type WHEN 'VIEW' THEN 'view' ELSE 'table' END AS resource_kind
-FROM information_schema.tables
-WHERE table_schema = ANY($1::text[])
-  AND table_type = 'BASE TABLE'
-ORDER BY table_schema, table_name
+    n.nspname AS schema_name,
+    c.relname AS resource_name,
+    CASE WHEN c.relkind IN ('v', 'm') THEN 'view' ELSE 'table' END AS resource_kind
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE n.nspname = ANY($1::text[])
+  AND c.relkind IN {_RELATION_KINDS}
+  AND NOT c.relispartition
+ORDER BY n.nspname, c.relname
 LIMIT $2
 """
 
-_COLUMNS_SQL = """
+COLUMNS_SQL = """
 /* daita:postgresql.columns */
 SELECT
-    c.column_name,
+    a.attname AS column_name,
     format_type(a.atttypid, a.atttypmod) AS native_type,
     type_ns.nspname AS type_schema,
     type_def.typname AS type_name,
-    c.ordinal_position AS ordinal,
-    (c.is_nullable = 'YES') AS nullable,
-    c.column_default AS default_expression,
+    a.attnum::integer AS ordinal,
+    NOT (a.attnotnull OR (type_def.typtype = 'd' AND type_def.typnotnull)) AS nullable,
+    CASE WHEN a.attgenerated = '' THEN pg_get_expr(def.adbin, def.adrelid) END
+        AS default_expression,
     CASE WHEN coll_ns.nspname = 'pg_catalog' AND coll.collisdeterministic
          THEN coll.collname ELSE NULL END AS collation,
     (a.attidentity <> '') AS is_identity,
     (a.attgenerated <> '') AS is_generated,
-    (c.is_updatable = 'YES') AS is_updatable,
-    pk.primary_key_ordinal
-FROM information_schema.columns AS c
-JOIN pg_namespace AS n ON n.nspname = c.table_schema
-JOIN pg_class AS rel ON rel.relnamespace = n.oid AND rel.relname = c.table_name
+    pg_column_is_updatable(rel.oid, a.attnum, false) AS is_updatable,
+    pk.primary_key_ordinal,
+    col_description(rel.oid, a.attnum) AS comment,
+    (
+        SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder)
+        FROM pg_enum AS e
+        WHERE e.enumtypid = CASE WHEN type_def.typtype = 'd'
+                                 THEN type_def.typbasetype ELSE a.atttypid END
+    ) AS enum_values
+FROM pg_namespace AS n
+JOIN pg_class AS rel ON rel.relnamespace = n.oid
 JOIN pg_attribute AS a
   ON a.attrelid = rel.oid
- AND a.attname = c.column_name
  AND a.attnum > 0
  AND NOT a.attisdropped
 JOIN pg_type AS type_def ON type_def.oid = a.atttypid
 JOIN pg_namespace AS type_ns ON type_ns.oid = type_def.typnamespace
+LEFT JOIN pg_attrdef AS def ON def.adrelid = rel.oid AND def.adnum = a.attnum
 LEFT JOIN pg_collation AS coll ON coll.oid = a.attcollation
 LEFT JOIN pg_namespace AS coll_ns ON coll_ns.oid = coll.collnamespace
 LEFT JOIN (
@@ -153,12 +143,12 @@ LEFT JOIN (
         WITH ORDINALITY AS key(attnum, ordinality)
     WHERE con.contype = 'p'
 ) AS pk ON pk.conrelid = rel.oid AND pk.attnum = a.attnum
-WHERE c.table_schema = $1 AND c.table_name = $2
-ORDER BY c.ordinal_position
+WHERE n.nspname = $1 AND rel.relname = $2
+ORDER BY a.attnum
 LIMIT $3
 """
 
-_INDEXES_SQL = """
+INDEXES_SQL = """
 /* daita:postgresql.indexes */
 SELECT
     idx.relname AS index_name,
@@ -234,12 +224,12 @@ LIMIT $2
 
 # Planner statistics are approximate and nonstructural. They are read once at
 # discovery, never during query revalidation, and never change a revision.
-_ESTIMATES_SQL = """
+_ESTIMATES_SQL = f"""
 /* daita:postgresql.estimates */
 SELECT
     n.nspname AS schema_name,
     c.relname AS resource_name,
-    c.reltuples::double precision AS reltuples,
+    {ROW_ESTIMATE_SQL} AS reltuples,
     pg_total_relation_size(c.oid) AS size_bytes,
     GREATEST(
         s.last_vacuum,
@@ -252,20 +242,20 @@ JOIN pg_namespace AS n ON n.oid = c.relnamespace
 JOIN unnest($1::text[], $2::text[]) AS known(schema_name, resource_name)
   ON known.schema_name = n.nspname AND known.resource_name = c.relname
 LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
-WHERE c.relkind IN ('r', 'p')
+WHERE c.relkind IN ('r', 'p', 'f', 'm')
 ORDER BY n.nspname, c.relname
 LIMIT $3
 """
 
-_SCHEMA_PROBE_SQL = """
+_SCHEMA_PROBE_SQL = f"""
 /* daita:postgresql.schema_probe */
 SELECT
     namespace.nspname AS schema_name,
     EXISTS (
         SELECT 1
-        FROM information_schema.tables AS table_info
-        WHERE table_info.table_schema = namespace.nspname
-          AND table_info.table_type = 'BASE TABLE'
+        FROM pg_class AS c
+        WHERE c.relnamespace = namespace.oid
+          AND c.relkind IN {_RELATION_KINDS}
     ) AS has_base_tables
 FROM pg_namespace AS namespace
 WHERE namespace.nspname <> 'information_schema'
@@ -831,7 +821,7 @@ async def _load_structure(
         kind_value = _row_text(row, "resource_kind")
         kind = ResourceKind.VIEW if kind_value == "view" else ResourceKind.TABLE
         column_rows = await connection.fetch(
-            _COLUMNS_SQL,
+            COLUMNS_SQL,
             schema,
             name,
             max_columns + 1,
@@ -841,15 +831,9 @@ async def _load_structure(
                 registration.id,
                 "PostgreSQL discovery column limit exceeded",
             )
-        columns = tuple(_column(row) for row in column_rows)
-        if any(not _is_supported_query_type(column) for column in columns):
-            # Custom/extension type output functions are executable database
-            # code.  Until their provenance is a durable catalog contract,
-            # omit the entire table rather than advertise an unsafe partial
-            # schema as queryable.
-            continue
+        columns = tuple(column_from_row(row) for row in column_rows)
         index_rows = await connection.fetch(
-            _INDEXES_SQL,
+            INDEXES_SQL,
             schema,
             name,
             max_indexes + 1,
@@ -1090,7 +1074,7 @@ def _catalog_snapshot(
     )
 
 
-def _column(row: Mapping[str, object]) -> TabularColumn:
+def column_from_row(row: Mapping[str, object]) -> TabularColumn:
     ordinal = _row_int(row, "ordinal")
     primary = row.get("primary_key_ordinal")
     type_schema = _row_text(row, "type_schema")
@@ -1111,16 +1095,10 @@ def _column(row: Mapping[str, object]) -> TabularColumn:
         identity=_row_bool(row, "is_identity"),
         generated=_row_bool(row, "is_generated"),
         updatable=_row_bool(row, "is_updatable"),
+        comment=(
+            comment[:2_048] if (comment := _optional_row_text(row, "comment")) else None
+        ),
     )
-
-
-def _is_supported_query_type(column: TabularColumn) -> bool:
-    namespace = column.native_type_namespace
-    name = column.native_type_name
-    if namespace != "pg_catalog" or name is None:
-        return False
-    element = name[1:] if name.startswith("_") else name
-    return element in _SUPPORTED_QUERY_TYPE_NAMES
 
 
 def _index(

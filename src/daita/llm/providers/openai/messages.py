@@ -80,6 +80,8 @@ def _response_input(
                         ),
                     }
                 )
+            if message.run_note is not None:
+                items.append({"role": "user", "content": message.run_note})
     if not items:
         raise ModelProviderError(
             ProviderErrorCode.INVALID_REQUEST,

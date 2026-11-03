@@ -30,17 +30,32 @@ source relationships in one edge set, labelled `provenance: "declared"` with
 `cross_source_unsupported` remains only for seeds with no linking group. Links
 are read fresh for each projection, outside the per-source index cache. Readable
 and run-scope filters apply to both link endpoints, so traversal never crosses
-a resource outside scope. A `catalog_describe` narrowed by `source_id` still
-lists each current link leaving that source, with its far endpoint unselected.
+a resource outside scope. `catalog_describe` lists each current link leaving the
+table it describes, by name, when the run may read the far endpoint.
+
+`catalog_search` always asks both the catalog snapshot and the live source, through
+one bounded lookup of table and column names (`pg_class` and `pg_attribute` in the
+configured schemas, `sqlite_schema`, a file listing), and merges compact hits marked
+`seen_live`. `catalog_describe` takes one name and reads the live source: native
+column types, enum values, keys, comments, a partitioned table as one table with a
+child count, and row estimates. A schema or folder name lists what it holds, capped
+at 100. A cached description answers only when the source cannot be reached, and says
+so; a table the live source no longer has is unknown even if the catalog remembers
+it. A failing catalog leaves both tools answering from the source.
+
+PostgreSQL discovery lists every relation kind from `pg_class`: tables, partitioned
+tables and foreign tables as `TABLE`, views and materialized views as `VIEW`, with
+partitions folded under their parent. It keeps every column whatever its type, with
+its `format_type` and comment.
 
 `daita.adapters` implements source admission, containment, discovery,
 freshness checks, and I/O. One composed `SourceTypeRegistry` per agent maps each
 `adapter_id` to its factory, credential fields, read capacity, SQL dialect and
 operation backends. `SourceOperation` names those backends: `SQL_READ`,
 `TABULAR_READ`, `TABULAR_EXPORT`, `PROFILE`, `RELATIONAL_UPDATE`,
-`RELATIONAL_UPSERT`, `FILE_SEARCH`, `TEXT_READ` and `PATH_QUERY`; every
-operation except `TABULAR_READ`, `FILE_SEARCH` and `TEXT_READ` requires an SQL
-dialect the read policy in `domains/data/sql` supports, checked at registration.
+`RELATIONAL_UPSERT`, `FILE_SEARCH`, `TEXT_READ`, `PATH_QUERY` and `LIVE_LOOKUP`;
+every operation except `TABULAR_READ`, `FILE_SEARCH`, `TEXT_READ` and `LIVE_LOOKUP`
+requires an SQL dialect the read policy in `domains/data/sql` supports, checked at registration.
 A stored source whose type is not registered stays listed
 but unavailable: it gets no tools or source capacity, and refresh or edit fails.
 Pass the composing `AgentConfig` to `Agent.delete` so credentials of its source

@@ -38,6 +38,8 @@ class SourceOperation(str, Enum):
     TEXT_READ = "text_read"
     # SQL over files a live folder matches by path pattern, not by catalog.
     PATH_QUERY = "path_query"
+    # Bounded name search and description straight from the source.
+    LIVE_LOOKUP = "live_lookup"
 
 
 # Operations whose validation and execution depend on the type's SQL dialect.
@@ -45,6 +47,7 @@ _SQL_OPERATIONS = frozenset(SourceOperation) - {
     SourceOperation.TABULAR_READ,
     SourceOperation.FILE_SEARCH,
     SourceOperation.TEXT_READ,
+    SourceOperation.LIVE_LOOKUP,
 }
 
 
@@ -209,6 +212,7 @@ def _sqlite_operations(
         SourceOperation.SQL_READ: backend,
         SourceOperation.TABULAR_EXPORT: backend,
         SourceOperation.PROFILE: backend,
+        SourceOperation.LIVE_LOOKUP: backend,
     }
 
 
@@ -236,6 +240,7 @@ def _postgresql_operations(
         SourceOperation.SQL_READ: reads,
         SourceOperation.TABULAR_EXPORT: reads,
         SourceOperation.PROFILE: reads,
+        SourceOperation.LIVE_LOOKUP: reads,
         SourceOperation.RELATIONAL_UPDATE: writes,
         SourceOperation.RELATIONAL_UPSERT: writes,
     }
@@ -252,6 +257,7 @@ def _folder_operations(
         SourceOperation.PATH_QUERY: backend,
         SourceOperation.FILE_SEARCH: backend,
         SourceOperation.TEXT_READ: backend,
+        SourceOperation.LIVE_LOOKUP: backend,
     }
 
 
@@ -282,6 +288,7 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
                     SourceOperation.SQL_READ,
                     SourceOperation.TABULAR_EXPORT,
                     SourceOperation.PROFILE,
+                    SourceOperation.LIVE_LOOKUP,
                 }
             ),
             create_backends=_sqlite_operations,
@@ -298,6 +305,7 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
                     SourceOperation.SQL_READ,
                     SourceOperation.TABULAR_EXPORT,
                     SourceOperation.PROFILE,
+                    SourceOperation.LIVE_LOOKUP,
                     SourceOperation.RELATIONAL_UPDATE,
                     SourceOperation.RELATIONAL_UPSERT,
                 }
@@ -318,6 +326,7 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
                             SourceOperation.PATH_QUERY,
                             SourceOperation.FILE_SEARCH,
                             SourceOperation.TEXT_READ,
+                            SourceOperation.LIVE_LOOKUP,
                         }
                     ),
                     create_backends=_folder_operations,

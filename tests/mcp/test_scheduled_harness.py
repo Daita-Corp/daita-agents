@@ -177,10 +177,10 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
         assert result.usage.total_tokens == 22417
         requests = scenario.provider.requests
         assert [r.max_total_tokens for r in requests] == [
-            100000,
-            96276,
-            91696,
-            84765,
+            200000,
+            196276,
+            191696,
+            184765,
         ]
         texts = [
             "".join(b.text for b in r.messages[0].content if isinstance(b, TextBlock))
@@ -190,7 +190,6 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
         assert "Available user-authorized procedural skill index" not in texts[0]
         # The code-owned run-start clock is part of the fixed setup context.
         assert len(texts[0].encode()) < 7200
-        assert '"match_outcomes":' in texts[0]
         assert '"kind":"toolbox"' not in texts[0]
         scheduled = "Scheduled runs ask a person before any write."
         assert scheduled not in texts[0]
@@ -203,18 +202,11 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
         assert model.provider_id not in transcript.run.message
         for request in requests:
             assert (
-                request.messages[1:-1]
-                == transcript.messages[: len(request.messages) - 2]
+                request.messages[1:] == transcript.messages[: len(request.messages) - 1]
             )
             assert request.sensitivity is scenario.binding.maximum_outbound_sensitivity
-        status = "".join(
-            b.text for b in requests[3].messages[-1].content if isinstance(b, TextBlock)
-        )
-        assert "Latest measured request input: 6915 tokens" in status
-        assert "recent input growth: 2382 tokens" in status
-        assert "24976 tokens" in status
-        assert "Budget pressure" not in status
-        assert "not reserved capacity or a guaranteed count" in status
+        # Plenty of budget left: no status, and nothing edits earlier requests.
+        assert not any(message.run_note for message in transcript.messages)
         assert len(await scenario.agent.list_routines()) == 0
         assert scenario.server.calls == []
     report = json.loads(path.read_text())
@@ -359,7 +351,7 @@ async def test_scheduled_mcp_harness_measures_runtime_and_preserves_failure_evid
         (item["first_event_seconds"] is not None) == streaming
         for item in report["model_timings"]
     )
-    ceiling = 100_000
+    ceiling = 200_000
     assert report["model_requests"][0]["remaining_tokens"] == ceiling
     assert report["model_requests"][1]["remaining_tokens"] == ceiling - 120
     assert report["evaluation_profile"] == profile_name
@@ -413,7 +405,7 @@ async def test_scheduled_mcp_harness_confirms_once_then_asks_before_each_action(
             response(text="The owner requests one exact immediate and weekly routine.")
         ]
         await scenario.run("Prepare the scheduled release-readiness report.")
-        assert scenario.limits.max_total_tokens == 100_000
+        assert scenario.limits.max_total_tokens == 200_000
         arguments = owner_routine_arguments(scenario)
         model.steps = [
             response(
@@ -764,7 +756,7 @@ def test_scheduled_mcp_explicit_profile_preserves_strict_defaults(
         value.max_estimated_cost_usd,
     ) == (
         24,
-        100_000,
+        200_000,
         300,
         Decimal("0.50"),
     )

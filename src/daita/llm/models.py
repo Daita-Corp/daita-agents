@@ -229,10 +229,17 @@ class CanonicalMessage:
     tool_calls: tuple[ToolCall, ...] = ()
     provider_id: str | None = None
     provider_metadata: Mapping[str, object] = field(default_factory=dict)
+    # Code-owned run status written once with a tool result and rendered after it,
+    # unchanged on every later request, so per-step status never edits history.
+    run_note: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.role, MessageRole):
             raise TypeError("message role must be a MessageRole")
+        if self.run_note is not None:
+            _required_text(self.run_note, "message run_note")
+            if self.role is not MessageRole.TOOL:
+                raise ValueError("only a tool message may carry a run note")
         if self.provider_id is not None:
             _required_text(self.provider_id, "message provider_id")
 

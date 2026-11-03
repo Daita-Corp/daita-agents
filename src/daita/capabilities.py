@@ -1236,7 +1236,7 @@ _IDENTITY_REFS: Mapping[str, tuple[str, str, str]] = MappingProxyType(
         SOURCE_ID_PATTERN: (
             "source",
             SOURCE_REF_PREFIX,
-            "Source display name, as shown in the catalog context.",
+            "Source display name, as shown in the directory.",
         ),
         RESOURCE_ID_PATTERN: (
             "resource",
@@ -1560,8 +1560,10 @@ def _resolve_resource_name(
     """Return the full ID a native table or file name names within ``source_ids``.
 
     A resource ID is the hash of (source, kind, native name), so a name resolves
-    without an index: the first kind that yields a readable ID wins, tables
-    before views.
+    without an index. A listed source: the first kind that yields a listed ID wins,
+    tables before views. A source read in full lists nothing, so the name hashes as
+    a table, the same on every replay; the tools that need a catalog entry look it
+    up from there.
     """
 
     if not isinstance(value, str) or _IDENTITY_PATTERNS[RESOURCE_ID_PATTERN].fullmatch(
@@ -1594,21 +1596,12 @@ def _resolve_resource_name(
                 ),
                 None,
             )
+            if found is None and source_id in scope.unrestricted_source_ids:
+                found = catalog_resource_id(source_id, ResourceKind.TABLE, value)
             if found is not None:
                 hits.append((source_id, found))
     if len(hits) == 1:
         return hits[0][1]
-    if not hits and scope and not scope.unrestricted_source_ids.isdisjoint(source_ids):
-        # Tools that name a table act on catalog entries, but no entry says nothing
-        # about what a source the run may read in full holds.
-        raise _ref_invalid(
-            "table_unknown",
-            f"The catalog has no entry for {value!r}. It may still be in the source.",
-            path,
-            value,
-            "Query the source to see whether the table exists, or use a name from "
-            "catalog_search.",
-        )
     if not hits:
         raise _ref_invalid(
             "table_unknown",
@@ -1622,7 +1615,7 @@ def _resolve_resource_name(
     assert scope is not None
     raise _ref_invalid(
         "table_ambiguous",
-        f"{len(hits)} sources in this run have a table named {value!r}.",
+        f"{len(hits)} sources in this run could hold a table named {value!r}.",
         path,
         value,
         "Name the source too: "

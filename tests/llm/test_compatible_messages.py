@@ -1,6 +1,14 @@
 """Chat Completions serialization of non-leading system instructions."""
 
-from daita.llm.models import CanonicalMessage, MessageRole, TextBlock
+from unittest.mock import ANY
+
+from daita.llm.models import (
+    CanonicalMessage,
+    MessageRole,
+    TextBlock,
+    ToolCall,
+    ToolResultBlock,
+)
 from daita.llm.providers.openai_compatible.messages import _chat_messages
 
 
@@ -35,4 +43,22 @@ def test_leading_system_messages_stay_separate():
         "system",
         "system",
         "user",
+    ]
+
+
+def test_a_run_note_follows_the_tool_results_as_user_text():
+    call = ToolCall("call-1", "lookup", {})
+    messages = (
+        _text(MessageRole.USER, "Question."),
+        CanonicalMessage(role=MessageRole.ASSISTANT, tool_calls=(call,)),
+        CanonicalMessage(
+            role=MessageRole.TOOL,
+            content=(ToolResultBlock(call_id=call.id, output={"rows": []}),),
+            run_note="Budget pressure.",
+        ),
+    )
+
+    assert _chat_messages(messages, "compatible")[-2:] == [
+        {"role": "tool", "tool_call_id": call.id, "content": ANY},
+        {"role": "user", "content": "Budget pressure."},
     ]

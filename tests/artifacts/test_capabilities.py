@@ -1038,8 +1038,7 @@ async def test_context_requires_default_delivery_before_final_text_for_explicit_
             and "requested local delivery before normal text" in system
         )
         assert "Normal assistant text ends the run" in system
-        assert "Ordinary user wording is not an exact stored value" in system
-        assert "bounded validated value read" in system
+        assert "Check categorical values with a quick DISTINCT query" in system
         assert "A committed artifact reference proves only internal creation" in system
         assert (
             "Only a successful artifact delivery receipt proves a local file exists"
@@ -1178,40 +1177,8 @@ class _Catalog:
         del agent_id, source_ids
         return ModelSensitivity.PUBLIC
 
-    def empty_catalog_context(self, *, prior_query=None) -> FrozenJsonObject:
-        return self._empty_catalog_context(prior_query is not None)
-
-    async def catalog_context(self, *args, **kwargs) -> FrozenJsonObject:
-        del args, kwargs
-        return self._empty_catalog_context(False)
-
-    @staticmethod
-    def _empty_catalog_context(has_prior: bool) -> FrozenJsonObject:
-        no_match = {
-            "binding_status": "no_match",
-            "source_status": "no_match",
-            "evidence_tier": "none",
-            "candidate_count": 0,
-            "candidate_bindings": (),
-            "omitted_candidate_count": 0,
-            "ambiguity_reasons": (),
-            "assessment_provenance": "catalog_service",
-            "trust_classification": "untrusted_external_data",
-        }
-        return FrozenJsonObject.from_mapping(
-            {
-                "resources": [],
-                "sources": [],
-                "match_outcomes": {
-                    "current_query": no_match,
-                    "prior_query": None,
-                },
-                "total_matches": 0,
-                "returned_count": 0,
-                "truncated": False,
-                "trust_classification": "untrusted_external_data",
-            }
-        )
+    async def source_directory(self, agent_id, source_ids):
+        return await self.source_routing_facts(agent_id, source_ids)
 
 
 async def test_hosted_composition_does_not_project_local_delivery_tools_or_paths() -> (

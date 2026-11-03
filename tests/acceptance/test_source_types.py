@@ -302,13 +302,17 @@ async def test_registered_type_without_sql_attaches_catalogs_reopens_and_detache
             provider,
             (
                 _tool("search", "catalog_search", {"query": "regions revenue"}),
-                _tool("describe", "catalog_describe", {"resource_ids": [resource.id]}),
+                _tool(
+                    "describe",
+                    "catalog_describe",
+                    {"source_id": source.id, "name": resource.native_identity},
+                ),
                 _stop("The regions table has region and revenue."),
             ),
             source_scope_ids=(source.id,),
         )
         assert not results["search"].is_error
-        assert resource.id in repr(results["search"].output)
+        assert resource.native_identity in repr(results["search"].output)
         assert not results["describe"].is_error
         assert "revenue" in repr(results["describe"].output)
     finally:

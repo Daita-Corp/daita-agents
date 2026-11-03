@@ -22,6 +22,11 @@ class _BrokenCatalogStore:
         raise CatalogStoreError(f"catalog store is unavailable: {name}")
 
 
+def _break_catalog(agent: Agent, monkeypatch: pytest.MonkeyPatch) -> None:
+    for owner in (agent._embedded._catalog_service, agent._embedded._data_view):
+        monkeypatch.setattr(owner, "_store", _BrokenCatalogStore())
+
+
 def _create_companies(database: Path) -> None:
     connection = sqlite3.connect(database)
     connection.execute("CREATE TABLE companies (name TEXT NOT NULL)")
@@ -73,7 +78,7 @@ async def test_read_answers_from_a_table_the_catalog_has_never_seen(
         await agent.close()
 
 
-async def test_describing_an_uncataloged_table_does_not_call_it_unreadable(
+async def test_describing_an_uncataloged_table_answers_from_the_source(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "companies.db"
@@ -83,7 +88,11 @@ async def test_describing_an_uncataloged_table_does_not_call_it_unreadable(
             ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
-                    ToolCall("describe", "catalog_describe", {"tables": ["companies"]}),
+                    ToolCall(
+                        "describe",
+                        "catalog_describe",
+                        {"source": "companies", "name": "companies"},
+                    ),
                 ),
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="Not cataloged yet."),
@@ -101,11 +110,11 @@ async def test_describing_an_uncataloged_table_does_not_call_it_unreadable(
         _create_companies(database)
         run = await agent.run("What columns does companies have?")
         ((_, result),) = await agent.tool_evidence(run.run_id)
-        assert result is not None and result.is_error
-        error = result.output["error"]
-        assert isinstance(error, Mapping)
-        assert error["code"] == "table_unknown"
-        assert "may still be in the source" in str(error["message"])
+        assert result is not None and not result.is_error, result
+        data = result.output["data"]
+        assert isinstance(data, Mapping)
+        assert data["name"] == "main.companies"
+        assert data["answered_from"] == "live"
     finally:
         await agent.close()
 
@@ -118,9 +127,7 @@ async def test_read_answers_while_the_catalog_store_is_failing(
     agent = await _create_agent(tmp_path)
     try:
         await agent.attach(SQLiteSource(database, name="CRM"))
-        monkeypatch.setattr(
-            agent._embedded._catalog_service, "_store", _BrokenCatalogStore()
-        )
+        _break_catalog(agent, monkeypatch)
         result = await agent.run("How many companies are there?")
         await _assert_counted_two(agent, result.run_id)
     finally:
@@ -152,9 +159,7 @@ async def test_a_selected_scope_holds_while_the_catalog_store_is_failing(
             source_id=source.id,
             confirmation_fingerprint=preview.confirmation_fingerprint,
         )
-        monkeypatch.setattr(
-            agent._embedded._catalog_service, "_store", _BrokenCatalogStore()
-        )
+        _break_catalog(agent, monkeypatch)
         result = await agent.run("How many companies are there?")
         await _assert_counted_two(agent, result.run_id)
     finally:

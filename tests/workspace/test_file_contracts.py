@@ -257,9 +257,9 @@ async def test_files_only_scopes_the_run_to_the_session_folder_source(
 
             return read
 
-        for method_name in ("catalog_context", "semantic_resource_facts"):
-            monkeypatch.setattr(view, method_name, unexpected_source_read)
+        monkeypatch.setattr(view, "semantic_resource_facts", unexpected_source_read)
         for method_name in (
+            "source_directory",
             "source_routing_facts",
             "relational_write_applicable_source_ids",
             "admitted_model_sensitivity",

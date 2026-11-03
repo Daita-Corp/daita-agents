@@ -193,12 +193,6 @@ async def test_catalog_continuation_is_complete_scoped_and_invalidated_by_hint_e
     )
     assert matching.total_matches == matching.total_candidates == 17
     assert all(hit.match_reasons == ("source_hint",) for hit in matching.hits)
-    assert matching.match_outcome.binding_status == "ambiguous"
-    assert matching.match_outcome.source_status == "unique"
-    assert matching.match_outcome.evidence_tier == "source_hint"
-    assert matching.match_outcome.candidate_count == 17
-    assert len(matching.match_outcome.candidate_bindings) == 12
-    assert matching.match_outcome.omitted_candidate_count == 5
     assert (
         await agent._embedded._execution_contract_reader(**contract_arguments)
         == contracts
@@ -342,10 +336,10 @@ async def test_mcp_hint_edits_preserve_execution_and_change_bounded_discovery(
             for index in range(12)
         )
         full = _connector_directory(
-            "rhinoceros", (source,), catalog_after, skills, maximum_bytes=20_000
+            (source,), catalog_after, skills, maximum_bytes=20_000
         )
         bounded = _connector_directory(
-            "rhinoceros", (source,), catalog_after, skills, maximum_bytes=512
+            (source,), catalog_after, skills, maximum_bytes=512
         )
         full_entries = full["entries"]
         assert isinstance(full_entries, list)

@@ -189,10 +189,9 @@ adequate coverage before claiming a total for the whole file. Retain completenes
 truncation, per-root search coverage and other reported limitations in derived
 outputs and conclusions.
 
-For database work, reuse sufficient current catalog evidence. Obtain missing
-schemas and resolved relationship paths through one `catalog_describe` call;
-`detail=identity` lists tables without columns. Load it through the ordinary
-toolbox if needed. Matching field names alone do not establish a join;
+For database work, reuse sufficient current evidence. Obtain a missing schema with
+`catalog_describe`, which reads one table, or lists a schema, from the live source.
+Load it through the ordinary toolbox if needed. Matching field names alone do not establish a join;
 ambiguous mappings or relationships can require ordinary clarification.
 
 For query results, use the returned `columns` and `rows`, including aliases and

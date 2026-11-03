@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from types import MappingProxyType
@@ -25,9 +25,9 @@ class EffectiveSourceScope:
     source_labels: Mapping[str, tuple[str, str]] = field(
         default_factory=dict, hash=False
     )
-    # Sources this run may read in full: the engine decides what exists. For
-    # these, resource_ids holds only what the catalog knows, for name resolution
-    # and catalog tools; it never limits a read.
+    # Sources this run may read in full: the engine decides what exists, so
+    # resource_ids lists no tables for them. Runs stored before catalog tools took
+    # names list what the catalog knew, which resolves their stored calls the same.
     unrestricted_source_ids: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
@@ -72,6 +72,15 @@ class EffectiveSourceScope:
             )
         return mapping
 
+    def covers(self, source_ids: Iterable[str], resource_ids: Iterable[str]) -> bool:
+        """Whether a record naming these sources and resources is inside this scope."""
+
+        sources = set(source_ids)
+        return sources <= self.source_ids and (
+            sources <= self.unrestricted_source_ids
+            or set(resource_ids) <= self.resource_ids
+        )
+
     def sources_named(self, name: str) -> tuple[str, ...]:
         """Return the IDs of every admitted source whose display name is ``name``."""
 
@@ -85,7 +94,6 @@ class EffectiveSourceScope:
         )
 
 
-EFFECTIVE_RESOURCE_LIMIT = 10_000
 SOURCE_REF_PREFIX = "s"
 RESOURCE_REF_PREFIX = "t"
 
@@ -221,35 +229,13 @@ async def _read_access(
             unrestricted.add(source_id)
         else:
             listed |= access
-    if unrestricted:
-        listed |= await _cataloged_tables(agent_id, unrestricted, catalog)
     return frozenset(unrestricted), frozenset(listed)
-
-
-async def _cataloged_tables(
-    agent_id: str, sources: set[str], catalog: SourceScopeCatalog
-) -> frozenset[str]:
-    """What the catalog knows of unrestricted sources; it advises, so may fail."""
-
-    from .catalog.protocols import CatalogStoreError
-
-    try:
-        known = await catalog.readable_resource_ids(agent_id, tuple(sorted(sources)))
-    except CatalogStoreError:
-        return frozenset()
-    # shortcut: past this bound a table is still readable, but tools that name a
-    # table by ID cannot reach it; lift it when catalog tools take names (2c).
-    return frozenset(sorted(known)[:EFFECTIVE_RESOURCE_LIMIT])
 
 
 class SourceScopeCatalog(Protocol):
     async def source_routing_facts(
         self, agent_id: str, source_ids: tuple[str, ...] = ()
     ) -> tuple[Mapping[str, object], ...]: ...
-
-    async def readable_resource_ids(
-        self, agent_id: str, source_ids: tuple[str, ...] = ()
-    ) -> frozenset[str]: ...
 
     async def source_read_access(
         self, agent_id: str, source_ids: tuple[str, ...]

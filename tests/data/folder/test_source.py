@@ -181,7 +181,7 @@ async def test_attached_folder_catalogs_folders_files_and_tabular_schemas(
             await _read(agent, source.id, "notes.md")
         assert refused.value.error_code == "resource_read_not_allowed"
 
-        search = await agent._embedded._data_view.search(
+        search = await agent._embedded._catalog_service.search(
             CatalogSearchRequest(agent_id=agent.id, query="region_code")
         )
         assert {

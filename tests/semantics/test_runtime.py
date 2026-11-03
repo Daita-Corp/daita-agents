@@ -759,3 +759,65 @@ async def test_natural_language_and_learn_route_to_semantics_without_new_command
         "/learn  Booked revenue uses invoices.booked_at. "
     )
     assert routed == "/learn Booked revenue uses invoices.booked_at."
+
+
+async def test_a_note_on_a_view_in_a_source_read_in_full_binds_its_catalog_entry(
+    tmp_path,
+):
+    database = tmp_path / "views.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, status TEXT)")
+        connection.execute("CREATE VIEW open_orders AS SELECT id, status FROM orders")
+
+    async def approve(request):
+        return ApprovalDecision.APPROVE
+
+    provider = MockModelProvider(
+        (
+            _call(
+                ToolCall("load", "toolbox_load", {"tool_names": ["semantic_save"]}),
+            ),
+            _call(
+                ToolCall(
+                    "save",
+                    "semantic_save",
+                    {
+                        "id": "open-orders-meaning",
+                        "kind": "glossary",
+                        "statement": "Open orders await shipping.",
+                        "subject": {
+                            "sources": ["Views"],
+                            "tables": ["main.open_orders"],
+                            "fields": [
+                                {"table": "main.open_orders", "field_name": "status"}
+                            ],
+                        },
+                        "evidence": [{"kind": "user_assertion"}],
+                    },
+                ),
+            ),
+            _stop("Saved."),
+        ),
+        provider_id="mock:semantic-view",
+    )
+    agent = await Agent.create(
+        "semantic-on-view",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=provider,
+        model_profile=_profile(provider),
+        approval_handler=approve,
+    )
+    try:
+        source = await agent.attach_sqlite(database, name="Views")
+        view = next(
+            item
+            for item in await agent.list_catalog_resources(source_id=source.id)
+            if item.name == "open_orders"
+        )
+        result = await agent.learn("Open orders await shipping.")
+        assert result.reason == "completed", result
+        (saved,) = await agent._embedded._store.list_semantic_annotations(agent.id)
+        assert saved.subject.resource_ids == (view.id,)
+    finally:
+        await agent.close()

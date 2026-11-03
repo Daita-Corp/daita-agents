@@ -124,7 +124,7 @@ async def test_later_turns_refusals_and_semantic_context_show_only_names(
                     ToolCall(
                         "joined",
                         "catalog_describe",
-                        {"tables": ["main.orders", "main.customers"]},
+                        {"source": "shop", "name": "main.orders"},
                     ),
                 ),
             ),
@@ -174,8 +174,7 @@ async def test_later_turns_refusals_and_semantic_context_show_only_names(
     during = "\n".join(model_visible_text(provider.requests[-2]))
     assert "Resources: main.orders" in during
     assert "arguments.source is required" in during
-    assert "catalog_describe needs tables or a query" in during
-    assert '"from_table":"main.orders"' in during
+    assert '"from":"main.orders"' in during
 
 
 def test_live_smoke_record_covers_the_current_surface() -> None:

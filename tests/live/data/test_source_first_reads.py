@@ -61,6 +61,11 @@ CREATE VIEW sales.north AS SELECT * FROM sales.customers WHERE region = 'north';
 CREATE MATERIALIZED VIEW sales.region_counts AS
     SELECT region, count(*) AS n FROM sales.customers GROUP BY region;
 CREATE VIEW sales.hidden_view AS SELECT * FROM sales.orders;
+CREATE DOMAIN sales.positive AS integer CHECK (VALUE > 0);
+CREATE TABLE sales.ledger (id integer PRIMARY KEY, amount sales.positive, cost money);
+CREATE TABLE sales.ledger_lines (id integer, ledger_id integer REFERENCES sales.ledger (id));
+COMMENT ON TABLE sales.ledger IS 'Booked amounts.';
+COMMENT ON COLUMN sales.ledger.amount IS 'Whole units only.';
 CREATE TABLE events.page_views (viewed_on date NOT NULL, path text)
     PARTITION BY RANGE (viewed_on);
 CREATE TABLE events.page_views_2026 PARTITION OF events.page_views
@@ -84,7 +89,7 @@ CREATE FUNCTION sales."LOWER"(integer) RETURNS text LANGUAGE sql AS 'SELECT $1::
 GRANT USAGE ON SCHEMA sales, legacy, events TO daita_reader;
 GRANT SELECT ON sales.customers, sales.orders, legacy.customers TO daita_reader;
 GRANT SELECT ON sales.shipments, sales.north, sales.region_counts TO daita_reader;
-GRANT SELECT ON sales.hidden_view TO daita_reader;
+GRANT SELECT ON sales.hidden_view, sales.ledger, sales.ledger_lines TO daita_reader;
 GRANT SELECT ON events.page_views, events.page_views_2026 TO daita_reader;
 """
 
@@ -656,3 +661,142 @@ async def test_composite_and_range_values_are_projected(
     assert cast(Mapping[str, object], rows[0]["span"])["lower"] == 1
     assert rows[0]["doc"] == '{"a": 1}'
     assert cast(Mapping[str, object], whole[0]["c"])["region"] == "north"
+
+
+async def _lookup(
+    reads: _Reads, tool: str, arguments: Mapping[str, object]
+) -> Mapping[str, object]:
+    loop = reads.agent._embedded._loop
+    assert loop is not None
+    (result,) = await execute_projected(
+        loop._tools,
+        RunInput(
+            id=f"lookup-{tool}",
+            agent_id=reads.agent.id,
+            message="Look.",
+            created_at=_OBSERVED_AT,
+            conversation_id=f"lookup-{tool}",
+        ),
+        (ToolCall("lookup", tool, arguments),),
+    )
+    assert "error" not in result.output, result.output
+    return cast(Mapping[str, object], result.output["data"])
+
+
+async def test_discovery_lists_every_relation_kind_with_partitions_folded(
+    database: None, tmp_path: Path
+) -> None:
+    reads = await _attached(tmp_path, ("sales", "events"))
+    try:
+        kinds = {
+            resource.native_identity: resource.kind
+            for resource in await reads.agent.list_catalog_resources(
+                source_id=reads.source_id
+            )
+        }
+        assert kinds["sales.north"] is ResourceKind.VIEW
+        assert kinds["sales.region_counts"] is ResourceKind.VIEW
+        assert kinds["sales.shipments"] is ResourceKind.TABLE  # enum, money
+        assert kinds["sales.ledger"] is ResourceKind.TABLE  # domain
+        assert kinds["events.page_views"] is ResourceKind.TABLE
+        assert "events.page_views_2026" not in kinds
+    finally:
+        await reads.agent.close()
+
+
+async def test_search_finds_live_tables_beside_a_stale_catalog(
+    database: None, tmp_path: Path
+) -> None:
+    reads = await _attached(tmp_path, ("sales", "legacy"))
+    try:
+        # The q05 shape: the catalog knows legacy.orders only.
+        admin = await _admin(_DATABASE)
+        try:
+            await admin.execute(
+                "CREATE TABLE legacy.orders (id integer);"
+                "GRANT SELECT ON legacy.orders TO daita_reader"
+            )
+        finally:
+            await admin.close()
+        data = await _lookup(reads, "catalog_search", {"query": "orders"})
+        hits = {
+            cast(str, hit["name"]): hit
+            for hit in cast(tuple[Mapping[str, object], ...], data["hits"])
+        }
+        assert hits["sales.orders"]["seen_live"] is True
+        assert hits["legacy.orders"]["seen_live"] is True
+        assert hits["sales.orders"]["dialect"] == "postgresql"
+        assert "customer_id integer" in cast(str, hits["sales.orders"]["columns"])
+    finally:
+        await reads.agent.close()
+
+
+async def test_describe_reads_types_enums_keys_comments_and_partitions_live(
+    database: None, tmp_path: Path
+) -> None:
+    reads = await _attached(tmp_path, ("sales", "events"))
+    try:
+        ledger = await _lookup(
+            reads,
+            "catalog_describe",
+            {"source": "Warehouse", "name": "sales.ledger"},
+        )
+        assert ledger["answered_from"] == "live"
+        assert ledger["comment"] == "Booked amounts."
+        assert ledger["primary_key"] == ("id",)
+        columns = {
+            cast(str, column["name"]): column
+            for column in cast(tuple[Mapping[str, object], ...], ledger["columns"])
+        }
+        assert columns["amount"]["type"] == "sales.positive"
+        assert columns["amount"]["comment"] == "Whole units only."
+        assert columns["cost"]["type"] == "money"
+        (link,) = cast(tuple[Mapping[str, object], ...], ledger["relationships"])
+        assert link["from"] == "sales.ledger_lines"
+        assert link["to"] == "sales.ledger"
+
+        shipments = await _lookup(
+            reads,
+            "catalog_describe",
+            {"source": "Warehouse", "name": "sales.shipments"},
+        )
+        status = next(
+            column
+            for column in cast(tuple[Mapping[str, object], ...], shipments["columns"])
+            if column["name"] == "status"
+        )
+        assert status["enum_values"] == ("open", "shipped")
+
+        parent = await _lookup(
+            reads,
+            "catalog_describe",
+            {"source": "Warehouse", "name": "events.page_views"},
+        )
+        assert parent["partitions"] == 1
+
+        listing = await _lookup(
+            reads, "catalog_describe", {"source": "Warehouse", "name": "events"}
+        )
+        assert listing["kind"] == "schema"
+        assert [
+            table["name"]
+            for table in cast(tuple[Mapping[str, object], ...], listing["tables"])
+        ] == ["events.page_views"]
+    finally:
+        await reads.agent.close()
+
+
+async def test_a_lookup_never_shows_a_name_outside_the_configured_schemas(
+    database: None, tmp_path: Path
+) -> None:
+    reads = await _attached(tmp_path, ("sales",))
+    try:
+        data = await _lookup(reads, "catalog_search", {"query": "salaries customers"})
+        names = {
+            hit["name"] for hit in cast(tuple[Mapping[str, object], ...], data["hits"])
+        }
+        assert "sales.customers" in names
+        assert "legacy.customers" not in names
+        assert "private.salaries" not in names
+    finally:
+        await reads.agent.close()

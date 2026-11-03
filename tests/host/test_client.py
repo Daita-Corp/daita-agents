@@ -237,7 +237,11 @@ async def _seed(root: Path) -> Seeded:
         (resource,) = await agent.list_catalog_resources(source_id=source.id)
         model.replace_script(
             (
-                _tool("describe", "catalog_describe", {"source_id": source.id}),
+                _tool(
+                    "describe",
+                    "catalog_describe",
+                    {"source_id": source.id, "name": "main"},
+                ),
                 _tool(
                     "note",
                     "artifact_create",

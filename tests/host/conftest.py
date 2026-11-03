@@ -166,7 +166,11 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
         (resource,) = resources
         provider.replace_script(
             (
-                _call("describe", "catalog_describe", {"source_id": source.id}),
+                _call(
+                    "describe",
+                    "catalog_describe",
+                    {"source_id": source.id, "name": "main"},
+                ),
                 _call(
                     "note",
                     "artifact_create",

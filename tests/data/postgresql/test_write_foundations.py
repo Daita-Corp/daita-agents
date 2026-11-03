@@ -407,7 +407,7 @@ async def test_committed_source_edit_deletes_only_the_previous_owned_credential(
 
 
 def test_postgresql_discovery_projects_write_relevant_column_facts():
-    column = postgresql_module._column(
+    column = postgresql_module.column_from_row(
         {
             "column_name": "account_id",
             "native_type": "bigint",
@@ -434,9 +434,9 @@ def test_postgresql_discovery_projects_write_relevant_column_facts():
         generated=False,
         updatable=False,
     )
-    assert "attidentity" in postgresql_module._COLUMNS_SQL
-    assert "attgenerated" in postgresql_module._COLUMNS_SQL
-    assert "is_updatable" in postgresql_module._COLUMNS_SQL
+    assert "attidentity" in postgresql_module.COLUMNS_SQL
+    assert "attgenerated" in postgresql_module.COLUMNS_SQL
+    assert "is_updatable" in postgresql_module.COLUMNS_SQL
 
 
 @pytest.mark.parametrize(

@@ -20,6 +20,20 @@ from .models import (
     SourceRegistration,
 )
 
+# Bounds on one live catalog_describe result.
+DESCRIBE_MAX_COLUMNS = 256
+DESCRIBE_MAX_LISTED_TABLES = 100
+SUMMARY_MAX_COLUMNS = 12
+
+
+def column_summary(columns: str | None, total: int) -> str | None:
+    """One line of leading ``name type`` pairs, saying how many more there are."""
+
+    if not columns:
+        return None
+    hidden = total - SUMMARY_MAX_COLUMNS
+    return f"{columns} (+{hidden} more)" if hidden > 0 else columns
+
 
 def _text(value: str, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
@@ -140,6 +154,10 @@ class SourceReadScopeStore(SourceStore, Protocol):
 
 
 __all__ = [
+    "DESCRIBE_MAX_COLUMNS",
+    "DESCRIBE_MAX_LISTED_TABLES",
+    "SUMMARY_MAX_COLUMNS",
+    "column_summary",
     "DiscoveryLimitError",
     "ResourceAdapter",
     "ResourceAdapterError",

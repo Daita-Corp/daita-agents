@@ -9,19 +9,24 @@ from typing import Protocol, cast
 from ..._json import FrozenJsonObject
 from ...adapters.folder import SessionFolderSource
 from ...adapters.models import SourceRegistration
-from ...adapters.protocols import SourceStore
+from ...adapters.protocols import (
+    DESCRIBE_MAX_COLUMNS,
+    SUMMARY_MAX_COLUMNS,
+    SourceStore,
+    column_summary,
+)
 from ...adapters.registry import SourceOperation, SourceTypeRegistry
 from ...catalog.models import (
-    CatalogDescribeRequest,
+    CATALOG_SCHEMA_TOOL_DEFAULT_RELATIONSHIPS,
     CatalogResource,
     CatalogSchemaRequest,
     CatalogSearchRequest,
-    CatalogSearchResult,
     CatalogTraversalRequest,
     ResourceKind,
     Sensitivity,
+    catalog_resource_id,
 )
-from ...catalog.protocols import CatalogResourceNotFoundError, CatalogStore
+from ...catalog.protocols import CatalogStore, CatalogStoreError
 from ...catalog.service import CatalogService
 from ...llm.models import ModelSensitivity
 from ...semantics import SemanticResourceFact
@@ -162,15 +167,6 @@ class CatalogDataView:
             else ()
         )
 
-    def empty_catalog_context(
-        self,
-        *,
-        prior_query: str | None = None,
-    ) -> FrozenJsonObject:
-        """Project the catalog-owned no-match result without reading source state."""
-
-        return self._service.empty_catalog_context(prior_query=prior_query)
-
     async def readable_resource_ids(
         self,
         agent_id: str,
@@ -180,6 +176,17 @@ class CatalogDataView:
 
         resources = await self._admitted_resources(agent_id, source_ids)
         return frozenset(resource.id for resource in resources)
+
+    async def non_table_resource_ids(self, agent_id: str) -> Mapping[str, str]:
+        """Each view or file's ID, keyed by the ID its name hashes to as a table."""
+
+        return {
+            catalog_resource_id(
+                resource.source_id, ResourceKind.TABLE, resource.native_identity
+            ): resource.id
+            for resource in await self._store.list_resources(agent_id)
+            if resource.kind is not ResourceKind.TABLE
+        }
 
     async def source_read_access(
         self,
@@ -317,22 +324,218 @@ class CatalogDataView:
                 "active source read scope ownership is invalid"
             )
 
-    async def search(
-        self,
-        request: CatalogSearchRequest,
-        *,
-        readable_resource_ids: frozenset[str] | None = None,
-    ) -> CatalogSearchResult:
+    async def lookup_sources(
+        self, agent_id: str, source_ids: tuple[str, ...] = ()
+    ) -> tuple[tuple[str, str, str | None], ...]:
+        """(source ID, adapter ID, SQL dialect) of each current readable source."""
+
+        facts = await self.source_routing_facts(agent_id, source_ids)
+        return tuple(
+            (
+                cast(str, fact["source_id"]),
+                adapter := cast(str, fact["adapter_id"]),
+                (
+                    None
+                    if (source_type := self._source_types.get(adapter)) is None
+                    else source_type.sql_dialect
+                ),
+            )
+            for fact in facts
+        )
+
+    async def source_directory(
+        self, agent_id: str, source_ids: tuple[str, ...]
+    ) -> tuple[FrozenJsonObject, ...]:
+        """Each source's routing facts plus type, dialect, schemas and object count.
+
+        The count advises: a failing catalog leaves it unknown.
+        """
+
+        directory: list[FrozenJsonObject] = []
+        for fact in await self.source_routing_facts(agent_id, source_ids):
+            source_id = cast(str, fact["source_id"])
+            source_type = self._source_types.get(cast(str, fact["adapter_id"]))
+            try:
+                count: int | None = len(
+                    await self._store.list_resources(agent_id, source_id)
+                )
+            except CatalogStoreError:
+                count = None
+            directory.append(
+                FrozenJsonObject.from_mapping(
+                    {
+                        **fact.to_dict(),
+                        "type": None if source_type is None else source_type.label,
+                        "dialect": (
+                            None if source_type is None else source_type.sql_dialect
+                        ),
+                        "schemas": await self.source_schemas(agent_id, source_id),
+                        "approximate_objects": count,
+                    }
+                )
+            )
+        return tuple(directory)
+
+    async def catalog_hits(
+        self, request: CatalogSearchRequest
+    ) -> tuple[Mapping[str, object], ...]:
+        """Ranked matches from the catalog snapshot, with their column summaries."""
+
         readable = await self.readable_resource_ids(
-            request.agent_id,
-            request.source_ids,
+            request.agent_id, request.source_ids
         )
-        if readable_resource_ids is not None:
-            readable &= readable_resource_ids
-        return await self._service.search(
-            request,
-            readable_resource_ids=readable,
+        result = await self._service.search(request, readable_resource_ids=readable)
+        names = await self.resource_names(request.agent_id, request.source_ids)
+        matched = [
+            hit for hit in result.hits if "unmatched_fallback" not in hit.match_reasons
+        ]
+        tabular = {
+            item.resource.id: item.tabular
+            for source_id in {hit.source_id for hit in matched}
+            for item in await self._service.tabular_resources(
+                request.agent_id, source_id
+            )
+        }
+        hits: list[Mapping[str, object]] = []
+        for hit in matched:
+            facet = tabular.get(hit.resource_id)
+            columns = () if facet is None else facet.columns
+            hits.append(
+                {
+                    "source_id": hit.source_id,
+                    "name": names.get(hit.resource_id, hit.name),
+                    "kind": hit.kind.value,
+                    "columns": column_summary(
+                        ", ".join(
+                            f"{column.name} {column.native_type}"
+                            for column in columns[:SUMMARY_MAX_COLUMNS]
+                        ),
+                        len(columns),
+                    ),
+                    "row_estimate": (
+                        None if facet is None else facet.row_count_estimate
+                    ),
+                }
+            )
+        return tuple(hits)
+
+    async def cached_description(
+        self, agent_id: str, source_id: str, name: str
+    ) -> Mapping[str, object] | None:
+        """The catalog's last description of one readable table, or None."""
+
+        if source_id == self.session_source_id:
+            return None
+        readable = await self.readable_resource_ids(agent_id, (source_id,))
+        folded = name.lower()
+        current = tuple(
+            item
+            for item in await self._service.tabular_resources(agent_id, source_id)
+            if item.resource.id in readable
         )
+        found = next(
+            (
+                item
+                for spelling in (name, folded, f"main.{folded}")
+                for item in current
+                if item.resource.native_identity == spelling
+            ),
+            None,
+        )
+        if found is None:
+            suffixed = [
+                item
+                for item in current
+                if item.resource.native_identity.endswith(f".{name}")
+            ]
+            if len(suffixed) != 1:
+                return None
+            found = suffixed[0]
+        facet = found.tabular
+        return {
+            "name": found.resource.native_identity,
+            "kind": found.resource.kind.value,
+            "revision": found.resource.current_revision,
+            "comment": None,
+            "row_estimate": facet.row_count_estimate,
+            "partitions": 0,
+            "columns": [
+                {
+                    "name": column.name,
+                    "type": column.native_type,
+                    "nullable": column.nullable,
+                    **({"comment": column.comment} if column.comment else {}),
+                }
+                for column in facet.columns[:DESCRIBE_MAX_COLUMNS]
+            ],
+            "columns_truncated": len(facet.columns) > DESCRIBE_MAX_COLUMNS,
+            "primary_key": [
+                column.name
+                for column in sorted(
+                    (item for item in facet.columns if item.primary_key_ordinal),
+                    key=lambda item: cast(int, item.primary_key_ordinal),
+                )
+            ],
+            "unique_keys": [
+                list(index.columns)
+                for index in facet.indexes
+                if index.unique and index.predicate is None
+            ],
+            "relationships": await self._cataloged_relationships(
+                agent_id, source_id, found.resource.id
+            ),
+        }
+
+    async def _cataloged_relationships(
+        self, agent_id: str, source_id: str, resource_id: str
+    ) -> list[Mapping[str, object]]:
+        """Relationships by name, including links declared across sources."""
+
+        # Every source's readable set: a declared link needs its far endpoint.
+        projection = await self._service.schema_slice(
+            CatalogSchemaRequest(
+                agent_id=agent_id,
+                resource_ids=(resource_id,),
+                source_id=source_id,
+                limit=1,
+                include_relationships=True,
+                max_join_depth=1,
+                relationship_limit=CATALOG_SCHEMA_TOOL_DEFAULT_RELATIONSHIPS,
+            ),
+            readable_resource_ids=await self.readable_resource_ids(agent_id),
+        )
+        known = {
+            item.id: item
+            for item in await self._store.list_resources(agent_id)
+            if item.agent_id == agent_id
+        }
+        relationships: list[Mapping[str, object]] = []
+        for raw in cast(
+            tuple[Mapping[str, object], ...], projection.get("relationships", ())
+        ):
+            start = known.get(cast(str, raw.get("from_resource_id")))
+            end = known.get(cast(str, raw.get("to_resource_id")))
+            if start is None or end is None:
+                continue
+            relationships.append(
+                {
+                    "from": start.native_identity,
+                    "from_source_id": start.source_id,
+                    "from_kind": start.kind.value,
+                    "to": end.native_identity,
+                    "to_source_id": end.source_id,
+                    "to_kind": end.kind.value,
+                    "columns": [
+                        [pair["source_field"], pair["target_field"]]
+                        for pair in cast(
+                            tuple[Mapping[str, object], ...],
+                            raw.get("field_pairs", ()),
+                        )
+                    ],
+                    "provenance": raw.get("provenance"),
+                }
+            )
+        return relationships
 
     async def schema_slice(
         self,
@@ -347,23 +550,6 @@ class CatalogDataView:
         if readable_resource_ids is not None:
             readable &= readable_resource_ids
         return await self._service.schema_slice(
-            request,
-            readable_resource_ids=readable,
-        )
-
-    async def describe(
-        self,
-        request: CatalogDescribeRequest,
-        *,
-        readable_resource_ids: frozenset[str] | None = None,
-    ) -> FrozenJsonObject:
-        # Every source's readable set, as traverse uses: the service applies the
-        # source_id narrowing itself, and a declared link listed from that source
-        # still needs its readable far endpoint.
-        readable = await self.readable_resource_ids(request.agent_id)
-        if readable_resource_ids is not None:
-            readable &= readable_resource_ids
-        return await self._service.describe(
             request,
             readable_resource_ids=readable,
         )
@@ -609,42 +795,6 @@ class CatalogDataView:
                 field_names=fields_by_id.get(resource.id, ()),
             )
             for resource in sorted(resources.values(), key=lambda item: item.id)
-        )
-
-    async def catalog_context(
-        self,
-        agent_id: str,
-        query: str,
-        *,
-        prior_query: str | None = None,
-        limit: int,
-        source_ids: tuple[str, ...] = (),
-        resource_ids: tuple[str, ...] = (),
-        readable_resource_ids: frozenset[str] | None = None,
-    ) -> FrozenJsonObject:
-        """Project exact IDs or rank within a current-readable frozen ceiling."""
-
-        readable = await self.readable_resource_ids(agent_id, source_ids)
-        if readable_resource_ids is not None:
-            readable &= readable_resource_ids
-        unreadable_resource_id = next(
-            (
-                resource_id
-                for resource_id in resource_ids
-                if resource_id not in readable
-            ),
-            None,
-        )
-        if unreadable_resource_id is not None:
-            raise CatalogResourceNotFoundError(agent_id, unreadable_resource_id)
-        return await self._service.catalog_context(
-            agent_id,
-            query,
-            prior_query=prior_query,
-            limit=limit,
-            source_ids=source_ids,
-            resource_ids=resource_ids,
-            readable_resource_ids=readable,
         )
 
     async def relational_write_scope_issue(
