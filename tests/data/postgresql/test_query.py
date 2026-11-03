@@ -264,7 +264,7 @@ async def test_a_read_without_functions_makes_no_policy_lookup_and_no_discovery(
 
     assert queries == ["SELECT 1 FROM public.t"]
     assert connection.lookups == []
-    assert result.source_revision == checked_read("x").source_revision
+    assert result.resource_ids == ("resource-orders",)
 
 
 async def test_reads_pin_the_configured_schemas_with_quoting(

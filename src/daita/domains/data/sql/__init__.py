@@ -27,7 +27,7 @@ from .duckdb_read import (
     ValidatedDuckDBRead,
     validate_duckdb_read,
 )
-from .read_validation import SQL_READ_DIALECTS, qualified_relation, validate_read
+from .read_validation import SQL_READ_DIALECTS, resource_id_in_scope, validate_read
 from .relational_update import (
     RELATIONAL_UPDATE_MAX_CANONICAL_BYTES,
     RelationalUpdateCell,
@@ -73,7 +73,7 @@ __all__ = [
     "checked_reads",
     "denied_relations",
     "normalize_sql",
-    "qualified_relation",
+    "resource_id_in_scope",
     "render_relational_update_statement",
     "sqlite_declared_type_affinity",
     "sqlite_identifier_key",

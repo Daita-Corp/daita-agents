@@ -559,8 +559,7 @@ def test_artifact_preview_reads_verified_xlsx_rows_and_marks_truncation():
         ((f"row-{index}",) for index in range(21)),
         provenance=ExactXlsxProvenance(
             source_id="source-test",
-            source_revision="schema:1",
-            resource_revisions=(("resource-test", "sha256:" + "1" * 64),),
+            resource_ids=("resource-test",),
             sql_fingerprint="sha256:" + "2" * 64,
             parameters_sha256="sha256:" + "3" * 64,
             sensitivity=ref.sensitivity,

@@ -304,7 +304,6 @@ class ContextToolProjectionAdapter:
         async def read_contracts(**kwargs):
             return frozen_execution_bindings(
                 kwargs["capability_ids"],
-                kwargs["resource_ids"],
                 kwargs["model_route_ids"],
                 registry=registry,
             )
@@ -329,7 +328,6 @@ class ContextToolProjectionAdapter:
 
 def frozen_execution_bindings(
     capability_ids: tuple[str, ...],
-    resource_ids: tuple[str, ...],
     route_ids: tuple[str, ...],
     *,
     registry: CapabilityRegistry | None = None,
@@ -344,7 +342,6 @@ def frozen_execution_bindings(
             )
             for key in capability_ids
         },
-        resource_revisions={key: "sha256:" + "b" * 64 for key in resource_ids},
         model_routes={key: "sha256:" + "c" * 64 for key in route_ids},
     )
 
@@ -379,15 +376,13 @@ def machine_scope_builder(
         bindings = (
             await contracts(
                 agent_id=agent_id,
-                source_ids=sources,
-                resource_ids=resources,
                 capability_ids=capabilities,
                 connector_binding_ids=(),
                 model_route_ids=model_route_ids,
             )
             if contracts is not None
             else frozen_execution_bindings(
-                capabilities, resources, model_route_ids, registry=registry
+                capabilities, model_route_ids, registry=registry
             )
         )
         return MachineRunScope(

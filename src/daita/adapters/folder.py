@@ -38,9 +38,9 @@ from ..catalog.models import (
     TabularFacet,
     catalog_resource_id,
 )
-from ..catalog.protocols import CatalogStore
 from ..errors import DaitaError
 from ..llm.models import ModelSensitivity
+from ..storage.sqlite_records import SourceReadMode
 from ..workspace import LocalFileAccess, LocalWorkspace
 from .local_file_query import (
     LocalFileQueryError,
@@ -81,6 +81,15 @@ if TYPE_CHECKING:
     from .registry import SourceBackendContext
 
 FOLDER_ADAPTER_ID = "folder"
+_UNREADABLE_PATH_CODES = frozenset(
+    {
+        "path_not_allowed",
+        "path_restricted",
+        "path_invalid",
+        "symlink_not_allowed",
+        "not_regular_file",
+    }
+)
 _DESCRIBE_BATCH_FILES = 32
 # The walk and the schema reads each get this budget; a discovery that runs
 # out of either commits a snapshot marked truncated.
@@ -618,10 +627,7 @@ class FolderBackend:
     """Serve every folder operation for the session and attached folders."""
 
     def __init__(self, context: SourceBackendContext) -> None:
-        if not isinstance(context.store, CatalogStore):
-            raise TypeError("folder sources need the catalog store")
         self._store = context.store
-        self._catalog = context.catalog
         self._home = context.home
         self._session = context.session_workspace
         self._session_source_id = context.session_source_id
@@ -669,23 +675,36 @@ class FolderBackend:
                 self._attached[source_id] = backend
         return backend, source
 
-    async def _cataloged_files(
-        self, agent_id: str, source_id: str, resource_ids: frozenset[str]
-    ) -> frozenset[str]:
-        """The paths of this run's readable cataloged files.
-
-        One cached snapshot load per call, not one lookup per resource.
+    async def _path_admission(
+        self,
+        agent_id: str,
+        source_id: str,
+        source: FolderSource,
+        narrowed: frozenset[str] | None,
+    ) -> Callable[[str], bool]:
+        """Decide from each file itself: a data file, in the folder's subpaths, and
+        readable now. Current permission is read here because a call can queue after
+        it was prepared; ``narrowed`` is the run's own limit, None when it has none.
         """
 
-        refs = await self._store.list_current_snapshot_refs(agent_id, (source_id,))
-        snapshot = await self._store.load_current_snapshot(refs[0]) if refs else None
-        if snapshot is None:
-            return frozenset()
-        return frozenset(
-            resource.native_identity
-            for resource in snapshot.resources
-            if resource.kind is ResourceKind.FILE and resource.id in resource_ids
+        scope = await self._store.load_source_read_scope(agent_id, source_id)
+        if scope is None or scope.mode is SourceReadMode.NONE:
+            return lambda _path: False
+        selected = (
+            None if scope.mode is SourceReadMode.ALL else frozenset(scope.resource_ids)
         )
+
+        def admitted(path: str) -> bool:
+            if structured_file_format(path) is None or not _within_subpaths(
+                path, source.subpaths
+            ):
+                return False
+            resource_id = _file_resource_id(source_id, path)
+            return all(
+                limit is None or resource_id in limit for limit in (selected, narrowed)
+            )
+
+        return admitted
 
     def _result(
         self,
@@ -728,8 +747,8 @@ class FolderBackend:
         backend, source = await self._attached_backend(
             request.agent_id, request.source_id
         )
-        files = await self._cataloged_files(
-            request.agent_id, request.source_id, request.resource_ids or frozenset()
+        admitted = await self._path_admission(
+            request.agent_id, request.source_id, source, request.resource_ids
         )
         paths = request.paths
         if request.path is None and paths is None and source.subpaths:
@@ -742,7 +761,7 @@ class FolderBackend:
             mode=request.mode,
             glob=request.glob,
             order_by=request.order_by,
-            allowed_paths=files,
+            admit_path=admitted,
         )
         return self._result(
             request.source_id,
@@ -769,21 +788,19 @@ class FolderBackend:
         backend, source = await self._attached_backend(
             request.agent_id, request.source_id
         )
-        files = await self._cataloged_files(
-            request.agent_id, request.source_id, request.resource_ids or frozenset()
+        admitted = await self._path_admission(
+            request.agent_id, request.source_id, source, request.resource_ids
         )
-        if request.path is not None and request.path not in files:
-            raise _not_readable()
         try:
             result = await backend.read(
                 run_id=request.run_id,
                 path=request.path,
                 cursor=request.cursor,
                 position=request.position,
-                allowed_paths=files,
+                admit_path=admitted,
             )
         except LocalWorkspaceError as error:
-            if error.code == "path_not_allowed":
+            if error.code in _UNREADABLE_PATH_CODES:
                 raise _not_readable() from error
             raise
         # Cataloged folders are read-only sources: no edit binding.
@@ -818,7 +835,7 @@ class FolderBackend:
             request.path_pattern,
             request.canonical_sql,
             request.sql_fingerprint,
-            request.resource_ids or frozenset(),
+            request.resource_ids,
         )
         return self._result(
             request.source_id,
@@ -853,7 +870,11 @@ class FolderBackend:
             read.path_pattern,
             read.canonical_sql,
             read.sql_fingerprint,
-            frozenset(read.allowed_resource_ids),
+            (
+                None
+                if read.allowed_resource_ids is None
+                else frozenset(read.allowed_resource_ids)
+            ),
             LocalFileQueryLimits(
                 max_result_rows=max_rows,
                 max_result_bytes=max_bytes,
@@ -862,20 +883,12 @@ class FolderBackend:
         )
         data = result.data
         rows = cast(tuple[Mapping[str, object], ...], data["rows"])
-        schemas = {
-            item.resource_id: item
-            for item in await self._catalog.resource_schemas(agent_id, source_id)
-        }
-        matched = [schemas[_file_resource_id(source_id, path)] for path in paths]
+        names = tuple((_file_resource_id(source_id, path), path) for path in paths)
         return SqlReadResult(
             source_id=source_id,
             canonical_sql=read.canonical_sql,
             sql_fingerprint=read.sql_fingerprint,
-            resource_ids=tuple(item.resource_id for item in matched),
-            resource_revisions=tuple(
-                (item.resource_id, cast(str, item.revision)) for item in matched
-            ),
-            source_revision=cast(str, matched[0].source_revision),
+            resource_ids=tuple(item[0] for item in names),
             columns=cast(tuple[str, ...], data["columns"]),
             projection=BoundedResultProjection(
                 rows=tuple(FrozenJsonObject.from_mapping(row) for row in rows),
@@ -887,7 +900,7 @@ class FolderBackend:
                 truncated=cast(bool, data["truncated"]),
                 truncation_reasons=cast(tuple[str, ...], data["truncation_reasons"]),
             ),
-            resource_names=tuple((item.resource_id, item.name) for item in matched),
+            resource_names=names,
         )
 
     async def _query_attached(
@@ -897,24 +910,19 @@ class FolderBackend:
         path_pattern: str,
         canonical_sql: str,
         sql_fingerprint: str,
-        allowed: frozenset[str],
+        narrowed: frozenset[str] | None,
         limits: LocalFileQueryLimits | None = None,
     ) -> tuple[LocalFileQueryResult, tuple[str, ...], FolderSource]:
         """Match the pattern against current files; each must be in this run's scope."""
 
         backend, source = await self._attached_backend(agent_id, source_id)
-        # A read can queue after it was prepared; revoked permission still counts.
-        allowed &= await self._catalog.readable_resource_ids(agent_id, (source_id,))
+        admitted = await self._path_admission(agent_id, source_id, source, narrowed)
         manifest = await backend.bind_query_manifest(
             run_id=_RUN_ID, path_pattern=path_pattern
         )
         try:
             paths = tuple(binding.relative_path for binding in manifest.bindings)
-            denied = [
-                path
-                for path in paths
-                if _file_resource_id(source_id, path) not in allowed
-            ]
+            denied = [path for path in paths if not admitted(path)]
             if denied:
                 raise FolderSourceError(
                     "resource_read_not_allowed",
@@ -945,6 +953,13 @@ class FolderBackend:
             self._attached.clear()
         for backend in backends:
             await backend.close()
+
+
+def _within_subpaths(path: str, subpaths: tuple[str, ...]) -> bool:
+    return not subpaths or any(
+        path == item.rstrip("/") or path.startswith(item.rstrip("/") + "/")
+        for item in subpaths
+    )
 
 
 def _file_resource_id(source_id: str, path: str) -> str:

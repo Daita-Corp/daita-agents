@@ -1,33 +1,36 @@
 """One read policy: parse once, then check statement, functions and name scope.
 
-The source resolves names and reports what does not exist; nothing here compares
-a read with a stored description of the source.
+The source resolves names and reports what does not exist. Scope needs no catalog:
+a name is folded and hashed forward to the ID stored permissions list.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 
+from ....catalog.models import ResourceKind, catalog_resource_id
 from .analysis import analyze_postgresql_sql, analyze_sqlite_sql
 from .contracts import (
     _ASCII_IDENTIFIER_CASE_TRANSLATION,
     MAX_SQL_PARAMETERS,
-    ResourceSchema,
     SqlAnalysis,
     SqlAnalysisError,
     SqlTableReference,
     SqlValidationIssue,
     SqlValidationResult,
-    _identifier_key,
     _required_text,
-    _short_identifier,
     _SqlDialect,
+    sqlite_identifier_key,
 )
 
 SQL_READ_DIALECTS = frozenset({"sqlite", "postgresql", "duckdb"})
 _MAX_ISSUES = 32
 _MAX_CANDIDATES = 8
+_POSTGRESQL_SYSTEM_SCHEMAS = frozenset({"pg_catalog", "information_schema", "pg_toast"})
+_SQLITE_SYSTEM_TABLES = frozenset(
+    {"sqlite_schema", "sqlite_master", "sqlite_temp_schema", "sqlite_temp_master"}
+)
 # These run SQL or read whole tables from arguments the parser cannot see, and
 # several are STABLE, so a volatility check alone would admit them.
 _POSTGRESQL_REFUSED_FUNCTIONS = re.compile(
@@ -81,12 +84,15 @@ def validate_read(
     *,
     dialect: _SqlDialect,
     source_id: str,
-    resources: Iterable[ResourceSchema],
     parameters: Sequence[object] = (),
-    allowed_resource_ids: Iterable[str] | None = None,
+    allowed_resource_ids: frozenset[str] | None = None,
     schemas: tuple[str, ...] = (),
 ) -> SqlValidationResult:
-    """Check one SELECT before any source I/O; ``schemas`` are configured, in order."""
+    """Check one SELECT before any source I/O, using only the SQL and the run's scope.
+
+    ``allowed_resource_ids`` of None means the run may read the source in full;
+    ``schemas`` are the source's configured schemas.
+    """
 
     display_name = "PostgreSQL" if dialect == "postgresql" else "SQLite"
     source_id = _required_text(source_id, "source_id")
@@ -102,8 +108,6 @@ def validate_read(
             source_id=source_id,
             analysis=None,
             resource_ids=(),
-            resource_revisions=(),
-            source_revision=None,
             issues=(SqlValidationIssue(error.code, str(error)),),
         )
 
@@ -151,72 +155,31 @@ def validate_read(
     issues.extend(_function_issues(analysis, dialect))
     issues.extend(_parameter_issues(analysis, parameters, dialect))
 
-    allowed = None if allowed_resource_ids is None else frozenset(allowed_resource_ids)
-    source_resources = tuple(item for item in resources if item.source_id == source_id)
-    selected: list[ResourceSchema] = []
+    selected: dict[str, str] = {}
+    unqualified: list[str] = []
     for table in analysis.tables:
         if table.is_cte:
             continue
-        candidates = _resource_candidates(table, source_resources, dialect)
-        visible = tuple(
-            item
-            for item in candidates
-            if allowed is None or item.resource_id in allowed
+        check = (
+            _check_postgresql_relation(table, source_id, allowed_resource_ids, schemas)
+            if dialect == "postgresql"
+            else _check_sqlite_relation(table, source_id, allowed_resource_ids)
         )
-        if (
-            dialect == "postgresql"
-            and len(table.qualified_parts) < 2
-            and len(schemas) > 1
-        ):
-            issues.append(
-                SqlValidationIssue(
-                    "unqualified_relation",
-                    f"{table.qualified_name} is unqualified and this source has "
-                    "several schemas; qualify it with one of the candidates.",
-                    {
-                        "relation": table.qualified_name,
-                        "candidates": [_full_name(item) for item in visible][
-                            :_MAX_CANDIDATES
-                        ],
-                        "schemas": list(schemas),
-                    },
-                )
-            )
-        elif len(visible) != 1:
-            issues.append(
-                SqlValidationIssue(
-                    "resource_out_of_scope",
-                    f"{table.qualified_name} is not available for reading in this run.",
-                    {"relation": table.qualified_name},
-                )
-            )
-        elif visible[0] not in selected:
-            selected.append(visible[0])
+        if isinstance(check, SqlValidationIssue):
+            issues.append(check)
+        elif check is None:
+            unqualified.append(_fold_postgresql(table.name, table.name_quoted))
+        else:
+            selected.setdefault(check[0], check[1])
 
-    if not any(not table.is_cte for table in analysis.tables):
-        issues.append(
-            SqlValidationIssue(
-                "resource_scope_empty",
-                f"{display_name} data queries must read a table.",
-            )
-        )
     bounded_issues = tuple(issues[:_MAX_ISSUES])
     return SqlValidationResult(
         valid=not bounded_issues,
         source_id=source_id,
         analysis=analysis,
-        resource_ids=tuple(item.resource_id for item in selected),
-        resource_revisions=tuple(
-            (item.resource_id, item.revision)
-            for item in selected
-            if item.revision is not None
-        ),
-        source_revision=next(
-            (item.source_revision for item in selected if item.source_revision), None
-        ),
+        resource_ids=tuple(selected),
         issues=bounded_issues,
-        resource_names=tuple((item.resource_id, item.name) for item in selected),
-        sensitivity_classes=tuple(item.sensitivity_class for item in selected),
+        resource_names=tuple(selected.items()),
         function_lookups=(
             tuple(
                 name
@@ -227,6 +190,100 @@ def validate_read(
             else ()
         ),
         attribute_lookups=analysis.attribute_names,
+        unqualified_relations=tuple(dict.fromkeys(unqualified)),
+    )
+
+
+def resource_id_in_scope(
+    source_id: str,
+    native_name: str,
+    allowed: frozenset[str] | None,
+) -> str | None:
+    """Hash a folded name forward: its ID if readable, with no catalog lookup."""
+
+    table_id = catalog_resource_id(source_id, ResourceKind.TABLE, native_name)
+    if allowed is None or table_id in allowed:
+        return table_id
+    view_id = catalog_resource_id(source_id, ResourceKind.VIEW, native_name)
+    return view_id if view_id in allowed else None
+
+
+def _check_postgresql_relation(
+    table: SqlTableReference,
+    source_id: str,
+    allowed: frozenset[str] | None,
+    schemas: tuple[str, ...],
+) -> tuple[str, str] | SqlValidationIssue | None:
+    """A relation's (ID, full name), the issue refusing it, or None when unqualified."""
+
+    parts = tuple(
+        _fold_postgresql(name, quoted) for name, quoted in table.qualified_parts
+    )
+    if len(parts) == 1:
+        # pg_catalog is searched first, so an unqualified pg_ name is a system
+        # catalog even when a configured schema has a table of that name.
+        if parts[0].startswith("pg_"):
+            parts = ("pg_catalog", parts[0])
+        elif len(schemas) == 1:
+            parts = (schemas[0], parts[0])
+        else:
+            return None
+    if len(parts) != 2:
+        return _out_of_scope(table)
+    schema, name = parts
+    full_name = f"{schema}.{name}"
+    if schema in _POSTGRESQL_SYSTEM_SCHEMAS:
+        if allowed is not None:
+            return _introspection_refused(table)
+    elif schema not in schemas:
+        return SqlValidationIssue(
+            "schema_not_configured",
+            f"{table.qualified_name} is in schema {schema}, which is not attached "
+            "to this source. Add the schema to the source to read it.",
+            {"relation": table.qualified_name, "schema": schema},
+        )
+    resource_id = resource_id_in_scope(source_id, full_name, allowed)
+    return _out_of_scope(table) if resource_id is None else (resource_id, full_name)
+
+
+def _check_sqlite_relation(
+    table: SqlTableReference,
+    source_id: str,
+    allowed: frozenset[str] | None,
+) -> tuple[str, str] | SqlValidationIssue:
+    parts = tuple(sqlite_identifier_key(name) for name, _ in table.qualified_parts)
+    if len(parts) > 2 or (len(parts) == 2 and parts[0] != "main"):
+        return _out_of_scope(table)
+    name = parts[-1]
+    # A pragma table reads connection state, such as file paths, not source data.
+    if name.startswith("pragma_"):
+        return _out_of_scope(table)
+    if name in _SQLITE_SYSTEM_TABLES and allowed is not None:
+        return _introspection_refused(table)
+    full_name = f"main.{name}"
+    resource_id = resource_id_in_scope(source_id, full_name, allowed)
+    return _out_of_scope(table) if resource_id is None else (resource_id, full_name)
+
+
+def _fold_postgresql(name: str, quoted: bool) -> str:
+    return name if quoted else name.translate(_ASCII_IDENTIFIER_CASE_TRANSLATION)
+
+
+def _out_of_scope(table: SqlTableReference) -> SqlValidationIssue:
+    return SqlValidationIssue(
+        "resource_out_of_scope",
+        f"{table.qualified_name} is not available for reading in this run.",
+        {"relation": table.qualified_name},
+    )
+
+
+def _introspection_refused(table: SqlTableReference) -> SqlValidationIssue:
+    # System catalogs would show names outside this run's scope.
+    return SqlValidationIssue(
+        "resource_out_of_scope",
+        f"{table.qualified_name} is not available in this run, which can read only "
+        "some tables of this source. Use catalog_search or catalog_describe.",
+        {"relation": table.qualified_name},
     )
 
 
@@ -318,84 +375,3 @@ def _parameter_issues(
             )
         )
     return tuple(issues)
-
-
-def qualified_relation(schema: ResourceSchema, dialect: str | None) -> str | None:
-    """Quote one catalog relation in a dialect, or None without an exact name."""
-
-    def quote(identifier: str) -> str:
-        return '"' + identifier.replace('"', '""') + '"'
-
-    if dialect == "sqlite":
-        return quote(schema.name)
-    if dialect != "postgresql":
-        return None
-    identity = next(
-        (
-            (alias[: -len(suffix)], schema.name)
-            for alias in schema.aliases
-            for suffix in ("." + schema.name,)
-            if alias.endswith(suffix) and len(alias) > len(suffix)
-        ),
-        None,
-    )
-    return None if identity is None else ".".join(quote(part) for part in identity)
-
-
-def _full_name(resource: ResourceSchema) -> str:
-    return next(
-        (item for item in resource.aliases if item.endswith("." + resource.name)),
-        resource.name,
-    )
-
-
-def _resource_candidates(
-    table: SqlTableReference,
-    resources: tuple[ResourceSchema, ...],
-    dialect: _SqlDialect,
-) -> tuple[ResourceSchema, ...]:
-    if dialect == "postgresql":
-        return tuple(
-            resource
-            for resource in resources
-            if _postgresql_resource_matches(table, resource)
-        )
-    key = _identifier_key(table.qualified_name)
-    short = _short_identifier(table.qualified_name)
-    return tuple(
-        resource
-        for resource in resources
-        if key in resource.lookup_names or short in resource.lookup_names
-    )
-
-
-def _postgresql_resource_matches(
-    table: SqlTableReference,
-    resource: ResourceSchema,
-) -> bool:
-    expected_name = (
-        table.name
-        if table.name_quoted
-        else table.name.translate(_ASCII_IDENTIFIER_CASE_TRANSLATION)
-    )
-    if resource.name != expected_name:
-        return False
-    if len(table.qualified_parts) < 2:
-        # pg_catalog is searched first, so an unqualified pg_ name is a system
-        # catalog even when a configured schema has a table of that name.
-        return not expected_name.startswith("pg_")
-    expected_parts = tuple(
-        name if quoted else name.translate(_ASCII_IDENTIFIER_CASE_TRANSLATION)
-        for name, quoted in table.qualified_parts
-    )
-    return any(
-        _postgresql_alias_parts(alias) == expected_parts for alias in resource.aliases
-    )
-
-
-def _postgresql_alias_parts(alias: str) -> tuple[str, ...]:
-    # Attached schemas are safe single identifiers, while quoted PostgreSQL
-    # resource names may themselves contain dots.  The first separator is the
-    # catalog-owned schema/resource boundary.
-    schema, separator, resource_name = alias.partition(".")
-    return (schema, resource_name) if separator else (schema,)

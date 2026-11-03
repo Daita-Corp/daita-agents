@@ -1587,6 +1587,10 @@ def semantic_declarations(
 
 
 class SemanticDomainCatalog(Protocol):
+    async def source_read_access(
+        self, agent_id: str, source_ids: tuple[str, ...]
+    ) -> Mapping[str, frozenset[str] | None]: ...
+
     async def source_routing_facts(
         self,
         agent_id: str,

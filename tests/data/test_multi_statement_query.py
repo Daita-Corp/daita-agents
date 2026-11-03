@@ -114,8 +114,8 @@ async def test_one_statement_counts_all_46_tables_including_empty_and_quoted(
         touched = cast(tuple[Mapping[str, object], ...], data["tables_touched"])
         assert len(touched) == TABLE_COUNT
         assert {item["name"] for item in touched} >= {
-            "empty_ledger",
-            'odd "table',
+            "main.empty_ledger",
+            'main.odd "table',
         }
         timing = cast(Mapping[str, object], data["timing"])
         assert timing["statement_timeout_ms"] == 5_000
@@ -180,10 +180,10 @@ async def test_several_statements_share_one_row_budget_and_report_each(
             item["name"]
             for item in cast(tuple[Mapping[str, object], ...], data["tables_touched"])
         } == {
-            "empty_ledger",
-            'odd "table',
-            "table_02",
-            "table_03",
+            "main.empty_ledger",
+            'main.odd "table',
+            "main.table_02",
+            "main.table_03",
         }
         assert data["returned_rows"] == sum(
             cast(int, item["returned_rows"]) for item in statements

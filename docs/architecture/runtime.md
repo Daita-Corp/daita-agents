@@ -177,9 +177,9 @@ run's, narrowed to the sources it names and without the job-run tools.
 Scheduled instructions are foreground-authorized content; job instructions are
 code-owned. Untrusted
 payloads and model text cannot enlarge the scope. `contract_bindings` retains
-the exact capability, MCP-origin, resource-structure and model-configuration
-digests read at start, so a change during the run fails the call rather than
-widening it. New scopes state `SCHEDULED_ROUTINE` or `JOB`; `JOB_EVENT` and
+the exact capability, MCP-origin and model-configuration digests read at start, so
+a change during the run fails the call rather than widening it; a catalog refresh
+is not such a change. New scopes state `SCHEDULED_ROUTINE` or `JOB`; `JOB_EVENT` and
 `GRAPH_TASK` (with its task binding) are decoded from stored runs only, and
 only the revision-1 migration decoder may infer an omitted legacy kind. Job
 runs and sub-runs are held to the job lane's per-call target ceiling (the

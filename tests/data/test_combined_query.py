@@ -276,10 +276,6 @@ async def test_combined_query_totals_revenue_by_region_across_two_sqlite_sources
     assert data["columns"] == ("region", "revenue")
     assert data["truncated"] is False
     assert data["resource_ids"] == tuple(sorted((shop.orders, shop.customers)))
-    assert {
-        item["resource_id"]: item["revision"]
-        for item in cast(tuple[Mapping[str, object], ...], data["resource_revisions"])
-    } == {resource_id: item.current_revision for resource_id, item in catalog.items()}
     inputs = cast(tuple[Mapping[str, object], ...], data["inputs"])
     assert [(item["alias"], item["source_id"], item["rows"]) for item in inputs] == [
         ("o", shop.orders_source, 3),
@@ -337,9 +333,7 @@ async def test_tabular_input_named_by_display_and_native_names_joins_a_sqlite_in
         {"column": "revenue", "operator": "gte", "value": 5}
     ]
     assert "canonical_sql" not in tabular
-    assert [dict(item) for item in tabular["resource_revisions"]] == [  # type: ignore[attr-defined]
-        {"resource_id": regions, "revision": table.current_revision}
-    ]
+    assert tabular["resource_ids"] == (regions,)
 
 
 async def test_an_input_with_no_rows_still_aggregates(tmp_path: Path):
@@ -643,6 +637,12 @@ async def test_input_outside_the_run_scope_is_refused_before_any_source_read(
         await shop.agent.close()
 
     error = _error(result)
+    if foreign == "resource" and customers_form == "sql":
+        # The in-scope source may be read in full; it has no such table, and the
+        # other source's table stays out of reach.
+        assert error["code"] == "query_invalid"
+        assert reads.reads == [shop.orders_source, shop.orders_source]
+        return
     assert error["code"] == (
         "source_scope_violation" if foreign == "source" else "resource_read_not_allowed"
     )
@@ -871,6 +871,7 @@ class _TargetsSource:
                 display_name="Targets",
                 configuration={},
                 attached_at=attached_at,
+                presentation_sensitivity=ModelSensitivity.CONFIDENTIAL,
             )
         )
 
@@ -883,8 +884,6 @@ class _TargetsBackend:
             canonical_sql=read.canonical_sql,
             sql_fingerprint="sha256:" + "2" * 64,
             resource_ids=read.resource_ids,
-            resource_revisions=read.resource_revisions,
-            source_revision="targets:v1",
             columns=("region", "target"),
             projection=project_result_rows(
                 (

@@ -53,6 +53,7 @@ from daita.llm.models import (
 )
 from daita.loop.models import LoopExitKind
 from daita.security import EmptySecretProvider
+from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
 from tests.support.toolbox_model import (
     ToolboxAwareMockModelProvider as MockModelProvider,
 )
@@ -457,6 +458,11 @@ class _SourceStore:
     def __init__(self, registration: SourceRegistration | None) -> None:
         self.registration = registration
 
+    async def load_source_read_scope(
+        self, agent_id: str, source_id: str
+    ) -> SourceReadScope:
+        return SourceReadScope(agent_id, source_id, SourceReadMode.ALL)
+
     async def register_source(self, registration: SourceRegistration):
         self.registration = registration
         return registration
@@ -584,7 +590,6 @@ async def test_postgresql_backend_executes_the_checked_read_once_without_live_db
     monkeypatch.setattr(postgresql_query_module, "_close_postgresql_connection", close)
     backend = postgresql_query_module.PostgreSQLQueryBackend(
         _SourceStore(registration),
-        _CatalogSchemas((resource,)),
         EmptySecretProvider(),
     )
     result = await backend.execute_exact_tabular(
@@ -594,10 +599,7 @@ async def test_postgresql_backend_executes_the_checked_read_once_without_live_db
             canonical_sql="SELECT amount FROM public.orders WHERE amount = $1",
             sql_fingerprint="sha256:" + "1" * 64,
             parameters=(Decimal("1.20"),),
-            resource_ids=(resource.resource_id,),
-            resource_revisions=((resource.resource_id, cast(str, resource.revision)),),
-            source_revision=source_revision,
-            sensitivity_classes=(resource.sensitivity_class,),
+            resource_ids=("resource-orders",),
         ),
         format_name=format_name,
         parameters_sha256="sha256:" + "0" * 64,
@@ -613,8 +615,7 @@ async def test_postgresql_backend_executes_the_checked_read_once_without_live_db
     assert closed
     assert result.content == b'"amount"\r\n1.20\r\n'
     assert result.format == format_name
-    assert result.resource_revisions == ((resource.resource_id, resource.revision),)
-    assert result.source_revision == source_revision
+    assert result.resource_ids == ("resource-orders",)
 
 
 def test_semantic_csv_tool_schema_cannot_accept_rows_bytes_or_provenance() -> None:
@@ -871,8 +872,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
         assert set(export_data) == {
             "adapter_id",
             "source_id",
-            "source_revision",
-            "resource_revisions",
+            "resource_ids",
             "format",
             "filename",
             "row_count",
@@ -948,7 +948,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
             (),
             "sql_validation_failed",
         ),
-        ("SELECT * FROM missing", (), "resource_read_not_allowed"),
+        ("SELECT * FROM missing", (), "query_invalid"),
     ),
 )
 async def test_csv_export_reuses_current_sql_and_catalog_validation(

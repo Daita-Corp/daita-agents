@@ -25,6 +25,10 @@ class EffectiveSourceScope:
     source_labels: Mapping[str, tuple[str, str]] = field(
         default_factory=dict, hash=False
     )
+    # Sources this run may read in full: the engine decides what exists. For
+    # these, resource_ids holds only what the catalog knows, for name resolution
+    # and catalog tools; it never limits a read.
+    unrestricted_source_ids: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         for name, maximum in (("source_ids", 256), ("resource_ids", 10_000)):
@@ -47,6 +51,10 @@ class EffectiveSourceScope:
         ):
             raise ValueError("source labels must name admitted sources")
         object.__setattr__(self, "source_labels", MappingProxyType(labels))
+        unrestricted = frozenset(self.unrestricted_source_ids)
+        if not unrestricted <= self.source_ids:
+            raise ValueError("unrestricted sources must be admitted sources")
+        object.__setattr__(self, "unrestricted_source_ids", unrestricted)
 
     def to_mapping(self) -> dict[str, object]:
         mapping: dict[str, object] = {
@@ -58,6 +66,10 @@ class EffectiveSourceScope:
                 source_id: list(self.source_labels[source_id])
                 for source_id in sorted(self.source_labels)
             }
+        if self.unrestricted_source_ids:
+            mapping["unrestricted_source_ids"] = tuple(
+                sorted(self.unrestricted_source_ids)
+            )
         return mapping
 
     def sources_named(self, name: str) -> tuple[str, ...]:
@@ -73,6 +85,7 @@ class EffectiveSourceScope:
         )
 
 
+EFFECTIVE_RESOURCE_LIMIT = 10_000
 SOURCE_REF_PREFIX = "s"
 RESOURCE_REF_PREFIX = "t"
 
@@ -146,8 +159,87 @@ async def resolve_machine_source_scope(
     sources -= {catalog.session_source_id}
     if not sources:
         return EffectiveSourceScope(frozenset(), frozenset())
-    resources = await catalog.readable_resource_ids(agent_id, tuple(sorted(sources)))
-    return EffectiveSourceScope(sources, resources)
+    unrestricted, resources = await _read_access(agent_id, sources, (), catalog)
+    return EffectiveSourceScope(
+        sources, resources, unrestricted_source_ids=unrestricted
+    )
+
+
+# (sources it leaves unrestricted, the tables it lists for every other source)
+ReadNarrowing = tuple[frozenset[str], frozenset[str]]
+
+
+def run_read_narrowings(run: RunInput) -> tuple[ReadNarrowing, ...]:
+    """What a run's frozen scope and machine ceiling each allow."""
+
+    narrowings: list[ReadNarrowing] = []
+    prepared = run.resolved_source_scope
+    if prepared is not None:
+        narrowings.append((prepared.unrestricted_source_ids, prepared.resource_ids))
+    ceiling = run.execution_scope
+    if ceiling is not None:
+        narrowings.append(
+            (
+                frozenset(ceiling.unrestricted_source_ids),
+                frozenset(ceiling.allowed_resource_ids),
+            )
+        )
+    return tuple(narrowings)
+
+
+def narrowed_read_access(
+    source_id: str,
+    access: frozenset[str] | None,
+    narrowings: tuple[ReadNarrowing, ...],
+) -> frozenset[str] | None:
+    """One source's current access under a run's limits; None means unrestricted.
+
+    Listed IDs from other sources are harmless here: an ID hashes its source, so
+    it never matches a table of this one.
+    """
+
+    for unrestricted, listed in narrowings:
+        if source_id not in unrestricted:
+            access = listed if access is None else access & listed
+    return access
+
+
+async def _read_access(
+    agent_id: str,
+    sources: frozenset[str],
+    narrowings: tuple[ReadNarrowing, ...],
+    catalog: SourceScopeCatalog,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Split sources into unrestricted ones and the tables listed for the rest."""
+
+    current = await catalog.source_read_access(agent_id, tuple(sorted(sources)))
+    unrestricted: set[str] = set()
+    listed: set[str] = set()
+    for source_id, access in current.items():
+        access = narrowed_read_access(source_id, access, narrowings)
+        if access is None:
+            unrestricted.add(source_id)
+        else:
+            listed |= access
+    if unrestricted:
+        listed |= await _cataloged_tables(agent_id, unrestricted, catalog)
+    return frozenset(unrestricted), frozenset(listed)
+
+
+async def _cataloged_tables(
+    agent_id: str, sources: set[str], catalog: SourceScopeCatalog
+) -> frozenset[str]:
+    """What the catalog knows of unrestricted sources; it advises, so may fail."""
+
+    from .catalog.protocols import CatalogStoreError
+
+    try:
+        known = await catalog.readable_resource_ids(agent_id, tuple(sorted(sources)))
+    except CatalogStoreError:
+        return frozenset()
+    # shortcut: past this bound a table is still readable, but tools that name a
+    # table by ID cannot reach it; lift it when catalog tools take names (2c).
+    return frozenset(sorted(known)[:EFFECTIVE_RESOURCE_LIMIT])
 
 
 class SourceScopeCatalog(Protocol):
@@ -158,6 +250,10 @@ class SourceScopeCatalog(Protocol):
     async def readable_resource_ids(
         self, agent_id: str, source_ids: tuple[str, ...] = ()
     ) -> frozenset[str]: ...
+
+    async def source_read_access(
+        self, agent_id: str, source_ids: tuple[str, ...]
+    ) -> Mapping[str, frozenset[str] | None]: ...
 
     @property
     def session_source_id(self) -> str | None: ...
@@ -214,13 +310,9 @@ async def resolve_effective_source_scope(
         sources -= {catalog.session_source_id}
     if not sources:
         return empty
-    resources = await catalog.readable_resource_ids(
-        run.agent_id, tuple(sorted(sources))
+    unrestricted, resources = await _read_access(
+        run.agent_id, sources, run_read_narrowings(run), catalog
     )
-    if ceiling is not None:
-        resources &= frozenset(ceiling.allowed_resource_ids)
-    if prepared is not None:
-        resources &= prepared.resource_ids
     return EffectiveSourceScope(
         sources,
         resources,
@@ -232,4 +324,5 @@ async def resolve_effective_source_scope(
             and isinstance(display_name := fact.get("display_name"), str)
             and display_name
         },
+        unrestricted,
     )

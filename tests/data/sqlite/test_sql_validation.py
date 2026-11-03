@@ -1,55 +1,31 @@
 import pytest
 
+from daita.catalog.models import ResourceKind, catalog_resource_id
 from daita.domains.data.sql import (
     MAX_SQL_CHARACTERS,
-    ResourceSchema,
     analyze_sqlite_sql,
     validate_read,
 )
 
-_REVISION = "sha256:" + "3" * 64
+_SOURCE = "source-sqlite"
 
 
-def _resource(
-    resource_id: str,
-    name: str,
-    columns: tuple[str, ...],
-) -> ResourceSchema:
-    return ResourceSchema(
-        resource_id=resource_id,
-        source_id="source-sqlite",
-        name=name,
-        columns=columns,
-        revision=_REVISION,
-        source_revision="schema_version:1",
-        resource_kind="table",
-    )
-
-
-_ORDERS = _resource(
-    "resource-orders",
-    "orders",
-    ("id", "customer_id", "status", "total_amount", "ordered_at"),
-)
-_CUSTOMERS = _resource(
-    "resource-customers",
-    "customers",
-    ("id", "name", "region"),
-)
-_RESOURCES = (_ORDERS, _CUSTOMERS)
+def _table(name: str) -> str:
+    return catalog_resource_id(_SOURCE, ResourceKind.TABLE, f"main.{name}")
 
 
 def _validate(
     sql: str,
     *,
     parameters: tuple[object, ...] = (),
+    allowed: frozenset[str] | None = None,
 ):
     return validate_read(
         sql,
         dialect="sqlite",
-        source_id="source-sqlite",
-        resources=_RESOURCES,
+        source_id=_SOURCE,
         parameters=parameters,
+        allowed_resource_ids=allowed,
     )
 
 
@@ -72,13 +48,11 @@ def test_ordinary_sqlite_query_shapes_are_valid(sql: str) -> None:
 
     assert result.valid, result.issues
     assert result.resource_ids
-    assert result.source_revision == "schema_version:1"
 
 
 @pytest.mark.parametrize(
     ("sql", "issue_code"),
     (
-        ("SELECT 1", "resource_scope_empty"),
         ("DELETE FROM orders", "mutation_not_allowed"),
         ("INSERT INTO orders (id) VALUES (1)", "mutation_not_allowed"),
         ("UPDATE orders SET id = 1", "mutation_not_allowed"),
@@ -89,8 +63,7 @@ def test_ordinary_sqlite_query_shapes_are_valid(sql: str) -> None:
             "mutation_not_allowed",
         ),
         ("/* SELECT 1; */ DROP TABLE orders", "mutation_not_allowed"),
-        ("SELECT o.id FROM absent o", "resource_out_of_scope"),
-        ("SELECT * FROM sqlite_schema", "resource_out_of_scope"),
+        ("SELECT o.id FROM temp.absent o", "resource_out_of_scope"),
         ("SELECT * FROM pragma_database_list", "resource_out_of_scope"),
         ("SELECT * FROM pragma_table_info('orders')", "function_not_allowed"),
         ("SELECT o.id FROM orders o; SELECT 1", "multiple_statements"),
@@ -108,6 +81,38 @@ def test_invalid_sqlite_statements_fail_closed_before_any_source_io(
 
     assert not result.valid
     assert issue_code in result.issue_codes
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT * FROM companies",
+        "SELECT * FROM Companies",
+        'SELECT * FROM "COMPANIES"',
+        "SELECT * FROM main.companies",
+        "SELECT * FROM MAIN.Companies",
+    ),
+)
+def test_every_spelling_of_a_table_is_one_identity(sql: str) -> None:
+    result = _validate(sql, allowed=frozenset({_table("companies")}))
+
+    assert result.valid
+    assert result.resource_names == ((_table("companies"), "main.companies"),)
+
+
+def test_selected_scope_refuses_other_tables_and_the_schema_table() -> None:
+    allowed = frozenset({_table("companies")})
+
+    assert (
+        "resource_out_of_scope"
+        in _validate("SELECT * FROM orders", allowed=allowed).issue_codes
+    )
+    assert (
+        "resource_out_of_scope"
+        in _validate("SELECT * FROM sqlite_schema", allowed=allowed).issue_codes
+    )
+    assert _validate("SELECT * FROM sqlite_schema").valid
+    assert _validate("SELECT 1").valid
 
 
 def test_sqlite_parameters_must_match_placeholders() -> None:

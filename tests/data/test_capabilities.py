@@ -261,6 +261,12 @@ class _Catalog:
             (schema, self.sqlite_other) if source_id == "source-sqlite" else (schema,)
         )
 
+    async def source_read_access(self, agent_id, source_ids):
+        return {
+            source_id: await self.readable_resource_ids(agent_id, (source_id,))
+            for source_id in source_ids
+        }
+
     async def readable_resource_ids(
         self,
         agent_id: str,
@@ -501,8 +507,12 @@ async def test_exact_relational_projection_rechecks_current_source_admission():
 
 
 async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
+    class WholeSources(_Catalog):
+        async def source_read_access(self, agent_id, source_ids):
+            return dict.fromkeys(source_ids)
+
     domain = object.__new__(DataCapabilityDomain)
-    domain._catalog = cast(DataDomainCatalog, _Catalog())
+    domain._catalog = cast(DataDomainCatalog, WholeSources())
     domain._source_types = SourceTypeRegistry()
 
     sqlite = await domain._validate_sql(
@@ -547,18 +557,6 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
             },
         )
     assert unknown_source.value.code == "sql_source_not_available"
-    # The tables a read touches come from the SQL; one the catalog lacks is
-    # refused before any source I/O.
-    with pytest.raises(CapabilityInputError) as unknown_resource:
-        await domain._validate_sql(
-            _run(),
-            operation=SourceOperation.SQL_READ,
-            arguments={
-                "source_id": "source-sqlite",
-                "sql": "SELECT id FROM missing_items",
-            },
-        )
-    assert unknown_resource.value.code == "resource_read_not_allowed"
 
 
 def _prepared_read(resource_id: str) -> dict[str, object]:
@@ -600,8 +598,6 @@ class _ReadBackend:
             canonical_sql="SELECT id FROM items",
             sql_fingerprint="sha256:" + "5" * 64,
             resource_ids=(resource_id,),
-            resource_revisions=((resource_id, "sha256:" + "6" * 64),),
-            source_revision="sha256:" + "7" * 64,
             columns=("id",),
             projection=projection,
         )
@@ -690,9 +686,8 @@ class _ExportBackend:
             format=str(arguments["format_name"]),
             adapter_id=self.adapter_id,
             source_id=str(arguments["source_id"]),
-            source_revision="sha256:" + "7" * 64,
             sql_fingerprint="sha256:" + "5" * 64,
-            resource_revisions=((resource_id, "sha256:" + "6" * 64),),
+            resource_ids=(resource_id,),
             columns=("id",),
             row_count=1,
             content=b"id\r\n1\r\n",
@@ -727,10 +722,7 @@ async def test_data_export_routes_each_catalog_binding_to_exactly_one_backend() 
         )
         assert output.data["adapter_id"] == adapter_id
         assert output.data["source_id"] == f"source-{adapter_id}"
-        revisions = output.data["resource_revisions"]
-        assert isinstance(revisions, tuple) and len(revisions) == 1
-        assert revisions[0]["resource_id"] == f"resource-{adapter_id}"
-        assert revisions[0]["revision"] == "sha256:" + "6" * 64
+        assert output.data["resource_ids"] == (f"resource-{adapter_id}",)
         assert output.artifact is not None
         assert output.artifact.provenance.resource_bindings[0].resource_id == (
             f"resource-{adapter_id}"

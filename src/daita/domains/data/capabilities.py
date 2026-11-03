@@ -7,6 +7,7 @@ import math
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import Protocol, TypeVar, cast
 
 from ..._json import FrozenJsonObject, canonical_json
@@ -193,12 +194,12 @@ RELATIONAL_UPDATE_RECEIPT_POLICY = EffectReceiptPolicy(
 
 @dataclass(frozen=True, slots=True)
 class SqlReadResult:
+    """One read's facts: the tables come from the parse, the rest from the source."""
+
     source_id: str
     canonical_sql: str
     sql_fingerprint: str
     resource_ids: tuple[str, ...]
-    resource_revisions: tuple[tuple[str, str], ...]
-    source_revision: str
     columns: tuple[str, ...]
     projection: BoundedResultProjection
     resource_names: tuple[tuple[str, str], ...] = ()
@@ -208,19 +209,13 @@ class SqlReadResult:
             (self.source_id, "source_id"),
             (self.canonical_sql, "canonical_sql"),
             (self.sql_fingerprint, "sql_fingerprint"),
-            (self.source_revision, "source_revision"),
         ):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be a non-empty string")
         resource_ids = tuple(self.resource_ids)
-        revisions = tuple(sorted(tuple(item) for item in self.resource_revisions))
         columns = tuple(self.columns)
-        if not resource_ids or len(resource_ids) != len(set(resource_ids)):
-            raise ValueError("resource_ids must be non-empty and unique")
-        if {item[0] for item in revisions} != set(resource_ids):
-            raise ValueError("resource_revisions must cover every resource")
-        if any(not value.startswith("sha256:") for _, value in revisions):
-            raise ValueError("resource revisions must use sha256")
+        if len(resource_ids) != len(set(resource_ids)):
+            raise ValueError("resource_ids must be unique")
         if any(not isinstance(item, str) or not item for item in columns):
             raise ValueError("columns must contain non-empty strings")
         if not isinstance(self.projection, BoundedResultProjection):
@@ -230,7 +225,6 @@ class SqlReadResult:
             raise ValueError("resource_names must cover every resource")
         object.__setattr__(self, "resource_names", names)
         object.__setattr__(self, "resource_ids", resource_ids)
-        object.__setattr__(self, "resource_revisions", revisions)
         object.__setattr__(self, "columns", columns)
 
     def tool_data(self) -> FrozenJsonObject:
@@ -241,12 +235,7 @@ class SqlReadResult:
                 "canonical_sql": self.canonical_sql,
                 "columns": self.columns,
                 "resource_ids": self.resource_ids,
-                "resource_revisions": tuple(
-                    {"resource_id": resource_id, "revision": revision}
-                    for resource_id, revision in self.resource_revisions
-                ),
                 "source_id": self.source_id,
-                "source_revision": self.source_revision,
                 "sql_fingerprint": self.sql_fingerprint,
                 "tables_touched": tables_touched(self.resource_names),
             }
@@ -256,7 +245,7 @@ class SqlReadResult:
 def tables_touched(
     resource_names: Iterable[tuple[str, str]],
 ) -> tuple[dict[str, str], ...]:
-    """Name the catalog tables a read touched, ordered for stable evidence."""
+    """Name the tables a read touched, ordered for stable evidence."""
 
     return tuple(
         {"name": name, "resource_id": resource_id}
@@ -749,6 +738,7 @@ class DataQueryExecutor:
         statement_timeout_seconds: float = DATA_QUERY_STATEMENT_TIMEOUT_SECONDS,
         total_timeout_seconds: float = DATA_QUERY_TOTAL_TIMEOUT_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if not 0 < statement_timeout_seconds <= total_timeout_seconds:
             raise ValueError("statement timeout must be positive and within total")
@@ -759,6 +749,7 @@ class DataQueryExecutor:
         self._statement_timeout_seconds = float(statement_timeout_seconds)
         self._total_timeout_seconds = float(total_timeout_seconds)
         self._clock = clock
+        self._wall_clock = wall_clock
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         source_id = request.arguments["source_id"]
@@ -773,12 +764,12 @@ class DataQueryExecutor:
         deadline = started + self._total_timeout_seconds
         remaining_rows = self._max_rows
         remaining_bytes = self._max_bytes
-        results: list[tuple[SqlReadResult | None, int]] = []
+        results: list[tuple[SqlReadResult | None, int, str]] = []
         for read in reads:
             if remaining_rows < 1 or remaining_bytes < 2:
                 # The shared budget is spent; later statements are reported as
                 # skipped rather than silently omitted.
-                results.append((None, 0))
+                results.append((None, 0, ""))
                 continue
             remaining_seconds = deadline - self._clock()
             if remaining_seconds <= 0:
@@ -788,6 +779,7 @@ class DataQueryExecutor:
                     f"{self._total_timeout_seconds:g} seconds.",
                 )
             statement_started = self._clock()
+            read_at = self._wall_clock().isoformat()
             result = await backend.execute_read(
                 agent_id=self._agent_id,
                 source_id=source_id,
@@ -799,10 +791,10 @@ class DataQueryExecutor:
             elapsed_ms = _elapsed_ms(statement_started, self._clock())
             if not isinstance(result, SqlReadResult) or result.source_id != source_id:
                 raise ValueError("SQL backend returned a different source")
-            results.append((result, elapsed_ms))
+            results.append((result, elapsed_ms, read_at))
             remaining_rows -= result.projection.returned_rows
             remaining_bytes -= result.projection.utf8_bytes
-        executed = tuple(result for result, _ in results if result is not None)
+        executed = tuple(result for result, _, _ in results if result is not None)
         timing = {
             "elapsed_ms": _elapsed_ms(started, self._clock()),
             "statement_timeout_ms": int(self._statement_timeout_seconds * 1_000),
@@ -811,6 +803,7 @@ class DataQueryExecutor:
         if len(reads) == 1:
             data = executed[0].tool_data().to_dict()
             data["adapter_id"] = adapter_id
+            data["read_at"] = results[0][2]
             data["timing"] = timing
             return ToolOutput(kind=DATA_QUERY_EVIDENCE_KIND, data=data)
         return ToolOutput(
@@ -861,7 +854,7 @@ class _InputRead:
 
     columns: tuple[str, ...]
     projection: BoundedResultProjection
-    resource_revisions: tuple[tuple[str, str], ...]
+    resource_ids: tuple[str, ...]
     resource_names: tuple[tuple[str, str], ...]
     lineage: dict[str, object]
 
@@ -959,9 +952,7 @@ class DataQueryCombinedExecutor:
             truncated=cast(bool, payload["truncated"]),
             truncation_reasons=cast(tuple[str, ...], payload["truncation_reasons"]),
         )
-        revisions = dict(
-            revision for _, read in reads for revision in read.resource_revisions
-        )
+        touched = {item for _, read in reads for item in read.resource_ids}
         names = dict(name for _, read in reads for name in read.resource_names)
         data = projection.to_payload().to_dict()
         data.update(
@@ -971,11 +962,7 @@ class DataQueryCombinedExecutor:
                 "inputs": tuple(
                     {"alias": alias, **read.lineage} for alias, read in reads
                 ),
-                "resource_ids": tuple(sorted(revisions)),
-                "resource_revisions": tuple(
-                    {"resource_id": resource_id, "revision": revision}
-                    for resource_id, revision in sorted(revisions.items())
-                ),
+                "resource_ids": tuple(sorted(touched)),
                 "sql_fingerprint": payload["sql_fingerprint"],
                 "tables_touched": tables_touched(names.items()),
                 "timing": {
@@ -994,6 +981,7 @@ class DataQueryCombinedExecutor:
         backend = self._backends.get(cast(str, item["_adapter_id"]))
         if backend is None:
             raise ValueError("relational query adapter binding is unsupported")
+        read_at = datetime.now(UTC).isoformat()
         result = await backend.execute_read(
             agent_id=self._agent_id,
             source_id=source_id,
@@ -1007,15 +995,14 @@ class DataQueryCombinedExecutor:
         return _InputRead(
             columns=result.columns,
             projection=result.projection,
-            resource_revisions=result.resource_revisions,
+            resource_ids=result.resource_ids,
             resource_names=result.resource_names,
             lineage={
                 "source_id": result.source_id,
-                "source_revision": result.source_revision,
+                "read_at": read_at,
                 "canonical_sql": result.canonical_sql,
                 "sql_fingerprint": result.sql_fingerprint,
                 "resource_ids": result.resource_ids,
-                "resource_revisions": _revision_payload(result.resource_revisions),
                 "rows": result.projection.returned_rows,
             },
         )
@@ -1027,12 +1014,12 @@ class DataQueryCombinedExecutor:
         if backend is None:
             raise ValueError("tabular read adapter binding is unsupported")
         resource_id = cast(str, item["resource_id"])
-        revision = cast(str, item["_resource_revision"])
         columns = cast(tuple[str, ...], item["columns"])
         filters = tuple(
             TabularFilter.from_mapping(cast(Mapping[str, object], value))
             for value in cast(tuple[object, ...], item.get("filters", ()))
         )
+        read_at = datetime.now(UTC).isoformat()
         projection = await backend.read_tabular(
             ReadTabularRequest(
                 agent_id=self._agent_id,
@@ -1049,31 +1036,20 @@ class DataQueryCombinedExecutor:
             set(row) != set(columns) for row in projection.rows
         ):
             raise ValueError("tabular backend returned different columns")
-        revisions = ((resource_id, revision),)
         return _InputRead(
             columns=columns,
             projection=projection,
-            resource_revisions=revisions,
+            resource_ids=(resource_id,),
             resource_names=((resource_id, cast(str, item["_resource_name"])),),
             lineage={
                 "source_id": item["source_id"],
-                "source_revision": item["_source_revision"],
+                "read_at": read_at,
                 "columns": columns,
                 "filters": tuple(value.to_payload() for value in filters),
                 "resource_ids": (resource_id,),
-                "resource_revisions": _revision_payload(revisions),
                 "rows": projection.returned_rows,
             },
         )
-
-
-def _revision_payload(
-    revisions: tuple[tuple[str, str], ...],
-) -> tuple[dict[str, str], ...]:
-    return tuple(
-        {"resource_id": resource_id, "revision": revision}
-        for resource_id, revision in revisions
-    )
 
 
 def _elapsed_ms(started: float, finished: float) -> int:
@@ -1083,49 +1059,41 @@ def _elapsed_ms(started: float, finished: float) -> int:
 def _multi_statement_data(
     adapter_id: str,
     source_id: str,
-    results: list[tuple[SqlReadResult | None, int]],
+    results: list[tuple[SqlReadResult | None, int, str]],
     *,
     timing: Mapping[str, int],
     row_limit: int,
     byte_limit: int,
 ) -> dict[str, object]:
     statements: list[dict[str, object]] = []
-    revisions: dict[str, str] = {}
+    touched: set[str] = set()
     names: dict[str, str] = {}
     reasons: list[str] = []
-    source_revision = ""
-    for index, (result, elapsed_ms) in enumerate(results):
+    for index, (result, elapsed_ms, read_at) in enumerate(results):
         if result is None:
             statements.append({"index": index, "status": "skipped_budget_spent"})
             reasons.append("budget_spent")
             continue
-        source_revision = result.source_revision
-        revisions.update(result.resource_revisions)
+        touched.update(result.resource_ids)
         names.update(result.resource_names)
         payload = result.tool_data().to_dict()
-        for name in ("source_id", "source_revision", "resource_revisions"):
-            payload.pop(name)
-        for name in ("row_limit", "byte_limit"):
+        for name in ("source_id", "row_limit", "byte_limit"):
             payload.pop(name)
         payload["elapsed_ms"] = elapsed_ms
         payload["index"] = index
+        payload["read_at"] = read_at
         payload["status"] = "completed"
         statements.append(payload)
         reasons.extend(result.projection.truncation_reasons)
-    executed = [result for result, _ in results if result is not None]
+    executed = [result for result, _, _ in results if result is not None]
     fingerprint = canonical_json([result.sql_fingerprint for result in executed])
     return {
         "adapter_id": adapter_id,
         "byte_limit": byte_limit,
-        "resource_ids": tuple(sorted(revisions)),
-        "resource_revisions": tuple(
-            {"resource_id": resource_id, "revision": revision}
-            for resource_id, revision in sorted(revisions.items())
-        ),
+        "resource_ids": tuple(sorted(touched)),
         "returned_rows": sum(result.projection.returned_rows for result in executed),
         "row_limit": row_limit,
         "source_id": source_id,
-        "source_revision": source_revision,
         "sql_fingerprint": "sha256:"
         + hashlib.sha256(fingerprint.encode("utf-8")).hexdigest(),
         "statements": tuple(statements),
@@ -1623,7 +1591,6 @@ def _query_declarations(
                 "resource_ids": {
                     "type": "array",
                     "items": resource_id_schema(),
-                    "minItems": 1,
                     "maxItems": DATA_QUERY_MAX_RESOURCES,
                     "uniqueItems": True,
                     "readOnly": True,
@@ -1667,7 +1634,6 @@ def _query_declarations(
     resource_ids_rule = {
         "type": "array",
         "items": resource_id_schema(),
-        "minItems": 1,
         "maxItems": DATA_QUERY_MAX_RESOURCES,
         "uniqueItems": True,
         "readOnly": True,
@@ -1814,6 +1780,13 @@ def _query_declarations(
     )
 
 
+# Results stored before reads stopped binding catalog revisions still validate.
+_STORED_READ_RESULT_KEYS: dict[str, object] = {
+    "resource_revisions": {"type": "array"},
+    "source_revision": {"type": "string"},
+}
+
+
 def _combined_query_output_schema() -> dict[str, object]:
     types = {
         "byte_limit": "integer",
@@ -1821,7 +1794,6 @@ def _combined_query_output_schema() -> dict[str, object]:
         "columns": "array",
         "inputs": "array",
         "resource_ids": "array",
-        "resource_revisions": "array",
         "returned_rows": "integer",
         "row_limit": "integer",
         "rows": "array",
@@ -1836,7 +1808,10 @@ def _combined_query_output_schema() -> dict[str, object]:
     }
     return {
         "type": "object",
-        "properties": {name: {"type": kind} for name, kind in sorted(types.items())},
+        "properties": {
+            **{name: {"type": kind} for name, kind in sorted(types.items())},
+            **_STORED_READ_RESULT_KEYS,
+        },
         "required": sorted(types),
         "additionalProperties": False,
     }
@@ -1848,13 +1823,12 @@ def _query_output_schema() -> dict[str, object]:
         "adapter_id": "string",
         "canonical_sql": "string",
         "columns": "array",
+        "read_at": "string",
         "resource_ids": "array",
-        "resource_revisions": "array",
         "returned_rows": "integer",
         "row_limit": "integer",
         "rows": "array",
         "source_id": "string",
-        "source_revision": "string",
         "sql_fingerprint": "string",
         "statements": "array",
         "tables_touched": "array",
@@ -1867,10 +1841,13 @@ def _query_output_schema() -> dict[str, object]:
     }
     # One statement keeps its columns, rows and SQL at the top level; several
     # statements report them per entry under statements.
-    per_statement = {"canonical_sql", "columns", "rows", "statements"}
+    per_statement = {"canonical_sql", "columns", "read_at", "rows", "statements"}
     return {
         "type": "object",
-        "properties": {name: {"type": kind} for name, kind in sorted(types.items())},
+        "properties": {
+            **{name: {"type": kind} for name, kind in sorted(types.items())},
+            **_STORED_READ_RESULT_KEYS,
+        },
         "required": sorted(set(types) - per_statement),
         "additionalProperties": False,
     }

@@ -5,6 +5,7 @@ import re
 import sqlite3
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 from ..sqlite_schema import (
     ANALYSIS_EVIDENCE_SQL,
@@ -298,6 +299,173 @@ def _askable_mcp_binding(record: dict[str, object]) -> dict[str, object]:
     return record
 
 
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _replaced(value: object, replacements: dict[str, str]) -> object:
+    if isinstance(value, str):
+        return replacements.get(value, value)
+    if isinstance(value, list):
+        return [_replaced(item, replacements) for item in value]
+    if isinstance(value, dict):
+        return {key: _replaced(item, replacements) for key, item in value.items()}
+    return value
+
+
+def _folded_snapshot(
+    source_id: str, fields: dict[str, Any]
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Fold one SQLite snapshot's table names, recomputing its chain of hashes.
+
+    A resource ID hashes its name, a relationship ID its endpoints, a relationship
+    revision that ID, and a resource revision its ID and relationship revisions.
+    Returns the old-to-new resource IDs and revisions; both empty if nothing folds.
+    """
+
+    ids: dict[str, str] = {}
+    identities: dict[str, str] = {}
+    for record in fields["resources"]:
+        resource = record["fields"]
+        folded = str(resource["native_identity"]).translate(_ASCII_LOWER)
+        ids[resource["id"]] = "catalog-resource:" + _digest(
+            {
+                "kind": resource["kind"]["value"],
+                "native_identity": folded,
+                "source_id": source_id,
+            }
+        )
+        identities[resource["id"]] = folded
+    if len(set(ids.values())) != len(ids):
+        raise ValueError("Historical SQLite catalog has tables differing only by case")
+    if all(old == new for old, new in ids.items()):
+        return {}, {}
+
+    for record in fields["facets"]:
+        record["fields"]["resource_id"] = ids[record["fields"]["resource_id"]]
+    relationship_revisions: dict[str, str] = {}
+    for record in fields["relationships"]:
+        relationship = record["fields"]
+        relationship["from_resource_id"] = ids[relationship["from_resource_id"]]
+        relationship["to_resource_id"] = ids[relationship["to_resource_id"]]
+        relationship["id"] = "catalog-relationship:" + _digest(
+            {
+                "field_pairs": [
+                    item["fields"]
+                    for item in sorted(
+                        relationship["field_pairs"],
+                        key=lambda item: item["fields"]["ordinal"],
+                    )
+                ],
+                "from_resource_id": relationship["from_resource_id"],
+                "kind": relationship["kind"]["value"],
+                "provenance": relationship["provenance"]["value"],
+                "source_id": source_id,
+                "to_resource_id": relationship["to_resource_id"],
+            }
+        )
+        revision = _digest(
+            {
+                "attributes": relationship["attributes"],
+                "confidence": float(relationship["confidence"]),
+                "relationship_id": relationship["id"],
+            }
+        )
+        relationship_revisions[relationship["revision"]] = revision
+        relationship["revision"] = revision
+    revisions: dict[str, str] = {}
+    for record in fields["revisions"]:
+        revision_fields = record["fields"]
+        revision_fields["resource_id"] = ids[revision_fields["resource_id"]]
+        revision_fields["relationship_revisions"] = sorted(
+            relationship_revisions[item]
+            for item in revision_fields["relationship_revisions"]
+        )
+        revision = _digest(
+            {
+                "facet_revisions": sorted(revision_fields["facet_revisions"]),
+                "relationship_revisions": revision_fields["relationship_revisions"],
+                "resource_id": revision_fields["resource_id"],
+            }
+        )
+        revisions[revision_fields["revision"]] = revision
+        revision_fields["revision"] = revision
+    for record in fields["resources"]:
+        resource = record["fields"]
+        resource["native_identity"] = identities[resource["id"]]
+        resource["id"] = ids[resource["id"]]
+        resource["current_revision"] = revisions[resource["current_revision"]]
+    return ids, revisions
+
+
+def _fold_sqlite_identities(connection: sqlite3.Connection) -> None:
+    """Give SQLite tables one identity per name, as SQLite itself does.
+
+    What must keep matching moves with them: read scopes, semantic annotations and
+    catalog snapshots. Artifacts, runs, messages and evidence stay as history.
+    """
+
+    sqlite_sources = {
+        (agent_id, source_id)
+        for agent_id, source_id, encoded in connection.execute(
+            "SELECT agent_id, id, data FROM sources"
+        )
+        if json.loads(encoded)["fields"]["adapter_id"] == "sqlite"
+    }
+    moved: dict[str, dict[str, str]] = {}
+    for agent_id, source_id, encoded in connection.execute(
+        "SELECT agent_id, source_id, data FROM snapshots"
+    ).fetchall():
+        if (agent_id, source_id) not in sqlite_sources:
+            continue
+        snapshot = json.loads(encoded)
+        ids, revisions = _folded_snapshot(source_id, snapshot["fields"])
+        if not ids:
+            continue
+        moved.setdefault(agent_id, {}).update(ids)
+        moved[agent_id].update(revisions)
+        connection.execute(
+            "UPDATE snapshots SET data = ? WHERE agent_id = ? AND source_id = ?",
+            (_dump(snapshot), agent_id, source_id),
+        )
+        scope_row = connection.execute(
+            "SELECT data FROM source_read_scopes WHERE agent_id = ? AND source_id = ?",
+            (agent_id, source_id),
+        ).fetchone()
+        if scope_row is not None:
+            scope = _replaced(json.loads(scope_row[0]), ids)
+            assert isinstance(scope, dict)
+            scope["fields"]["resource_ids"] = sorted(scope["fields"]["resource_ids"])
+            connection.execute(
+                "UPDATE source_read_scopes SET data = ? "
+                "WHERE agent_id = ? AND source_id = ?",
+                (_dump(scope), agent_id, source_id),
+            )
+    for agent_id, annotation_id, encoded in connection.execute(
+        "SELECT agent_id, id, data FROM semantic_annotations"
+    ).fetchall():
+        replacements = moved.get(agent_id)
+        if not replacements:
+            continue
+        annotation = _replaced(json.loads(encoded), replacements)
+        assert isinstance(annotation, dict)
+        fields = annotation["fields"]
+        subject = fields["subject"]["fields"]
+        subject["resource_ids"] = sorted(subject["resource_ids"])
+        subject["fields"].sort(
+            key=lambda item: (
+                item["fields"]["resource_id"],
+                item["fields"]["field_name"],
+            )
+        )
+        fields["catalog_revisions"].sort(
+            key=lambda item: (item["fields"]["resource_id"], item["fields"]["revision"])
+        )
+        connection.execute(
+            "UPDATE semantic_annotations SET data = ? WHERE agent_id = ? AND id = ?",
+            (_dump(annotation), agent_id, annotation_id),
+        )
+
+
 def _apply_revision_4(home: Path, source_shape: str | None) -> None:
     if source_shape is not None:
         raise ValueError("Unknown analysis migration source")
@@ -365,6 +533,7 @@ def _apply_revision_4(home: Path, source_shape: str | None) -> None:
                 ),
             )
         _convert_graph_jobs(connection)
+        _fold_sqlite_identities(connection)
         connection.commit()
 
 

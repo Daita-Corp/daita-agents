@@ -223,7 +223,7 @@ async def test_sqlite_execution_remains_bound_during_aba_path_substitution(
     )
 
     if execution == "query":
-        _columns, rows, _revision = await sqlite_query_module._run_query(
+        _columns, rows = await sqlite_query_module._run_query(
             admitted,
             "SELECT value FROM records",
             (),
@@ -232,18 +232,16 @@ async def test_sqlite_execution_remains_bound_during_aba_path_substitution(
         )
         assert rows == ({"value": "admitted"},)
     else:
-        content, _columns, row_count, _revision = (
-            await sqlite_query_module._run_exact_tabular(
-                admitted,
-                "SELECT value FROM records",
-                (),
-                format_name="csv",
-                xlsx_provenance=None,
-                max_rows=10,
-                max_columns=10,
-                max_bytes=10_000,
-                timeout_seconds=5,
-            )
+        content, _columns, row_count = await sqlite_query_module._run_exact_tabular(
+            admitted,
+            "SELECT value FROM records",
+            (),
+            format_name="csv",
+            xlsx_provenance=None,
+            max_rows=10,
+            max_columns=10,
+            max_bytes=10_000,
+            timeout_seconds=5,
         )
         assert row_count == 1
         assert b"admitted" in content

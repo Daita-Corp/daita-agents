@@ -612,14 +612,12 @@ async def test_relational_evidence_preserves_exact_current_resource_bindings(
     (table_ref,) = result.artifacts
     query_data = _tool_result(transcript, "query").output.get("data")
     assert isinstance(query_data, Mapping)
-    revisions = query_data.get("resource_revisions")
-    assert isinstance(revisions, tuple)
+    assert query_data["resource_ids"] == (resource.id,)
     assert len(table_ref.provenance.resource_bindings) == 1
     binding = table_ref.provenance.resource_bindings[0]
     assert binding.source_id == source.id
-    assert binding.source_revision == query_data["source_revision"]
     assert binding.resource_id == resource.id
-    assert binding.resource_revision == revisions[0]["revision"]
+    assert binding.source_revision is None and binding.resource_revision is None
 
 
 async def test_artifact_read_previews_model_authored_xlsx_data(

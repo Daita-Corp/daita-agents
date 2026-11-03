@@ -79,9 +79,6 @@ async def _search(
         FileSearchBackend,
         agent._embedded._source_backends[SourceOperation.FILE_SEARCH]["folder"],
     )
-    resource_ids = await agent._embedded._data_view.readable_resource_ids(
-        agent.id, (source_id,)
-    )
     result = await backend.search_files(
         FileSearchRequest(
             agent_id=agent.id,
@@ -93,7 +90,7 @@ async def _search(
             mode=mode,
             glob=None,
             order_by="path",
-            resource_ids=resource_ids,
+            resource_ids=None,
         )
     )
     return cast(tuple[Mapping[str, object], ...], result.data["matches"])
@@ -104,9 +101,6 @@ async def _read(agent: Agent, source_id: str, path: str) -> Mapping[str, object]
         TextReadBackend,
         agent._embedded._source_backends[SourceOperation.TEXT_READ]["folder"],
     )
-    resource_ids = await agent._embedded._data_view.readable_resource_ids(
-        agent.id, (source_id,)
-    )
     result = await backend.read_text(
         TextReadRequest(
             agent_id=agent.id,
@@ -115,7 +109,7 @@ async def _read(agent: Agent, source_id: str, path: str) -> Mapping[str, object]
             path=path,
             cursor=None,
             position=None,
-            resource_ids=resource_ids,
+            resource_ids=None,
         )
     )
     return result.data
@@ -358,7 +352,7 @@ def _rows(result: SourceFileResult) -> list[dict[str, object]]:
 
 
 async def _path_query(
-    agent: Agent, source_id: str, pattern: str, resource_ids: frozenset[str]
+    agent: Agent, source_id: str, pattern: str, resource_ids: frozenset[str] | None
 ) -> SourceFileResult:
     backend = cast(
         PathPatternReadBackend,
@@ -404,6 +398,36 @@ async def test_attached_folder_path_pattern_matches_current_files_within_scope(
             await _path_query(agent, source.id, "*.csv", only_a)
         assert denied.value.code == "resource_read_not_allowed"
         assert "b.csv" in str(denied.value)
+    finally:
+        await agent.close()
+
+
+async def test_an_unrestricted_folder_reads_data_files_in_its_subpaths_only(
+    tmp_path: Path,
+) -> None:
+    folder = tmp_path / "data"
+    (folder / "in").mkdir(parents=True)
+    (folder / "out").mkdir()
+    (folder / "in" / "a.csv").write_text("id\n1\n", encoding="utf-8")
+    (folder / "in" / "notes.txt").write_text("private\n", encoding="utf-8")
+    (folder / "out" / "b.csv").write_text("id\n2\n", encoding="utf-8")
+    agent = await _agent(tmp_path, "folder-reach")
+    try:
+        source = await agent.attach(FolderSource(folder, subpaths=("in",)))
+        # Created after attach and never refreshed: the catalog does not know it.
+        (folder / "in" / "later.csv").write_text("id\n3\n", encoding="utf-8")
+        assert _rows(await _path_query(agent, source.id, "in/*.csv", None)) == [
+            {"n": 2}
+        ]
+        assert await _read(agent, source.id, "in/later.csv")
+        for path in ("in/notes.txt", "out/b.csv"):
+            with pytest.raises(FolderSourceError) as refused:
+                await _read(agent, source.id, path)
+            assert refused.value.error_code == "resource_read_not_allowed"
+        with pytest.raises(FolderSourceError) as outside:
+            await _path_query(agent, source.id, "out/*.csv", None)
+        assert outside.value.code == "resource_read_not_allowed"
+        assert "out/b.csv" in str(outside.value)
     finally:
         await agent.close()
 

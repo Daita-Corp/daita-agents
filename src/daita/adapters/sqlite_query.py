@@ -23,7 +23,6 @@ from ..artifacts.renderers import (
     arrow_schema,
 )
 from ..domains.data.capabilities import SQLiteReadResult, refused_read_details
-from ..domains.data.controller import ReadScopedCatalogReader
 from ..domains.data.export_capabilities import (
     ExactTabularExportResult,
     ExactTabularProgress,
@@ -33,7 +32,8 @@ from ..domains.data.results import project_result_rows
 from ..domains.data.sql import CheckedRead, denied_relations
 from ..errors import DaitaError
 from ..storage.sqlite_records import SourcePermissionStateError
-from .protocols import SourceStore
+from .models import SourceRegistration
+from .protocols import SourceReadScopeStore
 
 _DEFAULT_STATEMENT_TIMEOUT_SECONDS = 5.0
 _MAX_STATEMENT_TIMEOUT_SECONDS = 60.0
@@ -63,17 +63,14 @@ class _AdmittedSQLiteFile:
 class SQLiteQueryBackend:
     """Perform one bounded read-only query that already passed policy."""
 
-    def __init__(self, sources: SourceStore, catalog: ReadScopedCatalogReader) -> None:
-        if not isinstance(sources, SourceStore):
-            raise TypeError("sources must implement SourceStore")
-        if not callable(getattr(catalog, "readable_resource_ids", None)):
-            raise TypeError("catalog must provide readable_resource_ids")
+    def __init__(self, sources: SourceReadScopeStore) -> None:
+        if not isinstance(sources, SourceReadScopeStore):
+            raise TypeError("sources must implement SourceReadScopeStore")
         self._sources = sources
-        self._catalog = catalog
 
-    async def _configured_path(
+    async def _admit(
         self, agent_id: str, source_id: str, read: CheckedRead
-    ) -> str:
+    ) -> tuple[str, SourceRegistration]:
         """Recheck current permission, since a read can queue after it was prepared."""
 
         registration = await self._sources.load_source(agent_id, source_id)
@@ -99,19 +96,20 @@ class SQLiteQueryBackend:
                 "SQLite source configuration is missing its path.",
             )
         try:
-            readable = await self._catalog.readable_resource_ids(agent_id, (source_id,))
+            read_scope = await self._sources.load_source_read_scope(agent_id, source_id)
         except SourcePermissionStateError:
             raise SQLiteQueryError(
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from None
-        denied = denied_relations(read, frozenset(readable))
-        if denied:
+        denied = denied_relations(read, read_scope)
+        if denied is None or denied:
             raise SQLiteQueryError(
                 "resource_read_not_allowed",
-                f"{', '.join(denied)} is not available for reading in this run.",
+                f"{', '.join(denied or ('This source',))} is not available for "
+                "reading in this run.",
             )
-        return configured_path
+        return configured_path, registration
 
     async def execute_read(
         self,
@@ -130,10 +128,9 @@ class SQLiteQueryBackend:
         )
         if not 0 < statement_timeout <= _MAX_STATEMENT_TIMEOUT_SECONDS:
             raise ValueError("timeout_seconds must be from 0 through 60")
-        path = _regular_unaliased_path(
-            await self._configured_path(agent_id, source_id, read)
-        )
-        columns, rows, live_source_revision = await _run_query(
+        configured_path, _registration = await self._admit(agent_id, source_id, read)
+        path = _regular_unaliased_path(configured_path)
+        columns, rows = await _run_query(
             path,
             read.canonical_sql,
             read.parameters,
@@ -151,8 +148,6 @@ class SQLiteQueryBackend:
             canonical_sql=read.canonical_sql,
             sql_fingerprint=read.sql_fingerprint,
             resource_ids=read.resource_ids,
-            resource_revisions=read.resource_revisions,
-            source_revision=live_source_revision,
             columns=columns,
             projection=projection,
             resource_names=read.resource_names,
@@ -175,13 +170,14 @@ class SQLiteQueryBackend:
     ) -> ExactTabularExportResult:
         """Run one fresh read through the selected fixed renderer."""
 
-        configured_path = await self._configured_path(agent_id, source_id, read)
-        sensitivity = resolved_exact_export_sensitivity(read.sensitivity_classes)
+        configured_path, registration = await self._admit(agent_id, source_id, read)
+        sensitivity = resolved_exact_export_sensitivity(
+            (registration.presentation_sensitivity.value,)
+        )
         xlsx_provenance = (
             ExactXlsxProvenance(
                 source_id=source_id,
-                source_revision=read.source_revision,
-                resource_revisions=read.resource_revisions,
+                resource_ids=read.resource_ids,
                 sql_fingerprint=read.sql_fingerprint,
                 parameters_sha256=parameters_sha256,
                 sensitivity=sensitivity,
@@ -190,7 +186,7 @@ class SQLiteQueryBackend:
             if format_name == "xlsx"
             else None
         )
-        content, columns, row_count, live_source_revision = await _run_exact_tabular(
+        content, columns, row_count = await _run_exact_tabular(
             _regular_unaliased_path(configured_path),
             read.canonical_sql,
             read.parameters,
@@ -206,9 +202,8 @@ class SQLiteQueryBackend:
             format=format_name,
             adapter_id="sqlite",
             source_id=source_id,
-            source_revision=live_source_revision,
             sql_fingerprint=read.sql_fingerprint,
-            resource_revisions=read.resource_revisions,
+            resource_ids=read.resource_ids,
             columns=columns,
             row_count=row_count,
             content=content,
@@ -247,7 +242,7 @@ async def _run_query(
     max_rows: int,
     max_bytes: int,
     timeout_seconds: float = 5.0,
-) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...], str]:
+) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...]]:
     cancellation = threading.Event()
     worker = asyncio.create_task(
         asyncio.to_thread(
@@ -287,7 +282,7 @@ async def _run_exact_tabular(
     max_bytes: int,
     timeout_seconds: float,
     progress: ExactTabularProgress | None = None,
-) -> tuple[bytes, tuple[str, ...], int, str]:
+) -> tuple[bytes, tuple[str, ...], int]:
     cancellation = threading.Event()
     worker = asyncio.create_task(
         asyncio.to_thread(
@@ -331,7 +326,7 @@ def _run_exact_tabular_sync(
     timeout_seconds: float,
     cancellation: threading.Event,
     progress: ExactTabularProgress | None = None,
-) -> tuple[bytes, tuple[str, ...], int, str]:
+) -> tuple[bytes, tuple[str, ...], int]:
     connection: sqlite3.Connection | None = None
     admitted_descriptor: int | None = None
     timed_out = threading.Event()
@@ -356,13 +351,6 @@ def _run_exact_tabular_sync(
         if hasattr(connection, "setlimit"):
             connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, max(4_096, max_bytes))
         connection.execute("BEGIN")
-        version_row = connection.execute("PRAGMA schema_version").fetchone()
-        if version_row is None or not isinstance(version_row[0], int):
-            raise SQLiteQueryError(
-                "source_revision_unavailable",
-                "SQLite source revision could not be read.",
-            )
-        live_schema_version = version_row[0]
         connection.set_authorizer(_read_only_authorizer)
         cursor = connection.execute(sql, parameters)
         if cursor.description is None:
@@ -415,12 +403,7 @@ def _run_exact_tabular_sync(
         content = renderer.finish()
         connection.set_authorizer(None)
         connection.execute("COMMIT")
-        return (
-            content,
-            renderer.columns,
-            renderer.row_count,
-            f"schema_version:{live_schema_version}",
-        )
+        return content, renderer.columns, renderer.row_count
     except ArtifactError:
         raise
     except SQLiteQueryError:
@@ -460,7 +443,7 @@ def _run_query_sync(
     max_bytes: int,
     cancellation: threading.Event,
     timeout_seconds: float = 5.0,
-) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...], str]:
+) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...]]:
     deadline = time.monotonic() + timeout_seconds
     connection: sqlite3.Connection | None = None
     admitted_descriptor: int | None = None
@@ -482,13 +465,6 @@ def _run_query_sync(
                 max(4_096, max_bytes),
             )
         connection.execute("BEGIN")
-        version_row = connection.execute("PRAGMA schema_version").fetchone()
-        if version_row is None or not isinstance(version_row[0], int):
-            raise SQLiteQueryError(
-                "source_revision_unavailable",
-                "SQLite source revision could not be read.",
-            )
-        live_schema_version = version_row[0]
         connection.set_authorizer(_read_only_authorizer)
         columns, rows = _execute_user_query(
             connection,
@@ -498,7 +474,7 @@ def _run_query_sync(
         )
         connection.set_authorizer(None)
         connection.execute("COMMIT")
-        return columns, rows, f"schema_version:{live_schema_version}"
+        return columns, rows
     except SQLiteQueryError:
         raise
     except sqlite3.Error as error:

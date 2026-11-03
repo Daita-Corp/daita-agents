@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Protocol
 from ..config import HostCapacityLimits, PostgreSQLReadLimits
 from ..security import SecretProvider
 from .models import SourceRegistration
-from .protocols import ResourceSource, SourceStore
+from .protocols import ResourceSource, SourceReadScopeStore
 
 if TYPE_CHECKING:
     from ..domains.data.catalog import CatalogDataView
@@ -52,7 +52,7 @@ _SQL_OPERATIONS = frozenset(SourceOperation) - {
 class SourceBackendContext:
     """Host-owned dependencies a source type may use to build its backends."""
 
-    store: SourceStore
+    store: SourceReadScopeStore
     catalog: CatalogDataView
     secret_provider: SecretProvider
     clock: Callable[[], datetime]
@@ -204,7 +204,7 @@ def _sqlite_operations(
 ) -> Mapping[SourceOperation, object]:
     from .sqlite_query import SQLiteQueryBackend
 
-    backend = SQLiteQueryBackend(context.store, context.catalog)
+    backend = SQLiteQueryBackend(context.store)
     return {
         SourceOperation.SQL_READ: backend,
         SourceOperation.TABULAR_EXPORT: backend,
@@ -220,7 +220,6 @@ def _postgresql_operations(
 
     reads = PostgreSQLQueryBackend(
         context.store,
-        context.catalog,
         context.secret_provider,
         read_limits=context.postgresql_reads,
         source_capacity=context.host_capacity.postgresql_read_capacity,

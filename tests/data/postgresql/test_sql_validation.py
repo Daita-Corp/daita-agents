@@ -3,6 +3,7 @@ from collections.abc import Mapping
 
 import pytest
 
+from daita.catalog.models import ResourceKind, catalog_resource_id
 from daita.domains.data.capabilities import data_query_capability_declarations
 from daita.domains.data.export_capabilities import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
@@ -11,70 +12,34 @@ from daita.domains.data.export_capabilities import (
 from daita.domains.data.sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
-    ResourceSchema,
     analyze_postgresql_sql,
     validate_read,
 )
 
-_REVISION = "sha256:" + "1" * 64
-_SOURCE_REVISION = "sha256:" + "2" * 64
+_SOURCE = "source-postgresql"
 
 
-def _resource(
-    resource_id: str,
-    name: str,
-    columns: tuple[str, ...],
-    *,
-    schema: str = "sales",
-    resource_kind: str = "table",
-) -> ResourceSchema:
-    return ResourceSchema(
-        resource_id=resource_id,
-        source_id="source-postgresql",
-        name=name,
-        aliases=(f"{schema}.{name}",),
-        columns=columns,
-        revision=_REVISION,
-        source_revision=_SOURCE_REVISION,
-        resource_kind=resource_kind,
-    )
+def _table(name: str) -> str:
+    return catalog_resource_id(_SOURCE, ResourceKind.TABLE, f"sales.{name}")
 
 
-_ORDERS = _resource(
-    "resource-orders",
-    "orders",
-    (
-        "id",
-        "customer_id",
-        "status",
-        "total_amount",
-        "ordered_at",
-        "payload",
-    ),
-)
-_CUSTOMERS = _resource(
-    "resource-customers",
-    "customers",
-    ("id", "name", "region"),
-)
-_RESOURCES = (_ORDERS, _CUSTOMERS)
+def _view(name: str) -> str:
+    return catalog_resource_id(_SOURCE, ResourceKind.VIEW, f"sales.{name}")
 
 
 def _validate(
     sql: str,
     *,
     parameters: tuple[object, ...] = (),
-    resources: tuple[ResourceSchema, ...] = _RESOURCES,
-    allowed_resource_ids: tuple[str, ...] | None = None,
+    allowed: frozenset[str] | None = None,
     schemas: tuple[str, ...] = ("sales",),
 ):
     return validate_read(
         sql,
         dialect="postgresql",
-        source_id="source-postgresql",
-        resources=resources,
+        source_id=_SOURCE,
         parameters=parameters,
-        allowed_resource_ids=allowed_resource_ids,
+        allowed_resource_ids=allowed,
         schemas=schemas,
     )
 
@@ -82,18 +47,22 @@ def _validate(
 @pytest.mark.parametrize(
     ("sql", "expected"),
     (
-        ("SELECT id FROM sales.customers", "resource-customers"),
-        ("SELECT id FROM SALES.CUSTOMERS", "resource-customers"),
-        ('SELECT id FROM sales."customers"', "resource-customers"),
-        ('SELECT id FROM sales."Customers"', "resource-quoted"),
+        ("SELECT id FROM sales.customers", "sales.customers"),
+        ("SELECT id FROM SALES.CUSTOMERS", "sales.customers"),
+        ('SELECT id FROM sales."customers"', "sales.customers"),
+        ('SELECT id FROM sales."Customers"', "sales.Customers"),
+        ("SELECT id FROM customers", "sales.customers"),
     ),
 )
-def test_a_quoted_mixed_case_table_is_not_its_lower_case_namesake(
+def test_a_name_folds_as_the_server_does_and_hashes_forward(
     sql: str, expected: str
 ) -> None:
-    quoted = _resource("resource-quoted", "Customers", ("id",))
-    result = _validate(sql, resources=(_CUSTOMERS, quoted))
-    assert result.valid and result.resource_ids == (expected,)
+    result = _validate(sql)
+
+    assert result.valid
+    assert result.resource_names == (
+        (catalog_resource_id(_SOURCE, ResourceKind.TABLE, expected), expected),
+    )
 
 
 @pytest.mark.parametrize(
@@ -264,8 +233,7 @@ def test_ordinary_postgresql_query_shapes_remain_valid(sql: str) -> None:
 @pytest.mark.parametrize(
     ("sql", "issue_code"),
     (
-        ("SELECT 1", "resource_scope_empty"),
-        ("SELECT o.id FROM private.orders o", "resource_out_of_scope"),
+        ("SELECT o.id FROM private.orders o", "schema_not_configured"),
         ("SELECT o.id FROM sales.orders o FOR UPDATE", "mutation_not_allowed"),
         ("SELECT * INTO sales.copy FROM sales.orders", "mutation_not_allowed"),
         ("SELECT o.id FROM sales.orders o; SELECT 1", "multiple_statements"),
@@ -407,29 +375,38 @@ def test_a_table_function_is_a_function_fact_and_not_a_relation() -> None:
     result = _validate("SELECT * FROM sales.orders o, generate_series(1, 3) AS g")
 
     assert result.valid, result.issues
-    assert result.resource_ids == ("resource-orders",)
+    assert result.resource_ids == (_table("orders"),)
     assert result.function_lookups == ("GENERATE_SERIES",)
 
 
+def test_a_read_needs_no_table_at_all() -> None:
+    result = _validate("SELECT 1")
+
+    assert result.valid and result.resource_ids == ()
+
+
+def test_an_unqualified_name_across_schemas_is_left_for_a_live_lookup() -> None:
+    result = _validate("SELECT id FROM ORDERS", schemas=("legacy", "sales"))
+
+    assert result.valid
+    assert result.unqualified_relations == ("orders",)
+    assert result.resource_ids == ()
+
+
 @pytest.mark.parametrize(
-    ("sql", "schemas", "valid"),
+    "sql",
     (
-        ("SELECT id FROM orders", ("sales",), True),
-        ("SELECT id FROM ORDERS", ("sales",), True),
-        ("SELECT id FROM orders", ("sales", "legacy"), False),
-        ("SELECT id FROM sales.orders", ("sales", "legacy"), True),
+        "SELECT * FROM legacy.orders",
+        'SELECT * FROM "SALES".orders',
     ),
 )
-def test_an_unqualified_name_needs_exactly_one_configured_schema(
-    sql: str, schemas: tuple[str, ...], valid: bool
+def test_a_relation_outside_the_configured_schemas_names_how_to_add_it(
+    sql: str,
 ) -> None:
-    result = _validate(sql, schemas=schemas)
+    result = _validate(sql)
 
-    assert result.valid is valid
-    if not valid:
-        assert result.issue_codes == ("unqualified_relation",)
-        assert result.issues[0].details["candidates"] == ("sales.orders",)
-        assert result.issues[0].details["schemas"] == schemas
+    assert result.issue_codes == ("schema_not_configured",)
+    assert "Add the schema" in result.issues[0].message
 
 
 @pytest.mark.parametrize(
@@ -438,44 +415,64 @@ def test_an_unqualified_name_needs_exactly_one_configured_schema(
         "SELECT * FROM pg_tables",
         "SELECT * FROM pg_catalog.pg_class",
         "SELECT * FROM information_schema.tables",
-        "SELECT * FROM legacy.orders",
-        'SELECT * FROM sales."ORDERS"',
-        'SELECT * FROM "SALES".orders',
-        "SELECT * FROM db.sales.orders",
-        "WITH sales AS (SELECT 1) SELECT * FROM private.salaries",
     ),
 )
-def test_scope_escapes_are_refused(sql: str) -> None:
-    result = _validate(sql)
+def test_system_catalogs_need_the_whole_source(sql: str) -> None:
+    assert _validate(sql).valid
 
-    assert not result.valid
+    selected = _validate(sql, allowed=frozenset({_table("orders")}))
+    assert selected.issue_codes == ("resource_out_of_scope",)
+    assert "catalog_describe" in selected.issues[0].message
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT * FROM sales.customers",
+        "SELECT * FROM customers",
+        'SELECT * FROM sales."Orders"',
+        'SELECT * FROM sales."ORDERS"',
+        "SELECT * FROM db.sales.orders",
+        "WITH orders AS (SELECT * FROM sales.customers) SELECT * FROM orders",
+        "SELECT * FROM sales.orders UNION ALL SELECT * FROM sales.customers",
+    ),
+)
+def test_selected_scope_refuses_every_other_name(sql: str) -> None:
+    result = _validate(sql, allowed=frozenset({_table("orders")}))
+
     assert "resource_out_of_scope" in result.issue_codes
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT * FROM sales.orders",
+        "SELECT * FROM ORDERS",
+        'SELECT * FROM sales."orders"',
+        "WITH o AS (SELECT * FROM sales.orders) SELECT * FROM o",
+    ),
+)
+def test_selected_scope_admits_its_table_however_it_is_spelled(sql: str) -> None:
+    result = _validate(sql, allowed=frozenset({_table("orders")}))
+
+    assert result.valid
+    assert result.resource_ids == (_table("orders"),)
+
+
+def test_selected_scope_admits_a_view_by_its_own_kind() -> None:
+    result = _validate(
+        "SELECT * FROM sales.recent", allowed=frozenset({_view("recent")})
+    )
+
+    assert result.valid and result.resource_ids == (_view("recent"),)
 
 
 def test_an_unqualified_system_catalog_name_never_means_a_namesake_table() -> None:
-    namesake = _resource("resource-namesake", "pg_tables", ("id",))
-
-    result = _validate("SELECT * FROM pg_tables", resources=(namesake,))
-
-    assert "resource_out_of_scope" in result.issue_codes
-
-
-def test_a_cte_shadowing_a_table_name_cannot_hide_its_inner_read() -> None:
     result = _validate(
-        "WITH orders AS (SELECT * FROM private.salaries) SELECT * FROM orders"
+        "SELECT * FROM pg_tables", allowed=frozenset({_table("pg_tables")})
     )
 
-    assert "resource_out_of_scope" in result.issue_codes
-
-
-def test_allowed_resource_scope_is_enforced() -> None:
-    result = _validate(
-        "SELECT c.id FROM sales.customers c",
-        allowed_resource_ids=("resource-orders",),
-    )
-
-    assert not result.valid
-    assert "resource_out_of_scope" in result.issue_codes
+    assert result.issue_codes == ("resource_out_of_scope",)
 
 
 @pytest.mark.parametrize(

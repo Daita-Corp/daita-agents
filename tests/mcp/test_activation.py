@@ -141,8 +141,6 @@ async def test_sdk_rich_contract_activates_calls_and_rechecks_in_same_agent(
         assert client._owner is not None and client._owner.done()
         contracts = await agent._embedded._execution_contract_reader(
             agent_id=agent.id,
-            source_ids=(),
-            resource_ids=(),
             capability_ids=(tool.capability_id,),
             connector_binding_ids=(status.binding.binding_id,),
             model_route_ids=(),

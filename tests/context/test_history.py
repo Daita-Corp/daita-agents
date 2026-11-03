@@ -603,7 +603,6 @@ async def test_oversized_analytical_history_keeps_compact_contract_and_requeries
     assert data["total_rows"] == 40
     assert data["returned_rows"] == 40
     assert data["truncated"] is False
-    assert data["source_revision"] == "catalog:history"
     assert "rows" not in data
 
     follow_up = (

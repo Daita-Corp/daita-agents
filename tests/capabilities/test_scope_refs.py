@@ -430,8 +430,9 @@ def test_nested_tables_resolve_within_the_sources_their_parent_names():
     assert ambiguous.value.code == "table_ambiguous"
 
 
-def test_table_names_resolve_by_their_exact_case(rig):
-    """``sales.Customers`` and ``sales.customers`` are two PostgreSQL tables."""
+def test_table_names_prefer_their_exact_case_then_fold(rig):
+    """``sales.Customers`` and ``sales.customers`` are two PostgreSQL tables, and
+    an unquoted ``SALES.CUSTOMERS`` is the second of them, as the server reads it."""
 
     runtime, _, _ = rig
     quoted = catalog_resource_id(SOURCE_A, ResourceKind.TABLE, "sales.Customers")
@@ -442,13 +443,17 @@ def test_table_names_resolve_by_their_exact_case(rig):
         {SOURCE_A: ("Sales", "postgresql")},
     )
     resolve = runtime._registry.resolve_call
-    for name, identity in (("sales.Customers", quoted), ("sales.customers", folded)):
+    for name, identity in (
+        ("sales.Customers", quoted),
+        ("sales.customers", folded),
+        ("SALES.CUSTOMERS", folded),
+    ):
         call = _call("c", "read", "Sales", name)
         resolved = resolve(call, result_refs=None, source_scope=scope)
         assert resolved.arguments["resource_ids"] == (identity,)
     with pytest.raises(CapabilityInputError) as refused:
         resolve(
-            _call("c", "read", "Sales", "SALES.CUSTOMERS"),
+            _call("c", "read", "Sales", "sales.absent"),
             result_refs=None,
             source_scope=scope,
         )

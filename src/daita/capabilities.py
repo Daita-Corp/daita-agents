@@ -472,14 +472,12 @@ class ExecutionContractBindings:
 
     capability_contracts: Mapping[str, str] = field(default_factory=dict)
     tool_origins: Mapping[str, str] = field(default_factory=dict)
-    resource_revisions: Mapping[str, str] = field(default_factory=dict)
     model_routes: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for name in (
             "capability_contracts",
             "tool_origins",
-            "resource_revisions",
             "model_routes",
         ):
             values = dict(getattr(self, name))
@@ -502,7 +500,6 @@ class ExecutionContractBindings:
             for name in (
                 "capability_contracts",
                 "tool_origins",
-                "resource_revisions",
                 "model_routes",
             )
         }
@@ -511,13 +508,11 @@ class ExecutionContractBindings:
         self,
         *,
         capability_ids: Iterable[str],
-        resource_ids: Iterable[str],
         route_ids: Iterable[str],
         mcp_capability_ids: Iterable[str],
     ) -> None:
         for expected, actual in (
             (capability_ids, self.capability_contracts),
-            (resource_ids, self.resource_revisions),
             (route_ids, self.model_routes),
             (mcp_capability_ids, self.tool_origins),
         ):
@@ -539,8 +534,6 @@ class ExecutionContractReader(Protocol):
         self,
         *,
         agent_id: str,
-        source_ids: tuple[str, ...],
-        resource_ids: tuple[str, ...],
         capability_ids: tuple[str, ...],
         connector_binding_ids: tuple[str, ...],
         model_route_ids: tuple[str, ...],
@@ -575,6 +568,9 @@ class ExecutionScope:
     routine_revision: int | None = None
     occurrence_id: str | None = None
     allowed_connector_binding_ids: tuple[str, ...] = ()
+    # Sources the run may read in full; allowed_resource_ids lists the rest, and
+    # what the catalog knows of these for tools that name a table by ID.
+    unrestricted_source_ids: tuple[str, ...] = ()
     # Stored by older routine runs only; new scopes never carry grants.
     capability_grants: tuple[CapabilityGrant, ...] = ()
     graph_task_binding: GraphTaskBinding | None = None
@@ -642,6 +638,13 @@ class ExecutionScope:
             self.allowed_resource_ids,
             "allowed_resource_ids",
         )
+        unrestricted = _scope_identities(
+            self.unrestricted_source_ids,
+            "unrestricted_source_ids",
+        )
+        if not set(unrestricted) <= set(sources):
+            raise ValueError("unrestricted sources must be allowed sources")
+        object.__setattr__(self, "unrestricted_source_ids", unrestricted)
         capabilities = _scope_identities(
             self.allowed_capability_ids,
             "allowed_capability_ids",
@@ -695,7 +698,7 @@ class ExecutionScope:
             ExecutionScopeKind.SCHEDULED_ROUTINE,
             ExecutionScopeKind.JOB,
         }:
-            if bool(sources) != bool(resources):
+            if bool(sources) != bool(resources or unrestricted):
                 raise ValueError(
                     "machine source and resource ceilings must be present together"
                 )
@@ -705,7 +708,6 @@ class ExecutionScope:
             )
         self.contract_bindings.validate_coverage(
             capability_ids=capabilities,
-            resource_ids=resources,
             route_ids=routes,
             mcp_capability_ids=self.contract_bindings.tool_origins,
         )
@@ -799,6 +801,11 @@ class ExecutionScope:
                             self.allowed_connector_binding_ids
                         ),
                         "allowed_resource_ids": self.allowed_resource_ids,
+                        **(
+                            {"unrestricted_source_ids": self.unrestricted_source_ids}
+                            if self.unrestricted_source_ids
+                            else {}
+                        ),
                         "allowed_capability_ids": self.allowed_capability_ids,
                         "allowed_access_modes": tuple(
                             sorted(item.value for item in self.allowed_access_modes)
@@ -1573,14 +1580,35 @@ def _resolve_resource_name(
     )
     hits: list[tuple[str, str]] = []
     if scope is not None and value.strip() == value and 0 < len(value) <= 512:
+        # Unquoted PostgreSQL and every SQLite name also match lower-cased; an
+        # exact PostgreSQL name such as "Orders" matches first.
+        spellings = tuple(dict.fromkeys((value, value.lower())))
         for source_id in sorted(source_ids):
-            for kind in kinds:
-                resource_id = catalog_resource_id(source_id, kind, value)
-                if resource_id in scope.resource_ids:
-                    hits.append((source_id, resource_id))
-                    break
+            found = next(
+                (
+                    resource_id
+                    for spelling in spellings
+                    for kind in kinds
+                    if (resource_id := catalog_resource_id(source_id, kind, spelling))
+                    in scope.resource_ids
+                ),
+                None,
+            )
+            if found is not None:
+                hits.append((source_id, found))
     if len(hits) == 1:
         return hits[0][1]
+    if not hits and scope and not scope.unrestricted_source_ids.isdisjoint(source_ids):
+        # Tools that name a table act on catalog entries, but no entry says nothing
+        # about what a source the run may read in full holds.
+        raise _ref_invalid(
+            "table_unknown",
+            f"The catalog has no entry for {value!r}. It may still be in the source.",
+            path,
+            value,
+            "Query the source to see whether the table exists, or use a name from "
+            "catalog_search.",
+        )
     if not hits:
         raise _ref_invalid(
             "table_unknown",

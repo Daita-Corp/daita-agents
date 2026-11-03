@@ -54,10 +54,17 @@ boundary.
 The read policy belongs in `daita.domains.data.sql`; connector guardrails still
 apply during execution. The data domain parses each statement once, before any
 source I/O, and the backend receives the result as a `CheckedRead`, runs its
-canonical SQL and never validates again. SQL that cannot be parsed is refused with
+canonical SQL and never validates again. It does recheck the source's stored read
+scope at dispatch, because the runtime prepares a read before it takes the source
+permit, so revoked permission still stops a queued read. SQL that cannot be parsed is refused with
 its position and never run. Policy allows one `SELECT` or `WITH` statement, with
-no data-modifying CTE, `SELECT INTO` or locking clause, and refuses relations
-outside the run's readable set, naming them. The source reports everything else:
+no data-modifying CTE, `SELECT INTO` or locking clause. A source read in full
+(`unrestricted_source_ids`) admits any relation the engine resolves in its
+configured schemas, and system catalogs. A SELECTED or narrowed scope folds each
+name, hashes it forward with `catalog_resource_id` and tests the listed IDs, with
+no catalog lookup, and refuses system catalogs. A relation in another schema is
+refused naming the schema. A result's classification comes from its source's
+registration, never from catalog resources. The source reports everything else:
 a missing table or column comes back as `query_invalid` with the server's message,
 hint and position. Other failures cross by SQLSTATE category only, because their
 text can echo a value (`postgresql_query.py`, `sqlite_query.py`).
@@ -65,7 +72,9 @@ text can echo a value (`postgresql_query.py`, `sqlite_query.py`).
 PostgreSQL reads run in a read-only transaction with `search_path` pinned to the
 source's configured schemas; `pg_catalog` stays implicitly first. With one schema
 an unqualified name means that schema, and with several it is refused with
-`unqualified_relation`, listing the candidates. Functions in `*_to_xml*`,
+`unqualified_relation`, listing candidates in the run's scope from a live lookup.
+SQLite tables have one identity per name: `native_identity` is the folded
+`main.<name>`, and `name` keeps the declared case. Functions in `*_to_xml*`,
 `cursor_to_*`, `ts_stat` and `ts_rewrite` are refused in every scope, because they
 run SQL the parser cannot see. For the rest, one tagged `pg_proc` lookup in the
 read transaction allows a called name only when it is in `pg_catalog`, no overload
@@ -102,9 +111,8 @@ incomplete input; an input with no rows still joins and aggregates. The
 combining `sql` is one DuckDB SELECT or UNION validated before execution to
 read every alias and nothing else: no table functions, file, HTTP or extension
 access. It runs in the same private DuckDB worker as folder-source SQL, one
-query at a time; a concurrent call waits for the worker. The result carries the union of input resource
-revisions, the highest input sensitivity and per-input lineage (`source_id`,
-`source_revision`, and `canonical_sql`/`sql_fingerprint` for SQL inputs or
+query at a time; a concurrent call waits for the worker. The result carries the union of input tables, the highest input
+sensitivity and per-input lineage (`source_id`, `read_at`, and `canonical_sql`/`sql_fingerprint` for SQL inputs or
 `columns`/`filters` for tabular inputs). Declared catalog links
 inform discovery and join paths only; they grant no read authority.
 
@@ -175,10 +183,10 @@ shared budget, qualified matches, and per-root coverage, and `file_read` returns
 bounded chunks, `position=end` tail windows and opaque cursors. `data_query` with
 `source_id`, `path_pattern` and `sql` queries one homogeneous dataset matched
 against a folder's current files and exposes only the relation `data`; live and
-attached folders share this one route. An attached folder answers only for the
-files readable in the run: search skips any other file, read refuses it before any
-file content is read, and a `path_pattern` that matches one is refused whole,
-naming it, because its ID hashes outside the run's readable set. A changed file is
+attached folders share this one route. An attached folder answers only for data files within its `subpaths` that the run may
+read, decided from each file itself: search skips any other file, read refuses it
+before any file content is read, and a `path_pattern` that matches one is refused
+whole, naming it. A changed file is
 read as it is now; only a read cursor stays bound to the bytes it started on and
 fails with `file_changed`. Every result carries the
 source's sensitivity and its binding provenance. A combined `data_query` uses
@@ -227,7 +235,7 @@ visible `result_ref` values in `evidence_refs`. The runtime resolves each ref to
 its call, and the artifact domain authenticates each result against the immutable registry and
 persisted transcript, rejects failed, stale, reordered, cross-run, or tampered
 lineage, inherits the highest result sensitivity, and preserves current
-relational resource revisions where present, per input for a combined query. The artifact remains explicitly
+the relational tables each result read, per input for a combined query. The artifact remains explicitly
 derived analysis rather than exact or complete source data. Exact complete
 relational export remains the separate `data.export_tabular` capability, reached
 through `data_query` with `output="csv"`, `"xlsx"` or `"arrow"`.

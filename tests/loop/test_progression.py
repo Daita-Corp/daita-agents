@@ -141,7 +141,6 @@ async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
     scope = ExecutionScope(
         contract_bindings=frozen_execution_bindings(
             ("test.lookup",),
-            ("resource-1",),
             (provider.provider_id,),
             registry=tools._projection._runtime._registry,
         ),

@@ -14,9 +14,9 @@ from daita import AgentConfig, PostgreSQLReadLimits
 from daita.adapters import postgresql as source_module, postgresql_query as module
 from daita.adapters.models import SourceRegistration
 from daita.security import SecretReference
+from daita.storage.sqlite_records import SourceReadMode
 from tests.data.postgresql._query_support import (
     _backend,
-    _CatalogSchemas,
     _Pool,
     _SourceStore,
 )
@@ -134,7 +134,6 @@ def _pooled(
     original, registration = _backend()
     backend = module.PostgreSQLQueryBackend(
         original._sources,
-        original._catalog,
         secrets,
         read_limits=limits or PostgreSQLReadLimits(pool_enabled=True),
         source_capacity=source_capacity,
@@ -259,7 +258,7 @@ async def test_poisoned_connection_is_discarded_without_query_replay(
     "change", ("credential", "registration", "permission", "detach", "idle")
 )
 async def test_exact_source_and_credential_admission_retire_idle_pools(
-    transport, monkeypatch, change
+    transport, change
 ):
     secrets = _Secret()
     backend, registration = _pooled(secrets=secrets)
@@ -279,11 +278,7 @@ async def test_exact_source_and_credential_admission_retire_idle_pools(
     elif change == "registration":
         store.registration = replace(registration, display_name="Changed admission")
     elif change == "permission":
-
-        async def denied(*args):
-            return frozenset()
-
-        monkeypatch.setattr(backend._catalog, "readable_resource_ids", denied)
+        store.read_mode = SourceReadMode.NONE
     elif change == "detach":
         await store.detach_source(
             registration.agent_id, registration.id, datetime.now(UTC)
@@ -466,15 +461,6 @@ async def test_host_connection_budget_retires_idle_sources(transport):
             for i in (2, 3)
         ],
     ]
-    resource = (await backend._catalog.resource_schemas(first.agent_id, first.id))[0]
-    resources = [
-        replace(
-            resource,
-            source_id=registration.id,
-            resource_id=f"resource-{i}",
-        )
-        for i, registration in enumerate(registrations)
-    ]
 
     class Sources(_SourceStore):
         async def load_source(self, agent_id, source_id):
@@ -488,7 +474,6 @@ async def test_host_connection_budget_retires_idle_sources(transport):
             )
 
     backend._sources = Sources(first)
-    backend._catalog = _CatalogSchemas(tuple(resources))
     entered, release = asyncio.Event(), asyncio.Event()
     active = peak = count = 0
 

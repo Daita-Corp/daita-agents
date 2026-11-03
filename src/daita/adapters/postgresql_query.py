@@ -26,18 +26,17 @@ from ..artifacts.renderers import (
 )
 from ..config import PostgreSQLReadLimits
 from ..domains.data.capabilities import PostgreSQLReadResult, refused_read_details
-from ..domains.data.controller import ReadScopedCatalogReader
 from ..domains.data.export_capabilities import (
     ExactTabularExportResult,
     ExactTabularProgress,
     resolved_exact_export_sensitivity,
 )
 from ..domains.data.results import project_result_rows
-from ..domains.data.sql import CheckedRead, denied_relations
+from ..domains.data.sql import CheckedRead, denied_relations, resource_id_in_scope
 from ..errors import DaitaError, ErrorRetryability
 from ..observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
 from ..security import SecretProvider, SecretReference, default_secret_provider
-from ..storage.sqlite_records import SourcePermissionStateError
+from ..storage.sqlite_records import SourcePermissionStateError, SourceReadScope
 from .models import SourceRegistration
 from .postgresql import (
     PostgreSQLSourceError,
@@ -46,7 +45,7 @@ from .postgresql import (
     _connect,
     _rollback_postgresql_transaction,
 )
-from .protocols import SourceStore
+from .protocols import SourceReadScopeStore
 
 _MAX_QUERY_ROWS = 10_000
 _MAX_QUERY_BYTES = 16 * 1_024 * 1_024
@@ -63,6 +62,15 @@ JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
 LEFT JOIN pg_catalog.pg_type AS argument ON argument.oid = p.proargtypes[0]
 WHERE p.proname = ANY($1::text[])
   AND n.nspname = ANY(pg_catalog.current_schemas(true))"""
+_UNQUALIFIED_RELATION_LOOKUP = """/* daita:postgresql.unqualified_relation */
+SELECT n.nspname, c.relname
+FROM pg_catalog.pg_class AS c
+JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+WHERE c.relname = ANY($1::text[])
+  AND n.nspname = ANY($2::text[])
+  AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+ORDER BY 1, 2
+LIMIT 32"""
 # Volatile in pg_catalog, yet they only read a clock or a random source.
 _VOLATILE_FUNCTION_EXCEPTIONS = frozenset(
     {"random", "clock_timestamp", "timeofday", "gen_random_uuid", "timezone"}
@@ -74,6 +82,7 @@ _PERMANENT_QUERY_ERRORS = frozenset(
         "source_adapter_mismatch",
         "source_permission_state_invalid",
         "function_not_allowed",
+        "unqualified_relation",
         "resource_read_not_allowed",
         "not_permitted",
         "query_invalid",
@@ -139,7 +148,7 @@ class PostgreSQLReadDiagnostics:
 @dataclass(eq=False, slots=True)
 class _ReadPool:
     registration: SourceRegistration
-    readable: frozenset[str]
+    read_scope: SourceReadScope | None
     password: str | None = field(repr=False)
     size: int = 1
     pool: Any = None
@@ -166,8 +175,7 @@ class PostgreSQLQueryBackend:
 
     def __init__(
         self,
-        sources: SourceStore,
-        catalog: ReadScopedCatalogReader,
+        sources: SourceReadScopeStore,
         secret_provider: SecretProvider | None = None,
         *,
         statement_timeout_seconds: float = 5.0,
@@ -177,10 +185,8 @@ class PostgreSQLQueryBackend:
         deadline_reader: Callable[[], float | None] | None = None,
         observer: AgentObserver | None = None,
     ) -> None:
-        if not isinstance(sources, SourceStore):
-            raise TypeError("sources must implement SourceStore")
-        if not callable(getattr(catalog, "readable_resource_ids", None)):
-            raise TypeError("catalog must provide readable_resource_ids")
+        if not isinstance(sources, SourceReadScopeStore):
+            raise TypeError("sources must implement SourceReadScopeStore")
         provider = default_secret_provider(secret_provider)
         if not isinstance(provider, SecretProvider):
             raise TypeError("secret_provider must implement SecretProvider")
@@ -253,7 +259,6 @@ class PostgreSQLQueryBackend:
             }
         )
         self._sources = sources
-        self._catalog = catalog
         self._secret_provider = provider
         self._statement_timeout_seconds = float(
             self._read_limits.statement_timeout_seconds
@@ -372,18 +377,18 @@ class PostgreSQLQueryBackend:
         current = await self._sources.load_source(
             registration.agent_id, registration.id
         )
-        readable = await self._catalog.readable_resource_ids(
-            registration.agent_id, (registration.id,)
+        read_scope = await self._sources.load_source_read_scope(
+            registration.agent_id, registration.id
         )
         return (
             current == registration
             and registration.active
-            and frozenset(readable) == entry.readable
+            and read_scope == entry.read_scope
             and await self._password(registration) == entry.password
         )
 
     async def _connection(
-        self, registration: SourceRegistration, readable: frozenset[str]
+        self, registration: SourceRegistration, read_scope: SourceReadScope | None
     ):
         if self._pool_closed:
             raise PostgreSQLQueryError(
@@ -418,7 +423,7 @@ class PostgreSQLQueryBackend:
                             changed = cached is current and (
                                 cached.registration != registration
                                 or cached.password != password
-                                or cached.readable != readable
+                                or cached.read_scope != read_scope
                             )
                             expired = (
                                 cached.users == 0
@@ -449,7 +454,7 @@ class PostgreSQLQueryBackend:
                             ):
                                 entry = _ReadPool(
                                     registration,
-                                    readable,
+                                    read_scope,
                                     password,
                                     self._pool_size,
                                     last_used=now,
@@ -686,7 +691,7 @@ class PostgreSQLQueryBackend:
             or not 2 <= max_bytes <= _MAX_QUERY_BYTES
         ):
             raise ValueError("max_bytes must be from two through 16777216")
-        registration, readable = await self._admit(agent_id, source_id, read)
+        registration, read_scope = await self._admit(agent_id, source_id, read)
 
         connection = None
         pool_entry = None
@@ -698,7 +703,9 @@ class PostgreSQLQueryBackend:
         rows: tuple[Mapping[str, object], ...] = ()
         try:
             async with self._operation(statement_timeout) as read_deadline:
-                connection, pool_entry = await self._connection(registration, readable)
+                connection, pool_entry = await self._connection(
+                    registration, read_scope
+                )
                 transaction = connection.transaction(
                     isolation="repeatable_read",
                     readonly=True,
@@ -772,8 +779,6 @@ class PostgreSQLQueryBackend:
             canonical_sql=read.canonical_sql,
             sql_fingerprint=read.sql_fingerprint,
             resource_ids=read.resource_ids,
-            resource_revisions=read.resource_revisions,
-            source_revision=read.source_revision,
             columns=columns,
             projection=projection,
             resource_names=read.resource_names,
@@ -781,7 +786,7 @@ class PostgreSQLQueryBackend:
 
     async def _admit(
         self, agent_id: str, source_id: str, read: CheckedRead
-    ) -> tuple[SourceRegistration, frozenset[str]]:
+    ) -> tuple[SourceRegistration, SourceReadScope | None]:
         """Recheck current permission, since a read can queue after it was prepared.
 
         Also retires a pool the current registration no longer matches.
@@ -805,9 +810,7 @@ class PostgreSQLQueryBackend:
                 "The selected source is not a PostgreSQL source.",
             )
         try:
-            readable = frozenset(
-                await self._catalog.readable_resource_ids(agent_id, (source_id,))
-            )
+            read_scope = await self._sources.load_source_read_scope(agent_id, source_id)
         except SourcePermissionStateError:
             raise PostgreSQLQueryError(
                 "source_permission_state_invalid",
@@ -816,16 +819,17 @@ class PostgreSQLQueryBackend:
         if self._read_limits.pool_enabled:
             cached = self._pools.get((agent_id, source_id))
             if cached is not None and (
-                cached.registration != registration or cached.readable != readable
+                cached.registration != registration or cached.read_scope != read_scope
             ):
                 await self.retire_source(agent_id, source_id)
-        denied = denied_relations(read, readable)
-        if denied:
+        denied = denied_relations(read, read_scope)
+        if denied is None or denied:
             raise PostgreSQLQueryError(
                 "resource_read_not_allowed",
-                f"{', '.join(denied)} is not available for reading in this run.",
+                f"{', '.join(denied or ('This source',))} is not available for "
+                "reading in this run.",
             )
-        return registration, readable
+        return registration, read_scope
 
     async def _finish_read(
         self,
@@ -874,7 +878,7 @@ class PostgreSQLQueryBackend:
     ) -> ExactTabularExportResult:
         """Run one fresh read through the selected fixed exact renderer."""
 
-        registration, readable = await self._admit(agent_id, source_id, read)
+        registration, read_scope = await self._admit(agent_id, source_id, read)
 
         connection = None
         pool_entry = None
@@ -887,12 +891,13 @@ class PostgreSQLQueryBackend:
         row_count = 0
         query_timeout = timeout_seconds
         completed = {"rows": 0, "columns": 0, "bytes": 0}
-        sensitivity = resolved_exact_export_sensitivity(read.sensitivity_classes)
+        sensitivity = resolved_exact_export_sensitivity(
+            (registration.presentation_sensitivity.value,)
+        )
         xlsx_provenance = (
             ExactXlsxProvenance(
                 source_id=source_id,
-                source_revision=read.source_revision,
-                resource_revisions=read.resource_revisions,
+                resource_ids=read.resource_ids,
                 sql_fingerprint=read.sql_fingerprint,
                 parameters_sha256=parameters_sha256,
                 sensitivity=sensitivity,
@@ -913,7 +918,9 @@ class PostgreSQLQueryBackend:
 
         try:
             async with self._operation(timeout_seconds) as read_deadline:
-                connection, pool_entry = await self._connection(registration, readable)
+                connection, pool_entry = await self._connection(
+                    registration, read_scope
+                )
                 transaction = connection.transaction(
                     isolation="repeatable_read",
                     readonly=True,
@@ -988,9 +995,8 @@ class PostgreSQLQueryBackend:
             format=format_name,
             adapter_id="postgresql",
             source_id=source_id,
-            source_revision=read.source_revision,
             sql_fingerprint=read.sql_fingerprint,
-            resource_revisions=read.resource_revisions,
+            resource_ids=read.resource_ids,
             columns=columns,
             row_count=row_count,
             content=content,
@@ -1020,10 +1026,48 @@ async def _prepare_read_transaction(
             for schema in _configuration_schemas(registration.configuration)
         ),
     )
+    if read.unqualified_relations:
+        await _refuse_unqualified(connection, registration, read)
     if read.function_lookups or read.attribute_lookups:
         await _check_functions(
             connection, read.function_lookups, read.attribute_lookups
         )
+
+
+async def _refuse_unqualified(
+    connection: Any, registration: SourceRegistration, read: CheckedRead
+) -> None:
+    """Several schemas could hold the name, so list where it exists and refuse.
+
+    PostgreSQL would silently use the first match. The list keeps to this run's
+    scope, so out-of-scope names cannot leak.
+    """
+
+    schemas = _configuration_schemas(registration.configuration)
+    rows = await connection.fetch(
+        _UNQUALIFIED_RELATION_LOOKUP, list(read.unqualified_relations), list(schemas)
+    )
+    allowed = (
+        None
+        if read.allowed_resource_ids is None
+        else frozenset(read.allowed_resource_ids)
+    )
+    candidates = tuple(
+        name
+        for row in rows
+        if resource_id_in_scope(registration.id, name := f"{row[0]}.{row[1]}", allowed)
+    )
+    relations = ", ".join(read.unqualified_relations)
+    raise PostgreSQLQueryError(
+        "unqualified_relation",
+        f"{relations} is unqualified and this source has several schemas; "
+        + (
+            f"qualify it: {', '.join(candidates)}."
+            if candidates
+            else f"it is in none of {', '.join(schemas)} that this run can read."
+        ),
+        refused_read_details({"candidates": candidates, "schemas": schemas}),
+    )
 
 
 async def _check_functions(

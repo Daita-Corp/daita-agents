@@ -37,6 +37,7 @@ from .catalog.models import (
     CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
     CatalogMatchOutcome,
 )
+from .catalog.protocols import CatalogStoreError
 from .domains.data.capabilities import (
     DATA_QUERY_TOOL_NAME,
 )
@@ -669,10 +670,14 @@ class AgentContextBuilder:
                 )
             )
             assert self._semantic_catalog is not None
-            facts = await self._semantic_catalog.semantic_resource_facts(
-                run.agent_id,
-                resource_ids,
-            )
+            # Without catalog facts no annotation counts as readable this turn.
+            try:
+                facts = await self._semantic_catalog.semantic_resource_facts(
+                    run.agent_id,
+                    resource_ids,
+                )
+            except CatalogStoreError:
+                facts = ()
             readable_fact_ids = {fact.resource_id for fact in facts}
             readable_annotations = tuple(
                 annotation
@@ -728,19 +733,25 @@ class AgentContextBuilder:
         discovery_query = _discovery_query(run)
         catalog_query = discovery_query[:CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS]
         prior_catalog_query = _latest_prior_user_query(prior_turns)
-        catalog = (
-            self._catalog.empty_catalog_context(prior_query=prior_catalog_query)
-            if not source_scope.resource_ids
-            else await self._catalog.catalog_context(
-                run.agent_id,
-                catalog_query,
-                prior_query=prior_catalog_query,
-                limit=self._catalog_limit,
-                source_ids=tuple(sorted(source_scope.source_ids)),
-                resource_ids=(),
-                readable_resource_ids=source_scope.resource_ids,
+        # The catalog advises: a failing store leaves the model to the source.
+        try:
+            catalog = (
+                self._catalog.empty_catalog_context(prior_query=prior_catalog_query)
+                if not source_scope.resource_ids
+                else await self._catalog.catalog_context(
+                    run.agent_id,
+                    catalog_query,
+                    prior_query=prior_catalog_query,
+                    limit=self._catalog_limit,
+                    source_ids=tuple(sorted(source_scope.source_ids)),
+                    resource_ids=(),
+                    readable_resource_ids=source_scope.resource_ids,
+                )
             )
-        )
+        except CatalogStoreError:
+            catalog = self._catalog.empty_catalog_context(
+                prior_query=prior_catalog_query
+            )
         catalog_payload = catalog.to_dict()
         source_presentations = (
             await self._catalog.source_routing_facts(
@@ -2029,9 +2040,8 @@ def _project_historical_result(
                 "truncated",
                 "truncation_reasons",
                 "source_id",
-                "source_revision",
+                "read_at",
                 "resource_ids",
-                "resource_revisions",
                 "row_limit",
                 "byte_limit",
                 "utf8_bytes",
@@ -2534,7 +2544,11 @@ async def run_scope_names(
         if isinstance(fact.get("source_id"), str)
     }
     if scope.resource_ids:
-        names.update(await catalog.resource_names(agent_id, source_ids))
+        # Names advise too: with a failing store, IDs drop out rather than show.
+        try:
+            names.update(await catalog.resource_names(agent_id, source_ids))
+        except CatalogStoreError:
+            pass
     return names
 
 

@@ -181,6 +181,33 @@ class CatalogDataView:
         resources = await self._admitted_resources(agent_id, source_ids)
         return frozenset(resource.id for resource in resources)
 
+    async def source_read_access(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...],
+    ) -> Mapping[str, frozenset[str] | None]:
+        """Each source's stored read scope: None when it may read in full.
+
+        Reads permission records only, so a failing catalog cannot affect it.
+        """
+
+        access: dict[str, frozenset[str] | None] = {}
+        for registration in await self._active_registrations(agent_id, source_ids):
+            scope = await self._sources.load_source_read_scope(
+                agent_id, registration.id
+            )
+            if scope is None:
+                raise SourcePermissionStateError(
+                    "active source is missing its read scope"
+                )
+            self._require_owned_read_scope(registration.id, agent_id, scope)
+            access[registration.id] = (
+                None
+                if scope.mode is SourceReadMode.ALL
+                else frozenset(scope.resource_ids)
+            )
+        return access
+
     async def resource_names(
         self,
         agent_id: str,
@@ -199,7 +226,7 @@ class CatalogDataView:
         """Classify the exact current readable scope, or fail closed with None."""
 
         try:
-            resources = await self._admitted_resources(agent_id, source_ids)
+            await self.source_read_access(agent_id, source_ids)
         except SourcePermissionStateError:
             return None
         sensitivities: list[ModelSensitivity] = []
@@ -214,10 +241,7 @@ class CatalogDataView:
             not source_ids or self._session_source.source_id in source_ids
         ):
             sensitivities.append(self._session_source.presentation_sensitivity)
-        for resource in resources:
-            if resource.sensitivity is Sensitivity.UNKNOWN:
-                return None
-            sensitivities.append(ModelSensitivity(resource.sensitivity.value))
+        # A source's classification covers every table in it, cataloged or not.
         if not sensitivities:
             return ModelSensitivity.PUBLIC
         return max(sensitivities, key=lambda item: item.routing_rank)
@@ -227,27 +251,10 @@ class CatalogDataView:
         agent_id: str,
         source_ids: tuple[str, ...],
     ) -> tuple[CatalogResource, ...]:
-        """Resolve the one exact current resource scope used by reads and routing."""
-
-        # The uncataloged session source admits no catalog resources.
-        selected_source_ids = frozenset(source_ids) - {self.session_source_id}
-        if source_ids and not selected_source_ids:
-            return ()
-        registrations = tuple(
-            registration
-            for registration in await self._sources.list_sources(agent_id)
-            if self._available(registration, agent_id)
-            and (not selected_source_ids or registration.id in selected_source_ids)
-        )
-        if selected_source_ids and selected_source_ids != {
-            item.id for item in registrations
-        }:
-            raise SourcePermissionStateError(
-                "selected source scope is not active for this agent"
-            )
+        """Resolve the cataloged resources catalog tools and routing may show."""
 
         admitted: list[CatalogResource] = []
-        for registration in registrations:
+        for registration in await self._active_registrations(agent_id, source_ids):
             scope = await self._sources.load_source_read_scope(
                 agent_id,
                 registration.id,
@@ -266,19 +273,34 @@ class CatalogDataView:
                 if resource.agent_id == agent_id
                 and resource.source_id == registration.id
             )
-            current_by_id = {resource.id: resource for resource in current}
-            if scope.mode is SourceReadMode.NONE:
-                continue
-            elif scope.mode is SourceReadMode.ALL:
+            if scope.mode is SourceReadMode.ALL:
                 admitted.extend(current)
             else:
-                if not set(scope.resource_ids) <= set(current_by_id):
-                    raise SourcePermissionStateError(
-                        "active source read scope references a resource outside "
-                        "the current catalog"
-                    )
-                admitted.extend(current_by_id[item] for item in scope.resource_ids)
+                # A stored ID for a table that no longer exists simply never matches.
+                selected = frozenset(scope.resource_ids)
+                admitted.extend(item for item in current if item.id in selected)
         return tuple(admitted)
+
+    async def _active_registrations(
+        self, agent_id: str, source_ids: tuple[str, ...]
+    ) -> tuple[SourceRegistration, ...]:
+        # The uncataloged session source has no registration or stored scope.
+        selected_source_ids = frozenset(source_ids) - {self.session_source_id}
+        if source_ids and not selected_source_ids:
+            return ()
+        registrations = tuple(
+            registration
+            for registration in await self._sources.list_sources(agent_id)
+            if self._available(registration, agent_id)
+            and (not selected_source_ids or registration.id in selected_source_ids)
+        )
+        if selected_source_ids and selected_source_ids != {
+            item.id for item in registrations
+        }:
+            raise SourcePermissionStateError(
+                "selected source scope is not active for this agent"
+            )
+        return registrations
 
     @staticmethod
     def _require_owned_read_scope(

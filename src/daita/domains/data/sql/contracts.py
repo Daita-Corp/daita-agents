@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from ...._json import FrozenJsonObject, canonical_json
+from ....storage.sqlite_records import SourceReadMode, SourceReadScope
 
 _SqlDialect = Literal["sqlite", "postgresql"]
 _MAX_VALIDATION_ISSUE_DETAILS_CHARACTERS = 1_536
@@ -456,13 +457,11 @@ class SqlValidationResult:
     source_id: str
     analysis: SqlAnalysis | None
     resource_ids: tuple[str, ...]
-    resource_revisions: tuple[tuple[str, str], ...]
-    source_revision: str | None
     issues: tuple[SqlValidationIssue, ...]
     resource_names: tuple[tuple[str, str], ...] = ()
-    sensitivity_classes: tuple[str, ...] = ()
     function_lookups: tuple[str, ...] = ()
     attribute_lookups: tuple[str, ...] = ()
+    unqualified_relations: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.valid, bool):
@@ -473,35 +472,9 @@ class SqlValidationResult:
         resource_ids = tuple(self.resource_ids)
         if len(resource_ids) != len(set(resource_ids)):
             raise ValueError("validation resource_ids must be unique")
-        resource_revisions = tuple(
-            sorted(tuple(item) for item in self.resource_revisions)
-        )
-        if any(
-            len(item) != 2
-            or not all(isinstance(value, str) and value.strip() for value in item)
-            for item in resource_revisions
-        ):
-            raise ValueError(
-                "validation resource_revisions must contain identifier/revision pairs"
-            )
-        revision_ids = tuple(item[0] for item in resource_revisions)
-        if len(revision_ids) != len(set(revision_ids)):
-            raise ValueError("validation resource_revisions must be unique")
-        if resource_revisions and set(revision_ids) != set(resource_ids):
-            raise ValueError(
-                "validation resource_revisions must cover every resolved resource"
-            )
-        if self.source_revision is not None:
-            source_revision = _required_text(
-                self.source_revision,
-                "validation source_revision",
-            )
-            if len(source_revision) > 1_024:
-                raise ValueError("validation source_revision exceeds 1024 characters")
         if self.valid != (self.analysis is not None and not self.issues):
             raise ValueError("validation validity must agree with analysis and issues")
         object.__setattr__(self, "resource_ids", resource_ids)
-        object.__setattr__(self, "resource_revisions", resource_revisions)
         object.__setattr__(self, "issues", tuple(self.issues))
 
     @property
@@ -520,15 +493,16 @@ class CheckedRead:
     # functions, and ``x.name`` reads the server could resolve to ``name(x)``.
     function_lookups: tuple[str, ...] = ()
     attribute_lookups: tuple[str, ...] = ()
-    # What the read touched. Revisions are echoed into results, never compared.
+    # Names only the source can place: refused with candidates from a live lookup.
+    unqualified_relations: tuple[str, ...] = ()
+    # What the read touches, from the parse: (derived ID, full name).
     resource_ids: tuple[str, ...] = ()
     resource_names: tuple[tuple[str, str], ...] = ()
-    resource_revisions: tuple[tuple[str, str], ...] = ()
-    source_revision: str = ""
-    sensitivity_classes: tuple[str, ...] = ()
-    # A folder read names its files by pattern and the IDs it may match.
+    # This run's limit on the source; None means unrestricted. A folder read needs
+    # it for the files its pattern matches, and an unqualified name's candidates.
+    allowed_resource_ids: tuple[str, ...] | None = None
+    # A folder read names its files by pattern.
     path_pattern: str | None = None
-    allowed_resource_ids: tuple[str, ...] = ()
 
     def to_mapping(self) -> dict[str, object]:
         return {name: getattr(self, name) for name in self.__slots__}
@@ -546,12 +520,22 @@ def checked_reads(arguments: Mapping[str, object]) -> tuple[CheckedRead, ...]:
     return tuple(CheckedRead.from_mapping(item) for item in items)
 
 
-def denied_relations(read: CheckedRead, readable: frozenset[str]) -> tuple[str, ...]:
-    """The tables of a prepared read that current permission no longer admits."""
+def denied_relations(
+    read: CheckedRead, scope: SourceReadScope | None
+) -> tuple[str, ...] | None:
+    """The tables stored permission no longer admits; None when it reads nothing.
 
+    A read can queue after it was prepared, so this runs again at dispatch.
+    """
+
+    if scope is None or scope.mode is SourceReadMode.NONE:
+        return None
+    if scope.mode is SourceReadMode.ALL:
+        return ()
+    selected = frozenset(scope.resource_ids)
     names = dict(read.resource_names)
     return tuple(
         names.get(resource_id, resource_id)
         for resource_id in read.resource_ids
-        if resource_id not in readable
+        if resource_id not in selected
     )

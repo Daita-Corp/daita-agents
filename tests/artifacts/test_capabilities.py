@@ -1160,6 +1160,12 @@ class _Catalog:
     async def source_routing_facts(self, agent_id, source_ids=()):
         return ()
 
+    async def source_read_access(self, agent_id, source_ids):
+        return {
+            source_id: await self.readable_resource_ids(agent_id, (source_id,))
+            for source_id in source_ids
+        }
+
     async def readable_resource_ids(self, agent_id, source_ids=()):
         return frozenset(())
 

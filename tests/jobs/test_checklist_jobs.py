@@ -262,7 +262,7 @@ async def test_job_runs_show_only_names_and_stay_inside_their_sources(
 
     assert refusals["read"]["kind"] == "data.query_result"
     assert refusals["other-source"]["error"]["code"] == "source_unknown"  # type: ignore[index]
-    assert refusals["other-table"]["error"]["code"] == "resource_read_not_allowed"  # type: ignore[index]
+    assert refusals["other-table"]["error"]["code"] == "query_invalid"  # type: ignore[index]
     assert refusals["describe"]["error"]["code"] == "table_unknown"  # type: ignore[index]
     for call_id in ("sub-outside", "sub-unknown"):
         assert refusals[call_id]["error"]["code"] == "job_source_unknown"  # type: ignore[index]

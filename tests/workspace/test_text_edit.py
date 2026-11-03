@@ -1234,8 +1234,6 @@ async def test_machine_origin_cannot_project_or_forge_ambient_workspace_edit_aut
     resource = (await agent.list_catalog_resources(source_id=source.id))[0]
     contracts = await embedded._execution_contract_reader(
         agent_id=agent.id,
-        source_ids=(source.id,),
-        resource_ids=(resource.id,),
         capability_ids=("artifact.edit_text", "artifact.save_local"),
         connector_binding_ids=(),
         model_route_ids=(provider.provider_id,),

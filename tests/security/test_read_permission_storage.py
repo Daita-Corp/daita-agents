@@ -188,19 +188,26 @@ async def test_fresh_schema_has_only_scoped_permission_tables(tmp_path: Path) ->
         )
 
 
-async def test_admitted_resource_scope_derives_sensitivity_and_fails_closed(
+@pytest.mark.parametrize(
+    ("source_class", "resource_label"),
+    [
+        (ModelSensitivity.PUBLIC, Sensitivity.CONFIDENTIAL),
+        (ModelSensitivity.CONFIDENTIAL, Sensitivity.PUBLIC),
+    ],
+)
+async def test_model_sensitivity_follows_the_source_and_a_stale_scope_id_never_matches(
     tmp_path: Path,
+    source_class: ModelSensitivity,
+    resource_label: Sensitivity,
 ) -> None:
     store = await SQLiteStateStore.open(tmp_path / "sensitivity.db")
-    registration = replace(
-        _registration(), presentation_sensitivity=ModelSensitivity.PUBLIC
-    )
-    public_snapshot, resource, _ = _snapshot(
+    registration = replace(_registration(), presentation_sensitivity=source_class)
+    snapshot, resource, _ = _snapshot(
         registration,
-        sync_id="sync-public",
-        sensitivity=Sensitivity.PUBLIC,
+        sync_id="sync-labelled",
+        sensitivity=resource_label,
     )
-    await store.commit_snapshot(public_snapshot, registration=registration)
+    await store.commit_snapshot(snapshot, registration=registration)
     view = CatalogDataView(
         store, CatalogService(store, store), store, SourceTypeRegistry()
     )
@@ -210,35 +217,7 @@ async def test_admitted_resource_scope_derives_sensitivity_and_fails_closed(
                 registration.agent_id,
                 (registration.id,),
             )
-            is ModelSensitivity.PUBLIC
-        )
-
-        confidential_snapshot, _, _ = _snapshot(
-            registration,
-            sync_id="sync-confidential",
-            sensitivity=Sensitivity.CONFIDENTIAL,
-        )
-        await store.commit_snapshot(confidential_snapshot, registration=registration)
-        assert (
-            await view.admitted_model_sensitivity(
-                registration.agent_id,
-                (registration.id,),
-            )
-            is ModelSensitivity.CONFIDENTIAL
-        )
-
-        unknown_snapshot, _, _ = _snapshot(
-            registration,
-            sync_id="sync-unknown",
-            sensitivity=Sensitivity.UNKNOWN,
-        )
-        await store.commit_snapshot(unknown_snapshot, registration=registration)
-        assert (
-            await view.admitted_model_sensitivity(
-                registration.agent_id,
-                (registration.id,),
-            )
-            is None
+            is source_class
         )
 
         stale_resource_id = catalog_resource_id(
@@ -260,13 +239,15 @@ async def test_admitted_resource_scope_derives_sensitivity_and_fails_closed(
                 registration.agent_id,
                 (registration.id,),
             )
-            is None
+            is source_class
         )
-        with pytest.raises(SourcePermissionStateError):
+        assert (
             await view.readable_resource_ids(
                 registration.agent_id,
                 (registration.id,),
             )
+            == frozenset()
+        )
         assert resource.id != stale_resource_id
     finally:
         await store.close()

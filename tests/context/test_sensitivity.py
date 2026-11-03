@@ -138,6 +138,12 @@ class _StaticContextCatalog:
     async def source_routing_facts(self, agent_id, source_ids=()):
         return ({"source_id": "source-static", "adapter_id": "sqlite"},)
 
+    async def source_read_access(self, agent_id, source_ids):
+        return {
+            source_id: await self.readable_resource_ids(agent_id, (source_id,))
+            for source_id in source_ids
+        }
+
     async def readable_resource_ids(self, agent_id, source_ids=()):
         return frozenset(("untrusted-resource",))
 

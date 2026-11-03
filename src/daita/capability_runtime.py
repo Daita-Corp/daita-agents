@@ -168,6 +168,7 @@ class MachineRunScope:
     capability_ids: tuple[str, ...]
     connector_binding_ids: tuple[str, ...]
     contract_bindings: ExecutionContractBindings
+    unrestricted_source_ids: tuple[str, ...] = ()
 
 
 # Builds the scope at run start: (origin, named source ids, model route ids).
@@ -813,8 +814,6 @@ class CapabilityRuntime:
         try:
             current = await self._execution_contract_reader(
                 agent_id=run.agent_id,
-                source_ids=scope.allowed_source_ids,
-                resource_ids=scope.allowed_resource_ids,
                 capability_ids=scope.allowed_capability_ids,
                 connector_binding_ids=scope.allowed_connector_binding_ids,
                 model_route_ids=scope.eligible_model_routes,
@@ -828,7 +827,6 @@ class CapabilityRuntime:
             }
             current.validate_coverage(
                 capability_ids=scope.allowed_capability_ids,
-                resource_ids=scope.allowed_resource_ids,
                 route_ids=scope.eligible_model_routes,
                 mcp_capability_ids=origins,
             )

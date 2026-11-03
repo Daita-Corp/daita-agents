@@ -62,8 +62,6 @@ class _StubReadBackend:
             canonical_sql=read.canonical_sql,
             sql_fingerprint="sha256:" + "1" * 64,
             resource_ids=read.resource_ids,
-            resource_revisions=read.resource_revisions,
-            source_revision="memory:v1",
             columns=("region", "revenue"),
             projection=project_result_rows(
                 ({"region": "north", "revenue": 15},), max_rows=100, max_bytes=16_384
@@ -278,9 +276,7 @@ async def test_type_with_only_tabular_reads_joins_a_sqlite_table_but_gets_no_sql
     regions_input = cast(tuple[Mapping[str, object], ...], data["inputs"])[0]
     assert regions_input["source_id"] == regions.id
     assert regions_input["columns"] == ("region", "revenue")
-    assert [dict(item) for item in regions_input["resource_revisions"]] == [  # type: ignore[attr-defined]
-        {"resource_id": regions_table.id, "revision": regions_table.current_revision}
-    ]
+    assert regions_input["resource_ids"] == (regions_table.id,)
 
 
 @pytest.mark.acceptance

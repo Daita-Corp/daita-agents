@@ -537,7 +537,9 @@ async def test_a_routine_run_shows_only_names_and_cannot_name_its_way_out(
     assert codes == {
         "in-scope": None,
         "source": "source_unknown",
-        "sql": "resource_read_not_allowed",
+        # The run may read shop in full; shop has no such table, and staff's stays
+        # out of reach.
+        "sql": "query_invalid",
         "table": "table_unknown",
     }
     assert identity_leaks(request for _, request in model.requests) == []

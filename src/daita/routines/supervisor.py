@@ -554,6 +554,7 @@ class RoutineSupervisor:
             allowed_source_ids=fixed.source_ids,
             allowed_connector_binding_ids=fixed.connector_binding_ids,
             allowed_resource_ids=fixed.resource_ids,
+            unrestricted_source_ids=fixed.unrestricted_source_ids,
             allowed_capability_ids=fixed.capability_ids,
             allowed_access_modes=frozenset(AccessMode),
             allowed_operational_effects=frozenset(OperationalEffect),

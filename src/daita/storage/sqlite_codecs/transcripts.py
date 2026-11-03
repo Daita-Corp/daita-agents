@@ -161,8 +161,12 @@ def _decode_resolved_source_scope(value: JsonValue) -> EffectiveSourceScope | No
     if value is None:
         return None
     fields = mapping(value, "resolved source scope")
-    # Scopes stored before sources were addressed by name carry no labels.
-    if set(fields) - {"source_labels"} != {"source_ids", "resource_ids"}:
+    # Scopes stored before sources were addressed by name carry no labels, and
+    # those from before unrestricted reads list every table they could read.
+    if set(fields) - {"source_labels", "unrestricted_source_ids"} != {
+        "source_ids",
+        "resource_ids",
+    }:
         raise ValueError("resolved source scope fields are invalid")
     labels = mapping(fields.get("source_labels", {}), "scope source labels")
     return EffectiveSourceScope(
@@ -178,6 +182,13 @@ def _decode_resolved_source_scope(value: JsonValue) -> EffectiveSourceScope | No
             text(source_id, "scope source ID"): _decode_source_label(label)
             for source_id, label in labels.items()
         },
+        unrestricted_source_ids=frozenset(
+            text(item, "scope unrestricted source ID")
+            for item in sequence(
+                fields.get("unrestricted_source_ids", []),
+                "scope unrestricted source IDs",
+            )
+        ),
     )
 
 

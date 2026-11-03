@@ -533,7 +533,7 @@ class _SearchState:
     cancellation: threading.Event
     deadline: float
     matches: list[LocalFileSearchMatch]
-    allowed_paths: frozenset[str] | None = None
+    admit_path: Callable[[str], bool] | None = None
     structured_only: bool = False
     scanned_entries: int = 0
     scanned_content_bytes: int = 0
@@ -759,11 +759,11 @@ class LocalWorkspaceBackend:
         mode: str = "paths",
         glob: str | None = None,
         order_by: str = "path",
-        allowed_paths: frozenset[str] | None = None,
+        admit_path: Callable[[str], bool] | None = None,
         structured_only: bool = False,
     ) -> LocalFileSearchResult:
-        """Search admitted files; ``allowed_paths`` limits matches to exact
-        root-relative files, checked before any content is read, and
+        """Search admitted files; ``admit_path`` limits matches by root-relative
+        path, checked before any content is read, and
         ``structured_only`` to files with a query format."""
 
         _required_run_id(run_id)
@@ -813,7 +813,7 @@ class LocalWorkspaceBackend:
             self._limits,
             self._protected_identities,
             self._protected_paths,
-            allowed_paths,
+            admit_path,
             structured_only,
             cancellation,
             timeout=self._limits.max_search_seconds + 1.0,
@@ -828,10 +828,10 @@ class LocalWorkspaceBackend:
         path: str | None = None,
         cursor: str | None = None,
         position: str | None = None,
-        allowed_paths: frozenset[str] | None = None,
+        admit_path: Callable[[str], bool] | None = None,
     ) -> LocalFileReadResult:
-        """Read one bounded chunk; ``allowed_paths`` admits only those
-        root-relative files, before any I/O."""
+        """Read one bounded chunk; ``admit_path`` admits root-relative files, before
+        any I/O."""
 
         _required_run_id(run_id)
         if (path is None) == (cursor is None):
@@ -871,7 +871,7 @@ class LocalWorkspaceBackend:
             location = self._resolve_location(path, allow_root=False)
             relative_path = location.relative_path
             direction = "backward" if position == "end" else "forward"
-        if allowed_paths is not None and relative_path not in allowed_paths:
+        if admit_path is not None and not admit_path(relative_path):
             raise LocalWorkspaceError(
                 "path_not_allowed", "The file is not admitted for this read."
             )
@@ -2186,7 +2186,7 @@ def _search_many_sync(
     limits: LocalWorkspaceLimits,
     protected_identities: frozenset[tuple[int, int]],
     protected_paths: tuple[Path, ...],
-    allowed_paths: frozenset[str] | None,
+    admit_path: Callable[[str], bool] | None,
     structured_only: bool,
     cancellation: threading.Event,
 ) -> LocalFileSearchResult:
@@ -2201,7 +2201,7 @@ def _search_many_sync(
         cancellation=cancellation,
         deadline=time.monotonic() + limits.max_search_seconds,
         matches=[],
-        allowed_paths=allowed_paths,
+        admit_path=admit_path,
         structured_only=structured_only,
     )
     coverage = dict(initial_coverage)
@@ -2471,7 +2471,7 @@ def _scan_directory(
         if state.structured_only and structured_file_format(name) is None:
             continue
         relative_path = PurePosixPath(*parents, name).as_posix()
-        if state.allowed_paths is not None and relative_path not in state.allowed_paths:
+        if state.admit_path is not None and not state.admit_path(relative_path):
             continue
         path_matches = state.query_folded in relative_path.casefold()
         if state.mode in {"paths", "both"} and path_matches:

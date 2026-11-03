@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ..errors import DaitaError, ErrorRetryability
+
+if TYPE_CHECKING:
+    from ..storage.sqlite_records import SourceReadScope
+
 from .models import (
     DiscoveryRequest,
     DiscoveryResult,
@@ -122,6 +126,17 @@ class SourceStore(Protocol):
         source_id: str,
         detached_at: datetime,
     ) -> SourceRegistration: ...
+
+
+@runtime_checkable
+class SourceReadScopeStore(SourceStore, Protocol):
+    """A source store that also answers what a source may currently read."""
+
+    async def load_source_read_scope(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> SourceReadScope | None: ...
 
 
 __all__ = [

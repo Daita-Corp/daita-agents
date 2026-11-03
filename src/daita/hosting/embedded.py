@@ -426,27 +426,15 @@ async def _current_execution_contracts(
     model_contracts: Mapping[str, str],
     *,
     agent_id: str,
-    source_ids: tuple[str, ...],
-    resource_ids: tuple[str, ...],
     capability_ids: tuple[str, ...],
     connector_binding_ids: tuple[str, ...],
     model_route_ids: tuple[str, ...],
 ) -> ExecutionContractBindings:
-    """Read exact current structural/admission references at the composition boundary."""
+    """Read exact current admission references at the composition boundary."""
 
     identity = await store.load_identity()
     if identity is None or identity.id != agent_id:
         raise ValueError("execution contract agent identity changed")
-    resources: dict[str, str] = {}
-    for resource_id in resource_ids:
-        resource = await store.load_resource(agent_id, resource_id)
-        if (
-            resource is None
-            or resource.agent_id != agent_id
-            or resource.source_id not in source_ids
-        ):
-            raise ValueError("execution contract resource identity changed")
-        resources[resource_id] = resource.current_revision
     expected_origins = {
         view.capability_id: view.origin_revision_digest
         for name in registry.tool_names
@@ -479,14 +467,12 @@ async def _current_execution_contracts(
             for capability_id in capability_ids
         },
         tool_origins=origins,
-        resource_revisions=resources,
         model_routes={
             route_id: model_contracts[route_id] for route_id in model_route_ids
         },
     )
     result.validate_coverage(
         capability_ids=capability_ids,
-        resource_ids=resource_ids,
         route_ids=model_route_ids,
         mcp_capability_ids=expected_origins,
     )
@@ -1708,8 +1694,6 @@ class EmbeddedAgent:
         async def read_execution_contracts(
             *,
             agent_id: str,
-            source_ids: tuple[str, ...],
-            resource_ids: tuple[str, ...],
             capability_ids: tuple[str, ...],
             connector_binding_ids: tuple[str, ...],
             model_route_ids: tuple[str, ...],
@@ -1719,8 +1703,6 @@ class EmbeddedAgent:
                 capabilities,
                 model_contracts,
                 agent_id=agent_id,
-                source_ids=source_ids,
-                resource_ids=resource_ids,
                 capability_ids=capability_ids,
                 connector_binding_ids=connector_binding_ids,
                 model_route_ids=model_route_ids,
@@ -1923,8 +1905,11 @@ class EmbeddedAgent:
             )
             # The scope lists sources and resources together; a source with
             # nothing readable contributes nothing.
+            unrestricted = tuple(sorted(sources.unrestricted_source_ids))
             source_tuple = (
-                tuple(sorted(sources.source_ids)) if sources.resource_ids else ()
+                tuple(sorted(sources.source_ids))
+                if sources.resource_ids or unrestricted
+                else ()
             )
             resource_tuple = tuple(sorted(sources.resource_ids))
             capability_ids = machine_run_capability_ids(
@@ -1934,12 +1919,11 @@ class EmbeddedAgent:
             return MachineRunScope(
                 source_ids=source_tuple,
                 resource_ids=resource_tuple,
+                unrestricted_source_ids=unrestricted,
                 capability_ids=capability_ids,
                 connector_binding_ids=connector_ids,
                 contract_bindings=await read_execution_contracts(
                     agent_id=identity.id,
-                    source_ids=source_tuple,
-                    resource_ids=resource_tuple,
                     capability_ids=capability_ids,
                     connector_binding_ids=connector_ids,
                     model_route_ids=model_route_ids,
@@ -1959,17 +1943,14 @@ class EmbeddedAgent:
                 and capabilities.resolve_domain_owner(capability_id) not in excluded
             )
             sources = parent.allowed_source_ids
+            unrestricted = parent.unrestricted_source_ids
+            # An ID hashes its source, so tables of a dropped source never match.
             resources = parent.allowed_resource_ids
             if source_ids:
                 sources = tuple(sorted(set(sources) & set(source_ids)))
-                kept: list[str] = []
-                for resource_id in resources:
-                    resource = await store.load_resource(identity.id, resource_id)
-                    if resource is not None and resource.source_id in sources:
-                        kept.append(resource_id)
-                resources = tuple(kept)
-                if not resources:
-                    sources = ()
+                unrestricted = tuple(sorted(set(unrestricted) & set(source_ids)))
+                if not sources:
+                    resources = ()
             bindings = parent.contract_bindings
             return replace(
                 parent,
@@ -1977,6 +1958,7 @@ class EmbeddedAgent:
                 allowed_capability_ids=capability_ids,
                 allowed_source_ids=sources,
                 allowed_resource_ids=resources,
+                unrestricted_source_ids=unrestricted,
                 contract_bindings=ExecutionContractBindings(
                     capability_contracts={
                         key: value
@@ -1987,11 +1969,6 @@ class EmbeddedAgent:
                         key: value
                         for key, value in bindings.tool_origins.items()
                         if key in capability_ids
-                    },
-                    resource_revisions={
-                        key: value
-                        for key, value in bindings.resource_revisions.items()
-                        if key in resources
                     },
                     model_routes=dict(bindings.model_routes),
                 ),

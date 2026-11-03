@@ -1,6 +1,6 @@
 import ast
 import inspect
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from functools import cache
 from pathlib import Path
 
@@ -952,6 +952,8 @@ def test_deleted_lifecycle_systems_remain_absent():
 # through the composed SourceTypeRegistry.
 _SOURCE_TYPE_LITERAL_FILES = frozenset(
     {
+        # Frozen historical conversion of records that name their adapter.
+        "storage/home_migrations/revision_0004.py",
         "adapters/sqlite.py",  # SQLite adapter owns its adapter id
         "adapters/sqlite_query.py",  # SQLite read/export backend checks its own type
         "adapters/postgresql.py",  # PostgreSQL adapter owns its adapter id
@@ -2794,18 +2796,9 @@ def test_raw_tool_call_detector_catches_each_raw_reader_form():
     assert _raw_tool_call_reads("reader.py", ast.parse(identity_only)) == []
 
 
-@pytest.mark.xfail(strict=True, reason="source I/O still consults the catalog")
-def test_source_io_never_consults_the_catalog():
-    """Catalog IDs can be derived from a name; catalog state is never read."""
-
-    source_io = (
-        PACKAGE / "adapters" / "postgresql_query.py",
-        PACKAGE / "adapters" / "postgresql_write.py",
-        PACKAGE / "adapters" / "sqlite_query.py",
-        *sorted((PACKAGE / "domains" / "data" / "sql").glob("*.py")),
-    )
+def _catalog_consumers(paths: Iterable[Path]) -> dict[str, set[str]]:
     consulting: dict[str, set[str]] = {}
-    for path in source_io:
+    for path in paths:
         names: set[str] = set()
         for node in ast.walk(_tree(path)):
             if (
@@ -2819,4 +2812,36 @@ def test_source_io_never_consults_the_catalog():
         consulting_names = names - {"ResourceKind", "catalog_resource_id"}
         if consulting_names:
             consulting[path.name] = consulting_names
-    assert consulting == {}
+    return consulting
+
+
+def test_read_io_never_consults_the_catalog():
+    """Catalog IDs can be derived from a name; catalog state is never read."""
+
+    assert (
+        _catalog_consumers(
+            (
+                PACKAGE / "adapters" / "postgresql_query.py",
+                PACKAGE / "adapters" / "sqlite_query.py",
+                PACKAGE / "domains" / "data" / "sql" / "analysis.py",
+                PACKAGE / "domains" / "data" / "sql" / "contracts.py",
+                PACKAGE / "domains" / "data" / "sql" / "duckdb_read.py",
+                PACKAGE / "domains" / "data" / "sql" / "read_validation.py",
+            )
+        )
+        == {}
+    )
+
+
+@pytest.mark.xfail(strict=True, reason="writes still load catalog structure")
+def test_write_io_never_consults_the_catalog():
+    assert (
+        _catalog_consumers(
+            (
+                PACKAGE / "adapters" / "postgresql_write.py",
+                PACKAGE / "domains" / "data" / "sql" / "relational_update.py",
+                PACKAGE / "domains" / "data" / "sql" / "relational_upsert.py",
+            )
+        )
+        == {}
+    )

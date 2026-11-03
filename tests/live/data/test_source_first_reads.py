@@ -9,6 +9,7 @@ Needs a disposable server whose admin connects without a password:
 from __future__ import annotations
 
 import os
+import sqlite3
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
@@ -16,12 +17,16 @@ from typing import cast
 import pytest
 
 from daita import Agent, PostgreSQLSource
+from daita.adapters.postgresql_query import PostgreSQLQueryError
+from daita.adapters.registry import SourceOperation
 from daita.capability_runtime import CapabilityRuntime
+from daita.catalog.models import ResourceKind, catalog_resource_id
 from daita.llm.models import ModelProfile, ToolCall
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
 from tests.catalog._schema_support import _OBSERVED_AT
 from tests.support.capability_runtime import execute_projected
+from tests.support.checked_read import checked_read
 from tests.support.workspace import workspace_for
 
 pytestmark = [
@@ -49,6 +54,13 @@ CREATE TABLE sales.orders (id integer, customer_id integer, total numeric, note 
 INSERT INTO sales.orders VALUES (1, 1, 10.5, 'a'), (2, 2, 20, 'b');
 CREATE TABLE sales.denied (id integer);
 INSERT INTO sales.denied VALUES (1);
+CREATE TYPE sales.status AS ENUM ('open', 'shipped');
+CREATE TABLE sales.shipments (id integer, status sales.status, weight money);
+INSERT INTO sales.shipments VALUES (1, 'shipped', 5), (2, 'open', 7);
+CREATE VIEW sales.north AS SELECT * FROM sales.customers WHERE region = 'north';
+CREATE MATERIALIZED VIEW sales.region_counts AS
+    SELECT region, count(*) AS n FROM sales.customers GROUP BY region;
+CREATE VIEW sales.hidden_view AS SELECT * FROM sales.orders;
 CREATE TABLE events.page_views (viewed_on date NOT NULL, path text)
     PARTITION BY RANGE (viewed_on);
 CREATE TABLE events.page_views_2026 PARTITION OF events.page_views
@@ -71,6 +83,8 @@ CREATE FUNCTION sales.upper(integer) RETURNS text LANGUAGE sql AS 'SELECT $1::te
 CREATE FUNCTION sales."LOWER"(integer) RETURNS text LANGUAGE sql AS 'SELECT $1::text';
 GRANT USAGE ON SCHEMA sales, legacy, events TO daita_reader;
 GRANT SELECT ON sales.customers, sales.orders, legacy.customers TO daita_reader;
+GRANT SELECT ON sales.shipments, sales.north, sales.region_counts TO daita_reader;
+GRANT SELECT ON sales.hidden_view TO daita_reader;
 GRANT SELECT ON events.page_views, events.page_views_2026 TO daita_reader;
 """
 
@@ -349,7 +363,7 @@ async def test_an_unqualified_name_across_schemas_lists_its_candidates(
     reads = await _attached(tmp_path, ("sales", "legacy"))
     try:
         error = _error(await reads.query("SELECT * FROM customers"))
-        assert error["code"] == "sql_validation_failed", error
+        assert error["code"] == "unqualified_relation", error
         text = str(error)
         assert "sales.customers" in text and "legacy.customers" in text
         assert "not available for reading" not in text
@@ -362,9 +376,6 @@ async def test_an_unqualified_name_across_schemas_lists_its_candidates(
     (
         "SELECT * FROM private.salaries",
         "SELECT * FROM legacy.customers",
-        "SELECT * FROM pg_tables",
-        "SELECT * FROM pg_catalog.pg_class",
-        "SELECT * FROM information_schema.tables",
         'SELECT * FROM "SALES"."customers"',
         "WITH sales AS (SELECT 1) SELECT * FROM private.salaries",
     ),
@@ -379,6 +390,157 @@ async def test_a_name_outside_the_scope_is_refused_naming_it(
         await reads.agent.close()
     assert error["code"] == "resource_read_not_allowed", error
     assert sql.split(" FROM ")[1].split()[0].strip('"').split('"')[0] in str(error)
+
+
+async def _select_only(reads: _Reads, *native_names: str) -> None:
+    resources = await reads.agent.list_catalog_resources(source_id=reads.source_id)
+    preview = await reads.agent.preview_source_permissions(
+        source_id=reads.source_id,
+        read_mode="selected",
+        read_resource_ids=tuple(
+            item.id for item in resources if item.native_identity in native_names
+        ),
+        relational_write_scopes={},
+    )
+    await reads.agent.apply_source_permissions(
+        source_id=reads.source_id,
+        confirmation_fingerprint=preview.confirmation_fingerprint,
+    )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT * FROM sales.orders",
+        "SELECT * FROM orders",
+        "SELECT * FROM legacy.customers",
+        'SELECT * FROM sales."CUSTOMERS"',
+        "SELECT * FROM sales.north",
+        "SELECT * FROM sales.hidden_view",
+        "SELECT * FROM private.salaries",
+        "SELECT * FROM pg_tables",
+        "SELECT * FROM pg_catalog.pg_class",
+        "SELECT * FROM information_schema.tables",
+        "WITH c AS (SELECT * FROM sales.orders) SELECT * FROM c",
+        "SELECT * FROM sales.customers c, sales.orders o",
+    ),
+)
+async def test_a_selected_scope_refuses_every_escape(
+    database: None, tmp_path: Path, sql: str
+) -> None:
+    reads = await _attached(tmp_path, ("sales",))
+    try:
+        await _select_only(reads, "sales.customers")
+        assert _rows(
+            await reads.query("SELECT count(*) AS n FROM SALES.customers")
+        ) == ({"n": 3},)
+        error = _error(await reads.query(sql))
+    finally:
+        await reads.agent.close()
+    assert error["code"] == "resource_read_not_allowed", error
+
+
+async def test_a_selected_scope_lists_only_its_own_candidates(
+    database: None, tmp_path: Path
+) -> None:
+    reads = await _attached(tmp_path, ("sales", "legacy"))
+    try:
+        await _select_only(reads, "sales.customers")
+        error = _error(await reads.query("SELECT * FROM customers"))
+    finally:
+        await reads.agent.close()
+    assert error["code"] == "unqualified_relation", error
+    assert "sales.customers" in str(error)
+    assert "legacy.customers" not in str(error)
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    (
+        ("SELECT 1 AS n", {"n": 1}),
+        ("SELECT count(*) AS n FROM sales.north", {"n": 2}),
+        ("SELECT n FROM sales.region_counts WHERE region = 'north'", {"n": 2}),
+        (
+            "SELECT count(*) AS n FROM sales.shipments WHERE status = 'shipped'",
+            {"n": 1},
+        ),
+        (
+            "SELECT count(*) AS n FROM information_schema.tables "
+            "WHERE table_schema = 'sales' AND table_name = 'customers'",
+            {"n": 1},
+        ),
+        ("SELECT count(*) AS n FROM pg_class WHERE relname = 'orders'", {"n": 1}),
+    ),
+)
+async def test_a_whole_source_answers_what_the_engine_resolves(
+    database: None, tmp_path: Path, sql: str, expected: Mapping[str, object]
+) -> None:
+    reads = await _attached(tmp_path, ("sales",))
+    try:
+        assert _rows(await reads.query(sql)) == (expected,)
+    finally:
+        await reads.agent.close()
+
+
+async def test_a_table_added_after_attach_is_readable_at_once(
+    database: None, tmp_path: Path
+) -> None:
+    reads = await _attached(tmp_path, ("sales",))
+    try:
+        admin = await _admin(_DATABASE)
+        try:
+            await admin.execute("CREATE TABLE sales.added (id integer)")
+            await admin.execute("INSERT INTO sales.added VALUES (1), (2)")
+            await admin.execute("GRANT SELECT ON sales.added TO daita_reader")
+        finally:
+            await admin.close()
+        assert _rows(await reads.query("SELECT count(*) AS n FROM sales.added")) == (
+            {"n": 2},
+        )
+    finally:
+        await reads.agent.close()
+
+
+async def test_a_wiped_catalog_still_answers(database: None, tmp_path: Path) -> None:
+    reads = await _attached(tmp_path, ("sales",))
+    try:
+        store = next(tmp_path.rglob("state.db"))
+        with sqlite3.connect(store) as connection:
+            connection.execute("DELETE FROM snapshots")
+        assert _rows(
+            await reads.query("SELECT count(*) AS n FROM sales.customers")
+        ) == ({"n": 3},)
+    finally:
+        await reads.agent.close()
+
+
+async def test_a_read_revoked_while_queued_does_not_run(
+    database: None, tmp_path: Path
+) -> None:
+    reads = await _attached(tmp_path, ("sales",))
+    try:
+        await _select_only(reads, "sales.orders")
+        backend = reads.agent._embedded._source_backends[SourceOperation.SQL_READ][
+            "postgresql"
+        ]
+        with pytest.raises(PostgreSQLQueryError) as refused:
+            await backend.execute_read(
+                agent_id=reads.agent.id,
+                source_id=reads.source_id,
+                read=checked_read(
+                    "SELECT count(*) FROM sales.customers",
+                    resource_id=catalog_resource_id(
+                        reads.source_id, ResourceKind.TABLE, "sales.customers"
+                    ),
+                    name="sales.customers",
+                ),
+                max_rows=10,
+                max_bytes=4_096,
+            )
+    finally:
+        await reads.agent.close()
+    assert refused.value.code == "resource_read_not_allowed"
+    assert "sales.customers" in str(refused.value)
 
 
 async def test_unrelated_ddl_between_questions_has_no_effect(
@@ -462,18 +624,16 @@ async def test_a_typo_is_not_reported_as_a_permission_denial(
     reads = await _attached(tmp_path, ("sales",))
     try:
         hint = _error(await reads.query("SELECT regio FROM sales.customers"))
-        admin = await _admin(_DATABASE)
-        try:
-            await admin.execute("REVOKE SELECT ON sales.orders FROM daita_reader")
-        finally:
-            await admin.close()
-        denied = _error(await reads.query("SELECT id FROM sales.orders"))
+        denied = _error(await reads.query("SELECT id FROM sales.denied"))
+        missing = _error(await reads.query("SELECT id FROM sales.nowhere"))
     finally:
         await reads.agent.close()
     assert hint["code"] == "query_invalid"
     assert "region" in str(hint)
     assert denied["code"] == "not_permitted"
-    assert "orders" in str(denied)
+    assert "denied" in str(denied)
+    assert missing["code"] == "query_invalid"
+    assert "sales.nowhere" in str(missing)
 
 
 async def test_composite_and_range_values_are_projected(

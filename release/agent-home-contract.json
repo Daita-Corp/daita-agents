@@ -132,7 +132,7 @@
         "affected_paths": [
           "state.db"
         ],
-        "checksum": "4b87d6d31da8a323cb593aeef4a3b93792b26a78c07d90876584d0aa1a2c5792",
+        "checksum": "6e3cade607c3579dc33310d3a3d798ca7a63cc56bb954340d36d14a245bda35f",
         "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete. Retire inactive learning candidates and their review stamps; approved knowledge is unaffected. Routines keep their title, prompt, schedule, named sources, counters and state; their frozen access, grants, routes, sensitivity, budgets, expiry, outcome, precheck, skills and provenance are dropped, and their runs ask before writes. Occurrences drop prechecks, reservations and their copy of the run's scope. MCP tool bindings drop unattended eligibility; every MCP action asks at the time. The task graph is replaced by one checklist-job record per job: finished jobs keep their accepted result, unfinished jobs fail with an upgrade message, result deliveries and receipts keep their job id, graph attention notices are dropped, and the graph tables go.",
         "migration_id": "0004_foreground_analysis_evidence",
         "revision": 4
@@ -476,6 +476,7 @@
         "allowed_source_ids",
         "allowed_connector_binding_ids",
         "allowed_resource_ids",
+        "unrestricted_source_ids",
         "allowed_capability_ids",
         "allowed_access_modes",
         "allowed_operational_effects",
@@ -2095,7 +2096,7 @@
       }
     }
   },
-  "contract_sha256": "5db6b16c9b941bb7432e172924325fc3a37942f2a3525fdca5ee70835ef0e6a2",
+  "contract_sha256": "22f2cb9063378be9bcd75a287117c364038555cbe8b9a73f8e34004b713c1217",
   "home_revision": 4,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1

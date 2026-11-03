@@ -9,7 +9,12 @@ does not guess which table or connector you meant when a consequential choice
 is ambiguous. Source content, prior answers, and saved knowledge can guide an
 investigation; they cannot add access or replace current catalog facts.
 
-The frozen readable resource set is a candidate ceiling, not an exact selection.
+A source you have made fully readable lets a run read anything PostgreSQL or
+SQLite resolves in it, cataloged or not. A source limited to selected tables stays
+limited to them, checked from the name in the SQL with no catalog lookup.
+
+For catalog results, the frozen readable resource set is a candidate ceiling, not
+an exact selection.
 Initial catalog context ranks only within that ceiling and reports separate
 `match_outcomes.current_query` and `match_outcomes.prior_query` assessments. The
 prior assessment may be null and is continuity evidence only; the two assessments

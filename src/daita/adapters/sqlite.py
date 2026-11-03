@@ -48,6 +48,14 @@ from .protocols import (
 )
 
 
+def _native_identity(name: str) -> str:
+    """SQLite treats names case-insensitively, so one table has one identity."""
+
+    from ..domains.data.sql import sqlite_identifier_key
+
+    return f"main.{sqlite_identifier_key(name)}"
+
+
 class SQLiteSourceError(ResourceAdapterError):
     def __init__(self, code: str, message: str, *, source_id: str = "sqlite:unopened"):
         super().__init__(source_id, code, message)
@@ -382,7 +390,7 @@ def _discover(
             resource_id = catalog_resource_id(
                 registration.id,
                 kind,
-                f"main.{name}",
+                _native_identity(name),
             )
             columns = _columns(connection, name, request, registration.id)
             indexes = _indexes(
@@ -439,7 +447,7 @@ def _discover(
                 CatalogResource.build(
                     agent_id=request.agent_id,
                     source_id=request.source_id,
-                    native_identity=f"main.{fact.name}",
+                    native_identity=_native_identity(fact.name),
                     external_uri=f"sqlite://{request.source_id}/main/{fact.name}",
                     kind=fact.kind,
                     name=fact.name,
