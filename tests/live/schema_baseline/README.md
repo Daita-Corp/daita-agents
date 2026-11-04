@@ -4,8 +4,7 @@ A reproducible yardstick for how Daita's PostgreSQL source handles a large,
 messy schema: discovery cost and limits, catalog coverage, the effect of
 unrelated schema changes, and answer
 outcomes on a fixed question set. Rerun it after every change to PostgreSQL
-discovery or query revalidation and compare against the committed results in
-`results/`.
+discovery or query revalidation and compare against your last report.
 
 ## What it builds
 
@@ -101,10 +100,7 @@ schemas. Add `?sslmode=require` for a non-local server.
 
 Results go to `live-evidence/schema-baseline/` (git-ignored) as
 `postgresql-schema-baseline-<commit>.json` and `.md`. Set
-`DAITA_SCHEMA_BASELINE_REPORT_DIR` to write elsewhere, for example
-`tests/live/schema_baseline/results` when capturing a new committed baseline.
-The offline report holds only synthetic fixture data, which is why it can be
-committed; never commit comparison reports.
+`DAITA_SCHEMA_BASELINE_REPORT_DIR` to write elsewhere. Reports stay out of git.
 
 For the comparison, export an Anthropic API key as `ANTHROPIC_API_KEY` (Claude
 Code runs with an empty config, so it cannot use a claude.ai login) and set:
