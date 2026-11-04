@@ -256,7 +256,12 @@ def _require_nonforeign_read_resources(
         "SELECT data FROM snapshots WHERE agent_id = ?",
         (scope.agent_id,),
     ):
-        snapshot = decode_catalog_snapshot(data)
+        try:
+            snapshot = decode_catalog_snapshot(data)
+        except (TypeError, ValueError):
+            # A resource ID hashes its source, so a row the catalog cannot read
+            # cannot make this source's reads foreign; the catalog only advises.
+            continue
         for resource in snapshot.resources:
             if resource.id in requested and resource.source_id != scope.source_id:
                 raise SourcePermissionStateError(
@@ -2296,7 +2301,12 @@ class SQLStateStore:
             )
             if row is None or row[0] != ref.sync_id:
                 return None
-            snapshot = await settled_thread(_decode_catalog_snapshot, row[1])
+            try:
+                snapshot = await settled_thread(_decode_catalog_snapshot, row[1])
+            except (TypeError, ValueError):
+                raise CatalogStoreError(
+                    "stored catalog snapshot is undecodable"
+                ) from None
             if (
                 snapshot.sync.agent_id != ref.agent_id
                 or snapshot.sync.source_id != ref.source_id
@@ -2323,7 +2333,12 @@ class SQLStateStore:
                     "SELECT data FROM syncs WHERE agent_id = ? AND id = ?",
                     (agent_id, sync_id),
                 ).fetchone()
-            return None if row is None else decode_catalog_sync(row[0])
+            if row is None:
+                return None
+            try:
+                return decode_catalog_sync(row[0])
+            except (TypeError, ValueError):
+                raise CatalogStoreError("stored catalog sync is undecodable") from None
 
         return await settled_thread(read)
 

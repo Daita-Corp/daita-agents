@@ -104,6 +104,10 @@ SEMANTIC_SAVE_DESCRIPTION = (
 SEMANTIC_DOMAIN_OWNER_ID = "semantics"
 
 _CONFIRMED_BY = "local-user"
+_UNCATALOGED_TABLE = (
+    "The catalog has no entry for this table yet, so a semantic note cannot bind "
+    "to it. Reads of the table are unaffected."
+)
 
 
 class SemanticValidationError(ValueError):
@@ -1817,9 +1821,7 @@ class SemanticCapabilityDomain:
         for resource_id in resource_ids:
             if resource_id not in facts:
                 raise CapabilityInputError(
-                    "semantic_unknown_resource",
-                    "A semantic subject resource is not current for this agent.",
-                    {"resource_id": resource_id},
+                    "semantic_unknown_resource", _UNCATALOGED_TABLE
                 )
         bound = arguments.to_dict()
         bound["catalog_revisions"] = [
@@ -2344,11 +2346,38 @@ class SemanticCapabilityDomain:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from error
-        if any(item not in readable for item in requested):
+        unreadable = tuple(item for item in requested if item not in readable)
+        if unreadable:
+            if capability.id == SEMANTIC_SAVE_CAPABILITY_ID and (
+                await self._permitted(run, arguments, unreadable)
+            ):
+                raise CapabilityInputError(
+                    "semantic_unknown_resource", _UNCATALOGED_TABLE
+                )
             raise CapabilityInputError(
                 "resource_read_not_allowed",
                 "The requested resource is not available for reading.",
             )
+
+    async def _permitted(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        resource_ids: tuple[str, ...],
+    ) -> bool:
+        """True when the run's read permission covers every table, cataloged or not."""
+
+        subject = cast(Mapping[str, object], arguments["subject"])
+        try:
+            access = await self._catalog.source_read_access(
+                run.agent_id, cast(tuple[str, ...], subject["source_ids"])
+            )
+        except SourcePermissionStateError:
+            return False
+        return all(
+            any(scope is None or item in scope for scope in access.values())
+            for item in resource_ids
+        )
 
     async def _validate_source_scope(
         self,

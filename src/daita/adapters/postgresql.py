@@ -8,12 +8,12 @@ import math
 import re
 import socket
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from hashlib import sha256
 from importlib import import_module
 from itertools import islice
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote
 
 from .._installation import repair_guidance
@@ -50,7 +50,6 @@ from .models import (
     SourceRegistration,
 )
 from .protocols import (
-    DiscoveryLimitError,
     ResourceAdapterError,
     ResourceNotFoundError,
     SourceClosedError,
@@ -72,16 +71,29 @@ _MAX_PROBE_ROW_FIELDS = 16
 _CONNECT_TIMEOUT_SECONDS = 8.0
 _COMMAND_TIMEOUT_SECONDS = 8.0
 _CLEANUP_TIMEOUT_SECONDS = 1.0
+# Per-table metadata is two round trips each; a slow source keeps what was read.
+_DISCOVERY_SECONDS = 60.0
 
 # The system catalogs list everything, whether or not this role can read it, and
 # a name it cannot use only misleads. Every metadata query goes through these.
-# Tables r, p and f map to TABLE; views v and m to VIEW. A partition folds under
-# its parent, which is what queries read.
+# Tables r, p and f map to TABLE; views v and m to VIEW.
 READABLE_RELATION_SQL = (
     "c.relkind IN ('r', 'p', 'f', 'v', 'm') "
     "AND pg_catalog.has_any_column_privilege(c.oid, 'SELECT') "
     "AND pg_catalog.has_schema_privilege(c.relnamespace, 'USAGE')"
 )
+# A partition folds under an ancestor the role can read in the source's schemas
+# ($1), which is what queries read; without one it is listed as its own table.
+LISTED_RELATION_SQL = """(NOT c.relispartition OR NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_partition_ancestors(c.oid) AS ancestor(relid)
+    JOIN pg_catalog.pg_class AS parent ON parent.oid = ancestor.relid
+    JOIN pg_catalog.pg_namespace AS parent_ns ON parent_ns.oid = parent.relnamespace
+    WHERE ancestor.relid <> c.oid
+      AND parent_ns.nspname = ANY($1::text[])
+      AND pg_catalog.has_any_column_privilege(parent.oid, 'SELECT')
+      AND pg_catalog.has_schema_privilege(parent.relnamespace, 'USAGE')
+))"""
 READABLE_COLUMN_SQL = (
     "a.attnum > 0 AND NOT a.attisdropped "
     "AND pg_catalog.has_column_privilege(a.attrelid, a.attnum, 'SELECT')"
@@ -123,7 +135,7 @@ FROM pg_class AS c
 JOIN pg_namespace AS n ON n.oid = c.relnamespace
 WHERE n.nspname = ANY($1::text[])
   AND {READABLE_RELATION_SQL}
-  AND NOT c.relispartition
+  AND {LISTED_RELATION_SQL}
 ORDER BY n.nspname, c.relname
 LIMIT $2
 """
@@ -145,6 +157,7 @@ SELECT
     (a.attgenerated <> '') AS is_generated,
     pg_column_is_updatable(rel.oid, a.attnum, false) AS is_updatable,
     pk.primary_key_ordinal,
+    pk.primary_key_size,
     col_description(rel.oid, a.attnum) AS comment,
     (
         SELECT array_agg(e.enumlabel::text ORDER BY e.enumsortorder)
@@ -166,11 +179,16 @@ LEFT JOIN (
     SELECT
         con.conrelid,
         key.attnum,
-        key.ordinality::integer AS primary_key_ordinal
+        key.ordinality::integer AS primary_key_ordinal,
+        cardinality(con.conkey) AS primary_key_size
     FROM pg_constraint AS con
     CROSS JOIN LATERAL unnest(con.conkey)
         WITH ORDINALITY AS key(attnum, ordinality)
     WHERE con.contype = 'p'
+      AND NOT EXISTS (
+          SELECT 1 FROM unnest(con.conkey) AS part(attnum)
+          WHERE NOT pg_catalog.has_column_privilege(con.conrelid, part.attnum, 'SELECT')
+      )
 ) AS pk ON pk.conrelid = rel.oid AND pk.attnum = a.attnum
 WHERE n.nspname = $1 AND rel.relname = $2
   AND pg_catalog.has_schema_privilege(n.oid, 'USAGE')
@@ -288,6 +306,58 @@ ORDER BY namespace.nspname
 LIMIT $1
 """
 
+
+# What this role could change, for the person who attached it. Joining pg_roles
+# on the built-in names keeps servers that lack one of them from erroring.
+_HEALTH_SQL = """
+/* daita:postgresql.health */
+SELECT
+    current_user::text AS role_name,
+    me.rolsuper,
+    me.rolbypassrls,
+    me.rolcreaterole,
+    me.rolcreatedb,
+    COALESCE((
+        SELECT pg_catalog.array_agg(grp.rolname::text ORDER BY grp.rolname)
+        FROM pg_catalog.pg_roles AS grp
+        WHERE grp.rolname IN (
+            'pg_read_all_data', 'pg_write_all_data', 'pg_read_server_files',
+            'pg_write_server_files', 'pg_execute_server_program'
+        )
+          AND pg_catalog.pg_has_role(current_user, grp.oid, 'MEMBER')
+    ), ARRAY[]::text[]) AS builtin_roles,
+    (
+        SELECT pg_catalog.count(*)
+        FROM pg_catalog.pg_class AS c
+        JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname = ANY($1::text[])
+          AND c.relkind IN ('r', 'p', 'f')
+          AND pg_catalog.has_schema_privilege(n.oid, 'USAGE')
+          AND (
+              pg_catalog.has_table_privilege(
+                  c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE')
+              OR pg_catalog.has_any_column_privilege(c.oid, 'INSERT, UPDATE')
+          )
+    )::integer AS writable_tables,
+    (
+        SELECT pg_catalog.count(*)
+        FROM pg_catalog.pg_namespace AS n
+        WHERE n.nspname = ANY($1::text[])
+          AND pg_catalog.has_schema_privilege(n.oid, 'CREATE')
+    )::integer AS creatable_schemas
+FROM pg_catalog.pg_roles AS me
+WHERE me.rolname = current_user
+"""
+_BUILTIN_ROLES = (
+    "pg_read_all_data",
+    "pg_write_all_data",
+    "pg_read_server_files",
+    "pg_write_server_files",
+    "pg_execute_server_program",
+)
+_WRITING_BUILTIN_ROLES = frozenset(
+    ("pg_write_all_data", "pg_write_server_files", "pg_execute_server_program")
+)
 
 POSTGRESQL_ADAPTER_ID = "postgresql"
 
@@ -593,6 +663,8 @@ class PostgreSQLResourceAdapter:
                     max_columns=request.max_columns_per_resource,
                     max_indexes=request.max_indexes_per_resource,
                     max_relationships=request.max_relationships,
+                    refresh_schemas=request.refresh_schemas,
+                    previous=request.previous,
                 )
                 estimates = await _load_estimates(self._connection, structure)
                 completed_at = max(self._clock(), request.requested_at)
@@ -725,18 +797,23 @@ class PostgreSQLResourceAdapter:
                     error_code="source_closed",
                 )
             try:
-                healthy = await self._connection.fetchval("SELECT 1") == 1
+                row = await self._connection.fetchrow(
+                    _HEALTH_SQL,
+                    list(_configuration_schemas(self._registration.configuration)),
+                )
+                details = _health_details(row)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                healthy = False
+                details = None
             return SourceHealth(
                 agent_id=self._registration.agent_id,
                 source_id=self._registration.id,
                 adapter_id="postgresql",
-                healthy=healthy,
+                healthy=details is not None,
                 checked_at=checked_at,
-                error_code=None if healthy else "postgresql_health_failed",
+                error_code=None if details else "postgresql_health_failed",
+                details=details or {},
             )
 
     async def close(self) -> None:
@@ -816,6 +893,7 @@ class PostgreSQLStructure:
     tables: tuple[_TableStructure, ...]
     relationships: tuple[_RelationshipStructure, ...]
     source_revision: str
+    truncated: bool = False
 
 
 async def _load_structure(
@@ -826,52 +904,68 @@ async def _load_structure(
     max_columns: int,
     max_indexes: int,
     max_relationships: int,
+    refresh_schemas: tuple[str, ...] = (),
+    previous: SourceCatalogSnapshot | None = None,
 ) -> PostgreSQLStructure:
+    """Read the structure the request allows; whatever a limit cuts is truncated."""
+
     schemas = _configuration_schemas(registration.configuration)
     resource_rows = await connection.fetch(
         _RESOURCES_SQL,
         list(schemas),
         max_resources + 1,
     )
-    if len(resource_rows) > max_resources:
-        raise DiscoveryLimitError(
-            registration.id,
-            "PostgreSQL discovery resource limit exceeded",
-        )
+    truncated = len(resource_rows) > max_resources
+    # A table outside the refreshed schemas keeps what the previous snapshot read.
+    kept = (
+        {facet.resource_id: facet for facet in previous.facets}
+        if refresh_schemas and previous is not None
+        else {}
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _DISCOVERY_SECONDS
     tables: list[_TableStructure] = []
-    for row in resource_rows:
+    for row in resource_rows[:max_resources]:
         schema = _row_text(row, "schema_name")
         name = _row_text(row, "resource_name")
         kind_value = _row_text(row, "resource_kind")
         kind = ResourceKind.VIEW if kind_value == "view" else ResourceKind.TABLE
-        column_rows = await connection.fetch(
-            COLUMNS_SQL,
-            schema,
-            name,
-            max_columns + 1,
-        )
-        if len(column_rows) > max_columns:
-            raise DiscoveryLimitError(
-                registration.id,
-                "PostgreSQL discovery column limit exceeded",
+        facet = (
+            None
+            if schema in refresh_schemas
+            else kept.get(
+                catalog_resource_id(registration.id, kind, f"{schema}.{name}")
             )
-        columns = tuple(column_from_row(row) for row in column_rows)
-        index_rows = await connection.fetch(
-            INDEXES_SQL,
-            schema,
-            name,
-            max_indexes + 1,
         )
-        if len(index_rows) > max_indexes:
-            raise DiscoveryLimitError(
-                registration.id,
-                "PostgreSQL discovery index limit exceeded",
+        if facet is not None:
+            tabular = TabularFacet.from_payload(facet.payload)
+            columns, indexes = tabular.columns, tabular.indexes
+            # The previous read may have been cut at these limits.
+            truncated |= len(columns) >= max_columns or len(indexes) >= max_indexes
+        elif loop.time() >= deadline:
+            truncated = True
+            continue
+        else:
+            column_rows = await connection.fetch(
+                COLUMNS_SQL,
+                schema,
+                name,
+                max_columns + 1,
             )
-        indexes = tuple(
-            index
-            for row in index_rows
-            if (index := _index(row, {column.name for column in columns})) is not None
-        )
+            columns = columns_from_rows(column_rows, max_columns)
+            index_rows = await connection.fetch(
+                INDEXES_SQL,
+                schema,
+                name,
+                max_indexes + 1,
+            )
+            truncated |= len(column_rows) > max_columns or len(index_rows) > max_indexes
+            known_columns = {column.name for column in columns}
+            indexes = tuple(
+                index
+                for row in index_rows[:max_indexes]
+                if (index := _index(row, known_columns)) is not None
+            )
         tables.append(
             _TableStructure(
                 schema=schema,
@@ -886,15 +980,14 @@ async def _load_structure(
         list(schemas),
         max_relationships + 1,
     )
-    if len(relationship_rows) > max_relationships:
-        raise DiscoveryLimitError(
-            registration.id,
-            "PostgreSQL discovery relationship limit exceeded",
-        )
-    known = {(table.schema, table.name) for table in tables}
+    truncated |= len(relationship_rows) > max_relationships
+    known = {
+        (table.schema, table.name): {column.name for column in table.columns}
+        for table in tables
+    }
     relationships = tuple(
         relation
-        for row in relationship_rows
+        for row in relationship_rows[:max_relationships]
         if (relation := _relationship(row, known)) is not None
     )
     ordered_tables = tuple(sorted(tables, key=lambda item: (item.schema, item.name)))
@@ -918,6 +1011,7 @@ async def _load_structure(
         tables=ordered_tables,
         relationships=ordered_relationships,
         source_revision="catalog:sha256:" + sha256(encoded).hexdigest(),
+        truncated=truncated,
     )
 
 
@@ -1088,6 +1182,7 @@ def _catalog_snapshot(
         source_revision=structure.source_revision,
         resource_count=len(resources),
         relationship_count=len(ordered_relationships),
+        truncated=structure.truncated,
     )
     return SourceCatalogSnapshot(
         sync=sync,
@@ -1096,6 +1191,19 @@ def _catalog_snapshot(
         facets=tuple(facets[key] for key in sorted(facets)),
         relationships=ordered_relationships,
     )
+
+
+def columns_from_rows(
+    rows: Sequence[Mapping[str, object]], limit: int
+) -> tuple[TabularColumn, ...]:
+    """The first ``limit`` columns; a primary key the cut splits shows not at all."""
+
+    kept = rows[:limit]
+    columns = tuple(column_from_row(row) for row in kept)
+    keyed = [row for row in kept if row.get("primary_key_ordinal") is not None]
+    if keyed and len(keyed) < _row_int(keyed[0], "primary_key_size"):
+        return tuple(replace(column, primary_key_ordinal=None) for column in columns)
+    return columns
 
 
 def column_from_row(row: Mapping[str, object]) -> TabularColumn:
@@ -1146,7 +1254,7 @@ def _index(
 
 def _relationship(
     row: Mapping[str, object],
-    known: set[tuple[str, str]],
+    known: Mapping[tuple[str, str], set[str]],
 ) -> _RelationshipStructure | None:
     source = (_row_text(row, "source_schema"), _row_text(row, "source_table"))
     target = (_row_text(row, "target_schema"), _row_text(row, "target_table"))
@@ -1163,6 +1271,11 @@ def _relationship(
         maximum_items=64,
     )
     if len(source_columns) != len(target_columns) or not source_columns:
+        return None
+    # A key naming a column the column limit cut would point outside its table.
+    if not (
+        set(source_columns) <= known[source] and set(target_columns) <= known[target]
+    ):
         return None
     pairs = tuple(
         RelationshipFieldPair(
@@ -1253,6 +1366,43 @@ def _probe_row_mapping(row: object) -> Mapping[str, object]:
     if len(normalized) != len(items):
         raise ValueError("probe row fields must be unique")
     return normalized
+
+
+def _health_details(row: Mapping[str, object]) -> dict[str, object]:
+    """The role, whether it can only read, and a sentence for each broad grant."""
+
+    # Only the fixed names are repeated, never server text.
+    held = set(_BUILTIN_ROLES).intersection(cast(Sequence[str], row["builtin_roles"]))
+    writable = cast(int, row["writable_tables"])
+    creatable = cast(int, row["creatable_schemas"])
+    superuser = cast(bool, row["rolsuper"])
+    warnings: list[str] = []
+    if superuser:
+        warnings.append("This role is a superuser, so it can read and change anything.")
+    if row["rolbypassrls"]:
+        warnings.append("This role bypasses row-level security.")
+    if row["rolcreaterole"] or row["rolcreatedb"]:
+        warnings.append("This role can create roles or databases.")
+    # A superuser implicitly holds every built-in role; its own warning says so.
+    if held and not superuser:
+        warnings.append(
+            f"This role belongs to broad built-in roles: {', '.join(sorted(held))}."
+        )
+    if writable:
+        warnings.append(
+            f"This role can change data in {writable} table"
+            f"{'' if writable == 1 else 's'}. Daita only writes what is enabled "
+            "and approved, but a read-only role is safer unless writes are planned."
+        )
+    if creatable:
+        warnings.append("This role can create objects in a configured schema.")
+    return {
+        "role": str(row["role_name"]),
+        "read_only": not (
+            superuser or writable or creatable or held & _WRITING_BUILTIN_ROLES
+        ),
+        "warnings": tuple(warnings),
+    }
 
 
 def _load_asyncpg() -> Any:

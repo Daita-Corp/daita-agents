@@ -93,6 +93,7 @@ REMOTE_AGENT_SURFACE: Final = frozenset(
         "edit_postgresql_source",
         "detach",
         "refresh_source",
+        "check_source",
         "resolve_source",
         "inspect_source_permissions",
         "preview_source_permissions",

@@ -1268,6 +1268,11 @@ def _connector_directory(
                 "dialect": source.get("dialect"),
                 "schemas": source.get("schemas", ()),
                 "approximate_objects": source.get("approximate_objects"),
+                **(
+                    {"catalog_partial": source["catalog_partial"]}
+                    if "catalog_partial" in source
+                    else {}
+                ),
             }
         )
     bindings: dict[str, FrozenJsonObject] = {}

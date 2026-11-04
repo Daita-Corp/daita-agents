@@ -10,6 +10,7 @@ from typing import cast
 import pytest
 
 from daita._json import FrozenJsonObject, canonical_json, thaw_json
+from daita.adapters import SQLiteQueryError
 from daita.adapters.registry import SourceOperation, SourceTypeRegistry
 from daita.capabilities import (
     CallTargetLane,
@@ -658,6 +659,45 @@ async def test_data_query_inline_byte_limit_reports_truncation() -> None:
     assert isinstance(byte_limit, int)
     assert 0 < returned_rows < len(rows)
     assert utf8_bytes <= byte_limit
+
+
+@pytest.mark.parametrize("undefined", (True, False))
+async def test_a_missing_object_asks_for_a_refresh_and_the_error_reaches_the_model(
+    undefined: bool,
+) -> None:
+    failure = SQLiteQueryError(
+        "query_invalid", "no such table: items", undefined_object=undefined
+    )
+
+    class Failing:
+        async def execute_read(self, **arguments: object) -> object:
+            raise failure
+
+    requested: list[tuple[str, tuple[str, ...]]] = []
+    executor = DataQueryExecutor(
+        "agent-relational",
+        {"sqlite": Failing()},  # type: ignore[dict-item]
+        request_refresh=lambda source_id, names: requested.append((source_id, names)),
+    )
+
+    with pytest.raises(SQLiteQueryError) as raised:
+        await executor.execute(
+            ToolExecution(
+                run_id="run-relational",
+                call_id="call-sqlite",
+                capability_id=DATA_QUERY_CAPABILITY_ID,
+                arguments={
+                    "source_id": "source-sqlite",
+                    "resource_ids": ("resource-sqlite",),
+                    "sql": "SELECT id FROM items",
+                    "_adapter_id": "sqlite",
+                    "_reads": (_prepared_read("resource-sqlite"),),
+                },
+            )
+        )
+
+    assert raised.value is failure
+    assert requested == ([("source-sqlite", ("items",))] if undefined else [])
 
 
 class _ExportBackend:

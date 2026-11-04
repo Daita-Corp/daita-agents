@@ -33,7 +33,7 @@ from ..adapters.mcp import (
     MCPServerInspection,
     MCPToolSelection,
 )
-from ..adapters.models import SourceRegistration
+from ..adapters.models import SourceHealth, SourceRegistration
 from ..adapters.postgresql import PostgreSQLProbeResult
 from ..adapters.postgresql_write import RelationalWriteReadiness
 from ..adapters.protocols import ResourceSource
@@ -1258,6 +1258,9 @@ class RemoteAgent:
 
     async def refresh_source(self, source_id: str) -> SourceRegistration:
         return await self._call("refresh_source", locals())
+
+    async def check_source(self, source_id: str) -> SourceHealth:
+        return await self._call("check_source", locals())
 
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
         return await self._call("list_sources", locals())

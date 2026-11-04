@@ -33,6 +33,37 @@ and `data_upsert_rows`.
   Generated identities are no longer returned, since a statement cannot have its own
   `RETURNING`.
 
+### Attach never fails on size, and the catalog keeps up
+
+A large source now attaches. Discovery reads up to 1,000 tables, 512 columns and 256
+indexes per table and 2,000 relationships, and on PostgreSQL stops reading table
+structure after 60 seconds. Whatever is cut stays reachable through `catalog_search`,
+`catalog_describe` and queries, and the source is marked truncated; the model is told
+the catalog holds only part of it. `DiscoveryLimitError` is gone.
+
+- **The catalog refreshes itself.** It refreshes on attach, on `Agent.refresh_source`,
+  when a search or describe finds a table the catalog lacks or has wrong, and when a
+  query fails because a table or column does not exist. Automatic refreshes run in the
+  background, never delay a read, and run at most once per source every five minutes.
+  On PostgreSQL a miss on a schema-qualified name re-reads only that schema.
+- **Revoking a source no longer waits for a refresh.**
+- **No re-preview after a sync.** A catalog sync between previewing and applying source
+  permissions no longer forces a new preview.
+- **Connection check.** `Agent.check_source(source_id)` asks the live source whether it
+  is reachable, which role Daita connects as, whether that role can only read, and
+  warns about broad grants such as a superuser role. `/sources` shows it for the
+  selected source, attaching a source shows it, and `daita attach` prints it as
+  `connection`. The host serves it at `POST /sources/{source_id}/check`.
+- **PostgreSQL shows only what the role can read.** A composite primary key appears only
+  if the role can read every column of it. A partition is listed on its own unless a
+  readable parent in the configured schemas holds it, so a role granted only a child
+  partition can find it.
+- **A damaged catalog row no longer stops work.** While the agent is open, reads and
+  approved writes continue; opening a home with a damaged row still fails.
+- **`semantic_save` on a table with no catalog entry** is refused with
+  `semantic_unknown_resource` and says reads are unaffected, instead of
+  `resource_read_not_allowed`.
+
 ### Routines are a title, a prompt and a schedule
 
 A routine now holds what a person asked for: a title, a prompt, a schedule

@@ -64,9 +64,13 @@ class SQLiteQueryError(DaitaError):
         code: str,
         message: str,
         details: Mapping[str, object] | None = None,
+        *,
+        undefined_object: bool = False,
     ) -> None:
         self.code = code
         self.details = dict(details or {})
+        # The source says a table or column is missing; the catalog may be stale.
+        self.undefined_object = undefined_object
         super().__init__(message, error_code=code)
 
 
@@ -717,7 +721,12 @@ def _classified_failure(error: sqlite3.Error) -> SQLiteQueryError:
         )
     if name == "SQLITE_ERROR":
         # Unknown tables and columns, ambiguity and syntax: names, never values.
-        return SQLiteQueryError("query_invalid", text, refused_read_details(details))
+        return SQLiteQueryError(
+            "query_invalid",
+            text,
+            refused_read_details(details),
+            undefined_object="no such table" in text or "no such column" in text,
+        )
     return SQLiteQueryError(
         "sqlite_query_failed",
         "SQLite could not complete the bounded read" + (f" ({name})." if name else "."),

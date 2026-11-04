@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from typing import Any
+
 from daita import AgentConfig, MCPToolSelection
 from daita.adapters.mcp import SDKMCPClientFactory
+from daita.adapters.models import SourceHealth
 from daita.host.client import RemoteAgent
 from daita.llm.models import FinishReason, ModelResponse, ToolCall
 from daita.llm.providers.mock import MockModelProvider
@@ -34,10 +38,12 @@ from tests.tui._support import (
     TranscriptBlock,
     TranscriptView,
     WelcomeView,
+    _create_sqlite_source,
     asyncio,
     parse_postgresql_connection_url,
     pytest,
     redact_presentation_value,
+    settle_until,
     workspace_for,
 )
 
@@ -1097,3 +1103,85 @@ async def test_postgresql_setup_probes_and_preselects_schemas_with_tables(monkey
         assert attached["schemas"] == ("core", "sales")
         assert deleted == []
         app.exit(0)
+
+
+async def _failing_check(_source_id: str) -> SourceHealth:
+    raise RuntimeError("password=DO-NOT-EXPOSE")
+
+
+async def _broad_check(source_id: str) -> SourceHealth:
+    return SourceHealth(
+        agent_id="agent",
+        source_id=source_id,
+        adapter_id="postgresql",
+        healthy=True,
+        checked_at=datetime(2026, 11, 4, tzinfo=UTC),
+        details={
+            "role": "ow\x1b[31mner",
+            "read_only": False,
+            "warnings": (
+                "This role is a superuser, so it can read and change anything.",
+            ),
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("check", "shown"),
+    (
+        (None, "Source attached. Connected · read-only."),
+        (
+            _broad_check,
+            "Source attached. Connected as ow?[31mner · can change data. "
+            "This role is a superuser, so it can read and change anything.",
+        ),
+        (
+            _failing_check,
+            "Source attached, but the connection could not be confirmed.",
+        ),
+    ),
+    ids=("read-only", "broad-role", "check-fails"),
+)
+async def test_attaching_a_source_confirms_the_connection_or_says_it_could_not(
+    tmp_path: Path, start_host: StartHost, check: Any, shown: str
+):
+    database = tmp_path / "attach.sqlite"
+    _create_sqlite_source(database, "records")
+    harness = await start_host()
+    opened = await remote_agent(harness, "attach-confirmation")
+    if check is not None:
+        opened.check_source = check  # type: ignore[method-assign]
+    app = DaitaApp(
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
+    )
+    app.controller.agent = opened
+    try:
+        async with app.run_test(size=(100, 32)) as pilot:
+            await app._show_chat()
+            composer = app.screen.query_one(Composer)
+            composer.load_text("/source add")
+            composer.action_submit()
+            await settle_until(pilot, lambda: isinstance(app.screen, SourceSetupScreen))
+            setup = app.screen
+            assert isinstance(setup, SourceSetupScreen)
+            setup.query_one("#source-type", Select).value = "sqlite"
+            setup.query_one("#source-name", Input).value = "Records"
+            setup.query_one("#source-path", Input).value = str(database)
+            assert await pilot.click("#attach-source", offset=(2, 1)) is True
+            await settle_until(
+                pilot,
+                lambda: isinstance(app.screen, ChatScreen)
+                and bool(app.screen.query_one("#notice-bar").display),
+            )
+
+            notice = str(app.screen.query_one("#notice-bar", Static).content)
+            assert notice.startswith(shown)
+            assert "DO-NOT-EXPOSE" not in notice
+            assert "\x1b" not in notice
+            # Whatever the check said, the source is attached.
+            assert [item.display_name for item in await opened.list_sources()] == [
+                "Records"
+            ]
+            app.exit(0)
+    finally:
+        await opened.close()

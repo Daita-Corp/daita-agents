@@ -308,7 +308,6 @@ class SourcePermissionsInspection:
     source_id: str
     source_display_name: str
     adapter_id: str
-    catalog_generation: str | None
     state: SourcePermissionState
     resources: tuple[SourcePermissionResource, ...]
     # Whether the source's type declares native update or upsert writes.
@@ -331,11 +330,6 @@ class SourcePermissionsInspection:
             "permission inspection adapter_id",
             maximum=128,
         )
-        if self.catalog_generation is not None:
-            _permission_text(
-                self.catalog_generation,
-                "permission inspection catalog_generation",
-            )
         if not isinstance(self.state, SourcePermissionState):
             raise TypeError("permission inspection state must be SourcePermissionState")
         if self.state.read_scope.source_id != self.source_id:
@@ -367,7 +361,6 @@ class SourcePermissionsPreview:
     """One exact in-process confirmed transition; it is never persisted."""
 
     source_id: str
-    catalog_generation: str | None
     before: SourcePermissionState
     after: SourcePermissionState
     automatic_read_additions: tuple[str, ...]
@@ -381,11 +374,6 @@ class SourcePermissionsPreview:
             or _SOURCE_PERMISSION_SOURCE_ID.fullmatch(self.source_id) is None
         ):
             raise ValueError("permission preview source_id must be canonical")
-        if self.catalog_generation is not None:
-            _permission_text(
-                self.catalog_generation,
-                "permission preview catalog_generation",
-            )
         for state, name in ((self.before, "before"), (self.after, "after")):
             if not isinstance(state, SourcePermissionState):
                 raise TypeError(f"permission preview {name} must be state")

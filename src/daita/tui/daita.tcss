@@ -850,6 +850,14 @@ ModelSetupScreen #model-help {
     color: $text-muted;
 }
 
+#source-connection {
+    height: auto;
+    max-height: 7;
+    overflow-y: auto;
+    padding-top: 1;
+    color: $text-muted;
+}
+
 #source-actions {
     height: auto;
     padding-top: 1;

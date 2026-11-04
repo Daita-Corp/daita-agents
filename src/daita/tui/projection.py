@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from typing import Any
 
 from daita import ConversationRun, LoopExit, LoopExitKind, Transcript
 from daita.llm.models import MessageRole, ToolCall, ToolResultBlock
@@ -683,6 +684,67 @@ def run_failure_notice(result: LoopExit, transcript: Transcript | None = None) -
         preserve_lines=True,
         fallback="Run stopped.",
     )
+
+
+def connection_facts(health: Any) -> dict[str, object]:
+    """What a person should know about a live connection check, safe to print.
+
+    Keys the source did not report are left out. The role is server text, so it
+    is sanitized here for every surface.
+    """
+
+    facts: dict[str, object] = {"reachable": health.healthy}
+    if health.error_code is not None:
+        facts["error_code"] = health.error_code
+    role = health.details.get("role")
+    if isinstance(role, str):
+        facts["role"] = sanitize_terminal_text(
+            role, maximum=64, preserve_lines=False, fallback="unknown role"
+        )
+    read_only = health.details.get("read_only")
+    if isinstance(read_only, bool):
+        facts["read_only"] = read_only
+    warnings = health.details.get("warnings")
+    if isinstance(warnings, tuple):
+        facts["warnings"] = [
+            sanitize_terminal_text(
+                warning, maximum=512, preserve_lines=False, fallback=""
+            )
+            for warning in warnings
+            if isinstance(warning, str)
+        ]
+    return facts
+
+
+def connection_lines(facts: Mapping[str, object]) -> list[str]:
+    """The connection facts as short lines: what it is, then each warning."""
+
+    if not facts.get("reachable"):
+        return [
+            "Not reachable",
+            str(facts.get("guidance") or "The source could not be reached."),
+        ]
+    head = "Connected"
+    if facts.get("role"):
+        head += f" as {facts['role']}"
+    if facts.get("read_only") is not None:
+        head += " · read-only" if facts["read_only"] else " · can change data"
+    warnings = facts.get("warnings")
+    return [head, *(warnings if isinstance(warnings, list) else [])]
+
+
+def connection_notice(facts: Mapping[str, object]) -> tuple[str, bool]:
+    """The one-line notice after attaching, and whether it deserves attention."""
+
+    if not facts.get("reachable"):
+        return (
+            "Source attached, but the connection could not be confirmed. "
+            + str(facts.get("guidance") or ""),
+            True,
+        )
+    head, *warnings = connection_lines(facts)
+    needs_attention = bool(warnings) or facts.get("read_only") is False
+    return " ".join(["Source attached. " + head + ".", *warnings]), needs_attention
 
 
 def format_status_label(

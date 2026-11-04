@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol, cast
 
@@ -49,6 +49,8 @@ _COMMON_WORDS = frozenset(
 # What a source's own failure can raise; a lookup then says so instead of failing.
 _LOOKUP_FAILURES = (DaitaError, ImportError, OSError, TimeoutError)
 _TRUST = "untrusted_external_data"
+
+RefreshRequest = Callable[[str, tuple[str, ...]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,10 +123,12 @@ class CatalogSearchExecutor:
         agent_id: str,
         service: CatalogProjection,
         live: Mapping[str, LiveLookup],
+        request_refresh: RefreshRequest = lambda source_id, names: None,
     ) -> None:
         self._agent_id = agent_id
         self._service = service
         self._live = live
+        self._request_refresh = request_refresh
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         query = _string_argument(request, "query")
@@ -208,6 +212,19 @@ class CatalogSearchExecutor:
                     "dialect": dialects.get(source_id),
                     "seen_live": False,
                 }
+        # A hit only the source knows means the catalog is behind; a failed
+        # catalog search says nothing about that.
+        in_catalog = {
+            (cast(str, hit["source_id"]), cast(str, hit["name"])) for hit in cataloged
+        }
+        missed: dict[str, list[str]] = {}
+        for (source_id, name), hit in merged.items():
+            if hit["seen_live"] and (source_id, name) not in in_catalog:
+                missed.setdefault(source_id, []).append(name)
+        if not catalog_failed:
+            for source_id, names in missed.items():
+                if source_id != session:
+                    self._request_refresh(source_id, tuple(names))
         hits = list(merged.values())
         return ToolOutput(
             kind=CATALOG_SEARCH_EVIDENCE_KIND,
@@ -231,10 +248,12 @@ class CatalogDescribeExecutor:
         agent_id: str,
         service: CatalogProjection,
         live: Mapping[str, LiveLookup],
+        request_refresh: RefreshRequest = lambda source_id, names: None,
     ) -> None:
         self._agent_id = agent_id
         self._service = service
         self._live = live
+        self._request_refresh = request_refresh
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         source_id = _string_argument(request, "source_id")
@@ -253,12 +272,17 @@ class CatalogDescribeExecutor:
             except _LOOKUP_FAILURES:
                 unreachable = True
         cached: Mapping[str, object] | None = None
+        catalog_failed = False
         try:
             cached = await self._service.cached_description(
                 self._agent_id, source_id, name
             )
         except CatalogStoreError:
-            pass
+            catalog_failed = True
+        if backend is not None and not unreachable and not catalog_failed:
+            stale = _disagreement(live, cached)
+            if stale is not None and source_id != self._service.session_source_id:
+                self._request_refresh(source_id, (stale,))
         # A cached answer never overrides a live one, and a table the live source
         # no longer has is gone even if the catalog remembers it.
         if live is not None:
@@ -365,6 +389,38 @@ class CatalogDescribeExecutor:
         return scoped
 
 
+def _disagreement(
+    live: Mapping[str, object] | None, cached: Mapping[str, object] | None
+) -> str | None:
+    """The relation the live source and the catalog disagree about, if any.
+
+    Only a table, view or file counts: an ambiguous name or a schema listing is
+    not one relation. Columns are compared by name and type, which both produce.
+    """
+
+    if live is None:
+        return None if cached is None else cast(str, cached["name"])
+    if live["kind"] == "ambiguous" or "tables" in live:
+        return None
+    name = cast(str, live["name"])
+    if cached is None:
+        return name
+    return (
+        name
+        if cached["name"] == name and _column_types(live) != _column_types(cached)
+        else None
+    )
+
+
+def _column_types(description: Mapping[str, object]) -> list[tuple[object, object]]:
+    return [
+        (column["name"], column["type"])
+        for column in cast(
+            Sequence[Mapping[str, object]], description.get("columns", ())
+        )
+    ]
+
+
 def _merged_relationships(
     live: Sequence[Mapping[str, object]], cached: Sequence[Mapping[str, object]]
 ) -> list[Mapping[str, object]]:
@@ -385,9 +441,14 @@ def catalog_declarations(
     agent_id: str,
     service: CatalogProjection,
     live: Mapping[str, LiveLookup] | None = None,
+    request_refresh: RefreshRequest = lambda source_id, names: None,
 ) -> CatalogDeclarations:
-    search_executor = CatalogSearchExecutor(agent_id, service, live or {})
-    describe_executor = CatalogDescribeExecutor(agent_id, service, live or {})
+    search_executor = CatalogSearchExecutor(
+        agent_id, service, live or {}, request_refresh
+    )
+    describe_executor = CatalogDescribeExecutor(
+        agent_id, service, live or {}, request_refresh
+    )
     search = Capability(
         id=CATALOG_SEARCH_CAPABILITY_ID,
         description=(

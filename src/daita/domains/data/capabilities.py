@@ -8,7 +8,7 @@ import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol, TypeVar, cast
+from typing import Any, Protocol, TypeVar, cast
 
 from ..._json import FrozenJsonObject, canonical_json
 from ...adapters.local_file_query import LocalFileQueryError, QueryRelation
@@ -283,6 +283,27 @@ class SqlReadBackend(Protocol):
     ) -> SqlReadResult: ...
 
 
+RefreshRequest = Callable[[str, tuple[str, ...]], None]
+
+
+async def _execute_read(
+    backend: SqlReadBackend,
+    request_refresh: RefreshRequest,
+    *,
+    source_id: str,
+    read: CheckedRead,
+    **arguments: Any,
+) -> SqlReadResult:
+    """Run one read; a missing object asks for a catalog refresh and still fails."""
+
+    try:
+        return await backend.execute_read(source_id=source_id, read=read, **arguments)
+    except Exception as error:
+        if getattr(error, "undefined_object", False):
+            request_refresh(source_id, tuple(name for _, name in read.resource_names))
+        raise
+
+
 TABULAR_FILTER_OPERATORS = ("eq", "in", "lt", "lte", "gt", "gte")
 TABULAR_READ_MAX_COLUMNS = 64
 TABULAR_READ_MAX_FILTERS = 16
@@ -445,10 +466,12 @@ class DataQueryExecutor:
         total_timeout_seconds: float = DATA_QUERY_TOTAL_TIMEOUT_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        request_refresh: RefreshRequest = lambda source_id, names: None,
     ) -> None:
         if not 0 < statement_timeout_seconds <= total_timeout_seconds:
             raise ValueError("statement timeout must be positive and within total")
         self._agent_id = agent_id
+        self._request_refresh = request_refresh
         self._backends = dict(backends)
         self._max_rows = max_rows
         self._max_bytes = max_bytes
@@ -486,7 +509,9 @@ class DataQueryExecutor:
                 )
             statement_started = self._clock()
             read_at = self._wall_clock().isoformat()
-            result = await backend.execute_read(
+            result = await _execute_read(
+                backend,
+                self._request_refresh,
                 agent_id=self._agent_id,
                 source_id=source_id,
                 read=read,
@@ -582,8 +607,10 @@ class DataQueryCombinedExecutor:
         *,
         tabular_backends: Mapping[str, TabularReadBackend] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        request_refresh: RefreshRequest = lambda source_id, names: None,
     ) -> None:
         self._agent_id = agent_id
+        self._request_refresh = request_refresh
         self._backends = dict(backends)
         self._tabular_backends = dict(tabular_backends or {})
         self._engine = engine
@@ -688,7 +715,9 @@ class DataQueryCombinedExecutor:
         if backend is None:
             raise ValueError("relational query adapter binding is unsupported")
         read_at = datetime.now(UTC).isoformat()
-        result = await backend.execute_read(
+        result = await _execute_read(
+            backend,
+            self._request_refresh,
             agent_id=self._agent_id,
             source_id=source_id,
             read=checked_reads(item)[0],
@@ -984,6 +1013,7 @@ def data_query_declarations(
     combined_engine: CombinedQueryEngine | None = None,
     tabular_backends: Mapping[str, TabularReadBackend] | None = None,
     path_backends: Mapping[str, PathPatternReadBackend] | None = None,
+    request_refresh: RefreshRequest = lambda source_id, names: None,
 ) -> DataQueryDeclarations:
     """Declare data_query over SQL backends.
 
@@ -991,7 +1021,9 @@ def data_query_declarations(
     adds the multi-source ``inputs`` route.
     """
 
-    executors: tuple[Executor, ...] = (DataQueryExecutor(agent_id, backends),)
+    executors: tuple[Executor, ...] = (
+        DataQueryExecutor(agent_id, backends, request_refresh=request_refresh),
+    )
     if path_backends:
         executors += (PathQueryExecutor(agent_id, path_backends),)
     if combined_engine is not None:
@@ -1001,6 +1033,7 @@ def data_query_declarations(
                 backends,
                 combined_engine,
                 tabular_backends=tabular_backends,
+                request_refresh=request_refresh,
             ),
         )
     declarations = data_query_capability_declarations(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,6 +16,11 @@ from daita.llm.models import (
     ToolCall,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.storage.sqlite import SQLiteStateStore
+from daita.storage.sqlite_codecs import (
+    decode_catalog_snapshot,
+    encode_catalog_snapshot,
+)
 from tests.support.workspace import workspace_for
 
 _NOW = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
@@ -84,8 +90,31 @@ async def test_the_directory_names_each_source_but_no_table(tmp_path: Path) -> N
     assert '"type":"SQLite"' in system
     assert '"dialect":"sqlite"' in system
     assert '"approximate_objects":3' in system
+    assert "catalog_partial" not in system
     for ranked in ("orders_east", "match_outcomes", "binding_status"):
         assert ranked not in system
+
+
+async def test_a_truncated_catalog_says_the_directory_is_only_part_of_the_source(
+    tmp_path: Path,
+) -> None:
+    agent, provider = await _agent(tmp_path, _stop())
+    try:
+        with sqlite3.connect(agent.home / "state.db") as connection:
+            ((data,),) = connection.execute("SELECT data FROM snapshots")
+            snapshot = decode_catalog_snapshot(data)
+            truncated = replace(snapshot, sync=replace(snapshot.sync, truncated=True))
+            connection.execute(
+                "UPDATE snapshots SET data = ?", (encode_catalog_snapshot(truncated),)
+            )
+        assert isinstance(agent._embedded._store, SQLiteStateStore)
+        agent._embedded._store._decoded_catalog_snapshots.clear()
+        await agent.run("Hello.")
+    finally:
+        await agent.close()
+    system = _system(provider.requests[0])
+    assert '"approximate_objects":3' in system
+    assert "catalog_partial" in system
 
 
 async def test_a_failing_catalog_leaves_the_directory_without_a_count(
@@ -108,6 +137,7 @@ async def test_a_failing_catalog_leaves_the_directory_without_a_count(
         await agent.close()
     system = _system(provider.requests[0])
     assert '"approximate_objects":null' in system
+    assert "catalog_partial" not in system
 
 
 async def test_later_turns_read_tables_again_rather_than_trust_old_descriptions(

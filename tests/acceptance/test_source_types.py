@@ -413,6 +413,7 @@ async def test_unregistered_type_in_a_stored_home_degrades_without_breaking_sqli
         assert await agent.unavailable_sources() == (memory,)
         with pytest.raises(AgentHomeError, match="not registered"):
             await agent.refresh_source(memory.id)
+        assert not (await agent.check_source(memory.id)).healthy
         assert (await agent.refresh_source(customers.id)).id == customers.id
 
         (table,) = await agent.list_catalog_resources(source_id=customers.id)

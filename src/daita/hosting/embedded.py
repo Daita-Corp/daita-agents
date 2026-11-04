@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import re
 import secrets
 import sqlite3
@@ -40,7 +41,7 @@ from ..adapters.mcp import (
     mcp_binding_from_inspection,
     mcp_execution_origin_digest,
 )
-from ..adapters.models import DiscoveryRequest, SourceRegistration
+from ..adapters.models import DiscoveryRequest, SourceHealth, SourceRegistration
 from ..adapters.postgresql import (
     POSTGRESQL_ADAPTER_ID,
     PostgreSQLProbeResult,
@@ -101,7 +102,9 @@ from ..catalog.models import (
     CatalogSync,
     CatalogSyncStatus,
     RelationshipFieldPair,
+    SourceCatalogSnapshot,
 )
+from ..catalog.protocols import CatalogStoreError
 from ..catalog.service import CatalogService
 from ..config import (
     AgentConfig,
@@ -150,6 +153,7 @@ from ..domains.mcp import (
     activate_mcp_domain,
     validate_mcp_model_compatibility,
 )
+from ..errors import DaitaError
 from ..identity import AgentIdentity
 from ..jobs.capabilities import (
     JOB_DOMAIN_OWNER_ID,
@@ -383,6 +387,9 @@ def machine_run_excluded_owners(origin: RunOrigin) -> frozenset[str]:
 
 _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
 _RUN_ADMISSION_DRAIN_SECONDS = 30.0
+# A model typo must not cost a discovery per query.
+_SOURCE_REFRESH_MIN_SECONDS = 300.0
+_LOGGER = logging.getLogger("daita.hosting")
 _T = TypeVar("_T")
 
 
@@ -603,6 +610,8 @@ class EmbeddedAgent:
         self._mcp_commit_lock = asyncio.Lock()
         self._source_management_lock = asyncio.Lock()
         self._source_commit_lock = asyncio.Lock()
+        self._source_refreshes: dict[str, asyncio.Task[None]] = {}
+        self._source_refresh_started: dict[str, float] = {}
         self._source_permission_lock = asyncio.Lock()
         self._source_permission_confirmation_key = secrets.token_bytes(32)
         self._source_permission_previews: dict[str, SourcePermissionsPreview] = {}
@@ -1333,8 +1342,15 @@ class EmbeddedAgent:
         for source_type in registry.types():
             for operation, backend in source_type.backends(backend_context).items():
                 source_backends[operation][source_type.adapter_id] = backend
+
+        def request_refresh(source_id: str, names: tuple[str, ...]) -> None:
+            embedded.request_source_refresh(source_id, names)
+
         catalog = catalog_declarations(
-            identity.id, data_view, source_backends[SourceOperation.LIVE_LOOKUP]
+            identity.id,
+            data_view,
+            source_backends[SourceOperation.LIVE_LOOKUP],
+            request_refresh=request_refresh,
         )
         if admission_cleanup is not None:
             for backend in _backends_with(source_backends, "close"):
@@ -1388,6 +1404,7 @@ class EmbeddedAgent:
             combined_engine=combined_engine,
             tabular_backends=source_backends[SourceOperation.TABULAR_READ],
             path_backends=source_backends[SourceOperation.PATH_QUERY],
+            request_refresh=request_refresh,
             file_outputs=(
                 exact_export_outputs(allow_arrow=export_arrow_bounds is not None)
                 if relational_export is not None
@@ -3891,12 +3908,11 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "source-attach", self._source_management_lock
         ):
-            async with self._source_commit_lock:
-                self._require_open()
-                return await self._attach_source_locked(
-                    source,
-                    attached_at=attached_at,
-                )
+            self._require_open()
+            return await self._attach_source_locked(
+                source,
+                attached_at=attached_at,
+            )
 
     async def _attach_source_locked(
         self,
@@ -3904,7 +3920,11 @@ class EmbeddedAgent:
         *,
         attached_at: datetime,
         persisted_registration: SourceRegistration | None = None,
+        refresh_schemas: tuple[str, ...] = (),
+        previous: SourceCatalogSnapshot | None = None,
     ) -> SourceRegistration:
+        """Discover under the management lock; only the commit takes the commit lock."""
+
         adapter = await source.open(
             agent_id=self.identity.id,
             attached_at=attached_at,
@@ -3947,18 +3967,22 @@ class EmbeddedAgent:
                     requested_at=sync.started_at,
                     agent_root=None if self._home is None else self._home.parent.parent,
                     agent_home=self._home,
+                    refresh_schemas=refresh_schemas,
+                    previous=previous,
                 )
             )
-            await self._store.commit_snapshot(
-                discovery.snapshot,
-                registration=registration,
-            )
-            self._admission_coordinator.configure_source_resource_capacity(
-                f"source:{registration.id}",
-                self._source_types.read_capacity(
-                    registration.adapter_id, self._host_capacity
-                ),
-            )
+            async with self._source_commit_lock:
+                self._require_open()
+                await self._store.commit_snapshot(
+                    discovery.snapshot,
+                    registration=registration,
+                )
+                self._admission_coordinator.configure_source_resource_capacity(
+                    f"source:{registration.id}",
+                    self._source_types.read_capacity(
+                        registration.adapter_id, self._host_capacity
+                    ),
+                )
             return registration
         except BaseException as error:
             if isinstance(error, ResourceAdapterError):
@@ -4356,10 +4380,6 @@ class EmbeddedAgent:
                         "permission confirmation is unknown or expired; preview again"
                     )
                 current = await self._inspect_source_permissions_locked(source_id)
-                if current.catalog_generation != preview.catalog_generation:
-                    raise ValueError(
-                        "source catalog changed after preview; preview again"
-                    )
                 if current.state == preview.after:
                     return current
                 if current.state != preview.before:
@@ -4481,29 +4501,160 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "source-refresh", self._source_management_lock
         ):
-            async with self._source_commit_lock:
-                self._require_open()
-                registration = await self._store.load_source(
-                    self.identity.id, source_id
+            refreshed = await self._refresh_source_locked(source_id)
+            if refreshed is None:
+                raise ValueError("unknown active source for this agent")
+            return refreshed
+
+    async def check_source(self, source_id: str) -> SourceHealth:
+        """Ask the live source who Daita connects as and what that can change.
+
+        It takes no lock and no lease, so it answers while a discovery runs. A
+        source that cannot be reached is a result with an error code, not a raise.
+        """
+
+        self._require_open()
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        registration = await self._store.load_source(self.identity.id, source_id)
+        if registration is None or not registration.active:
+            raise ValueError("unknown active source for this agent")
+
+        def unhealthy(code: str) -> SourceHealth:
+            try:
+                return SourceHealth(
+                    agent_id=self.identity.id,
+                    source_id=registration.id,
+                    adapter_id=registration.adapter_id,
+                    healthy=False,
+                    checked_at=self._clock(),
+                    error_code=code,
                 )
-                if registration is None or not registration.active:
-                    raise ValueError("unknown active source for this agent")
-                try:
-                    source = self._source_types.require(
-                        registration.adapter_id
-                    ).from_registration(
-                        registration,
-                        secret_provider=default_secret_provider(
-                            self._secret_provider or self._keychain
-                        ),
-                    )
-                except (TypeError, ValueError) as error:
-                    raise AgentHomeError(str(error)) from error
-                return await self._attach_source_locked(
-                    source,
-                    attached_at=registration.attached_at,
-                    persisted_registration=registration,
-                )
+            except ValueError:
+                return unhealthy("source_check_failed")
+
+        try:
+            source = self._source_types.require(
+                registration.adapter_id
+            ).from_registration(
+                registration,
+                secret_provider=default_secret_provider(
+                    self._secret_provider or self._keychain
+                ),
+            )
+            adapter = await source.open(
+                agent_id=self.identity.id,
+                attached_at=registration.attached_at,
+                clock=self._clock,
+            )
+            try:
+                return await adapter.health()
+            finally:
+                await adapter.close()
+        except (
+            DaitaError,
+            ImportError,
+            OSError,
+            TimeoutError,
+            TypeError,
+            ValueError,
+        ) as error:
+            return unhealthy(
+                error.error_code
+                if isinstance(error, DaitaError)
+                else "source_check_failed"
+            )
+
+    async def _refresh_source_locked(
+        self, source_id: str, names: tuple[str, ...] = ()
+    ) -> SourceRegistration | None:
+        """Refresh under the management lock; None when the source is gone."""
+
+        async with self._source_commit_lock:
+            self._require_open()
+            registration = await self._store.load_source(self.identity.id, source_id)
+        if registration is None or not registration.active:
+            return None
+        try:
+            source = self._source_types.require(
+                registration.adapter_id
+            ).from_registration(
+                registration,
+                secret_provider=default_secret_provider(
+                    self._secret_provider or self._keychain
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise AgentHomeError(str(error)) from error
+        refresh_schemas, previous = await self._refresh_scope(registration, names)
+        return await self._attach_source_locked(
+            source,
+            attached_at=registration.attached_at,
+            persisted_registration=registration,
+            refresh_schemas=refresh_schemas,
+            previous=previous,
+        )
+
+    async def _refresh_scope(
+        self, registration: SourceRegistration, names: tuple[str, ...]
+    ) -> tuple[tuple[str, ...], SourceCatalogSnapshot | None]:
+        """The schemas the names sit in, with the snapshot to keep the others from.
+
+        A name outside the configured schemas, or an unqualified one, refreshes all.
+        """
+
+        configured = registration.configuration.get("schemas")
+        parts = [name.partition(".") for name in names]
+        if not names or not isinstance(configured, tuple):
+            return (), None
+        if not all(dot and schema in configured for schema, dot, _ in parts):
+            return (), None
+        schemas = tuple(dict.fromkeys(schema for schema, _, _ in parts))
+        try:
+            refs = await self._store.list_current_snapshot_refs(
+                self.identity.id, (registration.id,)
+            )
+            return schemas, (
+                await self._store.load_current_snapshot(refs[0]) if refs else None
+            )
+        except CatalogStoreError:
+            return schemas, None
+
+    def request_source_refresh(
+        self, source_id: str, names: tuple[str, ...] = ()
+    ) -> None:
+        """Refresh one source's catalog in the background; never waits, never raises."""
+
+        loop = asyncio.get_running_loop()
+        started = self._source_refresh_started.get(source_id)
+        if (
+            self._closed
+            or source_id in self._source_refreshes
+            or (
+                started is not None
+                and loop.time() - started < _SOURCE_REFRESH_MIN_SECONDS
+            )
+        ):
+            return
+        self._source_refresh_started[source_id] = loop.time()
+        task = loop.create_task(self._refresh_source_in_background(source_id, names))
+        self._source_refreshes[source_id] = task
+        task.add_done_callback(lambda _: self._source_refreshes.pop(source_id, None))
+
+    async def _refresh_source_in_background(
+        self, source_id: str, names: tuple[str, ...]
+    ) -> None:
+        # No admission lease: one queued on the lock would hold slots that
+        # foreground runs, routines and jobs share.
+        try:
+            async with self._source_management_lock:
+                await self._refresh_source_locked(source_id, names)
+        except Exception as error:
+            # Error text can hold secrets; a failed sync is already recorded and
+            # the current snapshot stays.
+            _LOGGER.warning(
+                "background catalog refresh failed: %s", type(error).__name__
+            )
 
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
         self._require_open()
@@ -4642,6 +4793,10 @@ class EmbeddedAgent:
 
     async def _finish_close(self) -> None:
         first_error: BaseException | None = None
+        refreshes = tuple(self._source_refreshes.values())
+        for refresh in refreshes:
+            refresh.cancel()
+        await asyncio.gather(*refreshes, return_exceptions=True)
         await self._admission_coordinator.begin_draining()
         try:
             await self._routine_supervisor.close()

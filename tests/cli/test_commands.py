@@ -487,6 +487,24 @@ def test_attach_parser_builds_folder_source(tmp_path: Path):
     assert source.name == "Drop"
 
 
+def test_attach_confirms_the_connection_from_the_live_source() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve() / "state"
+        folder = root.parent / "drop"
+        folder.mkdir()
+        (folder / "orders.csv").write_text("region\nnorth\n", encoding="utf-8")
+        asyncio.run(_create_agent(root, "atlas"))
+
+        code, stdout, stderr = _invoke(
+            ["--no-host", "--root", str(root), "attach", "atlas", "folder", str(folder)]
+        )
+
+    assert (code, stderr) == (0, "")
+    result = json.loads(stdout)
+    assert result["name"] == "drop"
+    assert result["connection"] == {"reachable": True, "read_only": True}
+
+
 def test_attach_refuses_a_kind_without_a_command_line_form():
     args = cli.build_parser().parse_args(["attach", "atlas", "postgresql"])
     args.kind = "memory-table"

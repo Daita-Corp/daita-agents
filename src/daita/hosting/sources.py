@@ -230,8 +230,6 @@ async def _inspect_source_permissions(
     writable = _supports_relational_writes(source_types, registration.adapter_id)
     # The catalog only offers choices, so losing it must not stop a revoke.
     try:
-        refs = await store.list_current_snapshot_refs(agent_id, (source_id,))
-        catalog_generation = None if not refs else refs[0].sync_id
         resources = tuple(
             resource
             for resource in await store.list_resources(agent_id, source_id)
@@ -242,7 +240,7 @@ async def _inspect_source_permissions(
         )
     except (CatalogStoreError, ValueError) as error:
         _LOGGER.warning("catalog unavailable for permissions: %s", type(error).__name__)
-        catalog_generation, resources, schemas = None, (), ()
+        resources, schemas = (), ()
     schemas_by_resource_id = {schema.resource_id: schema for schema in schemas}
     # What the catalog knows only offers choices; enabling reads the table live.
     choices = tuple(
@@ -295,7 +293,6 @@ async def _inspect_source_permissions(
         source_id=source_id,
         source_display_name=registration.display_name,
         adapter_id=registration.adapter_id,
-        catalog_generation=catalog_generation,
         state=SourcePermissionState(read_scope, update_scopes),
         resources=choices,
         supports_relational_writes=writable,
@@ -500,7 +497,6 @@ async def _build_source_permissions_preview(
     material = {
         "source_id": inspection.source_id,
         "adapter_id": inspection.adapter_id,
-        "catalog_generation": inspection.catalog_generation,
         "before": _source_permission_state_payload(inspection.state),
         "after": _source_permission_state_payload(after),
         "automatic_read_additions": tuple(sorted(automatic_read_additions)),
@@ -516,7 +512,6 @@ async def _build_source_permissions_preview(
     )
     return SourcePermissionsPreview(
         source_id=inspection.source_id,
-        catalog_generation=inspection.catalog_generation,
         before=inspection.state,
         after=after,
         automatic_read_additions=tuple(automatic_read_additions),

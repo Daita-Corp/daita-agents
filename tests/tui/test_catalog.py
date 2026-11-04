@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from typing import Any
+
+from daita.adapters.models import SourceHealth
+from daita.tui.controller import SOURCE_REFRESH_ERRORS
 from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.tui._support import (
     Button,
@@ -128,7 +133,6 @@ def _permissions_app(stored_max_rows: int = 25):
         source_id="source-postgresql",
         source_display_name="Support PostgreSQL",
         adapter_id="postgresql",
-        catalog_generation="sync-one",
         state=state,
         resources=(tickets,),
         supports_relational_writes=True,
@@ -142,7 +146,6 @@ def _permissions_app(stored_max_rows: int = 25):
         previews.append(kwargs)
         return SimpleNamespace(
             source_id=inspection.source_id,
-            catalog_generation="sync-one",
             before=state,
             after=state,
             confirmation_fingerprint="sha256:" + "1" * 64,
@@ -223,7 +226,6 @@ async def test_source_permissions_configures_exact_relational_write_scope():
         source_id="source-postgresql",
         source_display_name="Support PostgreSQL",
         adapter_id="postgresql",
-        catalog_generation="sync-one",
         state=initial_state,
         resources=(tickets,),
         supports_relational_writes=True,
@@ -259,7 +261,6 @@ async def test_source_permissions_configures_exact_relational_write_scope():
         )
         return SimpleNamespace(
             source_id=inspection.source_id,
-            catalog_generation=inspection.catalog_generation,
             before=initial_state,
             after=after,
             confirmation_fingerprint="sha256:" + "1" * 64,
@@ -873,3 +874,125 @@ async def test_empty_catalog_refresh_opens_catalog_without_an_onboarding_loop(
             app.exit(0)
     finally:
         await opened.close()
+
+
+def _health(source_id: str, **fields: object) -> SourceHealth:
+    return SourceHealth(
+        agent_id="agent",
+        source_id=source_id,
+        adapter_id="postgresql",
+        checked_at=datetime(2026, 11, 4, tzinfo=UTC),
+        **{"healthy": True, **fields},  # type: ignore[arg-type]
+    )
+
+
+def _agent_checking(check_source: Any) -> Any:
+    async def close() -> None: ...
+
+    return SimpleNamespace(check_source=check_source, close=close)
+
+
+def _sources_screen(*names: str) -> CatalogScreen:
+    return CatalogScreen(
+        summary=SimpleNamespace(
+            active_source_count=len(names), resource_count=0, relationship_count=0
+        ),
+        sources=tuple(
+            SimpleNamespace(id=f"source-{name}", display_name=name, adapter_id="sqlite")
+            for name in names
+        ),
+        resources=(),
+    )
+
+
+async def test_sources_opens_at_once_and_shows_each_connection_check_once():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    release = asyncio.Event()
+    asked: list[str] = []
+
+    async def check_source(source_id: str) -> SourceHealth:
+        asked.append(source_id)
+        await release.wait()
+        return _health(
+            source_id,
+            details={
+                "role": "analyst",
+                "read_only": False,
+                "warnings": ("This role can create objects in a configured schema.",),
+            },
+        )
+
+    app.controller.agent = _agent_checking(check_source)
+    async with app.run_test(size=(100, 34)) as pilot:
+        screen = _sources_screen("Alpha", "Beta")
+        await app.push_screen(screen)
+        await settle_until(pilot, lambda: bool(screen.query("#source-connection")))
+        block = screen.query_one("#source-connection", Static)
+
+        # The screen is up and usable while the server has not answered.
+        assert str(block.content) == "Checking connection…"
+        tree = screen.query_one("#catalog-tree", Tree)
+        await pilot.press("down", "down")
+        assert tree.cursor_line == 2
+
+        release.set()
+        await settle_until(pilot, lambda: str(block.content) != "Checking connection…")
+        await pilot.press("up")
+        await pilot.pause()
+
+        assert str(block.content) == (
+            "Connected as analyst · can change data\n"
+            "This role can create objects in a configured schema."
+        )
+        # Moving between sources again does not ask the server again.
+        assert sorted(asked) == ["source-Alpha", "source-Beta"]
+        app.exit(0)
+
+
+async def test_server_text_in_a_connection_check_is_sanitized():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+
+    async def check_source(source_id: str) -> SourceHealth:
+        return _health(
+            source_id,
+            details={"role": "ev\x1b[31mil\x07", "read_only": True, "warnings": ()},
+        )
+
+    app.controller.agent = _agent_checking(check_source)
+    async with app.run_test(size=(100, 34)) as pilot:
+        screen = _sources_screen("Alpha")
+        await app.push_screen(screen)
+        block = screen.query_one("#source-connection", Static)
+        await settle_until(pilot, lambda: str(block.content).startswith("Connected"))
+
+        shown = str(block.content)
+        assert "\x1b" not in shown and "\x07" not in shown
+        assert shown == "Connected as ev?[31mil? · read-only"
+        app.exit(0)
+
+
+async def test_an_unreachable_or_failing_check_says_so_and_keeps_the_screen_usable():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+
+    async def check_source(source_id: str) -> SourceHealth:
+        if source_id == "source-Broken":
+            raise RuntimeError("password=DO-NOT-EXPOSE")
+        return _health(source_id, healthy=False, error_code="postgresql_connect_failed")
+
+    app.controller.agent = _agent_checking(check_source)
+    async with app.run_test(size=(100, 34)) as pilot:
+        screen = _sources_screen("Alpha", "Broken")
+        await app.push_screen(screen)
+        block = screen.query_one("#source-connection", Static)
+        await settle_until(pilot, lambda: str(block.content).startswith("Not reach"))
+
+        assert str(block.content) == (
+            "Not reachable\n" + SOURCE_REFRESH_ERRORS["postgresql_connect_failed"]
+        )
+        await pilot.press("down", "down")
+        await settle_until(pilot, lambda: str(block.content) != "Checking connection…")
+
+        assert isinstance(app.screen, CatalogScreen)
+        assert str(block.content).startswith("Not reachable")
+        assert "DO-NOT-EXPOSE" not in str(block.content)
+        app.exit(0)

@@ -36,7 +36,7 @@ from ..adapters.mcp import (
     MCPServerInspection,
     MCPToolSelection,
 )
-from ..adapters.models import SourceRegistration
+from ..adapters.models import SourceHealth, SourceRegistration
 from ..adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLProbeSchema,
@@ -626,6 +626,7 @@ for _record in (
     SkillSummary,
     SourceEditPreview,
     SourceEditResult,
+    SourceHealth,
     SourcePermissionResource,
     SourcePermissionState,
     SourcePermissionSummary,

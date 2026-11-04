@@ -47,6 +47,7 @@ from .postgresql import (
     COLUMNS_SQL,
     FOREIGN_KEYS_FROM_SQL,
     INDEXES_SQL,
+    LISTED_RELATION_SQL,
     READABLE_COLUMN_SQL,
     READABLE_FOREIGN_KEY_SQL,
     READABLE_RELATION_SQL,
@@ -56,7 +57,7 @@ from .postgresql import (
     _configuration_schemas,
     _connect,
     _rollback_postgresql_transaction,
-    column_from_row,
+    columns_from_rows,
 )
 from .protocols import (
     DESCRIBE_MAX_COLUMNS,
@@ -105,7 +106,7 @@ WITH words AS (
          AND a.attname ILIKE pattern)) AS columned
   FROM pg_class AS c
   JOIN pg_namespace AS n ON n.oid = c.relnamespace
-  WHERE n.nspname = ANY($1::text[]) AND {READABLE_RELATION_SQL} AND NOT c.relispartition
+  WHERE n.nspname = ANY($1::text[]) AND {READABLE_RELATION_SQL} AND {LISTED_RELATION_SQL}
 )
 SELECT m.nspname, m.relname, m.relkind, m.estimate,
   (SELECT string_agg(a.attname || ' ' || format_type(a.atttypid, a.atttypmod), ', ')
@@ -133,9 +134,9 @@ SELECT n.nspname, c.relname, c.relkind, {ROW_ESTIMATE_SQL} AS estimate,
   count(*) OVER () AS total
 FROM pg_class AS c
 JOIN pg_namespace AS n ON n.oid = c.relnamespace
-WHERE n.nspname = $1 AND {READABLE_RELATION_SQL} AND NOT c.relispartition
+WHERE n.nspname = $2 AND {READABLE_RELATION_SQL} AND {LISTED_RELATION_SQL}
 ORDER BY c.relname
-LIMIT $2"""
+LIMIT $3"""
 _LIVE_RELATIONSHIPS = f"""/* daita:postgresql.live_relationships */
 SELECT src_ns.nspname || '.' || src.relname, dst_ns.nspname || '.' || dst.relname,
   array_agg(src_att.attname::text ORDER BY keys.ordinality),
@@ -153,6 +154,8 @@ _VOLATILE_FUNCTION_EXCEPTIONS = frozenset(
     {"random", "clock_timestamp", "timeofday", "gen_random_uuid", "timezone"}
 )
 _MAX_SERVER_TEXT = 1_024
+# Undefined table, column and object, and an invalid schema name.
+_UNDEFINED_OBJECT_STATES = frozenset({"42P01", "42703", "42704", "3F000"})
 _PERMANENT_QUERY_ERRORS = frozenset(
     {
         "source_not_available",
@@ -180,6 +183,8 @@ class PostgreSQLQueryError(DaitaError):
         code: str,
         message: str,
         details: Mapping[str, object] | None = None,
+        *,
+        undefined_object: bool = False,
     ) -> None:
         if not isinstance(code, str) or not code.strip():
             raise ValueError("query error code must be a non-empty string")
@@ -187,6 +192,8 @@ class PostgreSQLQueryError(DaitaError):
             raise ValueError("query error message must be a non-empty string")
         self.code = code
         self.details = dict(details or {})
+        # The source says a table or column is missing; the catalog may be stale.
+        self.undefined_object = undefined_object
         super().__init__(
             message,
             error_code=code,
@@ -1040,7 +1047,7 @@ class PostgreSQLQueryBackend:
             if schema is None:
                 return None
             listed = await connection.fetch(
-                _LIVE_SCHEMA, schema, DESCRIBE_MAX_LISTED_TABLES
+                _LIVE_SCHEMA, list(schemas), schema, DESCRIBE_MAX_LISTED_TABLES
             )
             return {
                 "name": schema,
@@ -1263,7 +1270,7 @@ async def _describe_relation(
     )
     index_rows = await connection.fetch(INDEXES_SQL, schema, relation, 64)
     foreign_keys = await connection.fetch(_LIVE_RELATIONSHIPS, oid, list(schemas))
-    columns = [column_from_row(item) for item in column_rows]
+    columns = columns_from_rows(column_rows, DESCRIBE_MAX_COLUMNS)
     enums = {item["column_name"]: item["enum_values"] for item in column_rows}
     primary_key = [
         column.name
@@ -1290,9 +1297,9 @@ async def _describe_relation(
                     else {}
                 ),
             }
-            for column in columns[:DESCRIBE_MAX_COLUMNS]
+            for column in columns
         ],
-        "columns_truncated": len(columns) > DESCRIBE_MAX_COLUMNS,
+        "columns_truncated": len(column_rows) > DESCRIBE_MAX_COLUMNS,
         "primary_key": primary_key,
         "unique_keys": [
             list(item["columns"])
@@ -1507,6 +1514,7 @@ def _classified_failure(
             "query_invalid",
             _server_text(error, "message"),
             refused_read_details(details),
+            undefined_object=state in _UNDEFINED_OBJECT_STATES,
         )
     if state == "25006":
         return PostgreSQLQueryError(
@@ -1529,6 +1537,7 @@ def _classified_failure(
         "PostgreSQL could not complete the bounded read"
         + (f" (SQLSTATE {state})." if state else "."),
         details,
+        undefined_object=state in _UNDEFINED_OBJECT_STATES,
     )
 
 

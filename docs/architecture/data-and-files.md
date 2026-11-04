@@ -44,9 +44,54 @@ so; a table the live source no longer has is unknown even if the catalog remembe
 it. A failing catalog leaves both tools answering from the source.
 
 PostgreSQL discovery lists every relation kind from `pg_class`: tables, partitioned
-tables and foreign tables as `TABLE`, views and materialized views as `VIEW`, with
-partitions folded under their parent. It keeps every column whatever its type, with
-its `format_type` and comment.
+tables and foreign tables as `TABLE`, views and materialized views as `VIEW`. A
+partition folds under its parent when the role can read an ancestor in the source's
+configured schemas; otherwise it is listed as its own table, so a role granted only a
+child partition can still find it. It keeps every column whatever its type, with its
+`format_type` and comment. A composite primary key shows only when the role can read
+every column of it; a readable unique key still appears.
+
+Attach never fails on size. Discovery reads at most `DiscoveryRequest`'s 1,000
+tables, 512 columns and 256 indexes per table, and 2,000 relationships, and
+PostgreSQL stops reading per-table structure after 60 seconds. What a limit cuts
+stays reachable through the live tools, and `CatalogSync.truncated` is set. A
+primary key shows whole or not at all, and an index or foreign key that names a
+cut column is dropped. `source_directory` adds `catalog_partial` for a truncated
+source, so the model knows the object count is a floor and looks live.
+
+The catalog refreshes on attach, on an explicit `Agent.refresh_source`, when
+`catalog_describe` or `catalog_search` finds a table the catalog lacks or
+describes differently, and when a query fails with an undefined table, column,
+object or schema (SQLSTATE `42P01`, `42703`, `42704`, `3F000`; SQLite "no such
+table" or "no such column"). The automatic ones run in the background through
+`EmbeddedAgent.request_source_refresh`. They take no execution lease, never block
+a read, run at most once per source per 300 seconds, and are cancelled on close.
+There is no scheduler. A miss on a schema-qualified name re-reads only that
+schema's tables on PostgreSQL and keeps the rest from the previous snapshot; the
+table listing, relationships and row estimates are always current. When the
+catalog itself failed, a lookup does not refresh.
+
+Discovery runs under the source management lock. `_source_commit_lock` covers
+only the commit, so a revoke does not wait for discovery. Permission apply
+revalidates current facts rather than a catalog generation, so a sync between
+preview and apply does not force a new preview.
+
+`Agent.check_source(source_id)` asks the live source and returns a `SourceHealth`:
+whether it is reachable, the role Daita connects as, `read_only`, and a warning
+for each broad grant (superuser, row-level-security bypass, role or database
+creation, membership in broad built-in roles, tables the role can change, create
+rights in a configured schema). SQLite and folder sources report only
+`read_only`. It
+takes no lock and no lease, and an unreachable source is an unhealthy result with
+an error code, not a raise. The result is not model-visible and not stored.
+`/sources` shows it for the selected source, attach shows it, and the host
+serves it at `POST /sources/{source_id}/check`.
+
+A catalog row that cannot be decoded while the agent is open raises
+`CatalogStoreError`, which every run path treats as advisory, so reads and approved
+writes continue. Opening a home with a damaged row still fails closed. A
+`semantic_save` on a table with no catalog entry is refused with
+`semantic_unknown_resource`, which says reads are unaffected.
 
 `daita.adapters` implements source admission, containment, discovery,
 freshness checks, and I/O. One composed `SourceTypeRegistry` per agent maps each
@@ -206,7 +251,7 @@ folder source:
   FOLDER resources that hold them with `CONTAINS` edges, a `FileFacet` (format,
   media type, size, stat-based physical revision) and a `TabularFacet` read
   through the worker. Other files stay reachable only live, through the session
-  folder. Discovery is bounded by `max_resources` and a fixed walk and schema
+  folder. Discovery is bounded by the 1,000-resource limit and a fixed walk and schema
   budget; a discovery that reaches either commits a bounded snapshot with
   `CatalogSync.truncated`. Attached folders are always contained to their root;
   hosted compositions do not register the folder type. Like any source, they

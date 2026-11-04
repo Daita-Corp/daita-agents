@@ -451,18 +451,20 @@ class _ServerError(Exception):
 
 
 @pytest.mark.parametrize(
-    ("sqlstate", "code", "shown"),
+    ("sqlstate", "code", "shown", "undefined"),
     (
-        ("42703", "query_invalid", 'column "nope" does not exist'),
-        ("42P01", "query_invalid", 'column "nope" does not exist'),
-        ("42601", "query_invalid", 'column "nope" does not exist'),
-        ("42501", "not_permitted", 'column "nope" does not exist'),
-        ("22012", "query_data_error", None),
-        ("22P02", "query_data_error", None),
-        ("25006", "read_only_violation", None),
-        ("57014", "postgresql_query_timeout", None),
-        ("08006", "postgresql_connection_failed", None),
-        ("53300", "postgresql_query_failed", None),
+        ("42703", "query_invalid", 'column "nope" does not exist', True),
+        ("42P01", "query_invalid", 'column "nope" does not exist', True),
+        ("42704", "query_invalid", 'column "nope" does not exist', True),
+        ("3F000", "postgresql_query_failed", None, True),
+        ("42601", "query_invalid", 'column "nope" does not exist', False),
+        ("42501", "not_permitted", 'column "nope" does not exist', False),
+        ("22012", "query_data_error", None, False),
+        ("22P02", "query_data_error", None, False),
+        ("25006", "read_only_violation", None, False),
+        ("57014", "postgresql_query_timeout", None, False),
+        ("08006", "postgresql_connection_failed", None, False),
+        ("53300", "postgresql_query_failed", None, False),
     ),
 )
 async def test_server_failures_cross_by_category_with_only_safe_text(
@@ -470,6 +472,7 @@ async def test_server_failures_cross_by_category_with_only_safe_text(
     sqlstate: str,
     code: str,
     shown: str | None,
+    undefined: bool,
 ) -> None:
     backend, registration = _backend()
 
@@ -488,6 +491,8 @@ async def test_server_failures_cross_by_category_with_only_safe_text(
         await _run(backend, registration, checked_read("SELECT nope FROM public.t"))
 
     assert raised.value.code == code
+    assert raised.value.undefined_object is undefined
+    assert "undefined_object" not in raised.value.details
     assert raised.value.details["sqlstate"] == sqlstate
     assert raised.value.__context__ is None
     text = "".join(traceback.format_exception(raised.value))

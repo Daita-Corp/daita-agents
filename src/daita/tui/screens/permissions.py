@@ -307,7 +307,6 @@ class PermissionsScreen(Screen[bool]):
         if (
             self._preview is not None
             and self._preview.source_id == inspection.source_id
-            and self._preview.catalog_generation == inspection.catalog_generation
         ):
             return self._preview.after
         return inspection.state

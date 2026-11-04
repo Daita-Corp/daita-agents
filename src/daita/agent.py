@@ -20,7 +20,7 @@ from .adapters.mcp import (
     MCPServerInspection,
     MCPToolSelection,
 )
-from .adapters.models import SourceRegistration
+from .adapters.models import SourceHealth, SourceRegistration
 from .adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
@@ -1243,6 +1243,15 @@ class Agent:
         """Refresh one registered source through its persisted admitted config."""
 
         return await self._embedded.refresh_source(source_id)
+
+    async def check_source(self, source_id: str) -> SourceHealth:
+        """Check the live source: reachability, role and whether it is read-only.
+
+        An unreachable source is an unhealthy result with an error code; only an
+        unknown or detached source raises ``ValueError``.
+        """
+
+        return await self._embedded.check_source(source_id)
 
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
         return await self._embedded.list_sources()

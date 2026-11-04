@@ -1,12 +1,16 @@
 import sqlite3
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from daita import Agent, SQLiteSource
 from daita.adapters import sqlite_query as sqlite_query_module
+from daita.adapters.models import DiscoveryRequest
 from daita.adapters.registry import SourceTypeRegistry
+from daita.catalog.models import SourceCatalogSnapshot, TabularFacet
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -402,3 +406,109 @@ async def test_sqlite_source_type_satisfies_the_source_contract(tmp_path) -> Non
         SQLiteSource(database, name="Contract"),
         secret_provider=EmptySecretProvider(),
     )
+
+
+async def _discover_sqlite(database: Path, **limits: Any) -> SourceCatalogSnapshot:
+    now = datetime(2026, 11, 2, tzinfo=UTC)
+    adapter = await SQLiteSource(database).open(
+        agent_id="agent", attached_at=now, clock=lambda: now
+    )
+    try:
+        result = await adapter.discover(
+            DiscoveryRequest(
+                agent_id="agent",
+                source_id=adapter.registration.id,
+                sync_id="sync",
+                requested_at=now,
+                **limits,
+            )
+        )
+    finally:
+        await adapter.close()
+    return result.snapshot
+
+
+def _tabular(snapshot: SourceCatalogSnapshot, name: str) -> TabularFacet:
+    (resource,) = [item for item in snapshot.resources if item.name == name]
+    (facet,) = [item for item in snapshot.facets if item.resource_id == resource.id]
+    return TabularFacet.from_payload(facet.payload)
+
+
+async def test_sqlite_discovery_beyond_the_resource_limit_keeps_the_first_tables(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "many.sqlite"
+    with sqlite3.connect(database) as connection:
+        for index in range(8):
+            connection.execute(f"CREATE TABLE t{index} (id INTEGER)")
+
+    whole = await _discover_sqlite(database, max_resources=8)
+    cut = await _discover_sqlite(database, max_resources=5)
+
+    assert whole.sync.truncated is False
+    assert cut.sync.truncated is True
+    assert [item.name for item in cut.resources] == [f"t{index}" for index in range(5)]
+
+
+async def test_sqlite_wide_table_keeps_its_first_columns_and_a_whole_key_or_none(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "wide.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE whole (a INTEGER PRIMARY KEY, b, c, d);
+            CREATE TABLE split_last (a, b, c, d, PRIMARY KEY (a, d));
+            CREATE TABLE split_first (a, b, c, d, PRIMARY KEY (d, a));
+            CREATE INDEX split_last_by_a ON split_last (a);
+            CREATE INDEX split_last_by_d ON split_last (d);
+            CREATE TABLE child (x, y, FOREIGN KEY (x) REFERENCES whole (a),
+                                FOREIGN KEY (y) REFERENCES whole (d));
+            """)
+
+    snapshot = await _discover_sqlite(database, max_columns_per_resource=3)
+
+    assert snapshot.sync.truncated is True
+    keys = {
+        name: [
+            column.name
+            for column in _tabular(snapshot, name).columns
+            if column.primary_key_ordinal
+        ]
+        for name in ("whole", "split_last", "split_first")
+    }
+    assert keys == {"whole": ["a"], "split_last": [], "split_first": []}
+    split_last = _tabular(snapshot, "split_last")
+    assert [column.name for column in split_last.columns] == ["a", "b", "c"]
+    # The index and the key on the cut column d would point outside their table.
+    assert [index.name for index in split_last.indexes] == ["split_last_by_a"]
+    assert [
+        pair.source_field
+        for relationship in snapshot.relationships
+        for pair in relationship.field_pairs
+    ] == ["x"]
+
+
+async def test_sqlite_more_indexes_and_relationships_than_the_limits_keep_the_first(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "linked.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE parent (id INTEGER PRIMARY KEY, a, b, c);
+            CREATE INDEX by_a ON parent (a);
+            CREATE INDEX by_b ON parent (b);
+            CREATE INDEX by_c ON parent (c);
+            CREATE TABLE x (parent_id REFERENCES parent (id));
+            CREATE TABLE y (parent_id REFERENCES parent (id));
+            CREATE TABLE z (parent_id REFERENCES parent (id));
+            """)
+
+    whole = await _discover_sqlite(database)
+    cut = await _discover_sqlite(
+        database, max_indexes_per_resource=2, max_relationships=2
+    )
+
+    assert whole.sync.truncated is False
+    assert cut.sync.truncated is True
+    assert [index.name for index in _tabular(cut, "parent").indexes] == ["by_a", "by_b"]
+    assert len(cut.relationships) == 2

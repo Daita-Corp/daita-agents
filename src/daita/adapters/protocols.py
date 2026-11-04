@@ -61,11 +61,6 @@ class SourceClosedError(ResourceAdapterError):
         super().__init__(source_id, "source_closed", "resource source is closed")
 
 
-class DiscoveryLimitError(ResourceAdapterError):
-    def __init__(self, source_id: str, message: str) -> None:
-        super().__init__(source_id, "discovery_limit_exceeded", message)
-
-
 class ResourceNotFoundError(ResourceAdapterError):
     def __init__(self, source_id: str, resource_id: str) -> None:
         _text(resource_id, "missing resource_id")
@@ -168,7 +163,6 @@ __all__ = [
     "DESCRIBE_MAX_LISTED_TABLES",
     "SUMMARY_MAX_COLUMNS",
     "column_summary",
-    "DiscoveryLimitError",
     "ResourceAdapter",
     "ResourceAdapterError",
     "ResourceNotFoundError",

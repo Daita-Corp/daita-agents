@@ -371,6 +371,7 @@ class FolderResourceAdapter:
                     if self._closed
                     else ("folder_unavailable" if revision is None else None)
                 ),
+                details={"read_only": True},
             )
 
     async def close(self) -> None:

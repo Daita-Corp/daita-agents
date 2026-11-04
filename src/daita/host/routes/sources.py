@@ -38,6 +38,7 @@ TABLE = (
     ),
     Route("DELETE", "/sources/{source_id}", "detach"),
     Route("POST", "/sources/{source_id}/refresh", "refresh_source"),
+    Route("POST", "/sources/{source_id}/check", "check_source"),
     Route("GET", "/sources/{source_id}/permissions", "inspect_source_permissions"),
     Route(
         "POST", "/sources/{source_id}/permissions/preview", "preview_source_permissions"

@@ -32,7 +32,7 @@ head-to-head) can run the same set.
 `test_postgresql_schema_baseline` (offline, no model cost):
 
 1. Attaches all six schemas (1,500 tables) and records the discovery outcome.
-   Today this fails with `discovery_limit_exceeded` (1,000-table cap).
+   Attach succeeds and keeps the first 1,000 tables, marked truncated.
 2. Attaches the five schemas without `ops` (987 tables), then records attach
    time, metadata round trips by statement, resources and relationships.
 3. Compares the catalog with `pg_class` and lists every missing relation with
@@ -44,7 +44,8 @@ head-to-head) can run the same set.
    `refused`), refusal codes, run seconds, `query_seconds` (pool enabled so the
    backend records them), metadata round trips, loop steps and tokens.
 5. Adds a partition, then an unrelated table, and reruns question 1 after each
-   change and again after `refresh_source`, recording `catalog_source_stale`.
+   change and again after `refresh_source`, recording each outcome and the refresh
+   cost.
 
 Round trips are counted by wrapping `asyncpg.Connection` methods and reading
 Daita's `/* daita:postgresql.<name> */` statement tags, so the count survives

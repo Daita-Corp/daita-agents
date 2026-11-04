@@ -22,6 +22,7 @@ from daita.llm.models import (
     model_tool_result,
 )
 from daita.llm.providers.mock import MockModelProvider
+from tests.support.source_refresh import settled, sync_count
 from tests.support.workspace import workspace_for
 
 
@@ -93,7 +94,7 @@ async def test_search_finds_a_table_the_catalog_has_never_seen(tmp_path: Path) -
     database = _database(tmp_path / "shop.sqlite")
     agent, _provider = await _agent(tmp_path, _search("invoice"))
     try:
-        await agent.attach(SQLiteSource(database, name="Shop"))
+        source = await agent.attach(SQLiteSource(database, name="Shop"))
         with sqlite3.connect(database) as connection:
             connection.execute("CREATE TABLE invoices (id INTEGER, total REAL)")
         (result,) = await _results(agent)
@@ -102,6 +103,13 @@ async def test_search_finds_a_table_the_catalog_has_never_seen(tmp_path: Path) -
         assert hit["kind"] == "table"
         assert hit["dialect"] == "sqlite"
         assert hit["columns"] == "id INTEGER, total REAL"
+        # Seeing a table only the source knows brings the catalog up to date.
+        await settled(agent)
+        names = {
+            item.name
+            for item in await agent.list_catalog_resources(source_id=source.id)
+        }
+        assert "invoices" in names
     finally:
         await agent.close()
 
@@ -185,11 +193,18 @@ async def test_describe_reads_the_live_table_with_keys_and_relationships(
         tmp_path, _describe("orders"), _describe("customers", "customers")
     )
     try:
-        await agent.attach(SQLiteSource(database, name="Shop"))
+        source = await agent.attach(SQLiteSource(database, name="Shop"))
         # A column added after attach shows: a cached answer never overrides.
         with sqlite3.connect(database) as connection:
             connection.execute("ALTER TABLE orders ADD COLUMN placed_at TEXT")
         orders, customers = await _results(agent)
+        await settled(agent)
+        cached = await agent._embedded._data_view.cached_description(
+            agent.id, source.id, "orders"
+        )
+        assert cached is not None
+        columns = cast(Sequence[Mapping[str, object]], cached["columns"])
+        assert columns[-1]["name"] == "placed_at"
         data = _data(orders)
         assert data["name"] == "main.orders"
         assert data["answered_from"] == "live"
@@ -220,13 +235,56 @@ async def test_a_table_the_source_no_longer_has_is_unknown_even_if_cached(
     database = _database(tmp_path / "shop.sqlite")
     agent, _provider = await _agent(tmp_path, _describe("secrets"))
     try:
-        await agent.attach(SQLiteSource(database, name="Shop"))
+        source = await agent.attach(SQLiteSource(database, name="Shop"))
         with sqlite3.connect(database) as connection:
             connection.execute("DROP TABLE secrets")
         (result,) = await _results(agent)
         assert result.is_error
         error = cast(Mapping[str, object], result.output["error"])
         assert error["code"] == "table_unknown"
+        await settled(agent)
+        names = {
+            item.name
+            for item in await agent.list_catalog_resources(source_id=source.id)
+        }
+        assert "secrets" not in names
+    finally:
+        await agent.close()
+
+
+async def test_looking_up_tables_that_have_not_changed_starts_no_refresh(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path / "shop.sqlite")
+    agent, _provider = await _agent(
+        tmp_path,
+        _describe("orders"),
+        _describe("open_orders", "view"),
+        _describe("main", "listing"),
+        _describe("secrets", "secrets"),
+        _search("orders", "search"),
+    )
+    try:
+        await agent.attach(SQLiteSource(database, name="Shop"))
+        results = await _results(agent)
+        assert not any(result.is_error for result in results)
+        await settled(agent)
+        assert sync_count(agent) == 1
+    finally:
+        await agent.close()
+
+
+async def test_a_name_neither_the_source_nor_the_catalog_knows_starts_no_refresh(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path / "shop.sqlite")
+    agent, _provider = await _agent(tmp_path, _describe("nothing_here"))
+    try:
+        await agent.attach(SQLiteSource(database, name="Shop"))
+        (result,) = await _results(agent)
+        assert result.is_error
+        await settled(agent)
+        assert sync_count(agent) == 1
     finally:
         await agent.close()
 

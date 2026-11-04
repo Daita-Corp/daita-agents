@@ -121,6 +121,11 @@ async def assert_source_type_contract(
             registration.id,
             registration.adapter_id,
         )
+        # What a person sees at attach: the role, read-only status and warnings.
+        assert health.healthy
+        assert isinstance(health.details.get("role", ""), str)
+        assert isinstance(health.details.get("read_only", True), bool)
+        assert all(isinstance(item, str) for item in health.details.get("warnings", ()))  # type: ignore[attr-defined]
 
         rebuilt = source_type.from_registration(
             registration, secret_provider=secret_provider

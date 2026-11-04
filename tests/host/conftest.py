@@ -32,7 +32,7 @@ from daita import (
 )
 from daita._json import FrozenJsonObject
 from daita.adapters.mcp import SDKMCPClientFactory
-from daita.adapters.models import SourceRegistration
+from daita.adapters.models import SourceHealth, SourceRegistration
 from daita.adapters.postgresql import PostgreSQLProbeResult, PostgreSQLProbeSchema
 from daita.adapters.postgresql_write import RelationalWriteReadiness
 from daita.adapters.protocols import ResourceSource
@@ -330,6 +330,21 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
                 await agent.tool_evidence(origin.run_id),
             ),
             SourceRegistration: (source,),
+            SourceHealth: (
+                await agent.check_source(source.id),
+                SourceHealth(
+                    agent_id=agent.id,
+                    source_id=source.id,
+                    adapter_id="postgresql",
+                    healthy=True,
+                    checked_at=NOW,
+                    details={
+                        "role": "daita_reader",
+                        "read_only": False,
+                        "warnings": ("This role can create roles or databases.",),
+                    },
+                ),
+            ),
             tuple[SourceRegistration, ...]: (await agent.list_sources(),),
             tuple[CatalogResource, ...]: (resources,),
             CatalogSummary: (await agent.catalog_summary(),),

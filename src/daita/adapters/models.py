@@ -187,6 +187,13 @@ class DiscoveryRequest:
     # read or catalog; None for hosts without a local agent home.
     agent_root: Path | None = None
     agent_home: Path | None = None
+    # PostgreSQL only; SQLite and folder sources ignore both. With a previous
+    # snapshot, tables outside these schemas keep their columns and indexes
+    # from it instead of being read again. Empty means every schema is read.
+    refresh_schemas: tuple[str, ...] = ()
+    previous: SourceCatalogSnapshot | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         _text(self.agent_id, "discovery agent_id")
@@ -214,6 +221,16 @@ class DiscoveryRequest:
             for item in (self.agent_root, self.agent_home)
         ):
             raise ValueError("discovery agent state paths must be absolute together")
+        if not isinstance(self.refresh_schemas, tuple):
+            raise TypeError("discovery refresh_schemas must be a tuple")
+        for schema in self.refresh_schemas:
+            _text(schema, "discovery refresh schema")
+        if self.previous is not None and (
+            not isinstance(self.previous, SourceCatalogSnapshot)
+            or self.previous.sync.agent_id != self.agent_id
+            or self.previous.sync.source_id != self.source_id
+        ):
+            raise ValueError("discovery previous snapshot belongs to another source")
 
 
 @dataclass(frozen=True, slots=True)

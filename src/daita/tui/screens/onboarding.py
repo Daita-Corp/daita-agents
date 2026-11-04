@@ -26,6 +26,7 @@ from ..models import (
     SSL_MODES,
     PickerOption,
 )
+from ..projection import connection_notice
 from ..sanitization import sanitize_terminal_text
 from .selection import SelectionScreen
 
@@ -410,6 +411,8 @@ class SourceSetupScreen(Screen[bool]):
     def __init__(self) -> None:
         super().__init__()
         self._busy = False
+        # What the live source reported after attaching, for the app to show.
+        self.connection_notice: tuple[str, bool] = ("", False)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="onboard", classes="control-panel source-panel"):
@@ -521,6 +524,10 @@ class SourceSetupScreen(Screen[bool]):
             if registration is None:
                 return
             attached = True
+            self._show_source_message("Checking the connection…")
+            self.connection_notice = connection_notice(
+                await self.app.controller.check_source(registration.id)  # type: ignore[attr-defined]
+            )
         except Exception as error:
             self._show_source_message(
                 sanitize_terminal_text(

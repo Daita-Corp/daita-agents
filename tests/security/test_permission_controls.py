@@ -311,9 +311,7 @@ async def test_write_selected_many_all_current_and_future_table_exclusion(
         await agent.close()
 
 
-async def test_wide_column_choices_support_exact_binding_and_stale_preview(
-    tmp_path, monkeypatch
-):
+async def test_wide_column_choices_support_exact_binding(tmp_path, monkeypatch):
     _live_columns(monkeypatch)
     agent = await Agent.create(
         "permission-bound",
@@ -348,21 +346,73 @@ async def test_wide_column_choices_support_exact_binding_and_stale_preview(
             preview.after.relational_write_scopes[0].allowed_update_columns
             == all_columns
         )
+    finally:
+        await agent.close()
 
-        refreshed, _ = _snapshot(
+
+async def _sync_after_preview(
+    agent, source, *, mode, selected_ids=(), tables=("orders", "customers")
+):
+    preview = await agent.preview_source_permissions(
+        source_id=source.id,
+        read_mode=mode,
+        read_resource_ids=selected_ids,
+        relational_write_scopes={},
+    )
+    refreshed, _ = _snapshot(
+        source, sync_id="sync-two", tables=tuple((name, 2) for name in tables)
+    )
+    await agent._embedded._store.commit_snapshot(refreshed, registration=source)
+    return preview
+
+
+@pytest.mark.parametrize(
+    ("stored", "mode", "selected_names"),
+    (
+        (SourceReadMode.ALL, SourceReadMode.NONE, ()),
+        (SourceReadMode.ALL, SourceReadMode.SELECTED, ("orders",)),
+        (SourceReadMode.NONE, SourceReadMode.ALL, ()),
+    ),
+)
+async def test_a_sync_between_preview_and_apply_does_not_stop_the_change(
+    tmp_path, stored, mode, selected_names
+):
+    agent, source, resources = await _agent_with_catalog(tmp_path)
+    try:
+        await _apply(agent, source, mode=stored, scopes={})
+        preview = await _sync_after_preview(
+            agent,
             source,
-            sync_id="sync-wide-refreshed",
-            tables=(("wide", 33),),
+            mode=mode,
+            selected_ids=tuple(resources[name].id for name in selected_names),
         )
-        await agent._embedded._store.commit_snapshot(refreshed, registration=source)
-        with pytest.raises(ValueError, match="catalog changed"):
+        applied = await agent.apply_source_permissions(
+            source_id=source.id,
+            confirmation_fingerprint=preview.confirmation_fingerprint,
+        )
+        assert applied.state == preview.after
+    finally:
+        await agent.close()
+
+
+async def test_a_selected_table_the_sync_removed_is_still_refused(tmp_path):
+    agent, source, resources = await _agent_with_catalog(tmp_path)
+    try:
+        preview = await _sync_after_preview(
+            agent,
+            source,
+            mode=SourceReadMode.SELECTED,
+            selected_ids=(resources["orders"].id,),
+            tables=("customers",),
+        )
+        with pytest.raises(ValueError, match="not current resources"):
             await agent.apply_source_permissions(
                 source_id=source.id,
                 confirmation_fingerprint=preview.confirmation_fingerprint,
             )
         assert (
             await agent.inspect_source_permissions(source.id)
-        ).state.relational_write_scopes == ()
+        ).state == preview.before
     finally:
         await agent.close()
 

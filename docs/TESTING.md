@@ -254,6 +254,13 @@ Real-server write behaviour with a scripted model is in
 `DAITA_RUN_POSTGRES_WRITES=1`, `DAITA_WRITES_POSTGRES_PORT` and
 `DAITA_WRITES_POSTGRES_ADMIN` on a disposable server.
 
+`tests/live/data/test_readable_metadata.py` checks on a real server that metadata
+SQL and the connection check show only what the connecting role can read. Enable it
+with `DAITA_RUN_POSTGRES_LARGE_FIXTURE=1` and
+`DAITA_LARGE_POSTGRES_ADMIN_PASSWORD` against the `postgres-large` fixture. Each case
+runs in one transaction on that server's `postgres` database and always rolls back,
+so it leaves no schemas, tables or roles behind.
+
 The scheduled-write case (`tests/live/routines/test_scheduled_write.py`) runs a
 real model's one-time routine in a real host while no client watches: the run
 asks to upsert one row into the real `postgres-large` fixture, the host

@@ -66,7 +66,11 @@ from .observation import summarize_diagnostics
 from .routines.capabilities import routine_inspection_projection, routine_projection
 from .security import SecretReference
 from .terminal import run_terminal_application
-from .tui.projection import run_failure_notice, tool_outcome_summary
+from .tui.projection import (
+    connection_facts,
+    run_failure_notice,
+    tool_outcome_summary,
+)
 from .work_board import work_board_projection
 from .workspace import working_directory
 
@@ -1287,10 +1291,16 @@ async def _execute(args: argparse.Namespace) -> object:
         if args.command == "attach":
             source = _source_from_attach_args(args)
             registration = await agent.attach(source)
+            try:
+                connection = connection_facts(await agent.check_source(registration.id))
+            except Exception:
+                # The source is attached; a failed check only leaves it unconfirmed.
+                connection = {"reachable": False}
             return {
                 "source_id": registration.id,
                 "adapter": registration.adapter_id,
                 "name": registration.display_name,
+                "connection": connection,
             }
         if args.command == "mcp":
             if args.mcp_command in {"inspect", "attach"}:

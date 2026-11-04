@@ -876,7 +876,7 @@ async def test_failed_snapshot_decode_does_not_publish_a_cache_entry(
             return original_decode(value)
 
         monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", failing_decode)
-        with pytest.raises(ValueError, match="forced snapshot decode failure"):
+        with pytest.raises(CatalogStoreError, match="undecodable"):
             await reader.load_current_snapshot(ref)
         assert reader._decoded_catalog_snapshots == {}
 

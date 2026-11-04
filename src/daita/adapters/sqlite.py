@@ -40,7 +40,6 @@ from .models import (
     SourceRegistration,
 )
 from .protocols import (
-    DiscoveryLimitError,
     ResourceAdapterError,
     ResourceNotFoundError,
     SourceClosedError,
@@ -267,7 +266,7 @@ class SQLiteResourceAdapter:
                 healthy=True,
                 checked_at=checked_at,
                 source_revision=f"schema_version:{schema_version}",
-                details={"query_only": bool(query_only)},
+                details={"read_only": bool(query_only)},
             )
 
     async def close(self) -> None:
@@ -300,6 +299,7 @@ class _TableFacts:
     name: str
     kind: ResourceKind
     facet: CatalogFacet
+    columns: frozenset[str]
 
 
 def _safe_source_path(
@@ -377,11 +377,8 @@ def _discover(
                 key=lambda row: (str(row["name"]), str(row["type"])),
             )
         )
-        if len(visible) > request.max_resources:
-            raise DiscoveryLimitError(
-                registration.id,
-                "SQLite discovery resource limit exceeded",
-            )
+        truncated = len(visible) > request.max_resources
+        visible = visible[: request.max_resources]
 
         facts: list[_TableFacts] = []
         for row in visible:
@@ -392,34 +389,37 @@ def _discover(
                 kind,
                 _native_identity(name),
             )
-            columns = _columns(connection, name, request, registration.id)
-            indexes = _indexes(
+            columns, columns_cut = _columns(connection, name, request)
+            indexes, indexes_cut = _indexes(
                 connection,
                 name,
                 {column.name for column in columns},
                 request,
-                registration.id,
             )
+            truncated |= columns_cut or indexes_cut
             facet = CatalogFacet.from_tabular(
                 resource_id=resource_id,
                 sync_id=request.sync_id,
                 observed_at=request.requested_at,
                 facet=TabularFacet(columns=columns, indexes=indexes),
             )
-            facts.append(_TableFacts(name=name, kind=kind, facet=facet))
+            facts.append(
+                _TableFacts(
+                    name=name,
+                    kind=kind,
+                    facet=facet,
+                    columns=frozenset(column.name.casefold() for column in columns),
+                )
+            )
 
         facts_by_name = {fact.name: fact for fact in facts}
-        relationships = _relationships(
+        relationships, relationships_cut = _relationships(
             connection,
             registration,
             request,
             facts_by_name,
         )
-        if len(relationships) > request.max_relationships:
-            raise DiscoveryLimitError(
-                registration.id,
-                "SQLite discovery relationship limit exceeded",
-            )
+        truncated |= relationships_cut
         source_revision = f"schema_version:{schema_version}"
         revisions: list[CatalogResourceRevision] = []
         resources: list[CatalogResource] = []
@@ -468,6 +468,7 @@ def _discover(
             source_revision=source_revision,
             resource_count=len(resources),
             relationship_count=len(relationships),
+            truncated=truncated,
         )
         return SourceCatalogSnapshot(
             sync=sync,
@@ -486,32 +487,32 @@ def _columns(
     connection: sqlite3.Connection,
     table: str,
     request: DiscoveryRequest,
-    source_id: str,
-) -> tuple[TabularColumn, ...]:
+) -> tuple[tuple[TabularColumn, ...], bool]:
     rows = connection.execute(
         'SELECT cid, name, type, "notnull", dflt_value, pk, hidden '
         "FROM pragma_table_xinfo(?) ORDER BY cid",
         (table,),
     ).fetchall()
     visible_rows = tuple(row for row in rows if int(row["hidden"]) != 1)
-    if len(visible_rows) > request.max_columns_per_resource:
-        raise DiscoveryLimitError(
-            source_id,
-            "SQLite discovery column limit exceeded",
-        )
-    return tuple(
+    kept = visible_rows[: request.max_columns_per_resource]
+    # A primary key the cut splits shows not at all.
+    whole_key = sum(1 for row in kept if row["pk"]) == sum(
+        1 for row in visible_rows if row["pk"]
+    )
+    columns = tuple(
         TabularColumn(
             name=str(row["name"]),
             native_type=str(row["type"] or "UNKNOWN"),
             ordinal=int(row["cid"]),
             nullable=not bool(row["notnull"]) and not bool(row["pk"]),
-            primary_key_ordinal=(int(row["pk"]) or None),
+            primary_key_ordinal=(int(row["pk"]) or None) if whole_key else None,
             default_expression=(
                 None if row["dflt_value"] is None else str(row["dflt_value"])
             ),
         )
-        for row in visible_rows
+        for row in kept
     )
+    return columns, len(kept) < len(visible_rows)
 
 
 def _indexes(
@@ -519,20 +520,14 @@ def _indexes(
     table: str,
     known_columns: set[str],
     request: DiscoveryRequest,
-    source_id: str,
-) -> tuple[TabularIndex, ...]:
+) -> tuple[tuple[TabularIndex, ...], bool]:
     rows = connection.execute(
         'SELECT seq, name, "unique", origin, partial '
         "FROM pragma_index_list(?) ORDER BY name",
         (table,),
     ).fetchall()
-    if len(rows) > request.max_indexes_per_resource:
-        raise DiscoveryLimitError(
-            source_id,
-            "SQLite discovery index limit exceeded",
-        )
     indexes: list[TabularIndex] = []
-    for row in rows:
+    for row in rows[: request.max_indexes_per_resource]:
         name = str(row["name"])
         column_rows = connection.execute(
             "SELECT seqno, cid, name FROM pragma_index_info(?) ORDER BY seqno",
@@ -559,7 +554,7 @@ def _indexes(
                 predicate=predicate,
             )
         )
-    return tuple(indexes)
+    return tuple(indexes), len(rows) > request.max_indexes_per_resource
 
 
 def _index_predicate(sql: object) -> str | None:
@@ -574,7 +569,7 @@ def _relationships(
     registration: SourceRegistration,
     request: DiscoveryRequest,
     facts_by_name: dict[str, _TableFacts],
-) -> tuple[CatalogRelationship, ...]:
+) -> tuple[tuple[CatalogRelationship, ...], bool]:
     relationships: list[CatalogRelationship] = []
     for table, fact in sorted(facts_by_name.items()):
         if fact.kind is not ResourceKind.TABLE:
@@ -608,6 +603,15 @@ def _relationships(
                     zip(group, target_fields, strict=True)
                 )
             )
+            # A key naming a column the column limit cut would point outside its table.
+            if any(
+                pair.source_field.casefold() not in fact.columns
+                or pair.target_field.casefold() not in target.columns
+                for pair in pairs
+            ):
+                continue
+            if len(relationships) == request.max_relationships:
+                return tuple(sorted(relationships, key=lambda item: item.id)), True
             relationships.append(
                 CatalogRelationship.build(
                     source_id=registration.id,
@@ -626,7 +630,7 @@ def _relationships(
                     },
                 )
             )
-    return tuple(sorted(relationships, key=lambda item: item.id))
+    return tuple(sorted(relationships, key=lambda item: item.id)), False
 
 
 def _primary_key_columns(

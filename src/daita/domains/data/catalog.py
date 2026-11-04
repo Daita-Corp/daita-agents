@@ -38,6 +38,11 @@ from ...storage.sqlite_records import (
 )
 from .sql import ResourceSchema
 
+_CATALOG_PARTIAL = (
+    "The catalog holds only part of this source, so the object count is a floor. "
+    "catalog_search and catalog_describe read the source live."
+)
+
 
 # The source operation each relational write-scope operation requires.
 class CatalogDataView:
@@ -322,24 +327,40 @@ class CatalogDataView:
             for fact in facts
         )
 
+    async def _catalog_extent(
+        self, agent_id: str, source_id: str
+    ) -> tuple[int | None, bool]:
+        """(object count, whether the catalog holds only part of the source)."""
+
+        count = 0
+        partial = False
+        try:
+            for ref in await self._store.list_current_snapshot_refs(
+                agent_id, (source_id,)
+            ):
+                snapshot = await self._store.load_current_snapshot(ref)
+                if snapshot is None:  # a sync replaced it while reading
+                    return None, False
+                count += len(snapshot.resources)
+                partial = partial or snapshot.sync.truncated
+        except CatalogStoreError:
+            return None, False
+        return count, partial
+
     async def source_directory(
         self, agent_id: str, source_ids: tuple[str, ...]
     ) -> tuple[FrozenJsonObject, ...]:
         """Each source's routing facts plus type, dialect, schemas and object count.
 
-        The count advises: a failing catalog leaves it unknown.
+        The count advises: a failing catalog leaves it, and the note that the
+        catalog holds only part of the source, unknown.
         """
 
         directory: list[FrozenJsonObject] = []
         for fact in await self.source_routing_facts(agent_id, source_ids):
             source_id = cast(str, fact["source_id"])
             source_type = self._source_types.get(cast(str, fact["adapter_id"]))
-            try:
-                count: int | None = len(
-                    await self._store.list_resources(agent_id, source_id)
-                )
-            except CatalogStoreError:
-                count = None
+            count, partial = await self._catalog_extent(agent_id, source_id)
             directory.append(
                 FrozenJsonObject.from_mapping(
                     {
@@ -350,6 +371,7 @@ class CatalogDataView:
                         ),
                         "schemas": await self.source_schemas(agent_id, source_id),
                         "approximate_objects": count,
+                        **({"catalog_partial": _CATALOG_PARTIAL} if partial else {}),
                     }
                 )
             )
