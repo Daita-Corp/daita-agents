@@ -66,6 +66,7 @@ def test_postgresql_url_and_redaction():
     }
 
 
+@pytest.mark.tui_driven
 async def test_app_mounts_create_screen_and_exits_on_cancel(start_host: StartHost):
     harness = await start_host()
     app = DaitaApp(root=harness.root, workspace=host_workspace(harness))
@@ -77,6 +78,7 @@ async def test_app_mounts_create_screen_and_exits_on_cancel(start_host: StartHos
     assert app.return_value == 0
 
 
+@pytest.mark.tui_driven
 async def test_agent_picker_create_button_routes_to_existing_creation_flow(
     start_host: StartHost,
 ):
@@ -137,6 +139,7 @@ async def test_agent_picker_create_button_routes_to_existing_creation_flow(
     )
 
 
+@pytest.mark.tui_driven
 async def test_agent_picker_enters_delete_mode_then_confirms_typed_name(
     start_host: StartHost,
 ):
@@ -245,6 +248,7 @@ async def test_agent_picker_enters_delete_mode_then_confirms_typed_name(
     assert app.return_value == 0
 
 
+@pytest.mark.tui_driven
 @pytest.mark.parametrize("failure", ("malformed_config", "mcp_schema"))
 async def test_agent_picker_recovers_incompatible_model_settings_for_replacement(
     start_host: StartHost,
@@ -375,6 +379,7 @@ async def test_agent_picker_recovers_incompatible_model_settings_for_replacement
     assert config_path.read_bytes() == before
 
 
+@pytest.mark.tui_driven
 async def test_chat_preserves_input_while_agent_reopens(
     start_host: StartHost, monkeypatch
 ):
@@ -416,6 +421,7 @@ async def test_chat_preserves_input_while_agent_reopens(
         await app.controller.close()
 
 
+@pytest.mark.tui_driven
 async def test_app_resize_and_too_small_screen(start_host: StartHost):
     harness = await start_host()
     app = DaitaApp(root=harness.root, workspace=host_workspace(harness))
@@ -427,6 +433,7 @@ async def test_app_resize_and_too_small_screen(start_host: StartHost):
         app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_agent_home_is_available_without_model_source_or_catalog(
     start_host: StartHost,
 ):
@@ -452,6 +459,7 @@ async def test_agent_home_is_available_without_model_source_or_catalog(
         await opened.close()
 
 
+@pytest.mark.tui_driven
 @pytest.mark.integration
 @pytest.mark.parametrize("no_color", [False, True])
 async def test_terminal_defaults_preserve_markdown_and_focus_without_rgb_paint(
@@ -535,6 +543,7 @@ async def test_terminal_defaults_preserve_markdown_and_focus_without_rgb_paint(
             app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_wide_boot_swirls_dots_into_the_braille_logo():
     boot = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with boot.run_test(size=(140, 28)) as pilot:
@@ -548,6 +557,7 @@ async def test_wide_boot_swirls_dots_into_the_braille_logo():
         boot.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(
     start_host: StartHost,
 ):
@@ -598,6 +608,7 @@ async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(
         await opened.close()
 
 
+@pytest.mark.tui_driven
 @pytest.mark.parametrize(
     "login_mode", ("first_login", "reuse", "reconnect", "reuse_failure")
 )
@@ -744,6 +755,7 @@ async def test_model_setup_uses_codex_device_login_without_api_key(login_mode):
     )
 
 
+@pytest.mark.tui_driven
 async def test_model_setup_provider_and_model_pickers_do_not_block_each_other():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
 
@@ -782,6 +794,7 @@ async def test_model_setup_provider_and_model_pickers_do_not_block_each_other():
         app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_model_setup_reveals_only_custom_provider_fields_when_selected():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
 
@@ -807,6 +820,7 @@ async def test_model_setup_reveals_only_custom_provider_fields_when_selected():
         app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_source_setup_uses_terminal_defaults_and_visible_selection():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
 
@@ -858,6 +872,7 @@ async def test_source_setup_uses_terminal_defaults_and_visible_selection():
             app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_control_screens_use_terminal_defaults_and_retain_dialog_geometry():
     create_app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with create_app.run_test(size=(100, 32)) as pilot:
@@ -913,6 +928,7 @@ async def test_control_screens_use_terminal_defaults_and_retain_dialog_geometry(
             confirm_app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_source_setup_accepts_a_successfully_attached_empty_catalog(monkeypatch):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     attach_count = 0
@@ -945,6 +961,7 @@ async def test_source_setup_accepts_a_successfully_attached_empty_catalog(monkey
         app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_source_setup_starts_with_unfilled_labeled_fields():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with app.run_test(size=(100, 32)) as pilot:
@@ -975,6 +992,7 @@ async def test_source_setup_starts_with_unfilled_labeled_fields():
         app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_postgresql_url_honors_an_explicit_ssl_selection(monkeypatch):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     credential = SecretReference.keychain("test-postgresql-url-ssl")
@@ -1034,6 +1052,7 @@ async def test_postgresql_url_honors_an_explicit_ssl_selection(monkeypatch):
         app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_postgresql_setup_probes_and_preselects_schemas_with_tables(monkeypatch):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     credential = SecretReference.keychain("test-postgresql-probe")
@@ -1126,6 +1145,7 @@ async def _broad_check(source_id: str) -> SourceHealth:
     )
 
 
+@pytest.mark.tui_driven
 @pytest.mark.parametrize(
     ("check", "shown"),
     (

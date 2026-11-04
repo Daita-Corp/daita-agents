@@ -96,6 +96,7 @@ markers = [
     "requires_llm: requires live model credentials",
     "requires_db: requires an external database",
     "requires_network: contacts a real external service; local injected/loopback fixtures do not require it",
+    "tui_driven: drives the terminal UI with App.run_test; runs in CI without blocking a merge",
     "slow: extended deterministic local stress or soak coverage excluded from the default suite",
 ]
 

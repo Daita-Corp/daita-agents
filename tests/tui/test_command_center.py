@@ -24,7 +24,7 @@ from tests.tui._support import (
     settle_until,
 )
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.tui_driven]
 
 
 @pytest.mark.parametrize("size", [(80, 24), (100, 24), (140, 40)])

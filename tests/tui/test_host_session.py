@@ -82,6 +82,7 @@ def _card(app: DaitaApp) -> bool:
     return chat is not None and chat.is_mounted and chat.query_one(ApprovalPanel).active
 
 
+@pytest.mark.tui_driven
 async def test_a_reopened_app_rejoins_the_active_run_and_shows_its_answer(
     start_host: StartHost,
 ) -> None:
@@ -116,6 +117,7 @@ async def test_a_reopened_app_rejoins_the_active_run_and_shows_its_answer(
             app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_an_approval_raised_with_no_window_open_is_answered_on_reopen(
     start_host: StartHost,
 ) -> None:
@@ -143,6 +145,7 @@ async def test_an_approval_raised_with_no_window_open_is_answered_on_reopen(
         await agent.close()
 
 
+@pytest.mark.tui_driven
 async def test_answering_in_one_window_removes_the_card_from_the_other(
     start_host: StartHost,
 ) -> None:
@@ -168,6 +171,7 @@ async def test_answering_in_one_window_removes_the_card_from_the_other(
     assert finished["state"] == "completed"
 
 
+@pytest.mark.tui_driven
 async def test_the_status_bar_shows_connected_reconnecting_and_stopped(
     start_host: StartHost,
 ) -> None:
@@ -200,6 +204,7 @@ async def test_the_status_bar_shows_connected_reconnecting_and_stopped(
             app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_quitting_cancels_a_host_refresh_waiting_on_the_host(
     start_host: StartHost,
 ) -> None:
@@ -239,6 +244,7 @@ async def test_quitting_cancels_a_host_refresh_waiting_on_the_host(
     assert app._exception is None and app.return_code == 0
 
 
+@pytest.mark.tui_driven
 async def test_a_host_reset_reloads_the_transcript_and_work_board(
     start_host: StartHost,
 ) -> None:
@@ -300,6 +306,7 @@ async def test_a_host_reset_reloads_the_transcript_and_work_board(
     await second_host.stop()
 
 
+@pytest.mark.tui_driven
 async def test_a_busy_host_in_another_folder_keeps_the_draft(
     start_host: StartHost,
 ) -> None:
