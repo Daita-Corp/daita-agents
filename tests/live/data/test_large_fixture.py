@@ -88,23 +88,15 @@ async def test_daita_catalogs_and_queries_large_multi_schema_postgresql(tmp_path
             resource.native_identity: resource for resource in resources
         }
 
-        assert summary.resource_count == 34
+        assert summary.resource_count == 36
         assert summary.relationship_count == 47
-        assert len(resources) == 34
+        assert len(resources) == 36
         assert "sales.orders" in by_native_identity
         assert "archive.orders" in by_native_identity
-        assert "catalog.unsupported_type_probe" not in by_native_identity
-        assert "analytics.monthly_revenue" not in by_native_identity
+        assert "catalog.unsupported_type_probe" in by_native_identity
+        assert "analytics.monthly_revenue" in by_native_identity
         assert all(not name.startswith("private.") for name in by_native_identity)
 
-        schema_resources = (
-            "core.regions",
-            "core.organizations",
-            "core.customers",
-            "sales.orders",
-            "billing.invoices",
-            "archive.orders",
-        )
         provider._script = (
             ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,
@@ -113,9 +105,8 @@ async def test_daita_catalogs_and_queries_large_multi_schema_postgresql(tmp_path
                         id="multi-schema-catalog",
                         name="catalog_describe",
                         arguments={
-                            "resource_ids": [
-                                by_native_identity[name].id for name in schema_resources
-                            ],
+                            "source": "Large multi-schema PostgreSQL",
+                            "name": "sales.orders",
                         },
                     ),
                 ),
@@ -127,17 +118,7 @@ async def test_daita_catalogs_and_queries_large_multi_schema_postgresql(tmp_path
                         id="regional-invoiced-revenue",
                         name="data_query",
                         arguments={
-                            "source_id": source.id,
-                            "resource_ids": tuple(
-                                by_native_identity[name].id
-                                for name in (
-                                    "core.customers",
-                                    "core.organizations",
-                                    "core.regions",
-                                    "sales.orders",
-                                    "billing.invoices",
-                                )
-                            ),
+                            "source": "Large multi-schema PostgreSQL",
                             "sql": (
                                 "SELECT r.region_code, "
                                 "COUNT(DISTINCT o.order_id) AS paid_order_count, "
@@ -179,14 +160,14 @@ async def test_daita_catalogs_and_queries_large_multi_schema_postgresql(tmp_path
         assert schema_result.is_error is False
         schema_data = schema_result.output["data"]
         assert isinstance(schema_data, Mapping)
-        projected = schema_data["resources"]
-        assert isinstance(projected, tuple)
-        assert {item["name"] for item in projected if isinstance(item, Mapping)} == set(
-            schema_resources
-        )
+        assert schema_data["name"] == "sales.orders"
+        assert schema_data["answered_from"] == "live"
         relationships = schema_data["relationships"]
         assert isinstance(relationships, tuple)
-        assert len(relationships) >= 5
+        related = {item["from"] for item in relationships} | {
+            item["to"] for item in relationships
+        }
+        assert {"core.customers", "billing.invoices"} <= related
 
         query_result = next(
             block
@@ -399,7 +380,7 @@ async def test_bulk_update_uses_exact_preview_approval_commit_and_readback(
         "tests/fixtures/postgres-large/compose.yaml"
     ),
 )
-async def test_identity_describe_labels_postgresql_statistics_as_estimates(
+async def test_describe_reports_postgresql_statistics_as_estimates(
     tmp_path: Path,
 ):
     password = os.environ.get(
@@ -431,28 +412,13 @@ async def test_identity_describe_labels_postgresql_statistics_as_estimates(
                 run_id="postgres-large-estimates",
                 call_id="postgres-large-estimates-call",
                 capability_id=capability.id,
-                arguments={"detail": "identity", "source_id": source.id},
+                arguments={"source_id": source.id, "name": "sales.orders"},
             )
         )
         assert registry.validate_output(capability.id, output) == output
 
-        summary = output.data["estimates"]
-        assert isinstance(summary, Mapping)
-        assert summary["approximate"] is True
-        assert "never exact counts" in str(summary["note"])
-        rows = output.data["resources"]
-        assert isinstance(rows, tuple) and rows
-        estimated = [row["estimates"] for row in rows if "estimates" in row]
-        assert summary["available"] == len(estimated)
-        assert summary["unavailable"] == len(rows) - len(estimated)
-        for estimate in estimated:
-            assert isinstance(estimate, Mapping)
-            assert set(estimate) == {
-                "approximate_row_count",
-                "approximate_size_bytes",
-                "statistics_as_of",
-                "discovered_at",
-            }
-        assert all("row_count" not in row and "columns" not in row for row in rows)
+        assert output.data["answered_from"] == "live"
+        assert isinstance(output.data["row_estimate"], int)
+        assert "row_count" not in output.data
     finally:
         await agent.close()

@@ -130,6 +130,11 @@ sensitivity and per-input lineage (`source_id`, `read_at`, and `canonical_sql`/`
 `columns`/`filters` for tabular inputs). Declared catalog links
 inform discovery and join paths only; they grant no read authority.
 
+PostgreSQL metadata shows only what the source's role can read. `pg_class` and
+`pg_attribute` list everything, so discovery, the schema probe and live lookups all build on
+the shared `READABLE_*` SQL in `adapters/postgresql.py`. A name the role cannot use only
+misleads the model; the role remains the boundary either way.
+
 Data capabilities are reads except for `data_write`, backed by PostgreSQL: one
 `INSERT`, `UPDATE` or `DELETE` on one table with a write scope. Four rules hold for every
 source type: run what was checked, ask the source, verify the effect, and refuse by

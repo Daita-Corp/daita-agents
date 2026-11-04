@@ -21,8 +21,7 @@ Both can appear in the bounded schema probe, but neither exposes a base table to
 the fixture reader. `sales.orders` and `archive.orders` intentionally have the
 same short name. Foreign keys cross the exposed schema boundaries.
 
-The reader-visible catalog contains 34 supported base tables and 47
-relationships. It includes approximately 10,000 customers, 5,000 products,
+The reader-visible catalog contains 35 tables, one view and 47 relationships. It includes approximately 10,000 customers, 5,000 products,
 100,000 current orders, 300,000 current order items, 80,000 invoices, 240,000
 invoice lines, 20,000 support tickets, and 20,000 archived orders.
 
@@ -43,13 +42,14 @@ identity-sequence USAGE. It has no
 DELETE, TRUNCATE, DDL, administrative, or role-management privilege. Daita's own
 permission scope further restricts each admitted operation and column.
 
-Two deliberate PostgreSQL boundary cases are present:
+Three deliberate PostgreSQL boundary cases are present:
 
-- `catalog.unsupported_type_probe` uses a custom enum. Daita currently omits
-  an entire table containing a non-`pg_catalog` type rather than execute an
-  unproven custom output function.
-- `analytics.monthly_revenue` is a view. Daita catalogs only PostgreSQL base
-  tables, so the view is visible to PostgreSQL but absent from Daita's catalog.
+- `catalog.unsupported_type_probe` uses a custom enum, and is cataloged like any
+  other table.
+- `analytics.monthly_revenue` is a view, and is cataloged and queryable.
+- `private` holds tables the reader cannot read. They exist in `pg_class`, but stay
+  out of the schema probe's table count, the catalog and live lookups even if
+  `private` is attached.
 
 All generated values are deterministic. The database files live in container
 tmpfs and are discarded by `docker compose down`.

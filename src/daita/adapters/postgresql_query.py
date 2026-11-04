@@ -45,7 +45,11 @@ from ..storage.sqlite_records import (
 from .models import SourceRegistration
 from .postgresql import (
     COLUMNS_SQL,
+    FOREIGN_KEYS_FROM_SQL,
     INDEXES_SQL,
+    READABLE_COLUMN_SQL,
+    READABLE_FOREIGN_KEY_SQL,
+    READABLE_RELATION_SQL,
     ROW_ESTIMATE_SQL,
     PostgreSQLSourceError,
     _close_postgresql_connection,
@@ -77,17 +81,16 @@ JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
 LEFT JOIN pg_catalog.pg_type AS argument ON argument.oid = p.proargtypes[0]
 WHERE p.proname = ANY($1::text[])
   AND n.nspname = ANY(pg_catalog.current_schemas(true))"""
-_UNQUALIFIED_RELATION_LOOKUP = """/* daita:postgresql.unqualified_relation */
+_UNQUALIFIED_RELATION_LOOKUP = f"""/* daita:postgresql.unqualified_relation */
 SELECT n.nspname, c.relname
 FROM pg_catalog.pg_class AS c
 JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
 WHERE c.relname = ANY($1::text[])
   AND n.nspname = ANY($2::text[])
-  AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+  AND {READABLE_RELATION_SQL}
 ORDER BY 1, 2
 LIMIT 32"""
 _LOOKUP_SECONDS = 5.0
-_RELATION_FILTER = "c.relkind IN ('r', 'p', 'f', 'v', 'm')"
 _LIVE_SEARCH = f"""/* daita:postgresql.live_search */
 WITH words AS (
   SELECT * FROM unnest($2::text[], $3::text[]) AS w(word, pattern)
@@ -98,19 +101,19 @@ WITH words AS (
     (SELECT count(*) FROM words WHERE c.relname ILIKE pattern) AS named,
     (SELECT count(*) FROM words WHERE EXISTS (
        SELECT 1 FROM pg_attribute AS a
-       WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+       WHERE a.attrelid = c.oid AND {READABLE_COLUMN_SQL}
          AND a.attname ILIKE pattern)) AS columned
   FROM pg_class AS c
   JOIN pg_namespace AS n ON n.oid = c.relnamespace
-  WHERE n.nspname = ANY($1::text[]) AND {_RELATION_FILTER} AND NOT c.relispartition
+  WHERE n.nspname = ANY($1::text[]) AND {READABLE_RELATION_SQL} AND NOT c.relispartition
 )
 SELECT m.nspname, m.relname, m.relkind, m.estimate,
   (SELECT string_agg(a.attname || ' ' || format_type(a.atttypid, a.atttypmod), ', ')
-   FROM (SELECT * FROM pg_attribute
-         WHERE attrelid = m.oid AND attnum > 0 AND NOT attisdropped
-         ORDER BY attnum LIMIT 12) AS a) AS columns,
-  (SELECT count(*) FROM pg_attribute
-   WHERE attrelid = m.oid AND attnum > 0 AND NOT attisdropped) AS column_count
+   FROM (SELECT * FROM pg_attribute AS a
+         WHERE a.attrelid = m.oid AND {READABLE_COLUMN_SQL}
+         ORDER BY a.attnum LIMIT 12) AS a) AS columns,
+  (SELECT count(*) FROM pg_attribute AS a
+   WHERE a.attrelid = m.oid AND {READABLE_COLUMN_SQL}) AS column_count
 FROM matched AS m
 WHERE m.named + m.columned > 0
 ORDER BY m.exact DESC, m.named DESC, m.columned DESC, m.estimate DESC NULLS LAST,
@@ -122,7 +125,7 @@ SELECT c.oid, n.nspname, c.relname, c.relkind, obj_description(c.oid, 'pg_class'
   (SELECT count(*) FROM pg_inherits WHERE inhparent = c.oid) AS children
 FROM pg_class AS c
 JOIN pg_namespace AS n ON n.oid = c.relnamespace
-WHERE n.nspname = ANY($1::text[]) AND c.relname = ANY($2::text[]) AND {_RELATION_FILTER}
+WHERE n.nspname = ANY($1::text[]) AND c.relname = ANY($2::text[]) AND {READABLE_RELATION_SQL}
 ORDER BY c.relname = $3 DESC, n.nspname
 LIMIT 8"""
 _LIVE_SCHEMA = f"""/* daita:postgresql.live_schema */
@@ -130,28 +133,19 @@ SELECT n.nspname, c.relname, c.relkind, {ROW_ESTIMATE_SQL} AS estimate,
   count(*) OVER () AS total
 FROM pg_class AS c
 JOIN pg_namespace AS n ON n.oid = c.relnamespace
-WHERE n.nspname = $1 AND {_RELATION_FILTER} AND NOT c.relispartition
+WHERE n.nspname = $1 AND {READABLE_RELATION_SQL} AND NOT c.relispartition
 ORDER BY c.relname
 LIMIT $2"""
-_LIVE_RELATIONSHIPS = """/* daita:postgresql.live_relationships */
+_LIVE_RELATIONSHIPS = f"""/* daita:postgresql.live_relationships */
 SELECT src_ns.nspname || '.' || src.relname, dst_ns.nspname || '.' || dst.relname,
   array_agg(src_att.attname::text ORDER BY keys.ordinality),
   array_agg(dst_att.attname::text ORDER BY keys.ordinality)
-FROM pg_constraint AS con
-JOIN pg_class AS src ON src.oid = con.conrelid
-JOIN pg_namespace AS src_ns ON src_ns.oid = src.relnamespace
-JOIN pg_class AS dst ON dst.oid = con.confrelid
-JOIN pg_namespace AS dst_ns ON dst_ns.oid = dst.relnamespace
-CROSS JOIN LATERAL unnest(con.conkey, con.confkey)
-    WITH ORDINALITY AS keys(source_attnum, target_attnum, ordinality)
-JOIN pg_attribute AS src_att
-  ON src_att.attrelid = src.oid AND src_att.attnum = keys.source_attnum
-JOIN pg_attribute AS dst_att
-  ON dst_att.attrelid = dst.oid AND dst_att.attnum = keys.target_attnum
-WHERE con.contype = 'f' AND con.conparentid = 0
+{FOREIGN_KEYS_FROM_SQL}
+  AND con.conparentid = 0
   AND (con.conrelid = $1 OR con.confrelid = $1)
   AND src_ns.nspname = ANY($2::text[]) AND dst_ns.nspname = ANY($2::text[])
 GROUP BY con.oid, src_ns.nspname, src.relname, dst_ns.nspname, dst.relname
+{READABLE_FOREIGN_KEY_SQL}
 ORDER BY 1, 2
 LIMIT 32"""
 # Volatile in pg_catalog, yet they only read a clock or a random source.
@@ -948,12 +942,10 @@ class PostgreSQLQueryBackend:
                     isolation="repeatable_read", readonly=True
                 )
                 await transaction.start()
-                await connection.execute(
-                    "SELECT set_config('statement_timeout', $1, true)",
-                    f"{int(_LOOKUP_SECONDS * 1_000)}ms",
-                )
-                await connection.execute(
-                    "SELECT set_config('search_path', 'pg_catalog', true)"
+                await configure_transaction(
+                    connection,
+                    schemas=("pg_catalog",),
+                    statement_timeout_seconds=_LOOKUP_SECONDS,
                 )
                 result = await work(
                     connection, _configuration_schemas(registration.configuration)

@@ -12,15 +12,19 @@ from typing import Any
 
 import pytest
 
-from daita import Agent, ApprovalDecision, ApprovalRequest, MCPToolSelection
+from daita import Agent, ApprovalDecision, ApprovalRequest
 from daita.adapters import postgresql_write as native
 from daita.adapters.mcp import SDKMCPClientFactory
 from daita.capabilities import EffectEvidenceBasis, EffectOutcome
 from daita.llm.models import ModelSensitivity
 from daita.security import SecretReference
 from daita.storage.sqlite_records import EffectReceipt
-from tests.support.mcp import conformance_identities, mock_transport
-from tests.support.native_writes import ScriptedResearchModel
+from tests.support.mcp import mock_transport
+from tests.support.native_writes import (
+    ScriptedResearchModel,
+    attach_research,
+    research_server,
+)
 from tests.support.postgresql_write_release import DriverProbe, WriteModel
 from tests.support.workspace import workspace_for
 
@@ -167,6 +171,18 @@ class Fixture:
         )
 
 
+async def _attach_write_tester(agent: Agent) -> Any:
+    return await agent.attach_postgresql(
+        host="127.0.0.1",
+        port=int(os.environ.get("DAITA_LARGE_POSTGRES_PORT", "55433")),
+        database="daita_large_fixture",
+        username=_ROLE,
+        credential=SecretReference.keychain("fixture:postgres-large:write-release"),
+        schemas=("write_acceptance",),
+        ssl_mode="disable",
+    )
+
+
 async def _admin_connection() -> Any:
     import asyncpg  # type: ignore[import-untyped]
 
@@ -212,20 +228,7 @@ async def live_write_source(root: Path, agent: str) -> AsyncIterator[LiveWriteSo
     assert locked, "Another write-release suite owns this fixture; run serially."
     try:
         await _reset(admin)
-        research, _ = conformance_identities()
-        research.results["lookup"] = {
-            "content": [
-                {
-                    "type": "text",
-                    "text": "New Co lists Acme as a customer. "
-                    "https://source.test/new; one source, coverage is incomplete.",
-                }
-            ],
-            "structuredContent": {
-                "answer": "New Co; https://source.test/new; model must assess the claim"
-            },
-            "isError": False,
-        }
+        research = research_server()
         factory = SDKMCPClientFactory(http_transport=mock_transport(research))
         model = ScriptedResearchModel()
         home = await Agent.create(
@@ -238,17 +241,7 @@ async def live_write_source(root: Path, agent: str) -> AsyncIterator[LiveWriteSo
             mcp_client_factory=factory,
         )
         try:
-            source = await home.attach_postgresql(
-                host="127.0.0.1",
-                port=int(os.environ.get("DAITA_LARGE_POSTGRES_PORT", "55433")),
-                database="daita_large_fixture",
-                username=_ROLE,
-                credential=SecretReference.keychain(
-                    "fixture:postgres-large:write-release"
-                ),
-                schemas=("write_acceptance",),
-                ssl_mode="disable",
-            )
+            source = await _attach_write_tester(home)
             preview = await home.preview_source_permissions(
                 source_id=source.id,
                 read_mode="all",
@@ -266,19 +259,8 @@ async def live_write_source(root: Path, agent: str) -> AsyncIterator[LiveWriteSo
                 source_id=source.id,
                 confirmation_fingerprint=preview.confirmation_fingerprint,
             )
-            await home.attach_mcp_server(
-                endpoint=research.endpoint,
-                selections=(
-                    MCPToolSelection(
-                        remote_name="lookup",
-                        local_alias="research",
-                        description="Research companies and return cited evidence.",
-                        # A higher class would lift the request above this source's.
-                        result_sensitivity=ModelSensitivity.INTERNAL,
-                    ),
-                ),
-                maximum_outbound_sensitivity=ModelSensitivity.INTERNAL,
-            )
+            # A higher class would lift the request above this source's.
+            await attach_research(home, research, ModelSensitivity.INTERNAL)
         finally:
             await home.close()
         yield LiveWriteSource(
@@ -333,15 +315,7 @@ async def database(
             assert fixture is not None
             return await fixture.approve(request)
 
-        source = await agent.attach_postgresql(
-            host="127.0.0.1",
-            port=int(os.environ.get("DAITA_LARGE_POSTGRES_PORT", "55433")),
-            database="daita_large_fixture",
-            username=_ROLE,
-            credential=SecretReference.keychain("fixture:postgres-large:write-release"),
-            schemas=("write_acceptance",),
-            ssl_mode="disable",
-        )
+        source = await _attach_write_tester(agent)
         inspection = await agent.inspect_source_permissions(source.id)
         resources = {
             item.display_name: item.resource_id for item in inspection.resources

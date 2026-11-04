@@ -73,9 +73,39 @@ _CONNECT_TIMEOUT_SECONDS = 8.0
 _COMMAND_TIMEOUT_SECONDS = 8.0
 _CLEANUP_TIMEOUT_SECONDS = 1.0
 
+# The system catalogs list everything, whether or not this role can read it, and
+# a name it cannot use only misleads. Every metadata query goes through these.
 # Tables r, p and f map to TABLE; views v and m to VIEW. A partition folds under
 # its parent, which is what queries read.
-_RELATION_KINDS = "('r', 'p', 'f', 'v', 'm')"
+READABLE_RELATION_SQL = (
+    "c.relkind IN ('r', 'p', 'f', 'v', 'm') "
+    "AND pg_catalog.has_any_column_privilege(c.oid, 'SELECT') "
+    "AND pg_catalog.has_schema_privilege(c.relnamespace, 'USAGE')"
+)
+READABLE_COLUMN_SQL = (
+    "a.attnum > 0 AND NOT a.attisdropped "
+    "AND pg_catalog.has_column_privilege(a.attrelid, a.attnum, 'SELECT')"
+)
+# Each foreign key with its columns in order. Close the query with
+# READABLE_FOREIGN_KEY_SQL after its GROUP BY: a key is readable only whole.
+FOREIGN_KEYS_FROM_SQL = """FROM pg_constraint AS con
+JOIN pg_class AS src ON src.oid = con.conrelid
+JOIN pg_namespace AS src_ns ON src_ns.oid = src.relnamespace
+JOIN pg_class AS dst ON dst.oid = con.confrelid
+JOIN pg_namespace AS dst_ns ON dst_ns.oid = dst.relnamespace
+CROSS JOIN LATERAL unnest(con.conkey, con.confkey)
+    WITH ORDINALITY AS keys(source_attnum, target_attnum, ordinality)
+JOIN pg_attribute AS src_att
+  ON src_att.attrelid = src.oid AND src_att.attnum = keys.source_attnum
+JOIN pg_attribute AS dst_att
+  ON dst_att.attrelid = dst.oid AND dst_att.attnum = keys.target_attnum
+WHERE con.contype = 'f'
+  AND pg_catalog.has_schema_privilege(src.relnamespace, 'USAGE')
+  AND pg_catalog.has_schema_privilege(dst.relnamespace, 'USAGE')"""
+READABLE_FOREIGN_KEY_SQL = """HAVING bool_and(
+    pg_catalog.has_column_privilege(src.oid, src_att.attnum, 'SELECT')
+    AND pg_catalog.has_column_privilege(dst.oid, dst_att.attnum, 'SELECT')
+)"""
 ROW_ESTIMATE_SQL = """CASE WHEN c.relkind = 'p' THEN (
         SELECT sum(GREATEST(child.reltuples, 0))
         FROM pg_inherits AS part
@@ -92,13 +122,13 @@ SELECT
 FROM pg_class AS c
 JOIN pg_namespace AS n ON n.oid = c.relnamespace
 WHERE n.nspname = ANY($1::text[])
-  AND c.relkind IN {_RELATION_KINDS}
+  AND {READABLE_RELATION_SQL}
   AND NOT c.relispartition
 ORDER BY n.nspname, c.relname
 LIMIT $2
 """
 
-COLUMNS_SQL = """
+COLUMNS_SQL = f"""
 /* daita:postgresql.columns */
 SELECT
     a.attname AS column_name,
@@ -126,8 +156,7 @@ FROM pg_namespace AS n
 JOIN pg_class AS rel ON rel.relnamespace = n.oid
 JOIN pg_attribute AS a
   ON a.attrelid = rel.oid
- AND a.attnum > 0
- AND NOT a.attisdropped
+ AND {READABLE_COLUMN_SQL}
 JOIN pg_type AS type_def ON type_def.oid = a.atttypid
 JOIN pg_namespace AS type_ns ON type_ns.oid = type_def.typnamespace
 LEFT JOIN pg_attrdef AS def ON def.adrelid = rel.oid AND def.adnum = a.attnum
@@ -144,6 +173,7 @@ LEFT JOIN (
     WHERE con.contype = 'p'
 ) AS pk ON pk.conrelid = rel.oid AND pk.attnum = a.attnum
 WHERE n.nspname = $1 AND rel.relname = $2
+  AND pg_catalog.has_schema_privilege(n.oid, 'USAGE')
 ORDER BY a.attnum
 LIMIT $3
 """
@@ -179,11 +209,15 @@ WHERE n.nspname = $1
   AND key.ordinality <= ind.indnkeyatts
 GROUP BY idx.relname, am.amname, ind.indisunique, ind.indpred, ind.indrelid,
          ind.indisvalid, ind.indisready, ind.indimmediate, ind.indexprs
+HAVING bool_and(
+    att.attnum IS NULL
+    OR pg_catalog.has_column_privilege(rel.oid, att.attnum, 'SELECT')
+)
 ORDER BY idx.relname
 LIMIT $3
 """
 
-_RELATIONSHIPS_SQL = """
+_RELATIONSHIPS_SQL = f"""
 /* daita:postgresql.relationships */
 SELECT
     con.conname AS constraint_name,
@@ -201,23 +235,13 @@ SELECT
     CASE con.confdeltype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT'
          WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL'
          WHEN 'd' THEN 'SET DEFAULT' END AS on_delete
-FROM pg_constraint AS con
-JOIN pg_class AS src ON src.oid = con.conrelid
-JOIN pg_namespace AS src_ns ON src_ns.oid = src.relnamespace
-JOIN pg_class AS dst ON dst.oid = con.confrelid
-JOIN pg_namespace AS dst_ns ON dst_ns.oid = dst.relnamespace
-CROSS JOIN LATERAL unnest(con.conkey, con.confkey)
-    WITH ORDINALITY AS keys(source_attnum, target_attnum, ordinality)
-JOIN pg_attribute AS src_att
-  ON src_att.attrelid = src.oid AND src_att.attnum = keys.source_attnum
-JOIN pg_attribute AS dst_att
-  ON dst_att.attrelid = dst.oid AND dst_att.attnum = keys.target_attnum
-WHERE con.contype = 'f'
+{FOREIGN_KEYS_FROM_SQL}
   AND src_ns.nspname = ANY($1::text[])
   AND dst_ns.nspname = ANY($1::text[])
 GROUP BY con.oid, con.conname, src_ns.nspname, src.relname,
          dst_ns.nspname, dst.relname, con.confmatchtype,
          con.confupdtype, con.confdeltype
+{READABLE_FOREIGN_KEY_SQL}
 ORDER BY src_ns.nspname, src.relname, con.conname
 LIMIT $2
 """
@@ -255,7 +279,7 @@ SELECT
         SELECT 1
         FROM pg_class AS c
         WHERE c.relnamespace = namespace.oid
-          AND c.relkind IN {_RELATION_KINDS}
+          AND {READABLE_RELATION_SQL}
     ) AS has_base_tables
 FROM pg_namespace AS namespace
 WHERE namespace.nspname <> 'information_schema'

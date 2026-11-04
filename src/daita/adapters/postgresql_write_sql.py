@@ -351,6 +351,14 @@ def _target_identity(
     return full_name, catalog_resource_id(source_id, ResourceKind.TABLE, full_name)
 
 
+def _parsed(sql: str) -> tuple[SqlAnalysis, _Shape, Any]:
+    """Text that already passed ``describe_write``, parsed for building from."""
+
+    analysis, root = analyze_postgresql_write(sql)
+    _, exp = _load_sqlglot("postgresql")
+    return analysis, _statement_shape(root, analysis, exp), exp
+
+
 def verified_statement(
     sql: str, keys: Sequence[Sequence[str]]
 ) -> tuple[str, tuple[str, ...] | None]:
@@ -362,9 +370,7 @@ def verified_statement(
     when an INSERT does not list it, since the preview cannot know a generated value.
     """
 
-    analysis, root = analyze_postgresql_write(sql)
-    _, exp = _load_sqlglot("postgresql")
-    shape = _statement_shape(root, analysis, exp)
+    analysis, shape, exp = _parsed(sql)
     key = next(
         (
             tuple(columns)
@@ -402,9 +408,7 @@ def derived_select(
     """
 
     protected, stashed = stash_escape_strings(sql)
-    analysis, root = analyze_postgresql_write(protected)
-    _, exp = _load_sqlglot("postgresql")
-    shape = _statement_shape(root, analysis, exp)
+    _, shape, exp = _parsed(protected)
     scan, lock = _derived_select(shape, types, key, exp)
     for placeholder, literal in stashed.items():
         scan = scan.replace(placeholder, literal)

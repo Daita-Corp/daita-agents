@@ -662,7 +662,7 @@ async def test_composite_and_range_values_are_projected(
     assert cast(Mapping[str, object], whole[0]["c"])["region"] == "north"
 
 
-async def _lookup(
+async def _tool_output(
     reads: _Reads, tool: str, arguments: Mapping[str, object]
 ) -> Mapping[str, object]:
     loop = reads.agent._embedded._loop
@@ -678,8 +678,15 @@ async def _lookup(
         ),
         (ToolCall("lookup", tool, arguments),),
     )
-    assert "error" not in result.output, result.output
-    return cast(Mapping[str, object], result.output["data"])
+    return cast(Mapping[str, object], result.output)
+
+
+async def _lookup(
+    reads: _Reads, tool: str, arguments: Mapping[str, object]
+) -> Mapping[str, object]:
+    output = await _tool_output(reads, tool, arguments)
+    assert "error" not in output, output
+    return cast(Mapping[str, object], output["data"])
 
 
 async def test_discovery_lists_every_relation_kind_with_partitions_folded(
@@ -781,6 +788,80 @@ async def test_describe_reads_types_enums_keys_comments_and_partitions_live(
             table["name"]
             for table in cast(tuple[Mapping[str, object], ...], listing["tables"])
         ] == ["events.page_views"]
+    finally:
+        await reads.agent.close()
+
+
+def _names(items: object) -> list[object]:
+    return [item["name"] for item in cast(tuple[Mapping[str, object], ...], items)]
+
+
+async def test_metadata_shows_only_what_the_role_can_read(
+    database: None, tmp_path: Path
+) -> None:
+    admin = await _admin(_DATABASE)
+    try:
+        await admin.execute("""
+            CREATE TABLE sales.vault (id integer PRIMARY KEY, salary integer);
+            CREATE TABLE sales.vault_lines (
+                id integer PRIMARY KEY, vault_id integer REFERENCES sales.vault (id)
+            );
+            CREATE TABLE sales.partly (
+                id integer PRIMARY KEY, shown text, secret_col text UNIQUE
+            );
+            GRANT SELECT ON sales.vault_lines TO daita_reader;
+            GRANT SELECT (id, shown) ON sales.partly TO daita_reader;
+            """)
+    finally:
+        await admin.close()
+    reads = await _attached(tmp_path, ("sales", "legacy"))
+    place = {"source": "Warehouse"}
+    try:
+        cataloged = {
+            resource.native_identity
+            for resource in await reads.agent.list_catalog_resources(
+                source_id=reads.source_id
+            )
+        }
+        assert {"sales.partly", "sales.vault_lines"} <= cataloged
+        assert "sales.vault" not in cataloged and "sales.denied" not in cataloged
+
+        stored = await reads.agent._embedded._data_view.cached_description(
+            reads.agent.id, reads.source_id, "sales.partly"
+        )
+        assert stored is not None
+        assert _names(stored["columns"]) == ["id", "shown"]
+        assert "secret_col" not in repr(stored)
+
+        for word in ("vault salary", "secret_col"):
+            data = await _lookup(reads, "catalog_search", {"query": word})
+            found = repr(data["hits"])
+            assert "sales.vault'" not in found
+            assert "salary" not in found and "secret_col" not in found
+
+        hidden = await _tool_output(
+            reads, "catalog_describe", {**place, "name": "sales.vault"}
+        )
+        assert _error(hidden)["code"] == "table_unknown"
+        partly = await _lookup(
+            reads, "catalog_describe", {**place, "name": "sales.partly"}
+        )
+        assert _names(partly["columns"]) == ["id", "shown"]
+        assert "secret_col" not in repr(partly)
+        lines = await _lookup(
+            reads, "catalog_describe", {**place, "name": "sales.vault_lines"}
+        )
+        assert not lines["relationships"]
+        listing = await _lookup(reads, "catalog_describe", {**place, "name": "sales"})
+        assert "sales.vault" not in _names(listing["tables"])
+
+        # The role stays the boundary: a guess at either name still fails.
+        guessed = _error(await reads.query("SELECT secret_col FROM sales.partly"))
+        assert guessed["code"] == "not_permitted"
+        unqualified = _error(await reads.query("SELECT id FROM vault"))
+        assert unqualified["code"] == "unqualified_relation"
+        details = cast(Mapping[str, object], unqualified["details"])
+        assert details["candidates"] == ()
     finally:
         await reads.agent.close()
 

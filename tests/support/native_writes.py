@@ -136,17 +136,11 @@ def patch_fake_postgresql(monkeypatch, db: Database) -> None:
     monkeypatch.setattr(native, "_connect", connect)
 
 
-async def create_fixture(
-    tmp_path,
-    monkeypatch,
-    *,
-    sensitivity=Sensitivity.RESTRICTED,
-    limits: LoopLimits | None = None,
-):
-    clock = [NOW]
-    db = Database()
-    alpha, _ = conformance_identities()
-    alpha.results["lookup"] = {
+def research_server():
+    """A fake MCP server whose one lookup returns a cited company finding."""
+
+    server, _ = conformance_identities()
+    server.results["lookup"] = {
         "content": [
             {
                 "type": "text",
@@ -158,6 +152,34 @@ async def create_fixture(
         },
         "isError": False,
     }
+    return server
+
+
+async def attach_research(agent, server, sensitivity: ModelSensitivity):
+    return await agent.attach_mcp_server(
+        endpoint=server.endpoint,
+        selections=(
+            MCPToolSelection(
+                remote_name="lookup",
+                local_alias="research",
+                description="Research companies and return cited evidence.",
+                result_sensitivity=sensitivity,
+            ),
+        ),
+        maximum_outbound_sensitivity=sensitivity,
+    )
+
+
+async def create_fixture(
+    tmp_path,
+    monkeypatch,
+    *,
+    sensitivity=Sensitivity.RESTRICTED,
+    limits: LoopLimits | None = None,
+):
+    clock = [NOW]
+    db = Database()
+    alpha = research_server()
     factory = SDKMCPClientFactory(http_transport=mock_transport(alpha))
     provider = ScriptedResearchModel()
     approvals = []
@@ -230,18 +252,7 @@ async def create_fixture(
         source_id=registration.id,
         confirmation_fingerprint=preview.confirmation_fingerprint,
     )
-    status = await agent.attach_mcp_server(
-        endpoint=alpha.endpoint,
-        selections=(
-            MCPToolSelection(
-                remote_name="lookup",
-                local_alias="research",
-                description="Research companies and return cited evidence.",
-                result_sensitivity=ModelSensitivity.RESTRICTED,
-            ),
-        ),
-        maximum_outbound_sensitivity=ModelSensitivity.RESTRICTED,
-    )
+    status = await attach_research(agent, alpha, ModelSensitivity.RESTRICTED)
     home = agent.home
     await agent.close()
 
