@@ -22,6 +22,7 @@ from tests.support.product_workflows import (
 pytestmark = _pytestmark
 
 
+@pytest.mark.tui_driven
 async def test_background_refresh_preserves_foreground_approval_state(
     start_host: StartHost,
 ):

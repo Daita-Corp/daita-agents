@@ -832,6 +832,7 @@ async def test_binding_codec_and_origin_retain_authority_but_exclude_hints(actio
         )
 
 
+@pytest.mark.tui_driven
 async def test_guided_ui_explicit_action_permissions_reach_public_admission(
     tmp_path, start_host: StartHost
 ):

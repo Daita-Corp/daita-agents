@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
+
 from daita.adapters.models import SourceHealth
 from daita.host.client import connect
 from daita.tui.controller import SOURCE_REFRESH_ERRORS
@@ -32,6 +34,8 @@ from tests.tui._support import (
     sqlite3,
     workspace_for,
 )
+
+pytestmark = pytest.mark.tui_driven
 
 
 async def test_source_permissions_picker_remains_interactive_after_command_submit(

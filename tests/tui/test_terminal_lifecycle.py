@@ -88,6 +88,7 @@ async def test_one_interactive_run_path_is_unique():
     assert text.count("agent.run(") == 1
 
 
+@pytest.mark.tui_driven
 async def test_active_run_cancellation_does_not_retry_agent(start_host: StartHost):
     harness = await start_host()
     opened = await remote_agent(harness, "cancel-once")
@@ -122,6 +123,7 @@ async def test_active_run_cancellation_does_not_retry_agent(start_host: StartHos
         await opened.close()
 
 
+@pytest.mark.tui_driven
 async def test_learn_command_runs_explicit_learning(start_host: StartHost):
     harness = await start_host()
     opened = await remote_agent(harness, "learn-route")
@@ -158,6 +160,7 @@ async def test_learn_command_runs_explicit_learning(start_host: StartHost):
     assert "fiscal year starts in February" in calls[0][1]
 
 
+@pytest.mark.tui_driven
 async def test_approval_presentation_failure_is_not_converted_to_denial():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     request = ApprovalRequest(
@@ -182,6 +185,7 @@ async def test_approval_presentation_failure_is_not_converted_to_denial():
         app.exit(0)
 
 
+@pytest.mark.tui_driven
 @pytest.mark.skipif(os.name != "posix", reason="real PTY certification is POSIX-only")
 async def test_exiting_finishes_textual_shutdown_that_flushes_the_terminal(
     start_host: StartHost,

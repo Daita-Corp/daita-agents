@@ -194,6 +194,14 @@ Execution requirements are separate:
 - `requires_network` contacts another real external service; injected or local
   loopback transports do not need this marker.
 - `slow` is an extended deterministic stress or soak case.
+- `tui_driven` drives the terminal UI with Textual's `App.run_test`.
+
+`tui_driven` tests fail at random under CI's parallel load, so they do not block
+a merge. The `deterministic` job leaves them out. The `tui-driven` job runs them
+serially, and a failure there shows in the job summary but keeps the check
+green. Locally, plain `pytest` still runs them; run only these with
+`pytest -m tui_driven`. The release workflow runs them serially and blocks on a
+failure, so a real break cannot ship.
 
 Collect live cases without authorizing execution:
 
