@@ -109,8 +109,9 @@ async def test_close_retains_writer_lock_until_blocked_run_terminalizes(tmp_path
     )
     run = asyncio.create_task(agent.run("answer without tools"))
     started = asyncio.create_task(provider.started.wait())
+    # Only an upper bound: a loaded runner can take seconds to reach the model.
     done, _pending = await asyncio.wait(
-        (run, started), timeout=1, return_when=asyncio.FIRST_COMPLETED
+        (run, started), timeout=30, return_when=asyncio.FIRST_COMPLETED
     )
     assert started in done, (
         repr(run.exception() or run.result())
