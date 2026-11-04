@@ -86,7 +86,12 @@ async def test_source_permissions_picker_remains_interactive_after_command_submi
                     is True
                 )
                 assert await pilot.click(listing, offset=(2, 0)) is True
-                await pilot.pause()
+                await settle_until(
+                    pilot,
+                    lambda: app.screen is permissions
+                    and "Records"
+                    in str(permissions.query_one("#perm-body", Static).content),
+                )
 
                 assert app.screen is permissions
                 assert isinstance(permissions, PermissionsScreen)
@@ -365,7 +370,7 @@ async def test_source_edit_screen_reviews_and_switches_atomically(
             command_task = asyncio.create_task(
                 app._open_command_screen("source_edit", {})
             )
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, SourceEditScreen))
             assert isinstance(app.screen, SourceEditScreen)
             app.screen.query_one("#edit-source-path", Input).value = str(edited_path)
             apply_button = app.screen.query_one("#edit-source-apply", Button)
@@ -701,7 +706,7 @@ async def test_catalog_tree_graph_explores_relationship_neighborhoods(
             composer = app.screen.query_one(Composer)
             composer.load_text("/sources")
             composer.action_submit()
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
 
             screen = app.screen
             assert isinstance(screen, CatalogScreen)

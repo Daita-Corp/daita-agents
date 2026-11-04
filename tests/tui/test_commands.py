@@ -26,6 +26,7 @@ from tests.tui._support import (
     _create_sqlite_source,
     parse_source_override,
     pytest,
+    settle_until,
 )
 
 
@@ -71,7 +72,7 @@ async def test_typed_command_palette_navigates_and_inserts_without_submitting(
                 assert composer.styles.border_right[0] == "heavy"
 
                 await pilot.press("/")
-                await pilot.pause()
+                await settle_until(pilot, lambda: popup.display is True)
                 assert popup.display is True
                 await pilot.press("ctrl+3")
                 await pilot.pause()
@@ -108,7 +109,7 @@ async def test_typed_command_palette_navigates_and_inserts_without_submitting(
                 assert app._run_task is None
 
                 await pilot.press("enter")
-                await pilot.pause()
+                await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
                 assert isinstance(app.screen, CatalogScreen)
                 await pilot.press("escape")
                 await pilot.pause()
@@ -173,7 +174,7 @@ async def test_skill_and_source_completions_are_plain_and_selectable(
             composer.focus()
 
             await pilot.press("/", "a", "u")
-            await pilot.pause()
+            await settle_until(pilot, lambda: bool(popup.matches))
             assert popup.matches == (
                 (
                     "/audit ",

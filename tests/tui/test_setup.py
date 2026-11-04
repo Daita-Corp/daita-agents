@@ -361,7 +361,7 @@ async def test_agent_picker_recovers_incompatible_model_settings_for_replacement
         assert config_path.read_bytes() == before
 
         await pilot.press("escape")
-        await pilot.pause()
+        await settle_until(pilot, lambda: isinstance(app.screen, ChatScreen))
         assert isinstance(app.screen, ChatScreen)
         assert (
             await app.controller.dispatch_command("/mcp")

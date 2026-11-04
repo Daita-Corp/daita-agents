@@ -46,6 +46,7 @@ from tests.artifacts._public_surface_support import (
 )
 from tests.support.host import StartHost, host_workspace
 from tests.support.workspace import workspace_for
+from tests.tui._support import settle_until
 
 
 async def _wait_for_actions(manager: ArtifactsScreen) -> None:
@@ -221,11 +222,14 @@ async def test_artifact_command_manages_registered_files_after_history_clear(
                 await pilot.press(
                     "/", "a", "r", "t", "i", "f", "a", "c", "t", "s", "enter", "enter"
                 )
-                await pilot.pause()
+                await settle_until(
+                    pilot, lambda: isinstance(app.screen, ArtifactsScreen)
+                )
                 assert isinstance(app.screen, ArtifactsScreen)
                 manager = app.screen
                 await _wait_for_actions(manager)
-                await pilot.pause()
+                listing = manager.query_one("#artifacts-list", OptionList)
+                await settle_until(pilot, lambda: listing.option_count == 1)
                 assert (
                     manager.query_one("#artifacts-list", OptionList).option_count == 1
                 )
@@ -254,7 +258,10 @@ async def test_artifact_command_manages_registered_files_after_history_clear(
                 )
                 await pilot.press("v")
                 await _wait_for_actions(manager)
-                await pilot.pause()
+                detail = manager.query_one("#artifacts-detail", Static)
+                await settle_until(
+                    pilot, lambda: "surface payload" in str(detail.content)
+                )
                 assert "surface payload" in str(
                     manager.query_one("#artifacts-detail", Static).content
                 )
@@ -264,7 +271,7 @@ async def test_artifact_command_manages_registered_files_after_history_clear(
                 assert isinstance(app.screen, ConfirmScreen)
                 await pilot.press("y")
                 await _wait_for_actions(manager)
-                await pilot.pause()
+                await settle_until(pilot, (downloads / "result.txt").exists)
                 assert (downloads / "result.txt").read_bytes() == b"surface payload\n"
                 assert str(downloads / "result.txt") in str(
                     manager.query_one("#artifacts-notice", Static).content
@@ -281,7 +288,7 @@ async def test_artifact_command_manages_registered_files_after_history_clear(
                 assert isinstance(app.screen, ConfirmScreen)
                 await pilot.press("y")
                 await _wait_for_actions(manager)
-                await pilot.pause()
+                await settle_until(pilot, lambda: listing.option_count == 0)
                 assert (
                     manager.query_one("#artifacts-list", OptionList).option_count == 0
                 )
