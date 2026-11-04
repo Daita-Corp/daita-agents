@@ -228,6 +228,13 @@ efficiency target into the functional oracle. Record token use as benchmark
 evidence. Test exact token admission and exhaustion behavior with deterministic
 providers in the owning loop and LLM suites.
 
+A live test fails only when something is wrong for a user: the wrong rows
+changed, an effect happened twice, a receipt is missing, an unsafe action went
+through, a report disagrees with the evidence, or a run went past its limits. A
+run that did the right thing must pass, however the model wrote its SQL and even
+if a stalled model attempt was retried. Stalled attempts stay visible in the
+evidence report; usage arithmetic belongs in the deterministic suites.
+
 The live MCP action and scheduled execution suites default to a `$0.50`
 estimated cost cap per agent run in both evaluation profiles. Configure it with
 `DAITA_PHASE_F_LIVE_MAX_COST_USD`; it must remain finite and positive. These

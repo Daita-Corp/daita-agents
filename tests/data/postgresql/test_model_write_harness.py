@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from daita import ApprovalDecision, ApprovalRequest
-from daita._json import FrozenJsonObject, canonical_json
+from daita._json import FrozenJsonObject
 from daita.catalog.models import Sensitivity
 from daita.llm import factory
 from daita.llm.models import (
@@ -228,7 +228,7 @@ def _write_request(review: dict[str, object]) -> ApprovalRequest:
 
 
 @pytest.mark.parametrize(
-    "tamper", [None, "resource", "value", "column", "count", "duplicate"]
+    "tamper", [None, "unchanged", "resource", "value", "column", "count", "duplicate"]
 )
 async def test_exact_write_approval_fails_closed(tamper):
     scenario = Evaluation(
@@ -237,7 +237,10 @@ async def test_exact_write_approval_fails_closed(tamper):
     scenario.expect_upsert([dict(_NEW_ROW)])
     preview = _preview()
     target: dict[str, object] = {}
-    if tamper == "resource":
+    if tamper == "unchanged":
+        # An upsert that skips rows already correct is right, not a tampered card.
+        preview = _preview(affected_rows=0, inserted_rows=0, skipped_rows=1, samples=[])
+    elif tamper == "resource":
         target = {"resource_id": "other"}
     elif tamper == "value":
         preview = _preview(
@@ -252,7 +255,9 @@ async def test_exact_write_approval_fails_closed(tamper):
         assert await scenario.approve(request) is ApprovalDecision.APPROVE
         request = replace(request, call_id="second")
     assert await scenario.approve(request) is (
-        ApprovalDecision.APPROVE if tamper is None else ApprovalDecision.DENY
+        ApprovalDecision.APPROVE
+        if tamper in {None, "unchanged"}
+        else ApprovalDecision.DENY
     )
 
 
@@ -395,8 +400,8 @@ def test_report_counts_accept_zero_or_null_for_no_effect_but_not_invented_counts
 
 
 @pytest.mark.parametrize("profile", ["strict", "user_flow"])
-@pytest.mark.parametrize("failure", [None, "body", "accounting", "both", "budget"])
-async def test_owned_route_evidence_cleanup_and_exact_accounting_offline(
+@pytest.mark.parametrize("failure", [None, "body", "budget"])
+async def test_owned_route_evidence_and_cleanup_offline(
     tmp_path, monkeypatch, failure, profile
 ):
     fixture = await create_fixture(tmp_path, monkeypatch)
@@ -512,23 +517,7 @@ async def test_owned_route_evidence_cleanup_and_exact_accounting_offline(
                 with pytest.raises(AssertionError):
                     await scenario.run("A failed run cannot fund a follow-up.")
                 assert sum(len(item.requests) for item in providers) == request_count
-            scenario.assert_accounting()
-            original = scenario.captures[0]
-            scenario.captures[0] = (
-                replace(
-                    result,
-                    usage=replace(
-                        result.usage, input_tokens=result.usage.input_tokens + 1
-                    ),
-                ),
-                transcript,
-                None,
-            )
-            with pytest.raises(AssertionError):
-                scenario.assert_accounting()
-            if failure not in {"accounting", "both"}:
-                scenario.captures[0] = original
-            if failure in {"body", "both"}:
+            if failure == "body":
                 raise AssertionError("deliberate failed evaluation")
     except AssertionError as error:
         caught = error
@@ -545,15 +534,10 @@ async def test_owned_route_evidence_cleanup_and_exact_accounting_offline(
             )
     assert evidence_checked
     assert (caught is not None) == (failure is not None)
-    if failure in {"body", "both"}:
+    if failure == "body":
         assert str(caught) == "deliberate failed evaluation"
         assert report["failure"] == "AssertionError: deliberate failed evaluation"
     assert report["status"] == ("failed" if failure else "passed")
-    assert report["accounting"]["status"] == (
-        "failed" if failure in {"accounting", "both"} else "passed"
-    )
-    if failure in {"accounting", "both"}:
-        assert "input_tokens" in report["accounting"]["failure"]
     active = [item for item in providers if item.requests]
     # Pricing probes construct unopened providers; only resolved delegates own
     # active calls/clients. The router must drain and close every active delegate.
