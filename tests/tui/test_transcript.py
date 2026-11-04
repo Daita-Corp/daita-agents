@@ -153,6 +153,7 @@ def test_answer_summary_reports_queries_rows_steps_time_and_tokens():
     )
 
 
+@pytest.mark.tui_driven
 async def test_live_activity_and_exact_model_context_update_from_observation(
     start_host: StartHost,
 ):
@@ -387,6 +388,7 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
         await opened.close()
 
 
+@pytest.mark.tui_driven
 async def test_composer_submit_runs_agent_once(start_host: StartHost):
     from datetime import UTC, datetime
 
@@ -429,6 +431,7 @@ async def test_composer_submit_runs_agent_once(start_host: StartHost):
         await opened.close()
 
 
+@pytest.mark.tui_driven
 async def test_chat_accumulates_and_resumes_the_full_conversation_transcript(
     start_host: StartHost,
 ):
@@ -513,6 +516,7 @@ async def test_chat_accumulates_and_resumes_the_full_conversation_transcript(
         await opened.close()
 
 
+@pytest.mark.tui_driven
 async def test_transcript_history_supports_review_and_latest_navigation():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with app.run_test(size=(60, 14)) as pilot:
@@ -553,6 +557,7 @@ async def test_transcript_history_supports_review_and_latest_navigation():
         app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_ctrl_o_toggles_tool_calls_without_exiting_chat():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with app.run_test(size=(80, 24)) as pilot:
@@ -608,6 +613,7 @@ async def test_ctrl_o_toggles_tool_calls_without_exiting_chat():
             app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_copy_uses_native_wrap_independent_text_selection(monkeypatch):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     copied: list[str] = []
@@ -630,6 +636,7 @@ async def test_copy_uses_native_wrap_independent_text_selection(monkeypatch):
         app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_popup_copy_uses_terminal_aware_clipboard(monkeypatch):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     copied: list[str] = []

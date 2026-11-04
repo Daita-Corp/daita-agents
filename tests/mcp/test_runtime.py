@@ -784,6 +784,7 @@ def test_guided_mcp_aliases_are_safe_stable_and_collision_free():
     )
 
 
+@pytest.mark.tui_driven
 async def test_mcp_management_groups_legacy_bindings_by_server(start_host: StartHost):
     identity = _guided_mcp_identity()
     factory = SDKMCPClientFactory(http_transport=mock_transport(identity))
@@ -853,6 +854,7 @@ async def _wait_for_mcp_setup(screen: MCPSetupScreen) -> None:
         await asyncio.wait_for(screen.workers.wait_for_complete(workers), timeout=10)
 
 
+@pytest.mark.tui_driven
 async def test_guided_mcp_setup_corrects_credentials_and_invalidates_changed_endpoint(
     start_host: StartHost,
 ):
@@ -945,6 +947,7 @@ async def test_guided_mcp_setup_corrects_credentials_and_invalidates_changed_end
             app.exit(0)
 
 
+@pytest.mark.tui_driven
 @pytest.mark.parametrize("has_supported_tool", (True, False))
 async def test_guided_mcp_setup_disables_unsupported_tools_with_reasons(
     start_host: StartHost, has_supported_tool
@@ -1010,6 +1013,7 @@ async def test_guided_mcp_setup_disables_unsupported_tools_with_reasons(
             app.exit(0)
 
 
+@pytest.mark.tui_driven
 @pytest.mark.parametrize(
     ("auth_mode", "size", "entrypoint", "activation_pending"),
     (
@@ -1151,6 +1155,7 @@ async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
             app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(
     start_host: StartHost,
 ):
@@ -1800,6 +1805,7 @@ async def test_oversized_remote_result_becomes_one_bounded_transcript_error(tmp_
         await reopened.close()
 
 
+@pytest.mark.tui_driven
 @pytest.mark.parametrize("authenticated", (True, False))
 async def test_cancelled_masked_mcp_setup_deletes_unused_credential(
     start_host: StartHost, authenticated

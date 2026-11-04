@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from daita import connect
 from daita.tui.screens.selection import SelectionScreen
 from tests.support.host import StartHost, host_workspace, short_root
@@ -28,6 +30,7 @@ from tests.tui._support import settle_until
 pytestmark = _pytestmark
 
 
+@pytest.mark.tui_driven
 async def test_guided_write_authoring_applies_exact_preview(
     monkeypatch, start_host: StartHost
 ):

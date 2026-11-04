@@ -134,6 +134,7 @@ def _option_ids(listing: OptionList) -> list[str | None]:
     return [listing.get_option_at_index(i).id for i in range(listing.option_count)]
 
 
+@pytest.mark.tui_driven
 async def test_work_command_routes_to_the_work_tab_without_a_model_call(
     start_host: StartHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -171,6 +172,7 @@ async def test_work_command_routes_to_the_work_tab_without_a_model_call(
         await agent.close()
 
 
+@pytest.mark.tui_driven
 async def test_board_shows_four_columns_with_counts_truncation_and_empty_states(
     start_host: StartHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -246,6 +248,7 @@ async def test_board_shows_four_columns_with_counts_truncation_and_empty_states(
         await agent.close()
 
 
+@pytest.mark.tui_driven
 @pytest.mark.parametrize("width,narrow", [(140, False), (90, True)])
 async def test_board_uses_a_two_by_two_grid_on_narrow_terminals(
     start_host: StartHost, monkeypatch: pytest.MonkeyPatch, width: int, narrow: bool
@@ -274,6 +277,7 @@ async def test_board_uses_a_two_by_two_grid_on_narrow_terminals(
         await agent.close()
 
 
+@pytest.mark.tui_driven
 @pytest.mark.parametrize(
     "card,screen_type,selector,expected_id",
     [
@@ -399,6 +403,7 @@ async def test_enter_opens_each_card_kind_in_its_owner_screen(
         await agent.close()
 
 
+@pytest.mark.tui_driven
 async def test_d_dismisses_only_cards_that_carry_a_result(
     start_host: StartHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -457,6 +462,7 @@ async def test_d_dismisses_only_cards_that_carry_a_result(
         await agent.close()
 
 
+@pytest.mark.tui_driven
 async def test_selection_survives_refresh_and_card_text_is_sanitized(
     start_host: StartHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -504,6 +510,7 @@ async def test_selection_survives_refresh_and_card_text_is_sanitized(
         await agent.close()
 
 
+@pytest.mark.tui_driven
 async def test_new_needs_you_or_done_cards_notify_once_per_batch(
     start_host: StartHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -557,6 +564,7 @@ async def test_new_needs_you_or_done_cards_notify_once_per_batch(
         await agent.close()
 
 
+@pytest.mark.tui_driven
 async def test_result_screen_shows_a_sanitized_result_and_dismisses_it(
     start_host: StartHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:

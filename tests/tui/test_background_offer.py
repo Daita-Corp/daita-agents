@@ -26,7 +26,7 @@ from tests.support.host import (
     measured,
 )
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.tui_driven]
 
 SIZE = (110, 36)
 
