@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from hashlib import sha256
-from typing import Protocol, cast
+from typing import cast
 
 from ..._json import FrozenJsonObject
 from ...adapters.folder import SessionFolderSource
@@ -12,7 +12,7 @@ from ...adapters.models import SourceRegistration
 from ...adapters.protocols import (
     DESCRIBE_MAX_COLUMNS,
     SUMMARY_MAX_COLUMNS,
-    SourceStore,
+    SourcePermissionStore,
     column_summary,
 )
 from ...adapters.registry import SourceOperation, SourceTypeRegistry
@@ -35,32 +35,11 @@ from ...storage.sqlite_records import (
     SourcePermissionStateError,
     SourceReadMode,
     SourceReadScope,
-    relational_write_authorization_fingerprint,
 )
 from .sql import ResourceSchema
 
 
-class CatalogPermissionStore(SourceStore, Protocol):
-    async def load_source_read_scope(
-        self,
-        agent_id: str,
-        source_id: str,
-    ) -> SourceReadScope | None: ...
-
-    async def list_relational_write_scopes(
-        self,
-        agent_id: str,
-        source_id: str,
-    ) -> tuple[RelationalWriteScope, ...]: ...
-
-
 # The source operation each relational write-scope operation requires.
-RELATIONAL_WRITE_OPERATIONS = {
-    "update": SourceOperation.RELATIONAL_UPDATE,
-    "upsert": SourceOperation.RELATIONAL_UPSERT,
-}
-
-
 class CatalogDataView:
     """Translate catalog records without creating a second catalog owner."""
 
@@ -68,7 +47,7 @@ class CatalogDataView:
         self,
         store: CatalogStore,
         service: CatalogService,
-        sources: CatalogPermissionStore,
+        sources: SourcePermissionStore,
         source_types: SourceTypeRegistry,
         session_source: SessionFolderSource | None = None,
     ) -> None:
@@ -797,174 +776,38 @@ class CatalogDataView:
             for resource in sorted(resources.values(), key=lambda item: item.id)
         )
 
-    async def relational_write_scope_issue(
-        self,
-        agent_id: str,
-        source_id: str,
-        resource_id: str,
-        assignment_columns: tuple[str, ...],
-        *,
-        operation: str = "update",
-        insert_columns: tuple[str, ...] = (),
-        key_columns: tuple[str, ...] = (),
-        row_count: int | None = None,
-    ) -> tuple[str, str] | None:
-        """Validate one exact current update authorization without source I/O."""
+    async def relational_write_scopes(
+        self, agent_id: str, source_id: str
+    ) -> Mapping[str, RelationalWriteScope]:
+        """One source's stored write scopes by table ID: permission records only."""
 
-        readable = await self.readable_resource_ids(agent_id, (source_id,))
-        if resource_id not in readable:
-            return (
-                "resource_read_not_allowed",
-                "The requested resource is not available for reading.",
+        return {
+            scope.resource_id: scope
+            for scope in await self._sources.list_relational_write_scopes(
+                agent_id, source_id
             )
-        registration = await self._sources.load_source(agent_id, source_id)
-        if (
-            registration is None
-            or registration.agent_id != agent_id
-            or registration.id != source_id
-            or not registration.active
-            or operation not in RELATIONAL_WRITE_OPERATIONS
-            or not self._source_types.supports(
-                registration.adapter_id, RELATIONAL_WRITE_OPERATIONS[operation]
-            )
-        ):
-            return (
-                "resource_update_not_allowed",
-                "The requested resource is not authorized for PostgreSQL updates.",
-            )
-        current = next(
-            (
-                item
-                for item in await self._service.tabular_resources(agent_id, source_id)
-                if item.resource.id == resource_id
-                and item.resource.kind is ResourceKind.TABLE
-            ),
-            None,
-        )
-        if current is None:
-            return (
-                "resource_update_not_allowed",
-                "The requested resource is not authorized for PostgreSQL updates.",
-            )
-        scopes = await self._sources.list_relational_write_scopes(
-            agent_id,
-            source_id,
-        )
-        scope = next(
-            (item for item in scopes if item.resource_id == resource_id),
-            None,
-        )
-        if scope is None:
-            return (
-                "resource_update_not_allowed",
-                "The requested resource is not authorized for PostgreSQL updates.",
-            )
-        if (
-            not isinstance(scope, RelationalWriteScope)
-            or scope.agent_id != agent_id
-            or scope.source_id != source_id
-        ):
-            raise SourcePermissionStateError(
-                "stored PostgreSQL update scope ownership is invalid"
-            )
-        if operation not in scope.allowed_operations:
-            return (
-                "resource_write_not_allowed",
-                "This relational operation is not explicitly authorized.",
-            )
-        if key_columns and set(key_columns) != set(scope.key_columns):
-            return (
-                "write_key_not_allowed",
-                "The requested conflict key differs from the exact permission.",
-            )
-        if not set(insert_columns) <= set(scope.allowed_insert_columns):
-            return (
-                "insert_column_not_allowed",
-                "One or more insertion columns are not authorized.",
-            )
-        if row_count is not None and row_count > scope.max_rows:
-            return (
-                "write_row_limit",
-                "The exact batch exceeds the admitted row ceiling.",
-            )
-        requested_columns = frozenset(assignment_columns)
-        if not requested_columns <= frozenset(scope.allowed_update_columns):
-            return (
-                "update_column_not_allowed",
-                "One or more assignment columns are not authorized for this table.",
-            )
-        try:
-            expected = relational_write_authorization_fingerprint(
-                source=registration,
-                resource=current.resource,
-                facet=current.facet,
-                scope=scope,
-            )
-        except (TypeError, ValueError):
-            expected = None
-        if scope.authorization_fingerprint != expected:
-            return (
-                "resource_update_scope_stale",
-                "The PostgreSQL update scope is stale; configure source permissions again.",
-            )
-        return None
-
-    async def load_relational_write_scope(
-        self,
-        agent_id: str,
-        source_id: str,
-        resource_id: str,
-    ) -> RelationalWriteScope | None:
-        scopes = await self._sources.list_relational_write_scopes(agent_id, source_id)
-        scope = next((item for item in scopes if item.resource_id == resource_id), None)
-        if scope is None:
-            return None
-        issue = await self.relational_write_scope_issue(
-            agent_id,
-            source_id,
-            resource_id,
-            scope.allowed_update_columns,
-            operation=scope.allowed_operations[0],
-        )
-        if issue is not None:
-            return None
-        return scope
+        }
 
     async def relational_write_applicable_source_ids(
-        self,
-        agent_id: str,
-        source_ids: tuple[str, ...] = (),
-        *,
-        operation: str = "update",
+        self, agent_id: str, source_ids: tuple[str, ...] = ()
     ) -> frozenset[str]:
+        """Active writable sources with at least one stored write scope."""
+
         selected = frozenset(source_ids)
         applicable: set[str] = set()
         for registration in await self._sources.list_sources(agent_id):
             if (
-                registration.agent_id != agent_id
-                or not registration.active
-                or operation not in RELATIONAL_WRITE_OPERATIONS
-                or not self._source_types.supports(
-                    registration.adapter_id, RELATIONAL_WRITE_OPERATIONS[operation]
+                self._available(registration, agent_id)
+                and self._source_types.supports(
+                    registration.adapter_id, SourceOperation.RELATIONAL_WRITE
                 )
-                or (selected and registration.id not in selected)
-            ):
-                continue
-            for scope in await self._sources.list_relational_write_scopes(
-                agent_id,
-                registration.id,
-            ):
-                issue = await self.relational_write_scope_issue(
-                    agent_id,
-                    registration.id,
-                    scope.resource_id,
-                    scope.allowed_update_columns,
-                    operation=operation,
+                and (not selected or registration.id in selected)
+                and await self._sources.list_relational_write_scopes(
+                    agent_id, registration.id
                 )
-                if issue is None:
-                    applicable.add(registration.id)
-                    break
+            ):
+                applicable.add(registration.id)
         return frozenset(applicable)
 
 
-__all__ = ["RELATIONAL_WRITE_OPERATIONS", "CatalogDataView"]
+__all__ = ["CatalogDataView"]

@@ -265,12 +265,11 @@ async def test_a_quoted_name_cannot_reach_a_function_outside_pg_catalog(
 ) -> None:
     reads = await _attached(tmp_path, ("sales",))
     try:
-        # Canonical SQL runs lower-cased, so sales."LOWER"(integer) is never called.
+        # The statement runs as written, so this would call sales."LOWER"(integer).
         error = _error(await reads.query('SELECT "LOWER"(1) FROM sales.orders'))
     finally:
         await reads.agent.close()
-    assert error["code"] == "query_invalid", error
-    assert cast(Mapping[str, object], error["details"])["sqlstate"] == "42883"
+    assert error["code"] == "function_not_allowed", error
 
 
 @pytest.mark.parametrize(

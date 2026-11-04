@@ -39,9 +39,7 @@ from daita.domains.data import (
     exact_export_capability_declarations,
     exact_export_outputs,
     project_result_rows,
-    relational_update_capability_declarations,
-    relational_update_preview_capability_declarations,
-    relational_upsert_capability_declarations,
+    relational_write_capability_declarations,
     source_file_capability_declarations,
 )
 from daita.llm.models import ModelSensitivity, ToolCall
@@ -227,11 +225,9 @@ class _Catalog:
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
-        *,
-        operation: str = "update",
     ) -> frozenset[str]:
         del agent_id, source_ids
-        self.write_applicability_calls.append(operation)
+        self.write_applicability_calls.append("write")
         return frozenset()
 
     async def resource_identity(
@@ -303,17 +299,13 @@ def _domain(catalog: _Catalog, *, source_files: bool = False) -> DataCapabilityD
     export_bundle = exact_export_capability_declarations(
         adapter_ids=("sqlite", "postgresql")
     )
-    preview_bundle = relational_update_preview_capability_declarations()
-    update_bundle = relational_update_capability_declarations()
-    upsert_bundle = relational_upsert_capability_declarations()
+    write_bundle = relational_write_capability_declarations()
     file_bundle = source_file_capability_declarations()
     capabilities = (
         *catalog_bundle.capabilities,
         *query_bundle.capabilities,
         *export_bundle.capabilities,
-        *preview_bundle.capabilities,
-        *update_bundle.capabilities,
-        *upsert_bundle.capabilities,
+        *write_bundle.capabilities,
         *(file_bundle.capabilities if source_files else ()),
     )
     return DataCapabilityDomain(
@@ -325,9 +317,7 @@ def _domain(catalog: _Catalog, *, source_files: bool = False) -> DataCapabilityD
                 *catalog_bundle.tool_views,
                 *query_bundle.tool_views,
                 *export_bundle.tool_views,
-                *preview_bundle.tool_views,
-                *update_bundle.tool_views,
-                *upsert_bundle.tool_views,
+                *write_bundle.tool_views,
                 *(file_bundle.tool_views if source_files else ()),
             ),
         ),
@@ -353,9 +343,7 @@ async def test_mixed_relational_catalog_projects_each_semantic_tool_once(
     assert projected.count(DATA_QUERY_TOOL_NAME) == (
         tool_name in {None, DATA_QUERY_TOOL_NAME}
     )
-    assert catalog.write_applicability_calls == (
-        ["update", "upsert"] if tool_name is None else []
-    )
+    assert catalog.write_applicability_calls == (["write"] if tool_name is None else [])
 
 
 _SESSION_SOURCE = "source:workspace:sha256:" + "5" * 64

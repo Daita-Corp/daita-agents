@@ -343,7 +343,7 @@ def test_local_workspace_backend_is_explicit_and_conditionally_composed():
     assert "SessionFolderSource.for_workspace(identity.id, workspace)" in compose_text
     assert "session_workspace=workspace_backend" in compose_text
     assert "SourceTypeRegistry(source_types, local_files=not hosted)" in compose_text
-    assert "relational_upsert,\n            source_files,\n        )" in compose_text
+    assert "relational_write,\n            source_files,\n        )" in compose_text
 
 
 def test_bound_text_edit_has_one_artifact_producer_and_publication_owner():
@@ -580,7 +580,7 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["data_query"] == "data"
         assert resolved["file_search"] == "data"
         assert resolved["file_read"] == "data"
-        assert resolved["data_update_rows"] == "data"
+        assert resolved["data_write"] == "data"
         assert resolved["memory_set"] == "memory"
         assert resolved["skill_view"] == "skills"
         assert resolved["semantic_view"] == "semantics"
@@ -721,7 +721,7 @@ def test_public_surface_is_focused():
         "OutcomeState",
         "FolderSource",
         "PostgreSQLSource",
-        "RelationalUpdateReadiness",
+        "RelationalWriteReadiness",
         "RelationalWriteScope",
         "RetryPolicy",
         "RoutineIntent",
@@ -959,6 +959,7 @@ _SOURCE_TYPE_LITERAL_FILES = frozenset(
         "adapters/postgresql.py",  # PostgreSQL adapter owns its adapter id
         "adapters/postgresql_query.py",  # PostgreSQL read backend checks its own type
         "adapters/postgresql_write.py",  # PostgreSQL write backend checks its own type
+        "adapters/postgresql_write_sql.py",  # PostgreSQL write language
         "adapters/registry.py",  # built-in SourceType registrations
         "domains/data/sql/analysis.py",  # SQL dialect parsing
         "domains/data/sql/contracts.py",  # SQL dialect identifier rules
@@ -1310,8 +1311,7 @@ async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_bran
         assert effect_tools == {
             "artifact_save_local",
             "artifact_set_export_location",
-            "data_update_rows",
-            "data_upsert_rows",
+            "data_write",
             "job_cancel",
             "job_start",
             "memory_set",
@@ -1339,9 +1339,9 @@ async def test_database_writes_register_only_the_relational_write_slice(
             for name in registry.tool_names
             for capability_id in registry.tool_capability_ids(name)
         }
-        preview_capability = "data.preview_update_rows"
-        update_tool = "data_update_rows"
-        update_capability = "data.update_rows"
+        preview_capability = "data.preview_write"
+        update_tool = "data_write"
+        update_capability = "data.write"
         forbidden_tools = {
             "data_preview_sqlite_update",
             "data_update_sqlite",
@@ -1351,7 +1351,8 @@ async def test_database_writes_register_only_the_relational_write_slice(
             "data.sqlite.update",
         }
 
-        assert "data_preview_update_rows" not in registry.tool_names
+        assert "data_update_rows" not in registry.tool_names
+        assert "data_upsert_rows" not in registry.tool_names
         preview = registry.resolve_tool_mode(update_tool, "preview")[1]
         assert preview.id == preview_capability
         assert preview.access_mode is AccessMode.READ
@@ -1375,7 +1376,7 @@ async def test_database_writes_register_only_the_relational_write_slice(
         for dormant_name in forbidden_tools | forbidden_capabilities:
             assert f'"{dormant_name}"' not in package_text
             assert f"'{dormant_name}'" not in package_text
-        assert "class RelationalUpdateExecutor" in package_text
+        assert "class RelationalWriteExecutor" in package_text
         write_backend = (PACKAGE / "adapters" / "postgresql_write.py").read_text(
             encoding="utf-8"
         )
@@ -1391,8 +1392,8 @@ async def test_database_writes_register_only_the_relational_write_slice(
         capabilities_owner = (
             PACKAGE / "domains" / "data" / "capabilities.py"
         ).read_text(encoding="utf-8")
-        assert ".execute_update(" in capabilities_owner
-        assert ".execute_update(" not in controller
+        assert "backend.apply(" in capabilities_owner
+        assert "backend.apply(" not in controller
         assert ".execute_update(" not in (PACKAGE / "loop" / "driver.py").read_text(
             encoding="utf-8"
         )
@@ -1434,16 +1435,14 @@ def test_database_write_control_plane_keeps_current_owners():
     tui_commands = (PACKAGE / "tui" / "commands.py").read_text(encoding="utf-8")
     tui_controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
 
-    assert "relational_update_readiness" in agent_methods
-    assert "relational_update_readiness" in embedded_methods
-    assert "relational_update_readiness" in backend_methods
-    assert _class_owners("RelationalUpdateReadiness") == {
-        "adapters/postgresql_write.py"
-    }
-    assert "relational_update_readiness" not in controller
-    assert "relational_update_readiness" not in context
-    assert ".relational_update_readiness(" in cli
-    assert ".relational_update_readiness(" not in terminal
+    assert "relational_write_readiness" in agent_methods
+    assert "relational_write_readiness" in embedded_methods
+    assert "relational_write_readiness" in backend_methods
+    assert _class_owners("RelationalWriteReadiness") == {"adapters/postgresql_write.py"}
+    assert "relational_write_readiness" not in controller
+    assert "relational_write_readiness" not in context
+    assert ".relational_write_readiness(" in cli
+    assert ".relational_write_readiness(" not in terminal
     assert "inspect_source_permissions" in tui_controller
     assert "preview_source_permissions" in tui_controller
     assert "apply_source_permissions" in tui_controller
@@ -2512,32 +2511,21 @@ def test_native_write_contracts_are_neutral_and_use_the_existing_domain():
     from dataclasses import fields
 
     from daita.domains.data.capabilities import (
-        relational_update_capability_declarations,
-        relational_update_preview_capability_declarations,
-        relational_upsert_capability_declarations,
+        relational_write_capability_declarations,
     )
 
-    declarations = (
-        relational_update_preview_capability_declarations(),
-        relational_update_capability_declarations(),
-        relational_upsert_capability_declarations(),
-    )
+    declarations = (relational_write_capability_declarations(),)
     assert {view.name for bundle in declarations for view in bundle.tool_views} == {
-        "data_update_rows",
-        "data_upsert_rows",
+        "data_write",
     }
     assert {
         view.name: view.mode_capability_ids
         for bundle in declarations
         for view in bundle.tool_views
     } == {
-        "data_update_rows": (
-            ("preview", "data.preview_update_rows"),
-            ("apply", "data.update_rows"),
-        ),
-        "data_upsert_rows": (
-            ("preview", "data.preview_upsert_rows"),
-            ("apply", "data.upsert_rows"),
+        "data_write": (
+            ("preview", "data.preview_write"),
+            ("apply", "data.write"),
         ),
     }
     for bundle in declarations:
@@ -2553,12 +2541,10 @@ def test_native_write_contracts_are_neutral_and_use_the_existing_domain():
         "agent_id",
         "source_id",
         "resource_id",
-        "resource_revision",
+        "table",
         "allowed_operations",
         "allowed_insert_columns",
         "allowed_update_columns",
-        "key_columns",
-        "generated_identity_columns",
         "max_rows",
         "authorization_fingerprint",
     }
@@ -2821,14 +2807,12 @@ def test_read_io_never_consults_the_catalog():
     )
 
 
-@pytest.mark.xfail(strict=True, reason="writes still load catalog structure")
 def test_write_io_never_consults_the_catalog():
     assert (
         _catalog_consumers(
             (
                 PACKAGE / "adapters" / "postgresql_write.py",
-                PACKAGE / "domains" / "data" / "sql" / "relational_update.py",
-                PACKAGE / "domains" / "data" / "sql" / "relational_upsert.py",
+                PACKAGE / "adapters" / "postgresql_write_sql.py",
             )
         )
         == {}

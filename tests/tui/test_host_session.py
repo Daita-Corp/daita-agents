@@ -375,7 +375,7 @@ async def test_a_message_starting_with_a_file_path_is_not_a_skill(
     app = _app(harness)
     app.controller.agent = await remote_agent(harness, "sales")
     try:
-        message = "/Users/jendala/Desktop/guide.md summarise this"
+        message = "/Users/x/Desktop/guide.md summarise this"
         assert await app.controller.skill_invocation_message(message) is None
     finally:
         await app.controller.close()

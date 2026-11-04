@@ -18,23 +18,22 @@ import pytest
 
 from daita.host.paths import host_paths
 from daita.host.server import serve_host
-from tests.data.writes._upsert_support import Connection, Database
 from tests.support.mcp import MemoryKeychain
 from tests.support.native_writes import (
     ScriptedResearchModel,
-    companies_structure,
     measured_step,
     patch_fake_postgresql,
     response,
     scheduled_write_script,
 )
+from tests.support.write_database import Connection, Database
 
 
 def main() -> None:
     root, batch_file, marker = (Path(item) for item in sys.argv[1:4])
     db = Database()
     patch = pytest.MonkeyPatch()
-    patch_fake_postgresql(patch, db, companies_structure(db))
+    patch_fake_postgresql(patch, db)
     commit = Connection.commit
 
     async def hang_at_commit(connection: Connection) -> None:

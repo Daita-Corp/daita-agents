@@ -37,7 +37,7 @@ OBJECTIVE = "Record New Co in the companies table."
 
 
 def write_steps(batch: Mapping[str, object], *, then: ModelResponse) -> list[Any]:
-    """Load the upsert tool, write the fixture's one row in one call, then ``then``."""
+    """Load the write tool, write the fixture's one row in one call, then ``then``."""
 
     def after(request: ModelRequest) -> ModelResponse:
         write = tool_result(request, "write")
@@ -45,8 +45,8 @@ def write_steps(batch: Mapping[str, object], *, then: ModelResponse) -> list[Any
         return then
 
     return [
-        reply(ToolCall("load", "toolbox_load", {"tool_names": ["data_upsert_rows"]})),
-        reply(ToolCall("write", "data_upsert_rows", dict(batch))),
+        reply(ToolCall("load", "toolbox_load", {"tool_names": ["data_write"]})),
+        reply(ToolCall("write", "data_write", dict(batch))),
         after,
     ]
 
@@ -67,9 +67,7 @@ async def reopen(
 
 
 def inserts(db: Any) -> int:
-    return len(
-        [item for item in db.log if item[0] == "fetch" and item[1].startswith("INSERT")]
-    )
+    return db.inserts()
 
 
 async def test_a_job_write_asks_commits_once_and_is_listed_as_committed_after_a_resume(
@@ -108,7 +106,7 @@ async def test_a_job_write_asks_commits_once_and_is_listed_as_committed_after_a_
             agent, job.job_id, in_state(JobState.WAITING_FOR_YOU), model=model
         )
         (request,) = asked
-        assert request.capability_id == "data.upsert_rows"
+        assert request.capability_id == "data.write"
         assert request.requester == OBJECTIVE
         assert inserts(db) == 1 and db.rows["new.test"]["name"] == "New Co"
         (receipt,) = await agent.list_effects()

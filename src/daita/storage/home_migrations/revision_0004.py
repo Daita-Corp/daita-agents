@@ -466,6 +466,89 @@ def _fold_sqlite_identities(connection: sqlite3.Connection) -> None:
         )
 
 
+def _converted_write_scope(
+    agent_id: str, source: dict[str, Any], record: dict[str, Any], table: str
+) -> tuple[dict[str, object], str]:
+    """One stored scope in its new shape, with the fingerprint that binds it.
+
+    update stays update; upsert becomes insert and update. Delete is never granted.
+    """
+
+    if record["__record__"] != "RelationalWriteScope":
+        raise ValueError("Historical write scope record is invalid")
+    fields = record["fields"]
+    held = set(fields["allowed_operations"])
+    operations = sorted({"update"} | ({"insert"} if "upsert" in held else set()))
+    converted = {
+        "table": table,
+        "allowed_operations": operations,
+        "allowed_insert_columns": fields["allowed_insert_columns"],
+        "allowed_update_columns": fields["allowed_update_columns"],
+        "max_rows": fields["max_rows"],
+    }
+    return converted, _digest(
+        {
+            "agent_id": agent_id,
+            "adapter_id": source["adapter_id"],
+            "source_id": source["id"],
+            "resource_id": record["resource_id"],
+            "authority": converted,
+        }
+    )
+
+
+def _convert_write_scopes(connection: sqlite3.Connection) -> None:
+    """Bind stored write scopes to table and column names, not catalog revisions.
+
+    A scope whose table left the catalog, or changed since it was granted, was
+    already refused as stale, so it is dropped rather than given authority back.
+    """
+
+    tables: dict[tuple[str, str], tuple[str, str]] = {}
+    for agent_id, encoded in connection.execute("SELECT agent_id, data FROM snapshots"):
+        for resource in json.loads(encoded)["fields"]["resources"]:
+            fields = resource["fields"]
+            tables[(agent_id, fields["id"])] = (
+                fields["native_identity"],
+                fields["current_revision"],
+            )
+    sources = {
+        (agent_id, source_id): json.loads(encoded)["fields"]
+        for agent_id, source_id, encoded in connection.execute(
+            "SELECT agent_id, id, data FROM sources"
+        )
+    }
+    for agent_id, source_id, resource_id, encoded in connection.execute(
+        "SELECT agent_id, source_id, resource_id, data FROM relational_write_scopes"
+    ).fetchall():
+        key = (agent_id, source_id, resource_id)
+        record = json.loads(encoded)
+        table, revision = tables.get((agent_id, resource_id), (None, None))
+        if table is None or record["fields"]["resource_revision"] != revision:
+            connection.execute(
+                "DELETE FROM relational_write_scopes "
+                "WHERE agent_id = ? AND source_id = ? AND resource_id = ?",
+                key,
+            )
+            continue
+        converted, fingerprint = _converted_write_scope(
+            agent_id,
+            sources[(agent_id, source_id)],
+            {**record, "resource_id": resource_id},
+            table,
+        )
+        connection.execute(
+            "UPDATE relational_write_scopes "
+            "SET data = ?, authorization_fingerprint = ? "
+            "WHERE agent_id = ? AND source_id = ? AND resource_id = ?",
+            (
+                _dump({"__record__": "RelationalWriteScope", "fields": converted}),
+                fingerprint,
+                *key,
+            ),
+        )
+
+
 def _apply_revision_4(home: Path, source_shape: str | None) -> None:
     if source_shape is not None:
         raise ValueError("Unknown analysis migration source")
@@ -534,6 +617,7 @@ def _apply_revision_4(home: Path, source_shape: str | None) -> None:
             )
         _convert_graph_jobs(connection)
         _fold_sqlite_identities(connection)
+        _convert_write_scopes(connection)
         connection.commit()
 
 
@@ -556,7 +640,10 @@ REVISION_4 = HomeMigration(
         "MCP action asks at the time. "
         "The task graph is replaced by one checklist-job record per job: finished jobs keep their "
         "accepted result, unfinished jobs fail with an upgrade message, result deliveries and "
-        "receipts keep their job id, graph attention notices are dropped, and the graph tables go."
+        "receipts keep their job id, graph attention notices are dropped, and the graph tables go. "
+        "Stored write scopes bind to table and column names, not catalog revisions: update stays "
+        "update, upsert becomes insert and update, delete is never granted, conflict keys and "
+        "identity columns go, and a scope whose table left the catalog is dropped."
     ),
     affected_paths=("state.db",),
     target_schema=SCHEMA_REVISION_4,

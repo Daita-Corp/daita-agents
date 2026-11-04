@@ -870,8 +870,8 @@ def _approval_request(arguments: dict[str, object]) -> ApprovalRequest:
     return ApprovalRequest(
         run_id="run-1",
         call_id="call-1",
-        tool_name="data_update_rows",
-        capability_id="data.update_rows",
+        tool_name="data_write",
+        capability_id="data.write",
         arguments=FrozenJsonObject.from_mapping(arguments),
         reason="update one row",
     )
@@ -892,8 +892,8 @@ def test_cli_approval_displays_the_exact_canonical_review_document():
     assert decision is ApprovalDecision.APPROVE
     assert stdout.getvalue() == (
         "Approval required\n\n"
-        "Tool: data_update_rows\n"
-        "Capability: data.update_rows\n"
+        "Tool: data_write\n"
+        "Capability: data.write\n"
         "Change: update one row\n"
         "Exact validated details:\n"
         f"{rendered}\n"
@@ -991,7 +991,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "create",
         "attach",
         "sources",
-        "relational-update-readiness",
+        "relational-write-readiness",
         "detach",
         "conversations",
         "export-location",
@@ -1023,10 +1023,10 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         ("name",),
         frozenset({"-h", "--help"}),
     )
-    assert _surface(commands["relational-update-readiness"])[0] == (
+    assert _surface(commands["relational-write-readiness"])[0] == (
         "name",
         "source_id",
-        "resource_id",
+        "table",
     )
     conversations = _subcommands(commands["conversations"])
     assert set(conversations) == {"clear"}

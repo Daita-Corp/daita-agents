@@ -130,6 +130,7 @@ CASES: tuple[SmokeCase, ...] = (
         "jobs/write",
         "tests/live/jobs/test_jobs.py::test_live_job_performs_one_approved_write",
         _JOBS,
+        resource="postgres-large",
     ),
     SmokeCase(
         "routines/creation",
@@ -142,18 +143,21 @@ CASES: tuple[SmokeCase, ...] = (
         "tests/live/routines/test_scheduled_write.py::"
         "test_live_scheduled_routine_asks_notifies_and_writes_once_after_approval",
         {"DAITA_RUN_LIVE_SCHEDULED_WRITE": "1"},
+        resource="postgres-large",
     ),
     SmokeCase(
         "routines/injection",
         "tests/live/routines/test_scheduled_write.py::"
         "test_live_scheduled_research_cannot_start_an_unrequested_write",
         {"DAITA_RUN_LIVE_SCHEDULED_WRITE": "1"},
+        resource="postgres-large",
     ),
     SmokeCase(
         "routines/denial",
         "tests/live/routines/test_scheduled_write.py::"
         "test_live_denied_scheduled_write_is_reported_without_another_route",
         {"DAITA_RUN_LIVE_SCHEDULED_WRITE": "1"},
+        resource="postgres-large",
     ),
     SmokeCase(
         "routines/management",
@@ -164,7 +168,7 @@ CASES: tuple[SmokeCase, ...] = (
     SmokeCase(
         "data/write_release",
         "tests/live/data/test_model_write_acceptance.py::"
-        f"test_live_mixed_upsert_and_unchanged_repeat[{_MODEL}-0]",
+        f"test_live_mixed_upsert_and_repeat[{_MODEL}-0]",
         _POSTGRES,
         resource="postgres-large",
     ),

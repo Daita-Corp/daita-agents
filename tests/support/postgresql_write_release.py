@@ -38,11 +38,9 @@ class WriteModel:
 
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
-        self.configure("upsert", {})
+        self.configure({})
 
-    def configure(self, operation: str, arguments: Mapping[str, object]) -> None:
-        assert operation in {"update", "upsert"}
-        self.operation = operation
+    def configure(self, arguments: Mapping[str, object]) -> None:
         self.arguments = dict(arguments)
         self.phase = 0
         self.results: dict[str, ToolResultBlock] = {}
@@ -58,7 +56,7 @@ class WriteModel:
                 if isinstance(block, ToolResultBlock):
                     self.results[block.call_id] = block
         calls: tuple[ToolCall, ...] = ()
-        write_name = f"data_{self.operation}_rows"
+        write_name = "data_write"
         if self.phase == 0:
             calls = (
                 ToolCall(
@@ -127,7 +125,8 @@ class _Connection:
 
     def transaction(self, **kwargs: Any) -> Any:
         transaction = self.connection.transaction(**kwargs)
-        if kwargs.get("readonly", False):
+        # A savepoint or read-only transaction commits nothing a fault can target.
+        if not kwargs or kwargs.get("readonly", False):
             return transaction
         self.probe.write_pid = self.connection.get_server_pid()
         return _Transaction(transaction, self.connection, self.probe)
@@ -139,19 +138,26 @@ class _Connection:
             self.probe.reached.set()
             await self.probe.release.wait()
 
-    async def fetch(self, sql: str, *args: Any, **kwargs: Any) -> Any:
-        result = await self.connection.fetch(sql, *args, **kwargs)
-        if sql.startswith("INSERT INTO"):
-            await self._after_mutation()
-        return result
+    async def prepare(self, sql: str, **kwargs: Any) -> Any:
+        statement = await self.connection.prepare(sql, **kwargs)
+        if sql.startswith(("INSERT ", "UPDATE ", "DELETE ")):
+            return _Mutation(statement, self)
+        return statement
 
-    async def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
-        result = await self.connection.execute(sql, *args, **kwargs)
-        if sql.startswith("UPDATE "):
-            await self._after_mutation()
-            if self.probe.mode == "wrong_update_count":
-                return "UPDATE 0"
-        return result
+
+class _Mutation:
+    def __init__(self, statement: Any, connection: _Connection) -> None:
+        self.statement = statement
+        self.connection = connection
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.statement, name)
+
+    async def cursor(self, *args: Any, **kwargs: Any) -> Any:
+        async for record in self.statement.cursor(*args, **kwargs):
+            if self.connection.probe.mode != "wrong_update_count":
+                yield record
+        await self.connection._after_mutation()
 
 
 class _Transaction:

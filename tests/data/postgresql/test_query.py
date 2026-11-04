@@ -282,6 +282,7 @@ async def test_reads_pin_the_configured_schemas_with_quoting(
 
     # Registration keeps schemas sorted; several schemas refuse unqualified names.
     assert connection.settings["search_path"] == '"Legacy_2", "sales"'
+    assert connection.settings["standard_conforming_strings"] == "on"
 
 
 @pytest.mark.parametrize(
@@ -375,6 +376,53 @@ async def test_a_qualified_name_the_server_would_call_is_refused(
         await _run(backend, registration, read)
         assert len(queries) == 1
     assert connection.lookups == [("peek",)]
+
+
+@pytest.mark.parametrize(
+    ("server", "refused"),
+    (
+        # What the parser renames is still what the server runs.
+        ((("ceiling", "sales", b"i"), ("ceiling", "pg_catalog", b"i")), True),
+        ((("ceiling", "pg_catalog", b"v"),), True),
+        ((("ceiling", "pg_catalog", b"i"),), False),
+        # A word before "(" that names no function is the server's to explain.
+        ((), False),
+    ),
+)
+async def test_a_call_as_written_passes_the_function_rule(
+    monkeypatch: pytest.MonkeyPatch,
+    server: tuple[tuple[object, ...], ...],
+    refused: bool,
+) -> None:
+    backend, registration = _backend()
+    connection = _ReadConnection(server)
+    _route_to(monkeypatch, connection)
+    read = replace(
+        checked_read("SELECT ceiling(1) FROM public.t"), written_calls=("ceiling",)
+    )
+
+    if refused:
+        with pytest.raises(postgresql_query_module.PostgreSQLQueryError) as raised:
+            await _run(backend, registration, read)
+        assert raised.value.code == "function_not_allowed"
+        assert raised.value.details["functions"] == ("ceiling",)
+    else:
+        await _run(backend, registration, read)
+
+
+@pytest.mark.parametrize(
+    "sql", ("SELECT 1 AS v -- trailing comment", "SELECT 1 AS v /* note */")
+)
+def test_the_bounding_wrapper_sits_on_its_own_lines(sql: str) -> None:
+    for wrapped in (
+        postgresql_query_module._bounded_result_sql(
+            sql, column_count=1, max_rows=1, max_bytes=1
+        ),
+        postgresql_query_module._exact_tabular_bounded_result_sql(
+            sql, column_names=("v",), max_rows=1, max_bytes=1
+        ),
+    ):
+        assert f"(\n{sql}\n)" in wrapped
 
 
 async def test_called_functions_and_qualified_names_share_one_lookup(

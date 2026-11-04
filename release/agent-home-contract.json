@@ -132,8 +132,8 @@
         "affected_paths": [
           "state.db"
         ],
-        "checksum": "6e3cade607c3579dc33310d3a3d798ca7a63cc56bb954340d36d14a245bda35f",
-        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete. Retire inactive learning candidates and their review stamps; approved knowledge is unaffected. Routines keep their title, prompt, schedule, named sources, counters and state; their frozen access, grants, routes, sensitivity, budgets, expiry, outcome, precheck, skills and provenance are dropped, and their runs ask before writes. Occurrences drop prechecks, reservations and their copy of the run's scope. MCP tool bindings drop unattended eligibility; every MCP action asks at the time. The task graph is replaced by one checklist-job record per job: finished jobs keep their accepted result, unfinished jobs fail with an upgrade message, result deliveries and receipts keep their job id, graph attention notices are dropped, and the graph tables go.",
+        "checksum": "fdd1bc2b1afa0bbca130c860c984b6ba81f74395e2c5a8f42b753477fe72754b",
+        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete. Retire inactive learning candidates and their review stamps; approved knowledge is unaffected. Routines keep their title, prompt, schedule, named sources, counters and state; their frozen access, grants, routes, sensitivity, budgets, expiry, outcome, precheck, skills and provenance are dropped, and their runs ask before writes. Occurrences drop prechecks, reservations and their copy of the run's scope. MCP tool bindings drop unattended eligibility; every MCP action asks at the time. The task graph is replaced by one checklist-job record per job: finished jobs keep their accepted result, unfinished jobs fail with an upgrade message, result deliveries and receipts keep their job id, graph attention notices are dropped, and the graph tables go. Stored write scopes bind to table and column names, not catalog revisions: update stays update, upsert becomes insert and update, delete is never granted, conflict keys and identity columns go, and a scope whose table left the catalog is dropped.",
         "migration_id": "0004_foreground_analysis_evidence",
         "revision": 4
       }
@@ -802,12 +802,10 @@
         "maximum_output_tokens"
       ],
       "RelationalWriteScope": [
-        "resource_revision",
+        "table",
         "allowed_operations",
         "allowed_insert_columns",
         "allowed_update_columns",
-        "key_columns",
-        "generated_identity_columns",
         "max_rows"
       ],
       "RelationshipFieldPair": [
@@ -2097,7 +2095,7 @@
       }
     }
   },
-  "contract_sha256": "5db85a8ff12836b92db3ec4f07da9b0c13d220a6cbffd2f0464766e78635bd1a",
+  "contract_sha256": "6ded603196fc93cb3693c7e17aa76e4900f5cdaaa8e5d67c2e6843294ecf417f",
   "home_revision": 4,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1

@@ -242,9 +242,14 @@ update that keeps everything else. Enable them with
 `DAITA_CONTRACT_MODEL_ID` and, under API billing, its key with
 `DAITA_CONTRACT_LLM_API_KEY`.
 
+Real-server write behaviour with a scripted model is in
+`tests/live/data/test_source_first_writes.py`: enable it with
+`DAITA_RUN_POSTGRES_WRITES=1`, `DAITA_WRITES_POSTGRES_PORT` and
+`DAITA_WRITES_POSTGRES_ADMIN` on a disposable server.
+
 The scheduled-write case (`tests/live/routines/test_scheduled_write.py`) runs a
 real model's one-time routine in a real host while no client watches: the run
-asks to upsert one row into the simulated PostgreSQL fixture, the host
+asks to upsert one row into the real `postgres-large` fixture, the host
 notifies, the test approves through the interaction route, and exactly one
 receipted write follows. Because a scheduled run may use every write tool, two
 more cases check what the model attempts: a routine whose research result
@@ -257,7 +262,7 @@ billing, its key with `DAITA_LIVE_SCHEDULED_WRITE_LLM_API_KEY`.
 The background-job cases (`tests/live/jobs/test_jobs.py`) show a real model
 finishing a two-part job through `checklist_write` and `delegate`, a job that
 resumes after a restart, a job that asks with `ask_user` and uses the answer,
-and a job that performs one approved write against the simulated PostgreSQL
+and a job that performs one approved write against the real `postgres-large`
 fixture. The two-part cases check the real table totals. Enable them with `DAITA_RUN_LIVE_JOBS=1`;
 choose the model with `DAITA_LIVE_JOBS_MODEL_ID` and, under API billing, its key
 with `DAITA_LIVE_JOBS_LLM_API_KEY`.

@@ -6,7 +6,7 @@ import hashlib
 import math
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol, TypeVar, cast
 
@@ -14,7 +14,6 @@ from ..._json import FrozenJsonObject, canonical_json
 from ...adapters.local_file_query import LocalFileQueryError, QueryRelation
 from ...artifacts.renderers import MAX_CSV_ROWS, MAX_CSV_SECONDS
 from ...capabilities import (
-    RESOURCE_ID_PATTERN,
     SOURCE_ID_PATTERN,
     AccessMode,
     Capability,
@@ -46,10 +45,11 @@ from .controller import (
     DATA_QUERY_COMBINED_CAPABILITY_ID,
     DATA_QUERY_COMBINED_EVIDENCE_KIND,
     DATA_QUERY_EVIDENCE_KIND,
-    RELATIONAL_UPDATE_CAPABILITY_ID,
-    RELATIONAL_UPDATE_EVIDENCE_KIND,
-    RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
-    RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
+    RELATIONAL_WRITE_CAPABILITY_ID,
+    RELATIONAL_WRITE_EVIDENCE_KIND,
+    RELATIONAL_WRITE_PREVIEW_CAPABILITY_ID,
+    RELATIONAL_WRITE_PREVIEW_EVIDENCE_KIND,
+    WriteDescriber,
 )
 from .results import BoundedResultProjection
 from .source_files import (
@@ -62,21 +62,18 @@ from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
     CheckedRead,
-    RelationalUpdateCell,
-    RelationalUpdateCommand,
-    RelationalUpdateFilter,
-    RelationalUpdateIntent,
+    WriteFacts,
+    WritePreview,
     checked_reads,
+    write_facts,
 )
-from .sql.relational_upsert import RelationalUpsertIntent
 
 DATA_QUERY_EXECUTOR_ID = "data.query.executor"
 DATA_QUERY_COMBINED_EXECUTOR_ID = "data.query_combined.executor"
 DATA_QUERY_TOOL_NAME = "data_query"
-RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID = "data.preview_update_rows.executor"
-RELATIONAL_UPDATE_EXECUTOR_ID = "data.update_rows.executor"
-RELATIONAL_UPDATE_TOOL_NAME = "data_update_rows"
-RELATIONAL_UPSERT_TOOL_NAME = "data_upsert_rows"
+RELATIONAL_WRITE_PREVIEW_EXECUTOR_ID = "data.preview_write.executor"
+RELATIONAL_WRITE_EXECUTOR_ID = "data.write.executor"
+RELATIONAL_WRITE_TOOL_NAME = "data_write"
 # The data.query capability description is part of its contract digest, which
 # retained routine and graph bindings revalidate; the model reads the view's.
 _DATA_QUERY_CAPABILITY_DESCRIPTION = (
@@ -136,37 +133,26 @@ def _data_query_description(file_outputs: tuple[str, ...]) -> str:
     return DATA_QUERY_DESCRIPTION + file_output + _DATA_QUERY_USAGE
 
 
-RELATIONAL_UPDATE_DESCRIPTION = (
-    "Update rows in a PostgreSQL table in one call: Daita previews the "
-    "matching rows on the approval card, rechecks them after approval and "
-    "writes once. mode=preview only shows matched_rows and samples. Only "
-    "outcome=committed proves it; a change after approval is final for the "
-    "request. Limits: structured filters, no SQL. "
-    'Example: {"where": [{"column": "id", "operator": "eq", "value": 7}], '
-    '"assignments": [{"column": "status", "value": "paid"}], ...}. '
-    "Mistakes: asking for approval in chat; retrying after denial."
+RELATIONAL_WRITE_DESCRIPTION = (
+    "Write to a PostgreSQL table with one SQL statement in one call: INSERT with a "
+    "column list, UPDATE or DELETE with WHERE, including INSERT ... SELECT, ON "
+    "CONFLICT (columns), UPDATE ... FROM and DELETE ... USING. Daita previews the "
+    "rows on the approval card, rechecks them and writes once. mode=preview only "
+    "shows the count and samples. Only outcome=committed proves it. Limits: one "
+    'table with write permission, no RETURNING, 64 KiB. Example: {"sql": "UPDATE '
+    'orders SET status = $1 WHERE id = $2", "parameters": ["paid", 7]}. Mistakes: '
+    "asking for approval in chat; retrying after denial."
 )
-RELATIONAL_UPSERT_DESCRIPTION = (
-    "Insert missing rows and update existing ones in one PostgreSQL table by "
-    "key_columns in one call; needs upsert permission. Daita classifies the "
-    "batch on the approval card, locks the table briefly, rechecks and writes "
-    "once, reporting verified counts. mode=preview only classifies rows as "
-    "insert, update or unchanged. A change after approval is final for the "
-    "request. Limits: one uniform batch of up to 1000 scalar rows, no "
-    'chunking. Example: {"key_columns": ["sku"], "rows": [{"sku": "A1", '
-    '"qty": 3}], ...}. Mistakes: omitting a column to clear it (send null); '
-    "retrying after denial or failure."
-)
-_MAX_PREVIEW_OUTPUT_BYTES = 256 * 1_024
-
-RELATIONAL_UPDATE_RECEIPT_POLICY = EffectReceiptPolicy(
-    receipt_kind="data.update_rows",
+RELATIONAL_WRITE_RECEIPT_POLICY = EffectReceiptPolicy(
+    receipt_kind="data.write",
     success_evidence_basis=EffectEvidenceBasis.ADAPTER_VERIFIED,
     payload_schema={
         "type": "object",
         "properties": {
             "source_id": {"type": "string", "maxLength": 256},
             "resource_id": {"type": "string", "maxLength": 256},
+            "table": {"type": "string", "maxLength": 1024},
+            "operation": {"type": "string", "enum": ["insert", "update", "delete"]},
             "intent_sha256": {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"},
             "preview_fingerprint": {
                 "type": "string",
@@ -180,6 +166,8 @@ RELATIONAL_UPDATE_RECEIPT_POLICY = EffectReceiptPolicy(
         "required": [
             "source_id",
             "resource_id",
+            "table",
+            "operation",
             "intent_sha256",
             "preview_fingerprint",
             "target_set_sha256",
@@ -263,255 +251,6 @@ class SQLiteReadResult(SqlReadResult):
 @dataclass(frozen=True, slots=True)
 class PostgreSQLReadResult(SqlReadResult):
     pass
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalPreviewFingerprint:
-    intent_sha256: str
-    target_set_sha256: str
-    statement_sha256: str
-    preview_fingerprint: str
-
-    def __post_init__(self) -> None:
-        for value, name in (
-            (self.intent_sha256, "intent_sha256"),
-            (self.target_set_sha256, "target_set_sha256"),
-            (self.statement_sha256, "statement_sha256"),
-            (self.preview_fingerprint, "preview_fingerprint"),
-        ):
-            if (
-                not isinstance(value, str)
-                or len(value) != 71
-                or not value.startswith("sha256:")
-                or any(character not in "0123456789abcdef" for character in value[7:])
-            ):
-                raise ValueError(f"{name} must be a canonical sha256 hash")
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalUpdatePreviewChecks:
-    compile_only: str = "passed"
-    target_set_fingerprinted: bool = True
-    row_level_security: bool = False
-    user_triggers: bool = False
-    rewrite_rules: bool = False
-
-    def __post_init__(self) -> None:
-        if self.compile_only != "passed":
-            raise ValueError("preview compile_only must be passed")
-        for name in (
-            "target_set_fingerprinted",
-            "row_level_security",
-            "user_triggers",
-            "rewrite_rules",
-        ):
-            if not isinstance(getattr(self, name), bool):
-                raise TypeError(f"preview {name} must be boolean")
-        if (
-            not self.target_set_fingerprinted
-            or self.row_level_security
-            or self.user_triggers
-            or self.rewrite_rules
-        ):
-            raise ValueError("preview checks must represent admitted read-only state")
-
-    def to_payload(self) -> dict[str, object]:
-        return {
-            "compile_only": self.compile_only,
-            "target_set_fingerprinted": self.target_set_fingerprinted,
-            "row_level_security": self.row_level_security,
-            "user_triggers": self.user_triggers,
-            "rewrite_rules": self.rewrite_rules,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalUpdateSample:
-    primary_key: tuple[RelationalUpdateCell, ...]
-    before: tuple[RelationalUpdateCell, ...]
-    after: tuple[RelationalUpdateCell, ...]
-
-    def __post_init__(self) -> None:
-        primary_key = tuple(self.primary_key)
-        before = tuple(self.before)
-        after = tuple(self.after)
-        if not primary_key or any(
-            not isinstance(item, RelationalUpdateCell) for item in primary_key
-        ):
-            raise ValueError("update sample requires a primary key")
-        if (
-            not before
-            or any(not isinstance(item, RelationalUpdateCell) for item in before)
-            or any(not isinstance(item, RelationalUpdateCell) for item in after)
-            or tuple(item.column for item in before)
-            != tuple(item.column for item in after)
-        ):
-            raise ValueError("update sample before and after fields must agree")
-        object.__setattr__(self, "primary_key", primary_key)
-        object.__setattr__(self, "before", before)
-        object.__setattr__(self, "after", after)
-
-    def to_payload(self) -> dict[str, object]:
-        return {
-            "primary_key": tuple(item.to_payload() for item in self.primary_key),
-            "before": tuple(item.to_payload() for item in self.before),
-            "after": tuple(item.to_payload() for item in self.after),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalUpdatePreview:
-    source_id: str
-    resource_id: str
-    resource_name: str
-    source_revision: str
-    resource_revision: str
-    where: tuple[RelationalUpdateFilter, ...]
-    assignments: tuple[RelationalUpdateCell, ...]
-    matched_rows: int
-    samples: tuple[RelationalUpdateSample, ...]
-    fingerprint: RelationalPreviewFingerprint
-    checks: RelationalUpdatePreviewChecks
-    warnings: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        for text_value, text_name in (
-            (self.source_id, "preview source_id"),
-            (self.resource_id, "preview resource_id"),
-            (self.resource_name, "preview resource_name"),
-            (self.source_revision, "preview source_revision"),
-            (self.resource_revision, "preview resource_revision"),
-        ):
-            if not isinstance(text_value, str) or not text_value:
-                raise ValueError(f"{text_name} must be non-empty text")
-        where = tuple(self.where)
-        assignments = tuple(self.assignments)
-        samples = tuple(self.samples)
-        if not where or any(
-            not isinstance(item, RelationalUpdateFilter) for item in where
-        ):
-            raise TypeError("preview where must contain update filters")
-        if not assignments or any(
-            not isinstance(item, RelationalUpdateCell) for item in assignments
-        ):
-            raise TypeError("preview assignments must contain update cells")
-        if (
-            not isinstance(self.matched_rows, int)
-            or isinstance(self.matched_rows, bool)
-            or self.matched_rows < 0
-        ):
-            raise ValueError("preview matched_rows must be a non-negative integer")
-        if len(samples) > 5 or any(
-            not isinstance(item, RelationalUpdateSample) for item in samples
-        ):
-            raise ValueError("preview samples must be bounded update samples")
-        if len(samples) > self.matched_rows:
-            raise ValueError("preview samples cannot exceed matched rows")
-        object.__setattr__(self, "where", where)
-        object.__setattr__(self, "assignments", assignments)
-        object.__setattr__(self, "samples", samples)
-        if not isinstance(self.fingerprint, RelationalPreviewFingerprint):
-            raise TypeError("preview fingerprint must be RelationalPreviewFingerprint")
-        if not isinstance(self.checks, RelationalUpdatePreviewChecks):
-            raise TypeError("preview checks must be RelationalUpdatePreviewChecks")
-        warnings = tuple(self.warnings)
-        if len(warnings) > 8 or any(
-            not isinstance(item, str) or not item or len(item) > 160
-            for item in warnings
-        ):
-            raise ValueError("preview warnings must be bounded text")
-        object.__setattr__(self, "warnings", warnings)
-        if (
-            len(canonical_json(self.tool_data()).encode("utf-8"))
-            > _MAX_PREVIEW_OUTPUT_BYTES
-        ):
-            raise ValueError("preview output exceeds its fixed byte bound")
-
-    def tool_data(self) -> FrozenJsonObject:
-        fingerprint = self.fingerprint
-        return FrozenJsonObject.from_mapping(
-            {
-                "source_id": self.source_id,
-                "resource_id": self.resource_id,
-                "resource_name": self.resource_name,
-                "source_revision": self.source_revision,
-                "resource_revision": self.resource_revision,
-                "where": tuple(item.to_payload() for item in self.where),
-                "assignments": tuple(item.to_payload() for item in self.assignments),
-                "matched_rows": self.matched_rows,
-                "samples": tuple(item.to_payload() for item in self.samples),
-                "target_set_sha256": fingerprint.target_set_sha256,
-                "statement_sha256": fingerprint.statement_sha256,
-                "preview_fingerprint": fingerprint.preview_fingerprint,
-                "checks": self.checks.to_payload(),
-                "warnings": self.warnings,
-                "trust_classification": "untrusted_data",
-            }
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalUpdateResult:
-    """One positively acknowledged committed PostgreSQL update plan."""
-
-    receipt_id: str
-    source_id: str
-    resource_id: str
-    source_revision: str
-    resource_revision: str
-    preview_fingerprint: str
-    intent_sha256: str
-    target_set_sha256: str
-    affected_rows: int
-    committed_at: str
-    effect_observation: EffectObservation
-
-    def __post_init__(self) -> None:
-        for value, name in (
-            (self.receipt_id, "update result receipt_id"),
-            (self.source_id, "update result source_id"),
-            (self.resource_id, "update result resource_id"),
-            (self.source_revision, "update result source_revision"),
-            (self.resource_revision, "update result resource_revision"),
-            (self.committed_at, "update result committed_at"),
-        ):
-            if not isinstance(value, str) or not value:
-                raise ValueError(f"{name} must be non-empty text")
-        for value, name in (
-            (self.preview_fingerprint, "preview_fingerprint"),
-            (self.intent_sha256, "intent_sha256"),
-            (self.target_set_sha256, "target_set_sha256"),
-        ):
-            if (
-                not isinstance(value, str)
-                or len(value) != 71
-                or not value.startswith("sha256:")
-            ):
-                raise ValueError(f"update result {name} must be a sha256 hash")
-        if (
-            not isinstance(self.affected_rows, int)
-            or isinstance(self.affected_rows, bool)
-            or self.affected_rows < 1
-        ):
-            raise ValueError("update result affected_rows must be positive")
-
-    def tool_data(self) -> FrozenJsonObject:
-        return FrozenJsonObject.from_mapping(
-            {
-                "receipt_id": self.receipt_id,
-                "outcome": "committed",
-                "source_id": self.source_id,
-                "resource_id": self.resource_id,
-                "source_revision": self.source_revision,
-                "resource_revision": self.resource_revision,
-                "preview_fingerprint": self.preview_fingerprint,
-                "intent_sha256": self.intent_sha256,
-                "target_set_sha256": self.target_set_sha256,
-                "affected_rows": self.affected_rows,
-                "committed_at": self.committed_at,
-                "trust_classification": "untrusted_data",
-            }
-        )
 
 
 _CORRECT_READ = ToolRecovery(
@@ -662,41 +401,8 @@ async def _source_backend(
     return backend
 
 
-class RelationalUpdatePreviewBackend(Protocol):
-    async def preview_update(
-        self,
-        *,
-        agent_id: str,
-        intent: RelationalUpdateIntent,
-    ) -> RelationalUpdatePreview: ...
-
-
-class RelationalUpdateBackend(RelationalUpdatePreviewBackend, Protocol):
-    async def execute_update(
-        self,
-        *,
-        agent_id: str,
-        execution: ToolExecution,
-        command: RelationalUpdateCommand,
-    ) -> RelationalUpdateResult: ...
-
-
 @dataclass(frozen=True, slots=True)
 class DataQueryDeclarations:
-    capabilities: tuple[Capability, ...]
-    executors: tuple[Executor, ...]
-    tool_views: tuple[ToolView, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalUpdatePreviewDeclarations:
-    capabilities: tuple[Capability, ...]
-    executors: tuple[Executor, ...]
-    tool_views: tuple[ToolView, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalUpdateDeclarations:
     capabilities: tuple[Capability, ...]
     executors: tuple[Executor, ...]
     tool_views: tuple[ToolView, ...]
@@ -1107,103 +813,140 @@ def _multi_statement_data(
     }
 
 
-class RelationalUpdatePreviewExecutor:
-    executor_id = RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID
+@dataclass(frozen=True, slots=True)
+class VerifiedEffect:
+    """One committed write whose source compared what it touched with the card."""
 
+    receipt_id: str
+    source_id: str
+    table: str
+    operation: str
+    canonical_sql: str
+    preview_fingerprint: str
+    intent_sha256: str
+    target_set_sha256: str
+    affected_rows: int
+    inserted_rows: int
+    updated_rows: int
+    deleted_rows: int
+    skipped_rows: int
+    committed_at: str
+    effect_observation: EffectObservation
+
+    def tool_data(self) -> FrozenJsonObject:
+        return FrozenJsonObject.from_mapping(
+            {
+                "receipt_id": self.receipt_id,
+                "outcome": "committed",
+                "source_id": self.source_id,
+                "table": self.table,
+                "operation": self.operation,
+                "sql": self.canonical_sql,
+                "preview_fingerprint": self.preview_fingerprint,
+                "intent_sha256": self.intent_sha256,
+                "target_set_sha256": self.target_set_sha256,
+                "affected_rows": self.affected_rows,
+                "inserted_rows": self.inserted_rows,
+                "updated_rows": self.updated_rows,
+                "deleted_rows": self.deleted_rows,
+                "skipped_rows": self.skipped_rows,
+                "committed_at": self.committed_at,
+                "trust_classification": "untrusted_data",
+            }
+        )
+
+
+class RelationalWriteBackend(WriteDescriber, Protocol):
+    """The seam: everything about a source's language stays behind these."""
+
+    async def preview(
+        self, *, agent_id: str, source_id: str, facts: WriteFacts
+    ) -> WritePreview: ...
+
+    async def apply(
+        self,
+        *,
+        agent_id: str,
+        source_id: str,
+        execution: ToolExecution,
+        facts: WriteFacts,
+        preview_fingerprint: str,
+        expected_affected_rows: int,
+    ) -> VerifiedEffect: ...
+
+
+class _RelationalWriteRouting:
     def __init__(
         self,
         agent_id: str,
-        backends: Mapping[str, RelationalUpdatePreviewBackend],
+        backends: Mapping[str, RelationalWriteBackend],
         source_adapter_id: SourceAdapterLookup,
     ) -> None:
-        if not isinstance(agent_id, str) or not agent_id:
-            raise ValueError("preview executor agent_id must be non-empty text")
-        if any(
-            not callable(getattr(backend, "preview_update", None))
-            for backend in backends.values()
-        ):
-            raise TypeError("preview backend must provide preview_update")
         self._agent_id = agent_id
         self._backends = dict(backends)
         self._source_adapter_id = source_adapter_id
 
-    async def execute(self, request: ToolExecution) -> ToolOutput:
-        intent = RelationalUpdateIntent.from_mapping(request.arguments)
+    async def _preview(self, request: ToolExecution) -> WritePreview:
+        source_id = cast(str, request.arguments["source_id"])
         backend = await _source_backend(
-            self._backends, self._source_adapter_id, self._agent_id, intent.source_id
-        )
-        result = await backend.preview_update(
-            agent_id=self._agent_id,
-            intent=intent,
-        )
-        if (
-            result.source_id != intent.source_id
-            or result.resource_id != intent.resource_id
-            or result.where != intent.where
-        ):
-            raise ValueError("preview backend returned a different update identity")
-        return ToolOutput(
-            kind=RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
-            data=_without_fingerprint(result.tool_data()),
-        )
-
-
-def _without_fingerprint(data: Mapping[str, object]) -> FrozenJsonObject:
-    # The fingerprint binds approval to dispatch inside Daita; the model never sends it.
-    return FrozenJsonObject.from_mapping(
-        {key: value for key, value in data.items() if key != "preview_fingerprint"}
-    )
-
-
-class RelationalUpdateExecutor:
-    executor_id = RELATIONAL_UPDATE_EXECUTOR_ID
-
-    def __init__(
-        self,
-        agent_id: str,
-        backends: Mapping[str, RelationalUpdateBackend],
-        source_adapter_id: SourceAdapterLookup,
-    ) -> None:
-        if not isinstance(agent_id, str) or not agent_id:
-            raise ValueError("update executor agent_id must be non-empty text")
-        if any(
-            not callable(getattr(backend, "preview_update", None))
-            or not callable(getattr(backend, "execute_update", None))
-            for backend in backends.values()
-        ):
-            raise TypeError(
-                "update backend must provide preview_update and execute_update"
-            )
-        self._agent_id = agent_id
-        self._backends = dict(backends)
-        self._source_adapter_id = source_adapter_id
-
-    async def _backend(self, source_id: str) -> RelationalUpdateBackend:
-        return await _source_backend(
             self._backends, self._source_adapter_id, self._agent_id, source_id
         )
+        return await backend.preview(
+            agent_id=self._agent_id,
+            source_id=source_id,
+            facts=write_facts(request.arguments),
+        )
+
+
+class RelationalWritePreviewExecutor(_RelationalWriteRouting):
+    executor_id = RELATIONAL_WRITE_PREVIEW_EXECUTOR_ID
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        preview = (await self._preview(request)).to_mapping()
+        # The fingerprint binds approval to dispatch inside Daita; the model never
+        # sends it.
+        del preview["preview_fingerprint"]
+        return ToolOutput(
+            kind=RELATIONAL_WRITE_PREVIEW_EVIDENCE_KIND,
+            data=FrozenJsonObject.from_mapping(
+                {**preview, "trust_classification": "untrusted_data"}
+            ),
+        )
+
+
+class RelationalWriteExecutor(_RelationalWriteRouting):
+    executor_id = RELATIONAL_WRITE_EXECUTOR_ID
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        intent = RelationalUpdateIntent.from_mapping(request.arguments)
-        backend = await self._backend(intent.source_id)
-        preview = await backend.preview_update(agent_id=self._agent_id, intent=intent)
-        if preview.matched_rows == 0:
+        preview = await self._preview(request)
+        if preview.affected_rows == 0:
             raise CapabilityInputError(
                 "write_target_not_found",
-                "The target selection does not currently match any rows.",
+                "The statement does not currently change any rows.",
             )
         return FrozenJsonObject.from_mapping(
             {
-                "intent_sha256": preview.fingerprint.intent_sha256,
-                "preview_fingerprint": preview.fingerprint.preview_fingerprint,
-                "resource_revision": preview.resource_revision,
-                "target_set_sha256": preview.fingerprint.target_set_sha256,
-                "source_revision": preview.source_revision,
-                "statement_sha256": preview.fingerprint.statement_sha256,
+                "intent_sha256": preview.intent_sha256,
+                "preview_fingerprint": preview.preview_fingerprint,
+                "target_set_sha256": preview.target_set_sha256,
+                "structure_sha256": preview.structure_sha256,
                 "review": {
-                    "matched_rows": preview.matched_rows,
-                    "samples": tuple(sample.to_payload() for sample in preview.samples),
-                    "warnings": preview.warnings,
+                    key: getattr(preview, key)
+                    for key in (
+                        "sql",
+                        "operation",
+                        "columns_changed",
+                        "affected_rows",
+                        "inserted_rows",
+                        "updated_rows",
+                        "deleted_rows",
+                        "skipped_rows",
+                        "samples",
+                        "triggers",
+                        "cascades",
+                        "warnings",
+                        "verification",
+                    )
                 },
             }
         )
@@ -1211,28 +954,23 @@ class RelationalUpdateExecutor:
     async def execute(self, request: ToolExecution) -> ToolOutput:
         approved = request.approved_preflight
         if approved is None:
-            raise ValueError("update dispatch requires its approved preflight")
-        command = RelationalUpdateCommand(
-            intent=RelationalUpdateIntent.from_mapping(request.arguments),
+            raise ValueError("write dispatch requires its approved preflight")
+        source_id = cast(str, request.arguments["source_id"])
+        backend = await _source_backend(
+            self._backends, self._source_adapter_id, self._agent_id, source_id
+        )
+        result = await backend.apply(
+            agent_id=self._agent_id,
+            source_id=source_id,
+            execution=request,
+            facts=write_facts(request.arguments),
             preview_fingerprint=cast(str, approved["preview_fingerprint"]),
             expected_affected_rows=cast(
-                int, cast(Mapping[str, object], approved["review"])["matched_rows"]
+                int, cast(Mapping[str, object], approved["review"])["affected_rows"]
             ),
         )
-        backend = await self._backend(command.intent.source_id)
-        result = await backend.execute_update(
-            agent_id=self._agent_id,
-            execution=request,
-            command=command,
-        )
-        if (
-            result.source_id != command.intent.source_id
-            or result.resource_id != command.intent.resource_id
-            or result.preview_fingerprint != command.preview_fingerprint
-        ):
-            raise ValueError("update backend returned a different update identity")
         return ToolOutput(
-            kind=RELATIONAL_UPDATE_EVIDENCE_KIND,
+            kind=RELATIONAL_WRITE_EVIDENCE_KIND,
             data=result.tool_data(),
             effect_observation=result.effect_observation,
         )
@@ -1273,34 +1011,6 @@ def data_query_declarations(
     )
     return DataQueryDeclarations(
         declarations.capabilities, executors, declarations.tool_views
-    )
-
-
-def relational_update_preview_declarations(
-    agent_id: str,
-    backends: Mapping[str, RelationalUpdatePreviewBackend],
-    source_adapter_id: SourceAdapterLookup,
-) -> RelationalUpdatePreviewDeclarations:
-    executor = RelationalUpdatePreviewExecutor(agent_id, backends, source_adapter_id)
-    declarations = relational_update_preview_capability_declarations()
-    return RelationalUpdatePreviewDeclarations(
-        declarations.capabilities,
-        (executor,),
-        declarations.tool_views,
-    )
-
-
-def relational_update_declarations(
-    agent_id: str,
-    backends: Mapping[str, RelationalUpdateBackend],
-    source_adapter_id: SourceAdapterLookup,
-) -> RelationalUpdateDeclarations:
-    executor = RelationalUpdateExecutor(agent_id, backends, source_adapter_id)
-    declarations = relational_update_capability_declarations()
-    return RelationalUpdateDeclarations(
-        declarations.capabilities,
-        (executor,),
-        declarations.tool_views,
     )
 
 
@@ -1362,203 +1072,6 @@ def data_query_capability_declarations(
         file_capability_id=file_capability_id,
         combined=combined,
         path_query=path_query,
-    )
-
-
-def relational_update_preview_capability_declarations() -> CapabilityDeclarations:
-    cell_schema: dict[str, object] = {
-        "type": "object",
-        "properties": {
-            "column": {"type": "string", "minLength": 1, "maxLength": 256},
-            "value": {},
-        },
-        "required": ["column", "value"],
-        "additionalProperties": False,
-    }
-    filter_schema: dict[str, object] = {
-        "type": "object",
-        "properties": {
-            "column": {"type": "string", "minLength": 1, "maxLength": 256},
-            "operator": {
-                "type": "string",
-                "enum": [
-                    "eq",
-                    "ne",
-                    "lt",
-                    "lte",
-                    "gt",
-                    "gte",
-                    "in",
-                    "not_in",
-                    "is_null",
-                    "is_not_null",
-                ],
-            },
-            "value": {},
-        },
-        "required": ["column", "operator", "value"],
-        "additionalProperties": False,
-    }
-    capability = Capability(
-        id=RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
-        description=(
-            "Validate and preview one structured PostgreSQL update over an exact "
-            "catalog-scoped target set without changing the database. When the "
-            "user requested approval or execution, ground the intended target "
-            "and pass its exact positive preview to data_update_rows when the run "
-            "can proceed. Zero matches require correction or explanation; "
-            "preview alone does not request approval."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "source_id": {
-                    "type": "string",
-                    "pattern": SOURCE_ID_PATTERN,
-                },
-                "resource_id": {
-                    "type": "string",
-                    "pattern": RESOURCE_ID_PATTERN,
-                },
-                "where": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": filter_schema,
-                },
-                "assignments": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": cell_schema,
-                },
-            },
-            "required": ["source_id", "resource_id", "where", "assignments"],
-            "additionalProperties": False,
-        },
-        output_kind=RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
-        output_schema=_relational_update_preview_output_schema(),
-        executor_id=RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID,
-        access_mode=AccessMode.READ,
-    )
-    return CapabilityDeclarations(
-        domain_owner_id="data",
-        capabilities=(capability,),
-        executor_ids=(capability.executor_id,),
-    )
-
-
-def relational_update_capability_declarations() -> CapabilityDeclarations:
-    cell_schema: dict[str, object] = {
-        "type": "object",
-        "properties": {
-            "column": {"type": "string", "minLength": 1, "maxLength": 256},
-            "value": {},
-        },
-        "required": ["column", "value"],
-        "additionalProperties": False,
-    }
-    filter_schema: dict[str, object] = {
-        "type": "object",
-        "properties": {
-            "column": {"type": "string", "minLength": 1, "maxLength": 256},
-            "operator": {
-                "type": "string",
-                "enum": [
-                    "eq",
-                    "ne",
-                    "lt",
-                    "lte",
-                    "gt",
-                    "gte",
-                    "in",
-                    "not_in",
-                    "is_null",
-                    "is_not_null",
-                ],
-            },
-            "value": {},
-        },
-        "required": ["column", "operator", "value"],
-        "additionalProperties": False,
-    }
-    capability = Capability(
-        id=RELATIONAL_UPDATE_CAPABILITY_ID,
-        description=(
-            "Preview one exact PostgreSQL update for runtime approval, then "
-            "apply it exactly once only if approved and the recheck finds the "
-            "same rows."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "source_id": {
-                    "type": "string",
-                    "pattern": SOURCE_ID_PATTERN,
-                },
-                "resource_id": {
-                    "type": "string",
-                    "pattern": RESOURCE_ID_PATTERN,
-                },
-                "where": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": filter_schema,
-                },
-                "assignments": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": cell_schema,
-                },
-            },
-            "required": ["source_id", "resource_id", "where", "assignments"],
-            "additionalProperties": False,
-        },
-        output_kind=RELATIONAL_UPDATE_EVIDENCE_KIND,
-        output_schema=_relational_update_output_schema(),
-        executor_id=RELATIONAL_UPDATE_EXECUTOR_ID,
-        access_mode=AccessMode.WRITE,
-        operational_effect=OperationalEffect.MUTATE_DATA,
-        effect_receipt_policy=RELATIONAL_UPDATE_RECEIPT_POLICY,
-        execution_admission_policy=ExecutionAdmissionPolicy(
-            shape="preview_bound_postgresql_update",
-            inline_eligible=True,
-            graph_v1_eligible=True,
-            target_count_argument=None,
-            inline_max_targets=1,
-            graph_max_targets=1,
-        ),
-    )
-    view = ToolView(
-        name=RELATIONAL_UPDATE_TOOL_NAME,
-        capability_id=capability.id,
-        description=RELATIONAL_UPDATE_DESCRIPTION,
-        mode_capability_ids=(
-            ("preview", RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID),
-            ("apply", capability.id),
-        ),
-        default_mode="apply",
-        presentation=ToolPresentation(
-            toolbox_id=ToolboxId.SOURCES,
-            load_mode=ToolLoadMode.ON_DEMAND,
-            text_trust=ToolTextTrust.CODE,
-            summary="Update existing relational rows in one approved call.",
-            when_to_use="Call once to write; the approval card shows the matching rows. Use mode=preview only to look first.",
-            keywords=(
-                "data",
-                "relational",
-                "postgresql",
-                "rows",
-                "update",
-                "preview",
-                "apply",
-                "approval",
-            ),
-        ),
-    )
-    return CapabilityDeclarations(
-        domain_owner_id="data",
-        capabilities=(capability,),
-        executor_ids=(capability.executor_id,),
-        tool_views=(view,),
     )
 
 
@@ -1853,386 +1366,98 @@ def _query_output_schema() -> dict[str, object]:
     }
 
 
-def _relational_update_preview_output_schema() -> dict[str, object]:
-    cell_schema = {
-        "type": "object",
-        "properties": {"column": {"type": "string"}, "value": {}},
-        "required": ["column", "value"],
-        "additionalProperties": False,
-    }
-    names = (
-        "source_id",
-        "resource_id",
-        "resource_name",
-        "source_revision",
-        "resource_revision",
-        "where",
-        "assignments",
-        "matched_rows",
-        "samples",
-        "target_set_sha256",
-        "statement_sha256",
-        "checks",
-        "warnings",
-        "trust_classification",
-    )
-    hash_rule = {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"}
-    return {
+def relational_write_capability_declarations() -> CapabilityDeclarations:
+    input_schema: dict[str, object] = {
         "type": "object",
         "properties": {
-            "source_id": {"type": "string"},
-            "resource_id": {"type": "string"},
-            "resource_name": {"type": "string"},
-            "source_revision": {"type": "string"},
-            "resource_revision": {"type": "string"},
-            "where": {"type": "array", "items": {"type": "object"}},
-            "assignments": {"type": "array", "items": cell_schema},
-            "matched_rows": {"type": "integer", "minimum": 0},
-            "samples": {"type": "array", "items": {"type": "object"}},
-            "target_set_sha256": hash_rule,
-            "statement_sha256": hash_rule,
-            "checks": {
-                "type": "object",
-                "properties": {
-                    "compile_only": {"type": "string", "enum": ["passed"]},
-                    "target_set_fingerprinted": {"type": "boolean"},
-                    "row_level_security": {"type": "boolean"},
-                    "user_triggers": {"type": "boolean"},
-                    "rewrite_rules": {"type": "boolean"},
-                },
-                "required": [
-                    "compile_only",
-                    "target_set_fingerprinted",
-                    "row_level_security",
-                    "user_triggers",
-                    "rewrite_rules",
-                ],
-                "additionalProperties": False,
-            },
-            "warnings": {"type": "array", "items": {"type": "string"}},
-            "trust_classification": {
-                "type": "string",
-                "enum": ["untrusted_data"],
+            "source_id": {"type": "string", "pattern": SOURCE_ID_PATTERN},
+            "sql": {"type": "string", "minLength": 1, "maxLength": MAX_SQL_CHARACTERS},
+            "parameters": {
+                "type": "array",
+                "maxItems": 32_767,
+                "description": "Values for $1, $2, ... by index.",
             },
         },
-        "required": list(names),
+        "required": ["source_id", "sql"],
         "additionalProperties": False,
     }
-
-
-def _relational_update_output_schema() -> dict[str, object]:
-    hash_rule = {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"}
-    names = (
-        "receipt_id",
-        "outcome",
-        "source_id",
-        "resource_id",
-        "source_revision",
-        "resource_revision",
-        "preview_fingerprint",
-        "intent_sha256",
-        "target_set_sha256",
-        "affected_rows",
-        "committed_at",
-        "trust_classification",
-    )
-    return {
-        "type": "object",
-        "properties": {
-            "receipt_id": {
-                "type": "string",
-                "pattern": r"^effect-receipt:sha256:[0-9a-f]{64}$",
-            },
-            "outcome": {"type": "string", "enum": ["committed"]},
-            "source_id": {"type": "string"},
-            "resource_id": {"type": "string"},
-            "source_revision": {"type": "string"},
-            "resource_revision": {"type": "string"},
-            "preview_fingerprint": hash_rule,
-            "intent_sha256": hash_rule,
-            "target_set_sha256": hash_rule,
-            "affected_rows": {"type": "integer", "minimum": 1},
-            "committed_at": {"type": "string"},
-            "trust_classification": {
-                "type": "string",
-                "enum": ["untrusted_data"],
-            },
-        },
-        "required": list(names),
-        "additionalProperties": False,
+    count: dict[str, object] = {"type": "integer", "minimum": 0}
+    preview_properties: dict[str, object] = {
+        "source_id": {"type": "string"},
+        "table": {"type": "string"},
+        "operation": {"type": "string", "enum": ["insert", "update", "delete"]},
+        "sql": {"type": "string"},
+        "columns_changed": {"type": "array", "items": {"type": "string"}},
+        "affected_rows": count,
+        "inserted_rows": count,
+        "updated_rows": count,
+        "deleted_rows": count,
+        "skipped_rows": count,
+        "samples": {"type": "array", "maxItems": 5, "items": {"type": "object"}},
+        "triggers": {"type": "array", "items": {"type": "string"}},
+        "cascades": {"type": "array", "items": {"type": "string"}},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "verification": {"type": "string", "enum": ["rows", "count"]},
+        "intent_sha256": {"type": "string"},
+        "target_set_sha256": {"type": "string"},
+        "structure_sha256": {"type": "string"},
+        "trust_classification": {"type": "string"},
     }
-
-
-__all__ = [
-    "DATA_QUERY_EXECUTOR_ID",
-    "DATA_QUERY_TOOL_NAME",
-    "DataQueryDeclarations",
-    "DataQueryExecutor",
-    "RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID",
-    "RELATIONAL_UPDATE_EXECUTOR_ID",
-    "RELATIONAL_UPDATE_TOOL_NAME",
-    "RELATIONAL_UPSERT_TOOL_NAME",
-    "PostgreSQLReadResult",
-    "RelationalPreviewFingerprint",
-    "RelationalUpdatePreview",
-    "RelationalUpdatePreviewBackend",
-    "RelationalUpdatePreviewChecks",
-    "RelationalUpdatePreviewDeclarations",
-    "RelationalUpdatePreviewExecutor",
-    "RelationalUpdateBackend",
-    "RelationalUpdateDeclarations",
-    "RelationalUpdateExecutor",
-    "RelationalUpdateResult",
-    "RelationalUpdateSample",
-    "SQLiteReadResult",
-    "ReadTabularRequest",
-    "TABULAR_FILTER_OPERATORS",
-    "TabularFilter",
-    "TabularReadBackend",
-    "data_query_declarations",
-    "data_query_capability_declarations",
-    "relational_update_preview_declarations",
-    "relational_update_preview_capability_declarations",
-    "relational_upsert_declarations",
-    "relational_upsert_capability_declarations",
-    "RelationalUpsertResult",
-    "RelationalUpsertBackend",
-    "relational_update_declarations",
-    "relational_update_capability_declarations",
-]
-
-_NATIVE_COLUMNS_SCHEMA = {
-    "type": "array",
-    "items": {"type": "string", "minLength": 1, "maxLength": 256},
-    "maxItems": 512,
-    "uniqueItems": True,
-}
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalUpsertResult:
-    data: FrozenJsonObject
-    effect_observation: EffectObservation
-
-
-class RelationalUpsertBackend(Protocol):
-    async def preview_upsert(
-        self, *, agent_id: str, intent: RelationalUpsertIntent
-    ) -> FrozenJsonObject: ...
-    async def execute_upsert(
-        self,
-        *,
-        agent_id: str,
-        execution: ToolExecution,
-        intent: RelationalUpsertIntent,
-        preview_fingerprint: str,
-    ) -> RelationalUpsertResult: ...
-
-
-def _upsert_intent(request: ToolExecution) -> RelationalUpsertIntent:
-    """Bind the model's batch to the evidence the runtime derived for it."""
-
-    return replace(
-        RelationalUpsertIntent.from_mapping(request.arguments),
-        evidence_call_ids=request.provenance.evidence_call_ids,
-    )
-
-
-class _RelationalUpsertRouting:
-    def __init__(
-        self,
-        agent_id: str,
-        backends: Mapping[str, RelationalUpsertBackend],
-        source_adapter_id: SourceAdapterLookup,
-    ) -> None:
-        self._agent_id = agent_id
-        self._backends = dict(backends)
-        self._source_adapter_id = source_adapter_id
-
-    async def _backend(self, intent: RelationalUpsertIntent) -> RelationalUpsertBackend:
-        return await _source_backend(
-            self._backends, self._source_adapter_id, self._agent_id, intent.source_id
-        )
-
-
-class RelationalUpsertPreviewExecutor(_RelationalUpsertRouting):
-    executor_id = "data.preview_upsert_rows.executor"
-
-    async def execute(self, request: ToolExecution) -> ToolOutput:
-        intent = _upsert_intent(request)
-        backend = await self._backend(intent)
-        return ToolOutput(
-            kind="data.preview_upsert_rows",
-            data=_without_fingerprint(
-                await backend.preview_upsert(agent_id=self._agent_id, intent=intent)
-            ),
-        )
-
-
-class RelationalUpsertExecutor(_RelationalUpsertRouting):
-    executor_id = "data.upsert_rows.executor"
-
-    async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        intent = _upsert_intent(request)
-        backend = await self._backend(intent)
-        preview = await backend.preview_upsert(agent_id=self._agent_id, intent=intent)
-        return FrozenJsonObject.from_mapping(
-            {
-                **{
-                    key: preview[key]
-                    for key in (
-                        "intent_sha256",
-                        "preview_fingerprint",
-                        "resource_revision",
-                        "target_set_sha256",
-                        "permission_fingerprint",
-                    )
-                },
-                "review": {
-                    **{
-                        key: preview[key]
-                        for key in (
-                            "input_count",
-                            "inserted_count",
-                            "updated_count",
-                            "unchanged_count",
-                            "identity_sequence_gaps_possible",
-                        )
-                    },
-                    "classifications": cast(
-                        tuple[object, ...], preview["classifications"]
-                    )[:5],
-                },
-            }
-        )
-
-    async def execute(self, request: ToolExecution) -> ToolOutput:
-        if request.approved_preflight is None:
-            raise ValueError("upsert dispatch requires its approved preflight")
-        intent = _upsert_intent(request)
-        backend = await self._backend(intent)
-        result = await backend.execute_upsert(
-            agent_id=self._agent_id,
-            execution=request,
-            intent=intent,
-            preview_fingerprint=cast(
-                str, request.approved_preflight["preview_fingerprint"]
-            ),
-        )
-        return ToolOutput(
-            kind="data.upsert_rows_result",
-            data=result.data,
-            effect_observation=result.effect_observation,
-        )
-
-
-_UPSERT_RECEIPT_SCHEMA: dict[str, object] = {
-    "type": "object",
-    "properties": {
-        "source_id": {"type": "string", "maxLength": 256},
-        "resource_id": {"type": "string", "maxLength": 256},
-        "intent_sha256": {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"},
-        "preview_fingerprint": {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"},
-        "target_set_sha256": {"type": ["string", "null"], "maxLength": 71},
-        "input_count": {"type": "integer", "minimum": 1, "maximum": 1000},
-        "inserted_count": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000},
-        "updated_count": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000},
-        "unchanged_count": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000},
-        "normalized_error_code": {"type": ["string", "null"], "maxLength": 128},
-        "identity_sequence_gaps_possible": {"type": "boolean"},
-    },
-    "required": [
-        "source_id",
-        "resource_id",
-        "intent_sha256",
-        "preview_fingerprint",
-        "target_set_sha256",
-        "input_count",
-        "inserted_count",
-        "updated_count",
-        "unchanged_count",
-        "normalized_error_code",
-        "identity_sequence_gaps_possible",
-    ],
-    "additionalProperties": False,
-}
-
-
-def relational_upsert_capability_declarations() -> CapabilityDeclarations:
-    properties: dict[str, object] = {
-        "source_id": {"type": "string", "pattern": SOURCE_ID_PATTERN},
-        "resource_id": {
-            "type": "string",
-            "pattern": RESOURCE_ID_PATTERN,
-        },
-        "key_columns": {**_NATIVE_COLUMNS_SCHEMA, "minItems": 1},
-        "insert_columns": {**_NATIVE_COLUMNS_SCHEMA, "minItems": 1},
-        "update_columns": {**_NATIVE_COLUMNS_SCHEMA, "minItems": 1},
-        "rows": {
-            "type": "array",
-            "minItems": 1,
-            "maxItems": 1000,
-            "items": {
-                "type": "object",
-                "additionalProperties": {
-                    "type": ["string", "number", "boolean", "null"]
-                },
-            },
-        },
+    write_properties: dict[str, object] = {
+        "receipt_id": {"type": "string"},
+        "outcome": {"type": "string", "enum": ["committed"]},
+        "source_id": {"type": "string"},
+        "table": {"type": "string"},
+        "operation": {"type": "string", "enum": ["insert", "update", "delete"]},
+        "sql": {"type": "string"},
+        "preview_fingerprint": {"type": "string"},
+        "intent_sha256": {"type": "string"},
+        "target_set_sha256": {"type": "string"},
+        "affected_rows": {"type": "integer", "minimum": 1},
+        "inserted_rows": count,
+        "updated_rows": count,
+        "deleted_rows": count,
+        "skipped_rows": count,
+        "committed_at": {"type": "string"},
+        "trust_classification": {"type": "string"},
     }
-    required = [
-        "source_id",
-        "resource_id",
-        "key_columns",
-        "insert_columns",
-        "update_columns",
-        "rows",
-    ]
     preview = Capability(
-        id="data.preview_upsert_rows",
+        id=RELATIONAL_WRITE_PREVIEW_CAPABILITY_ID,
         description=(
-            "Preview one exact uniform batch as inserts, updates or unchanged rows. Values are model-derived claims; "
-            "earlier reads of the same table in this run are recorded as evidence, not proof of truth. Identity values are allocated only on insert. "
-            "Execution briefly takes a table-wide EXCLUSIVE lock permitting ordinary reads, with bounded timeouts."
+            "Preview one SQL write without writing: the rows it would touch, counted "
+            "once each, with a bounded sample."
         ),
-        input_schema={
+        input_schema=input_schema,
+        output_kind=RELATIONAL_WRITE_PREVIEW_EVIDENCE_KIND,
+        output_schema={
             "type": "object",
-            "properties": properties,
-            "required": required,
+            "properties": preview_properties,
+            "required": list(preview_properties),
             "additionalProperties": False,
         },
-        output_kind="data.preview_upsert_rows",
-        output_schema=_upsert_output_schema(preview=True),
-        executor_id=RelationalUpsertPreviewExecutor.executor_id,
+        executor_id=RELATIONAL_WRITE_PREVIEW_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        derives_call_provenance=True,
     )
     write = Capability(
-        id="data.upsert_rows",
+        id=RELATIONAL_WRITE_CAPABILITY_ID,
         description=(
-            "Preview one exact upsert batch for approval, then apply it atomically once if approved and unchanged. "
-            "No chunking or replay. Unchanged rows consume the invocation and produce verified zero-change evidence. "
-            "Rollback does not restore identity sequence allocations."
+            "Preview one SQL write for runtime approval, then apply it exactly once "
+            "only if approved and the recheck finds the same rows and table."
         ),
-        input_schema={
+        input_schema=input_schema,
+        output_kind=RELATIONAL_WRITE_EVIDENCE_KIND,
+        output_schema={
             "type": "object",
-            "properties": properties,
-            "required": required,
+            "properties": write_properties,
+            "required": list(write_properties),
             "additionalProperties": False,
         },
-        output_kind="data.upsert_rows_result",
-        output_schema=_upsert_output_schema(preview=False),
-        executor_id=RelationalUpsertExecutor.executor_id,
+        executor_id=RELATIONAL_WRITE_EXECUTOR_ID,
         access_mode=AccessMode.WRITE,
         operational_effect=OperationalEffect.MUTATE_DATA,
-        effect_receipt_policy=EffectReceiptPolicy(
-            receipt_kind="data.upsert_rows",
-            payload_schema=_UPSERT_RECEIPT_SCHEMA,
-            success_evidence_basis=EffectEvidenceBasis.ADAPTER_VERIFIED,
-        ),
-        derives_call_provenance=True,
+        effect_receipt_policy=RELATIONAL_WRITE_RECEIPT_POLICY,
         execution_admission_policy=ExecutionAdmissionPolicy(
-            shape="preview_bound_postgresql_upsert",
+            shape="preview_bound_postgresql_write",
             inline_eligible=True,
             graph_v1_eligible=True,
             target_count_argument=None,
@@ -2246,37 +1471,33 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
         executor_ids=(preview.executor_id, write.executor_id),
         tool_views=(
             ToolView(
-                name=RELATIONAL_UPSERT_TOOL_NAME,
+                name=RELATIONAL_WRITE_TOOL_NAME,
                 capability_id=write.id,
-                description=RELATIONAL_UPSERT_DESCRIPTION,
+                description=RELATIONAL_WRITE_DESCRIPTION,
                 mode_capability_ids=(("preview", preview.id), ("apply", write.id)),
                 default_mode="apply",
                 presentation=ToolPresentation(
                     toolbox_id=ToolboxId.SOURCES,
                     load_mode=ToolLoadMode.ON_DEMAND,
                     text_trust=ToolTextTrust.CODE,
-                    summary=(
-                        "Write an exact relational batch in one approved call: insert "
-                        "missing rows, update existing rows, or leave them unchanged."
-                    ),
+                    summary="Insert, update or delete rows with one approved SQL statement.",
                     when_to_use=(
-                        "Call once to write a batch identified by exact conflict keys; "
-                        "the approval card shows the planned actions. Use mode=preview "
-                        "only to look first."
+                        "Call once to write; the approval card shows the rows. Use "
+                        "mode=preview only to look first."
                     ),
                     keywords=(
                         "data",
-                        "relational",
-                        "upsert",
-                        "insert",
-                        "update",
+                        "postgresql",
                         "rows",
                         "row",
                         "table",
+                        "database",
+                        "write",
+                        "insert",
+                        "update",
+                        "delete",
+                        "upsert",
                         "batch",
-                        "research",
-                        "preview",
-                        "apply",
                         "save",
                         "approval",
                     ),
@@ -2286,74 +1507,42 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
     )
 
 
-def _upsert_output_schema(*, preview: bool) -> dict[str, object]:
-    properties: dict[str, object] = {
-        "source_id": {"type": "string"},
-        "resource_id": {"type": "string"},
-        "resource_revision": {"type": "string"},
-        "intent_sha256": {"type": "string"},
-        "target_set_sha256": {"type": "string"},
-        "permission_fingerprint": {"type": "string"},
-        "input_count": {"type": "integer", "minimum": 1, "maximum": 1000},
-        "inserted_count": {"type": "integer", "minimum": 0, "maximum": 1000},
-        "updated_count": {"type": "integer", "minimum": 0, "maximum": 1000},
-        "unchanged_count": {"type": "integer", "minimum": 0, "maximum": 1000},
-        "classifications": {
-            "type": "array",
-            "maxItems": 1000,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "key": {"type": "object"},
-                    "action": {
-                        "type": "string",
-                        "enum": ["insert", "update", "unchanged"],
-                    },
-                },
-                "required": ["key", "action"],
-                "additionalProperties": False,
-            },
-        },
-        "evidence_call_ids": {
-            "type": "array",
-            "maxItems": 32,
-            "items": {"type": "string"},
-        },
-        "authorship": {"type": "string", "enum": ["model_derived"]},
-        "identity_sequence_gaps_possible": {"type": "boolean"},
-    }
-    if not preview:
-        properties.update(
-            {
-                "preview_fingerprint": {"type": "string"},
-                "receipt_id": {"type": "string"},
-                "committed_at": {"type": "string"},
-                "generated_identities": {
-                    "type": "array",
-                    "maxItems": 1000,
-                    "items": {"type": "object"},
-                },
-            }
-        )
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": list(properties),
-        "additionalProperties": False,
-    }
-
-
-def relational_upsert_declarations(
+def relational_write_declarations(
     agent_id: str,
-    backends: Mapping[str, RelationalUpsertBackend],
+    backends: Mapping[str, RelationalWriteBackend],
     source_adapter_id: SourceAdapterLookup,
 ) -> DataQueryDeclarations:
-    declarations = relational_upsert_capability_declarations()
+    declarations = relational_write_capability_declarations()
     return DataQueryDeclarations(
         declarations.capabilities,
         (
-            RelationalUpsertPreviewExecutor(agent_id, backends, source_adapter_id),
-            RelationalUpsertExecutor(agent_id, backends, source_adapter_id),
+            RelationalWritePreviewExecutor(agent_id, backends, source_adapter_id),
+            RelationalWriteExecutor(agent_id, backends, source_adapter_id),
         ),
         declarations.tool_views,
     )
+
+
+__all__ = [
+    "DATA_QUERY_EXECUTOR_ID",
+    "DATA_QUERY_TOOL_NAME",
+    "DataQueryDeclarations",
+    "DataQueryExecutor",
+    "PostgreSQLReadResult",
+    "RELATIONAL_WRITE_EXECUTOR_ID",
+    "RELATIONAL_WRITE_PREVIEW_EXECUTOR_ID",
+    "RELATIONAL_WRITE_TOOL_NAME",
+    "RelationalWriteBackend",
+    "RelationalWriteExecutor",
+    "RelationalWritePreviewExecutor",
+    "VerifiedEffect",
+    "SQLiteReadResult",
+    "ReadTabularRequest",
+    "TABULAR_FILTER_OPERATORS",
+    "TabularFilter",
+    "TabularReadBackend",
+    "data_query_declarations",
+    "data_query_capability_declarations",
+    "relational_write_capability_declarations",
+    "relational_write_declarations",
+]

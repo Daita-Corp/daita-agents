@@ -126,7 +126,7 @@ _FORBIDDEN_TOOL_NAMES = frozenset(
         "routine_inspect",
         "routine_list",
         "routine_save",
-        "data_update_rows",
+        "data_write",
     }
 )
 

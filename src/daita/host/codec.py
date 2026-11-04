@@ -42,7 +42,7 @@ from ..adapters.postgresql import (
     PostgreSQLProbeSchema,
     PostgreSQLSource,
 )
-from ..adapters.postgresql_write import RelationalUpdateReadiness
+from ..adapters.postgresql_write import RelationalWriteReadiness
 from ..adapters.sqlite import SQLiteSource
 from ..artifacts.models import (
     ArtifactAuthorship,
@@ -614,7 +614,7 @@ for _record in (
     OutcomeArtifactReference,
     PostgreSQLProbeResult,
     PostgreSQLProbeSchema,
-    RelationalUpdateReadiness,
+    RelationalWriteReadiness,
     RetryPolicy,
     RoutineIntent,
     SQLiteSource,

@@ -52,8 +52,7 @@ its `format_type` and comment.
 freshness checks, and I/O. One composed `SourceTypeRegistry` per agent maps each
 `adapter_id` to its factory, credential fields, read capacity, SQL dialect and
 operation backends. `SourceOperation` names those backends: `SQL_READ`,
-`TABULAR_READ`, `TABULAR_EXPORT`, `PROFILE`, `RELATIONAL_UPDATE`,
-`RELATIONAL_UPSERT`, `FILE_SEARCH`, `TEXT_READ`, `PATH_QUERY` and `LIVE_LOOKUP`;
+`TABULAR_READ`, `TABULAR_EXPORT`, `PROFILE`, `RELATIONAL_WRITE`, `FILE_SEARCH`, `TEXT_READ`, `PATH_QUERY` and `LIVE_LOOKUP`;
 every operation except `TABULAR_READ`, `FILE_SEARCH`, `TEXT_READ` and `LIVE_LOOKUP`
 requires an SQL dialect the read policy in `domains/data/sql` supports, checked at registration.
 A stored source whose type is not registered stays listed
@@ -131,35 +130,63 @@ sensitivity and per-input lineage (`source_id`, `read_at`, and `canonical_sql`/`
 `columns`/`filters` for tabular inputs). Declared catalog links
 inform discovery and join paths only; they grant no read authority.
 
-Data capabilities are reads except for explicitly admitted `data_update_rows` and
-`data_upsert_rows`, initially backed by PostgreSQL. A write is one call: `mode`
-defaults to `apply`, whose side-effect preflight builds the preview that the
-approval card shows. After approval the runtime runs the preflight again and
-refuses a drifted preview, then hands the approved preflight to the executor
-(`ToolExecution.approved_preflight`), so the locked transaction checks the same
-preview fingerprint and row count the person reviewed. The model never sends a
-fingerprint or count, and the preview is not stored. `mode=preview` routes to the
-read-only `data.preview_update_rows`/`data.preview_upsert_rows`. Update retains
-its exact selection, target-count, drift, rollback and receipt safeguards.
+Data capabilities are reads except for `data_write`, backed by PostgreSQL: one
+`INSERT`, `UPDATE` or `DELETE` on one table with a write scope. Four rules hold for every
+source type: run what was checked, ask the source, verify the effect, and refuse by
+principle. The refusals are the fixed list in `docs/RELATIONAL_WRITES.md`; when a
+statement misbehaves, ask which rule failed instead of adding a refusal.
 
-`RelationalWriteScope` binds exact structural revision, explicit update/upsert
-operations, keys, insert/update columns, admitted identity generation and row limits.
-Update permission never implies insertion authority. Upsert uses one bounded uniform
-scalar batch, supported non-null unique-key equality, explicit omitted/null semantics,
-and narrowly admitted identity generation. Its transaction acquires EXCLUSIVE on the
-exact table before the authoritative scan, rebuilds the preview, rejects drift,
-inserts missing rows, updates changed rows, skips unchanged rows, and verifies exact
-counts summing to the input count. Mismatches roll back the entire batch. Sequence
-allocations may leave gaps after rollback; receipts describe table-row effects.
+The flow and the seam are shared, and a source's language stays in its adapter.
+`domains/data` owns approval, receipts, scopes and comparing evidence, and never reads
+SQL. A source implements `RelationalWriteBackend`:
 
+| Method | Returns |
+| --- | --- |
+| `describe` | `WriteFacts`: target, operation, columns, read names, and an opaque `statement` only that adapter reads. Parses for early errors, before any I/O |
+| `preview` | `WritePreview`: count, identity digest, sample, warnings and `verification` |
+| `apply` | `VerifiedEffect`: what happened, with commit certainty |
+
+PostgreSQL is the one implementation. `adapters/postgresql_write_sql.py` owns its
+language: early refusals, the `RETURNING` Daita adds, and the `SELECT` derived from the
+statement. A write is one call: `mode` defaults to `apply`, whose side-effect preflight
+previews and builds what the approval card shows. After approval the runtime runs the
+preflight again and refuses a drifted preview, then hands the approved preflight to the
+executor (`ToolExecution.approved_preflight`). `mode=preview` routes to the read-only
+`data.preview_write`.
+
+Both preview and apply first run `EXPLAIN (FORMAT JSON, VERBOSE)` on the exact text plus
+`RETURNING`, and refuse unless every `ModifyTable` names the one approved operation and
+table. That takes `ROW EXCLUSIVE` on the table even when read-only, so it runs in a
+savepoint that releases the lock before the derived `SELECT`.
+
+In the write transaction the backend (`adapters/postgresql_write.py`) re-reads the one
+target table, locks existing target rows, reruns the derived `SELECT` and compares the
+row digest (`ctid`, `xmin` and, when nothing varies, new values), structure digest and
+count with the approved fingerprint. It then runs the statement and compares what
+`RETURNING` reports with the locked read, using an order-independent digest, and rolls
+back on any difference. A row's identity is `ctid` for a `DELETE`, or the first unique
+not-null key the statement does not assign and, for an `INSERT`, lists; without one the
+level is `count`. `xmax = 0` tells inserts from updates, and only on an `INSERT`: on a
+plain `UPDATE` it means nothing. A statement varies when the function lookup finds a
+non-immutable function or the parser finds a SQL time keyword; its sample then shows new
+values as computed, since the runtime rechecks the whole preflight after approval. Receipt reservation and
+finalization stay in `CapabilityRuntime`; an uncertain commit stays uncertain, and
+nothing is retried or replayed.
+
+The derived `SELECT` is rendered from a parse tree, so it is a claim, and a wrong one
+fails preview or fails verification. sqlglot cannot render `E'...'` faithfully, so those
+literals are kept out of the tree. Every other statement Daita sends is the model's exact
+text. The function rule also checks each name written before `(`, because the tree renames
+some calls, hides others and drops the case of a quoted one; reads keep their name checks from the parser, since `EXPLAIN`
+expands views to their base tables.
+
+`RelationalWriteScope` binds a table name, explicit `insert`, `update` and `delete`
+operations, insert and update columns and a row limit, and reads no catalog. Stored
+receipts of kind `data.update_rows` and `data.upsert_rows` keep decoding and resolving.
 A native write in a scheduled or job run asks a person at the time, exactly as a
-foreground write does; the approval card carries the routine or job title.
-An unchanged batch consumes its reservation and produces
-verified zero-mutation evidence. Full request sensitivity must fit the current target classification.
-Research lineage remains model-derived claims, distinct from transaction facts.
-Receipt reservation/finalization stays in CapabilityRuntime. No arbitrary SQL,
-insert-only tool, delete, DDL, chunking, automatic retry or replay is supported.
-Machine runs use these same PostgreSQL update/upsert contracts, asking at the time.
+foreground write does; the card carries the routine or job title. Full request
+sensitivity must fit the source's classification. DDL, `TRUNCATE`, `COPY`, `MERGE`,
+a statement's own `RETURNING`, chunking, automatic retry and replay are not supported.
 
 ## Local computer files and artifacts
 

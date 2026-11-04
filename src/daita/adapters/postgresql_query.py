@@ -1321,6 +1321,33 @@ async def _describe_relation(
     }
 
 
+async def configure_transaction(
+    connection: Any,
+    *,
+    schemas: tuple[str, ...],
+    statement_timeout_seconds: float,
+    lock_timeout_seconds: float | None = None,
+) -> None:
+    """Bound one transaction and pin how the server reads names and strings."""
+
+    statement_milliseconds = f"{max(1, int(statement_timeout_seconds * 1_000))}ms"
+    settings = [("statement_timeout", statement_milliseconds)]
+    if lock_timeout_seconds is not None:
+        settings += [
+            ("lock_timeout", f"{max(1, int(lock_timeout_seconds * 1_000))}ms"),
+            ("idle_in_transaction_session_timeout", statement_milliseconds),
+        ]
+    settings += [
+        # pg_catalog stays implicitly first, so a configured schema cannot shadow a
+        # built-in operator or a system catalog.
+        ("search_path", ", ".join(_postgresql_identifier(item) for item in schemas)),
+        # The parser reads a plain string's backslash as literal; so must the server.
+        ("standard_conforming_strings", "on"),
+    ]
+    for name, value in settings:
+        await connection.execute(f"SELECT set_config('{name}', $1, true)", value)
+
+
 async def _prepare_read_transaction(
     connection: Any,
     registration: SourceRegistration,
@@ -1329,29 +1356,32 @@ async def _prepare_read_transaction(
 ) -> None:
     """Bound the transaction, pin name resolution, then apply the function rule."""
 
-    await connection.execute(
-        "SELECT set_config('statement_timeout', $1, true)",
-        f"{max(1, int(timeout_seconds * 1_000))}ms",
-    )
-    # pg_catalog stays implicitly first, so a configured schema cannot shadow a
-    # built-in operator or a system catalog.
-    await connection.execute(
-        "SELECT set_config('search_path', $1, true)",
-        ", ".join(
-            _postgresql_identifier(schema)
-            for schema in _configuration_schemas(registration.configuration)
-        ),
+    await configure_transaction(
+        connection,
+        schemas=_configuration_schemas(registration.configuration),
+        statement_timeout_seconds=timeout_seconds,
     )
     if read.unqualified_relations:
-        await _refuse_unqualified(connection, registration, read)
-    if read.function_lookups or read.attribute_lookups:
-        await _check_functions(
-            connection, read.function_lookups, read.attribute_lookups
+        await refuse_unqualified(
+            connection,
+            registration,
+            read.unqualified_relations,
+            read.allowed_resource_ids,
+        )
+    if read.function_lookups or read.written_calls or read.attribute_lookups:
+        await check_functions(
+            connection,
+            read.function_lookups,
+            read.attribute_lookups,
+            read.written_calls,
         )
 
 
-async def _refuse_unqualified(
-    connection: Any, registration: SourceRegistration, read: CheckedRead
+async def refuse_unqualified(
+    connection: Any,
+    registration: SourceRegistration,
+    relations: tuple[str, ...],
+    allowed_resource_ids: tuple[str, ...] | None,
 ) -> None:
     """Several schemas could hold the name, so list where it exists and refuse.
 
@@ -1361,22 +1391,17 @@ async def _refuse_unqualified(
 
     schemas = _configuration_schemas(registration.configuration)
     rows = await connection.fetch(
-        _UNQUALIFIED_RELATION_LOOKUP, list(read.unqualified_relations), list(schemas)
+        _UNQUALIFIED_RELATION_LOOKUP, list(relations), list(schemas)
     )
-    allowed = (
-        None
-        if read.allowed_resource_ids is None
-        else frozenset(read.allowed_resource_ids)
-    )
+    allowed = None if allowed_resource_ids is None else frozenset(allowed_resource_ids)
     candidates = tuple(
         name
         for row in rows
         if resource_id_in_scope(registration.id, name := f"{row[0]}.{row[1]}", allowed)
     )
-    relations = ", ".join(read.unqualified_relations)
     raise PostgreSQLQueryError(
         "unqualified_relation",
-        f"{relations} is unqualified and this source has several schemas; "
+        f"{', '.join(relations)} is unqualified and this source has several schemas; "
         + (
             f"qualify it: {', '.join(candidates)}."
             if candidates
@@ -1386,21 +1411,30 @@ async def _refuse_unqualified(
     )
 
 
-async def _check_functions(
-    connection: Any, called: tuple[str, ...], attributes: tuple[str, ...] = ()
-) -> None:
-    """Let the server say what each name resolves to on the pinned path."""
+async def check_functions(
+    connection: Any,
+    called: tuple[str, ...],
+    attributes: tuple[str, ...] = (),
+    written: tuple[str, ...] = (),
+) -> bool:
+    """Let the server say what each name resolves to on the pinned path.
+
+    Returns whether any called name can give a different result on another call.
+    """
 
     bare = {name: name.removeprefix("PG_CATALOG.").lower() for name in called}
     rows = await connection.fetch(
-        _FUNCTION_POLICY_LOOKUP, sorted({*bare.values(), *attributes})
+        _FUNCTION_POLICY_LOOKUP, sorted({*bare.values(), *attributes, *written})
     )
     builtin: dict[str, list[bytes | str]] = {}
     shadowed: set[str] = set()
     row_functions: set[str] = set()
+    calls = {*bare.values(), *written}
+    varying = False
     for row in rows:
         name, schema, volatility, takes_row = row[0], row[1], row[2], row[3]
         volatile = _is_volatile(name, volatility)
+        varying = varying or (name in calls and volatility not in (b"i", "i"))
         if schema == "pg_catalog":
             builtin.setdefault(name, []).append(volatility)
         else:
@@ -1420,6 +1454,14 @@ async def _check_functions(
                     or any(_is_volatile(bare_name, item) for item in builtin[bare_name])
                 ),
                 *(name for name in attributes if name in row_functions),
+                # What the parser renamed: a word that names no function is left
+                # to the server, like any other name.
+                *(
+                    name
+                    for name in written
+                    if name in shadowed
+                    or any(_is_volatile(name, item) for item in builtin.get(name, ()))
+                ),
             }
         )
     )
@@ -1431,6 +1473,7 @@ async def _check_functions(
             "allowed.",
             refused_read_details({"functions": refused[:8]}),
         )
+    return varying
 
 
 def _is_volatile(name: str, volatility: bytes | str) -> bool:
@@ -1699,7 +1742,7 @@ def _bounded_result_sql(
     )
     return (
         f"{_BOUNDED_RESULT_MARKER} SELECT {', '.join(selected)} "
-        f"FROM ({sql}) AS {row_alias}{alias_clause} LIMIT {max_rows + 1}"
+        f"FROM (\n{sql}\n) AS {row_alias}{alias_clause} LIMIT {max_rows + 1}"
     )
 
 
@@ -1726,7 +1769,7 @@ def _exact_tabular_bounded_result_sql(
     alias_clause = " (" + ", ".join(f'"{item}"' for item in aliases) + ")"
     return (
         "/* daita:postgresql.exact_tabular */ "
-        f"SELECT {', '.join(selected)} FROM ({sql}) AS {row_alias}{alias_clause} "
+        f"SELECT {', '.join(selected)} FROM (\n{sql}\n) AS {row_alias}{alias_clause} "
         f"LIMIT {max_rows + 1}"
     )
 

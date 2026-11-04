@@ -319,7 +319,7 @@ async def test_public_workflow_fixtures_use_actual_agent_and_tool_results(
             queries = [r for r in row["tool_results"] if r["name"] == "data_query"]
             assert [r["is_error"] for r in queries] == [True, False]
         with pytest.raises(runner.DiagnosticFailure, match="read-only fixture"):
-            fixture["recorder"].check(call("effect", "data_update_rows", {}))
+            fixture["recorder"].check(call("effect", "data_write", {}))
     finally:
         await runner.close_fixture(fixture, ledger)
     assert not ledger.stopped

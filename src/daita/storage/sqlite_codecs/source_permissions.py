@@ -1,4 +1,4 @@
-"""Encode and decode source read scopes and PostgreSQL update scopes."""
+"""Encode and decode source read scopes and PostgreSQL write scopes."""
 
 from __future__ import annotations
 
@@ -83,12 +83,10 @@ def decode_relational_write_scope(
         load_payload(value),
         "RelationalWriteScope",
         (
-            "resource_revision",
+            "table",
             "allowed_operations",
             "allowed_insert_columns",
             "allowed_update_columns",
-            "key_columns",
-            "generated_identity_columns",
             "max_rows",
         ),
     )
@@ -101,12 +99,10 @@ def decode_relational_write_scope(
         source_id=source_id,
         resource_id=resource_id,
         authorization_fingerprint=authorization_fingerprint,
-        resource_revision=text(fields["resource_revision"], "resource_revision"),
+        table=text(fields["table"], "table"),
         allowed_operations=names("allowed_operations"),
         allowed_insert_columns=names("allowed_insert_columns"),
         allowed_update_columns=names("allowed_update_columns"),
-        key_columns=names("key_columns"),
-        generated_identity_columns=names("generated_identity_columns"),
         max_rows=integer(fields["max_rows"], "max_rows"),
     )
 

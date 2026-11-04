@@ -26,7 +26,7 @@ from tests.support.product_workflows import (
 pytestmark = _pytestmark
 
 
-async def test_guided_upsert_authoring_applies_exact_preview(
+async def test_guided_write_authoring_applies_exact_preview(
     monkeypatch, start_host: StartHost
 ):
     # The fixture builds the agent in process; the host then owns it with the
@@ -61,8 +61,7 @@ async def test_guided_upsert_authoring_applies_exact_preview(
         choice = next(
             item for item in inspection.resources if item.resource_id == resource.id
         )
-        assert choice.upsert_conflict_keys == (("domain",),)
-        assert choice.generated_identity_columns == ("id",)
+        assert "domain" in choice.eligible_insert_columns
         before = inspection.state
         async with app.run_test(size=(110, 38)) as pilot:
             await app.push_screen(PermissionsScreen(source_id=resource.source_id))
@@ -72,13 +71,9 @@ async def test_guided_upsert_authoring_applies_exact_preview(
             await pilot.pause()
             choose(app, (resource.id,))
             await pilot.pause()
-            choose(app, ("upsert",))
-            await pilot.pause()
-            choose(app, ("0",))
+            choose(app, ("insert", "update"), multi=True)
             await pilot.pause()
             choose(app, ("domain", "name", "evidence_url"), multi=True)
-            await pilot.pause()
-            choose(app, ("allow",))
             await pilot.pause()
             choose(app, ("name", "evidence_url"), multi=True)
             await pilot.pause()
@@ -91,10 +86,11 @@ async def test_guided_upsert_authoring_applies_exact_preview(
             ).state == before
             assert preview.after.relational_write_scopes[0].max_rows == 7
             assert preview.after.relational_write_scopes[0].allowed_operations == (
-                "upsert",
+                "insert",
+                "update",
             )
             body = str(manager.query_one("#perm-body", Static).content)
-            assert '"generated_identity_columns"' in body and '"max_rows": 7' in body
+            assert '"table": "public.companies"' in body and '"max_rows": 7' in body
             assert await pilot.click("#perm-apply")
             await pilot.pause()
             assert (

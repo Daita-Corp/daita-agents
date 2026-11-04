@@ -608,7 +608,7 @@ async def test_every_model_facing_identity_argument_takes_a_name(tmp_path: Path)
     assert {
         "data_query:input.source",
         "catalog_describe:input.source",
-        "data_update_rows:input.table",
+        "data_write:input.source",
         "semantic_save:input.subject.fields[items].table",
     } <= identity_keys
 

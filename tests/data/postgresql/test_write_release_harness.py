@@ -13,15 +13,23 @@ from tests.support.postgresql_write_release import DriverProbe, WriteModel
 from tests.support.workspace import workspace_for
 
 
-@pytest.mark.parametrize("case", ["valid", "bytes", "approval", "shape"])
+@pytest.mark.parametrize(
+    ("case", "code"),
+    (
+        ("valid", None),
+        ("bytes", "write_too_large"),
+        ("shape", "write_preview_failed"),
+    ),
+)
 async def test_release_script_uses_current_public_contract_and_normalizes_invalid_input(
-    tmp_path, monkeypatch, case
+    tmp_path, monkeypatch, case, code
 ):
     # Reuse existing fake-I/O conformance support solely to verify that the new
     # script drives the current public contract. This is not PostgreSQL evidence.
     fixture = await create_fixture(tmp_path, monkeypatch)
     agent, _, db, _, _, _, _, batch, _, _ = fixture
     await agent.close()
+    db.log.clear()
     model = WriteModel()
     approvals = []
 
@@ -39,28 +47,21 @@ async def test_release_script_uses_current_public_contract_and_normalizes_invali
     )
     try:
         arguments = dict(batch)
-        if case in {"bytes", "approval"}:
-            arguments["rows"] = [
-                {
-                    "domain": str(i),
-                    "name": "N",
-                    "evidence_url": (
-                        "https://evidence.test/" if case == "bytes" else ""
-                    )
-                    + str(i),
-                }
-                for i in range(1000)
-            ]
+        if case == "bytes":
+            arguments["parameters"] = ("new.test", "N" * 70_000, "https://e.test")
         elif case == "shape":
-            arguments["rows"] = [{"domain": "new.test", "name": "New"}]
-        model.configure("upsert", arguments)
+            arguments["sql"] = (
+                "INSERT INTO public.companies (domain) VALUES ($1) "
+                "ON CONFLICT ON CONSTRAINT companies_domain_key DO NOTHING"
+            )
+            arguments["parameters"] = ("new.test",)
+        model.configure(arguments)
         result = await agent.run("Store the fixture company once.")
         assert result.reason == "completed"
-        if case != "valid":
+        if code is not None:
             error = model.results["preview"].output["error"]
             assert isinstance(error, Mapping)
-            assert error["code"] == "upsert_invalid_batch"
-            assert "no write was dispatched" in str(error["message"])
+            assert error["code"] == code
             assert len(model.requests) == 3 and result.usage.total_tokens == 36
             assert not approvals and not db.rows and not db.log
             assert not await agent.list_effects()
@@ -73,6 +74,16 @@ async def test_release_script_uses_current_public_contract_and_normalizes_invali
         assert len(approvals) == 1 and len(db.rows) == 1
     finally:
         await agent.close()
+
+
+class Statement:
+    def __init__(self, connection, sql):
+        self.connection = connection
+        self.sql = sql
+
+    async def cursor(self, *args, **kwargs):
+        self.connection.log.append(self.sql)
+        yield {"__daita_key": "1", "__daita_inserted": False}
 
 
 class Connection:
@@ -93,13 +104,16 @@ class Connection:
     async def commit(self):
         self.log.append("real-commit")
 
-    async def execute(self, sql, *args, **kwargs):
-        self.log.append(sql)
-        return "UPDATE 1"
+    async def prepare(self, sql, **kwargs):
+        return Statement(self, sql)
 
     async def fetch(self, sql, *args, **kwargs):
         self.log.append(sql)
         return [{"id": 123}]
+
+
+async def _drain(rows):
+    return [row async for row in rows]
 
 
 @pytest.mark.parametrize(
@@ -143,9 +157,10 @@ async def test_cancellation_injection_waits_until_the_driver_operation_finishes(
     probe.mode = mode
     wrapped = probe.wrap(connection)
     if mode == "pause_after_mutation":
-        work = wrapped.fetch("INSERT INTO canary VALUES ($1)", 1)
+        statement = await wrapped.prepare("INSERT INTO canary VALUES ($1)")
+        work = _drain(statement.cursor(1))
     else:
-        work = wrapped.transaction().commit()
+        work = wrapped.transaction(isolation="read_committed").commit()
     task = asyncio.create_task(work)
     try:
         await asyncio.wait_for(probe.reached.wait(), timeout=1)
@@ -164,7 +179,7 @@ async def test_count_mismatch_is_injected_after_real_update_completion():
     connection = Connection()
     probe = DriverProbe()
     probe.mode = "wrong_update_count"
-    status = await probe.wrap(connection).execute("UPDATE canary SET name = $1", "New")
-    assert status == "UPDATE 0"
+    statement = await probe.wrap(connection).prepare("UPDATE canary SET name = $1")
+    assert await _drain(statement.cursor("New")) == []
     assert connection.log == ["UPDATE canary SET name = $1"]
     assert probe.mutations == 1 and probe.server_commits == 0

@@ -7,7 +7,11 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from ...._json import FrozenJsonObject, canonical_json
-from ....storage.sqlite_records import SourceReadMode, SourceReadScope
+from ....storage.sqlite_records import (
+    RelationalWriteScope,
+    SourceReadMode,
+    SourceReadScope,
+)
 
 _SqlDialect = Literal["sqlite", "postgresql"]
 _MAX_VALIDATION_ISSUE_DETAILS_CHARACTERS = 1_536
@@ -386,6 +390,7 @@ class SqlAnalysis:
     table_function_names: tuple[str, ...] = ()
     explicit_operator_names: tuple[str, ...] = ()
     attribute_names: tuple[str, ...] = ()
+    written_call_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sql", _required_text(self.sql, "analysis sql"))
@@ -419,6 +424,7 @@ class SqlAnalysis:
             "table_function_names",
             "explicit_operator_names",
             "attribute_names",
+            "written_call_names",
         ):
             values = tuple(getattr(self, field_name))
             if values != tuple(sorted(set(values))):
@@ -461,6 +467,7 @@ class SqlValidationResult:
     resource_names: tuple[tuple[str, str], ...] = ()
     function_lookups: tuple[str, ...] = ()
     attribute_lookups: tuple[str, ...] = ()
+    written_calls: tuple[str, ...] = ()
     unqualified_relations: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -493,6 +500,7 @@ class CheckedRead:
     # functions, and ``x.name`` reads the server could resolve to ``name(x)``.
     function_lookups: tuple[str, ...] = ()
     attribute_lookups: tuple[str, ...] = ()
+    written_calls: tuple[str, ...] = ()
     # Names only the source can place: refused with candidates from a live lookup.
     unqualified_relations: tuple[str, ...] = ()
     # What the read touches, from the parse: (derived ID, full name).
@@ -510,6 +518,114 @@ class CheckedRead:
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> CheckedRead:
         return cls(**value)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
+class WriteFacts:
+    """What a source's ``describe`` says one write is: its target and columns."""
+
+    table: str
+    resource_id: str
+    operation: str
+    insert_columns: tuple[str, ...]
+    update_columns: tuple[str, ...]
+    # How the source runs it; only that source's adapter reads this.
+    statement: Mapping[str, object]
+    resource_ids: tuple[str, ...] = ()
+    resource_names: tuple[tuple[str, str], ...] = ()
+    allowed_resource_ids: tuple[str, ...] | None = None
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((*self.insert_columns, *self.update_columns)))
+
+    def to_mapping(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in self.__slots__}
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> WriteFacts:
+        return cls(**value)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
+class WritePreview:
+    """What a source says a write would touch, for the approval card."""
+
+    source_id: str
+    table: str
+    operation: str
+    sql: str
+    columns_changed: tuple[str, ...]
+    affected_rows: int
+    inserted_rows: int
+    updated_rows: int
+    deleted_rows: int
+    skipped_rows: int
+    samples: tuple[Mapping[str, object], ...]
+    triggers: tuple[str, ...]
+    cascades: tuple[str, ...]
+    warnings: tuple[str, ...]
+    # How far the source compares what it touched: "rows" or "count".
+    verification: str
+    intent_sha256: str
+    target_set_sha256: str
+    structure_sha256: str
+    preview_fingerprint: str
+
+    def to_mapping(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in self.__slots__}
+
+
+def write_facts(arguments: Mapping[str, object]) -> WriteFacts:
+    """The write the data domain prepared for one executor call."""
+
+    item = arguments["_write"]
+    assert isinstance(item, Mapping)
+    return WriteFacts.from_mapping(item)
+
+
+def write_permission_issue(
+    scope: RelationalWriteScope | None, facts: WriteFacts
+) -> SqlValidationIssue | None:
+    """Why stored permission does not cover this operation and these columns."""
+
+    table = facts.table
+    if scope is None:
+        return SqlValidationIssue(
+            "resource_write_not_allowed",
+            f"{table} has no write permission. A person enables writes for a table "
+            "with /sources.",
+            {"table": table},
+        )
+    needed = {facts.operation, *(("update",) if facts.update_columns else ())}
+    missing = sorted(needed - set(scope.allowed_operations))
+    if missing:
+        return SqlValidationIssue(
+            "write_operation_not_allowed",
+            f"{table} allows {', '.join(scope.allowed_operations)}, not "
+            f"{', '.join(missing)}.",
+            {"table": table, "allowed_operations": scope.allowed_operations},
+        )
+    for columns, allowed, code in (
+        (
+            facts.insert_columns,
+            scope.allowed_insert_columns,
+            "insert_column_not_allowed",
+        ),
+        (
+            facts.update_columns,
+            scope.allowed_update_columns,
+            "update_column_not_allowed",
+        ),
+    ):
+        refused = sorted(set(columns) - set(allowed))
+        if refused:
+            return SqlValidationIssue(
+                code,
+                f"{table} does not allow writing {', '.join(refused)}.",
+                {"table": table, "columns": refused, "allowed_columns": allowed},
+            )
+    return None
 
 
 def checked_reads(arguments: Mapping[str, object]) -> tuple[CheckedRead, ...]:

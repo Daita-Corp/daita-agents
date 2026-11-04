@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Protocol
 from ..config import HostCapacityLimits, PostgreSQLReadLimits
 from ..security import SecretProvider
 from .models import SourceRegistration
-from .protocols import ResourceSource, SourceReadScopeStore
+from .protocols import ResourceSource, SourcePermissionStore
 
 if TYPE_CHECKING:
     from ..domains.data.catalog import CatalogDataView
@@ -31,8 +31,7 @@ class SourceOperation(str, Enum):
     SQL_READ = "sql_read"
     TABULAR_EXPORT = "tabular_export"
     PROFILE = "profile"
-    RELATIONAL_UPDATE = "relational_update"
-    RELATIONAL_UPSERT = "relational_upsert"
+    RELATIONAL_WRITE = "relational_write"
     TABULAR_READ = "tabular_read"
     FILE_SEARCH = "file_search"
     TEXT_READ = "text_read"
@@ -55,7 +54,7 @@ _SQL_OPERATIONS = frozenset(SourceOperation) - {
 class SourceBackendContext:
     """Host-owned dependencies a source type may use to build its backends."""
 
-    store: SourceReadScopeStore
+    store: SourcePermissionStore
     catalog: CatalogDataView
     secret_provider: SecretProvider
     clock: Callable[[], datetime]
@@ -232,7 +231,6 @@ def _postgresql_operations(
     )
     writes = PostgreSQLWriteBackend(
         context.store,
-        context.catalog,
         context.secret_provider,
         clock=context.clock,
     )
@@ -241,8 +239,7 @@ def _postgresql_operations(
         SourceOperation.TABULAR_EXPORT: reads,
         SourceOperation.PROFILE: reads,
         SourceOperation.LIVE_LOOKUP: reads,
-        SourceOperation.RELATIONAL_UPDATE: writes,
-        SourceOperation.RELATIONAL_UPSERT: writes,
+        SourceOperation.RELATIONAL_WRITE: writes,
     }
 
 
@@ -306,8 +303,7 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
                     SourceOperation.TABULAR_EXPORT,
                     SourceOperation.PROFILE,
                     SourceOperation.LIVE_LOOKUP,
-                    SourceOperation.RELATIONAL_UPDATE,
-                    SourceOperation.RELATIONAL_UPSERT,
+                    SourceOperation.RELATIONAL_WRITE,
                 }
             ),
             create_backends=_postgresql_operations,

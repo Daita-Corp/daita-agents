@@ -674,7 +674,7 @@ async def test_public_cancellation_settles_real_worker_and_child_io(
 async def test_public_shared_child_budget_and_forbidden_targets(
     tmp_path, analysis_report
 ):
-    code = "for name in ['python_execute','toolbox_load','artifact_save_local','data_update_rows','unloaded_fixture']:\n r=tools.call(name, {})\n assert r['is_error']"
+    code = "for name in ['python_execute','toolbox_load','artifact_save_local','data_write','unloaded_fixture']:\n r=tools.call(name, {})\n assert r['is_error']"
     agent = await make_agent(
         tmp_path,
         (

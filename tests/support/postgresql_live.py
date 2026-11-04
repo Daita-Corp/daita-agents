@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from daita import Agent, ApprovalDecision, ApprovalRequest
+from daita import Agent, ApprovalDecision, ApprovalRequest, MCPToolSelection
 from daita.adapters import postgresql_write as native
+from daita.adapters.mcp import SDKMCPClientFactory
 from daita.capabilities import EffectEvidenceBasis, EffectOutcome
+from daita.llm.models import ModelSensitivity
 from daita.security import SecretReference
 from daita.storage.sqlite_records import EffectReceipt
+from tests.support.mcp import conformance_identities, mock_transport
+from tests.support.native_writes import ScriptedResearchModel
 from tests.support.postgresql_write_release import DriverProbe, WriteModel
 from tests.support.workspace import workspace_for
 
@@ -27,6 +32,7 @@ _LOCK_ID = 7_346_218_930
 async def _reset(admin: Any) -> None:
     await admin.execute(f"ALTER TABLE {_TABLE} DROP COLUMN IF EXISTS release_drift")
     await admin.execute(f"GRANT SELECT, UPDATE ON {_TABLE} TO {_ROLE}")
+    await admin.execute(f"REVOKE DELETE ON {_TABLE} FROM {_ROLE}")
     await admin.execute(
         f"GRANT INSERT (domain, name, evidence_url, notes) ON {_TABLE} TO {_ROLE}"
     )
@@ -35,7 +41,7 @@ async def _reset(admin: Any) -> None:
     )
 
 
-class _Secrets:
+class WriteTesterSecrets:
     async def resolve(self, reference: SecretReference) -> str:
         assert reference == SecretReference.keychain(
             "fixture:postgres-large:write-release"
@@ -71,16 +77,17 @@ class Fixture:
     ) -> None:
         scopes = {}
         if operation != "none":
-            scopes[self.resource_id] = {
-                "allowed_operations": (operation,),
+            scopes[_TABLE] = {
+                "allowed_operations": {
+                    "upsert": ("insert", "update"),
+                    "all": ("insert", "update", "delete"),
+                }.get(operation, (operation,)),
                 "allowed_insert_columns": (
                     ("domain", "name", "evidence_url", "notes")
-                    if operation == "upsert"
+                    if operation in {"upsert", "all"}
                     else ()
                 ),
                 "allowed_update_columns": ("name", "evidence_url", "notes"),
-                "key_columns": ("domain",) if operation == "upsert" else ("id",),
-                "generated_identity_columns": ("id",) if operation == "upsert" else (),
                 "max_rows": max_rows,
             }
         preview = await self.agent.preview_source_permissions(
@@ -95,35 +102,18 @@ class Fixture:
         )
 
     def upsert(self, rows: list[dict[str, object]], *, notes: bool = False) -> None:
+        columns = ["domain", "name", "evidence_url", *(["notes"] if notes else [])]
         self.model.configure(
-            "upsert",
-            {
-                "source_id": self.source_id,
-                "resource_id": self.resource_id,
-                "key_columns": ("domain",),
-                "insert_columns": (
-                    ("domain", "name", "evidence_url", "notes")
-                    if notes
-                    else ("domain", "name", "evidence_url")
-                ),
-                "update_columns": (
-                    ("name", "evidence_url", "notes")
-                    if notes
-                    else ("name", "evidence_url")
-                ),
-                "rows": rows,
-            },
+            batch_upsert(self.source_id, _TABLE, columns, "domain", rows)
         )
 
     def update(self) -> None:
         self.model.configure(
-            "update",
             {
                 "source_id": self.source_id,
-                "resource_id": self.resource_id,
-                "where": [{"column": "id", "operator": "eq", "value": 1}],
-                "assignments": [{"column": "name", "value": "Updated"}],
-            },
+                "sql": f"UPDATE {_TABLE} SET name = $1 WHERE id = $2",
+                "parameters": ["Updated", 1],
+            }
         )
 
     async def run(self) -> None:
@@ -171,20 +161,17 @@ class Fixture:
             root=self.root,
             model=self.model,
             model_profile=self.model.model_profile,
-            secret_provider=_Secrets(),
+            secret_provider=WriteTesterSecrets(),
             workspace=workspace_for(self.root),
             approval_handler=self.approve,
         )
 
 
-@pytest.fixture
-async def database(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> AsyncIterator[Fixture]:
+async def _admin_connection() -> Any:
     import asyncpg  # type: ignore[import-untyped]
 
     # No configurable host/database: this harness must never target a customer DB.
-    admin = await asyncpg.connect(
+    return await asyncpg.connect(
         host="127.0.0.1",
         port=int(os.environ.get("DAITA_LARGE_POSTGRES_PORT", "55433")),
         database="daita_large_fixture",
@@ -197,6 +184,121 @@ async def database(
         command_timeout=10,
         server_settings={"application_name": "daita-write-release-control"},
     )
+
+
+@dataclass
+class LiveWriteSource:
+    """A home whose one writable source is the real postgres-large fixture."""
+
+    admin: Any
+    source_id: str
+    research: Any
+    research_factory: SDKMCPClientFactory
+    parameters: tuple[str, str, str]
+
+    async def rows(self) -> Mapping[str, Mapping[str, Any]]:
+        return {
+            row["domain"]: dict(row)
+            for row in await self.admin.fetch(f"SELECT * FROM {_TABLE}")
+        }
+
+
+@contextlib.asynccontextmanager
+async def live_write_source(root: Path, agent: str) -> AsyncIterator[LiveWriteSource]:
+    """Prepare and close one agent home; live job and routine runs then open it."""
+
+    admin = await _admin_connection()
+    locked = await admin.fetchval("SELECT pg_try_advisory_lock($1)", _LOCK_ID)
+    assert locked, "Another write-release suite owns this fixture; run serially."
+    try:
+        await _reset(admin)
+        research, _ = conformance_identities()
+        research.results["lookup"] = {
+            "content": [
+                {
+                    "type": "text",
+                    "text": "New Co lists Acme as a customer. "
+                    "https://source.test/new; one source, coverage is incomplete.",
+                }
+            ],
+            "structuredContent": {
+                "answer": "New Co; https://source.test/new; model must assess the claim"
+            },
+            "isError": False,
+        }
+        factory = SDKMCPClientFactory(http_transport=mock_transport(research))
+        model = ScriptedResearchModel()
+        home = await Agent.create(
+            agent,
+            root=root,
+            model=model,
+            model_profile=model.model_profile,
+            secret_provider=WriteTesterSecrets(),
+            workspace=workspace_for(root),
+            mcp_client_factory=factory,
+        )
+        try:
+            source = await home.attach_postgresql(
+                host="127.0.0.1",
+                port=int(os.environ.get("DAITA_LARGE_POSTGRES_PORT", "55433")),
+                database="daita_large_fixture",
+                username=_ROLE,
+                credential=SecretReference.keychain(
+                    "fixture:postgres-large:write-release"
+                ),
+                schemas=("write_acceptance",),
+                ssl_mode="disable",
+            )
+            preview = await home.preview_source_permissions(
+                source_id=source.id,
+                read_mode="all",
+                read_resource_ids=(),
+                relational_write_scopes={
+                    _TABLE: {
+                        "allowed_operations": ("insert", "update"),
+                        "allowed_insert_columns": ("domain", "name", "evidence_url"),
+                        "allowed_update_columns": ("name", "evidence_url"),
+                        "max_rows": 10,
+                    }
+                },
+            )
+            await home.apply_source_permissions(
+                source_id=source.id,
+                confirmation_fingerprint=preview.confirmation_fingerprint,
+            )
+            await home.attach_mcp_server(
+                endpoint=research.endpoint,
+                selections=(
+                    MCPToolSelection(
+                        remote_name="lookup",
+                        local_alias="research",
+                        description="Research companies and return cited evidence.",
+                        # A higher class would lift the request above this source's.
+                        result_sensitivity=ModelSensitivity.INTERNAL,
+                    ),
+                ),
+                maximum_outbound_sensitivity=ModelSensitivity.INTERNAL,
+            )
+        finally:
+            await home.close()
+        yield LiveWriteSource(
+            admin,
+            source.id,
+            research,
+            factory,
+            ("new.test", "New Co", "https://source.test/new"),
+        )
+    finally:
+        await _reset(admin)
+        await admin.fetchval("SELECT pg_advisory_unlock($1)", _LOCK_ID)
+        await admin.close()
+
+
+@pytest.fixture
+async def database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[Fixture]:
+    admin = await _admin_connection()
     locked = False
     fixture = None
     probe = DriverProbe()
@@ -222,7 +324,7 @@ async def database(
             root=tmp_path,
             model=model,
             model_profile=model.model_profile,
-            secret_provider=_Secrets(),
+            secret_provider=WriteTesterSecrets(),
             workspace=workspace_for(tmp_path),
             approval_handler=lambda request: approve(request),
         )
@@ -286,6 +388,34 @@ async def database(
             finally:
                 await admin.close()
             assert not leaked, "native write left an asyncpg connection open"
+
+
+def batch_upsert(
+    source_id: str,
+    table: str,
+    columns: list[str],
+    key: str,
+    rows: list[dict[str, object]],
+) -> dict[str, object]:
+    """One INSERT ... VALUES ... ON CONFLICT with bound parameters."""
+
+    values = ", ".join(
+        "("
+        + ", ".join(f"${i * len(columns) + j + 1}" for j in range(len(columns)))
+        + ")"
+        for i in range(len(rows))
+    )
+    updates = ", ".join(
+        f"{column} = EXCLUDED.{column}" for column in columns if column != key
+    )
+    return {
+        "source_id": source_id,
+        "sql": (
+            f"INSERT INTO {table} ({', '.join(columns)}) VALUES {values} "
+            f"ON CONFLICT ({key}) DO UPDATE SET {updates}"
+        ),
+        "parameters": [item.get(column) for item in rows for column in columns],
+    }
 
 
 def row(domain: str = "new.test", name: str = "New") -> dict[str, object]:

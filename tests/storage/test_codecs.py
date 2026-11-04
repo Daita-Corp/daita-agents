@@ -329,12 +329,10 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
         agent_id=read_scope.agent_id,
         source_id=read_scope.source_id,
         resource_id="catalog-resource:sha256:" + "2" * 64,
+        table="public.orders",
         allowed_update_columns=("status", "amount"),
-        resource_revision="sha256:" + "5" * 64,
         allowed_operations=("update",),
         allowed_insert_columns=(),
-        key_columns=("id",),
-        generated_identity_columns=(),
         max_rows=10000,
         authorization_fingerprint="sha256:" + "4" * 64,
     )

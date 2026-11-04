@@ -20,11 +20,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol
 
+from ..adapters.protocols import SourcePermissionStore
 from ..artifacts.store import ArtifactRegistry
 from ..capability_runtime import EffectReceiptStore
 from ..catalog.protocols import CatalogStore
 from ..distribution.owner import DistributionStore
-from ..domains.data.catalog import CatalogPermissionStore
 from ..domains.mcp import MCPBindingStore
 from ..jobs.owner import JobStore
 from ..loop.driver import TranscriptStore
@@ -57,7 +57,7 @@ class StateStore(
     EffectReceiptStore,
     CatalogStore,
     DistributionStore,
-    CatalogPermissionStore,
+    SourcePermissionStore,
     MCPBindingStore,
     JobStore,
     TranscriptStore,

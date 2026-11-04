@@ -163,8 +163,8 @@ async def test_approval_presentation_failure_is_not_converted_to_denial():
     request = ApprovalRequest(
         run_id="run-failure",
         call_id="call-failure",
-        tool_name="data_update_rows",
-        capability_id="data.update_rows",
+        tool_name="data_write",
+        capability_id="data.write",
         arguments=FrozenJsonObject.from_mapping({"name": "safe"}),
         reason="review failure",
     )

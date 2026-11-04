@@ -152,8 +152,8 @@ def validate_read(
                 "tabular execution path.",
             )
         )
-    issues.extend(_function_issues(analysis, dialect))
-    issues.extend(_parameter_issues(analysis, parameters, dialect))
+    issues.extend(function_issues(analysis, dialect))
+    issues.extend(parameter_issues(analysis, parameters, dialect))
 
     selected: dict[str, str] = {}
     unqualified: list[str] = []
@@ -161,14 +161,14 @@ def validate_read(
         if table.is_cte:
             continue
         check = (
-            _check_postgresql_relation(table, source_id, allowed_resource_ids, schemas)
+            check_postgresql_relation(table, source_id, allowed_resource_ids, schemas)
             if dialect == "postgresql"
             else _check_sqlite_relation(table, source_id, allowed_resource_ids)
         )
         if isinstance(check, SqlValidationIssue):
             issues.append(check)
         elif check is None:
-            unqualified.append(_fold_postgresql(table.name, table.name_quoted))
+            unqualified.append(fold_postgresql(table.name, table.name_quoted))
         else:
             selected.setdefault(check[0], check[1])
 
@@ -181,16 +181,21 @@ def validate_read(
         issues=bounded_issues,
         resource_names=tuple(selected.items()),
         function_lookups=(
-            tuple(
-                name
-                for name in analysis.function_names
-                if name.removeprefix("PG_CATALOG.") not in _POSTGRESQL_GRAMMAR_FORMS
-            )
-            if dialect == "postgresql"
-            else ()
+            postgresql_function_lookups(analysis) if dialect == "postgresql" else ()
         ),
         attribute_lookups=analysis.attribute_names,
+        written_calls=analysis.written_call_names,
         unqualified_relations=tuple(dict.fromkeys(unqualified)),
+    )
+
+
+def postgresql_function_lookups(analysis: SqlAnalysis) -> tuple[str, ...]:
+    """The called names the server must place; grammar forms are not functions."""
+
+    return tuple(
+        name
+        for name in analysis.function_names
+        if name.removeprefix("PG_CATALOG.") not in _POSTGRESQL_GRAMMAR_FORMS
     )
 
 
@@ -208,7 +213,7 @@ def resource_id_in_scope(
     return view_id if view_id in allowed else None
 
 
-def _check_postgresql_relation(
+def check_postgresql_relation(
     table: SqlTableReference,
     source_id: str,
     allowed: frozenset[str] | None,
@@ -217,7 +222,7 @@ def _check_postgresql_relation(
     """A relation's (ID, full name), the issue refusing it, or None when unqualified."""
 
     parts = tuple(
-        _fold_postgresql(name, quoted) for name, quoted in table.qualified_parts
+        fold_postgresql(name, quoted) for name, quoted in table.qualified_parts
     )
     if len(parts) == 1:
         # pg_catalog is searched first, so an unqualified pg_ name is a system
@@ -265,7 +270,7 @@ def _check_sqlite_relation(
     return _out_of_scope(table) if resource_id is None else (resource_id, full_name)
 
 
-def _fold_postgresql(name: str, quoted: bool) -> str:
+def fold_postgresql(name: str, quoted: bool) -> str:
     return name if quoted else name.translate(_ASCII_IDENTIFIER_CASE_TRANSLATION)
 
 
@@ -287,7 +292,7 @@ def _introspection_refused(table: SqlTableReference) -> SqlValidationIssue:
     )
 
 
-def _function_issues(
+def function_issues(
     analysis: SqlAnalysis, dialect: _SqlDialect
 ) -> tuple[SqlValidationIssue, ...]:
     if dialect == "sqlite":
@@ -334,7 +339,7 @@ def _function_issues(
     return tuple(issues)
 
 
-def _parameter_issues(
+def parameter_issues(
     analysis: SqlAnalysis, parameters: Sequence[object], dialect: _SqlDialect
 ) -> tuple[SqlValidationIssue, ...]:
     if dialect == "sqlite":

@@ -42,9 +42,9 @@ from .domains.data.controller import (
     FILE_SEARCH_CAPABILITY_ID,
     PATH_QUERY_CAPABILITY_ID,
     PATH_QUERY_OUTPUT_KIND,
-    RELATIONAL_UPDATE_CAPABILITY_ID,
-    RELATIONAL_UPDATE_EVIDENCE_KIND,
-    RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
+    RELATIONAL_WRITE_CAPABILITY_ID,
+    RELATIONAL_WRITE_EVIDENCE_KIND,
+    RELATIONAL_WRITE_PREVIEW_EVIDENCE_KIND,
     SOURCE_FILE_CAPABILITY_IDS,
     TEXT_READ_CAPABILITY_ID,
     TEXT_READ_OUTPUT_KIND as TEXT_READ_EVIDENCE_KIND,
@@ -142,10 +142,14 @@ _MAXIMUM_MCP_HISTORY_PREVIEW_UTF8_BYTES = 2_048
 _CATALOG_EVIDENCE_KINDS = frozenset(
     {CATALOG_SEARCH_EVIDENCE_KIND, CATALOG_DESCRIBE_EVIDENCE_KIND}
 )
+# The stored kind: transcripts from before data_write still replay.
+_STORED_UPDATE_PREVIEW_KIND = "data.preview_update_rows"
+_STORED_UPDATE_RESULT_KIND = "data.update_rows_result"
 _QUERY_EVIDENCE_KINDS = frozenset(
     {
         DATA_QUERY_EVIDENCE_KIND,
-        RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
+        RELATIONAL_WRITE_PREVIEW_EVIDENCE_KIND,
+        _STORED_UPDATE_PREVIEW_KIND,
     }
 )
 _QUERY_TOOL_EVIDENCE_KINDS = {
@@ -158,7 +162,8 @@ _SIDE_EFFECT_EVIDENCE_KINDS = frozenset(
         SEMANTIC_DELETE_OUTPUT_KIND,
         SKILL_SAVE_OUTPUT_KIND,
         SKILL_DELETE_OUTPUT_KIND,
-        RELATIONAL_UPDATE_EVIDENCE_KIND,
+        RELATIONAL_WRITE_EVIDENCE_KIND,
+        _STORED_UPDATE_RESULT_KIND,
     }
 )
 _SIDE_EFFECT_TOOL_NAMES = frozenset(
@@ -1680,11 +1685,14 @@ def _project_historical_result(
     data = block.output.get("data")
     if not isinstance(data, Mapping):
         return None, True, False
-    if kind == RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND:
+    if kind in {RELATIONAL_WRITE_PREVIEW_EVIDENCE_KIND, _STORED_UPDATE_PREVIEW_KIND}:
         compact = _selected_result_fields(
             data,
             (
                 "source_id",
+                "table",
+                "operation",
+                "affected_rows",
                 "source_revision",
                 "resource_id",
                 "resource_revision",
@@ -2669,18 +2677,15 @@ def _tool_guidance(
                 "outputs.add and explicitly select save_output for artifact publication. "
                 "Reuse an existing candidate when only saving is needed."
             )
-    native_tools = (
-        (RELATIONAL_UPDATE_CAPABILITY_ID, "data_update_rows"),
-        ("data.upsert_rows", "data_upsert_rows"),
+    discoverable_native = (
+        ["data_write"]
+        if RELATIONAL_WRITE_CAPABILITY_ID in candidates
+        and RELATIONAL_WRITE_CAPABILITY_ID not in capability_ids
+        else []
     )
-    discoverable_native = [
-        name
-        for capability_id, name in native_tools
-        if capability_id in candidates and capability_id not in capability_ids
-    ]
     if discoverable_native:
         instructions.append(
-            "Native row tools discoverable in this run: "
+            "Native write tool discoverable in this run: "
             + ", ".join(discoverable_native)
             + ". For a requested mutation, load the tool with toolbox_load; no search is "
             "needed for these exact names. Loading takes effect next step and grants no "
@@ -2692,12 +2697,10 @@ def _tool_guidance(
         # Catalog tools mean a connected source whose rows the note is about;
         # a live folder alone has no rows to mutate.
         and CATALOG_SEARCH_CAPABILITY_ID in candidates
-        and not any(
-            capability_id in candidates for capability_id, _name in native_tools
-        )
+        and RELATIONAL_WRITE_CAPABILITY_ID not in candidates
     ):
         instructions.append(
-            "Native row mutation is unavailable in this run. Reads cannot write, and repeated search cannot enable it."
+            "Native writes are unavailable in this run. Reads cannot write, and repeated search cannot enable it."
         )
     if external_actions_callable:
         instructions.append(

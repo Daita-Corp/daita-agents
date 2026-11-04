@@ -26,7 +26,7 @@ from .adapters.postgresql import (
     PostgreSQLSourceError,
 )
 from .adapters.postgresql_query import PostgreSQLReadDiagnostics
-from .adapters.postgresql_write import RelationalUpdateReadiness
+from .adapters.postgresql_write import RelationalWriteReadiness
 from .adapters.protocols import (
     ResourceAdapterError as SourceRefreshError,
     ResourceSource,
@@ -1192,11 +1192,11 @@ class Agent:
         if not isinstance(relational_write_scopes, Mapping):
             raise TypeError("relational_write_scopes must be a mapping")
         if any(
-            not isinstance(resource_id, str) or not isinstance(value, Mapping)
-            for resource_id, value in relational_write_scopes.items()
+            not isinstance(table, str) or not isinstance(value, Mapping)
+            for table, value in relational_write_scopes.items()
         ):
             raise TypeError(
-                "relational_write_scopes must map exact resource IDs to explicit write constraints"
+                "relational_write_scopes must map full table names to explicit write constraints"
             )
         return await self._embedded.preview_source_permissions(
             source_id=source_id,
@@ -1225,38 +1225,16 @@ class Agent:
             confirmation_fingerprint=confirmation_fingerprint,
         )
 
-    async def relational_upsert_readiness(
-        self, source_id: str, resource_id: str
-    ) -> Mapping[str, object]:
-        """Inspect exact admitted upsert structure and privileges without writing."""
-        if (
-            not isinstance(source_id, str)
-            or not source_id
-            or not isinstance(resource_id, str)
-            or not resource_id
-        ):
-            raise ValueError("upsert readiness requires exact source and resource IDs")
-        return await self._embedded.relational_upsert_readiness(source_id, resource_id)
-
-    async def relational_update_readiness(
-        self,
-        source_id: str,
-        resource_id: str,
-        assignment_columns: tuple[str, ...],
-    ) -> RelationalUpdateReadiness:
-        """Return bounded non-mutating readiness for one exact update scope."""
+    async def relational_write_readiness(
+        self, source_id: str, table: str
+    ) -> RelationalWriteReadiness:
+        """Return bounded non-mutating readiness for one table's write scope."""
 
         if not isinstance(source_id, str) or not source_id:
             raise ValueError("source_id must be a non-empty string")
-        if not isinstance(resource_id, str) or not resource_id:
-            raise ValueError("resource_id must be a non-empty string")
-        if not isinstance(assignment_columns, tuple):
-            raise TypeError("assignment_columns must be a tuple")
-        return await self._embedded.relational_update_readiness(
-            source_id,
-            resource_id,
-            assignment_columns,
-        )
+        if not isinstance(table, str) or not table:
+            raise ValueError("table must be a non-empty string")
+        return await self._embedded.relational_write_readiness(source_id, table)
 
     async def detach(self, source_id: str) -> SourceRegistration:
         return await self._embedded.detach(source_id)

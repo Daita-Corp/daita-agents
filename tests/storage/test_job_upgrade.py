@@ -241,6 +241,8 @@ def _seed_revision_3_graph(home: Path, agent_id: str) -> str:
             "'job-done', 'worker', 'attempt-1', 1, ?, ?)",
             (agent_id, receipt.receipt_id, DIGEST, DIGEST, encode_receipt(receipt)),
         )
+    # Left to the garbage collector, its close can rewrite the file mid-upgrade.
+    connection.close()
     return receipt.receipt_id
 
 

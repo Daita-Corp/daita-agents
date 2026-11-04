@@ -47,7 +47,7 @@ from ..adapters.postgresql import (
     PostgreSQLSource,
 )
 from ..adapters.postgresql_query import PostgreSQLReadDiagnostics
-from ..adapters.postgresql_write import RelationalUpdateReadiness
+from ..adapters.postgresql_write import PostgreSQLWriteBackend, RelationalWriteReadiness
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.registry import (
     SourceBackendContext,
@@ -75,7 +75,6 @@ from ..capabilities import (
     ApprovalRequest,
     Capability,
     CapabilityDeclarations,
-    CapabilityInputError,
     CapabilityRegistry,
     EffectOutcome,
     ExecutionContractBindings,
@@ -141,12 +140,9 @@ from ..domains.data import (
     data_query_declarations,
     exact_export_declarations,
     exact_export_outputs,
-    relational_update_declarations,
-    relational_update_preview_declarations,
-    relational_upsert_declarations,
+    relational_write_declarations,
     source_file_declarations,
 )
-from ..domains.data.catalog import RELATIONAL_WRITE_OPERATIONS
 from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
 from ..domains.mcp import (
     MCP_DOMAIN_OWNER_ID,
@@ -367,28 +363,6 @@ def _backends_with(backends: SourceBackends, method: str) -> tuple[Any, ...]:
         for backend in unique.values()
         if callable(getattr(backend, method, None))
     )
-
-
-async def _relational_upsert_readiness(
-    data_view: CatalogDataView,
-    backends: SourceBackends,
-    agent_id: str,
-    constraints: FrozenJsonObject,
-) -> FrozenJsonObject:
-    adapter_id = await data_view.source_adapter_id(
-        agent_id, str(constraints["source_id"])
-    )
-    backend = (
-        None
-        if adapter_id is None
-        else backends[SourceOperation.RELATIONAL_UPSERT].get(adapter_id)
-    )
-    if backend is None:
-        raise CapabilityInputError(
-            "resource_write_not_allowed",
-            "Explicit current upsert permission is required.",
-        )
-    return cast(FrozenJsonObject, await backend.upsert_readiness(agent_id, constraints))
 
 
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -1420,19 +1394,9 @@ class EmbeddedAgent:
                 else ()
             ),
         )
-        relational_update_preview = relational_update_preview_declarations(
+        relational_write = relational_write_declarations(
             identity.id,
-            source_backends[SourceOperation.RELATIONAL_UPDATE],
-            data_view.source_adapter_id,
-        )
-        relational_update = relational_update_declarations(
-            identity.id,
-            source_backends[SourceOperation.RELATIONAL_UPDATE],
-            data_view.source_adapter_id,
-        )
-        relational_upsert = relational_upsert_declarations(
-            identity.id,
-            source_backends[SourceOperation.RELATIONAL_UPSERT],
+            source_backends[SourceOperation.RELATIONAL_WRITE],
             data_view.source_adapter_id,
         )
         if hosted != (workspace is None and workspace_backend is None):
@@ -1456,18 +1420,14 @@ class EmbeddedAgent:
             if registration.active and registry.get(registration.adapter_id)
         )
         for registration in available_sources:
-            for scope in await store.list_relational_write_scopes(
+            if await store.list_relational_write_scopes(
                 identity.id, registration.id
+            ) and not registry.supports(
+                registration.adapter_id, SourceOperation.RELATIONAL_WRITE
             ):
-                if any(
-                    not registry.supports(
-                        registration.adapter_id, RELATIONAL_WRITE_OPERATIONS[name]
-                    )
-                    for name in scope.allowed_operations
-                ):
-                    raise AgentHomeError(
-                        "stored relational write scope is foreign to its source type"
-                    )
+                raise AgentHomeError(
+                    "stored relational write scope is foreign to its source type"
+                )
         source_capacities = {
             f"source:{registration.id}": registry.read_capacity(
                 registration.adapter_id, host_capacity
@@ -1536,9 +1496,7 @@ class EmbeddedAgent:
             catalog,
             relational_query,
             relational_export,
-            relational_update_preview,
-            relational_update,
-            relational_upsert,
+            relational_write,
             source_files,
         )
         memory_declarations = _domain_declarations(MEMORY_DOMAIN_OWNER_ID, memory)
@@ -1563,12 +1521,12 @@ class EmbeddedAgent:
             registry,
             relational_export_available=relational_export is not None,
             combined_query_available=combined_engine is not None,
-            transcript_loader=store.load,
             source_files_available=source_files is not None,
             path_query_available=any(
                 capability.id == PATH_QUERY_CAPABILITY_ID
                 for capability in relational_query.capabilities
             ),
+            write_backends=source_backends[SourceOperation.RELATIONAL_WRITE],
         )
         skill_domain = SkillCapabilityDomain(
             skill_declaration_bundle, transcript_loader=store.load
@@ -1665,9 +1623,7 @@ class EmbeddedAgent:
             *catalog.executors,
             *relational_query.executors,
             *(relational_export.executors if relational_export is not None else ()),
-            *relational_update_preview.executors,
-            *relational_update.executors,
-            *relational_upsert.executors,
+            *relational_write.executors,
             *(source_files.executors if source_files is not None else ()),
             *memory.executors,
             *skills.executors,
@@ -1758,7 +1714,6 @@ class EmbeddedAgent:
         )
         if artifact_domain is not None:
             artifact_domain.bind_capability_registry(capabilities)
-        data_domain.bind_capability_registry(capabilities)
 
         async def resolve_run_sources(run: RunInput):
             return await resolve_effective_source_scope(run, data_view)
@@ -1827,7 +1782,6 @@ class EmbeddedAgent:
                 nonlocal capabilities
                 # No await: every reader switches before another task can run.
                 capability_runtime._replace_catalog(next_registry, next_domains)
-                data_domain.bind_capability_registry(next_registry)
                 if artifact_domain is not None:
                     artifact_domain.bind_capability_registry(next_registry)
                 capabilities = next_registry
@@ -4414,10 +4368,10 @@ class EmbeddedAgent:
                     )
 
                 update_mapping = {
-                    scope.resource_id: {
+                    scope.table: {
                         key: value
                         for key, value in scope.constraints().items()
-                        if key != "resource_revision"
+                        if key != "table"
                     }
                     for scope in preview.after.relational_write_scopes
                 }
@@ -4461,8 +4415,6 @@ class EmbeddedAgent:
     ) -> SourcePermissionsPreview:
         return await _build_source_permissions_preview(
             self._store,
-            self._catalog_service,
-            self._data_view,
             self._source_types,
             self.identity.id,
             self._source_permission_confirmation_key,
@@ -4470,47 +4422,26 @@ class EmbeddedAgent:
             read_mode=read_mode,
             read_resource_ids=read_resource_ids,
             relational_write_scopes=relational_write_scopes,
+            inspect_write_table=self._write_backend().inspect_write_table,
         )
 
-    async def relational_upsert_readiness(
-        self, source_id: str, resource_id: str
-    ) -> FrozenJsonObject:
-        async with self._source_commit_lock:
-            self._require_open()
-            permission = await self._data_view.load_relational_write_scope(
-                self.identity.id, source_id, resource_id
-            )
-            if permission is None:
-                raise ValueError("exact current upsert permission is required")
-            constraints = FrozenJsonObject.from_mapping(
-                {
-                    "source_id": source_id,
-                    "resource_id": resource_id,
-                    **permission.constraints(),
-                }
-            )
-            return await _relational_upsert_readiness(
-                self._data_view, self._source_backends, self.identity.id, constraints
-            )
+    def _write_backend(self) -> PostgreSQLWriteBackend:
+        # The PostgreSQL readiness record also reports other sources as unavailable.
+        return cast(
+            PostgreSQLWriteBackend,
+            self._source_backends[SourceOperation.RELATIONAL_WRITE][
+                POSTGRESQL_ADAPTER_ID
+            ],
+        )
 
-    async def relational_update_readiness(
-        self,
-        source_id: str,
-        resource_id: str,
-        assignment_columns: tuple[str, ...],
-    ) -> RelationalUpdateReadiness:
-        """Inspect one exact PostgreSQL update scope without mutating state."""
+    async def relational_write_readiness(
+        self, source_id: str, table: str
+    ) -> RelationalWriteReadiness:
+        """Inspect one table's stored write scope without mutating state."""
 
         self._require_open()
-        # The PostgreSQL readiness record also reports other sources as unavailable.
-        backend = self._source_backends[SourceOperation.RELATIONAL_UPDATE][
-            POSTGRESQL_ADAPTER_ID
-        ]
-        return await backend.relational_update_readiness(
-            agent_id=self.identity.id,
-            source_id=source_id,
-            resource_id=resource_id,
-            assignment_columns=assignment_columns,
+        return await self._write_backend().relational_write_readiness(
+            agent_id=self.identity.id, source_id=source_id, table=table
         )
 
     async def _retire_source_backends(self, source_id: str) -> None:

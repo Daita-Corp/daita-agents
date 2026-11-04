@@ -97,7 +97,7 @@ REMOTE_AGENT_SURFACE: Final = frozenset(
         "inspect_source_permissions",
         "preview_source_permissions",
         "apply_source_permissions",
-        "relational_update_readiness",
+        "relational_write_readiness",
         "catalog_summary",
         "list_catalog_resources",
         "inspect_catalog_resource",

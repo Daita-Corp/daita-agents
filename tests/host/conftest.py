@@ -34,7 +34,7 @@ from daita._json import FrozenJsonObject
 from daita.adapters.mcp import SDKMCPClientFactory
 from daita.adapters.models import SourceRegistration
 from daita.adapters.postgresql import PostgreSQLProbeResult, PostgreSQLProbeSchema
-from daita.adapters.postgresql_write import RelationalUpdateReadiness
+from daita.adapters.postgresql_write import RelationalWriteReadiness
 from daita.adapters.protocols import ResourceSource
 from daita.artifacts.models import (
     ArtifactDeliveryReceipt,
@@ -285,7 +285,7 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
             SemanticAnnotationState | None: (SemanticAnnotationState.ACTIVE,),
             Mapping[str, object]: ({"region": "EMEA", "limit": 5},),
             Mapping[str, Mapping[str, object]]: (
-                {resource.id: {"operations": ("update",), "key_columns": ("id",)}},
+                {"public.orders": {"allowed_operations": ("update",)}},
                 {},
             ),
             dict[str, object] | None: (_analysis_summary(), None),
@@ -377,7 +377,7 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
                     ),
                 ),
             ),
-            RelationalUpdateReadiness: (_readiness(source.id, resource.id),),
+            RelationalWriteReadiness: (_readiness(source.id),),
         }
 
         async def accept(_preview: object) -> bool:
@@ -457,11 +457,11 @@ def _receipt(agent_id: str, run_id: str, started_at: datetime) -> EffectReceipt:
             call_id="update-orders",
             operation_key=operation_key,
         ),
-        receipt_kind="data.relational_update",
+        receipt_kind="data.write",
         agent_id=agent_id,
         run_id=run_id,
         call_id="update-orders",
-        capability_id="data.update_rows",
+        capability_id="data.write",
         domain_owner_id="data",
         capability_contract_digest=operation_key,
         operation_key=operation_key,
@@ -478,11 +478,11 @@ def _receipt(agent_id: str, run_id: str, started_at: datetime) -> EffectReceipt:
     )
 
 
-def _readiness(source_id: str, resource_id: str) -> RelationalUpdateReadiness:
-    return RelationalUpdateReadiness(
+def _readiness(source_id: str) -> RelationalWriteReadiness:
+    return RelationalWriteReadiness(
         source_id=source_id,
-        resource_id=resource_id,
-        assignment_columns=("amount",),
+        table="public.orders",
+        allowed_operations=("update",),
         daita_scope_ready=False,
         ready_for_preview=False,
         proves_execution=False,
@@ -505,7 +505,7 @@ def _readiness(source_id: str, resource_id: str) -> RelationalUpdateReadiness:
         ),
         relation=FrozenJsonObject.from_mapping(
             {
-                "catalog_admitted": True,
+                "exists": True,
                 "base_table": True,
                 "partition": False,
                 "inheritance": False,

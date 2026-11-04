@@ -76,8 +76,8 @@ def test_unrelated_tool_arguments_cannot_impersonate_a_routine_review():
         }
     )
     document, reviewable = approval_review_document(
-        tool_name="data_update_rows",
-        capability_id="data.update_rows",
+        tool_name="data_write",
+        capability_id="data.write",
         arguments_text=arguments,
     )
     assert reviewable and document is not None

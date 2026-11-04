@@ -84,7 +84,7 @@ local computer files and creating, changing or running routines and jobs. Its
 scope is fixed when the run starts: a source added later is seen by the next
 run, not the current one.
 
-When a run wants to write (a PostgreSQL update or upsert, an admitted MCP
+When a run wants to write (a PostgreSQL insert, update or delete, an admitted MCP
 action), it pauses and the host opens an approval naming the routine. A desktop
 notification appears if no window is watching; opening `daita` shows the card.
 Approve and the run continues; deny and the model gets the refusal and carries

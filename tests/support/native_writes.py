@@ -30,14 +30,20 @@ from daita.llm.models import (
 )
 from daita.llm.pricing import CostEstimate
 from daita.loop.models import LoopLimits
-from tests.data.writes._upsert_support import Database
 from tests.support.mcp import (
     conformance_identities,
     mock_transport,
 )
 from tests.support.workspace import workspace_for
+from tests.support.write_database import Database
 
 NOW = datetime(2026, 9, 6, 12, tzinfo=UTC)
+TABLE = "public.companies"
+UPSERT_SQL = (
+    "INSERT INTO public.companies (domain, name, evidence_url) VALUES ($1, $2, $3) "
+    "ON CONFLICT (domain) DO UPDATE "
+    "SET name = EXCLUDED.name, evidence_url = EXCLUDED.evidence_url"
+)
 
 
 class ScriptedResearchModel:
@@ -121,19 +127,13 @@ def companies_structure(db: Database) -> pg.PostgreSQLStructure:
     return pg.PostgreSQLStructure((table,), (), db.structure_revision)
 
 
-def patch_fake_postgresql(
-    monkeypatch, db: Database, structure: pg.PostgreSQLStructure
-) -> None:
-    """Route native PostgreSQL I/O to the in-memory database."""
+def patch_fake_postgresql(monkeypatch, db: Database) -> None:
+    """Route the write backend's connections to the in-memory database."""
 
     async def connect(*args, **kwargs):
         return db.connect()
 
-    async def load_structure(*args, **kwargs):
-        return replace(structure, source_revision=db.structure_revision)
-
     monkeypatch.setattr(native, "_connect", connect)
-    monkeypatch.setattr(native, "_load_structure", load_structure)
 
 
 async def create_fixture(
@@ -182,6 +182,7 @@ async def create_fixture(
         adapter_id="postgresql",
         native_identity="postgresql:companies",
         display_name="Company research",
+        presentation_sensitivity=ModelSensitivity(sensitivity.value),
         configuration={
             "database": "research",
             "host": "db.fixture.test",
@@ -213,18 +214,17 @@ async def create_fixture(
     await agent._embedded._store.commit_snapshot(snapshot, registration=registration)
     resource = snapshot.resources[0]
     constraints = {
-        "allowed_operations": ("upsert",),
+        "allowed_operations": ("insert", "update"),
         "allowed_insert_columns": ("domain", "name", "evidence_url"),
         "allowed_update_columns": ("name", "evidence_url"),
-        "key_columns": ("domain",),
-        "generated_identity_columns": ("id",),
         "max_rows": 10,
     }
+    patch_fake_postgresql(monkeypatch, db)
     preview = await agent.preview_source_permissions(
         source_id=registration.id,
         read_mode="all",
         read_resource_ids=(),
-        relational_write_scopes={resource.id: constraints},
+        relational_write_scopes={TABLE: constraints},
     )
     await agent.apply_source_permissions(
         source_id=registration.id,
@@ -245,7 +245,6 @@ async def create_fixture(
     home = agent.home
     await agent.close()
 
-    patch_fake_postgresql(monkeypatch, db, structure)
     agent = await Agent.open(
         "native-acceptance",
         root=tmp_path,
@@ -259,17 +258,8 @@ async def create_fixture(
     )
     batch = {
         "source_id": registration.id,
-        "resource_id": resource.id,
-        "key_columns": ("domain",),
-        "insert_columns": ("domain", "name", "evidence_url"),
-        "update_columns": ("name", "evidence_url"),
-        "rows": (
-            {
-                "domain": "new.test",
-                "name": "New Co",
-                "evidence_url": "https://source.test/new",
-            },
-        ),
+        "sql": UPSERT_SQL,
+        "parameters": ("new.test", "New Co", "https://source.test/new"),
     }
     return (
         agent,
@@ -322,10 +312,8 @@ def scheduled_write_script(batch: Mapping[str, object]) -> list[Step]:
         return response(text=f"The write was refused ({error['code']}).")
 
     steps: list[Step] = [
-        response(
-            ToolCall("load", "toolbox_load", {"tool_names": ["data_upsert_rows"]})
-        ),
-        response(ToolCall("write", "data_upsert_rows", dict(batch))),
+        response(ToolCall("load", "toolbox_load", {"tool_names": ["data_write"]})),
+        response(ToolCall("write", "data_write", dict(batch))),
         report,
     ]
     return [measured_step(step) for step in steps]

@@ -41,6 +41,21 @@ _VOLATILE_CONTEXT_EXPRESSIONS = frozenset(
 )
 
 
+# Literals, quoted names and comments match whole, so only real parameters change.
+_POSTGRESQL_TOKENS = re.compile(
+    r"""
+    (?<![A-Za-z0-9_])[eE]'(?:[^'\\]|\\.|'')*'
+    | '(?:[^']|'')*'
+    | "(?:[^"]|"")*"
+    | --[^\n]*
+    | /\*.*?\*/
+    | \$(?P<tag>(?:[A-Za-z_][A-Za-z0-9_]*)?)\$.*?\$(?P=tag)\$
+    | (?P<parameter>\$\d+)(?=[^\s\d])
+    """,
+    re.DOTALL | re.VERBOSE,
+)
+
+
 def _load_sqlglot(dialect: _SqlDialect = "sqlite") -> tuple[Any, Any]:
     try:
         import sqlglot
@@ -83,9 +98,18 @@ def analyze_postgresql_sql(sql: str) -> SqlAnalysis:
     return _analyze_sql(sql, dialect="postgresql")
 
 
+def analyze_postgresql_write(sql: str) -> tuple[SqlAnalysis, Any]:
+    """Parse PostgreSQL SQL once; a write policy reads the tree as well as the facts."""
+
+    return _parsed_analysis(sql, dialect="postgresql")
+
+
 def _analyze_sql(sql: str, *, dialect: _SqlDialect) -> SqlAnalysis:
+    return _parsed_analysis(sql, dialect=dialect)[0]
+
+
+def _parsed_analysis(sql: str, *, dialect: _SqlDialect) -> tuple[SqlAnalysis, Any]:
     display_name = "PostgreSQL" if dialect == "postgresql" else "SQLite"
-    sqlglot_dialect = "postgres" if dialect == "postgresql" else "sqlite"
 
     if isinstance(sql, str) and len(sql) > MAX_SQL_CHARACTERS:
         raise SqlAnalysisError(
@@ -100,7 +124,7 @@ def _analyze_sql(sql: str, *, dialect: _SqlDialect) -> SqlAnalysis:
     explain = _explain_prefix(normalized)
     parse_sql = explain[1] if explain is not None else normalized
     try:
-        parsed = tuple(sqlglot.parse(parse_sql, read=sqlglot_dialect))
+        parsed = tuple(_parse_statements(sqlglot, parse_sql, dialect=dialect))
         expressions = tuple(item for item in parsed if item is not None)
     except Exception as error:
         sqlglot_errors = getattr(sqlglot, "errors", None)
@@ -155,17 +179,8 @@ def _analyze_sql(sql: str, *, dialect: _SqlDialect) -> SqlAnalysis:
         if cls is not None
     )
     is_read = isinstance(root, read_roots) and not mutation_types
-    canonical_inner = "; ".join(
-        item.sql(dialect=sqlglot_dialect, pretty=False) for item in expressions
-    )
-    if len(parsed) != len(expressions):
-        # Preserve empty statements in the canonical value so repeated trailing
-        # delimiters cannot share a fingerprint with one valid statement.
-        canonical_inner = parse_sql
-    canonical_sql = (
-        f"{explain[0]} {canonical_inner}" if explain is not None else canonical_inner
-    )
-    fingerprint = "sha256:" + hashlib.sha256(canonical_sql.encode("utf-8")).hexdigest()
+    # The server receives the statement as written; the tree only answers questions.
+    fingerprint = "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     placeholder_count = sum(
         1 for item in root.walk() if isinstance(item, exp.Placeholder)
     )
@@ -195,9 +210,9 @@ def _analyze_sql(sql: str, *, dialect: _SqlDialect) -> SqlAnalysis:
         if dialect == "postgresql"
         else placeholder_count
     )
-    return SqlAnalysis(
+    analysis = SqlAnalysis(
         sql=normalized,
-        canonical_sql=canonical_sql,
+        canonical_sql=normalized,
         sql_fingerprint=fingerprint,
         statement_type=(
             "explain" if explain is not None else type(root).__name__.lower()
@@ -215,7 +230,75 @@ def _analyze_sql(sql: str, *, dialect: _SqlDialect) -> SqlAnalysis:
         table_function_names=table_functions,
         explicit_operator_names=explicit_operators,
         attribute_names=attribute_names,
+        written_call_names=(
+            _written_calls(sqlglot, parse_sql) if dialect == "postgresql" else ()
+        ),
     )
+    return analysis, root
+
+
+def _parse_statements(sqlglot: Any, sql: str, *, dialect: _SqlDialect) -> list[Any]:
+    if dialect != "postgresql":
+        return sqlglot.parse(sql, read="sqlite")
+    # sqlglot reads the "$1,$" of "$1,$2" as a dollar-quote opener, though PostgreSQL's
+    # tags cannot start with a digit. Only the parser sees this spaced copy.
+    return sqlglot.parse(_POSTGRESQL_TOKENS.sub(_space_parameter, sql), read="postgres")
+
+
+def _space_parameter(match: re.Match[str]) -> str:
+    return match.group(0) + " " if match.group("parameter") else match.group(0)
+
+
+def _written_calls(sqlglot: Any, sql: str) -> tuple[str, ...]:
+    """Unqualified names written before "(", as the server will read them.
+
+    The tree cannot say: it renames some calls (ceiling is CEIL), hides others (mod is
+    an operator) and reads "LOWER"(1) as lower(1). A quoted name keeps its case. Names
+    that turn out not to be functions are harmless.
+    """
+
+    from sqlglot.tokens import TokenType
+
+    tokens = sqlglot.Dialect.get_or_raise("postgres").tokenize(
+        _POSTGRESQL_TOKENS.sub(_space_parameter, sql)
+    )
+    return tuple(
+        sorted(
+            {
+                (
+                    token.text
+                    if token.token_type is TokenType.IDENTIFIER
+                    else token.text.lower()
+                )[:256]
+                for before, token, after in zip(
+                    (None, *tokens), tokens, tokens[1:], strict=False
+                )
+                if token.token_type in (TokenType.VAR, TokenType.IDENTIFIER)
+                and after.token_type is TokenType.L_PAREN
+                and (before is None or before.token_type is not TokenType.DOT)
+            }
+        )
+    )
+
+
+def stash_escape_strings(sql: str) -> tuple[str, dict[str, str]]:
+    """Swap each E'...' for a plain placeholder a tree can render unharmed.
+
+    sqlglot decodes E'\\\\' to one backslash and renders it unescaped, which closes the
+    string early and turns its remainder into SQL.
+    """
+
+    stashed: dict[str, str] = {}
+
+    def stash(match: re.Match[str]) -> str:
+        text = match.group(0)
+        if text[0] not in "eE" or text[1] != "'":
+            return text
+        placeholder = f"'__daita_escape_string_{len(stashed)}__'"
+        stashed[placeholder] = text
+        return placeholder
+
+    return _POSTGRESQL_TOKENS.sub(stash, sql), stashed
 
 
 def _parse_refusal(
@@ -430,8 +513,7 @@ def _function_facts(
         functions.add(name)
         if dialect == "postgresql":
             # An explicit namespace other than pg_catalog is never admitted, and
-            # canonical SQL upper-cases a quoted name, so it could run another
-            # function than the one the lookup checked.
+            # a quoted name keeps its case, which the lookup's folded name would miss.
             if (namespace is not None and not name.startswith("PG_CATALOG.")) or (
                 isinstance(function.this, exp.Identifier)
                 and bool(function.this.args.get("quoted", False))

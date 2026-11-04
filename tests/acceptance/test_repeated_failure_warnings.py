@@ -136,8 +136,8 @@ async def _foreground(tmp_path: Path) -> tuple[MockModelProvider, tuple[object, 
         (
             _refused("first"),
             _refused("second"),
-            _tool("exact-1", "toolbox_search", query="data_update_rows"),
-            _tool("exact-2", "toolbox_search", query="data_update_rows"),
+            _tool("exact-1", "toolbox_search", query="data_write"),
+            _tool("exact-2", "toolbox_search", query="data_write"),
             _stop("No row-count tool is callable here."),
             _refused("next-run"),
             _stop("Still no row-count tool."),
@@ -184,7 +184,7 @@ async def test_foreground_run_warns_after_second_identical_refusal(
     status = _status(provider.requests[4])
     assert "`warehouse_row_count`" in status
     assert "exact-name searches found no callable tool named" in status
-    assert "`data_update_rows`" in status
+    assert "`data_write`" in status
 
 
 async def test_foreground_transcript_results_and_budgets_match_without_warnings(

@@ -60,7 +60,7 @@ Daita is a persistent, read-first data agent. Each agent has an **agent home**
 artifacts and model configuration. The agent connects to data sources through a
 catalog, answers questions through a single model loop, and can run scheduled
 **routines** and durable **jobs** in the background. Writes to external systems
-(PostgreSQL update/upsert, admitted MCP actions) are narrowly scoped, explicitly
+(PostgreSQL insert/update/delete, admitted MCP actions) are narrowly scoped, explicitly
 enabled, approved and receipted.
 
 One run looks like this:

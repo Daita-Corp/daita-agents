@@ -20,7 +20,7 @@ from daita.llm.models import ToolResultBlock
 from daita.loop.models import LoopExitKind
 from daita.routines.owner import schedule_text
 from daita.storage.sqlite_records import EffectResolutionDecision
-from tests.support.postgresql_live import _TABLE, row
+from tests.support.postgresql_live import _ROLE, _TABLE, row
 from tests.support.postgresql_live_harness import (
     AUTHORIZATION,
     LIMITS,
@@ -118,7 +118,7 @@ async def test_live_source_free_update(database, scenario_factory, phrasing):
                 "The company whose domain is existing.test should be called Updated. Please fix its name in the companies table without changing anything else.",
             )[phrasing],
         )
-        assert_exact_preview(scenario, transcript, "update")
+        assert_exact_preview(scenario, transcript)
         receipt = await database.receipt(EffectOutcome.SUCCEEDED)
         assert receipt.payload["affected_rows"] == 1
         assert (
@@ -159,10 +159,7 @@ async def test_live_ambiguous_company_then_user_clarifies(database, scenario_fac
         )
         scenario.assert_completed_runs()
         assert not calls_for(
-            scenario.evidence[transcript.run.id], "data_update_rows", "apply"
-        )
-        assert not calls_for(
-            scenario.evidence[transcript.run.id], "data_upsert_rows", "apply"
+            scenario.evidence[transcript.run.id], "data_write", "apply"
         )
         assert not scenario.approvals and not await scenario.agent.list_effects()
         assert await database.rows() == original
@@ -173,7 +170,7 @@ async def test_live_ambiguous_company_then_user_clarifies(database, scenario_fac
         result, transcript = await scenario.run(
             "", user_prompt="I mean the one whose domain is existing.test."
         )
-        assert_exact_preview(scenario, transcript, "update")
+        assert_exact_preview(scenario, transcript)
         receipt = await database.receipt(EffectOutcome.SUCCEEDED)
         assert receipt.payload["affected_rows"] == 1
         assert await database.rows() == [
@@ -185,7 +182,7 @@ async def test_live_ambiguous_company_then_user_clarifies(database, scenario_fac
         scenario.stages.append("user_clarification_selected_exact_company")
 
 
-async def test_live_mixed_upsert_and_unchanged_repeat(database, scenario_factory):
+async def test_live_mixed_upsert_and_repeat(database, scenario_factory):
     await database.seed()
     await database.admin.execute(
         f"INSERT INTO {_TABLE} (domain, name, evidence_url) VALUES ('stable.test', 'Stable', 'https://evidence.test/stable.test')"
@@ -214,10 +211,7 @@ async def test_live_mixed_upsert_and_unchanged_repeat(database, scenario_factory
         assert_exact_preview(scenario, transcript)
         assert_one_call(scenario.evidence[transcript.run.id])
         receipt = await database.receipt(EffectOutcome.SUCCEEDED)
-        assert tuple(
-            receipt.payload[key]
-            for key in ("inserted_count", "updated_count", "unchanged_count")
-        ) == (1, 1, 1)
+        assert receipt.payload["affected_rows"] == 3
         actual = await database.rows()
         assert [(item["domain"], item["name"]) for item in actual] == [
             ("existing.test", "After"),
@@ -226,7 +220,7 @@ async def test_live_mixed_upsert_and_unchanged_repeat(database, scenario_factory
         ]
         assert actual[0]["id"] == 1 and actual[0]["notes"] == "Retained"
         assert actual[1]["id"] > 2 and actual[1]["notes"] is None
-        scenario.assert_report(result, "succeeded", (1, 1, 1))
+        scenario.assert_report(result, "succeeded", (1, 2, None))
 
         repeated, repeated_transcript = await scenario.run(
             "Recheck and apply the same exact findings as a new authorized operation. Obtain current evidence even if nothing changed. "
@@ -237,18 +231,64 @@ async def test_live_mixed_upsert_and_unchanged_repeat(database, scenario_factory
         assert_one_call(scenario.evidence[repeated_transcript.run.id])
         receipts = await scenario.agent.list_effects()
         assert len(receipts) == 2
-        unchanged = next(
+        repeat = next(
             item for item in receipts if item.receipt_id != receipt.receipt_id
         )
-        assert unchanged.outcome is EffectOutcome.SUCCEEDED
-        assert tuple(
-            unchanged.payload[key]
-            for key in ("inserted_count", "updated_count", "unchanged_count")
-        ) == (0, 0, 3)
+        assert repeat.outcome is EffectOutcome.SUCCEEDED
+        # ON CONFLICT DO UPDATE rewrites a matching row, whether or not it differs.
+        assert repeat.payload["affected_rows"] == 3
         assert await database.rows() == actual
         assert database.probe.mutations == 2 and database.probe.server_commits == 2
-        scenario.stages.append("mixed_and_unchanged_upserts_verified")
-        scenario.assert_report(repeated, "succeeded", (0, 0, 3))
+        scenario.stages.append("mixed_and_repeated_upserts_verified")
+        scenario.assert_report(repeated, "succeeded", (None, 3, None))
+
+
+async def test_live_delete_through_approval(database, scenario_factory):
+    await database.admin.execute(f"GRANT DELETE ON {_TABLE} TO {_ROLE}")
+    await database.permissions("all")
+    await database.seed()
+    await database.admin.execute(
+        f"INSERT INTO {_TABLE} (domain, name, evidence_url) VALUES "
+        "('keep.test', 'Keep', 'https://evidence.test/keep')"
+    )
+    async with scenario_factory() as scenario:
+        scenario.expect_rows("delete", 1)
+        result, transcript = await scenario.run(
+            "Delete the company whose domain is existing.test from the companies "
+            "table, and no other company. " + REPORT_INSTRUCTION,
+            user_prompt=(
+                "Please delete the company whose domain is existing.test from our "
+                "companies table. Leave every other company alone."
+            ),
+        )
+        assert_exact_preview(scenario, transcript)
+        receipt = await database.receipt(EffectOutcome.SUCCEEDED)
+        assert receipt.payload["affected_rows"] == 1
+        assert [item["domain"] for item in await database.rows()] == ["keep.test"]
+        assert database.probe.mutations == database.probe.server_commits == 1
+
+
+async def test_live_insert_select_through_approval(database, scenario_factory):
+    await database.admin.execute(
+        "INSERT INTO write_acceptance.cells (k, v) VALUES (1, 10), (2, 20)"
+    )
+    async with scenario_factory() as scenario:
+        scenario.expect_rows("insert", 2)
+        result, transcript = await scenario.run(
+            "Add one company to the companies table for each row of the cells table, "
+            "with one INSERT ... SELECT: domain 'cell-<k>.test', name 'Cell <k>', "
+            "evidence_url 'https://evidence.test/cell-<k>'. " + REPORT_INSTRUCTION,
+            user_prompt=(
+                "For every row in the cells table, add a company with one statement: "
+                "domain cell-<k>.test, name Cell <k>, evidence link "
+                "https://evidence.test/cell-<k>."
+            ),
+        )
+        assert_exact_preview(scenario, transcript)
+        receipt = await database.receipt(EffectOutcome.SUCCEEDED)
+        assert receipt.payload["affected_rows"] == 2
+        assert [item["name"] for item in await database.rows()] == ["Cell 1", "Cell 2"]
+        assert database.probe.mutations == database.probe.server_commits == 1
 
 
 @pytest.mark.parametrize("denial", ["missing_permission", "approval_denied"])
@@ -278,7 +318,7 @@ async def test_live_write_denial_preserves_database(database, scenario_factory, 
                 len(
                     calls_for(
                         scenario.evidence[transcript.run.id],
-                        "data_upsert_rows",
+                        "data_write",
                         "apply",
                     )
                 )
@@ -305,17 +345,13 @@ async def test_live_drift_during_approval_does_not_reapply(database, scenario_fa
             + REPORT_INSTRUCTION,
             user_prompt="Please change the name of the company whose domain is existing.test to Updated. Leave everything else alone and let me know the result.",
         )
-        assert_exact_preview(scenario, transcript, "update")
+        assert_exact_preview(scenario, transcript)
         # One call: Daita's own preview was on the card. Post-approval drift is
         # final for the request in both profiles: the framework recovery says
         # stop and report, so the model never re-previews or re-applies.
-        assert_one_call(scenario.evidence[transcript.run.id], "update")
+        assert_one_call(scenario.evidence[transcript.run.id])
         assert (
-            len(
-                calls_for(
-                    scenario.evidence[transcript.run.id], "data_update_rows", "apply"
-                )
-            )
+            len(calls_for(scenario.evidence[transcript.run.id], "data_write", "apply"))
             == 1
         )
         assert len(scenario.approvals) == 1
@@ -377,9 +413,7 @@ async def test_live_unique_constraint_failure_rolls_back_whole_batch(
         assert_exact_preview(scenario, transcript)
         receipt = await database.receipt(EffectOutcome.NOT_APPLIED)
         assert receipt.payload["normalized_error_code"] == "write_constraint_violation"
-        assert (
-            receipt.payload["inserted_count"] == receipt.payload["updated_count"] == 0
-        )
+        assert receipt.payload["affected_rows"] == 0
         assert await database.rows() == (
             [
                 {
@@ -556,21 +590,15 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
         )
         assert database.probe.mutations == 1 and database.probe.server_commits == 2
         for call, run, counts in (
-            (immediate_call, immediate, (1, 0, 0)),
-            (weekly_call, weekly, (0, 0, 1)),
+            (immediate_call, immediate, 1),
+            (weekly_call, weekly, 1),
         ):
             receipt = next(item for item in receipts if item.run_id == run.run_id)
             assert receipt.call_id == call.id
             # The receipt binds Daita's own preview; the call carried none.
             assert str(receipt.payload["preview_fingerprint"]).startswith("sha256:")
             assert "preview_fingerprint" not in call.arguments
-            assert (
-                tuple(
-                    receipt.payload[key]
-                    for key in ("inserted_count", "updated_count", "unchanged_count")
-                )
-                == counts
-            )
+            assert receipt.payload["affected_rows"] == counts
         assert await database.rows() == [
             {
                 "id": 1,
@@ -584,8 +612,8 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
         # upsert asked at the time and was approved once.
         assert [item["tool"] for item in scenario.approvals] == [
             *(["routine_save"] if setup == "model_authored" else []),
-            "data_upsert_rows",
-            "data_upsert_rows",
+            "data_write",
+            "data_write",
         ]
         assert all(item["approved"] for item in scenario.approvals)
         deliveries = await scenario.agent.list_deliveries(

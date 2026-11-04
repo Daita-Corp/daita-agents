@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from ..errors import DaitaError, ErrorRetryability
 
 if TYPE_CHECKING:
-    from ..storage.sqlite_records import SourceReadScope
+    from ..storage.sqlite_records import RelationalWriteScope, SourceReadScope
 
 from .models import (
     DiscoveryRequest,
@@ -151,6 +151,16 @@ class SourceReadScopeStore(SourceStore, Protocol):
         agent_id: str,
         source_id: str,
     ) -> SourceReadScope | None: ...
+
+
+class SourcePermissionStore(SourceReadScopeStore, Protocol):
+    """A source store that also answers what a person allowed writing."""
+
+    async def list_relational_write_scopes(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> tuple[RelationalWriteScope, ...]: ...
 
 
 __all__ = [

@@ -265,9 +265,7 @@ async def test_terminal_write_permissions_use_large_support_tickets(
             read_mode=inspection.state.read_scope.mode,
             read_resource_ids=inspection.state.read_scope.resource_ids,
             relational_write_scopes={
-                tickets.resource_id: update_constraints(
-                    ("priority",), key_columns=tickets.key_columns
-                )
+                tickets.display_name: update_constraints(("priority",))
             },
         )
         await agent.apply_source_permissions(
@@ -280,10 +278,8 @@ async def test_terminal_write_permissions_use_large_support_tickets(
         scope = after.state.relational_write_scopes[0]
         assert scope.resource_id == tickets.resource_id
         assert scope.allowed_update_columns == ("priority",)
-        readiness = await agent.relational_update_readiness(
-            source.id,
-            tickets.resource_id,
-            ("priority",),
+        readiness = await agent.relational_write_readiness(
+            source.id, tickets.display_name
         )
         assert readiness.ready_for_preview is True
         assert provider.requests == ()
@@ -349,9 +345,7 @@ async def test_bulk_update_uses_exact_preview_approval_commit_and_readback(
             read_mode="all",
             read_resource_ids=(),
             relational_write_scopes={
-                tickets.resource_id: update_constraints(
-                    ("priority",), key_columns=tickets.key_columns
-                )
+                tickets.display_name: update_constraints(("priority",))
             },
         )
         await agent.apply_source_permissions(
@@ -361,7 +355,6 @@ async def test_bulk_update_uses_exact_preview_approval_commit_and_readback(
 
         provider.configure(
             source_id=source.id,
-            resource_id=tickets.resource_id,
             desired_priority="high",
         )
         applied = await agent.run(
@@ -372,7 +365,6 @@ async def test_bulk_update_uses_exact_preview_approval_commit_and_readback(
 
         provider.configure(
             source_id=source.id,
-            resource_id=tickets.resource_id,
             desired_priority="low",
         )
         restored = await agent.run(
@@ -382,12 +374,12 @@ async def test_bulk_update_uses_exact_preview_approval_commit_and_readback(
         assert restored.final_text.startswith("Committed and verified ")
 
         assert len(approvals) == 2
-        assert all(item.tool_name == "data_update_rows" for item in approvals)
+        assert all(item.tool_name == "data_write" for item in approvals)
         for request in approvals:
             document = data_write_approval(request)
             assert document is not None
             # Daita's own preview is on the card; nothing was copied back.
-            matched_rows = document["preview"]["matched_rows"]
+            matched_rows = document["preview"]["affected_rows"]
             assert isinstance(matched_rows, int) and matched_rows > 1
             assert not {"preview_fingerprint", "expected_affected_rows"} & set(
                 document["arguments"]

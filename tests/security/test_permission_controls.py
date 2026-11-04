@@ -8,6 +8,7 @@ import pytest
 
 from daita import Agent, SQLiteSource
 from daita.adapters.models import SourceRegistration
+from daita.adapters.postgresql_write import PostgreSQLWriteBackend, RelationalWriteError
 from daita.catalog.models import (
     CatalogFacet,
     CatalogResource,
@@ -21,7 +22,9 @@ from daita.catalog.models import (
     TabularFacet,
     catalog_resource_id,
 )
+from daita.catalog.protocols import CatalogStoreError
 from daita.hosting.errors import AgentHomeError
+from daita.hosting.sources import _source_edit_read_scope
 from daita.storage.sqlite_codecs import encode_relational_write_scope
 from daita.storage.sqlite_records import RelationalWriteScope, SourceReadMode
 from tests.support.relational_writes import update_constraints
@@ -140,6 +143,15 @@ def _snapshot(
     )
 
 
+def _live_columns(monkeypatch: pytest.MonkeyPatch, count: int = 64) -> None:
+    """Enabling writes reads the table live; answer for the catalog's fake tables."""
+
+    async def inspect(self, **_arguments: object) -> dict[str, tuple[str, ...]]:
+        return {"columns": tuple(f"value_{i:02d}" for i in range(count))}
+
+    monkeypatch.setattr(PostgreSQLWriteBackend, "inspect_write_table", inspect)
+
+
 async def _agent_with_catalog(tmp_path, tables=("orders", "customers")):
     agent = await Agent.create(
         "permission-control",
@@ -170,7 +182,7 @@ async def test_inspect_is_exact_complete_catalog_and_secret_free(tmp_path):
             resource.id for resource in resources.values()
         }
         assert all(
-            item.eligible_assignment_columns == ("value_01", "value_02")
+            item.eligible_assignment_columns == ("id", "value_01", "value_02")
             for item in inspection.resources
         )
         safe = repr(asdict(inspection))
@@ -218,7 +230,10 @@ async def test_preview_apply_read_modes(tmp_path, mode, selected_names):
         await agent.close()
 
 
-async def test_write_adds_read_uses_exact_columns_and_read_narrowing_revokes(tmp_path):
+async def test_write_adds_read_uses_exact_columns_and_read_narrowing_revokes(
+    tmp_path, monkeypatch
+):
+    _live_columns(monkeypatch)
     agent, source, resources = await _agent_with_catalog(tmp_path)
     orders = resources["orders"]
     try:
@@ -227,7 +242,7 @@ async def test_write_adds_read_uses_exact_columns_and_read_narrowing_revokes(tmp
             read_mode="none",
             read_resource_ids=(),
             relational_write_scopes={
-                orders.id: update_constraints(("value_01", "value_02"))
+                orders.native_identity: update_constraints(("value_01", "value_02"))
             },
         )
         assert write_preview.after.read_scope.mode is SourceReadMode.SELECTED
@@ -257,11 +272,14 @@ async def test_write_adds_read_uses_exact_columns_and_read_narrowing_revokes(tmp
         await agent.close()
 
 
-async def test_write_selected_many_all_current_and_future_table_exclusion(tmp_path):
+async def test_write_selected_many_all_current_and_future_table_exclusion(
+    tmp_path, monkeypatch
+):
+    _live_columns(monkeypatch)
     agent, source, resources = await _agent_with_catalog(tmp_path)
     try:
         mapping = {
-            resource.id: update_constraints(("value_01", "value_02"))
+            resource.native_identity: update_constraints(("value_01", "value_02"))
             for resource in resources.values()
         }
         preview = await agent.preview_source_permissions(
@@ -293,7 +311,10 @@ async def test_write_selected_many_all_current_and_future_table_exclusion(tmp_pa
         await agent.close()
 
 
-async def test_wide_column_choices_support_exact_binding_and_stale_preview(tmp_path):
+async def test_wide_column_choices_support_exact_binding_and_stale_preview(
+    tmp_path, monkeypatch
+):
+    _live_columns(monkeypatch)
     agent = await Agent.create(
         "permission-bound",
         root=tmp_path,
@@ -311,12 +332,17 @@ async def test_wide_column_choices_support_exact_binding_and_stale_preview(tmp_p
     all_columns = tuple(f"value_{index:02d}" for index in range(1, 34))
     try:
         inspection = await agent.inspect_source_permissions(source.id)
-        assert inspection.resources[0].eligible_assignment_columns == all_columns
+        assert inspection.resources[0].eligible_assignment_columns == (
+            "id",
+            *all_columns,
+        )
         preview = await agent.preview_source_permissions(
             source_id=source.id,
             read_mode="all",
             read_resource_ids=(),
-            relational_write_scopes={wide.id: update_constraints(all_columns)},
+            relational_write_scopes={
+                wide.native_identity: update_constraints(all_columns)
+            },
         )
         assert (
             preview.after.relational_write_scopes[0].allowed_update_columns
@@ -384,7 +410,7 @@ async def test_hosting_rejects_write_scopes_for_a_type_without_native_writes(
                 source_id=source.id,
                 read_mode="all",
                 read_resource_ids=(),
-                relational_write_scopes={table.id: update_constraints(("name",))},
+                relational_write_scopes={"main.t": update_constraints(("name",))},
             )
     finally:
         await agent.close()
@@ -394,12 +420,10 @@ async def test_hosting_rejects_write_scopes_for_a_type_without_native_writes(
         agent_id=source.agent_id,
         source_id=source.id,
         resource_id=table.id,
-        resource_revision=table.current_revision,
+        table=table.native_identity,
         allowed_operations=("update",),
         allowed_insert_columns=(),
         allowed_update_columns=("name",),
-        key_columns=("id",),
-        generated_identity_columns=(),
         max_rows=10,
         authorization_fingerprint="sha256:" + "1" * 64,
     )
@@ -424,3 +448,207 @@ async def test_hosting_rejects_write_scopes_for_a_type_without_native_writes(
             clock=lambda: NOW,
             workspace=workspace_for(tmp_path),
         )
+
+
+def _write_scope(*operations: str, columns=("value_01",), max_rows=10) -> dict:
+    return {
+        "allowed_operations": operations,
+        "allowed_insert_columns": columns if "insert" in operations else (),
+        "allowed_update_columns": columns if "update" in operations else (),
+        "max_rows": max_rows,
+    }
+
+
+async def _apply(agent, source, *, mode=SourceReadMode.ALL, read_ids=(), scopes):
+    preview = await agent.preview_source_permissions(
+        source_id=source.id,
+        read_mode=mode,
+        read_resource_ids=read_ids,
+        relational_write_scopes=scopes,
+    )
+    return await agent.apply_source_permissions(
+        source_id=source.id,
+        confirmation_fingerprint=preview.confirmation_fingerprint,
+    )
+
+
+def _source_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def inspect(self, **_arguments: object) -> dict[str, tuple[str, ...]]:
+        raise RelationalWriteError("postgresql_connect_failed", "The source is down.")
+
+    monkeypatch.setattr(PostgreSQLWriteBackend, "inspect_write_table", inspect)
+
+
+async def test_revoking_or_narrowing_needs_no_live_read(tmp_path, monkeypatch):
+    """Taking access away must work with the source down or a kept table dropped."""
+
+    _live_columns(monkeypatch)
+    agent, source, _resources = await _agent_with_catalog(tmp_path)
+    kept = _write_scope("insert", "update", columns=("value_01", "value_02"))
+    try:
+        await _apply(
+            agent,
+            source,
+            scopes={"public.orders": kept, "public.dropped": kept},
+        )
+        _source_unreachable(monkeypatch)
+
+        inspection = await _apply(agent, source, scopes={"public.dropped": kept})
+        assert [s.table for s in inspection.state.relational_write_scopes] == [
+            "public.dropped"
+        ]
+
+        narrower = _write_scope("update", columns=("value_01",), max_rows=5)
+        inspection = await _apply(agent, source, scopes={"public.dropped": narrower})
+        (scope,) = inspection.state.relational_write_scopes
+        assert scope.allowed_operations == ("update",)
+        assert scope.max_rows == 5
+
+        inspection = await _apply(agent, source, scopes={})
+        assert inspection.state.relational_write_scopes == ()
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize(
+    "wider",
+    (
+        _write_scope("update", "delete", columns=("value_01",)),
+        _write_scope("update", columns=("value_01", "value_02")),
+        _write_scope("update", columns=("value_01",), max_rows=11),
+    ),
+)
+async def test_widening_a_scope_still_reads_the_table_live(
+    tmp_path, monkeypatch, wider
+):
+    _live_columns(monkeypatch)
+    agent, source, _resources = await _agent_with_catalog(tmp_path)
+    try:
+        await _apply(agent, source, scopes={"public.orders": _write_scope("update")})
+        _source_unreachable(monkeypatch)
+        with pytest.raises(RelationalWriteError):
+            await agent.preview_source_permissions(
+                source_id=source.id,
+                read_mode=SourceReadMode.ALL,
+                read_resource_ids=(),
+                relational_write_scopes={"public.orders": wider},
+            )
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize("mode", (SourceReadMode.SELECTED, SourceReadMode.NONE))
+async def test_a_table_the_catalog_has_not_seen_enables_under_narrow_reads(
+    tmp_path, monkeypatch, mode
+):
+    """The automatic read permission is for the write's table, not a catalog row."""
+
+    _live_columns(monkeypatch)
+    agent, source, resources = await _agent_with_catalog(tmp_path)
+    selected = (resources["orders"].id,) if mode is SourceReadMode.SELECTED else ()
+    scopes = {"public.fresh": _write_scope("update")}
+    try:
+        inspection = await _apply(
+            agent, source, mode=mode, read_ids=selected, scopes=scopes
+        )
+        (scope,) = inspection.state.relational_write_scopes
+        assert scope.table == "public.fresh"
+        assert inspection.state.read_scope.mode is SourceReadMode.SELECTED
+        assert scope.resource_id in inspection.state.read_scope.resource_ids
+
+        # Previewing what is now stored must not trip on that read permission.
+        again = await _apply(
+            agent,
+            source,
+            mode=SourceReadMode.SELECTED,
+            read_ids=inspection.state.read_scope.resource_ids,
+            scopes=scopes,
+        )
+        assert again.state == inspection.state
+    finally:
+        await agent.close()
+
+
+async def test_a_read_nobody_has_permission_for_is_still_refused(tmp_path):
+    agent, source, _resources = await _agent_with_catalog(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="not current resources"):
+            await agent.preview_source_permissions(
+                source_id=source.id,
+                read_mode=SourceReadMode.SELECTED,
+                read_resource_ids=(
+                    catalog_resource_id(source.id, ResourceKind.TABLE, "public.other"),
+                ),
+                relational_write_scopes={},
+            )
+    finally:
+        await agent.close()
+
+
+async def test_a_stored_scope_the_catalog_has_not_seen_is_offered_for_removal(
+    tmp_path, monkeypatch
+):
+    _live_columns(monkeypatch)
+    agent, source, _resources = await _agent_with_catalog(tmp_path)
+    scope = _write_scope("insert", "update", columns=("value_01",))
+    try:
+        await _apply(agent, source, scopes={"public.fresh": scope})
+        inspection = await agent.inspect_source_permissions(source.id)
+        offered = {item.display_name: item for item in inspection.resources}
+        assert offered["public.fresh"].resource_kind == "table"
+        assert offered["public.fresh"].eligible_insert_columns == ("value_01",)
+        assert offered["public.fresh"].eligible_assignment_columns == ("value_01",)
+        # Never listed twice, or under an ID.
+        assert len(offered) == len(inspection.resources)
+        assert "public.orders" in offered
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize(
+    "broken", ("list_current_snapshot_refs", "list_resources", "resource_schemas")
+)
+async def test_a_failing_catalog_read_does_not_stop_a_revoke(
+    tmp_path, monkeypatch, broken
+):
+    """The stored permissions are enough to take access away."""
+
+    _live_columns(monkeypatch)
+    agent, source, _resources = await _agent_with_catalog(tmp_path)
+    try:
+        await _apply(agent, source, scopes={"public.orders": _write_scope("update")})
+
+        async def fails(*_args: object, **_kwargs: object) -> object:
+            raise CatalogStoreError("the catalog could not be read")
+
+        embedded = agent._embedded
+        owner = embedded._data_view if broken == "resource_schemas" else embedded._store
+        monkeypatch.setattr(owner, broken, fails)
+        inspection = await _apply(agent, source, scopes={})
+        assert inspection.state.relational_write_scopes == ()
+    finally:
+        await agent.close()
+
+
+async def test_a_source_edit_names_no_read_permission_by_its_id(tmp_path, monkeypatch):
+    _live_columns(monkeypatch)
+    agent, source, resources = await _agent_with_catalog(tmp_path)
+    try:
+        inspection = await _apply(
+            agent,
+            source,
+            mode=SourceReadMode.NONE,
+            scopes={"public.fresh": _write_scope("update")},
+        )
+        (scope,) = inspection.state.relational_write_scopes
+        _read, omitted = _source_edit_read_scope(
+            current_read_scope=inspection.state.read_scope,
+            current_resources=tuple(resources.values()),
+            replacement=_snapshot(
+                _registration(agent.id), sync_id="sync-two", tables=(("orders", 2),)
+            )[0],
+        )
+        assert omitted
+        assert not any(scope.resource_id in item for item in omitted)
+    finally:
+        await agent.close()

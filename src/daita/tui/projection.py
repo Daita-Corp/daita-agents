@@ -758,8 +758,7 @@ def approval_review_document(
             if capability_id
             in {
                 "control.resolve_effect",
-                "data.update_rows",
-                "data.upsert_rows",
+                "data.write",
             }
             else ""
         )
@@ -824,48 +823,57 @@ def approval_summary(arguments_text: str, capability_id: str) -> str:
         return ""
     if not isinstance(document, dict):
         return ""
-    if capability_id in {"data.update_rows", "data.upsert_rows"}:
-        arguments, target, preview = (
-            document.get("arguments"),
-            document.get("target"),
-            document.get("preview"),
-        )
-        if not all(isinstance(item, dict) for item in (arguments, target, preview)):
+    if capability_id == "data.write":
+        target, preview = document.get("target"), document.get("preview")
+        if not all(isinstance(item, dict) for item in (target, preview)):
             return ""
-        assert isinstance(arguments, dict)
         assert isinstance(target, dict)
         assert isinstance(preview, dict)
+        warnings = preview.get("warnings") or ()
         lines = [
             f"Connection: {target.get('source_name')}",
             f"Table: {target.get('name')}",
-            "Catalog aliases: " + json.dumps(target.get("aliases"), ensure_ascii=True),
+            f"SQL: {preview.get('sql')}",
+            "Columns changed: "
+            + json.dumps(preview.get("columns_changed"), ensure_ascii=True),
+            f"Preview: {preview.get('affected_rows')} row(s) change: "
+            f"{preview.get('inserted_rows')} insert, "
+            f"{preview.get('updated_rows')} update, "
+            f"{preview.get('deleted_rows')} delete; "
+            f"{preview.get('skipped_rows')} left as they are.",
+            "Bounded sample: " + json.dumps(preview.get("samples"), ensure_ascii=True),
         ]
-        if capability_id == "data.update_rows":
-            lines.extend(
-                (
-                    "Select rows where: "
-                    + json.dumps(arguments.get("where"), ensure_ascii=True),
-                    "Set: "
-                    + json.dumps(arguments.get("assignments"), ensure_ascii=True),
-                    f"Preview: {preview.get('matched_rows')} matching row(s) will change.",
-                    "Bounded samples of primary keys and before/after values: "
-                    + json.dumps(preview.get("samples"), ensure_ascii=True),
-                )
+        lines.append(
+            "Before committing, Daita compares "
+            + (
+                "the rows the statement touched with these rows."
+                if preview.get("verification") == "rows"
+                else "only the number of rows the statement touched: "
+                "this statement has no row key Daita can check."
             )
-        else:
-            lines.extend(
-                (
-                    "Match keys: "
-                    + json.dumps(arguments.get("key_columns"), ensure_ascii=True),
-                    "Insert columns: "
-                    + json.dumps(arguments.get("insert_columns"), ensure_ascii=True),
-                    "Update columns: "
-                    + json.dumps(arguments.get("update_columns"), ensure_ascii=True),
-                    f"Preview: {preview.get('inserted_count')} insert, {preview.get('updated_count')} update, {preview.get('unchanged_count')} unchanged; {preview.get('input_count')} input row(s).",
-                    "Bounded samples of keys and planned actions: "
-                    + json.dumps(preview.get("classifications"), ensure_ascii=True),
-                    "The complete supplied batch is in the exact details below. Omitted update values stay unchanged; explicit null clears an admitted nullable value.",
-                )
+        )
+        if "where_matches_every_row" in warnings:
+            lines.append("WARNING: this statement touches every row in the table.")
+        if "values_can_change" in warnings:
+            lines.append(
+                "WARNING: this statement uses the time, randomness or a function whose "
+                "result can change, so its new values are computed when written. If "
+                "the rows differ, Daita rolls back."
+            )
+        if "row_matched_more_than_once" in warnings:
+            lines.append(
+                "WARNING: a row matches more than once with different new values, so "
+                "PostgreSQL picks one of them."
+            )
+        if preview.get("triggers"):
+            lines.append(
+                "WARNING: these triggers will fire and are not previewed: "
+                + json.dumps(preview.get("triggers"), ensure_ascii=True)
+            )
+        if preview.get("cascades"):
+            lines.append(
+                "WARNING: foreign keys cascade from this table and are not previewed: "
+                + json.dumps(preview.get("cascades"), ensure_ascii=True)
             )
         lines.append(
             "Check that these are the intended entities and values. Samples are not a complete inventory or proof of business meaning. Approval permits this exact operation once; changed state is rechecked before execution."

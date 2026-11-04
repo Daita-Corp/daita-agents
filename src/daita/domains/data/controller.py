@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from difflib import get_close_matches
 from hashlib import sha256
@@ -20,11 +20,9 @@ from ...artifacts.models import (
 from ...artifacts.renderers import ARROW_MEDIA_TYPE, arrow_schema
 from ...capabilities import (
     AccessMode,
-    CallProvenance,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
-    CapabilityRegistry,
     OperationalEffect,
     RecoveryKind,
     ToolExecution,
@@ -37,10 +35,9 @@ from ...catalog.capabilities import (
     CATALOG_DESCRIBE_CAPABILITY_ID,
     CATALOG_SEARCH_CAPABILITY_ID,
 )
-from ...catalog.models import ResourceKind, catalog_resource_id
 from ...catalog.protocols import CatalogStoreError
-from ...llm.models import ModelSensitivity, ToolCall, ToolResultBlock
-from ...loop.models import RunInput, RunOrigin, Transcript
+from ...llm.models import ModelSensitivity, ToolCall
+from ...loop.models import RunInput, RunOrigin
 from ...loop.session import RunSession
 from ...scope import (
     EffectiveSourceScope,
@@ -52,19 +49,16 @@ from ...storage.sqlite_records import RelationalWriteScope, SourcePermissionStat
 from .sql import (
     CheckedRead,
     DuckDBReadValidationError,
-    RelationalUpdateIntent,
     ResourceSchema,
     SqlValidationIssue,
+    WriteFacts,
     checked_reads,
     validate_duckdb_read,
     validate_read,
-    validate_relational_update_intent,
+    write_facts,
+    write_permission_issue,
 )
 from .sql.contracts import _SqlDialect
-from .sql.relational_upsert import (
-    RelationalUpsertIntent,
-    validate_relational_upsert_intent,
-)
 
 DATA_DOMAIN_OWNER_ID = "data"
 DATA_QUERY_CAPABILITY_ID = "data.query"
@@ -72,10 +66,10 @@ DATA_QUERY_EVIDENCE_KIND = "data.query_result"
 DATA_QUERY_COMBINED_CAPABILITY_ID = "data.query_combined"
 DATA_QUERY_COMBINED_EVIDENCE_KIND = "data.query_combined_result"
 DATA_EXPORT_TABULAR_CAPABILITY_ID = "data.export_tabular"
-RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID = "data.preview_update_rows"
-RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND = "data.preview_update_rows"
-RELATIONAL_UPDATE_CAPABILITY_ID = "data.update_rows"
-RELATIONAL_UPDATE_EVIDENCE_KIND = "data.update_rows_result"
+RELATIONAL_WRITE_PREVIEW_CAPABILITY_ID = "data.preview_write"
+RELATIONAL_WRITE_PREVIEW_EVIDENCE_KIND = "data.preview_write"
+RELATIONAL_WRITE_CAPABILITY_ID = "data.write"
+RELATIONAL_WRITE_EVIDENCE_KIND = "data.write_result"
 FILE_SEARCH_CAPABILITY_ID = "data.search_files"
 FILE_SEARCH_OUTPUT_KIND = "data.search_files_result"
 TEXT_READ_CAPABILITY_ID = "data.read_text"
@@ -96,20 +90,15 @@ _CATALOG_CAPABILITIES = frozenset(
 _RELATIONAL_READ_CAPABILITIES = frozenset(
     {DATA_QUERY_CAPABILITY_ID, DATA_EXPORT_TABULAR_CAPABILITY_ID}
 )
-_UPDATE_CAPABILITIES = frozenset(
-    {RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID, RELATIONAL_UPDATE_CAPABILITY_ID}
+_WRITE_CAPABILITIES = frozenset(
+    {RELATIONAL_WRITE_PREVIEW_CAPABILITY_ID, RELATIONAL_WRITE_CAPABILITY_ID}
 )
-_UPSERT_CAPABILITIES = frozenset({"data.preview_upsert_rows", "data.upsert_rows"})
-_NATIVE_WRITE_CAPABILITIES = frozenset(
-    {RELATIONAL_UPDATE_CAPABILITY_ID, "data.upsert_rows"}
-)
-
-
-_RESOURCE_ARGUMENT_CAPABILITIES = frozenset(
+_PERMISSION_ISSUE_CODES = frozenset(
     {
-        *_UPSERT_CAPABILITIES,
-        RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
-        RELATIONAL_UPDATE_CAPABILITY_ID,
+        "resource_write_not_allowed",
+        "write_operation_not_allowed",
+        "insert_column_not_allowed",
+        "update_column_not_allowed",
     }
 )
 _RESOURCE_LIST_ARGUMENT_CAPABILITIES = _RELATIONAL_READ_CAPABILITIES
@@ -124,8 +113,7 @@ _CAPABILITY_OPERATIONS = {
     FILE_SEARCH_CAPABILITY_ID: SourceOperation.FILE_SEARCH,
     TEXT_READ_CAPABILITY_ID: SourceOperation.TEXT_READ,
     PATH_QUERY_CAPABILITY_ID: SourceOperation.PATH_QUERY,
-    **{item: SourceOperation.RELATIONAL_UPDATE for item in _UPDATE_CAPABILITIES},
-    **{item: SourceOperation.RELATIONAL_UPSERT for item in _UPSERT_CAPABILITIES},
+    **{item: SourceOperation.RELATIONAL_WRITE for item in _WRITE_CAPABILITIES},
 }
 # Combined-query inputs each need SQL_READ or TABULAR_READ, checked per input.
 _SOURCE_CAPABILITIES = frozenset().union(
@@ -201,31 +189,13 @@ class ReadScopedCatalogReader(CatalogSchemaReader, Protocol):
     ) -> frozenset[str]: ...
 
 
-class RelationalWriteCatalogReader(CatalogSchemaReader, Protocol):
-    async def relational_write_scope_issue(
-        self,
-        agent_id: str,
-        source_id: str,
-        resource_id: str,
-        assignment_columns: tuple[str, ...],
-        *,
-        operation: str = "update",
-        insert_columns: tuple[str, ...] = (),
-        key_columns: tuple[str, ...] = (),
-        row_count: int | None = None,
-    ) -> tuple[str, str] | None: ...
-
-    async def load_relational_write_scope(
-        self,
-        agent_id: str,
-        source_id: str,
-        resource_id: str,
-    ) -> RelationalWriteScope | None: ...
+class RelationalWriteScopeReader(Protocol):
+    async def relational_write_scopes(
+        self, agent_id: str, source_id: str
+    ) -> Mapping[str, RelationalWriteScope]: ...
 
 
-class DataDomainCatalog(
-    ReadScopedCatalogReader, RelationalWriteCatalogReader, Protocol
-):
+class DataDomainCatalog(ReadScopedCatalogReader, RelationalWriteScopeReader, Protocol):
     async def source_routing_facts(
         self,
         agent_id: str,
@@ -233,11 +203,7 @@ class DataDomainCatalog(
     ) -> tuple[Mapping[str, object], ...]: ...
 
     async def relational_write_applicable_source_ids(
-        self,
-        agent_id: str,
-        source_ids: tuple[str, ...] = (),
-        *,
-        operation: str = "update",
+        self, agent_id: str, source_ids: tuple[str, ...] = ()
     ) -> frozenset[str]: ...
 
     async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None: ...
@@ -266,37 +232,18 @@ class DataDomainCatalog(
     def session_source_id(self) -> str | None: ...
 
 
-def _reads_resource(
-    data: Mapping[str, object], source_id: object, resource_id: object
-) -> bool:
-    """Whether one read result covers the exact source resource.
+class WriteDescriber(Protocol):
+    """A source's parse of one write, before any source I/O."""
 
-    Query results name their source and the tables they read; a description names
-    the one table it read, and older ones list resources with their own source.
-    """
-
-    touched = data.get("resource_ids", ())
-    if data.get("source_id") == source_id and (
-        data.get("resource_id") == resource_id
-        or (isinstance(touched, tuple) and resource_id in touched)
-    ):
-        return True
-    name, kind = data.get("name"), data.get("kind")
-    if (
-        isinstance(source_id, str)
-        and data.get("source_id") == source_id
-        and isinstance(name, str)
-        and kind in {"table", "view"}
-        and catalog_resource_id(source_id, ResourceKind(str(kind)), name) == resource_id
-    ):
-        return True
-    resources = data.get("resources", ())
-    return isinstance(resources, tuple) and any(
-        isinstance(item, Mapping)
-        and item.get("source_id") == source_id
-        and item.get("resource_id") == resource_id
-        for item in resources
-    )
+    def describe(
+        self,
+        sql: str,
+        *,
+        source_id: str,
+        parameters: Sequence[object],
+        allowed_resource_ids: frozenset[str] | None,
+        schemas: tuple[str, ...],
+    ) -> WriteFacts | tuple[SqlValidationIssue, ...]: ...
 
 
 class DataCapabilityDomain:
@@ -312,9 +259,9 @@ class DataCapabilityDomain:
         *,
         relational_export_available: bool = True,
         combined_query_available: bool = False,
-        transcript_loader: Callable[[str], Awaitable[Transcript]] | None = None,
         source_files_available: bool = False,
         path_query_available: bool = False,
+        write_backends: Mapping[str, WriteDescriber] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("data declarations have the wrong domain owner")
@@ -342,17 +289,12 @@ class DataCapabilityDomain:
         ):
             if not callable(getattr(catalog, method_name, None)):
                 raise TypeError(f"data catalog must provide {method_name}")
-        self._transcript_loader = transcript_loader
-        self._registry: CapabilityRegistry | None = None
         self._declarations = declarations
         self._catalog = catalog
         self._source_types = source_types
+        self._write_backends = dict(write_backends or {})
         self._views = {item.name: item for item in declarations.tool_views}
         self._capabilities = {item.id: item for item in declarations.capabilities}
-
-    def bind_capability_registry(self, registry: CapabilityRegistry) -> None:
-        registry.validate_declarations(self._declarations)
-        self._registry = registry
 
     @property
     def declarations(self) -> CapabilityDeclarations:
@@ -401,30 +343,23 @@ class DataCapabilityDomain:
         )
         run = replace(run, resolved_source_scope=scope)
         facts: tuple[Mapping[str, object], ...]
-        update_source_ids: frozenset[str]
+        write_source_ids: frozenset[str]
         if not scope.source_ids:
             facts = ()
-            update_source_ids = frozenset()
+            write_source_ids = frozenset()
         else:
             facts = await self._catalog.source_routing_facts(
                 run.agent_id,
                 tuple(sorted(scope.source_ids)),
             )
-            update_source_ids = (
+            write_source_ids = (
                 await self._catalog.relational_write_applicable_source_ids(
                     run.agent_id,
                     tuple(sorted(scope.source_ids)),
                 )
-                if source_capability_ids & _UPDATE_CAPABILITIES
+                if source_capability_ids & _WRITE_CAPABILITIES
                 else frozenset()
             )
-        upsert_source_ids = (
-            await self._catalog.relational_write_applicable_source_ids(
-                run.agent_id, tuple(sorted(scope.source_ids)), operation="upsert"
-            )
-            if scope.source_ids and source_capability_ids & _UPSERT_CAPABILITIES
-            else frozenset()
-        )
         active_adapter_ids: set[str] = set()
         for fact in facts:
             adapter_id = fact.get("adapter_id")
@@ -448,9 +383,7 @@ class DataCapabilityDomain:
                 for adapter_id in active_adapter_ids
             ):
                 continue
-            if capability.id in _UPDATE_CAPABILITIES and not update_source_ids:
-                continue
-            if capability.id in _UPSERT_CAPABILITIES and not upsert_source_ids:
+            if capability.id in _WRITE_CAPABILITIES and not write_source_ids:
                 continue
             names.append(name)
         withheld = {
@@ -493,7 +426,7 @@ class DataCapabilityDomain:
         self._validate_execution_resource_scope(run, capability, arguments)
         await self._validate_resource_read_scope(run, capability, arguments)
         if capability.access_mode is AccessMode.WRITE and (
-            capability.id not in _NATIVE_WRITE_CAPABILITIES
+            capability.id != RELATIONAL_WRITE_CAPABILITY_ID
             or capability.operational_effect is not OperationalEffect.MUTATE_DATA
         ):
             raise CapabilityInputError(
@@ -518,72 +451,8 @@ class DataCapabilityDomain:
                 arguments,
                 operation=_CAPABILITY_OPERATIONS[capability.id],
             )
-        if capability.id in _UPDATE_CAPABILITIES | _UPSERT_CAPABILITIES:
-            await self._validate_target_sensitivity(
-                run.agent_id, arguments, request_sensitivity
-            )
-        if capability.id in _UPSERT_CAPABILITIES:
-            try:
-                intent = RelationalUpsertIntent.from_mapping(arguments)
-            except ValueError:
-                raise CapabilityInputError(
-                    "upsert_invalid_batch",
-                    "Upsert requires uniform scalar rows with explicit columns, "
-                    "at most 1,000 rows, and a batch within 64 KiB and the exact "
-                    "approval display bound. Reduce the batch or correct its shape; "
-                    "no write was dispatched.",
-                ) from None
-            permission = await self._catalog.load_relational_write_scope(
-                run.agent_id, intent.source_id, intent.resource_id
-            )
-            if permission is None:
-                raise CapabilityInputError(
-                    "resource_write_not_allowed",
-                    "The exact write permission is unavailable or stale.",
-                    recovery=_WRITE_PERMISSION_REQUIRED,
-                )
-            issue = await self._catalog.relational_write_scope_issue(
-                run.agent_id,
-                intent.source_id,
-                intent.resource_id,
-                intent.update_columns,
-                operation="upsert",
-                insert_columns=intent.insert_columns,
-                key_columns=intent.key_columns,
-                row_count=len(intent.rows),
-            )
-            if issue is not None:
-                raise CapabilityInputError(*issue)
-            resource = next(
-                item
-                for item in await self._catalog.resource_schemas(
-                    run.agent_id, intent.source_id
-                )
-                if item.resource_id == intent.resource_id
-            )
-            validate_relational_upsert_intent(
-                intent,
-                resource=resource,
-                generated_identity_columns=permission.generated_identity_columns,
-                max_rows=permission.max_rows,
-            )
-            await self._authenticate_upsert_evidence(
-                run, call, capability, intent.evidence_call_ids
-            )
-        if capability.id in _UPDATE_CAPABILITIES:
-            await self._validate_relational_update_call(run, arguments)
-            if capability.id == RELATIONAL_UPDATE_CAPABILITY_ID:
-                permission = await self._catalog.load_relational_write_scope(
-                    run.agent_id,
-                    cast(str, arguments["source_id"]),
-                    cast(str, arguments["resource_id"]),
-                )
-                if permission is None:
-                    raise CapabilityInputError(
-                        "resource_write_not_allowed",
-                        "The current write permission is unavailable.",
-                        recovery=_WRITE_PERMISSION_REQUIRED,
-                    )
+        if capability.id in _WRITE_CAPABILITIES:
+            arguments = await self._prepare_write(run, arguments, request_sensitivity)
         return arguments
 
     prepare_session_call = prepare_call
@@ -597,22 +466,12 @@ class DataCapabilityDomain:
         fingerprint: FrozenJsonObject,
     ) -> SideEffectPlan:
         if (
-            capability.id not in _NATIVE_WRITE_CAPABILITIES
+            capability.id != RELATIONAL_WRITE_CAPABILITY_ID
             or capability.operational_effect is not OperationalEffect.MUTATE_DATA
         ):
             raise ValueError("data domain received an unsupported side effect")
+        write = write_facts(execution.arguments)
         source_id = cast(str, execution.arguments["source_id"])
-        resource_id = cast(str, execution.arguments["resource_id"])
-        resource = next(
-            (
-                item
-                for item in await self._catalog.resource_schemas(
-                    run.agent_id, source_id
-                )
-                if item.resource_id == resource_id
-            ),
-            None,
-        )
         source = next(
             (
                 item
@@ -623,49 +482,39 @@ class DataCapabilityDomain:
             ),
             None,
         )
-        if (
-            resource is None
-            or source is None
-            or resource.revision != fingerprint["resource_revision"]
-        ):
+        if source is None:
             raise CapabilityInputError(
                 "write_state_changed",
-                "The exact review target is no longer current.",
+                "The source is no longer available.",
             )
         approval_arguments = FrozenJsonObject.from_mapping(
             {
-                "arguments": execution.arguments,
+                "arguments": {
+                    "source_id": source_id,
+                    "sql": execution.arguments["sql"],
+                    "parameters": execution.arguments.get("parameters", ()),
+                },
                 "target": {
                     "source_id": source_id,
-                    "resource_id": resource_id,
-                    "name": resource.name,
-                    "aliases": resource.aliases,
+                    "resource_id": write.resource_id,
+                    "name": write.table,
                     "source_name": source["display_name"],
-                    "revision": resource.revision,
                 },
                 "preview": fingerprint["review"],
             }
         )
-        approval_reason = (
-            "Review the exact batch. Execution briefly holds an EXCLUSIVE table lock; ordinary reads may continue."
-            if capability.id == "data.upsert_rows"
-            else "Review the exact selected rows and assignments. Execution locks matching rows and rejects a changed preview."
-        )
-        if (
-            capability.id == "data.upsert_rows"
-            and cast(Mapping[str, object], fingerprint["review"])[
-                "identity_sequence_gaps_possible"
-            ]
-        ):
-            approval_reason += " Identity sequence gaps can remain after rollback."
         return SideEffectPlan(
-            approval_reason=approval_reason,
+            approval_reason=(
+                "Review the exact SQL and rows. Execution locks existing target rows "
+                "and refuses if they or the table changed. Trigger and cascade "
+                "effects are not previewed."
+            ),
             approval_arguments=approval_arguments,
             recheck_after_approval=True,
             effect_intent=FrozenJsonObject.from_mapping(
                 {
-                    "source_id": execution.arguments["source_id"],
-                    "resource_id": execution.arguments["resource_id"],
+                    "source_id": source_id,
+                    "resource_id": write.resource_id,
                     "intent_sha256": fingerprint["intent_sha256"],
                 }
             ),
@@ -792,21 +641,21 @@ class DataCapabilityDomain:
     ) -> CapabilityFailure | None:
         del call
         from ...adapters.postgresql_write import (
-            RelationalUpdateExecutionCancelled,
-            RelationalUpdateExecutionError,
+            RelationalWriteCancelled,
+            RelationalWriteError,
         )
 
-        if isinstance(error, RelationalUpdateExecutionError):
+        if isinstance(error, RelationalWriteError):
             return CapabilityFailure(
                 error.error_code,
                 str(error),
                 error.details,
                 effect_observation=error.effect_observation,
             )
-        if isinstance(error, RelationalUpdateExecutionCancelled):
+        if isinstance(error, RelationalWriteCancelled):
             return CapabilityFailure(
                 "write_interrupted",
-                "The native update was interrupted; see its transaction evidence.",
+                "The native write was interrupted; see its transaction evidence.",
                 effect_observation=error.effect_observation,
             )
         if isinstance(error, LocalWorkspaceError):
@@ -920,9 +769,7 @@ class DataCapabilityDomain:
                 ),
             )
         resource_ids: tuple[object, ...] = ()
-        if capability.id in _RESOURCE_ARGUMENT_CAPABILITIES:
-            resource_ids = (arguments.get("resource_id"),)
-        elif capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
+        if capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
         for resource_id in resource_ids:
@@ -946,9 +793,7 @@ class DataCapabilityDomain:
         arguments: Mapping[str, object],
     ) -> None:
         resource_ids: tuple[object, ...] = ()
-        if capability.id in _RESOURCE_ARGUMENT_CAPABILITIES:
-            resource_ids = (arguments.get("resource_id"),)
-        elif capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
+        if capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
         requested = tuple(item for item in resource_ids if isinstance(item, str))
@@ -1074,6 +919,7 @@ class DataCapabilityDomain:
                     parameters=parameters,
                     function_lookups=result.function_lookups,
                     attribute_lookups=result.attribute_lookups,
+                    written_calls=result.written_calls,
                     unqualified_relations=result.unqualified_relations,
                     resource_ids=result.resource_ids,
                     resource_names=result.resource_names,
@@ -1089,6 +935,82 @@ class DataCapabilityDomain:
         prepared["resource_ids"] = tuple(
             sorted({item for read in reads for item in read.resource_ids})
         )
+        return FrozenJsonObject.from_mapping(prepared)
+
+    async def _prepare_write(
+        self,
+        run: RunInput,
+        arguments: FrozenJsonObject,
+        request_sensitivity: ModelSensitivity,
+    ) -> FrozenJsonObject:
+        """Parse the one statement once and hand the executor what passed policy."""
+
+        source_id = cast(str, arguments["source_id"])
+        adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
+        if adapter_id is None or adapter_id not in self._write_backends:
+            raise CapabilityInputError(
+                "write_source_not_available",
+                "data_write works on PostgreSQL sources; this source cannot be "
+                "written.",
+                {"source_id": source_id},
+            )
+        target = await self._catalog.admitted_model_sensitivity(
+            run.agent_id, (source_id,)
+        )
+        if target is None or request_sensitivity.routing_rank > target.routing_rank:
+            raise CapabilityInputError(
+                "write_sensitivity_denied",
+                "The request exceeds the source's admitted classification.",
+            )
+        access = await self._read_access_in_run(run, source_id)
+        try:
+            scopes = await self._catalog.relational_write_scopes(
+                run.agent_id, source_id
+            )
+        except SourcePermissionStateError as error:
+            raise CapabilityInputError(
+                "source_permission_state_invalid",
+                "Stored source permission state is missing or invalid.",
+            ) from error
+        checked = self._write_backends[adapter_id].describe(
+            cast(str, arguments["sql"]),
+            source_id=source_id,
+            parameters=cast(tuple[object, ...], arguments.get("parameters", ())),
+            allowed_resource_ids=access,
+            schemas=await self._catalog.source_schemas(run.agent_id, source_id),
+        )
+        if not isinstance(checked, tuple):
+            issue = write_permission_issue(scopes.get(checked.resource_id), checked)
+            checked = checked if issue is None else (issue,)
+        if isinstance(checked, tuple):
+            if all(item.code in _SCOPE_ISSUE_CODES for item in checked):
+                raise await self._read_denied(run, source_id, checked)
+            first = checked[0]
+            raise CapabilityInputError(
+                first.code,
+                first.message,
+                {
+                    "issues": [
+                        {
+                            "code": item.code,
+                            "message": item.message,
+                            "details": item.details,
+                        }
+                        for item in checked
+                    ],
+                    "source_id": source_id,
+                },
+                recovery=(
+                    _WRITE_PERMISSION_REQUIRED
+                    if first.code in _PERMISSION_ISSUE_CODES
+                    else _CORRECT_SQL
+                ),
+            )
+        prepared: dict[str, object] = dict(arguments)
+        prepared["_adapter_id"] = adapter_id
+        prepared["_write"] = checked.to_mapping()
+        # The admission policy reads the touched tables here.
+        prepared["resource_ids"] = checked.resource_ids
         return FrozenJsonObject.from_mapping(prepared)
 
     async def _read_denied(
@@ -1352,9 +1274,7 @@ class DataCapabilityDomain:
                 )
             return
         resource_ids: tuple[object, ...] = ()
-        if capability.id in _RESOURCE_ARGUMENT_CAPABILITIES:
-            resource_ids = (arguments.get("resource_id"),)
-        elif capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
+        if capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
         if source_id in unrestricted:
@@ -1368,312 +1288,6 @@ class DataCapabilityDomain:
                 "execution_scope_resource_violation",
                 "The requested resource is outside this run's immutable scope.",
             )
-
-    async def _validate_relational_update_call(
-        self,
-        run: RunInput,
-        arguments: Mapping[str, object],
-    ) -> None:
-        source_id = arguments.get("source_id")
-        if not isinstance(source_id, str):
-            raise CapabilityInputError(
-                "write_source_not_available",
-                "PostgreSQL update requires an exact current source.",
-            )
-        adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
-        if adapter_id is None or not self._source_types.supports(
-            adapter_id, SourceOperation.RELATIONAL_UPDATE
-        ):
-            raise CapabilityInputError(
-                "write_source_not_available",
-                "The selected source is not an active PostgreSQL source owned by "
-                "this agent.",
-                {"source_id": source_id},
-            )
-        try:
-            intent = RelationalUpdateIntent.from_mapping(arguments)
-        except (TypeError, ValueError) as error:
-            raise CapabilityInputError(
-                "write_assignment_invalid",
-                "The PostgreSQL update intent is malformed.",
-            ) from error
-        try:
-            issue = await self._catalog.relational_write_scope_issue(
-                run.agent_id,
-                source_id,
-                intent.resource_id,
-                tuple(item.column for item in intent.assignments),
-            )
-        except SourcePermissionStateError as error:
-            raise CapabilityInputError(
-                "source_permission_state_invalid",
-                "Stored source permission state is missing or invalid.",
-            ) from error
-        if issue is not None:
-            raise CapabilityInputError(issue[0], issue[1])
-        validation = validate_relational_update_intent(
-            intent,
-            resources=await self._catalog.resource_schemas(
-                run.agent_id,
-                source_id,
-            ),
-        )
-        if not validation.valid:
-            first = validation.issues[0]
-            raise CapabilityInputError(
-                first.code,
-                first.message,
-                {"source_id": source_id, "resource_id": intent.resource_id},
-            )
-
-    async def _validate_target_sensitivity(
-        self,
-        agent_id: str,
-        arguments: Mapping[str, object],
-        sensitivity: ModelSensitivity,
-    ) -> None:
-        resource = next(
-            (
-                item
-                for item in await self._catalog.resource_schemas(
-                    agent_id, cast(str, arguments["source_id"])
-                )
-                if item.resource_id == arguments["resource_id"]
-            ),
-            None,
-        )
-        try:
-            target = ModelSensitivity(
-                "unknown" if resource is None else resource.sensitivity_class
-            )
-        except ValueError:
-            raise CapabilityInputError(
-                "write_sensitivity_denied", "Target classification is unknown."
-            ) from None
-        if sensitivity.routing_rank > target.routing_rank:
-            raise CapabilityInputError(
-                "write_sensitivity_denied",
-                "The request exceeds the target's current admitted classification.",
-            )
-
-    async def _authenticate_upsert_evidence(
-        self,
-        run: RunInput,
-        call: ToolCall,
-        capability: Capability,
-        evidence_ids: tuple[str, ...],
-    ) -> None:
-        if not evidence_ids:
-            return
-        _, results = await self._authenticated_prior_results(run, call, capability)
-        if (
-            tuple(block.call_id for block in results if block.call_id in evidence_ids)
-            != evidence_ids
-        ):
-            known = {block.call_id for block in results}
-            unknown = [item for item in evidence_ids if item not in known]
-            raise CapabilityInputError(
-                "write_evidence_invalid",
-                "Evidence must identify ordered successful authenticated current-run results"
-                + (
-                    f"; not a successful call id in this run: {', '.join(unknown[:4])}."
-                    if unknown
-                    else "; the call ids are out of order."
-                ),
-            )
-
-    async def derive_call_provenance(
-        self,
-        run: RunInput,
-        call: ToolCall,
-        capability: Capability,
-        arguments: FrozenJsonObject,
-        *,
-        session: RunSession | None = None,
-    ) -> CallProvenance:
-        """Derive upsert evidence: earlier authenticated reads of the same table."""
-
-        del session
-        registry = self._registry
-        if capability.id not in _UPSERT_CAPABILITIES or registry is None:
-            return CallProvenance()
-        try:
-            _, results = await self._authenticated_prior_results(run, call, capability)
-        except CapabilityInputError:
-            return CallProvenance()
-        source_id, resource_id = arguments["source_id"], arguments["resource_id"]
-        evidence: list[str] = []
-        for block in results:
-            data = block.output.get("data")
-            if (
-                block.capability_id is None
-                or block.capability_id in _UPSERT_CAPABILITIES | _UPDATE_CAPABILITIES
-                or registry.capability(block.capability_id).access_mode
-                is not AccessMode.READ
-                or not isinstance(data, Mapping)
-            ):
-                continue
-            if _reads_resource(data, source_id, resource_id):
-                evidence.append(block.call_id)
-        return CallProvenance(tuple(evidence[-32:]))
-
-    async def _authenticated_prior_results(
-        self,
-        run: RunInput,
-        call: ToolCall,
-        capability: Capability,
-    ) -> tuple[dict[str, ToolCall], list[ToolResultBlock]]:
-        """Return this call's earlier successful results with verified lineage."""
-
-        if self._transcript_loader is None or self._registry is None:
-            raise CapabilityInputError(
-                "write_preview_not_authenticated",
-                "Current-run native lineage is unavailable.",
-            )
-        transcript = await self._transcript_loader(run.id)
-        if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
-            raise CapabilityInputError(
-                "write_preview_not_authenticated",
-                "The transcript belongs to another run or agent.",
-            )
-        registry = self._registry
-
-        def target(candidate: ToolCall) -> ToolCall:
-            # A mode-routed tool persists its model call with the mode selector;
-            # its capability received the same call without it.
-            return replace(
-                candidate,
-                arguments=registry.target_arguments(
-                    candidate.name, candidate.arguments
-                ),
-            )
-
-        # Calls are compared by the arguments they executed with, not the
-        # run-scoped refs and handles the model sent.
-        try:
-            executed = {
-                candidate.id: target(candidate)
-                for candidate, _ in registry.executed_tool_pairs(
-                    transcript, source_scope=run.resolved_source_scope
-                )
-            }
-        except ValueError as error:
-            raise CapabilityInputError(
-                "write_preview_not_authenticated",
-                "Current-run native lineage is malformed.",
-            ) from error
-        positions = [
-            index
-            for index, message in enumerate(transcript.messages)
-            for candidate in message.tool_calls
-            if candidate.id == call.id
-        ]
-        # The runtime's routed call, resolved by the same resolver.
-        executing = (
-            None
-            if len(positions) != 1
-            else registry.executed_call(
-                call,
-                messages=transcript.messages[: positions[0]],
-                source_scope=run.resolved_source_scope,
-                capability=capability,
-            )
-        )
-        if executing is None or executed.get(call.id) != executing:
-            raise CapabilityInputError(
-                "write_preview_not_authenticated",
-                "The native call does not match its persisted current-run identity.",
-            )
-        current_index = positions[0]
-        calls = {
-            candidate.id: executed[candidate.id]
-            for message in transcript.messages[:current_index]
-            for candidate in message.tool_calls
-        }
-        results: list[ToolResultBlock] = []
-        for result_index, message in enumerate(transcript.messages[:current_index]):
-            for block in message.content:
-                if (
-                    not isinstance(block, ToolResultBlock)
-                    or block.is_error
-                    or block.call_id not in calls
-                    or block.capability_id is None
-                ):
-                    continue
-                producers = [
-                    index
-                    for index, item in enumerate(transcript.messages)
-                    for candidate in item.tool_calls
-                    if candidate.id == block.call_id
-                ]
-                result_count = sum(
-                    1
-                    for item in transcript.messages
-                    for other in item.content
-                    if isinstance(other, ToolResultBlock)
-                    and other.call_id == block.call_id
-                )
-                if (
-                    len(producers) != 1
-                    or result_count != 1
-                    or not producers[0] < result_index < current_index
-                ):
-                    continue
-                if (
-                    block.output_sha256
-                    != "sha256:"
-                    + sha256(canonical_json(block.output).encode("utf-8")).hexdigest()
-                    or block.sensitivity is None
-                ):
-                    continue
-                try:
-                    _, result_capability = self._registry.resolve_tool(
-                        calls[block.call_id].name,
-                        capability_id=block.capability_id,
-                    )
-                    if (
-                        result_capability.id != block.capability_id
-                        or result_capability.executor_id != block.executor_id
-                        or result_capability.operational_effect
-                        is not OperationalEffect.NONE
-                    ):
-                        continue
-                    await self._registry.validate_arguments_async(
-                        result_capability.id, calls[block.call_id].arguments
-                    )
-                    result_data = block.output.get("data")
-                    if not isinstance(result_data, Mapping):
-                        continue
-                    self._registry.validate_output(
-                        result_capability.id,
-                        ToolOutput(
-                            kind=cast(str, block.output["kind"]), data=result_data
-                        ),
-                    )
-                    source_id = result_data.get("source_id")
-                    revisions = result_data.get("resource_revisions", ())
-                    if (
-                        isinstance(source_id, str)
-                        and isinstance(revisions, tuple)
-                        and revisions
-                    ):
-                        schemas = {
-                            item.resource_id: item.revision
-                            for item in await self._catalog.resource_schemas(
-                                run.agent_id, source_id
-                            )
-                        }
-                        if any(
-                            not isinstance(item, Mapping)
-                            or schemas.get(cast(str, item.get("resource_id")))
-                            != item.get("revision")
-                            for item in revisions
-                        ):
-                            continue
-                except (KeyError, TypeError, ValueError):
-                    continue
-                results.append(block)
-        return calls, results
 
     async def _classify(
         self,
@@ -1786,10 +1400,11 @@ __all__ = [
     "DATA_QUERY_COMBINED_EVIDENCE_KIND",
     "DATA_QUERY_EVIDENCE_KIND",
     "DATA_EXPORT_TABULAR_CAPABILITY_ID",
-    "RELATIONAL_UPDATE_CAPABILITY_ID",
-    "RELATIONAL_UPDATE_EVIDENCE_KIND",
-    "RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID",
-    "RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND",
-    "RelationalWriteCatalogReader",
+    "RELATIONAL_WRITE_CAPABILITY_ID",
+    "RELATIONAL_WRITE_EVIDENCE_KIND",
+    "RELATIONAL_WRITE_PREVIEW_CAPABILITY_ID",
+    "RELATIONAL_WRITE_PREVIEW_EVIDENCE_KIND",
+    "WriteDescriber",
+    "RelationalWriteScopeReader",
     "ReadScopedCatalogReader",
 ]

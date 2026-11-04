@@ -50,7 +50,6 @@ from ..catalog.models import (
     CatalogSnapshotRef,
     CatalogSummary,
     CatalogSync,
-    FacetKind,
     RelationshipKind,
     SourceCatalogSnapshot,
 )
@@ -1443,41 +1442,13 @@ class SQLStateStore:
                 and not update_resource_ids <= set(read_scope.resource_ids)
             ):
                 raise ValueError("PostgreSQL update scope must be a read subset")
-            snapshot = _current_source_snapshot(
-                connection,
-                read_scope.agent_id,
-                read_scope.source_id,
-            )
-            resources = (
-                {}
-                if snapshot is None
-                else {item.id: item for item in snapshot.resources}
-            )
-            facets = (
-                {}
-                if snapshot is None
-                else {
-                    item.resource_id: item
-                    for item in snapshot.facets
-                    if item.kind is FacetKind.TABULAR
-                }
-            )
             for scope in update_scopes:
-                resource = resources.get(scope.resource_id)
-                facet = facets.get(scope.resource_id)
-                if resource is None or facet is None:
-                    raise ValueError(
-                        "PostgreSQL update scope requires a current table resource"
-                    )
                 expected = relational_write_authorization_fingerprint(
-                    source=registration,
-                    resource=resource,
-                    facet=facet,
-                    scope=scope,
+                    source=registration, scope=scope
                 )
                 if scope.authorization_fingerprint != expected:
                     raise ValueError(
-                        "PostgreSQL update authorization fingerprint is stale"
+                        "PostgreSQL write authorization fingerprint is stale"
                     )
             connection.execute(
                 f"""INSERT INTO source_read_scopes(agent_id, source_id, data)

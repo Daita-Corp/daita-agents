@@ -10,7 +10,7 @@ How one agent is composed and how a run moves from a message to an answer.
 ## Run model
 
 Daita is a persistent, read-first data agent with a narrowly scoped,
-explicitly enabled native relational update/upsert capability, initially backed by PostgreSQL,
+explicitly enabled native relational write capability, initially backed by PostgreSQL,
 and locally admitted MCP external actions. It uses one direct loop:
 
 ```text

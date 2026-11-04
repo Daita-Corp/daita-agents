@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
@@ -11,13 +12,15 @@ from typing import cast
 
 from .._json import canonical_json
 from ..adapters.models import SourceRegistration
-from ..adapters.registry import SourceTypeRegistry
-from ..capabilities import CapabilityInputError
-from ..catalog.models import CatalogResource, ResourceKind, SourceCatalogSnapshot
-from ..catalog.service import CatalogService
+from ..adapters.registry import SourceOperation, SourceTypeRegistry
+from ..catalog.models import (
+    CatalogResource,
+    ResourceKind,
+    SourceCatalogSnapshot,
+    catalog_resource_id,
+)
+from ..catalog.protocols import CatalogStoreError
 from ..domains.data import CatalogDataView
-from ..domains.data.catalog import RELATIONAL_WRITE_OPERATIONS
-from ..domains.data.sql import validate_relational_write_scope
 from ..storage.protocols import StateStore
 from ..storage.sqlite_records import (
     RelationalWriteScope,
@@ -31,7 +34,9 @@ from ..storage.sqlite_records import (
     relational_write_authorization_fingerprint,
 )
 
+_LOGGER = logging.getLogger("daita.hosting")
 _SOURCE_ALIAS_SEPARATOR = re.compile(r"[^a-z0-9]+")
+_UNCATALOGED_READ = "a table the catalog has not seen"
 
 
 def _source_alias(value: str) -> str:
@@ -159,7 +164,9 @@ def _source_edit_read_scope(
     for resource_id in current_read_scope.resource_ids:
         current = current_by_id.get(resource_id)
         if current is None:
-            omitted.append(resource_id)
+            # Enabled live, so the catalog has no name for it; never show the ID.
+            if _UNCATALOGED_READ not in omitted:
+                omitted.append(_UNCATALOGED_READ)
             continue
         matches = replacement_by_identity.get(
             (current.kind, current.native_identity),
@@ -192,10 +199,7 @@ def _source_edit_read_scope(
 def _supports_relational_writes(
     source_types: SourceTypeRegistry, adapter_id: str
 ) -> bool:
-    return any(
-        source_types.supports(adapter_id, operation)
-        for operation in RELATIONAL_WRITE_OPERATIONS.values()
-    )
+    return source_types.supports(adapter_id, SourceOperation.RELATIONAL_WRITE)
 
 
 async def _inspect_source_permissions(
@@ -223,113 +227,95 @@ async def _inspect_source_permissions(
         agent_id,
         source_id,
     )
-    refs = await store.list_current_snapshot_refs(
-        agent_id,
-        (source_id,),
-    )
-    if len(refs) > 1:
-        raise ValueError("source has multiple current catalog generations")
-    catalog_generation = None if not refs else refs[0].sync_id
-    resources = tuple(
-        resource
-        for resource in await store.list_resources(
-            agent_id,
-            source_id,
-        )
-        if resource.agent_id == agent_id and resource.source_id == source_id
-    )
     writable = _supports_relational_writes(source_types, registration.adapter_id)
-    schemas = await data_view.resource_schemas(agent_id, source_id) if writable else ()
-    schemas_by_resource_id = {schema.resource_id: schema for schema in schemas}
-    choices: list[SourcePermissionResource] = []
-    from ..domains.data.sql.relational_upsert import (
-        validate_relational_upsert_scope,
-    )
-
-    for resource in resources:
-        eligible_columns: tuple[str, ...] = ()
-        insert_columns: tuple[str, ...] = ()
-        upsert_keys: list[tuple[str, ...]] = []
-        schema = schemas_by_resource_id.get(resource.id)
-        if schema is not None and resource.kind is ResourceKind.TABLE:
-            eligible_columns = tuple(
-                column
-                for column in schema.columns
-                if validate_relational_write_scope(
-                    source_id,
-                    resource.id,
-                    (column,),
-                    resources=(schema,),
-                ).valid
-            )
-            insert_columns = tuple(
-                column
-                for column in schema.columns
-                if column not in schema.identity_columns
-            )
-            for keys in schema.conflict_keys:
-                try:
-                    validate_relational_upsert_scope(
-                        schema,
-                        key_columns=keys,
-                        insert_columns=insert_columns,
-                        update_columns=tuple(
-                            column
-                            for column in schema.updatable_columns
-                            if column
-                            not in (
-                                *keys,
-                                *schema.primary_key_columns,
-                                *schema.identity_columns,
-                            )
-                        ),
-                        generated_identity_columns=schema.identity_columns,
-                    )
-                except CapabilityInputError:
-                    continue
-                upsert_keys.append(keys)
-        choices.append(
-            SourcePermissionResource(
-                resource_id=resource.id,
-                display_name=resource.native_identity,
-                resource_kind=resource.kind.value,
-                eligible_assignment_columns=eligible_columns,
-                key_columns=() if schema is None else schema.primary_key_columns,
-                upsert_conflict_keys=tuple(upsert_keys),
-                eligible_insert_columns=insert_columns if upsert_keys else (),
-                eligible_upsert_update_columns=(
-                    ()
-                    if schema is None or not upsert_keys
-                    else tuple(
-                        column
-                        for column in schema.updatable_columns
-                        if column
-                        not in (
-                            *schema.primary_key_columns,
-                            *schema.identity_columns,
-                        )
-                    )
-                ),
-                generated_identity_columns=(
-                    () if schema is None or not upsert_keys else schema.identity_columns
-                ),
-            )
+    # The catalog only offers choices, so losing it must not stop a revoke.
+    try:
+        refs = await store.list_current_snapshot_refs(agent_id, (source_id,))
+        catalog_generation = None if not refs else refs[0].sync_id
+        resources = tuple(
+            resource
+            for resource in await store.list_resources(agent_id, source_id)
+            if resource.agent_id == agent_id and resource.source_id == source_id
         )
+        schemas = (
+            await data_view.resource_schemas(agent_id, source_id) if writable else ()
+        )
+    except (CatalogStoreError, ValueError) as error:
+        _LOGGER.warning("catalog unavailable for permissions: %s", type(error).__name__)
+        catalog_generation, resources, schemas = None, (), ()
+    schemas_by_resource_id = {schema.resource_id: schema for schema in schemas}
+    # What the catalog knows only offers choices; enabling reads the table live.
+    choices = tuple(
+        SourcePermissionResource(
+            resource_id=resource.id,
+            display_name=resource.native_identity,
+            resource_kind=resource.kind.value,
+            eligible_assignment_columns=(
+                tuple(
+                    column
+                    for column in schemas_by_resource_id[resource.id].updatable_columns
+                    if column
+                    not in schemas_by_resource_id[resource.id].identity_columns
+                )
+                if resource.id in schemas_by_resource_id
+                and resource.kind is ResourceKind.TABLE
+                else ()
+            ),
+            eligible_insert_columns=(
+                tuple(
+                    column
+                    for column in schemas_by_resource_id[resource.id].columns
+                    if column
+                    not in schemas_by_resource_id[resource.id].identity_columns
+                )
+                if resource.id in schemas_by_resource_id
+                and resource.kind is ResourceKind.TABLE
+                else ()
+            ),
+        )
+        for resource in resources
+    )
+    # A stored scope stays on offer, so it can always be removed, catalog or not.
+    cataloged = {choice.resource_id for choice in choices}
+    choices = (
+        *choices,
+        *(
+            SourcePermissionResource(
+                resource_id=scope.resource_id,
+                display_name=scope.table,
+                resource_kind=ResourceKind.TABLE.value,
+                eligible_assignment_columns=scope.allowed_update_columns,
+                eligible_insert_columns=scope.allowed_insert_columns,
+            )
+            for scope in update_scopes
+            if scope.resource_id not in cataloged
+        ),
+    )
     return SourcePermissionsInspection(
         source_id=source_id,
         source_display_name=registration.display_name,
         adapter_id=registration.adapter_id,
         catalog_generation=catalog_generation,
         state=SourcePermissionState(read_scope, update_scopes),
-        resources=tuple(choices),
+        resources=choices,
         supports_relational_writes=writable,
+    )
+
+
+def _within(scope: RelationalWriteScope, stored: RelationalWriteScope | None) -> bool:
+    """True when a scope grants nothing the stored one did not already grant."""
+
+    return (
+        stored is not None
+        and set(scope.allowed_operations) <= set(stored.allowed_operations)
+        and set(scope.allowed_insert_columns) <= set(stored.allowed_insert_columns)
+        and set(scope.allowed_update_columns) <= set(stored.allowed_update_columns)
+        and scope.max_rows <= stored.max_rows
     )
 
 
 async def _build_source_permissions_preview(
     store: StateStore,
-    catalog_service: CatalogService,
-    data_view: CatalogDataView,
     source_types: SourceTypeRegistry,
     agent_id: str,
     confirmation_key: bytes,
@@ -338,6 +324,7 @@ async def _build_source_permissions_preview(
     read_mode: SourceReadMode,
     read_resource_ids: tuple[str, ...],
     relational_write_scopes: Mapping[str, Mapping[str, object]],
+    inspect_write_table: Callable[..., Awaitable[Mapping[str, tuple[str, ...]]]],
 ) -> SourcePermissionsPreview:
     if not isinstance(read_mode, SourceReadMode):
         raise TypeError("read_mode must be SourceReadMode")
@@ -354,12 +341,6 @@ async def _build_source_permissions_preview(
         mode=read_mode,
         resource_ids=read_resource_ids,
     )
-    if requested_read.mode is SourceReadMode.SELECTED:
-        unknown_read_ids = set(requested_read.resource_ids) - set(current_resources)
-        if unknown_read_ids:
-            raise ValueError(
-                "selected read resources are not current resources of this source"
-            )
     if relational_write_scopes and not inspection.supports_relational_writes:
         raise ValueError(
             "Relational write scopes require an active source whose type "
@@ -376,48 +357,30 @@ async def _build_source_permissions_preview(
         or registration.adapter_id != inspection.adapter_id
     ):
         raise ValueError("source identity changed during permission preview")
-    tabular_by_resource_id = {
-        item.resource.id: item
-        for item in await catalog_service.tabular_resources(
-            agent_id,
-            inspection.source_id,
-        )
+    stored_scopes = {
+        scope.table: scope for scope in inspection.state.relational_write_scopes
     }
     update_scopes: list[RelationalWriteScope] = []
     requested_update_ids: set[str] = set()
-    schemas = {
-        item.resource_id: item
-        for item in await data_view.resource_schemas(agent_id, inspection.source_id)
-    }
-    from ..domains.data.sql.relational_upsert import (
-        validate_relational_upsert_scope,
-    )
-
-    for resource_id, constraints in relational_write_scopes.items():
+    for table, constraints in relational_write_scopes.items():
         if not isinstance(constraints, Mapping) or set(constraints) != {
             "allowed_operations",
             "allowed_insert_columns",
             "allowed_update_columns",
-            "key_columns",
-            "generated_identity_columns",
             "max_rows",
         }:
             raise ValueError(
-                "write scopes require explicit operations, keys, insert/update columns, identities and row limit"
+                "write scopes require explicit operations, insert/update columns "
+                "and row limit"
             )
-        tabular = tabular_by_resource_id.get(resource_id)
-        schema = schemas.get(resource_id)
-        if (
-            tabular is None
-            or schema is None
-            or tabular.resource.kind is not ResourceKind.TABLE
-        ):
-            raise ValueError("write scope requires an exact current table")
+        resource_id = catalog_resource_id(
+            inspection.source_id, ResourceKind.TABLE, table
+        )
         scope = RelationalWriteScope(
             agent_id=agent_id,
             source_id=inspection.source_id,
             resource_id=resource_id,
-            resource_revision=tabular.resource.current_revision,
+            table=table,
             allowed_operations=cast(tuple[str, ...], constraints["allowed_operations"]),
             allowed_insert_columns=cast(
                 tuple[str, ...], constraints["allowed_insert_columns"]
@@ -425,54 +388,41 @@ async def _build_source_permissions_preview(
             allowed_update_columns=cast(
                 tuple[str, ...], constraints["allowed_update_columns"]
             ),
-            key_columns=cast(tuple[str, ...], constraints["key_columns"]),
-            generated_identity_columns=cast(
-                tuple[str, ...], constraints["generated_identity_columns"]
-            ),
             max_rows=cast(int, constraints["max_rows"]),
             authorization_fingerprint="sha256:" + "0" * 64,
         )
-        if any(
-            not source_types.supports(
-                inspection.adapter_id, RELATIONAL_WRITE_OPERATIONS[name]
+        # Taking access away must work with the source down or the table gone.
+        if not _within(scope, stored_scopes.get(table)):
+            live = await inspect_write_table(
+                agent_id=agent_id, source_id=inspection.source_id, table=table
             )
-            for name in scope.allowed_operations
-        ):
-            raise ValueError("source type does not support the requested write")
-        if "update" in scope.allowed_operations:
-            if (
-                set(scope.key_columns) != set(schema.primary_key_columns)
-                or not validate_relational_write_scope(
-                    inspection.source_id,
-                    resource_id,
-                    scope.allowed_update_columns,
-                    resources=(schema,),
-                ).valid
-            ):
-                raise ValueError(
-                    "update scope requires eligible columns and the exact primary key"
-                )
-        if "upsert" in scope.allowed_operations:
-            validate_relational_upsert_scope(
-                schema,
-                key_columns=scope.key_columns,
-                insert_columns=scope.allowed_insert_columns,
-                update_columns=scope.allowed_update_columns,
-                generated_identity_columns=scope.generated_identity_columns,
+            missing = sorted(
+                {*scope.allowed_insert_columns, *scope.allowed_update_columns}
+                - set(live["columns"])
             )
-            if scope.max_rows > 1000:
-                raise ValueError("upsert scope cannot exceed 1000 rows")
+            if missing:
+                raise ValueError(f"{table} has no writable column {', '.join(missing)}")
         scope = replace(
             scope,
             authorization_fingerprint=relational_write_authorization_fingerprint(
-                source=registration,
-                resource=tabular.resource,
-                facet=tabular.facet,
-                scope=scope,
+                source=registration, scope=scope
             ),
         )
         update_scopes.append(scope)
         requested_update_ids.add(resource_id)
+
+    if requested_read.mode is SourceReadMode.SELECTED:
+        # A write's table and what is already stored need no catalog entry.
+        unknown_read_ids = (
+            set(requested_read.resource_ids)
+            - set(current_resources)
+            - requested_update_ids
+            - set(inspection.state.read_scope.resource_ids)
+        )
+        if unknown_read_ids:
+            raise ValueError(
+                "selected read resources are not current resources of this source"
+            )
 
     automatic_read_additions: set[str] = set()
     if requested_read.mode is SourceReadMode.ALL:
@@ -495,15 +445,11 @@ async def _build_source_permissions_preview(
                 mode=SourceReadMode.NONE,
             )
         )
-    effective_read_ids = (
-        set(current_resources)
-        if final_read_scope.mode is SourceReadMode.ALL
-        else set(final_read_scope.resource_ids)
-    )
     dependent_revocations = tuple(
         scope.resource_id
         for scope in inspection.state.relational_write_scopes
-        if scope.resource_id not in effective_read_ids
+        if final_read_scope.mode is not SourceReadMode.ALL
+        and scope.resource_id not in final_read_scope.resource_ids
     )
 
     after = SourcePermissionState(
@@ -511,7 +457,14 @@ async def _build_source_permissions_preview(
         tuple(update_scopes),
     )
     names = {
-        resource.resource_id: resource.display_name for resource in inspection.resources
+        **{
+            resource.resource_id: resource.display_name
+            for resource in inspection.resources
+        },
+        **{
+            scope.resource_id: scope.table
+            for scope in (*inspection.state.relational_write_scopes, *update_scopes)
+        },
     }
     summary = SourcePermissionSummary(
         source_display_name=inspection.source_display_name,

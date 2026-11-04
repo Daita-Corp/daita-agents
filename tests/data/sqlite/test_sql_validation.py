@@ -130,13 +130,11 @@ def test_sqlite_parameters_must_match_placeholders() -> None:
     assert "parameter_count_mismatch" in invalid.issue_codes
 
 
-def test_sqlite_analysis_is_bounded_and_canonical() -> None:
-    first = analyze_sqlite_sql("SELECT o.id FROM orders o")
-    second = analyze_sqlite_sql(" SELECT o.id\nFROM orders AS o; ")
+def test_sqlite_analysis_is_bounded_and_runs_the_text_as_written() -> None:
+    written = "SELECT o.id\nFROM orders AS o"
     oversized = _validate("SELECT o.id FROM orders o " + (" " * MAX_SQL_CHARACTERS))
 
-    assert first.canonical_sql == second.canonical_sql
-    assert first.sql_fingerprint == second.sql_fingerprint
+    assert analyze_sqlite_sql(written + "; ").canonical_sql == written
     assert not oversized.valid
     assert oversized.analysis is None
     assert oversized.issue_codes == ("sql_too_large",)

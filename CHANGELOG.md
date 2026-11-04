@@ -2,6 +2,37 @@
 
 ## 1.3.0 (unreleased)
 
+### One write tool: `data_write`
+
+The model writes to PostgreSQL with one SQL statement (`INSERT`, `UPDATE` or `DELETE`)
+through `data_write`, previewed and approved as before. It replaces `data_update_rows`
+and `data_upsert_rows`.
+
+- **Write scopes** name a table, `insert`, `update` and `delete` operations, columns and
+  a row limit. Upgrading converts stored scopes: `update` stays `update`, `upsert`
+  becomes `insert` and `update`, and delete is never granted.
+  A scope already refused as stale is dropped rather than revived.
+  `Agent.preview_source_permissions(relational_write_scopes=...)` is now keyed by full
+  table name, without `key_columns` or `generated_identity_columns`.
+- **Verified writes.** PostgreSQL receives each read and write exactly as written, so
+  `E'\\d+'` now works. Before a write, PostgreSQL reports what the statement targets;
+  before commit, Daita compares the rows it touched with the rows on the card and rolls
+  back if they differ. The card says whether it checks `rows` or only the `count`.
+  Refusals are a fixed list of six. `UPDATE` and `DELETE` without `WHERE` are now a card
+  warning, as are time, randomness and a row matched twice. A statement that cannot be
+  previewed fails with `write_preview_failed` and PostgreSQL's own message. A preview now
+  takes a brief table lock, so it can time out behind a schema change.
+- **The catalog no longer gates writes.** A table with no catalog entry can be enabled
+  and written, and unrelated DDL no longer fails a write.
+- **Triggers and cascading foreign keys** no longer refuse a table; the approval card
+  names them and says their effects are not previewed.
+- **Removed:** `Agent.relational_update_readiness` and
+  `Agent.relational_upsert_readiness` become `Agent.relational_write_readiness(source_id,
+  table)`, `RelationalUpdateReadiness` becomes `RelationalWriteReadiness`, and
+  `daita relational-update-readiness` becomes `daita relational-write-readiness`.
+  Generated identities are no longer returned, since a statement cannot have its own
+  `RETURNING`.
+
 ### Routines are a title, a prompt and a schedule
 
 A routine now holds what a person asked for: a title, a prompt, a schedule

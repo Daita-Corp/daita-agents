@@ -35,7 +35,7 @@ from ..adapters.mcp import (
 )
 from ..adapters.models import SourceRegistration
 from ..adapters.postgresql import PostgreSQLProbeResult
-from ..adapters.postgresql_write import RelationalUpdateReadiness
+from ..adapters.postgresql_write import RelationalWriteReadiness
 from ..adapters.protocols import ResourceSource
 from ..artifacts.models import (
     ArtifactDeliveryReceipt,
@@ -96,7 +96,6 @@ from .runs import ACTIVE_STATES
 from .supervise import HostStartError, host_status, start_host, stop_host
 
 if TYPE_CHECKING:
-    import httpx
 
     from .routes import Route
 
@@ -1249,13 +1248,10 @@ class RemoteAgent:
     ) -> SourcePermissionsInspection:
         return await self._call("apply_source_permissions", locals())
 
-    async def relational_update_readiness(
-        self,
-        source_id: str,
-        resource_id: str,
-        assignment_columns: tuple[str, ...],
-    ) -> RelationalUpdateReadiness:
-        return await self._call("relational_update_readiness", locals())
+    async def relational_write_readiness(
+        self, source_id: str, table: str
+    ) -> RelationalWriteReadiness:
+        return await self._call("relational_write_readiness", locals())
 
     async def detach(self, source_id: str) -> SourceRegistration:
         return await self._call("detach", locals())

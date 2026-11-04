@@ -35,7 +35,7 @@ The automated write release tests use `daita_large_write_tester` and the isolate
 `write_acceptance.companies` and `write_acceptance.cells` tables. This does not add
 tables or permissions to the reader or change the original update canary. The
 company table's integer identity and two unique text keys exercise generated IDs,
-conflict-key matching, and independent server
+conflict columns, and independent server
 constraint failures. The narrow integer `cells` table reaches the 1,000-row ceiling
 without exceeding the byte or exact approval bounds. The role has SELECT,
 table-level UPDATE (needed for the EXCLUSIVE lock), column-scoped INSERT, and
@@ -158,16 +158,17 @@ MCP calls, or live external services beyond this local fixture are needed.
 
 The suite covers:
 
-- Mixed insert/update/unchanged batches, exact counts and generated identities;
-  unchanged repeats; omitted values versus explicit nulls.
+- Mixed insert/update batches and exact counts; repeated batches; omitted values
+  versus explicit nulls.
 - Approval denial, stale row values and structure, revoked database privileges,
   and Daita permission revocation retained after reopen.
-- Duplicate/null keys, explicit identity assignments, row and byte ceilings,
-  and update permission that cannot authorize upsert.
+- Duplicate and null keys the server refuses, explicit identity assignments, row
+  and byte ceilings,
+  and update permission that cannot authorize an insert.
 - A real second-insert unique violation rolling back the entire batch; a
   deliberately corrupted driver row count rolling back a real update.
-- Real lock timeout and a concurrent insertion while the upsert waits for its
-  EXCLUSIVE lock. The authoritative scan must see the committed competitor.
+- Real lock timeout, and a concurrent insertion of the same key while the upsert
+  waits on it, which refuses when the competitor commits.
 - Driver cancellation after mutation and after commit; foreground cancellation
   that drains an already-started write and retains its verified commit; lost
   commit confirmation;

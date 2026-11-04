@@ -12,6 +12,7 @@ from daita.domains.data.export_capabilities import (
 from daita.domains.data.sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
+    SqlAnalysisError,
     analyze_postgresql_sql,
     validate_read,
 )
@@ -511,13 +512,50 @@ def test_postgresql_parameters_are_contiguous_and_numbered(
         assert issue_code in result.issue_codes
 
 
-def test_canonical_sql_keeps_partitions_and_is_format_stable() -> None:
-    first = analyze_postgresql_sql("SELECT o.id FROM sales.orders o")
-    second = analyze_postgresql_sql("  SELECT o.id\nFROM sales.orders AS o;  ")
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT o.id\nFROM sales.orders AS o",
+        "select /* why */ o.id from sales.orders o -- trailing",
+        r"SELECT id FROM sales.items WHERE name ~ E'\\d+'",
+        "SELECT $1,$2",
+    ),
+)
+def test_the_server_receives_the_statement_as_written(sql: str) -> None:
+    assert analyze_postgresql_sql(sql).canonical_sql == sql
+    assert analyze_postgresql_sql(sql + " ;  ").canonical_sql == sql
 
-    assert "ONLY" not in first.canonical_sql
-    assert second.canonical_sql == first.canonical_sql
-    assert second.sql_fingerprint == first.sql_fingerprint
+
+@pytest.mark.parametrize(
+    ("call", "name"),
+    (
+        ("ceiling(1)", "ceiling"),
+        ("mod(2, 3)", "mod"),
+        ("date_part('year', ts)", "date_part"),
+        ("now('x')", "now"),
+        ("NOW ()", "now"),
+    ),
+)
+def test_a_call_is_checked_as_written_not_as_the_parser_renames_it(
+    call: str, name: str
+) -> None:
+    result = _validate(f"SELECT {call} FROM sales.orders")
+    assert name in result.written_calls
+
+
+def test_a_quoted_call_keeps_its_case_for_the_function_rule() -> None:
+    """The tree reads "LOWER"(1) as lower(1), but the server keeps the quotes."""
+
+    result = _validate('SELECT "LOWER"(1), "evil"(2) FROM sales.orders')
+    assert {"LOWER", "evil"} <= set(result.written_calls)
+
+
+def test_grammar_and_qualified_calls_are_not_written_calls() -> None:
+    result = _validate(
+        "SELECT pg_catalog.lower(a) FROM sales.orders WHERE id IN (1) AND b = ANY ($1)",
+        parameters=(1,),
+    )
+    assert result.written_calls == ()
 
 
 def test_sql_and_parameter_inputs_are_bounded_before_execution() -> None:
@@ -554,3 +592,68 @@ def test_model_facing_sql_capabilities_publish_the_same_input_bounds() -> None:
         assert isinstance(parameter_schema, Mapping)
         assert sql_schema["maxLength"] == MAX_SQL_CHARACTERS
         assert parameter_schema["maxItems"] == MAX_SQL_PARAMETERS
+
+
+@pytest.mark.parametrize(
+    ("sql", "parameters"),
+    (
+        ("SELECT $1,$2", (1, 2)),
+        ("SELECT $1,$2,$3", (1, 2, 3)),
+        ("SELECT $1+$2", (1, 2)),
+        ("SELECT $1::int,$2::int", (1, 2)),
+        ("SELECT $1,'x',$2", (1, 2)),
+        ("SELECT * FROM t WHERE a IN ($1,$2)", (1, 2)),
+    ),
+)
+def test_numbered_parameters_need_no_space_between_them(
+    sql: str, parameters: tuple[int, ...]
+) -> None:
+    analysis = analyze_postgresql_sql(sql)
+    assert analysis.parameter_ordinals == tuple(range(1, len(parameters) + 1))
+
+
+@pytest.mark.parametrize(
+    ("sql", "kept"),
+    (
+        ("SELECT $1,$2, 'cost $1,$2'", "'cost $1,$2'"),
+        ("SELECT $1,$2, 'it''s $1,$2'", "'it''s $1,$2'"),
+        ("SELECT $1,$2, E'a\\'$1,$2'", "$1,$2"),
+        ('SELECT $1,$2 AS "$1,$2"', '"$1,$2"'),
+        ("SELECT $1,$2, $tag$ $1,$2 $tag$", " $1,$2 "),
+        ("SELECT $1,$2, $$ $1,$2 $$", " $1,$2 "),
+    ),
+)
+def test_spacing_parameters_leaves_literals_exactly_as_written(
+    sql: str, kept: str
+) -> None:
+    assert kept in analyze_postgresql_sql(sql).canonical_sql
+
+
+def test_a_comment_cannot_hide_a_statement_from_parameter_spacing() -> None:
+    analysis = analyze_postgresql_sql("SELECT $1,$2 /* $3,$4 */; DROP TABLE t -- $5,$6")
+    assert analysis.statement_count == 2
+
+
+def test_an_unterminated_dollar_quote_is_still_refused() -> None:
+    with pytest.raises(SqlAnalysisError, match="could not be parsed"):
+        analyze_postgresql_sql("SELECT $tag$ never closed")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        r"SELECT id FROM sales.items WHERE name ~ E'\\d+'",
+        r"SELECT E'a\\nb'",
+    ),
+)
+def test_a_backslash_in_an_escape_string_reaches_the_server_unchanged(sql: str) -> None:
+    result = _validate(sql)
+    assert not result.issues
+    assert result.analysis is not None and result.analysis.canonical_sql == sql
+
+
+@pytest.mark.parametrize(
+    "literal", ("E'plain'", r"E'a\nb'", r"E'it\'s'", r"'a\b'", r"$$a\b$$")
+)
+def test_strings_that_keep_their_meaning_still_read(literal: str) -> None:
+    assert not _validate(f"SELECT {literal} AS value").issues

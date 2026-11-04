@@ -7,6 +7,7 @@ import inspect
 import itertools
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -31,6 +32,7 @@ from daita import (
     RoutineIntent,
 )
 from daita._json import FrozenJsonObject
+from daita.adapters.postgresql_write import PostgreSQLWriteBackend
 from daita.capabilities import ApprovalDecision, ApprovalRequest
 from daita.host import (
     HostUnavailableError,
@@ -38,7 +40,7 @@ from daita.host import (
     client as host_client,
     server as host_server,
 )
-from daita.host.client import RemoteAgent
+from daita.host.client import RemoteAgent, _routes
 from daita.host.codec import supports
 from daita.host.protocol import (
     CLIENT_ONLY_MEMBERS,
@@ -503,6 +505,7 @@ import asyncio, json, sys
 from pathlib import Path
 
 import daita
+from daita.adapters.postgresql_write import PostgreSQLWriteBackend
 from daita.capabilities import ApprovalDecision
 
 
@@ -1067,3 +1070,34 @@ async def test_a_run_finishing_while_the_stream_is_down_still_returns(
         await agent.close()
 
     assert exit.final_text == "Saved."
+
+
+def test_every_route_path_names_parameters_its_member_takes() -> None:
+    """A renamed parameter must not leave a route asking for the old name."""
+
+    for member, route in _routes().items():
+        parameters = set(inspect.signature(getattr(RemoteAgent, member)).parameters)
+        named = set(re.findall(r"{(\w+)}", route.path))
+        assert named <= parameters, f"{member}: {route.path}"
+
+
+async def test_write_readiness_reaches_the_agent_by_table_name(
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: dict[str, str] = {}
+
+    async def readiness(self: object, **arguments: str) -> None:
+        seen.update(arguments)
+        raise ValueError("reached the backend")
+
+    monkeypatch.setattr(PostgreSQLWriteBackend, "relational_write_readiness", readiness)
+    harness = await start_host()
+    await harness.create_agent()
+    agent = await daita.connect("sales", cwd=harness.work(), root=harness.root)
+    try:
+        with pytest.raises(ValueError, match="reached the backend"):
+            await agent.relational_write_readiness("source-one", "public.orders")
+    finally:
+        await agent.close()
+    assert seen["source_id"] == "source-one"
+    assert seen["table"] == "public.orders"

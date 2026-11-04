@@ -45,7 +45,7 @@ explicitly labeled. `total_matches` and `total_candidates` describe different
 counts. A cursor is valid only for its current prepared scope and discovery
 snapshot; a changed query, run, admission, or search snapshot requires a fresh
 search. Exact `toolbox_load` names still need no preceding search.
-For admitted native updates/upserts, initial guidance names the discoverable
+For admitted native writes, initial guidance names the discoverable
 preview/execution tools so one load can prepare both without a search. Revoked
 or absent write capabilities are not advertised. Preparation fits this guidance
 against the same candidate catalog used by step projection. Loading does not

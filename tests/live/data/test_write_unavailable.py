@@ -11,7 +11,7 @@ import pytest
 from daita import Agent, LoopLimits
 from daita.capabilities import ApprovalDecision, ApprovalRequest
 from daita.domains.data.capabilities import (
-    RELATIONAL_UPDATE_TOOL_NAME,
+    RELATIONAL_WRITE_TOOL_NAME,
 )
 from daita.llm.models import (
     CanonicalMessage,
@@ -52,7 +52,7 @@ _ALLOWED_MODEL_CALLS = frozenset(
         "toolbox_inspect",
         "catalog_search",
         "catalog_describe",
-        RELATIONAL_UPDATE_TOOL_NAME,
+        RELATIONAL_WRITE_TOOL_NAME,
     }
 )
 
@@ -97,7 +97,7 @@ class _GuardedRecordingProvider:
             raise AssertionError(
                 f"an unrelated mutation surface was projected to the model: {forbidden}"
             )
-        required_update_tools = {RELATIONAL_UPDATE_TOOL_NAME}
+        required_update_tools = {RELATIONAL_WRITE_TOOL_NAME}
         if not required_update_tools.issubset(projected):
             if self.bootstrap_count != 0:
                 raise AssertionError("guard update-tool bootstrap did not take effect")
@@ -273,9 +273,7 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
             read_mode="all",
             read_resource_ids=(),
             relational_write_scopes={
-                resource.id: update_constraints(
-                    ("is_active",), key_columns=("customer_id",)
-                )
+                resource.native_identity: update_constraints(("is_active",))
             },
         )
         await agent.apply_source_permissions(
@@ -297,7 +295,7 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
         update_receipts = []
         for call in _tool_calls(evidence):
             if (
-                call.name == RELATIONAL_UPDATE_TOOL_NAME
+                call.name == RELATIONAL_WRITE_TOOL_NAME
                 and call.arguments.get("mode") == "apply"
             ):
                 update_receipts.append(
@@ -327,12 +325,12 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
         {definition.name for definition in request.tools}
         for request in provider.requests
     )
-    assert any(RELATIONAL_UPDATE_TOOL_NAME in names for names in projected_names)
+    assert any(RELATIONAL_WRITE_TOOL_NAME in names for names in projected_names)
     results = _tool_results(transcript.messages)
     write_calls = tuple(
         call
         for call in _tool_calls(evidence)
-        if call.name == RELATIONAL_UPDATE_TOOL_NAME
+        if call.name == RELATIONAL_WRITE_TOOL_NAME
     )
     assert write_calls
     assert all(results[call.id].is_error is True for call in write_calls)

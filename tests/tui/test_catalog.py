@@ -95,6 +95,117 @@ async def test_source_permissions_picker_remains_interactive_after_command_submi
         await opened.close()
 
 
+def _permissions_app(stored_max_rows: int = 25):
+    """A permission screen over one stored scope on one table; records previews."""
+
+    tickets = SimpleNamespace(
+        resource_id="resource-tickets",
+        display_name="support.tickets",
+        resource_kind="table",
+        eligible_assignment_columns=("priority", "ticket_status"),
+        eligible_insert_columns=(),
+    )
+    state = SimpleNamespace(
+        read_scope=SimpleNamespace(mode=SimpleNamespace(value="all"), resource_ids=()),
+        relational_write_scopes=(
+            SimpleNamespace(
+                table="support.tickets",
+                allowed_operations=("update",),
+                allowed_insert_columns=(),
+                allowed_update_columns=("priority", "ticket_status"),
+                max_rows=stored_max_rows,
+                constraints=lambda: {
+                    "table": "support.tickets",
+                    "allowed_operations": ("update",),
+                    "allowed_insert_columns": (),
+                    "allowed_update_columns": ("priority", "ticket_status"),
+                    "max_rows": stored_max_rows,
+                },
+            ),
+        ),
+    )
+    inspection = SimpleNamespace(
+        source_id="source-postgresql",
+        source_display_name="Support PostgreSQL",
+        adapter_id="postgresql",
+        catalog_generation="sync-one",
+        state=state,
+        resources=(tickets,),
+        supports_relational_writes=True,
+    )
+    previews: list[dict[str, object]] = []
+
+    async def inspect(source_id: str):
+        return inspection
+
+    async def preview(**kwargs: object):
+        previews.append(kwargs)
+        return SimpleNamespace(
+            source_id=inspection.source_id,
+            catalog_generation="sync-one",
+            before=state,
+            after=state,
+            confirmation_fingerprint="sha256:" + "1" * 64,
+        )
+
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    app.controller.inspect_source_permissions = inspect  # type: ignore[method-assign]
+    app.controller.preview_source_permissions = preview  # type: ignore[method-assign]
+    return app, inspection, previews
+
+
+def _pick(app: DaitaApp, *identities: str) -> None:
+    picker = app.screen
+    assert isinstance(picker, SelectionScreen)
+    listing = picker.query_one("#picker-options", OptionList)
+    for identity in identities:
+        listing.highlighted = next(
+            index
+            for index in range(listing.option_count)
+            if str(listing.get_option_at_index(index).id) == identity
+        )
+        if picker._multi:
+            picker.action_toggle_selected()
+    picker.action_confirm()
+
+
+async def test_choosing_no_operations_revokes_the_table():
+    app, inspection, previews = _permissions_app()
+    async with app.run_test(size=(100, 32)) as pilot:
+        await app.push_screen(PermissionsScreen(source_id=inspection.source_id))
+        permissions = app.screen
+        assert await pilot.click("#perm-write") is True
+        await pilot.pause()
+        _pick(app, "resource-tickets")
+        await pilot.pause()
+        _pick(app)
+        await pilot.pause()
+
+        assert app.screen is permissions
+        assert previews[-1]["relational_write_scopes"] == {}
+        app.exit(0)
+
+
+async def test_editing_a_scope_keeps_its_row_limit_unless_one_is_typed():
+    for typed, expected in (("", 25), ("7", 7)):
+        app, inspection, previews = _permissions_app(stored_max_rows=25)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await app.push_screen(PermissionsScreen(source_id=inspection.source_id))
+            app.screen.query_one("#perm-max-rows", Input).value = typed
+            assert await pilot.click("#perm-write") is True
+            await pilot.pause()
+            _pick(app, "resource-tickets")
+            await pilot.pause()
+            _pick(app, "update")
+            await pilot.pause()
+            _pick(app, "priority")
+            await pilot.pause()
+
+            updates = previews[-1]["relational_write_scopes"]
+            assert updates["support.tickets"]["max_rows"] == expected
+            app.exit(0)
+
+
 async def test_source_permissions_configures_exact_relational_write_scope():
     read_scope = SimpleNamespace(mode=SimpleNamespace(value="all"), resource_ids=())
     initial_state = SimpleNamespace(
@@ -103,12 +214,10 @@ async def test_source_permissions_configures_exact_relational_write_scope():
     )
     tickets = SimpleNamespace(
         resource_id="resource-tickets",
-        key_columns=("ticket_id",),
         display_name="support.tickets",
         resource_kind="table",
         eligible_assignment_columns=("priority", "ticket_status"),
-        relational_update_eligible=True,
-        upsert_conflict_keys=(),
+        eligible_insert_columns=("ticket_id", "priority", "ticket_status"),
     )
     inspection = SimpleNamespace(
         source_id="source-postgresql",
@@ -132,11 +241,14 @@ async def test_source_permissions_configures_exact_relational_write_scope():
         assert isinstance(updates, dict)
         scopes = tuple(
             SimpleNamespace(
-                resource_id=resource_id,
+                table=table,
                 **columns,
-                constraints=lambda columns=columns: dict(columns),
+                constraints=lambda table=table, columns=columns: {
+                    "table": table,
+                    **columns,
+                },
             )
-            for resource_id, columns in updates.items()
+            for table, columns in updates.items()
         )
         after = SimpleNamespace(
             read_scope=SimpleNamespace(
@@ -193,7 +305,7 @@ async def test_source_permissions_configures_exact_relational_write_scope():
         await pilot.pause()
         choose_single(app, tickets.resource_id)
         await pilot.pause()
-        choose_single(app, "update")
+        choose_multi(app, "update")
         await pilot.pause()
         choose_multi(app, "priority")
         await pilot.pause()
@@ -205,12 +317,10 @@ async def test_source_permissions_configures_exact_relational_write_scope():
                 "read_mode": "all",
                 "read_resource_ids": (),
                 "relational_write_scopes": {
-                    tickets.resource_id: {
+                    tickets.display_name: {
                         "allowed_operations": ("update",),
                         "allowed_insert_columns": (),
                         "allowed_update_columns": ("priority",),
-                        "key_columns": ("ticket_id",),
-                        "generated_identity_columns": (),
                         "max_rows": 100,
                     },
                 },

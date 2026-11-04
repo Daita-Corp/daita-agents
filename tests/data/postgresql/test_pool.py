@@ -178,7 +178,8 @@ async def test_repeated_queries_and_exports_share_connections_and_fresh_transact
     assert len(transport.created[0].transactions) == 20
     assert all(t.committed for t in transport.created[0].transactions)
     assert transport.created[0].resets == 20
-    assert len(transport.created[0].settings) == 40
+    # Each read pins its timeout, its search path and how strings are read.
+    assert len(transport.created[0].settings) == 60
     metrics = backend.diagnostics()
     assert metrics.active == 0 and metrics.connections_created == 1
     assert metrics.query_seconds >= 0

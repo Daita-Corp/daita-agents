@@ -84,10 +84,16 @@ def live_model_id(model_id: str) -> str:
     return candidate
 
 
-def cost_cap(amount: Decimal) -> Decimal | None:
-    """Return the dollar cap for API billing and none for subscription routes."""
+def cost_cap(amount: Decimal, model_id: str = "") -> Decimal | None:
+    """Return the dollar cap, or none where the route refuses one.
 
-    return None if subscription_billing() else amount
+    Subscription routes are unpriced and Anthropic routes refuse a cap; their step
+    and token limits bound them instead.
+    """
+
+    if subscription_billing() or model_id.startswith("anthropic:"):
+        return None
+    return amount
 
 
 def live_provider(
