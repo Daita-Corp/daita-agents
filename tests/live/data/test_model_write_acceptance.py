@@ -427,7 +427,8 @@ async def test_live_unique_constraint_failure_rolls_back_whole_batch(
             if scenario.profile == "user_flow"
             else []
         )
-        assert database.probe.mutations == 1 and database.probe.commit_attempts == 0
+        # The probe counts completed mutations, and this one failed at the server.
+        assert database.probe.mutations == 0 and database.probe.commit_attempts == 0
         scenario.stages.append("constraint_rollback_verified")
         scenario.assert_report(result, "not_applied", (0, 0, None))
 
@@ -576,7 +577,8 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
         scenario.clock = NEXT_SLOT
         scenario.agent._embedded._routine_supervisor.wake()
         weekly, weekly_transcript = await scenario.scheduled_result(2)
-        scenario.assert_report(weekly, "succeeded", (0, 0, 1))
+        # ON CONFLICT DO UPDATE rewrites a matching row, whether or not it differs.
+        scenario.assert_report(weekly, "succeeded", (0, 1, 0))
         weekly_call = assert_preview_binding(
             scenario.evidence[weekly_transcript.run.id]
         )
@@ -588,7 +590,7 @@ async def test_live_model_authors_and_executes_immediate_weekly_upsert(
             and item.evidence_basis is EffectEvidenceBasis.ADAPTER_VERIFIED
             for item in receipts
         )
-        assert database.probe.mutations == 1 and database.probe.server_commits == 2
+        assert database.probe.mutations == 2 and database.probe.server_commits == 2
         for call, run, counts in (
             (immediate_call, immediate, 1),
             (weekly_call, weekly, 1),
