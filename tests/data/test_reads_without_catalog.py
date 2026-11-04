@@ -199,6 +199,11 @@ async def test_a_damaged_catalog_row_does_not_stop_a_run(
                 tool_calls=(
                     ToolCall("count", "data_query", _QUERY),
                     ToolCall("search", "catalog_search", {"query": "companies"}),
+                ),
+            ),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
                     ToolCall(
                         "describe",
                         "catalog_describe",
