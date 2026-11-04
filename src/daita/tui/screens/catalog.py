@@ -721,6 +721,7 @@ class CatalogScreen(ModalScreen[SourceManagerAction | None]):
                     self._check_connection(source_id),
                     name="catalog-connection-check",
                     group="catalog-connection",
+                    exit_on_error=False,
                 )
 
     async def _check_connection(self, source_id: str) -> None:
@@ -728,7 +729,12 @@ class CatalogScreen(ModalScreen[SourceManagerAction | None]):
             source_id
         )
         self._checking.discard(source_id)
-        if self.is_mounted and self._selected_source_id() == source_id:
+        # The screen can be closing: still mounted, but its tree already gone.
+        if (
+            self.is_mounted
+            and self.query("#catalog-tree")
+            and self._selected_source_id() == source_id
+        ):
             self._show_connection(source_id)
 
     def _summary_text(self) -> str:

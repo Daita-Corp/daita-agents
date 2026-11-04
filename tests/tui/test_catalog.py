@@ -618,7 +618,7 @@ async def test_catalog_command_opens_grouped_named_resource_tree(
                 composer = app.screen.query_one(Composer)
                 composer.load_text(f"/source refresh {first.id}")
                 composer.action_submit()
-                await pilot.pause()
+                await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
                 assert isinstance(app.screen, CatalogScreen)
                 refresh_notice = app.screen.query_one("#catalog-notice", Static)
                 assert str(refresh_notice.content) == (
@@ -745,7 +745,7 @@ async def test_sources_manager_routes_actions_for_the_selected_source(
             composer = app.screen.query_one(Composer)
             composer.load_text("/sources")
             composer.action_submit()
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
 
             assert isinstance(app.screen, CatalogScreen)
             assert await pilot.click("#source-edit") is True
@@ -759,10 +759,10 @@ async def test_sources_manager_routes_actions_for_the_selected_source(
             assert edit._source.id == source.id
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
             assert isinstance(app.screen, CatalogScreen)
             assert await pilot.click("#source-permissions") is True
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, PermissionsScreen))
             permissions = app.screen
             assert isinstance(permissions, PermissionsScreen)
             assert permissions._source_id == source.id
@@ -771,17 +771,17 @@ async def test_sources_manager_routes_actions_for_the_selected_source(
             )
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
             assert isinstance(app.screen, CatalogScreen)
             assert await pilot.click("#source-detach") is True
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("n")
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
             assert isinstance(app.screen, CatalogScreen)
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, ChatScreen))
             assert isinstance(app.screen, ChatScreen)
             app.exit(0)
     finally:
@@ -866,7 +866,7 @@ async def test_empty_catalog_refresh_opens_catalog_without_an_onboarding_loop(
             assert "0 resources" in str(source_node.label)
             assert str(source_node.children[0].label) == "No current resources"
             await pilot.press("escape")
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, ChatScreen))
             assert isinstance(app.screen, ChatScreen)
             assert "Catalog refresh completed, but found no resources" in str(
                 app.screen.query_one("#notice-bar", Static).content
@@ -995,4 +995,29 @@ async def test_an_unreachable_or_failing_check_says_so_and_keeps_the_screen_usab
         assert isinstance(app.screen, CatalogScreen)
         assert str(block.content).startswith("Not reachable")
         assert "DO-NOT-EXPOSE" not in str(block.content)
+        app.exit(0)
+
+
+async def test_closing_sources_during_a_connection_check_does_not_crash_the_app():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def check_source(source_id: str) -> SourceHealth:
+        entered.set()
+        await release.wait()
+        return _health(source_id)
+
+    app.controller.agent = _agent_checking(check_source)
+    async with app.run_test(size=(100, 34)) as pilot:
+        screen = _sources_screen("Alpha")
+        await app.push_screen(screen)
+        await asyncio.wait_for(entered.wait(), timeout=10)
+
+        # While the screen is closing it can still be mounted with its tree gone.
+        await screen.query_one("#catalog-tree").remove()
+        release.set()
+        await pilot.pause(0.1)
+
+        assert app.is_running
+        assert app._exception is None
         app.exit(0)
