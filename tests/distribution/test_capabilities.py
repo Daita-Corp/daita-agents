@@ -178,9 +178,7 @@ async def test_scheduled_scope_cannot_discover_or_inspect_distribution() -> None
     instruction = "Read within the frozen scope."
     plan = inbox_distribution_plan("conversation-1")
     scope = ExecutionScope(
-        contract_bindings=frozen_execution_bindings(
-            ("data.query",), ("resource-1",), ("mock",)
-        ),
+        contract_bindings=frozen_execution_bindings(("data.query",), ("mock",)),
         scope_id="scope-routine",
         revision=1,
         agent_id="agent-1",

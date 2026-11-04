@@ -34,7 +34,7 @@ from .capabilities import (
     source_id_schema,
 )
 from .capability_runtime import CapabilityFailure, SideEffectPlan
-from .catalog.models import CATALOG_CONTEXT_DEFAULT_LIMIT
+from .catalog.protocols import CatalogStoreError
 from .llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
 from .loop.models import RunInput, Transcript
 from .loop.session import RunSession
@@ -85,7 +85,7 @@ SEMANTIC_DELETE_OUTPUT_KIND = "semantic.deleted"
 # semantic_save routes action=save (default) to semantic.save and
 # action=delete to semantic.delete, each with its own approval.
 SEMANTIC_VIEW_DESCRIPTION = (
-    "Without id, list annotations (filter by source_id, resource_id, kind, "
+    "Without id, list annotations (filter by source, table, kind, "
     "limit); list before creating a duplicate. With id, load one annotation and "
     "current_sha256 before replacing, superseding, deleting or revalidating it. "
     "maintenance.state says whether its statement is current meaning; stale, "
@@ -97,13 +97,17 @@ SEMANTIC_SAVE_DESCRIPTION = (
     "the sole approval card. Use only for explicit user assertions or validated "
     "tool results: evidence kind tool_result names the result_ref of an earlier "
     "step; the runtime binds run and position. Global definitions belong in "
-    "MEMORY.md. Needs current catalog IDs and fields; Daita binds their "
+    "MEMORY.md. Needs current catalog table names and fields; Daita binds their "
     "revisions. To replace, supersede or action=delete, semantic_view the "
     "annotation earlier in this run; Daita binds that version."
 )
 SEMANTIC_DOMAIN_OWNER_ID = "semantics"
 
 _CONFIRMED_BY = "local-user"
+_UNCATALOGED_TABLE = (
+    "The catalog has no entry for this table yet, so a semantic note cannot bind "
+    "to it. Reads of the table are unaffected."
+)
 
 
 class SemanticValidationError(ValueError):
@@ -1121,10 +1125,8 @@ class SemanticListExecutor:
             and (kind is None or item.kind is kind)
             and (
                 request.source_scope is None
-                or (
-                    set(item.subject.source_ids) <= request.source_scope.source_ids
-                    and set(item.subject.resource_ids)
-                    <= request.source_scope.resource_ids
+                or request.source_scope.covers(
+                    item.subject.source_ids, item.subject.resource_ids
                 )
             )
         )[:limit]
@@ -1472,7 +1474,7 @@ def semantic_declarations(
                 "binds the exact current run ID and transcript message position. "
                 "Never invent transcript IDs or positions. Tool-result evidence must "
                 "come from an earlier completed tool step in this run. "
-                "Global definitions belong in MEMORY.md. Current catalog IDs and "
+                "Global definitions belong in MEMORY.md. Current catalog table names and "
                 "fields are required; the runtime binds their current revisions. "
                 "Replacement and supersession need an earlier semantic_view of the "
                 "target in this run, whose version the runtime binds."
@@ -1587,21 +1589,17 @@ def semantic_declarations(
 
 
 class SemanticDomainCatalog(Protocol):
+    async def source_read_access(
+        self, agent_id: str, source_ids: tuple[str, ...]
+    ) -> Mapping[str, frozenset[str] | None]: ...
+
     async def source_routing_facts(
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
     ) -> tuple[Mapping[str, object], ...]: ...
 
-    async def catalog_context(
-        self,
-        agent_id: str,
-        query: str,
-        *,
-        limit: int,
-        source_ids: tuple[str, ...] = (),
-        resource_ids: tuple[str, ...] = (),
-    ) -> FrozenJsonObject: ...
+    async def non_table_resource_ids(self, agent_id: str) -> Mapping[str, str]: ...
 
     async def readable_resource_ids(
         self,
@@ -1665,10 +1663,15 @@ class SemanticCapabilityDomain:
         use the existing semantic owner and its exact revision/evidence checks.
         """
         scope = await resolve_effective_source_scope(run, self._catalog)
-        if not scope.resource_ids:
+        known = scope.resource_ids
+        if scope.unrestricted_source_ids:
+            known |= await self._catalog.readable_resource_ids(
+                run.agent_id, tuple(sorted(scope.unrestricted_source_ids))
+            )
+        if not known:
             return
         facts = await self._catalog.semantic_resource_facts(
-            run.agent_id, tuple(sorted(scope.resource_ids))
+            run.agent_id, tuple(sorted(known))[:2_048]
         )
         qualified_fields = set(re.findall(r"\b[A-Za-z_]\w*\.([A-Za-z_]\w*)\b", content))
         quoted_identifiers = set(re.findall(r"`([A-Za-z_]\w*)`", content))
@@ -1763,6 +1766,7 @@ class SemanticCapabilityDomain:
         session: RunSession | None = None,
     ) -> FrozenJsonObject:
         del request_sensitivity
+        arguments = await self._with_cataloged_kinds(run, arguments)
         await self._validate_source_scope(run, capability, arguments)
         await self._validate_read_scope(run, capability, arguments)
         if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
@@ -1780,6 +1784,27 @@ class SemanticCapabilityDomain:
 
     prepare_session_call = prepare_call
 
+    async def _with_cataloged_kinds(
+        self, run: RunInput, arguments: FrozenJsonObject
+    ) -> FrozenJsonObject:
+        """A name in a source read in full hashes as a table; annotations bind the
+        catalog entry, which may be a view or file."""
+
+        aliases = await self._catalog.non_table_resource_ids(run.agent_id)
+
+        def rewrite(value: object) -> object:
+            if isinstance(value, str):
+                return aliases.get(value, value)
+            if isinstance(value, Mapping):
+                return {key: rewrite(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [rewrite(item) for item in value]
+            return value
+
+        return FrozenJsonObject.from_mapping(
+            cast(Mapping[str, object], rewrite(arguments.to_dict()))
+        )
+
     async def _bind_save_versions(
         self, run: RunInput, arguments: FrozenJsonObject
     ) -> FrozenJsonObject:
@@ -1796,9 +1821,7 @@ class SemanticCapabilityDomain:
         for resource_id in resource_ids:
             if resource_id not in facts:
                 raise CapabilityInputError(
-                    "semantic_unknown_resource",
-                    "A semantic subject resource is not current for this agent.",
-                    {"resource_id": resource_id},
+                    "semantic_unknown_resource", _UNCATALOGED_TABLE
                 )
         bound = arguments.to_dict()
         bound["catalog_revisions"] = [
@@ -2103,8 +2126,9 @@ class SemanticCapabilityDomain:
             view
             for view in await self._current_views(run.agent_id)
             if view.state is SemanticAnnotationState.ACTIVE
-            and set(view.annotation.subject.source_ids) <= scope.source_ids
-            and set(view.annotation.subject.resource_ids) <= scope.resource_ids
+            and scope.covers(
+                view.annotation.subject.source_ids, view.annotation.subject.resource_ids
+            )
             and (source_id is None or source_id in view.annotation.subject.source_ids)
             and (
                 resource_id is None
@@ -2322,11 +2346,38 @@ class SemanticCapabilityDomain:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from error
-        if any(item not in readable for item in requested):
+        unreadable = tuple(item for item in requested if item not in readable)
+        if unreadable:
+            if capability.id == SEMANTIC_SAVE_CAPABILITY_ID and (
+                await self._permitted(run, arguments, unreadable)
+            ):
+                raise CapabilityInputError(
+                    "semantic_unknown_resource", _UNCATALOGED_TABLE
+                )
             raise CapabilityInputError(
                 "resource_read_not_allowed",
                 "The requested resource is not available for reading.",
             )
+
+    async def _permitted(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        resource_ids: tuple[str, ...],
+    ) -> bool:
+        """True when the run's read permission covers every table, cataloged or not."""
+
+        subject = cast(Mapping[str, object], arguments["subject"])
+        try:
+            access = await self._catalog.source_read_access(
+                run.agent_id, cast(tuple[str, ...], subject["source_ids"])
+            )
+        except SourcePermissionStateError:
+            return False
+        return all(
+            any(scope is None or item in scope for scope in access.values())
+            for item in resource_ids
+        )
 
     async def _validate_source_scope(
         self,
@@ -2391,7 +2442,11 @@ class SemanticCapabilityDomain:
                 )
 
     async def _maintenance_requested(self, run: RunInput) -> bool:
-        views = await self._current_views(run.agent_id)
+        # Semantic notes advise: a failing catalog only leaves their review for later.
+        try:
+            views = await self._current_views(run.agent_id)
+        except CatalogStoreError:
+            return False
         if not any(
             view.requires_revalidation
             or view.state is SemanticAnnotationState.DUPLICATE
@@ -2399,24 +2454,10 @@ class SemanticCapabilityDomain:
             for view in views
         ):
             return False
-        catalog = await self._catalog.catalog_context(
-            run.agent_id,
-            run.message[:4_000],
-            limit=CATALOG_CONTEXT_DEFAULT_LIMIT,
-            source_ids=(
-                tuple(sorted(run.resolved_source_scope.source_ids))
-                if run.resolved_source_scope is not None
-                else run.source_scope_ids
-            ),
-        )
-        resources = catalog.get("resources")
-        if not isinstance(resources, tuple):
-            return False
         selected_ids = tuple(
             resource_id
-            for resource in resources
-            if isinstance(resource, FrozenJsonObject)
-            and isinstance((resource_id := resource.get("resource_id")), str)
+            for view in views
+            for resource_id in view.annotation.subject.resource_ids
         )
         return semantic_maintenance_intersects(
             views,

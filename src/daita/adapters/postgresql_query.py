@@ -1,18 +1,19 @@
-"""Execute catalog-validated, bounded read queries against PostgreSQL."""
+"""Execute policy-checked, bounded read queries against PostgreSQL."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import re
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 from uuid import UUID
 
 from .._json import FrozenJsonObject, canonical_json
@@ -25,51 +26,148 @@ from ..artifacts.renderers import (
     arrow_schema,
 )
 from ..config import PostgreSQLReadLimits
-from ..domains.data.capabilities import PostgreSQLReadResult
-from ..domains.data.controller import ReadScopedCatalogReader
+from ..domains.data.capabilities import PostgreSQLReadResult, refused_read_details
 from ..domains.data.export_capabilities import (
     ExactTabularExportResult,
     ExactTabularProgress,
     resolved_exact_export_sensitivity,
 )
 from ..domains.data.results import project_result_rows
-from ..domains.data.sql import (
-    ResourceSchema,
-    validate_postgresql_read,
-)
+from ..domains.data.sql import CheckedRead, denied_relations, resource_id_in_scope
 from ..errors import DaitaError, ErrorRetryability
 from ..observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
 from ..security import SecretProvider, SecretReference, default_secret_provider
-from ..storage.sqlite_records import SourcePermissionStateError
+from ..storage.sqlite_records import (
+    SourcePermissionStateError,
+    SourceReadMode,
+    SourceReadScope,
+)
 from .models import SourceRegistration
 from .postgresql import (
-    _DEFAULT_MAX_COLUMNS,
-    _DEFAULT_MAX_INDEXES,
-    _DEFAULT_MAX_RELATIONSHIPS,
-    _DEFAULT_MAX_RESOURCES,
+    COLUMNS_SQL,
+    FOREIGN_KEYS_FROM_SQL,
+    INDEXES_SQL,
+    LISTED_RELATION_SQL,
+    READABLE_COLUMN_SQL,
+    READABLE_FOREIGN_KEY_SQL,
+    READABLE_RELATION_SQL,
+    ROW_ESTIMATE_SQL,
     PostgreSQLSourceError,
     _close_postgresql_connection,
+    _configuration_schemas,
     _connect,
-    _load_structure,
     _rollback_postgresql_transaction,
+    columns_from_rows,
 )
-from .protocols import SourceStore
+from .protocols import (
+    DESCRIBE_MAX_COLUMNS,
+    DESCRIBE_MAX_LISTED_TABLES,
+    SourceReadScopeStore,
+    column_summary,
+)
 
+_T = TypeVar("_T")
 _MAX_QUERY_ROWS = 10_000
 _MAX_QUERY_BYTES = 16 * 1_024 * 1_024
 _MAX_RESULT_COLUMNS = 512
 _MAX_VALUE_DEPTH = 32
 _BOUNDED_RESULT_MARKER = "/* daita:postgresql.bounded_result */"
+_FUNCTION_POLICY_LOOKUP = """/* daita:postgresql.function_policy */
+SELECT p.proname, n.nspname, p.provolatile,
+  p.pronargs >= 1
+    AND p.pronargs - p.pronargdefaults <= 1
+    AND argument.typtype IN ('c', 'd', 'p') AS takes_row
+FROM pg_catalog.pg_proc AS p
+JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+LEFT JOIN pg_catalog.pg_type AS argument ON argument.oid = p.proargtypes[0]
+WHERE p.proname = ANY($1::text[])
+  AND n.nspname = ANY(pg_catalog.current_schemas(true))"""
+_UNQUALIFIED_RELATION_LOOKUP = f"""/* daita:postgresql.unqualified_relation */
+SELECT n.nspname, c.relname
+FROM pg_catalog.pg_class AS c
+JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+WHERE c.relname = ANY($1::text[])
+  AND n.nspname = ANY($2::text[])
+  AND {READABLE_RELATION_SQL}
+ORDER BY 1, 2
+LIMIT 32"""
+_LOOKUP_SECONDS = 5.0
+_LIVE_SEARCH = f"""/* daita:postgresql.live_search */
+WITH words AS (
+  SELECT * FROM unnest($2::text[], $3::text[]) AS w(word, pattern)
+), matched AS (
+  SELECT c.oid, n.nspname, c.relname, c.relkind,
+    {ROW_ESTIMATE_SQL} AS estimate,
+    (SELECT count(*) FROM words WHERE lower(c.relname) = word) AS exact,
+    (SELECT count(*) FROM words WHERE c.relname ILIKE pattern) AS named,
+    (SELECT count(*) FROM words WHERE EXISTS (
+       SELECT 1 FROM pg_attribute AS a
+       WHERE a.attrelid = c.oid AND {READABLE_COLUMN_SQL}
+         AND a.attname ILIKE pattern)) AS columned
+  FROM pg_class AS c
+  JOIN pg_namespace AS n ON n.oid = c.relnamespace
+  WHERE n.nspname = ANY($1::text[]) AND {READABLE_RELATION_SQL} AND {LISTED_RELATION_SQL}
+)
+SELECT m.nspname, m.relname, m.relkind, m.estimate,
+  (SELECT string_agg(a.attname || ' ' || format_type(a.atttypid, a.atttypmod), ', ')
+   FROM (SELECT * FROM pg_attribute AS a
+         WHERE a.attrelid = m.oid AND {READABLE_COLUMN_SQL}
+         ORDER BY a.attnum LIMIT 12) AS a) AS columns,
+  (SELECT count(*) FROM pg_attribute AS a
+   WHERE a.attrelid = m.oid AND {READABLE_COLUMN_SQL}) AS column_count
+FROM matched AS m
+WHERE m.named + m.columned > 0
+ORDER BY m.exact DESC, m.named DESC, m.columned DESC, m.estimate DESC NULLS LAST,
+         m.nspname, m.relname
+LIMIT $4"""
+_LIVE_RELATIONS = f"""/* daita:postgresql.live_relations */
+SELECT c.oid, n.nspname, c.relname, c.relkind, obj_description(c.oid, 'pg_class'),
+  {ROW_ESTIMATE_SQL} AS estimate,
+  (SELECT count(*) FROM pg_inherits WHERE inhparent = c.oid) AS children
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE n.nspname = ANY($1::text[]) AND c.relname = ANY($2::text[]) AND {READABLE_RELATION_SQL}
+ORDER BY c.relname = $3 DESC, n.nspname
+LIMIT 8"""
+_LIVE_SCHEMA = f"""/* daita:postgresql.live_schema */
+SELECT n.nspname, c.relname, c.relkind, {ROW_ESTIMATE_SQL} AS estimate,
+  count(*) OVER () AS total
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+WHERE n.nspname = $2 AND {READABLE_RELATION_SQL} AND {LISTED_RELATION_SQL}
+ORDER BY c.relname
+LIMIT $3"""
+_LIVE_RELATIONSHIPS = f"""/* daita:postgresql.live_relationships */
+SELECT src_ns.nspname || '.' || src.relname, dst_ns.nspname || '.' || dst.relname,
+  array_agg(src_att.attname::text ORDER BY keys.ordinality),
+  array_agg(dst_att.attname::text ORDER BY keys.ordinality)
+{FOREIGN_KEYS_FROM_SQL}
+  AND con.conparentid = 0
+  AND (con.conrelid = $1 OR con.confrelid = $1)
+  AND src_ns.nspname = ANY($2::text[]) AND dst_ns.nspname = ANY($2::text[])
+GROUP BY con.oid, src_ns.nspname, src.relname, dst_ns.nspname, dst.relname
+{READABLE_FOREIGN_KEY_SQL}
+ORDER BY 1, 2
+LIMIT 32"""
+# Volatile in pg_catalog, yet they only read a clock or a random source.
+_VOLATILE_FUNCTION_EXCEPTIONS = frozenset(
+    {"random", "clock_timestamp", "timeofday", "gen_random_uuid", "timezone"}
+)
+_MAX_SERVER_TEXT = 1_024
+# Undefined table, column and object, and an invalid schema name.
+_UNDEFINED_OBJECT_STATES = frozenset({"42P01", "42703", "42704", "3F000"})
 _PERMANENT_QUERY_ERRORS = frozenset(
     {
         "source_not_available",
         "source_adapter_mismatch",
         "source_permission_state_invalid",
+        "function_not_allowed",
+        "unqualified_relation",
         "resource_read_not_allowed",
-        "query_revalidation_failed",
-        "query_resource_scope_empty",
-        "catalog_provenance_missing",
-        "catalog_source_stale",
+        "not_permitted",
+        "query_invalid",
+        "query_data_error",
+        "read_only_violation",
         "query_result_too_wide",
         "query_result_invalid",
         "query_value_unsupported",
@@ -80,12 +178,22 @@ _PERMANENT_QUERY_ERRORS = frozenset(
 class PostgreSQLQueryError(DaitaError):
     """Normalized query-boundary failure without connector error leakage."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: Mapping[str, object] | None = None,
+        *,
+        undefined_object: bool = False,
+    ) -> None:
         if not isinstance(code, str) or not code.strip():
             raise ValueError("query error code must be a non-empty string")
         if not isinstance(message, str) or not message.strip():
             raise ValueError("query error message must be a non-empty string")
         self.code = code
+        self.details = dict(details or {})
+        # The source says a table or column is missing; the catalog may be stale.
+        self.undefined_object = undefined_object
         super().__init__(
             message,
             error_code=code,
@@ -117,7 +225,6 @@ class PostgreSQLReadDiagnostics:
     pools_retired: int
     discarded: int
     queue_seconds: float
-    structural_seconds: float
     query_seconds: float
     cleanup_seconds: float
 
@@ -125,7 +232,7 @@ class PostgreSQLReadDiagnostics:
 @dataclass(eq=False, slots=True)
 class _ReadPool:
     registration: SourceRegistration
-    readable: frozenset[str]
+    read_scope: SourceReadScope | None
     password: str | None = field(repr=False)
     size: int = 1
     pool: Any = None
@@ -148,12 +255,11 @@ class _ResolvedReadSecret:
 
 
 class PostgreSQLQueryBackend:
-    """Revalidate catalog scope and structure, then run one bounded read."""
+    """Run one bounded read that already passed policy; the source resolves names."""
 
     def __init__(
         self,
-        sources: SourceStore,
-        catalog: ReadScopedCatalogReader,
+        sources: SourceReadScopeStore,
         secret_provider: SecretProvider | None = None,
         *,
         statement_timeout_seconds: float = 5.0,
@@ -163,11 +269,8 @@ class PostgreSQLQueryBackend:
         deadline_reader: Callable[[], float | None] | None = None,
         observer: AgentObserver | None = None,
     ) -> None:
-        if not isinstance(sources, SourceStore):
-            raise TypeError("sources must implement SourceStore")
-        for method_name in ("resource_schemas", "readable_resource_ids"):
-            if not callable(getattr(catalog, method_name, None)):
-                raise TypeError(f"catalog must provide {method_name}")
+        if not isinstance(sources, SourceReadScopeStore):
+            raise TypeError("sources must implement SourceReadScopeStore")
         provider = default_secret_provider(secret_provider)
         if not isinstance(provider, SecretProvider):
             raise TypeError("secret_provider must implement SecretProvider")
@@ -234,14 +337,12 @@ class PostgreSQLQueryBackend:
                 name: 0.0
                 for name in (
                     "queue_seconds",
-                    "structural_seconds",
                     "query_seconds",
                     "cleanup_seconds",
                 )
             }
         )
         self._sources = sources
-        self._catalog = catalog
         self._secret_provider = provider
         self._statement_timeout_seconds = float(
             self._read_limits.statement_timeout_seconds
@@ -261,9 +362,8 @@ class PostgreSQLQueryBackend:
 
     @asynccontextmanager
     async def _operation(self, seconds: float):
-        if not self._read_limits.pool_enabled:
-            yield None
-            return
+        """One wall-clock limit around everything a read does, pooled or not."""
+
         deadline = (
             asyncio.get_running_loop().time()
             + seconds
@@ -361,18 +461,18 @@ class PostgreSQLQueryBackend:
         current = await self._sources.load_source(
             registration.agent_id, registration.id
         )
-        readable = await self._catalog.readable_resource_ids(
-            registration.agent_id, (registration.id,)
+        read_scope = await self._sources.load_source_read_scope(
+            registration.agent_id, registration.id
         )
         return (
             current == registration
             and registration.active
-            and frozenset(readable) == entry.readable
+            and read_scope == entry.read_scope
             and await self._password(registration) == entry.password
         )
 
     async def _connection(
-        self, registration: SourceRegistration, readable: frozenset[str]
+        self, registration: SourceRegistration, read_scope: SourceReadScope | None
     ):
         if self._pool_closed:
             raise PostgreSQLQueryError(
@@ -407,7 +507,7 @@ class PostgreSQLQueryBackend:
                             changed = cached is current and (
                                 cached.registration != registration
                                 or cached.password != password
-                                or cached.readable != readable
+                                or cached.read_scope != read_scope
                             )
                             expired = (
                                 cached.users == 0
@@ -438,7 +538,7 @@ class PostgreSQLQueryBackend:
                             ):
                                 entry = _ReadPool(
                                     registration,
-                                    readable,
+                                    read_scope,
                                     password,
                                     self._pool_size,
                                     last_used=now,
@@ -653,11 +753,9 @@ class PostgreSQLQueryBackend:
         *,
         agent_id: str,
         source_id: str,
-        sql: str,
-        parameters: tuple[object, ...],
+        read: CheckedRead,
         max_rows: int,
         max_bytes: int,
-        expected_resource_revisions: tuple[tuple[str, str], ...] | None = None,
         timeout_seconds: float | None = None,
     ) -> PostgreSQLReadResult:
         statement_timeout = self._statement_timeout_seconds
@@ -677,134 +775,34 @@ class PostgreSQLQueryBackend:
             or not 2 <= max_bytes <= _MAX_QUERY_BYTES
         ):
             raise ValueError("max_bytes must be from two through 16777216")
-        registration = await self._sources.load_source(agent_id, source_id)
-        if (
-            registration is None
-            or registration.agent_id != agent_id
-            or registration.id != source_id
-            or not registration.active
-        ):
-            await self.retire_source(agent_id, source_id)
-            raise PostgreSQLQueryError(
-                "source_not_available",
-                "The PostgreSQL source is not attached to this agent.",
-            )
-        if registration.adapter_id != "postgresql":
-            raise PostgreSQLQueryError(
-                "source_adapter_mismatch",
-                "The selected source is not a PostgreSQL source.",
-            )
-        resources = await self._catalog.resource_schemas(agent_id, source_id)
-        if expected_resource_revisions is not None:
-            current = {item.resource_id: item.revision for item in resources}
-            if any(
-                current.get(resource_id) != revision
-                for resource_id, revision in expected_resource_revisions
-            ):
-                raise PostgreSQLQueryError(
-                    "query_binding_stale",
-                    "A validated resource revision changed before source dispatch.",
-                )
-        try:
-            readable = await self._catalog.readable_resource_ids(
-                agent_id,
-                (source_id,),
-            )
-        except SourcePermissionStateError:
-            raise PostgreSQLQueryError(
-                "source_permission_state_invalid",
-                "Stored source permission state is missing or invalid.",
-            ) from None
-        if self._read_limits.pool_enabled:
-            cached = self._pools.get((agent_id, source_id))
-            if cached is not None and (
-                cached.registration != registration
-                or cached.readable != frozenset(readable)
-            ):
-                await self.retire_source(agent_id, source_id)
-        validation = validate_postgresql_read(
-            sql,
-            source_id=source_id,
-            resources=resources,
-            parameters=parameters,
-            allowed_resource_ids=readable,
-        )
-        if not validation.valid or validation.analysis is None:
-            if "resource_out_of_scope" in validation.issue_codes:
-                raise PostgreSQLQueryError(
-                    "resource_read_not_allowed",
-                    "One or more requested resources are not available for reading.",
-                )
-            codes = ",".join(validation.issue_codes[:8]) or "invalid_sql"
-            raise PostgreSQLQueryError(
-                "query_revalidation_failed",
-                f"PostgreSQL query failed deterministic revalidation: {codes}",
-            )
-        if not validation.resource_ids:
-            raise PostgreSQLQueryError(
-                "query_resource_scope_empty",
-                "PostgreSQL query must reference a current catalog resource.",
-            )
-        if validation.source_revision is None or len(
-            validation.resource_revisions
-        ) != len(validation.resource_ids):
-            raise PostgreSQLQueryError(
-                "catalog_provenance_missing",
-                "PostgreSQL query requires complete current catalog provenance.",
-            )
+        registration, read_scope = await self._admit(agent_id, source_id, read)
 
         connection = None
         pool_entry = None
         read_deadline = None
         transaction = None
         transaction_finished = False
-        connection_failure: tuple[str, str] | None = None
-        query_failed = False
-        query_timed_out = False
+        failure: PostgreSQLQueryError | None = None
         columns: tuple[str, ...] = ()
         rows: tuple[Mapping[str, object], ...] = ()
         try:
             async with self._operation(statement_timeout) as read_deadline:
                 connection, pool_entry = await self._connection(
-                    registration, frozenset(readable)
+                    registration, read_scope
                 )
                 transaction = connection.transaction(
                     isolation="repeatable_read",
                     readonly=True,
                 )
                 await transaction.start()
-                timeout_milliseconds = max(1, int(statement_timeout * 1_000))
-                await connection.execute(
-                    "SELECT set_config('statement_timeout', $1, true)",
-                    f"{timeout_milliseconds}ms",
+                await _prepare_read_transaction(
+                    connection, registration, read, statement_timeout
                 )
-                await connection.execute(
-                    "SELECT set_config('search_path', $1, true)",
-                    "pg_catalog",
-                )
-                structural_started = asyncio.get_running_loop().time()
-                structure = await _load_structure(
-                    connection,
-                    registration,
-                    max_resources=_DEFAULT_MAX_RESOURCES,
-                    max_columns=_DEFAULT_MAX_COLUMNS,
-                    max_indexes=_DEFAULT_MAX_INDEXES,
-                    max_relationships=_DEFAULT_MAX_RELATIONSHIPS,
-                )
-                if self._read_limits.pool_enabled:
-                    self._metrics["structural_seconds"] += (
-                        asyncio.get_running_loop().time() - structural_started
-                    )
-                if structure.source_revision != validation.source_revision:
-                    raise PostgreSQLQueryError(
-                        "catalog_source_stale",
-                        "PostgreSQL source structure changed after its catalog snapshot.",
-                    )
                 query_started = asyncio.get_running_loop().time()
                 columns, rows, value_limited = await _execute_user_query(
                     connection,
-                    validation.analysis.canonical_sql,
-                    parameters,
+                    read.canonical_sql,
+                    read.parameters,
                     max_rows=max_rows,
                     max_bytes=max_bytes,
                     timeout_seconds=statement_timeout,
@@ -828,54 +826,22 @@ class PostgreSQLQueryBackend:
             # The connection boundary has already removed connector diagnostics.
             # Retain only its safe code and message, then raise a fresh query error
             # after the original exception context has ended.
-            connection_failure = (error.code, str(error))
+            failure = PostgreSQLQueryError(error.code, str(error))
         except Exception as error:
-            # Driver and server errors can carry SQL, bound values, DSNs, or
-            # credentials.  Cross the boundary only after the original
-            # exception context has ended so diagnostics retain none of it.
-            # Only the timeout class (client deadline or server SQLSTATE 57014
-            # from statement_timeout) is retained.
-            query_failed = True
-            query_timed_out = (
-                isinstance(error, TimeoutError)
-                or getattr(error, "sqlstate", None) == "57014"
-            )
+            # Driver and server errors can carry bound values, DSNs or credentials.
+            # Only their category crosses, after the original exception context
+            # has ended, so diagnostics retain nothing else.
+            failure = _classified_failure(error, read, statement_timeout)
         finally:
-            if pool_entry is not None and connection is not None:
-                await self._release_pooled(
-                    connection,
-                    pool_entry,
-                    discard=not transaction_finished,
-                    deadline=read_deadline,
-                )
-            else:
-                try:
-                    if transaction is not None and not transaction_finished:
-                        await _rollback_postgresql_transaction(
-                            transaction,
-                            connection,
-                            timeout_seconds=self._cleanup_timeout_seconds,
-                        )
-                finally:
-                    if connection is not None:
-                        await _close_postgresql_connection(
-                            connection,
-                            timeout_seconds=self._cleanup_timeout_seconds,
-                        )
-
-        if connection_failure is not None:
-            raise PostgreSQLQueryError(*connection_failure)
-        if query_timed_out:
-            raise PostgreSQLQueryError(
-                "postgresql_query_timeout",
-                "The bounded PostgreSQL read exceeded its statement deadline of "
-                f"{statement_timeout:g} seconds.",
+            await self._finish_read(
+                connection,
+                pool_entry,
+                transaction,
+                transaction_finished,
+                read_deadline,
             )
-        if query_failed:
-            raise PostgreSQLQueryError(
-                "postgresql_query_failed",
-                "PostgreSQL could not complete the bounded read.",
-            )
+        if failure is not None:
+            raise failure
 
         projection = project_result_rows(
             rows,
@@ -894,34 +860,35 @@ class PostgreSQLQueryBackend:
             )
         return PostgreSQLReadResult(
             source_id=source_id,
-            canonical_sql=validation.analysis.canonical_sql,
-            sql_fingerprint=validation.analysis.sql_fingerprint,
-            resource_ids=validation.resource_ids,
-            resource_revisions=validation.resource_revisions,
-            source_revision=validation.source_revision,
+            canonical_sql=read.canonical_sql,
+            sql_fingerprint=read.sql_fingerprint,
+            resource_ids=read.resource_ids,
             columns=columns,
             projection=projection,
-            resource_names=_resource_names(resources, validation.resource_ids),
+            resource_names=read.resource_names,
         )
 
-    async def execute_exact_tabular(
-        self,
-        *,
-        agent_id: str,
-        source_id: str,
-        sql: str,
-        parameters: tuple[object, ...],
-        format_name: str,
-        parameters_sha256: str,
-        created_at: datetime,
-        max_rows: int,
-        max_columns: int,
-        max_bytes: int,
-        timeout_seconds: float,
-        progress: ExactTabularProgress | None = None,
-    ) -> ExactTabularExportResult:
-        """Run one fresh read through the selected fixed exact renderer."""
+    async def _admit(
+        self, agent_id: str, source_id: str, read: CheckedRead
+    ) -> tuple[SourceRegistration, SourceReadScope | None]:
+        """Recheck current permission, since a read can queue after it was prepared.
 
+        Also retires a pool the current registration no longer matches.
+        """
+
+        registration, read_scope = await self._current_source(agent_id, source_id)
+        denied = denied_relations(read, read_scope)
+        if denied is None or denied:
+            raise PostgreSQLQueryError(
+                "resource_read_not_allowed",
+                f"{', '.join(denied or ('This source',))} is not available for "
+                "reading in this run.",
+            )
+        return registration, read_scope
+
+    async def _current_source(
+        self, agent_id: str, source_id: str
+    ) -> tuple[SourceRegistration, SourceReadScope | None]:
         registration = await self._sources.load_source(agent_id, source_id)
         if (
             registration is None
@@ -939,12 +906,8 @@ class PostgreSQLQueryBackend:
                 "source_adapter_mismatch",
                 "The selected source is not a PostgreSQL source.",
             )
-        resources = await self._catalog.resource_schemas(agent_id, source_id)
         try:
-            readable = await self._catalog.readable_resource_ids(
-                agent_id,
-                (source_id,),
-            )
+            read_scope = await self._sources.load_source_read_scope(agent_id, source_id)
         except SourcePermissionStateError:
             raise PostgreSQLQueryError(
                 "source_permission_state_invalid",
@@ -953,65 +916,223 @@ class PostgreSQLQueryBackend:
         if self._read_limits.pool_enabled:
             cached = self._pools.get((agent_id, source_id))
             if cached is not None and (
-                cached.registration != registration
-                or cached.readable != frozenset(readable)
+                cached.registration != registration or cached.read_scope != read_scope
             ):
                 await self.retire_source(agent_id, source_id)
-        validation = validate_postgresql_read(
-            sql,
-            source_id=source_id,
-            resources=resources,
-            parameters=parameters,
-            allowed_resource_ids=readable,
-        )
-        if not validation.valid or validation.analysis is None:
-            if "resource_out_of_scope" in validation.issue_codes:
-                raise PostgreSQLQueryError(
-                    "resource_read_not_allowed",
-                    "One or more requested resources are not available for reading.",
+        return registration, read_scope
+
+    async def _lookup(
+        self,
+        agent_id: str,
+        source_id: str,
+        work: Callable[[Any, tuple[str, ...]], Awaitable[_T]],
+    ) -> _T:
+        """Run code-owned catalog queries in one bounded read-only transaction."""
+
+        registration, read_scope = await self._current_source(agent_id, source_id)
+        if read_scope is None or read_scope.mode is SourceReadMode.NONE:
+            raise PostgreSQLQueryError(
+                "resource_read_not_allowed",
+                "This source is not available for reading in this run.",
+            )
+        connection = None
+        pool_entry = None
+        read_deadline = None
+        transaction = None
+        finished = False
+        try:
+            async with self._operation(_LOOKUP_SECONDS) as read_deadline:
+                connection, pool_entry = await self._connection(
+                    registration, read_scope
                 )
-            codes = ",".join(validation.issue_codes[:8]) or "invalid_sql"
+                transaction = connection.transaction(
+                    isolation="repeatable_read", readonly=True
+                )
+                await transaction.start()
+                await configure_transaction(
+                    connection,
+                    schemas=("pg_catalog",),
+                    statement_timeout_seconds=_LOOKUP_SECONDS,
+                )
+                result = await work(
+                    connection, _configuration_schemas(registration.configuration)
+                )
+                await transaction.commit()
+                finished = True
+                return result
+        except (asyncio.CancelledError, ImportError, PostgreSQLQueryError):
+            raise
+        except Exception:
+            # Driver and server text can carry DSNs; none of it crosses.
             raise PostgreSQLQueryError(
-                "query_revalidation_failed",
-                f"PostgreSQL query failed deterministic revalidation: {codes}",
+                "source_unreachable", "The PostgreSQL source could not be inspected."
+            ) from None
+        finally:
+            await self._finish_read(
+                connection, pool_entry, transaction, finished, read_deadline
             )
-        if not validation.resource_ids:
-            raise PostgreSQLQueryError(
-                "query_resource_scope_empty",
-                "PostgreSQL query must reference a current catalog resource.",
+
+    async def search_names(
+        self, *, agent_id: str, source_id: str, words: tuple[str, ...], limit: int
+    ) -> tuple[Mapping[str, object], ...]:
+        """Match words against relation and column names in the configured schemas."""
+
+        async def work(
+            connection: Any, schemas: tuple[str, ...]
+        ) -> tuple[Mapping[str, object], ...]:
+            rows = await connection.fetch(
+                _LIVE_SEARCH,
+                list(schemas),
+                list(words),
+                [f"%{_like_literal(word)}%" for word in words],
+                limit,
             )
-        if validation.source_revision is None or len(
-            validation.resource_revisions
-        ) != len(validation.resource_ids):
-            raise PostgreSQLQueryError(
-                "catalog_provenance_missing",
-                "PostgreSQL query requires complete current catalog provenance.",
+            return tuple(
+                {
+                    "name": f"{row[0]}.{row[1]}",
+                    "kind": _relation_kind(row[2]),
+                    "columns": column_summary(row[4], int(row[5])),
+                    "row_estimate": _row_estimate(row[3]),
+                }
+                for row in rows
             )
+
+        return await self._lookup(agent_id, source_id, work)
+
+    async def describe_name(
+        self, *, agent_id: str, source_id: str, name: str
+    ) -> Mapping[str, object] | None:
+        """Describe one relation or one configured schema live; None when absent."""
+
+        async def work(
+            connection: Any, schemas: tuple[str, ...]
+        ) -> Mapping[str, object] | None:
+            parts = _name_parts(name)
+            bare = parts[-1]
+            searched = (
+                tuple(schema for schema in schemas if schema in {parts[0]})
+                or tuple(s for s in schemas if s == parts[0].lower())
+                if len(parts) == 2
+                else schemas
+            )
+            rows = (
+                await connection.fetch(
+                    _LIVE_RELATIONS,
+                    list(searched),
+                    list({bare, bare.lower()}),
+                    bare,
+                )
+                if len(parts) <= 2 and searched
+                else ()
+            )
+            if rows:
+                exact = [row for row in rows if row[2] == bare] or rows
+                if len({row[1] for row in exact}) > 1:
+                    return {
+                        "name": name,
+                        "kind": "ambiguous",
+                        "tables": [
+                            {
+                                "name": f"{row[1]}.{row[2]}",
+                                "kind": _relation_kind(row[3]),
+                                "row_estimate": _row_estimate(row[5]),
+                            }
+                            for row in exact
+                        ],
+                    }
+                return await _describe_relation(connection, exact[0], schemas)
+            schema = next(
+                (item for item in schemas if item in {name, name.lower()}), None
+            )
+            if schema is None:
+                return None
+            listed = await connection.fetch(
+                _LIVE_SCHEMA, list(schemas), schema, DESCRIBE_MAX_LISTED_TABLES
+            )
+            return {
+                "name": schema,
+                "kind": "schema",
+                "tables": [
+                    {
+                        "name": f"{row[0]}.{row[1]}",
+                        "kind": _relation_kind(row[2]),
+                        "row_estimate": _row_estimate(row[3]),
+                    }
+                    for row in listed
+                ],
+                "total_tables": int(listed[0][4]) if listed else 0,
+            }
+
+        return await self._lookup(agent_id, source_id, work)
+
+    async def _finish_read(
+        self,
+        connection: Any,
+        pool_entry: _ReadPool | None,
+        transaction: Any,
+        transaction_finished: bool,
+        read_deadline: float | None,
+    ) -> None:
+        if pool_entry is not None and connection is not None:
+            await self._release_pooled(
+                connection,
+                pool_entry,
+                discard=not transaction_finished,
+                deadline=read_deadline,
+            )
+            return
+        try:
+            if transaction is not None and not transaction_finished:
+                await _rollback_postgresql_transaction(
+                    transaction,
+                    connection,
+                    timeout_seconds=self._cleanup_timeout_seconds,
+                )
+        finally:
+            if connection is not None:
+                await _close_postgresql_connection(
+                    connection,
+                    timeout_seconds=self._cleanup_timeout_seconds,
+                )
+
+    async def execute_exact_tabular(
+        self,
+        *,
+        agent_id: str,
+        source_id: str,
+        read: CheckedRead,
+        format_name: str,
+        parameters_sha256: str,
+        created_at: datetime,
+        max_rows: int,
+        max_columns: int,
+        max_bytes: int,
+        timeout_seconds: float,
+        progress: ExactTabularProgress | None = None,
+    ) -> ExactTabularExportResult:
+        """Run one fresh read through the selected fixed exact renderer."""
+
+        registration, read_scope = await self._admit(agent_id, source_id, read)
 
         connection = None
         pool_entry = None
         read_deadline = None
         transaction = None
         transaction_finished = False
-        connection_failure: tuple[str, str] | None = None
-        query_failed = False
+        failure: PostgreSQLQueryError | None = None
         content = b""
         columns: tuple[str, ...] = ()
         row_count = 0
+        query_timeout = timeout_seconds
         completed = {"rows": 0, "columns": 0, "bytes": 0}
         sensitivity = resolved_exact_export_sensitivity(
-            tuple(
-                item.sensitivity_class
-                for item in resources
-                if item.resource_id in validation.resource_ids
-            )
+            (registration.presentation_sensitivity.value,)
         )
         xlsx_provenance = (
             ExactXlsxProvenance(
                 source_id=source_id,
-                source_revision=validation.source_revision,
-                resource_revisions=validation.resource_revisions,
-                sql_fingerprint=validation.analysis.sql_fingerprint,
+                resource_ids=read.resource_ids,
+                sql_fingerprint=read.sql_fingerprint,
                 parameters_sha256=parameters_sha256,
                 sensitivity=sensitivity,
                 created_at=created_at,
@@ -1032,7 +1153,7 @@ class PostgreSQLQueryBackend:
         try:
             async with self._operation(timeout_seconds) as read_deadline:
                 connection, pool_entry = await self._connection(
-                    registration, frozenset(readable)
+                    registration, read_scope
                 )
                 transaction = connection.transaction(
                     isolation="repeatable_read",
@@ -1048,39 +1169,15 @@ class PostgreSQLQueryBackend:
                     if self._read_limits.pool_enabled
                     else timeout_seconds
                 )
-                timeout_milliseconds = max(1, int(query_timeout * 1_000))
-                await connection.execute(
-                    "SELECT set_config('statement_timeout', $1, true)",
-                    f"{timeout_milliseconds}ms",
+                await _prepare_read_transaction(
+                    connection, registration, read, query_timeout
                 )
-                await connection.execute(
-                    "SELECT set_config('search_path', $1, true)",
-                    "pg_catalog",
-                )
-                structural_started = asyncio.get_running_loop().time()
-                structure = await _load_structure(
-                    connection,
-                    registration,
-                    max_resources=_DEFAULT_MAX_RESOURCES,
-                    max_columns=_DEFAULT_MAX_COLUMNS,
-                    max_indexes=_DEFAULT_MAX_INDEXES,
-                    max_relationships=_DEFAULT_MAX_RELATIONSHIPS,
-                )
-                if self._read_limits.pool_enabled:
-                    self._metrics["structural_seconds"] += (
-                        asyncio.get_running_loop().time() - structural_started
-                    )
-                if structure.source_revision != validation.source_revision:
-                    raise PostgreSQLQueryError(
-                        "catalog_source_stale",
-                        "PostgreSQL source structure changed after its catalog snapshot.",
-                    )
                 async with asyncio.timeout(timeout_seconds):
                     query_started = asyncio.get_running_loop().time()
                 content, columns, row_count = await _execute_exact_tabular_query(
                     connection,
-                    validation.analysis.canonical_sql,
-                    parameters,
+                    read.canonical_sql,
+                    read.parameters,
                     format_name=format_name,
                     xlsx_provenance=xlsx_provenance,
                     max_rows=max_rows,
@@ -1115,45 +1212,25 @@ class PostgreSQLQueryBackend:
         except (ArtifactError, PostgreSQLQueryError):
             raise
         except PostgreSQLSourceError as error:
-            connection_failure = (error.code, str(error))
-        except Exception:
-            query_failed = True
+            failure = PostgreSQLQueryError(error.code, str(error))
+        except Exception as error:
+            failure = _classified_failure(error, read, query_timeout)
         finally:
-            if pool_entry is not None and connection is not None:
-                await self._release_pooled(
-                    connection,
-                    pool_entry,
-                    discard=not transaction_finished,
-                    deadline=read_deadline,
-                )
-            else:
-                try:
-                    if transaction is not None and not transaction_finished:
-                        await _rollback_postgresql_transaction(
-                            transaction,
-                            connection,
-                            timeout_seconds=self._cleanup_timeout_seconds,
-                        )
-                finally:
-                    if connection is not None:
-                        await _close_postgresql_connection(
-                            connection,
-                            timeout_seconds=self._cleanup_timeout_seconds,
-                        )
-        if connection_failure is not None:
-            raise PostgreSQLQueryError(*connection_failure)
-        if query_failed:
-            raise PostgreSQLQueryError(
-                "postgresql_query_failed",
-                "PostgreSQL could not complete the exact bounded read.",
+            await self._finish_read(
+                connection,
+                pool_entry,
+                transaction,
+                transaction_finished,
+                read_deadline,
             )
+        if failure is not None:
+            raise failure
         return ExactTabularExportResult(
             format=format_name,
             adapter_id="postgresql",
             source_id=source_id,
-            source_revision=validation.source_revision,
-            sql_fingerprint=validation.analysis.sql_fingerprint,
-            resource_revisions=validation.resource_revisions,
+            sql_fingerprint=read.sql_fingerprint,
+            resource_ids=read.resource_ids,
             columns=columns,
             row_count=row_count,
             content=content,
@@ -1162,12 +1239,311 @@ class PostgreSQLQueryBackend:
         )
 
 
-def _resource_names(
-    resources: Iterable[ResourceSchema],
-    resource_ids: Iterable[str],
-) -> tuple[tuple[str, str], ...]:
-    names = {item.resource_id: item.name for item in resources}
-    return tuple((resource_id, names[resource_id]) for resource_id in resource_ids)
+def _like_literal(word: str) -> str:
+    return word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _relation_kind(relkind: object) -> str:
+    return "view" if relkind in (b"v", b"m", "v", "m") else "table"
+
+
+def _row_estimate(value: object) -> int | None:
+    # PostgreSQL reports 0 or -1 until a table has been analyzed: unknown, not empty.
+    return int(value) if isinstance(value, (int, float)) and value > 0 else None
+
+
+def _name_parts(name: str) -> tuple[str, ...]:
+    """Split a dotted name: quoted parts are exact, others keep their spelling."""
+
+    return tuple(
+        quoted.replace('""', '"') or bare
+        for quoted, bare in re.findall(r'"((?:[^"]|"")+)"|([^.]+)', name)
+    )
+
+
+async def _describe_relation(
+    connection: Any, row: Any, schemas: tuple[str, ...]
+) -> Mapping[str, object]:
+    oid, schema, relation, relkind, comment, estimate, children = row
+    column_rows = await connection.fetch(
+        COLUMNS_SQL, schema, relation, DESCRIBE_MAX_COLUMNS + 1
+    )
+    index_rows = await connection.fetch(INDEXES_SQL, schema, relation, 64)
+    foreign_keys = await connection.fetch(_LIVE_RELATIONSHIPS, oid, list(schemas))
+    columns = columns_from_rows(column_rows, DESCRIBE_MAX_COLUMNS)
+    enums = {item["column_name"]: item["enum_values"] for item in column_rows}
+    primary_key = [
+        column.name
+        for column in sorted(
+            (item for item in columns if item.primary_key_ordinal),
+            key=lambda item: cast(int, item.primary_key_ordinal),
+        )
+    ]
+    return {
+        "name": f"{schema}.{relation}",
+        "kind": _relation_kind(relkind),
+        "comment": comment,
+        "row_estimate": _row_estimate(estimate),
+        "partitions": int(children),
+        "columns": [
+            {
+                "name": column.name,
+                "type": column.native_type,
+                "nullable": column.nullable,
+                **({"comment": column.comment} if column.comment else {}),
+                **(
+                    {"enum_values": list(enums[column.name])}
+                    if enums.get(column.name)
+                    else {}
+                ),
+            }
+            for column in columns
+        ],
+        "columns_truncated": len(column_rows) > DESCRIBE_MAX_COLUMNS,
+        "primary_key": primary_key,
+        "unique_keys": [
+            list(item["columns"])
+            for item in index_rows
+            if item["is_unique"]
+            and item["predicate"] is None
+            and item["columns"]
+            and list(item["columns"]) != primary_key
+        ],
+        "relationships": [
+            {
+                "from": item[0],
+                "to": item[1],
+                "columns": [list(pair) for pair in zip(item[2], item[3], strict=True)],
+            }
+            for item in foreign_keys
+        ],
+    }
+
+
+async def configure_transaction(
+    connection: Any,
+    *,
+    schemas: tuple[str, ...],
+    statement_timeout_seconds: float,
+    lock_timeout_seconds: float | None = None,
+) -> None:
+    """Bound one transaction and pin how the server reads names and strings."""
+
+    statement_milliseconds = f"{max(1, int(statement_timeout_seconds * 1_000))}ms"
+    settings = [("statement_timeout", statement_milliseconds)]
+    if lock_timeout_seconds is not None:
+        settings += [
+            ("lock_timeout", f"{max(1, int(lock_timeout_seconds * 1_000))}ms"),
+            ("idle_in_transaction_session_timeout", statement_milliseconds),
+        ]
+    settings += [
+        # pg_catalog stays implicitly first, so a configured schema cannot shadow a
+        # built-in operator or a system catalog.
+        ("search_path", ", ".join(_postgresql_identifier(item) for item in schemas)),
+        # The parser reads a plain string's backslash as literal; so must the server.
+        ("standard_conforming_strings", "on"),
+    ]
+    for name, value in settings:
+        await connection.execute(f"SELECT set_config('{name}', $1, true)", value)
+
+
+async def _prepare_read_transaction(
+    connection: Any,
+    registration: SourceRegistration,
+    read: CheckedRead,
+    timeout_seconds: float,
+) -> None:
+    """Bound the transaction, pin name resolution, then apply the function rule."""
+
+    await configure_transaction(
+        connection,
+        schemas=_configuration_schemas(registration.configuration),
+        statement_timeout_seconds=timeout_seconds,
+    )
+    if read.unqualified_relations:
+        await refuse_unqualified(
+            connection,
+            registration,
+            read.unqualified_relations,
+            read.allowed_resource_ids,
+        )
+    if read.function_lookups or read.written_calls or read.attribute_lookups:
+        await check_functions(
+            connection,
+            read.function_lookups,
+            read.attribute_lookups,
+            read.written_calls,
+        )
+
+
+async def refuse_unqualified(
+    connection: Any,
+    registration: SourceRegistration,
+    relations: tuple[str, ...],
+    allowed_resource_ids: tuple[str, ...] | None,
+) -> None:
+    """Several schemas could hold the name, so list where it exists and refuse.
+
+    PostgreSQL would silently use the first match. The list keeps to this run's
+    scope, so out-of-scope names cannot leak.
+    """
+
+    schemas = _configuration_schemas(registration.configuration)
+    rows = await connection.fetch(
+        _UNQUALIFIED_RELATION_LOOKUP, list(relations), list(schemas)
+    )
+    allowed = None if allowed_resource_ids is None else frozenset(allowed_resource_ids)
+    candidates = tuple(
+        name
+        for row in rows
+        if resource_id_in_scope(registration.id, name := f"{row[0]}.{row[1]}", allowed)
+    )
+    raise PostgreSQLQueryError(
+        "unqualified_relation",
+        f"{', '.join(relations)} is unqualified and this source has several schemas; "
+        + (
+            f"qualify it: {', '.join(candidates)}."
+            if candidates
+            else f"it is in none of {', '.join(schemas)} that this run can read."
+        ),
+        refused_read_details({"candidates": candidates, "schemas": schemas}),
+    )
+
+
+async def check_functions(
+    connection: Any,
+    called: tuple[str, ...],
+    attributes: tuple[str, ...] = (),
+    written: tuple[str, ...] = (),
+) -> bool:
+    """Let the server say what each name resolves to on the pinned path.
+
+    Returns whether any called name can give a different result on another call.
+    """
+
+    bare = {name: name.removeprefix("PG_CATALOG.").lower() for name in called}
+    rows = await connection.fetch(
+        _FUNCTION_POLICY_LOOKUP, sorted({*bare.values(), *attributes, *written})
+    )
+    builtin: dict[str, list[bytes | str]] = {}
+    shadowed: set[str] = set()
+    row_functions: set[str] = set()
+    calls = {*bare.values(), *written}
+    varying = False
+    for row in rows:
+        name, schema, volatility, takes_row = row[0], row[1], row[2], row[3]
+        volatile = _is_volatile(name, volatility)
+        varying = varying or (name in calls and volatility not in (b"i", "i"))
+        if schema == "pg_catalog":
+            builtin.setdefault(name, []).append(volatility)
+        else:
+            shadowed.add(name)
+        # x.name is name(x) unless x has that column. A real column of the same
+        # name is refused too: the parser cannot tell them apart.
+        if takes_row and (schema != "pg_catalog" or volatile):
+            row_functions.add(name)
+    refused = tuple(
+        sorted(
+            {
+                *(
+                    bare_name
+                    for name, bare_name in bare.items()
+                    if bare_name not in builtin
+                    or (not name.startswith("PG_CATALOG.") and bare_name in shadowed)
+                    or any(_is_volatile(bare_name, item) for item in builtin[bare_name])
+                ),
+                *(name for name in attributes if name in row_functions),
+                # What the parser renamed: a word that names no function is left
+                # to the server, like any other name.
+                *(
+                    name
+                    for name in written
+                    if name in shadowed
+                    or any(_is_volatile(name, item) for item in builtin.get(name, ()))
+                ),
+            }
+        )
+    )
+    if refused:
+        raise PostgreSQLQueryError(
+            "function_not_allowed",
+            f"Reads cannot call {', '.join(refused[:8])}: only functions in "
+            "pg_catalog that do not change or reach outside the database are "
+            "allowed.",
+            refused_read_details({"functions": refused[:8]}),
+        )
+    return varying
+
+
+def _is_volatile(name: str, volatility: bytes | str) -> bool:
+    return volatility in (b"v", "v") and name not in _VOLATILE_FUNCTION_EXCEPTIONS
+
+
+def _classified_failure(
+    error: Exception, read: CheckedRead, timeout_seconds: float
+) -> PostgreSQLQueryError:
+    """Sort one driver or server failure by SQLSTATE; only safe text crosses."""
+
+    sqlstate = getattr(error, "sqlstate", None)
+    state = sqlstate if isinstance(sqlstate, str) else ""
+    details: dict[str, object] = {"sqlstate": state} if state else {}
+    if isinstance(error, TimeoutError) or state == "57014":
+        return PostgreSQLQueryError(
+            "postgresql_query_timeout",
+            "The bounded PostgreSQL read exceeded its deadline of "
+            f"{timeout_seconds:g} seconds.",
+            details,
+        )
+    if type(error).__name__ == "UnsupportedClientFeatureError":
+        return PostgreSQLQueryError(
+            "query_value_unsupported",
+            "A selected value has a type this read cannot decode; select its "
+            "columns or cast it to text.",
+        )
+    if state == "42501":
+        return PostgreSQLQueryError(
+            "not_permitted", _server_text(error, "message"), details
+        )
+    if state.startswith("42"):
+        for name in ("hint", "position"):
+            value = _server_text(error, name)
+            if value:
+                details[name] = value
+        details["canonical_sql"] = read.canonical_sql
+        return PostgreSQLQueryError(
+            "query_invalid",
+            _server_text(error, "message"),
+            refused_read_details(details),
+            undefined_object=state in _UNDEFINED_OBJECT_STATES,
+        )
+    if state == "25006":
+        return PostgreSQLQueryError(
+            "read_only_violation", "A read cannot modify data.", details
+        )
+    if state.startswith("22"):
+        return PostgreSQLQueryError(
+            "query_data_error",
+            f"PostgreSQL could not process a value in the query (SQLSTATE {state}).",
+            details,
+        )
+    if state.startswith("08"):
+        return PostgreSQLQueryError(
+            "postgresql_connection_failed",
+            "The connection to PostgreSQL failed during the read.",
+            details,
+        )
+    return PostgreSQLQueryError(
+        "postgresql_query_failed",
+        "PostgreSQL could not complete the bounded read"
+        + (f" (SQLSTATE {state})." if state else "."),
+        details,
+        undefined_object=state in _UNDEFINED_OBJECT_STATES,
+    )
+
+
+def _server_text(error: Exception, name: str) -> str:
+    value = getattr(error, name, None)
+    return "" if value is None else str(value)[:_MAX_SERVER_TEXT]
 
 
 async def _execute_user_query(
@@ -1367,7 +1743,7 @@ def _bounded_result_sql(
     )
     return (
         f"{_BOUNDED_RESULT_MARKER} SELECT {', '.join(selected)} "
-        f"FROM ({sql}) AS {row_alias}{alias_clause} LIMIT {max_rows + 1}"
+        f"FROM (\n{sql}\n) AS {row_alias}{alias_clause} LIMIT {max_rows + 1}"
     )
 
 
@@ -1394,7 +1770,7 @@ def _exact_tabular_bounded_result_sql(
     alias_clause = " (" + ", ".join(f'"{item}"' for item in aliases) + ")"
     return (
         "/* daita:postgresql.exact_tabular */ "
-        f"SELECT {', '.join(selected)} FROM ({sql}) AS {row_alias}{alias_clause} "
+        f"SELECT {', '.join(selected)} FROM (\n{sql}\n) AS {row_alias}{alias_clause} "
         f"LIMIT {max_rows + 1}"
     )
 
@@ -1488,6 +1864,21 @@ def _json_value(value: object, *, _depth: int = 0) -> object:
                 "PostgreSQL returned a value outside the bounded JSON projection.",
             )
         return {"type": "bit_string", "value": bits}
+    if value_type.__name__ == "Range" and value_type.__module__.startswith("asyncpg"):
+        range_value = cast(Any, value)
+        return {
+            "lower": _json_value(range_value.lower, _depth=_depth + 1),
+            "upper": _json_value(range_value.upper, _depth=_depth + 1),
+            "lower_inclusive": bool(range_value.lower_inc),
+            "upper_inclusive": bool(range_value.upper_inc),
+            "empty": bool(range_value.isempty),
+        }
+    # asyncpg.Record has the mapping API without registering as a Mapping.
+    if value_type.__name__ == "Record" and value_type.__module__.startswith("asyncpg"):
+        return {
+            str(key): _json_value(item, _depth=_depth + 1)
+            for key, item in cast(Any, value).items()
+        }
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
             raise PostgreSQLQueryError(

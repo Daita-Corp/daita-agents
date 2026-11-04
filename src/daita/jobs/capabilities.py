@@ -180,6 +180,11 @@ class JobStartExecutor(_Executor):
             conversation_id=request.conversation_id,
             sources=tuple(str(item) for item in sources),
             refs=scope_refs(request.source_scope),
+            within=(
+                None
+                if request.source_scope is None
+                else request.source_scope.source_ids
+            ),
         )
         return _output(
             "job.started",
@@ -306,16 +311,10 @@ class DelegateExecutor(_Executor):
         assert isinstance(goal, str) and isinstance(context, str)
         assert isinstance(sources, tuple) and (item is None or isinstance(item, str))
         source_ids = await self._owner.resolve_sources(
-            tuple(str(value) for value in sources), scope_refs(request.source_scope)
+            tuple(str(value) for value in sources),
+            scope_refs(request.source_scope),
+            within=frozenset(request.execution_scope.allowed_source_ids),
         )
-        outside = sorted(
-            set(source_ids) - set(request.execution_scope.allowed_source_ids)
-        )
-        if outside:
-            raise CapabilityInputError(
-                "job_source_outside_run",
-                "A sub-run can read only the sources this run reads.",
-            )
         delegation, sensitivity = await self._supervisor.delegate(
             job_id=job_id,
             parent_scope=request.execution_scope,

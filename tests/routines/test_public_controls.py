@@ -23,9 +23,12 @@ from daita.llm.models import (
     ModelResponse,
     ModelSensitivity,
     ModelUsage,
+    ToolCall,
 )
 from daita.llm.pricing import CostEstimate
 from daita.llm.providers.mock import MockModelProvider
+from tests.support.jobs import JobModel, open_job_agent, reply, tool_result
+from tests.support.model_surface import identity_leaks
 from tests.support.workspace import workspace_for
 
 
@@ -42,7 +45,6 @@ def _profile(provider: MockModelProvider) -> ModelProfile:
 @pytest.mark.parametrize("update", [False, True])
 async def test_routine_input_error_precedes_approval(tmp_path, update):
     from daita.capabilities import ApprovalDecision
-    from daita.llm.models import ToolCall
     from tests.support.capability_runtime import execute_projected
 
     approvals = []
@@ -282,7 +284,6 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
 async def test_public_source_free_once_routine_commits_its_document(tmp_path):
     from daita import OnceSchedule
     from daita.distribution.models import OutcomeState
-    from daita.llm.models import ToolCall
     from tests.support.toolbox_model import ToolboxAwareMockModelProvider
 
     usage = ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0")))
@@ -380,7 +381,6 @@ async def test_routine_save_creates_with_code_defaults_and_updates_one_revision(
     tmp_path,
 ):
     from daita.capabilities import ApprovalDecision
-    from daita.llm.models import ToolCall
     from tests.support.capability_runtime import execute_projected
     from tests.support.toolbox_model import ToolboxAwareMockModelProvider
 
@@ -485,89 +485,117 @@ async def test_routine_save_creates_with_code_defaults_and_updates_one_revision(
         await agent.close()
 
 
-async def test_routine_save_rejects_run_local_refs_in_the_instruction(tmp_path):
-    from daita.capabilities import ApprovalDecision
-    from daita.llm.models import ToolCall, ToolResultBlock
-    from tests.support.toolbox_model import ToolboxAwareMockModelProvider
-
-    database = tmp_path / "crm.sqlite"
-    connection = sqlite3.connect(database)
-    connection.execute("CREATE TABLE companies (name TEXT NOT NULL)")
-    connection.commit()
-    connection.close()
-
-    async def approve(request):
-        return ApprovalDecision.APPROVE
-
-    provider = ToolboxAwareMockModelProvider(
-        [ModelResponse(finish_reason=FinishReason.STOP, text="Ready.")]
+async def test_a_routine_run_shows_only_names_and_cannot_name_its_way_out(
+    tmp_path: Path,
+) -> None:
+    shop, staff = tmp_path / "shop.db", tmp_path / "staff.db"
+    with sqlite3.connect(shop) as connection:
+        connection.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
+    with sqlite3.connect(staff) as connection:
+        connection.execute("CREATE TABLE people (id INTEGER PRIMARY KEY)")
+    model = JobModel()
+    reads = (
+        ("in-scope", "data_query", {"source": "shop", "sql": "SELECT id FROM orders"}),
+        ("source", "data_query", {"source": "staff", "sql": "SELECT id FROM people"}),
+        ("sql", "data_query", {"source": "shop", "sql": "SELECT id FROM people"}),
+        ("table", "catalog_describe", {"source": "shop", "name": "main.people"}),
     )
-    agent = await Agent.create(
-        "routine-scope-refs",
-        root=tmp_path,
-        workspace=workspace_for(tmp_path),
-        model=provider,
-        model_profile=provider.model_profile,
-        approval_handler=approve,
-    )
-    try:
-        source = await agent.attach(SQLiteSource(database, name="CRM"))
-        resource = (await agent.list_catalog_resources(source_id=source.id))[0]
-        origin = await agent.run("Plan a weekly companies upsert.")
-        now = datetime.now(UTC)
-        arguments = {
-            "title": "Weekly companies upsert",
-            "schedule": {
-                "kind": "interval",
-                "interval_seconds": 7 * 86_400,
-                "anchor_at": (now + timedelta(days=7)).isoformat(),
-            },
-            "sources": ("CRM",),
-        }
-        stale = {
-            **arguments,
-            "prompt": "Upsert this week's rows into t1.",
-        }
-        stable = {
-            **arguments,
-            "prompt": "Upsert this week's rows into companies.",
-        }
-        provider.replace_script(
-            [
-                ModelResponse(
-                    finish_reason=FinishReason.TOOL_CALLS,
-                    tool_calls=(ToolCall("stale", "routine_save", stale),),
-                ),
-                ModelResponse(
-                    finish_reason=FinishReason.TOOL_CALLS,
-                    tool_calls=(ToolCall("stable", "routine_save", stable),),
-                ),
-                ModelResponse(finish_reason=FinishReason.STOP, text="Saved."),
-            ]
-        )
-        result = await agent.run(
-            "Save the weekly companies upsert.",
-            conversation_id=origin.conversation_id,
-        )
-        assert result.kind.value == "completed"
-        provider.assert_consumed()
-        (rejected,) = [
-            block
-            for message in provider.logical_requests[-2].messages
-            for block in message.content
-            if isinstance(block, ToolResultBlock) and block.call_id == "stale"
+    model.script(
+        user=[
+            *(reply(ToolCall(call, name, args)) for call, name, args in reads),
+            reply(text="Reported."),
         ]
-        error = rejected.output["error"]
-        assert isinstance(error, Mapping)
-        assert error["code"] == "routine_instruction_scope_ref"
-        assert isinstance(details := error["details"], Mapping)
-        assert isinstance(recovery := details["recovery"], Mapping)
-        assert recovery["kind"] == "correct_arguments"
-        assert f"t1 is {resource.id}" in recovery["constraint"]
-        (saved,) = await agent.list_routines()
-        inspection = await agent.inspect_routine(saved.routine_id)
-        assert inspection is not None
-        assert inspection.routine.authorized_instruction == stable["prompt"]
-        assert inspection.routine.source_ids == (source.id,)
+    )
+    agent = await open_job_agent(tmp_path, model)
+    try:
+        await agent.attach(SQLiteSource(shop, name="shop"))
+        await agent.attach(SQLiteSource(staff, name="staff"))
+        routine = await agent.create_routine(
+            RoutineIntent(
+                title="Orders",
+                prompt="Report the orders table.",
+                schedule=IntervalSchedule(
+                    3_600, datetime.now(UTC) + timedelta(hours=1)
+                ),
+                sources=("shop",),
+            )
+        )
+        await agent.run_routine_now(
+            routine.routine_id, expected_revision=routine.revision
+        )
+        for _ in range(1_000):
+            if await agent.list_deliveries(conversation_id=routine.conversation_id):
+                break
+            await asyncio.sleep(0.005)
     finally:
         await agent.close()
+    last = model.requests[-1][1]
+    codes = {
+        call: tool_result(last, call).output.get("error", {}).get("code")  # type: ignore[attr-defined]
+        for call, _, _ in reads
+    }
+    assert codes == {
+        "in-scope": None,
+        "source": "source_unknown",
+        # The run may read shop in full; shop has no such table, and staff's stays
+        # out of reach.
+        "sql": "query_invalid",
+        "table": "table_unknown",
+    }
+    assert identity_leaks(request for _, request in model.requests) == []
+
+
+@pytest.mark.parametrize("read_mode", ("all", "selected"))
+async def test_a_routine_can_search_only_sources_it_reads_in_full(
+    tmp_path: Path, read_mode: str
+) -> None:
+    shop = tmp_path / "shop.sqlite"
+    with sqlite3.connect(shop) as connection:
+        connection.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
+    model = JobModel()
+    model.script(
+        user=[
+            reply(ToolCall("find", "catalog_search", {"query": "orders"})),
+            reply(text="Reported."),
+        ]
+    )
+    agent = await open_job_agent(tmp_path, model)
+    try:
+        source = await agent.attach(SQLiteSource(shop, name="shop"))
+        if read_mode == "selected":
+            (orders,) = await agent.list_catalog_resources(source_id=source.id)
+            preview = await agent.preview_source_permissions(
+                source_id=source.id,
+                read_mode="selected",
+                read_resource_ids=(orders.id,),
+                relational_write_scopes={},
+            )
+            await agent.apply_source_permissions(
+                source_id=source.id,
+                confirmation_fingerprint=preview.confirmation_fingerprint,
+            )
+        routine = await agent.create_routine(
+            RoutineIntent(
+                title="Orders",
+                prompt="Report the orders table.",
+                schedule=IntervalSchedule(
+                    3_600, datetime.now(UTC) + timedelta(hours=1)
+                ),
+                sources=("shop",),
+            )
+        )
+        await agent.run_routine_now(
+            routine.routine_id, expected_revision=routine.revision
+        )
+        for _ in range(1_000):
+            if await agent.list_deliveries(conversation_id=routine.conversation_id):
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        await agent.close()
+    output = tool_result(model.requests[-1][1], "find").output
+    if read_mode == "all":
+        assert "error" not in output, output
+        assert "main.orders" in repr(output)
+    else:
+        assert output["error"]["code"] == "execution_scope_resource_violation"  # type: ignore[index]

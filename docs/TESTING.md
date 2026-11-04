@@ -222,11 +222,18 @@ publish these files as public CI artifacts. Test harnesses and synthetic fixture
 remain part of the repository.
 
 Functional live suites use the ordinary outer safety envelope of 24 model
-requests, 100,000 total tokens, and 300 seconds, together with each module's
+requests, 200,000 total tokens, and 300 seconds, together with each module's
 explicit cost cap. These limits prevent runaway execution without turning an
 efficiency target into the functional oracle. Record token use as benchmark
 evidence. Test exact token admission and exhaustion behavior with deterministic
 providers in the owning loop and LLM suites.
+
+A live test fails only when something is wrong for a user: the wrong rows
+changed, an effect happened twice, a receipt is missing, an unsafe action went
+through, a report disagrees with the evidence, or a run went past its limits. A
+run that did the right thing must pass, however the model wrote its SQL and even
+if a stalled model attempt was retried. Stalled attempts stay visible in the
+evidence report; usage arithmetic belongs in the deterministic suites.
 
 The live MCP action and scheduled execution suites default to a `$0.50`
 estimated cost cap per agent run in both evaluation profiles. Configure it with
@@ -242,9 +249,21 @@ update that keeps everything else. Enable them with
 `DAITA_CONTRACT_MODEL_ID` and, under API billing, its key with
 `DAITA_CONTRACT_LLM_API_KEY`.
 
+Real-server write behaviour with a scripted model is in
+`tests/live/data/test_source_first_writes.py`: enable it with
+`DAITA_RUN_POSTGRES_WRITES=1`, `DAITA_WRITES_POSTGRES_PORT` and
+`DAITA_WRITES_POSTGRES_ADMIN` on a disposable server.
+
+`tests/live/data/test_readable_metadata.py` checks on a real server that metadata
+SQL and the connection check show only what the connecting role can read. Enable it
+with `DAITA_RUN_POSTGRES_LARGE_FIXTURE=1` and
+`DAITA_LARGE_POSTGRES_ADMIN_PASSWORD` against the `postgres-large` fixture. Each case
+runs in one transaction on that server's `postgres` database and always rolls back,
+so it leaves no schemas, tables or roles behind.
+
 The scheduled-write case (`tests/live/routines/test_scheduled_write.py`) runs a
 real model's one-time routine in a real host while no client watches: the run
-asks to upsert one row into the simulated PostgreSQL fixture, the host
+asks to upsert one row into the real `postgres-large` fixture, the host
 notifies, the test approves through the interaction route, and exactly one
 receipted write follows. Because a scheduled run may use every write tool, two
 more cases check what the model attempts: a routine whose research result
@@ -257,7 +276,7 @@ billing, its key with `DAITA_LIVE_SCHEDULED_WRITE_LLM_API_KEY`.
 The background-job cases (`tests/live/jobs/test_jobs.py`) show a real model
 finishing a two-part job through `checklist_write` and `delegate`, a job that
 resumes after a restart, a job that asks with `ask_user` and uses the answer,
-and a job that performs one approved write against the simulated PostgreSQL
+and a job that performs one approved write against the real `postgres-large`
 fixture. The two-part cases check the real table totals. Enable them with `DAITA_RUN_LIVE_JOBS=1`;
 choose the model with `DAITA_LIVE_JOBS_MODEL_ID` and, under API billing, its key
 with `DAITA_LIVE_JOBS_LLM_API_KEY`.
@@ -701,6 +720,15 @@ what they receive.
 Textual rule: a body inside `App.run_test()` that raises without calling
 `app.exit()` hangs the run. Put `app.exit()` in a `finally`, or let the pilot
 drive the app to its own exit.
+
+### PostgreSQL schema baseline
+
+`tests/live/schema_baseline` measures PostgreSQL discovery limits, catalog
+coverage, per-query structural cost, staleness and question outcomes on a
+1,500-table messy schema. It runs only when `DAITA_SCHEMA_BASELINE_POSTGRES_URL`
+names a disposable `daita_schema_baseline` database. Its paid Daita-versus-Claude
+Code comparison also needs `DAITA_RUN_LIVE_SCHEMA_BASELINE_COMPARISON=1`. Reports go to the
+ignored `live-evidence/schema-baseline/` and stay out of git. See its `README.md`.
 
 ## Model-surface gate
 

@@ -276,7 +276,9 @@ async def test_public_workflow_fixtures_use_actual_agent_and_tool_results(
         responses = [answer("RELIABILITY_OK")]
     elif case.scale == "workspace":
         responses = [
-            call("read", "file_read", {"source_id": "s1", "path": "probe.txt"}),
+            call(
+                "read", "file_read", {"source": "Working folder", "path": "probe.txt"}
+            ),
             answer(runner.FILE_TOKEN),
         ]
     else:
@@ -317,7 +319,7 @@ async def test_public_workflow_fixtures_use_actual_agent_and_tool_results(
             queries = [r for r in row["tool_results"] if r["name"] == "data_query"]
             assert [r["is_error"] for r in queries] == [True, False]
         with pytest.raises(runner.DiagnosticFailure, match="read-only fixture"):
-            fixture["recorder"].check(call("effect", "data_update_rows", {}))
+            fixture["recorder"].check(call("effect", "data_write", {}))
     finally:
         await runner.close_fixture(fixture, ledger)
     assert not ledger.stopped

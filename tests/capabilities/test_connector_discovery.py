@@ -22,8 +22,6 @@ from tests.capabilities._toolbox_support import (
 
 class _ContractArguments(TypedDict):
     agent_id: str
-    source_ids: tuple[str, ...]
-    resource_ids: tuple[str, ...]
     capability_ids: tuple[str, ...]
     connector_binding_ids: tuple[str, ...]
     model_route_ids: tuple[str, ...]
@@ -171,8 +169,6 @@ async def test_catalog_continuation_is_complete_scoped_and_invalidated_by_hint_e
     )
     contract_arguments = _ContractArguments(
         agent_id=agent.id,
-        source_ids=(source.id,),
-        resource_ids=(resource.id,),
         capability_ids=("catalog.describe",),
         connector_binding_ids=(),
         model_route_ids=(),
@@ -197,17 +193,11 @@ async def test_catalog_continuation_is_complete_scoped_and_invalidated_by_hint_e
     )
     assert matching.total_matches == matching.total_candidates == 17
     assert all(hit.match_reasons == ("source_hint",) for hit in matching.hits)
-    assert matching.match_outcome.binding_status == "ambiguous"
-    assert matching.match_outcome.source_status == "unique"
-    assert matching.match_outcome.evidence_tier == "source_hint"
-    assert matching.match_outcome.candidate_count == 17
-    assert len(matching.match_outcome.candidate_bindings) == 12
-    assert matching.match_outcome.omitted_candidate_count == 5
     assert (
         await agent._embedded._execution_contract_reader(**contract_arguments)
         == contracts
     )
-    # Refresh time and ordinary values do not change the approved structural reference.
+    # Neither a refresh nor a schema change touches a machine run's contract.
     with sqlite3.connect(tmp_path / "source-0.sqlite") as connection:
         connection.execute("INSERT INTO item_00 (id) VALUES (7)")
     await agent.refresh_source(source.id)
@@ -220,7 +210,7 @@ async def test_catalog_continuation_is_complete_scoped_and_invalidated_by_hint_e
     await agent.refresh_source(source.id)
     assert (
         await agent._embedded._execution_contract_reader(**contract_arguments)
-        != contracts
+        == contracts
     )
     await agent.close()
 
@@ -271,8 +261,6 @@ async def test_mcp_hint_edits_preserve_execution_and_change_bounded_discovery(
     origin = mcp_execution_origin_digest(binding, tool)
     contract_arguments = _ContractArguments(
         agent_id=agent.id,
-        source_ids=(),
-        resource_ids=(),
         capability_ids=(tool.capability_id,),
         connector_binding_ids=(binding.binding_id,),
         model_route_ids=(),
@@ -348,10 +336,10 @@ async def test_mcp_hint_edits_preserve_execution_and_change_bounded_discovery(
             for index in range(12)
         )
         full = _connector_directory(
-            "rhinoceros", (source,), catalog_after, skills, maximum_bytes=20_000
+            (source,), catalog_after, skills, maximum_bytes=20_000
         )
         bounded = _connector_directory(
-            "rhinoceros", (source,), catalog_after, skills, maximum_bytes=512
+            (source,), catalog_after, skills, maximum_bytes=512
         )
         full_entries = full["entries"]
         assert isinstance(full_entries, list)

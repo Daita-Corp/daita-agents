@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from ..errors import DaitaError, ErrorRetryability
+
+if TYPE_CHECKING:
+    from ..storage.sqlite_records import RelationalWriteScope, SourceReadScope
+
 from .models import (
     DiscoveryRequest,
     DiscoveryResult,
@@ -15,6 +19,20 @@ from .models import (
     SourceHealth,
     SourceRegistration,
 )
+
+# Bounds on one live catalog_describe result.
+DESCRIBE_MAX_COLUMNS = 256
+DESCRIBE_MAX_LISTED_TABLES = 100
+SUMMARY_MAX_COLUMNS = 12
+
+
+def column_summary(columns: str | None, total: int) -> str | None:
+    """One line of leading ``name type`` pairs, saying how many more there are."""
+
+    if not columns:
+        return None
+    hidden = total - SUMMARY_MAX_COLUMNS
+    return f"{columns} (+{hidden} more)" if hidden > 0 else columns
 
 
 def _text(value: str, field_name: str) -> None:
@@ -41,11 +59,6 @@ class ResourceAdapterError(DaitaError):
 class SourceClosedError(ResourceAdapterError):
     def __init__(self, source_id: str) -> None:
         super().__init__(source_id, "source_closed", "resource source is closed")
-
-
-class DiscoveryLimitError(ResourceAdapterError):
-    def __init__(self, source_id: str, message: str) -> None:
-        super().__init__(source_id, "discovery_limit_exceeded", message)
 
 
 class ResourceNotFoundError(ResourceAdapterError):
@@ -124,8 +137,32 @@ class SourceStore(Protocol):
     ) -> SourceRegistration: ...
 
 
+@runtime_checkable
+class SourceReadScopeStore(SourceStore, Protocol):
+    """A source store that also answers what a source may currently read."""
+
+    async def load_source_read_scope(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> SourceReadScope | None: ...
+
+
+class SourcePermissionStore(SourceReadScopeStore, Protocol):
+    """A source store that also answers what a person allowed writing."""
+
+    async def list_relational_write_scopes(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> tuple[RelationalWriteScope, ...]: ...
+
+
 __all__ = [
-    "DiscoveryLimitError",
+    "DESCRIBE_MAX_COLUMNS",
+    "DESCRIBE_MAX_LISTED_TABLES",
+    "SUMMARY_MAX_COLUMNS",
+    "column_summary",
     "ResourceAdapter",
     "ResourceAdapterError",
     "ResourceNotFoundError",

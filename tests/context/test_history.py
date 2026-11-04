@@ -50,7 +50,6 @@ from tests.support.conversations import (
     _profile,
     _project_completed_history,
     _request_text,
-    _simple_conversation_record,
     _stop,
     _tool_response,
     canonical_json,
@@ -374,9 +373,6 @@ async def test_catalog_clarification_is_an_ordinary_completed_turn(tmp_path):
         assert first.reason == "completed"
         assert first.final_text == clarification
         assert "data_query" in {tool.name for tool in provider.requests[0].tools}
-        system = provider.requests[0].messages[0].content[0]
-        assert isinstance(system, TextBlock)
-        assert "catalog assessment reports multiple plausible" in system.text
 
         transcript = await agent.transcript(first.run_id)
         assert tuple(
@@ -603,7 +599,6 @@ async def test_oversized_analytical_history_keeps_compact_contract_and_requeries
     assert data["total_rows"] == 40
     assert data["returned_rows"] == 40
     assert data["truncated"] is False
-    assert data["source_revision"] == "catalog:history"
     assert "rows" not in data
 
     follow_up = (
@@ -880,61 +875,6 @@ def test_compact_file_and_sql_error_receipts_keep_shape_state_and_order():
     assert repr(projected).count(_HISTORY_OMISSION_MARKER) == 1
 
 
-async def test_catalog_queries_keep_current_and_most_recent_prior_user_separate():
-    catalog = CatalogSpy()
-    builder = AgentContextBuilder(
-        catalog,
-        profile=ModelProfile(
-            id="mock:catalog-query",
-            context_window_tokens=20_000,
-            max_output_tokens=1_000,
-            supports_tools=True,
-        ),
-    )
-    prior = _project_completed_history(
-        (
-            _simple_conversation_record(0),
-            _simple_conversation_record(1),
-        )
-    )
-    request = await _prepared_request(
-        builder,
-        RunInput(
-            id="referential-run",
-            agent_id="agent-history",
-            message="Now only EMEA",
-            created_at=NOW,
-            conversation_id="history-conversation",
-        ),
-        (
-            *prior,
-            CanonicalMessage(
-                role=MessageRole.USER,
-                content=(TextBlock("Now only EMEA"),),
-            ),
-        ),
-        (),
-        step=1,
-    )
-    assert catalog.queries == [("Now only EMEA", "history user 1")]
-    assert catalog.context_selections == [
-        (
-            ("source-history",),
-            (),
-            frozenset({"resource-unmatched"}),
-        )
-    ]
-    system_text = request.messages[0].content[0]
-    assert isinstance(system_text, TextBlock)
-    assert (
-        "fresh source/tool evidence outrank stale historical claims" in system_text.text
-    )
-    assert (
-        "use its resource_id directly. Reuse authenticated current structure and "
-        "values where sufficient" in system_text.text
-    )
-
-
 async def test_inspection_keeps_nonreplayable_runs_but_history_excludes_them(tmp_path):
     initial_provider = MockModelProvider((_stop("valid answer"),))
     agent = await Agent.create(
@@ -1047,166 +987,3 @@ async def test_inspection_keeps_nonreplayable_runs_but_history_excludes_them(tmp
         assert records[3].result.reason == "previous_process_terminated"
     finally:
         await reopened.close()
-
-
-async def test_historical_schema_slice_reuse_requires_current_matching_revisions():
-    resource_id = "catalog-resource:sha256:" + ("a" * 64)
-    source_id = "source:sha256:" + ("b" * 64)
-    revision = "sha256:" + ("c" * 64)
-    sync_id = "catalog-sync-current"
-    source_revision = "catalog:sha256:" + ("d" * 64)
-    schema_call = ToolCall(
-        id="schema-history-call",
-        name="catalog_describe",
-        arguments={"resource_ids": (resource_id,)},
-    )
-    record = _conversation_record(
-        0,
-        (
-            CanonicalMessage(
-                role=MessageRole.USER,
-                content=(TextBlock("Plan the paid revenue query"),),
-            ),
-            CanonicalMessage(
-                role=MessageRole.ASSISTANT,
-                tool_calls=(schema_call,),
-            ),
-            CanonicalMessage(
-                role=MessageRole.TOOL,
-                content=(
-                    ToolResultBlock(
-                        call_id=schema_call.id,
-                        output={
-                            "kind": "catalog.description",
-                            "data": {
-                                "bounds": {"resources": 12},
-                                "detail": "schema",
-                                "include_relationships": True,
-                                "relationships": (),
-                                "resources": (
-                                    {
-                                        "columns": (
-                                            {
-                                                "name": "paid_revenue",
-                                                "nullable": False,
-                                                "type": "NUMERIC",
-                                            },
-                                        ),
-                                        "kind": "table",
-                                        "name": "analytics.orders",
-                                        "primary_key_fields": ("order_id",),
-                                        "resource_id": resource_id,
-                                        "revision": revision,
-                                        "source_id": source_id,
-                                        "structural_facts": {},
-                                        "sync_id": sync_id,
-                                        "unique_key_fields": (),
-                                    },
-                                ),
-                                "sources": (
-                                    {
-                                        "source_id": source_id,
-                                        "source_revision": source_revision,
-                                        "sync_id": sync_id,
-                                    },
-                                ),
-                                "total_matches": 1,
-                                "truncation": {"resources": False},
-                                "trust_classification": "untrusted_external_data",
-                            },
-                        },
-                    ),
-                ),
-            ),
-            CanonicalMessage(
-                role=MessageRole.ASSISTANT,
-                content=(TextBlock("Use paid_revenue from analytics.orders."),),
-            ),
-        ),
-    )
-    prior = _project_completed_history((record,))
-    assert "catalog.description" in repr(prior)
-    assert "paid_revenue" in repr(prior)
-
-    current_resource = {
-        "kind": "table",
-        "name": "orders",
-        "resource_id": resource_id,
-        "revision": revision,
-        "sensitivity": "internal",
-        "source_id": source_id,
-    }
-    current_source = {
-        "source_id": source_id,
-        "source_revision": source_revision,
-        "sync_id": sync_id,
-    }
-    profile = ModelProfile(
-        id="mock:schema-history",
-        context_window_tokens=60_000,
-        max_output_tokens=2_000,
-        supports_tools=True,
-    )
-    run = RunInput(
-        id="schema-history-follow-up",
-        agent_id="agent-history",
-        message="Now only EMEA",
-        created_at=NOW,
-        conversation_id="history-conversation",
-    )
-    current_user = CanonicalMessage(
-        role=MessageRole.USER,
-        content=(TextBlock(run.message),),
-    )
-
-    unchanged = await _prepared_request(
-        AgentContextBuilder(
-            CatalogSpy((current_resource,), (current_source,)),
-            profile=profile,
-        ),
-        run,
-        (*prior, current_user),
-        (),
-        step=1,
-    )
-    unchanged_text = repr(unchanged.messages)
-    assert "catalog.description" in unchanged_text
-    assert "paid_revenue" in unchanged_text
-
-    changed_resource = {
-        **current_resource,
-        "revision": "sha256:" + ("e" * 64),
-    }
-    changed_source = {
-        **current_source,
-        "sync_id": "catalog-sync-refreshed",
-        "source_revision": "catalog:sha256:" + ("f" * 64),
-    }
-    changed = await _prepared_request(
-        AgentContextBuilder(
-            CatalogSpy((changed_resource,), (changed_source,)),
-            profile=profile,
-        ),
-        run,
-        (*prior, current_user),
-        (),
-        step=1,
-    )
-    changed_text = repr(changed.messages)
-    assert "catalog.description" not in changed_text
-    assert "'name', 'paid_revenue'" not in changed_text
-    assert _HISTORY_OMISSION_MARKER in changed_text
-
-    missing_source = await _prepared_request(
-        AgentContextBuilder(
-            CatalogSpy((current_resource,), ()),
-            profile=profile,
-        ),
-        run,
-        (*prior, current_user),
-        (),
-        step=1,
-    )
-    missing_source_text = repr(missing_source.messages)
-    assert "catalog.description" not in missing_source_text
-    assert _HISTORY_OMISSION_MARKER in missing_source_text

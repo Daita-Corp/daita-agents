@@ -36,13 +36,13 @@ from ..adapters.mcp import (
     MCPServerInspection,
     MCPToolSelection,
 )
-from ..adapters.models import SourceRegistration
+from ..adapters.models import SourceHealth, SourceRegistration
 from ..adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLProbeSchema,
     PostgreSQLSource,
 )
-from ..adapters.postgresql_write import RelationalUpdateReadiness
+from ..adapters.postgresql_write import RelationalWriteReadiness
 from ..adapters.sqlite import SQLiteSource
 from ..artifacts.models import (
     ArtifactAuthorship,
@@ -614,7 +614,7 @@ for _record in (
     OutcomeArtifactReference,
     PostgreSQLProbeResult,
     PostgreSQLProbeSchema,
-    RelationalUpdateReadiness,
+    RelationalWriteReadiness,
     RetryPolicy,
     RoutineIntent,
     SQLiteSource,
@@ -626,6 +626,7 @@ for _record in (
     SkillSummary,
     SourceEditPreview,
     SourceEditResult,
+    SourceHealth,
     SourcePermissionResource,
     SourcePermissionState,
     SourcePermissionSummary,

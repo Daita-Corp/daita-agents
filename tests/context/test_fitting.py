@@ -227,90 +227,6 @@ async def test_final_budget_omits_oldest_turns_and_preserves_current_exchange():
     assert roles[-3:] == [MessageRole.USER, MessageRole.ASSISTANT, MessageRole.TOOL]
 
 
-async def test_context_fitting_retains_exact_current_anchor_and_updates_counts():
-    source_id = "source:exact-current"
-    resources = (
-        {
-            "kind": "table",
-            "match_reasons": ("resource_name_exact_mention",),
-            "name": "exact_current_target",
-            "resource_id": "resource:exact-current",
-            "revision": "sha256:" + ("a" * 64),
-            "sensitivity": "internal",
-            "source_id": source_id,
-        },
-        {
-            "kind": "table",
-            "match_reasons": ("resource_name_exact_mention",),
-            "name": "prior_target_" + ("p" * 30_000),
-            "resource_id": "resource:prior",
-            "revision": "sha256:" + ("b" * 64),
-            "sensitivity": "internal",
-            "source_id": source_id,
-        },
-        {
-            "kind": "table",
-            "match_reasons": ("resource_name_contains",),
-            "name": "broad_candidate_" + ("b" * 30_000),
-            "resource_id": "resource:broad",
-            "revision": "sha256:" + ("c" * 64),
-            "sensitivity": "internal",
-            "source_id": source_id,
-        },
-    )
-    sources = (
-        {
-            "source_id": source_id,
-            "source_revision": "catalog:sha256:" + ("d" * 64),
-            "sync_id": "catalog-sync-current",
-        },
-    )
-    catalog = CatalogSpy(resources, sources)
-    builder = AgentContextBuilder(
-        catalog,
-        profile=ModelProfile(
-            id="mock:catalog-fitting",
-            context_window_tokens=20_000,
-            max_output_tokens=1_000,
-            supports_tools=True,
-        ),
-    )
-    run = RunInput(
-        id="catalog-fitting-run",
-        agent_id="agent-history",
-        message="Profile exact_current_target",
-        created_at=NOW,
-        conversation_id="catalog-fitting-conversation",
-    )
-    request = await _prepared_request(
-        builder,
-        run,
-        (
-            CanonicalMessage(
-                role=MessageRole.USER,
-                content=(TextBlock(run.message),),
-            ),
-        ),
-        (),
-        step=1,
-    )
-    system = request.messages[0].content[0]
-    assert isinstance(system, TextBlock)
-    assert "exact_current_target" in system.text
-    assert "prior_target_" not in system.text
-    assert "broad_candidate_" not in system.text
-    assert '"returned_count":1' in system.text
-    assert '"total_matches":3' in system.text
-    assert '"truncated":true' in system.text
-    assert '"binding_status":"ambiguous"' in system.text
-    assert '"candidate_count":2' in system.text
-    assert '"assessment_provenance":"catalog_service"' in system.text
-    assert (
-        "catalog assessment reports multiple plausible resource bindings" in system.text
-    )
-    assert "rank/approval cannot select" in system.text
-
-
 async def test_material_ambiguity_guidance_covers_mcp_without_catalog_gate():
     builder = AgentContextBuilder(
         CatalogSpy(),
@@ -346,11 +262,9 @@ async def test_material_ambiguity_guidance_covers_mcp_without_catalog_gate():
 
     system = request.messages[0].content[0]
     assert isinstance(system, TextBlock)
-    assert "material ambiguity" in system.text
-    assert "Explicit sets/comparisons" in system.text
-    assert "multiple search hits need no question" in system.text
-    assert "rank/approval cannot select a target, connector, account" in system.text
-    assert "catalog assessment reports multiple plausible" not in system.text
+    assert "Choose the best-supported table from the evidence" in system.text
+    assert "Ask only when the evidence cannot separate the options" in system.text
+    assert "Rank or relevance never selects a write target, connector" in system.text
     assert {
         "mcp_hubspot_lookup",
         "mcp_salesforce_lookup",
@@ -366,27 +280,13 @@ async def test_discovery_pressure_preserves_newest_continuity_and_tool_exchange(
     from daita.context import _estimate_input_tokens
 
     source_id = "source:budget"
-    resources = tuple(
-        {
-            "kind": "table",
-            "name": f"candidate_{index:02d}_" + "r" * 200,
-            "resource_id": f"resource:{index}",
-            "source_id": source_id,
-            "revision": "sha256:" + "a" * 64,
-            "sensitivity": "public",
-            "match_reasons": ("unmatched_fallback",),
-        }
-        for index in range(24)
-    )
     profile = ModelProfile(
         id="mock:discovery-budget",
         context_window_tokens=14000,
         max_output_tokens=1000,
         supports_tools=True,
     )
-    builder = AgentContextBuilder(
-        CatalogSpy(resources), profile=profile, catalog_limit=24
-    )
+    builder = AgentContextBuilder(CatalogSpy(), profile=profile)
     prior = _project_completed_history((_simple_conversation_record(7, answer=answer),))
     run = RunInput(
         id="run-discovery-budget",
@@ -420,7 +320,6 @@ async def test_discovery_pressure_preserves_newest_continuity_and_tool_exchange(
     assert answer in repr(request.messages)
     assert request.messages[-3:] == current
     assert _estimate_input_tokens(request) <= profile.maximum_input_tokens
-    assert '"truncated":true' in repr(request.messages)
 
 
 async def test_context_overflow_fails_before_provider_and_is_not_replayed(tmp_path):

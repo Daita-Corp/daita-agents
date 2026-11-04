@@ -10,7 +10,7 @@ How one agent is composed and how a run moves from a message to an answer.
 ## Run model
 
 Daita is a persistent, read-first data agent with a narrowly scoped,
-explicitly enabled native relational update/upsert capability, initially backed by PostgreSQL,
+explicitly enabled native relational write capability, initially backed by PostgreSQL,
 and locally admitted MCP external actions. It uses one direct loop:
 
 ```text
@@ -23,8 +23,8 @@ model-visible results, so the model can correct a call on the next step. Normal
 model text completes the run. There is no verifier, repair, synthesis, or
 resumable-session pass.
 
-Persisted tool calls keep the model's run-local handles. Code that reads call
-arguments uses the executed record (`CapabilityRegistry.executed_tool_pairs`,
+Persisted tool calls keep the names the model sent; runs stored before names
+were used keep its run-local handles. Code that reads call arguments uses the executed record (`CapabilityRegistry.executed_tool_pairs`,
 public `Agent.tool_evidence`), never per-reader re-resolution;
 `tests/architecture` enforces this.
 
@@ -69,7 +69,7 @@ supervisors, and closes them in drain-safe order. Composition belongs here rathe
 than in the loop or a dependency-injection framework. The default
 PostgreSQL read backend owns optional lazy bounded native pools and closes them
 after drain, before credentials and state. Every read/export retains a fresh
-read-only transaction and full structural revalidation; reuse grants no authority.
+read-only transaction with its own pinned `search_path`; reuse grants no authority.
 Pool configuration and resolved credentials are runtime-only; retired or uncertain
 connections are never reused or replayed.
 
@@ -125,9 +125,14 @@ cumulative run limit. Fixed instructions, current input, and pinned schemas form
 the mandatory baseline; they do not consume the optional-addition allowance. This
 presentation target cannot truncate the exact current
 transcript, lower sensitivity, grant authority, or replace provider token admission.
-The same projection reports remaining steps and an advisory two-request budget
-forecast using measured input growth and output allowances. Forecasts cannot reserve
-credit, alter hard admission, or guarantee completion with unknown future results.
+Run status is append-only. The driver writes a note only when it matters (budget
+pressure from an advisory two-request forecast, the last step, a new progress
+warning), stores it on the batch's last tool-result message as `run_note`, and every
+adapter renders it after that result, unchanged on later requests, so no per-step text
+edits provider history. Forecasts cannot reserve credit, alter hard admission, or
+guarantee completion with unknown future results. Prior turns drop their notes.
+`_estimate_input_tokens` prices only what a provider receives: provenance stays local
+and tool results are priced as rendered.
 
 Foreground `RunInput.source_scope_ids=()` admits all currently readable sources
 as candidates at preparation; a nonempty tuple narrows them to exact caller IDs.
@@ -177,9 +182,9 @@ run's, narrowed to the sources it names and without the job-run tools.
 Scheduled instructions are foreground-authorized content; job instructions are
 code-owned. Untrusted
 payloads and model text cannot enlarge the scope. `contract_bindings` retains
-the exact capability, MCP-origin, resource-structure and model-configuration
-digests read at start, so a change during the run fails the call rather than
-widening it. New scopes state `SCHEDULED_ROUTINE` or `JOB`; `JOB_EVENT` and
+the exact capability, MCP-origin and model-configuration digests read at start, so
+a change during the run fails the call rather than widening it; a catalog refresh
+is not such a change. New scopes state `SCHEDULED_ROUTINE` or `JOB`; `JOB_EVENT` and
 `GRAPH_TASK` (with its task binding) are decoded from stored runs only, and
 only the revision-1 migration decoder may infer an omitted legacy kind. Job
 runs and sub-runs are held to the job lane's per-call target ceiling (the

@@ -1,54 +1,31 @@
 import pytest
 
+from daita.catalog.models import ResourceKind, catalog_resource_id
 from daita.domains.data.sql import (
     MAX_SQL_CHARACTERS,
-    ResourceSchema,
     analyze_sqlite_sql,
-    validate_sqlite_read,
+    validate_read,
 )
 
-_REVISION = "sha256:" + "3" * 64
+_SOURCE = "source-sqlite"
 
 
-def _resource(
-    resource_id: str,
-    name: str,
-    columns: tuple[str, ...],
-) -> ResourceSchema:
-    return ResourceSchema(
-        resource_id=resource_id,
-        source_id="source-sqlite",
-        name=name,
-        columns=columns,
-        revision=_REVISION,
-        source_revision="schema_version:1",
-        resource_kind="table",
-    )
-
-
-_ORDERS = _resource(
-    "resource-orders",
-    "orders",
-    ("id", "customer_id", "status", "total_amount", "ordered_at"),
-)
-_CUSTOMERS = _resource(
-    "resource-customers",
-    "customers",
-    ("id", "name", "region"),
-)
-_RESOURCES = (_ORDERS, _CUSTOMERS)
+def _table(name: str) -> str:
+    return catalog_resource_id(_SOURCE, ResourceKind.TABLE, f"main.{name}")
 
 
 def _validate(
     sql: str,
     *,
     parameters: tuple[object, ...] = (),
+    allowed: frozenset[str] | None = None,
 ):
-    return validate_sqlite_read(
+    return validate_read(
         sql,
-        source_id="source-sqlite",
-        resources=_RESOURCES,
+        dialect="sqlite",
+        source_id=_SOURCE,
         parameters=parameters,
+        allowed_resource_ids=allowed,
     )
 
 
@@ -62,63 +39,41 @@ def _validate(
         "SELECT recent.id FROM recent UNION ALL SELECT o.id FROM orders o",
         "SELECT o.status, count(*), sum(o.total_amount) FROM orders o "
         "GROUP BY o.status HAVING count(*) > 0",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) "
+        "SELECT r.n FROM r, orders",
     ),
 )
-def test_catalog_scoped_sqlite_query_shapes_are_valid(sql: str) -> None:
+def test_ordinary_sqlite_query_shapes_are_valid(sql: str) -> None:
     result = _validate(sql)
 
     assert result.valid, result.issues
     assert result.resource_ids
-    assert result.source_revision == "schema_version:1"
-
-
-def test_cte_order_by_output_alias_wins_before_parent_scope_lookup() -> None:
-    result = _validate("""
-        WITH selected AS (
-          SELECT c.name AS customer_id
-          FROM customers AS c
-          ORDER BY customer_id
-        )
-        SELECT selected.customer_id
-        FROM orders AS o
-        CROSS JOIN selected
-        """)
-
-    assert result.valid, result.issues
-
-
-def test_cte_cannot_escape_to_same_named_parent_column_without_local_alias() -> None:
-    result = _validate("""
-        WITH selected AS (
-          SELECT c.name
-          FROM customers AS c
-          ORDER BY customer_id
-        )
-        SELECT selected.name
-        FROM orders AS o
-        CROSS JOIN selected
-        """)
-
-    assert not result.valid
-    assert "column_scope_escape" in result.issue_codes
 
 
 @pytest.mark.parametrize(
     ("sql", "issue_code"),
     (
-        ("SELECT 1", "resource_scope_empty"),
         ("DELETE FROM orders", "mutation_not_allowed"),
-        ("SELECT o.missing FROM orders o", "missing_column"),
-        ("SELECT o.id FROM absent o", "unknown_resource"),
+        ("INSERT INTO orders (id) VALUES (1)", "mutation_not_allowed"),
+        ("UPDATE orders SET id = 1", "mutation_not_allowed"),
+        ("DROP TABLE orders", "mutation_not_allowed"),
+        ("CREATE TABLE copy AS SELECT * FROM orders", "mutation_not_allowed"),
         (
-            "SELECT id FROM orders o JOIN customers c ON o.customer_id = c.id",
-            "ambiguous_column",
+            "WITH d AS (DELETE FROM orders RETURNING id) SELECT id FROM d",
+            "mutation_not_allowed",
         ),
+        ("/* SELECT 1; */ DROP TABLE orders", "mutation_not_allowed"),
+        ("SELECT o.id FROM temp.absent o", "resource_out_of_scope"),
+        ("SELECT * FROM pragma_database_list", "resource_out_of_scope"),
+        ("SELECT * FROM pragma_table_info('orders')", "function_not_allowed"),
         ("SELECT o.id FROM orders o; SELECT 1", "multiple_statements"),
         ("ATTACH DATABASE '/tmp/value.db' AS value", "mutation_not_allowed"),
+        ("PRAGMA writable_schema = 1", "read_statement_required"),
+        ("COMMIT", "read_statement_required"),
+        ("SELECT id FROM orders ORDER BY 1 USING <", "sql_parse_error"),
     ),
 )
-def test_invalid_sqlite_statement_and_catalog_shapes_fail_closed(
+def test_invalid_sqlite_statements_fail_closed_before_any_source_io(
     sql: str,
     issue_code: str,
 ) -> None:
@@ -126,6 +81,38 @@ def test_invalid_sqlite_statement_and_catalog_shapes_fail_closed(
 
     assert not result.valid
     assert issue_code in result.issue_codes
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT * FROM companies",
+        "SELECT * FROM Companies",
+        'SELECT * FROM "COMPANIES"',
+        "SELECT * FROM main.companies",
+        "SELECT * FROM MAIN.Companies",
+    ),
+)
+def test_every_spelling_of_a_table_is_one_identity(sql: str) -> None:
+    result = _validate(sql, allowed=frozenset({_table("companies")}))
+
+    assert result.valid
+    assert result.resource_names == ((_table("companies"), "main.companies"),)
+
+
+def test_selected_scope_refuses_other_tables_and_the_schema_table() -> None:
+    allowed = frozenset({_table("companies")})
+
+    assert (
+        "resource_out_of_scope"
+        in _validate("SELECT * FROM orders", allowed=allowed).issue_codes
+    )
+    assert (
+        "resource_out_of_scope"
+        in _validate("SELECT * FROM sqlite_schema", allowed=allowed).issue_codes
+    )
+    assert _validate("SELECT * FROM sqlite_schema").valid
+    assert _validate("SELECT 1").valid
 
 
 def test_sqlite_parameters_must_match_placeholders() -> None:
@@ -143,13 +130,11 @@ def test_sqlite_parameters_must_match_placeholders() -> None:
     assert "parameter_count_mismatch" in invalid.issue_codes
 
 
-def test_sqlite_analysis_is_bounded_and_canonical() -> None:
-    first = analyze_sqlite_sql("SELECT o.id FROM orders o")
-    second = analyze_sqlite_sql(" SELECT o.id\nFROM orders AS o; ")
+def test_sqlite_analysis_is_bounded_and_runs_the_text_as_written() -> None:
+    written = "SELECT o.id\nFROM orders AS o"
     oversized = _validate("SELECT o.id FROM orders o " + (" " * MAX_SQL_CHARACTERS))
 
-    assert first.canonical_sql == second.canonical_sql
-    assert first.sql_fingerprint == second.sql_fingerprint
+    assert analyze_sqlite_sql(written + "; ").canonical_sql == written
     assert not oversized.valid
     assert oversized.analysis is None
     assert oversized.issue_codes == ("sql_too_large",)

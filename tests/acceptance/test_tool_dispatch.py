@@ -243,7 +243,7 @@ async def test_direct_file_dispatch_preserves_authenticated_result(
                 _tool(
                     "find-forecast",
                     "file_search",
-                    {"source_id": "s1", "query": "Q4", "mode": "paths"},
+                    {"source": "Working folder", "query": "Q4", "mode": "paths"},
                 ),
                 _stop("The Q4 forecast is planning/Q4-forecast.md."),
             ),
@@ -256,7 +256,7 @@ async def test_direct_file_dispatch_preserves_authenticated_result(
                 _tool(
                     "read-todo",
                     "file_read",
-                    {"source_id": "s1", "path": "notes/todo.md"},
+                    {"source": "Working folder", "path": "notes/todo.md"},
                 ),
                 _stop("The todo token is TODO_8C32."),
             ),
@@ -308,7 +308,7 @@ async def test_folder_query_dispatch_preserves_result(
                 "query-sales",
                 "data_query",
                 {
-                    "source_id": "s1",
+                    "source": "Working folder",
                     "path_pattern": "sales.csv",
                     "sql": (
                         "SELECT region, SUM(revenue) AS total_revenue FROM data "
@@ -361,10 +361,7 @@ async def test_connected_schema_dispatch_uses_one_catalog_call(
             _tool(
                 "customer-schema",
                 "catalog_describe",
-                {
-                    "query": "customer table columns",
-                    "limit": 5,
-                },
+                {"source": "Customers", "name": "customers"},
             ),
             _stop("The customer columns are customer_id, name, and segment."),
         ),
@@ -555,10 +552,7 @@ async def test_mixed_file_and_source_dispatch_keeps_results_separate(
                 _tool(
                     "mixed-schema",
                     "catalog_describe",
-                    {
-                        "query": "customer segment",
-                        "limit": 5,
-                    },
+                    {"source_id": source.id, "name": "customers"},
                 ),
                 _tool(
                     "mixed-source-query",
@@ -627,7 +621,7 @@ async def test_files_only_scope_projects_and_dispatches_only_file_tools(
             _tool(
                 "files-only-search",
                 "file_search",
-                {"source_id": "s1", "query": "Q4", "mode": "paths"},
+                {"source": "Working folder", "query": "Q4", "mode": "paths"},
             ),
             _stop("The files-only forecast is Q4-forecast.md."),
         ),
@@ -676,7 +670,7 @@ async def test_latest_log_dispatch_searches_before_bound_tail_read(
                 "latest-search",
                 "file_search",
                 {
-                    "source_id": "s1",
+                    "source": "Working folder",
                     "query": "*.log",
                     "mode": "paths",
                     "order_by": "modified_desc",
@@ -685,7 +679,11 @@ async def test_latest_log_dispatch_searches_before_bound_tail_read(
             _tool(
                 "latest-read",
                 "file_read",
-                {"source_id": "s1", "path": "logs/latest.log", "position": "end"},
+                {
+                    "source": "Working folder",
+                    "path": "logs/latest.log",
+                    "position": "end",
+                },
             ),
             _stop("The latest log ends with LATEST_TAIL_9D11."),
         ),
@@ -705,7 +703,7 @@ async def test_latest_log_dispatch_searches_before_bound_tail_read(
         calls = {call.id: call for call in _calls(transcript)}
         assert calls["latest-search"].arguments["order_by"] == "modified_desc"
         assert dict(calls["latest-read"].arguments) == {
-            "source_id": "s1",
+            "source": "Working folder",
             "path": "logs/latest.log",
             "position": "end",
         }
@@ -826,7 +824,9 @@ class _EditRoutingProvider:
         results = _request_results(request)
         if "edit-read" not in results:
             return _tool(
-                "edit-read", "file_read", {"source_id": "s1", "path": "config.yaml"}
+                "edit-read",
+                "file_read",
+                {"source": "Working folder", "path": "config.yaml"},
             )
         if "edit-search" not in results:
             return _tool(

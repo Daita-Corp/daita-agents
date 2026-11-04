@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from daita import connect
+from daita.tui.screens.selection import SelectionScreen
 from tests.support.host import StartHost, host_workspace, short_root
 from tests.support.product_workflows import (
     ActionFixture,
@@ -22,11 +23,12 @@ from tests.support.product_workflows import (
     response,
     timedelta,
 )
+from tests.tui._support import settle_until
 
 pytestmark = _pytestmark
 
 
-async def test_guided_upsert_authoring_applies_exact_preview(
+async def test_guided_write_authoring_applies_exact_preview(
     monkeypatch, start_host: StartHost
 ):
     # The fixture builds the agent in process; the host then owns it with the
@@ -61,27 +63,33 @@ async def test_guided_upsert_authoring_applies_exact_preview(
         choice = next(
             item for item in inspection.resources if item.resource_id == resource.id
         )
-        assert choice.upsert_conflict_keys == (("domain",),)
-        assert choice.generated_identity_columns == ("id",)
+        assert "domain" in choice.eligible_insert_columns
         before = inspection.state
         async with app.run_test(size=(110, 38)) as pilot:
             await app.push_screen(PermissionsScreen(source_id=resource.source_id))
             manager = app.screen
+            assert isinstance(manager, PermissionsScreen)
             manager.query_one("#perm-max-rows", Input).value = "7"
+
+            async def next_picker(previous):
+                await settle_until(
+                    pilot,
+                    lambda: isinstance(app.screen, SelectionScreen)
+                    and app.screen is not previous,
+                )
+
             assert await pilot.click("#perm-write")
-            await pilot.pause()
-            choose(app, (resource.id,))
-            await pilot.pause()
-            choose(app, ("upsert",))
-            await pilot.pause()
-            choose(app, ("0",))
-            await pilot.pause()
-            choose(app, ("domain", "name", "evidence_url"), multi=True)
-            await pilot.pause()
-            choose(app, ("allow",))
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, SelectionScreen))
+            for identities, multi in (
+                ((resource.id,), False),
+                (("insert", "update"), True),
+                (("domain", "name", "evidence_url"), True),
+            ):
+                picker = app.screen
+                choose(app, identities, multi=multi)
+                await next_picker(picker)
             choose(app, ("name", "evidence_url"), multi=True)
-            await pilot.pause()
+            await settle_until(pilot, lambda: manager._preview is not None)
             assert app.screen is manager
             assert isinstance(manager, PermissionsScreen)
             preview = manager._preview
@@ -91,12 +99,13 @@ async def test_guided_upsert_authoring_applies_exact_preview(
             ).state == before
             assert preview.after.relational_write_scopes[0].max_rows == 7
             assert preview.after.relational_write_scopes[0].allowed_operations == (
-                "upsert",
+                "insert",
+                "update",
             )
             body = str(manager.query_one("#perm-body", Static).content)
-            assert '"generated_identity_columns"' in body and '"max_rows": 7' in body
+            assert '"table": "public.companies"' in body and '"max_rows": 7' in body
             assert await pilot.click("#perm-apply")
-            await pilot.pause()
+            await settle_until(pilot, lambda: app.screen is not manager)
             assert (
                 await agent.inspect_source_permissions(resource.source_id)
             ).state == preview.after

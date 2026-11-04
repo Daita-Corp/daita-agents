@@ -235,19 +235,25 @@ def artifact_text_change_summary_to_mapping(
 
 @dataclass(frozen=True, slots=True)
 class ArtifactResourceBinding:
+    """A table an artifact came from. Revisions exist only on older artifacts."""
+
     source_id: str
-    source_revision: str
     resource_id: str
-    resource_revision: str
+    source_revision: str | None = None
+    resource_revision: str | None = None
 
     def __post_init__(self) -> None:
         for value, name in (
             (self.source_id, "artifact source_id"),
-            (self.source_revision, "artifact source_revision"),
             (self.resource_id, "artifact resource_id"),
-            (self.resource_revision, "artifact resource_revision"),
         ):
             _required_text(value, name, maximum=1_024)
+        for optional, name in (
+            (self.source_revision, "artifact source_revision"),
+            (self.resource_revision, "artifact resource_revision"),
+        ):
+            if optional is not None:
+                _required_text(optional, name, maximum=1_024)
 
 
 @dataclass(frozen=True, slots=True)
@@ -946,13 +952,9 @@ def artifact_provenance_from_mapping(value: Mapping[str, object]) -> ArtifactPro
         bindings.append(
             ArtifactResourceBinding(
                 source_id=_mapping_text(item, "source_id", "artifact binding"),
-                source_revision=_mapping_text(
-                    item, "source_revision", "artifact binding"
-                ),
+                source_revision=_optional_mapping_text(item, "source_revision"),
                 resource_id=_mapping_text(item, "resource_id", "artifact binding"),
-                resource_revision=_mapping_text(
-                    item, "resource_revision", "artifact binding"
-                ),
+                resource_revision=_optional_mapping_text(item, "resource_revision"),
             )
         )
     evidence = value.get("evidence_call_ids", ())

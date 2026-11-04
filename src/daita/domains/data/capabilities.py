@@ -6,14 +6,14 @@ import hashlib
 import math
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
-from typing import Protocol, TypeVar, cast
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, Protocol, TypeVar, cast
 
 from ..._json import FrozenJsonObject, canonical_json
 from ...adapters.local_file_query import LocalFileQueryError, QueryRelation
 from ...artifacts.renderers import MAX_CSV_ROWS, MAX_CSV_SECONDS
 from ...capabilities import (
-    RESOURCE_ID_PATTERN,
     SOURCE_ID_PATTERN,
     AccessMode,
     Capability,
@@ -34,6 +34,7 @@ from ...capabilities import (
     ToolRecovery,
     ToolTextTrust,
     ToolView,
+    recovery_details,
     resource_id_schema,
     source_id_schema,
 )
@@ -44,10 +45,11 @@ from .controller import (
     DATA_QUERY_COMBINED_CAPABILITY_ID,
     DATA_QUERY_COMBINED_EVIDENCE_KIND,
     DATA_QUERY_EVIDENCE_KIND,
-    RELATIONAL_UPDATE_CAPABILITY_ID,
-    RELATIONAL_UPDATE_EVIDENCE_KIND,
-    RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
-    RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
+    RELATIONAL_WRITE_CAPABILITY_ID,
+    RELATIONAL_WRITE_EVIDENCE_KIND,
+    RELATIONAL_WRITE_PREVIEW_CAPABILITY_ID,
+    RELATIONAL_WRITE_PREVIEW_EVIDENCE_KIND,
+    WriteDescriber,
 )
 from .results import BoundedResultProjection
 from .source_files import (
@@ -59,36 +61,35 @@ from .source_files import (
 from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
-    RelationalUpdateCell,
-    RelationalUpdateCommand,
-    RelationalUpdateFilter,
-    RelationalUpdateIntent,
+    CheckedRead,
+    WriteFacts,
+    WritePreview,
+    checked_reads,
+    write_facts,
 )
-from .sql.relational_upsert import RelationalUpsertIntent
 
 DATA_QUERY_EXECUTOR_ID = "data.query.executor"
 DATA_QUERY_COMBINED_EXECUTOR_ID = "data.query_combined.executor"
 DATA_QUERY_TOOL_NAME = "data_query"
-RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID = "data.preview_update_rows.executor"
-RELATIONAL_UPDATE_EXECUTOR_ID = "data.update_rows.executor"
-RELATIONAL_UPDATE_TOOL_NAME = "data_update_rows"
-RELATIONAL_UPSERT_TOOL_NAME = "data_upsert_rows"
+RELATIONAL_WRITE_PREVIEW_EXECUTOR_ID = "data.preview_write.executor"
+RELATIONAL_WRITE_EXECUTOR_ID = "data.write.executor"
+RELATIONAL_WRITE_TOOL_NAME = "data_write"
 # The data.query capability description is part of its contract digest, which
 # retained routine and graph bindings revalidate; the model reads the view's.
 _DATA_QUERY_CAPABILITY_DESCRIPTION = (
-    "Run read-only SQL on exact catalog resources of one source. Use sql, or "
-    "statements for up to 8 reads in one call; resource_ids must list every "
-    "table read. Returns columns, rows, tables_touched, truncation "
+    "Run read-only SQL on the cataloged tables of one source, named by its "
+    "display name. Use sql, or statements for up to 8 reads in one call. "
+    "Returns columns, rows, tables_touched, truncation "
     "and timing. Limits: 5s per statement, 15s total, 100 rows and 16 KB "
     "shared by all statements. "
-    'Example: {"source_id": "...", "resource_ids": ["..."], '
+    'Example: {"source": "Shop", '
     '"sql": "SELECT region, sum(total) FROM orders GROUP BY region"}. '
     "Mistakes: columns absent from catalog evidence; joining on matching "
     "names alone; treating truncated rows as complete."
 )
 DATA_QUERY_DESCRIPTION = (
-    "Read-only SQL on exact catalog resources of one source; list every table "
-    "read in resource_ids. Use sql, or statements for up to 8 reads. "
+    "Read-only SQL on the cataloged tables of one source, named by its display "
+    "name. Use sql, or statements for up to 8 reads. "
     "Limits: 5s per statement, 15s "
     "total, 100 rows and 16 KB shared."
 )
@@ -109,14 +110,15 @@ _DATA_QUERY_COMBINED_CAPABILITY_DESCRIPTION = (
     "completely refuses the call, so aggregate or filter inside each input."
 )
 _DATA_QUERY_COMBINED_USAGE = (
-    " Join sources: inputs is 2-4 {alias, source_id, resource_ids, sql} in each "
-    "source's dialect, or {alias, source_id, resource_id, columns, filters} for "
+    " Join sources: inputs is 2-4 {alias, source, sql} in each "
+    "source's dialect, with path_pattern for a folder, or {alias, source, table, "
+    "columns, filters} for "
     "a source without SQL; sql is one DuckDB SELECT or UNION over the aliases "
     "(8 KiB). Aggregate or filter in each input: one too large refuses the call."
 )
 _DATA_QUERY_PATH_USAGE = (
-    " Folder files: query relation data by path_pattern (live folder) or "
-    "resource_ids (attached folder)."
+    " Folder files: query relation data by path_pattern, matched against the "
+    "folder's current files."
 )
 
 
@@ -131,37 +133,26 @@ def _data_query_description(file_outputs: tuple[str, ...]) -> str:
     return DATA_QUERY_DESCRIPTION + file_output + _DATA_QUERY_USAGE
 
 
-RELATIONAL_UPDATE_DESCRIPTION = (
-    "Update rows in a PostgreSQL table in one call: Daita previews the "
-    "matching rows on the approval card, rechecks them after approval and "
-    "writes once. mode=preview only shows matched_rows and samples. Only "
-    "outcome=committed proves it; a change after approval is final for the "
-    "request. Limits: structured filters, no SQL. "
-    'Example: {"where": [{"column": "id", "operator": "eq", "value": 7}], '
-    '"assignments": [{"column": "status", "value": "paid"}], ...}. '
-    "Mistakes: asking for approval in chat; retrying after denial."
+RELATIONAL_WRITE_DESCRIPTION = (
+    "Write to a PostgreSQL table with one SQL statement in one call: INSERT with a "
+    "column list, UPDATE or DELETE with WHERE, including INSERT ... SELECT, ON "
+    "CONFLICT (columns), UPDATE ... FROM and DELETE ... USING. Daita previews the "
+    "rows on the approval card, rechecks them and writes once. mode=preview only "
+    "shows the count and samples. Only outcome=committed proves it. Limits: one "
+    'table with write permission, no RETURNING, 64 KiB. Example: {"sql": "UPDATE '
+    'orders SET status = $1 WHERE id = $2", "parameters": ["paid", 7]}. Mistakes: '
+    "asking for approval in chat; retrying after denial."
 )
-RELATIONAL_UPSERT_DESCRIPTION = (
-    "Insert missing rows and update existing ones in one PostgreSQL table by "
-    "key_columns in one call; needs upsert permission. Daita classifies the "
-    "batch on the approval card, locks the table briefly, rechecks and writes "
-    "once, reporting verified counts. mode=preview only classifies rows as "
-    "insert, update or unchanged. A change after approval is final for the "
-    "request. Limits: one uniform batch of up to 1000 scalar rows, no "
-    'chunking. Example: {"key_columns": ["sku"], "rows": [{"sku": "A1", '
-    '"qty": 3}], ...}. Mistakes: omitting a column to clear it (send null); '
-    "retrying after denial or failure."
-)
-_MAX_PREVIEW_OUTPUT_BYTES = 256 * 1_024
-
-RELATIONAL_UPDATE_RECEIPT_POLICY = EffectReceiptPolicy(
-    receipt_kind="data.update_rows",
+RELATIONAL_WRITE_RECEIPT_POLICY = EffectReceiptPolicy(
+    receipt_kind="data.write",
     success_evidence_basis=EffectEvidenceBasis.ADAPTER_VERIFIED,
     payload_schema={
         "type": "object",
         "properties": {
             "source_id": {"type": "string", "maxLength": 256},
             "resource_id": {"type": "string", "maxLength": 256},
+            "table": {"type": "string", "maxLength": 1024},
+            "operation": {"type": "string", "enum": ["insert", "update", "delete"]},
             "intent_sha256": {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"},
             "preview_fingerprint": {
                 "type": "string",
@@ -175,6 +166,8 @@ RELATIONAL_UPDATE_RECEIPT_POLICY = EffectReceiptPolicy(
         "required": [
             "source_id",
             "resource_id",
+            "table",
+            "operation",
             "intent_sha256",
             "preview_fingerprint",
             "target_set_sha256",
@@ -189,12 +182,12 @@ RELATIONAL_UPDATE_RECEIPT_POLICY = EffectReceiptPolicy(
 
 @dataclass(frozen=True, slots=True)
 class SqlReadResult:
+    """One read's facts: the tables come from the parse, the rest from the source."""
+
     source_id: str
     canonical_sql: str
     sql_fingerprint: str
     resource_ids: tuple[str, ...]
-    resource_revisions: tuple[tuple[str, str], ...]
-    source_revision: str
     columns: tuple[str, ...]
     projection: BoundedResultProjection
     resource_names: tuple[tuple[str, str], ...] = ()
@@ -204,19 +197,13 @@ class SqlReadResult:
             (self.source_id, "source_id"),
             (self.canonical_sql, "canonical_sql"),
             (self.sql_fingerprint, "sql_fingerprint"),
-            (self.source_revision, "source_revision"),
         ):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{name} must be a non-empty string")
         resource_ids = tuple(self.resource_ids)
-        revisions = tuple(sorted(tuple(item) for item in self.resource_revisions))
         columns = tuple(self.columns)
-        if not resource_ids or len(resource_ids) != len(set(resource_ids)):
-            raise ValueError("resource_ids must be non-empty and unique")
-        if {item[0] for item in revisions} != set(resource_ids):
-            raise ValueError("resource_revisions must cover every resource")
-        if any(not value.startswith("sha256:") for _, value in revisions):
-            raise ValueError("resource revisions must use sha256")
+        if len(resource_ids) != len(set(resource_ids)):
+            raise ValueError("resource_ids must be unique")
         if any(not isinstance(item, str) or not item for item in columns):
             raise ValueError("columns must contain non-empty strings")
         if not isinstance(self.projection, BoundedResultProjection):
@@ -226,7 +213,6 @@ class SqlReadResult:
             raise ValueError("resource_names must cover every resource")
         object.__setattr__(self, "resource_names", names)
         object.__setattr__(self, "resource_ids", resource_ids)
-        object.__setattr__(self, "resource_revisions", revisions)
         object.__setattr__(self, "columns", columns)
 
     def tool_data(self) -> FrozenJsonObject:
@@ -237,12 +223,7 @@ class SqlReadResult:
                 "canonical_sql": self.canonical_sql,
                 "columns": self.columns,
                 "resource_ids": self.resource_ids,
-                "resource_revisions": tuple(
-                    {"resource_id": resource_id, "revision": revision}
-                    for resource_id, revision in self.resource_revisions
-                ),
                 "source_id": self.source_id,
-                "source_revision": self.source_revision,
                 "sql_fingerprint": self.sql_fingerprint,
                 "tables_touched": tables_touched(self.resource_names),
             }
@@ -252,7 +233,7 @@ class SqlReadResult:
 def tables_touched(
     resource_names: Iterable[tuple[str, str]],
 ) -> tuple[dict[str, str], ...]:
-    """Name the catalog tables a read touched, ordered for stable evidence."""
+    """Name the tables a read touched, ordered for stable evidence."""
 
     return tuple(
         {"name": name, "resource_id": resource_id}
@@ -272,253 +253,21 @@ class PostgreSQLReadResult(SqlReadResult):
     pass
 
 
-@dataclass(frozen=True, slots=True)
-class RelationalPreviewFingerprint:
-    intent_sha256: str
-    target_set_sha256: str
-    statement_sha256: str
-    preview_fingerprint: str
-
-    def __post_init__(self) -> None:
-        for value, name in (
-            (self.intent_sha256, "intent_sha256"),
-            (self.target_set_sha256, "target_set_sha256"),
-            (self.statement_sha256, "statement_sha256"),
-            (self.preview_fingerprint, "preview_fingerprint"),
-        ):
-            if (
-                not isinstance(value, str)
-                or len(value) != 71
-                or not value.startswith("sha256:")
-                or any(character not in "0123456789abcdef" for character in value[7:])
-            ):
-                raise ValueError(f"{name} must be a canonical sha256 hash")
+_CORRECT_READ = ToolRecovery(
+    RecoveryKind.CORRECT_ARGUMENTS,
+    "Fix the SQL using this message; the same call fails the same way.",
+)
 
 
-@dataclass(frozen=True, slots=True)
-class RelationalUpdatePreviewChecks:
-    compile_only: str = "passed"
-    target_set_fingerprinted: bool = True
-    row_level_security: bool = False
-    user_triggers: bool = False
-    rewrite_rules: bool = False
+def refused_read_details(details: Mapping[str, object]) -> dict[str, object]:
+    """Details for a read the source refused before reading a row.
 
-    def __post_init__(self) -> None:
-        if self.compile_only != "passed":
-            raise ValueError("preview compile_only must be passed")
-        for name in (
-            "target_set_fingerprinted",
-            "row_level_security",
-            "user_triggers",
-            "rewrite_rules",
-        ):
-            if not isinstance(getattr(self, name), bool):
-                raise TypeError(f"preview {name} must be boolean")
-        if (
-            not self.target_set_fingerprinted
-            or self.row_level_security
-            or self.user_triggers
-            or self.rewrite_rules
-        ):
-            raise ValueError("preview checks must represent admitted read-only state")
+    Marking it undispatched lets the loop warn when the model repeats it.
+    """
 
-    def to_payload(self) -> dict[str, object]:
-        return {
-            "compile_only": self.compile_only,
-            "target_set_fingerprinted": self.target_set_fingerprinted,
-            "row_level_security": self.row_level_security,
-            "user_triggers": self.user_triggers,
-            "rewrite_rules": self.rewrite_rules,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalUpdateSample:
-    primary_key: tuple[RelationalUpdateCell, ...]
-    before: tuple[RelationalUpdateCell, ...]
-    after: tuple[RelationalUpdateCell, ...]
-
-    def __post_init__(self) -> None:
-        primary_key = tuple(self.primary_key)
-        before = tuple(self.before)
-        after = tuple(self.after)
-        if not primary_key or any(
-            not isinstance(item, RelationalUpdateCell) for item in primary_key
-        ):
-            raise ValueError("update sample requires a primary key")
-        if (
-            not before
-            or any(not isinstance(item, RelationalUpdateCell) for item in before)
-            or any(not isinstance(item, RelationalUpdateCell) for item in after)
-            or tuple(item.column for item in before)
-            != tuple(item.column for item in after)
-        ):
-            raise ValueError("update sample before and after fields must agree")
-        object.__setattr__(self, "primary_key", primary_key)
-        object.__setattr__(self, "before", before)
-        object.__setattr__(self, "after", after)
-
-    def to_payload(self) -> dict[str, object]:
-        return {
-            "primary_key": tuple(item.to_payload() for item in self.primary_key),
-            "before": tuple(item.to_payload() for item in self.before),
-            "after": tuple(item.to_payload() for item in self.after),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalUpdatePreview:
-    source_id: str
-    resource_id: str
-    resource_name: str
-    source_revision: str
-    resource_revision: str
-    where: tuple[RelationalUpdateFilter, ...]
-    assignments: tuple[RelationalUpdateCell, ...]
-    matched_rows: int
-    samples: tuple[RelationalUpdateSample, ...]
-    fingerprint: RelationalPreviewFingerprint
-    checks: RelationalUpdatePreviewChecks
-    warnings: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        for text_value, text_name in (
-            (self.source_id, "preview source_id"),
-            (self.resource_id, "preview resource_id"),
-            (self.resource_name, "preview resource_name"),
-            (self.source_revision, "preview source_revision"),
-            (self.resource_revision, "preview resource_revision"),
-        ):
-            if not isinstance(text_value, str) or not text_value:
-                raise ValueError(f"{text_name} must be non-empty text")
-        where = tuple(self.where)
-        assignments = tuple(self.assignments)
-        samples = tuple(self.samples)
-        if not where or any(
-            not isinstance(item, RelationalUpdateFilter) for item in where
-        ):
-            raise TypeError("preview where must contain update filters")
-        if not assignments or any(
-            not isinstance(item, RelationalUpdateCell) for item in assignments
-        ):
-            raise TypeError("preview assignments must contain update cells")
-        if (
-            not isinstance(self.matched_rows, int)
-            or isinstance(self.matched_rows, bool)
-            or self.matched_rows < 0
-        ):
-            raise ValueError("preview matched_rows must be a non-negative integer")
-        if len(samples) > 5 or any(
-            not isinstance(item, RelationalUpdateSample) for item in samples
-        ):
-            raise ValueError("preview samples must be bounded update samples")
-        if len(samples) > self.matched_rows:
-            raise ValueError("preview samples cannot exceed matched rows")
-        object.__setattr__(self, "where", where)
-        object.__setattr__(self, "assignments", assignments)
-        object.__setattr__(self, "samples", samples)
-        if not isinstance(self.fingerprint, RelationalPreviewFingerprint):
-            raise TypeError("preview fingerprint must be RelationalPreviewFingerprint")
-        if not isinstance(self.checks, RelationalUpdatePreviewChecks):
-            raise TypeError("preview checks must be RelationalUpdatePreviewChecks")
-        warnings = tuple(self.warnings)
-        if len(warnings) > 8 or any(
-            not isinstance(item, str) or not item or len(item) > 160
-            for item in warnings
-        ):
-            raise ValueError("preview warnings must be bounded text")
-        object.__setattr__(self, "warnings", warnings)
-        if (
-            len(canonical_json(self.tool_data()).encode("utf-8"))
-            > _MAX_PREVIEW_OUTPUT_BYTES
-        ):
-            raise ValueError("preview output exceeds its fixed byte bound")
-
-    def tool_data(self) -> FrozenJsonObject:
-        fingerprint = self.fingerprint
-        return FrozenJsonObject.from_mapping(
-            {
-                "source_id": self.source_id,
-                "resource_id": self.resource_id,
-                "resource_name": self.resource_name,
-                "source_revision": self.source_revision,
-                "resource_revision": self.resource_revision,
-                "where": tuple(item.to_payload() for item in self.where),
-                "assignments": tuple(item.to_payload() for item in self.assignments),
-                "matched_rows": self.matched_rows,
-                "samples": tuple(item.to_payload() for item in self.samples),
-                "target_set_sha256": fingerprint.target_set_sha256,
-                "statement_sha256": fingerprint.statement_sha256,
-                "preview_fingerprint": fingerprint.preview_fingerprint,
-                "checks": self.checks.to_payload(),
-                "warnings": self.warnings,
-                "trust_classification": "untrusted_data",
-            }
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalUpdateResult:
-    """One positively acknowledged committed PostgreSQL update plan."""
-
-    receipt_id: str
-    source_id: str
-    resource_id: str
-    source_revision: str
-    resource_revision: str
-    preview_fingerprint: str
-    intent_sha256: str
-    target_set_sha256: str
-    affected_rows: int
-    committed_at: str
-    effect_observation: EffectObservation
-
-    def __post_init__(self) -> None:
-        for value, name in (
-            (self.receipt_id, "update result receipt_id"),
-            (self.source_id, "update result source_id"),
-            (self.resource_id, "update result resource_id"),
-            (self.source_revision, "update result source_revision"),
-            (self.resource_revision, "update result resource_revision"),
-            (self.committed_at, "update result committed_at"),
-        ):
-            if not isinstance(value, str) or not value:
-                raise ValueError(f"{name} must be non-empty text")
-        for value, name in (
-            (self.preview_fingerprint, "preview_fingerprint"),
-            (self.intent_sha256, "intent_sha256"),
-            (self.target_set_sha256, "target_set_sha256"),
-        ):
-            if (
-                not isinstance(value, str)
-                or len(value) != 71
-                or not value.startswith("sha256:")
-            ):
-                raise ValueError(f"update result {name} must be a sha256 hash")
-        if (
-            not isinstance(self.affected_rows, int)
-            or isinstance(self.affected_rows, bool)
-            or self.affected_rows < 1
-        ):
-            raise ValueError("update result affected_rows must be positive")
-
-    def tool_data(self) -> FrozenJsonObject:
-        return FrozenJsonObject.from_mapping(
-            {
-                "receipt_id": self.receipt_id,
-                "outcome": "committed",
-                "source_id": self.source_id,
-                "resource_id": self.resource_id,
-                "source_revision": self.source_revision,
-                "resource_revision": self.resource_revision,
-                "preview_fingerprint": self.preview_fingerprint,
-                "intent_sha256": self.intent_sha256,
-                "target_set_sha256": self.target_set_sha256,
-                "affected_rows": self.affected_rows,
-                "committed_at": self.committed_at,
-                "trust_classification": "untrusted_data",
-            }
-        )
+    return recovery_details(
+        _CORRECT_READ, {**details, "execution_disposition": "not_dispatched"}
+    )
 
 
 class SqlReadBackend(Protocol):
@@ -527,13 +276,32 @@ class SqlReadBackend(Protocol):
         *,
         agent_id: str,
         source_id: str,
-        sql: str,
-        parameters: tuple[object, ...],
+        read: CheckedRead,
         max_rows: int,
         max_bytes: int,
-        expected_resource_revisions: tuple[tuple[str, str], ...] | None = None,
         timeout_seconds: float | None = None,
     ) -> SqlReadResult: ...
+
+
+RefreshRequest = Callable[[str, tuple[str, ...]], None]
+
+
+async def _execute_read(
+    backend: SqlReadBackend,
+    request_refresh: RefreshRequest,
+    *,
+    source_id: str,
+    read: CheckedRead,
+    **arguments: Any,
+) -> SqlReadResult:
+    """Run one read; a missing object asks for a catalog refresh and still fails."""
+
+    try:
+        return await backend.execute_read(source_id=source_id, read=read, **arguments)
+    except Exception as error:
+        if getattr(error, "undefined_object", False):
+            request_refresh(source_id, tuple(name for _, name in read.resource_names))
+        raise
 
 
 TABULAR_FILTER_OPERATORS = ("eq", "in", "lt", "lte", "gt", "gte")
@@ -591,16 +359,11 @@ class TabularFilter:
 
 @dataclass(frozen=True, slots=True)
 class ReadTabularRequest:
-    """One bounded read of named columns from one catalog resource.
-
-    The backend refuses the read when ``expected_revision`` is no longer the
-    resource's current catalog revision.
-    """
+    """One bounded read of named columns from one catalog resource."""
 
     agent_id: str
     source_id: str
     resource_id: str
-    expected_revision: str
     columns: tuple[str, ...]
     filters: tuple[TabularFilter, ...]
     limit: int
@@ -612,7 +375,6 @@ class ReadTabularRequest:
             (self.agent_id, "agent_id"),
             (self.source_id, "source_id"),
             (self.resource_id, "resource_id"),
-            (self.expected_revision, "expected_revision"),
         ):
             if not isinstance(value, str) or not value:
                 raise ValueError(f"tabular read {name} must be non-empty text")
@@ -660,41 +422,8 @@ async def _source_backend(
     return backend
 
 
-class RelationalUpdatePreviewBackend(Protocol):
-    async def preview_update(
-        self,
-        *,
-        agent_id: str,
-        intent: RelationalUpdateIntent,
-    ) -> RelationalUpdatePreview: ...
-
-
-class RelationalUpdateBackend(RelationalUpdatePreviewBackend, Protocol):
-    async def execute_update(
-        self,
-        *,
-        agent_id: str,
-        execution: ToolExecution,
-        command: RelationalUpdateCommand,
-    ) -> RelationalUpdateResult: ...
-
-
 @dataclass(frozen=True, slots=True)
 class DataQueryDeclarations:
-    capabilities: tuple[Capability, ...]
-    executors: tuple[Executor, ...]
-    tool_views: tuple[ToolView, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalUpdatePreviewDeclarations:
-    capabilities: tuple[Capability, ...]
-    executors: tuple[Executor, ...]
-    tool_views: tuple[ToolView, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalUpdateDeclarations:
     capabilities: tuple[Capability, ...]
     executors: tuple[Executor, ...]
     tool_views: tuple[ToolView, ...]
@@ -718,11 +447,10 @@ class DataQueryError(DaitaError):
 
 
 class DataQueryExecutor:
-    """Run catalog-bound read-only statements against one relational source.
+    """Run read-only statements that passed policy against one relational source.
 
     Every statement shares one row budget, one UTF-8 byte budget and one total
-    deadline, and each statement also has its own statement deadline. All
-    statements must observe the catalog revisions validated before dispatch.
+    deadline, and each statement also has its own statement deadline.
     """
 
     executor_id = DATA_QUERY_EXECUTOR_ID
@@ -737,26 +465,27 @@ class DataQueryExecutor:
         statement_timeout_seconds: float = DATA_QUERY_STATEMENT_TIMEOUT_SECONDS,
         total_timeout_seconds: float = DATA_QUERY_TOTAL_TIMEOUT_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        request_refresh: RefreshRequest = lambda source_id, names: None,
     ) -> None:
         if not 0 < statement_timeout_seconds <= total_timeout_seconds:
             raise ValueError("statement timeout must be positive and within total")
         self._agent_id = agent_id
+        self._request_refresh = request_refresh
         self._backends = dict(backends)
         self._max_rows = max_rows
         self._max_bytes = max_bytes
         self._statement_timeout_seconds = float(statement_timeout_seconds)
         self._total_timeout_seconds = float(total_timeout_seconds)
         self._clock = clock
+        self._wall_clock = wall_clock
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         source_id = request.arguments["source_id"]
-        resource_ids = request.arguments["resource_ids"]
         adapter_id = request.arguments["_adapter_id"]
         assert isinstance(source_id, str)
-        assert isinstance(resource_ids, tuple)
         assert isinstance(adapter_id, str)
-        statements = data_query_statements(request.arguments)
-        expected = _expected_resource_revisions(request.arguments)
+        reads = checked_reads(request.arguments)
         backend = self._backends.get(adapter_id)
         if backend is None:
             raise ValueError("relational query adapter binding is unsupported")
@@ -764,12 +493,12 @@ class DataQueryExecutor:
         deadline = started + self._total_timeout_seconds
         remaining_rows = self._max_rows
         remaining_bytes = self._max_bytes
-        results: list[tuple[SqlReadResult | None, int]] = []
-        for sql, parameters in statements:
+        results: list[tuple[SqlReadResult | None, int, str]] = []
+        for read in reads:
             if remaining_rows < 1 or remaining_bytes < 2:
                 # The shared budget is spent; later statements are reported as
                 # skipped rather than silently omitted.
-                results.append((None, 0))
+                results.append((None, 0, ""))
                 continue
             remaining_seconds = deadline - self._clock()
             if remaining_seconds <= 0:
@@ -779,48 +508,33 @@ class DataQueryExecutor:
                     f"{self._total_timeout_seconds:g} seconds.",
                 )
             statement_started = self._clock()
-            result = await backend.execute_read(
+            read_at = self._wall_clock().isoformat()
+            result = await _execute_read(
+                backend,
+                self._request_refresh,
                 agent_id=self._agent_id,
                 source_id=source_id,
-                sql=sql,
-                parameters=parameters,
+                read=read,
                 max_rows=remaining_rows,
                 max_bytes=remaining_bytes,
-                expected_resource_revisions=expected,
                 timeout_seconds=min(self._statement_timeout_seconds, remaining_seconds),
             )
             elapsed_ms = _elapsed_ms(statement_started, self._clock())
-            if (
-                not isinstance(result, SqlReadResult)
-                or result.source_id != source_id
-                or not frozenset(result.resource_ids) <= frozenset(resource_ids)
-            ):
-                raise ValueError("SQL backend returned different catalog binding facts")
-            if results and any(
-                earlier is not None
-                and earlier.source_revision != result.source_revision
-                for earlier, _ in results
-            ):
-                raise DataQueryError(
-                    "query_binding_stale",
-                    "The source changed between statements of one read.",
-                )
-            results.append((result, elapsed_ms))
+            if not isinstance(result, SqlReadResult) or result.source_id != source_id:
+                raise ValueError("SQL backend returned a different source")
+            results.append((result, elapsed_ms, read_at))
             remaining_rows -= result.projection.returned_rows
             remaining_bytes -= result.projection.utf8_bytes
-        executed = tuple(result for result, _ in results if result is not None)
-        if frozenset(
-            resource_id for result in executed for resource_id in result.resource_ids
-        ) != frozenset(resource_ids):
-            raise ValueError("SQL backend returned different catalog binding facts")
+        executed = tuple(result for result, _, _ in results if result is not None)
         timing = {
             "elapsed_ms": _elapsed_ms(started, self._clock()),
             "statement_timeout_ms": int(self._statement_timeout_seconds * 1_000),
             "total_timeout_ms": int(self._total_timeout_seconds * 1_000),
         }
-        if len(statements) == 1:
+        if len(reads) == 1:
             data = executed[0].tool_data().to_dict()
             data["adapter_id"] = adapter_id
+            data["read_at"] = results[0][2]
             data["timing"] = timing
             return ToolOutput(kind=DATA_QUERY_EVIDENCE_KIND, data=data)
         return ToolOutput(
@@ -834,32 +548,6 @@ class DataQueryExecutor:
                 byte_limit=self._max_bytes,
             ),
         )
-
-
-def data_query_statements(
-    arguments: Mapping[str, object],
-) -> tuple[tuple[str, tuple[object, ...]], ...]:
-    """Return the ordered statements of one data_query call."""
-
-    raw_statements = arguments.get("statements")
-    if raw_statements is None:
-        sql = arguments.get("sql")
-        parameters = arguments.get("parameters", ())
-        if not isinstance(sql, str) or not isinstance(parameters, tuple):
-            raise ValueError("data_query requires sql or statements")
-        return ((sql, parameters),)
-    if not isinstance(raw_statements, tuple) or not raw_statements:
-        raise ValueError("data_query statements must be a non-empty array")
-    statements: list[tuple[str, tuple[object, ...]]] = []
-    for item in raw_statements:
-        if not isinstance(item, Mapping):
-            raise ValueError("data_query statements must be objects")
-        sql = item.get("sql")
-        parameters = item.get("parameters", ())
-        if not isinstance(sql, str) or not isinstance(parameters, tuple):
-            raise ValueError("data_query statements need sql and parameters")
-        statements.append((sql, parameters))
-    return tuple(statements)
 
 
 COMBINED_QUERY_MAX_INPUTS = 4
@@ -897,7 +585,7 @@ class _InputRead:
 
     columns: tuple[str, ...]
     projection: BoundedResultProjection
-    resource_revisions: tuple[tuple[str, str], ...]
+    resource_ids: tuple[str, ...]
     resource_names: tuple[tuple[str, str], ...]
     lineage: dict[str, object]
 
@@ -906,8 +594,7 @@ class DataQueryCombinedExecutor:
     """Join complete bounded per-source reads in the private DuckDB worker.
 
     Each input runs through its source's registry backend, as SQL or as a
-    tabular read, under the catalog revisions validated before dispatch,
-    within one shared input deadline.
+    tabular read, within one shared input deadline.
     """
 
     executor_id = DATA_QUERY_COMBINED_EXECUTOR_ID
@@ -920,8 +607,10 @@ class DataQueryCombinedExecutor:
         *,
         tabular_backends: Mapping[str, TabularReadBackend] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        request_refresh: RefreshRequest = lambda source_id, names: None,
     ) -> None:
         self._agent_id = agent_id
+        self._request_refresh = request_refresh
         self._backends = dict(backends)
         self._tabular_backends = dict(tabular_backends or {})
         self._engine = engine
@@ -996,9 +685,7 @@ class DataQueryCombinedExecutor:
             truncated=cast(bool, payload["truncated"]),
             truncation_reasons=cast(tuple[str, ...], payload["truncation_reasons"]),
         )
-        revisions = dict(
-            revision for _, read in reads for revision in read.resource_revisions
-        )
+        touched = {item for _, read in reads for item in read.resource_ids}
         names = dict(name for _, read in reads for name in read.resource_names)
         data = projection.to_payload().to_dict()
         data.update(
@@ -1008,11 +695,7 @@ class DataQueryCombinedExecutor:
                 "inputs": tuple(
                     {"alias": alias, **read.lineage} for alias, read in reads
                 ),
-                "resource_ids": tuple(sorted(revisions)),
-                "resource_revisions": tuple(
-                    {"resource_id": resource_id, "revision": revision}
-                    for resource_id, revision in sorted(revisions.items())
-                ),
+                "resource_ids": tuple(sorted(touched)),
                 "sql_fingerprint": payload["sql_fingerprint"],
                 "tables_touched": tables_touched(names.items()),
                 "timing": {
@@ -1031,35 +714,30 @@ class DataQueryCombinedExecutor:
         backend = self._backends.get(cast(str, item["_adapter_id"]))
         if backend is None:
             raise ValueError("relational query adapter binding is unsupported")
-        result = await backend.execute_read(
+        read_at = datetime.now(UTC).isoformat()
+        result = await _execute_read(
+            backend,
+            self._request_refresh,
             agent_id=self._agent_id,
             source_id=source_id,
-            sql=cast(str, item["sql"]),
-            parameters=(),
+            read=checked_reads(item)[0],
             max_rows=COMBINED_QUERY_INPUT_MAX_ROWS,
             max_bytes=COMBINED_QUERY_INPUT_MAX_BYTES,
-            expected_resource_revisions=_expected_resource_revisions(item),
             timeout_seconds=timeout,
         )
-        if (
-            not isinstance(result, SqlReadResult)
-            or result.source_id != source_id
-            or frozenset(result.resource_ids)
-            != frozenset(cast(tuple[str, ...], item["resource_ids"]))
-        ):
-            raise ValueError("SQL backend returned different catalog binding facts")
+        if not isinstance(result, SqlReadResult) or result.source_id != source_id:
+            raise ValueError("SQL backend returned a different source")
         return _InputRead(
             columns=result.columns,
             projection=result.projection,
-            resource_revisions=result.resource_revisions,
+            resource_ids=result.resource_ids,
             resource_names=result.resource_names,
             lineage={
                 "source_id": result.source_id,
-                "source_revision": result.source_revision,
+                "read_at": read_at,
                 "canonical_sql": result.canonical_sql,
                 "sql_fingerprint": result.sql_fingerprint,
                 "resource_ids": result.resource_ids,
-                "resource_revisions": _revision_payload(result.resource_revisions),
                 "rows": result.projection.returned_rows,
             },
         )
@@ -1071,20 +749,17 @@ class DataQueryCombinedExecutor:
         if backend is None:
             raise ValueError("tabular read adapter binding is unsupported")
         resource_id = cast(str, item["resource_id"])
-        ((_, revision),) = cast(
-            tuple[tuple[str, str], ...], item["_resource_revisions"]
-        )
         columns = cast(tuple[str, ...], item["columns"])
         filters = tuple(
             TabularFilter.from_mapping(cast(Mapping[str, object], value))
             for value in cast(tuple[object, ...], item.get("filters", ()))
         )
+        read_at = datetime.now(UTC).isoformat()
         projection = await backend.read_tabular(
             ReadTabularRequest(
                 agent_id=self._agent_id,
                 source_id=cast(str, item["source_id"]),
                 resource_id=resource_id,
-                expected_revision=revision,
                 columns=columns,
                 filters=filters,
                 limit=COMBINED_QUERY_INPUT_MAX_ROWS,
@@ -1096,53 +771,20 @@ class DataQueryCombinedExecutor:
             set(row) != set(columns) for row in projection.rows
         ):
             raise ValueError("tabular backend returned different columns")
-        revisions = ((resource_id, revision),)
         return _InputRead(
             columns=columns,
             projection=projection,
-            resource_revisions=revisions,
+            resource_ids=(resource_id,),
             resource_names=((resource_id, cast(str, item["_resource_name"])),),
             lineage={
                 "source_id": item["source_id"],
-                # The backend confirmed the bound revision, so the catalog
-                # source revision bound with it is the one that was read.
-                "source_revision": item["_source_revision"],
+                "read_at": read_at,
                 "columns": columns,
                 "filters": tuple(value.to_payload() for value in filters),
                 "resource_ids": (resource_id,),
-                "resource_revisions": _revision_payload(revisions),
                 "rows": projection.returned_rows,
             },
         )
-
-
-def _revision_payload(
-    revisions: tuple[tuple[str, str], ...],
-) -> tuple[dict[str, str], ...]:
-    return tuple(
-        {"resource_id": resource_id, "revision": revision}
-        for resource_id, revision in revisions
-    )
-
-
-def _expected_resource_revisions(
-    arguments: Mapping[str, object],
-) -> tuple[tuple[str, str], ...] | None:
-    raw = arguments.get("_resource_revisions")
-    if raw is None:
-        return None
-    if not isinstance(raw, tuple):
-        raise ValueError("validated resource revisions are malformed")
-    revisions: list[tuple[str, str]] = []
-    for item in raw:
-        if (
-            not isinstance(item, tuple)
-            or len(item) != 2
-            or not all(isinstance(value, str) for value in item)
-        ):
-            raise ValueError("validated resource revisions are malformed")
-        revisions.append((item[0], item[1]))
-    return tuple(revisions)
 
 
 def _elapsed_ms(started: float, finished: float) -> int:
@@ -1152,49 +794,41 @@ def _elapsed_ms(started: float, finished: float) -> int:
 def _multi_statement_data(
     adapter_id: str,
     source_id: str,
-    results: list[tuple[SqlReadResult | None, int]],
+    results: list[tuple[SqlReadResult | None, int, str]],
     *,
     timing: Mapping[str, int],
     row_limit: int,
     byte_limit: int,
 ) -> dict[str, object]:
     statements: list[dict[str, object]] = []
-    revisions: dict[str, str] = {}
+    touched: set[str] = set()
     names: dict[str, str] = {}
     reasons: list[str] = []
-    source_revision = ""
-    for index, (result, elapsed_ms) in enumerate(results):
+    for index, (result, elapsed_ms, read_at) in enumerate(results):
         if result is None:
             statements.append({"index": index, "status": "skipped_budget_spent"})
             reasons.append("budget_spent")
             continue
-        source_revision = result.source_revision
-        revisions.update(result.resource_revisions)
+        touched.update(result.resource_ids)
         names.update(result.resource_names)
         payload = result.tool_data().to_dict()
-        for name in ("source_id", "source_revision", "resource_revisions"):
-            payload.pop(name)
-        for name in ("row_limit", "byte_limit"):
+        for name in ("source_id", "row_limit", "byte_limit"):
             payload.pop(name)
         payload["elapsed_ms"] = elapsed_ms
         payload["index"] = index
+        payload["read_at"] = read_at
         payload["status"] = "completed"
         statements.append(payload)
         reasons.extend(result.projection.truncation_reasons)
-    executed = [result for result, _ in results if result is not None]
+    executed = [result for result, _, _ in results if result is not None]
     fingerprint = canonical_json([result.sql_fingerprint for result in executed])
     return {
         "adapter_id": adapter_id,
         "byte_limit": byte_limit,
-        "resource_ids": tuple(sorted(revisions)),
-        "resource_revisions": tuple(
-            {"resource_id": resource_id, "revision": revision}
-            for resource_id, revision in sorted(revisions.items())
-        ),
+        "resource_ids": tuple(sorted(touched)),
         "returned_rows": sum(result.projection.returned_rows for result in executed),
         "row_limit": row_limit,
         "source_id": source_id,
-        "source_revision": source_revision,
         "sql_fingerprint": "sha256:"
         + hashlib.sha256(fingerprint.encode("utf-8")).hexdigest(),
         "statements": tuple(statements),
@@ -1208,103 +842,140 @@ def _multi_statement_data(
     }
 
 
-class RelationalUpdatePreviewExecutor:
-    executor_id = RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID
+@dataclass(frozen=True, slots=True)
+class VerifiedEffect:
+    """One committed write whose source compared what it touched with the card."""
 
+    receipt_id: str
+    source_id: str
+    table: str
+    operation: str
+    canonical_sql: str
+    preview_fingerprint: str
+    intent_sha256: str
+    target_set_sha256: str
+    affected_rows: int
+    inserted_rows: int
+    updated_rows: int
+    deleted_rows: int
+    skipped_rows: int
+    committed_at: str
+    effect_observation: EffectObservation
+
+    def tool_data(self) -> FrozenJsonObject:
+        return FrozenJsonObject.from_mapping(
+            {
+                "receipt_id": self.receipt_id,
+                "outcome": "committed",
+                "source_id": self.source_id,
+                "table": self.table,
+                "operation": self.operation,
+                "sql": self.canonical_sql,
+                "preview_fingerprint": self.preview_fingerprint,
+                "intent_sha256": self.intent_sha256,
+                "target_set_sha256": self.target_set_sha256,
+                "affected_rows": self.affected_rows,
+                "inserted_rows": self.inserted_rows,
+                "updated_rows": self.updated_rows,
+                "deleted_rows": self.deleted_rows,
+                "skipped_rows": self.skipped_rows,
+                "committed_at": self.committed_at,
+                "trust_classification": "untrusted_data",
+            }
+        )
+
+
+class RelationalWriteBackend(WriteDescriber, Protocol):
+    """The seam: everything about a source's language stays behind these."""
+
+    async def preview(
+        self, *, agent_id: str, source_id: str, facts: WriteFacts
+    ) -> WritePreview: ...
+
+    async def apply(
+        self,
+        *,
+        agent_id: str,
+        source_id: str,
+        execution: ToolExecution,
+        facts: WriteFacts,
+        preview_fingerprint: str,
+        expected_affected_rows: int,
+    ) -> VerifiedEffect: ...
+
+
+class _RelationalWriteRouting:
     def __init__(
         self,
         agent_id: str,
-        backends: Mapping[str, RelationalUpdatePreviewBackend],
+        backends: Mapping[str, RelationalWriteBackend],
         source_adapter_id: SourceAdapterLookup,
     ) -> None:
-        if not isinstance(agent_id, str) or not agent_id:
-            raise ValueError("preview executor agent_id must be non-empty text")
-        if any(
-            not callable(getattr(backend, "preview_update", None))
-            for backend in backends.values()
-        ):
-            raise TypeError("preview backend must provide preview_update")
         self._agent_id = agent_id
         self._backends = dict(backends)
         self._source_adapter_id = source_adapter_id
 
-    async def execute(self, request: ToolExecution) -> ToolOutput:
-        intent = RelationalUpdateIntent.from_mapping(request.arguments)
+    async def _preview(self, request: ToolExecution) -> WritePreview:
+        source_id = cast(str, request.arguments["source_id"])
         backend = await _source_backend(
-            self._backends, self._source_adapter_id, self._agent_id, intent.source_id
-        )
-        result = await backend.preview_update(
-            agent_id=self._agent_id,
-            intent=intent,
-        )
-        if (
-            result.source_id != intent.source_id
-            or result.resource_id != intent.resource_id
-            or result.where != intent.where
-        ):
-            raise ValueError("preview backend returned a different update identity")
-        return ToolOutput(
-            kind=RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
-            data=_without_fingerprint(result.tool_data()),
-        )
-
-
-def _without_fingerprint(data: Mapping[str, object]) -> FrozenJsonObject:
-    # The fingerprint binds approval to dispatch inside Daita; the model never sends it.
-    return FrozenJsonObject.from_mapping(
-        {key: value for key, value in data.items() if key != "preview_fingerprint"}
-    )
-
-
-class RelationalUpdateExecutor:
-    executor_id = RELATIONAL_UPDATE_EXECUTOR_ID
-
-    def __init__(
-        self,
-        agent_id: str,
-        backends: Mapping[str, RelationalUpdateBackend],
-        source_adapter_id: SourceAdapterLookup,
-    ) -> None:
-        if not isinstance(agent_id, str) or not agent_id:
-            raise ValueError("update executor agent_id must be non-empty text")
-        if any(
-            not callable(getattr(backend, "preview_update", None))
-            or not callable(getattr(backend, "execute_update", None))
-            for backend in backends.values()
-        ):
-            raise TypeError(
-                "update backend must provide preview_update and execute_update"
-            )
-        self._agent_id = agent_id
-        self._backends = dict(backends)
-        self._source_adapter_id = source_adapter_id
-
-    async def _backend(self, source_id: str) -> RelationalUpdateBackend:
-        return await _source_backend(
             self._backends, self._source_adapter_id, self._agent_id, source_id
         )
+        return await backend.preview(
+            agent_id=self._agent_id,
+            source_id=source_id,
+            facts=write_facts(request.arguments),
+        )
+
+
+class RelationalWritePreviewExecutor(_RelationalWriteRouting):
+    executor_id = RELATIONAL_WRITE_PREVIEW_EXECUTOR_ID
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        preview = (await self._preview(request)).to_mapping()
+        # The fingerprint binds approval to dispatch inside Daita; the model never
+        # sends it.
+        del preview["preview_fingerprint"]
+        return ToolOutput(
+            kind=RELATIONAL_WRITE_PREVIEW_EVIDENCE_KIND,
+            data=FrozenJsonObject.from_mapping(
+                {**preview, "trust_classification": "untrusted_data"}
+            ),
+        )
+
+
+class RelationalWriteExecutor(_RelationalWriteRouting):
+    executor_id = RELATIONAL_WRITE_EXECUTOR_ID
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        intent = RelationalUpdateIntent.from_mapping(request.arguments)
-        backend = await self._backend(intent.source_id)
-        preview = await backend.preview_update(agent_id=self._agent_id, intent=intent)
-        if preview.matched_rows == 0:
+        preview = await self._preview(request)
+        if preview.affected_rows == 0:
             raise CapabilityInputError(
                 "write_target_not_found",
-                "The target selection does not currently match any rows.",
+                "The statement does not currently change any rows.",
             )
         return FrozenJsonObject.from_mapping(
             {
-                "intent_sha256": preview.fingerprint.intent_sha256,
-                "preview_fingerprint": preview.fingerprint.preview_fingerprint,
-                "resource_revision": preview.resource_revision,
-                "target_set_sha256": preview.fingerprint.target_set_sha256,
-                "source_revision": preview.source_revision,
-                "statement_sha256": preview.fingerprint.statement_sha256,
+                "intent_sha256": preview.intent_sha256,
+                "preview_fingerprint": preview.preview_fingerprint,
+                "target_set_sha256": preview.target_set_sha256,
+                "structure_sha256": preview.structure_sha256,
                 "review": {
-                    "matched_rows": preview.matched_rows,
-                    "samples": tuple(sample.to_payload() for sample in preview.samples),
-                    "warnings": preview.warnings,
+                    key: getattr(preview, key)
+                    for key in (
+                        "sql",
+                        "operation",
+                        "columns_changed",
+                        "affected_rows",
+                        "inserted_rows",
+                        "updated_rows",
+                        "deleted_rows",
+                        "skipped_rows",
+                        "samples",
+                        "triggers",
+                        "cascades",
+                        "warnings",
+                        "verification",
+                    )
                 },
             }
         )
@@ -1312,28 +983,23 @@ class RelationalUpdateExecutor:
     async def execute(self, request: ToolExecution) -> ToolOutput:
         approved = request.approved_preflight
         if approved is None:
-            raise ValueError("update dispatch requires its approved preflight")
-        command = RelationalUpdateCommand(
-            intent=RelationalUpdateIntent.from_mapping(request.arguments),
+            raise ValueError("write dispatch requires its approved preflight")
+        source_id = cast(str, request.arguments["source_id"])
+        backend = await _source_backend(
+            self._backends, self._source_adapter_id, self._agent_id, source_id
+        )
+        result = await backend.apply(
+            agent_id=self._agent_id,
+            source_id=source_id,
+            execution=request,
+            facts=write_facts(request.arguments),
             preview_fingerprint=cast(str, approved["preview_fingerprint"]),
             expected_affected_rows=cast(
-                int, cast(Mapping[str, object], approved["review"])["matched_rows"]
+                int, cast(Mapping[str, object], approved["review"])["affected_rows"]
             ),
         )
-        backend = await self._backend(command.intent.source_id)
-        result = await backend.execute_update(
-            agent_id=self._agent_id,
-            execution=request,
-            command=command,
-        )
-        if (
-            result.source_id != command.intent.source_id
-            or result.resource_id != command.intent.resource_id
-            or result.preview_fingerprint != command.preview_fingerprint
-        ):
-            raise ValueError("update backend returned a different update identity")
         return ToolOutput(
-            kind=RELATIONAL_UPDATE_EVIDENCE_KIND,
+            kind=RELATIONAL_WRITE_EVIDENCE_KIND,
             data=result.tool_data(),
             effect_observation=result.effect_observation,
         )
@@ -1347,6 +1013,7 @@ def data_query_declarations(
     combined_engine: CombinedQueryEngine | None = None,
     tabular_backends: Mapping[str, TabularReadBackend] | None = None,
     path_backends: Mapping[str, PathPatternReadBackend] | None = None,
+    request_refresh: RefreshRequest = lambda source_id, names: None,
 ) -> DataQueryDeclarations:
     """Declare data_query over SQL backends.
 
@@ -1354,7 +1021,9 @@ def data_query_declarations(
     adds the multi-source ``inputs`` route.
     """
 
-    executors: tuple[Executor, ...] = (DataQueryExecutor(agent_id, backends),)
+    executors: tuple[Executor, ...] = (
+        DataQueryExecutor(agent_id, backends, request_refresh=request_refresh),
+    )
     if path_backends:
         executors += (PathQueryExecutor(agent_id, path_backends),)
     if combined_engine is not None:
@@ -1364,6 +1033,7 @@ def data_query_declarations(
                 backends,
                 combined_engine,
                 tabular_backends=tabular_backends,
+                request_refresh=request_refresh,
             ),
         )
     declarations = data_query_capability_declarations(
@@ -1374,34 +1044,6 @@ def data_query_declarations(
     )
     return DataQueryDeclarations(
         declarations.capabilities, executors, declarations.tool_views
-    )
-
-
-def relational_update_preview_declarations(
-    agent_id: str,
-    backends: Mapping[str, RelationalUpdatePreviewBackend],
-    source_adapter_id: SourceAdapterLookup,
-) -> RelationalUpdatePreviewDeclarations:
-    executor = RelationalUpdatePreviewExecutor(agent_id, backends, source_adapter_id)
-    declarations = relational_update_preview_capability_declarations()
-    return RelationalUpdatePreviewDeclarations(
-        declarations.capabilities,
-        (executor,),
-        declarations.tool_views,
-    )
-
-
-def relational_update_declarations(
-    agent_id: str,
-    backends: Mapping[str, RelationalUpdateBackend],
-    source_adapter_id: SourceAdapterLookup,
-) -> RelationalUpdateDeclarations:
-    executor = RelationalUpdateExecutor(agent_id, backends, source_adapter_id)
-    declarations = relational_update_capability_declarations()
-    return RelationalUpdateDeclarations(
-        declarations.capabilities,
-        (executor,),
-        declarations.tool_views,
     )
 
 
@@ -1430,7 +1072,7 @@ def data_query_capability_declarations(
                 else "Run one bounded validated read-only relational query."
             ),
             when_to_use=(
-                "Use exact source/resource IDs and columns from current catalog evidence; "
+                "Use exact source, table and column names from current catalog evidence; "
                 "obtain missing structure only through admitted, callable tools."
                 + (
                     " Exports cover all database rows the query selects."
@@ -1466,203 +1108,6 @@ def data_query_capability_declarations(
     )
 
 
-def relational_update_preview_capability_declarations() -> CapabilityDeclarations:
-    cell_schema: dict[str, object] = {
-        "type": "object",
-        "properties": {
-            "column": {"type": "string", "minLength": 1, "maxLength": 256},
-            "value": {},
-        },
-        "required": ["column", "value"],
-        "additionalProperties": False,
-    }
-    filter_schema: dict[str, object] = {
-        "type": "object",
-        "properties": {
-            "column": {"type": "string", "minLength": 1, "maxLength": 256},
-            "operator": {
-                "type": "string",
-                "enum": [
-                    "eq",
-                    "ne",
-                    "lt",
-                    "lte",
-                    "gt",
-                    "gte",
-                    "in",
-                    "not_in",
-                    "is_null",
-                    "is_not_null",
-                ],
-            },
-            "value": {},
-        },
-        "required": ["column", "operator", "value"],
-        "additionalProperties": False,
-    }
-    capability = Capability(
-        id=RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
-        description=(
-            "Validate and preview one structured PostgreSQL update over an exact "
-            "catalog-scoped target set without changing the database. When the "
-            "user requested approval or execution, ground the intended target "
-            "and pass its exact positive preview to data_update_rows when the run "
-            "can proceed. Zero matches require correction or explanation; "
-            "preview alone does not request approval."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "source_id": {
-                    "type": "string",
-                    "pattern": SOURCE_ID_PATTERN,
-                },
-                "resource_id": {
-                    "type": "string",
-                    "pattern": RESOURCE_ID_PATTERN,
-                },
-                "where": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": filter_schema,
-                },
-                "assignments": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": cell_schema,
-                },
-            },
-            "required": ["source_id", "resource_id", "where", "assignments"],
-            "additionalProperties": False,
-        },
-        output_kind=RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
-        output_schema=_relational_update_preview_output_schema(),
-        executor_id=RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID,
-        access_mode=AccessMode.READ,
-    )
-    return CapabilityDeclarations(
-        domain_owner_id="data",
-        capabilities=(capability,),
-        executor_ids=(capability.executor_id,),
-    )
-
-
-def relational_update_capability_declarations() -> CapabilityDeclarations:
-    cell_schema: dict[str, object] = {
-        "type": "object",
-        "properties": {
-            "column": {"type": "string", "minLength": 1, "maxLength": 256},
-            "value": {},
-        },
-        "required": ["column", "value"],
-        "additionalProperties": False,
-    }
-    filter_schema: dict[str, object] = {
-        "type": "object",
-        "properties": {
-            "column": {"type": "string", "minLength": 1, "maxLength": 256},
-            "operator": {
-                "type": "string",
-                "enum": [
-                    "eq",
-                    "ne",
-                    "lt",
-                    "lte",
-                    "gt",
-                    "gte",
-                    "in",
-                    "not_in",
-                    "is_null",
-                    "is_not_null",
-                ],
-            },
-            "value": {},
-        },
-        "required": ["column", "operator", "value"],
-        "additionalProperties": False,
-    }
-    capability = Capability(
-        id=RELATIONAL_UPDATE_CAPABILITY_ID,
-        description=(
-            "Preview one exact PostgreSQL update for runtime approval, then "
-            "apply it exactly once only if approved and the recheck finds the "
-            "same rows."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "source_id": {
-                    "type": "string",
-                    "pattern": SOURCE_ID_PATTERN,
-                },
-                "resource_id": {
-                    "type": "string",
-                    "pattern": RESOURCE_ID_PATTERN,
-                },
-                "where": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": filter_schema,
-                },
-                "assignments": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": cell_schema,
-                },
-            },
-            "required": ["source_id", "resource_id", "where", "assignments"],
-            "additionalProperties": False,
-        },
-        output_kind=RELATIONAL_UPDATE_EVIDENCE_KIND,
-        output_schema=_relational_update_output_schema(),
-        executor_id=RELATIONAL_UPDATE_EXECUTOR_ID,
-        access_mode=AccessMode.WRITE,
-        operational_effect=OperationalEffect.MUTATE_DATA,
-        effect_receipt_policy=RELATIONAL_UPDATE_RECEIPT_POLICY,
-        execution_admission_policy=ExecutionAdmissionPolicy(
-            shape="preview_bound_postgresql_update",
-            inline_eligible=True,
-            graph_v1_eligible=True,
-            target_count_argument=None,
-            inline_max_targets=1,
-            graph_max_targets=1,
-        ),
-    )
-    view = ToolView(
-        name=RELATIONAL_UPDATE_TOOL_NAME,
-        capability_id=capability.id,
-        description=RELATIONAL_UPDATE_DESCRIPTION,
-        mode_capability_ids=(
-            ("preview", RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID),
-            ("apply", capability.id),
-        ),
-        default_mode="apply",
-        presentation=ToolPresentation(
-            toolbox_id=ToolboxId.SOURCES,
-            load_mode=ToolLoadMode.ON_DEMAND,
-            text_trust=ToolTextTrust.CODE,
-            summary="Update existing relational rows in one approved call.",
-            when_to_use="Call once to write; the approval card shows the matching rows. Use mode=preview only to look first.",
-            keywords=(
-                "data",
-                "relational",
-                "postgresql",
-                "rows",
-                "update",
-                "preview",
-                "apply",
-                "approval",
-            ),
-        ),
-    )
-    return CapabilityDeclarations(
-        domain_owner_id="data",
-        capabilities=(capability,),
-        executor_ids=(capability.executor_id,),
-        tool_views=(view,),
-    )
-
-
 def _query_declarations(
     presentation: ToolPresentation,
     *,
@@ -1686,12 +1131,15 @@ def _query_declarations(
             "type": "object",
             "properties": {
                 "source_id": source_id_schema(),
+                # The tables a read touches come from the SQL; the controller
+                # records them here for the executor. readOnly keeps the
+                # argument out of the model-facing schema.
                 "resource_ids": {
                     "type": "array",
                     "items": resource_id_schema(),
-                    "minItems": 1,
                     "maxItems": DATA_QUERY_MAX_RESOURCES,
                     "uniqueItems": True,
+                    "readOnly": True,
                 },
                 "sql": sql_rule,
                 "parameters": parameters_rule,
@@ -1711,7 +1159,7 @@ def _query_declarations(
                     "description": "Use instead of sql to run several reads in one call.",
                 },
             },
-            "required": ["source_id", "resource_ids"],
+            "required": ["source_id"],
             "additionalProperties": False,
         },
         output_kind=DATA_QUERY_EVIDENCE_KIND,
@@ -1732,9 +1180,9 @@ def _query_declarations(
     resource_ids_rule = {
         "type": "array",
         "items": resource_id_schema(),
-        "minItems": 1,
         "maxItems": DATA_QUERY_MAX_RESOURCES,
         "uniqueItems": True,
+        "readOnly": True,
     }
     combined_capability = Capability(
         id=DATA_QUERY_COMBINED_CAPABILITY_ID,
@@ -1755,11 +1203,15 @@ def _query_declarations(
                                     "source_id": source_id_schema(),
                                     "resource_ids": resource_ids_rule,
                                     "sql": sql_rule,
+                                    "path_pattern": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "maxLength": 2_048,
+                                    },
                                 },
                                 "required": [
                                     "alias",
                                     "source_id",
-                                    "resource_ids",
                                     "sql",
                                 ],
                                 "additionalProperties": False,
@@ -1811,7 +1263,7 @@ def _query_declarations(
                         "Use with sql as one DuckDB SELECT over these aliases "
                         "to join sources. Each input is either sql in its own "
                         "source's dialect, or exact catalog columns of one "
-                        "resource_id with optional AND-combined filters "
+                        "table with optional AND-combined filters "
                         "(eq, in, lt, lte, gt, gte)."
                     ),
                 },
@@ -1874,6 +1326,13 @@ def _query_declarations(
     )
 
 
+# Results stored before reads stopped binding catalog revisions still validate.
+_STORED_READ_RESULT_KEYS: dict[str, object] = {
+    "resource_revisions": {"type": "array"},
+    "source_revision": {"type": "string"},
+}
+
+
 def _combined_query_output_schema() -> dict[str, object]:
     types = {
         "byte_limit": "integer",
@@ -1881,7 +1340,6 @@ def _combined_query_output_schema() -> dict[str, object]:
         "columns": "array",
         "inputs": "array",
         "resource_ids": "array",
-        "resource_revisions": "array",
         "returned_rows": "integer",
         "row_limit": "integer",
         "rows": "array",
@@ -1896,7 +1354,10 @@ def _combined_query_output_schema() -> dict[str, object]:
     }
     return {
         "type": "object",
-        "properties": {name: {"type": kind} for name, kind in sorted(types.items())},
+        "properties": {
+            **{name: {"type": kind} for name, kind in sorted(types.items())},
+            **_STORED_READ_RESULT_KEYS,
+        },
         "required": sorted(types),
         "additionalProperties": False,
     }
@@ -1908,13 +1369,12 @@ def _query_output_schema() -> dict[str, object]:
         "adapter_id": "string",
         "canonical_sql": "string",
         "columns": "array",
+        "read_at": "string",
         "resource_ids": "array",
-        "resource_revisions": "array",
         "returned_rows": "integer",
         "row_limit": "integer",
         "rows": "array",
         "source_id": "string",
-        "source_revision": "string",
         "sql_fingerprint": "string",
         "statements": "array",
         "tables_touched": "array",
@@ -1927,395 +1387,110 @@ def _query_output_schema() -> dict[str, object]:
     }
     # One statement keeps its columns, rows and SQL at the top level; several
     # statements report them per entry under statements.
-    per_statement = {"canonical_sql", "columns", "rows", "statements"}
+    per_statement = {"canonical_sql", "columns", "read_at", "rows", "statements"}
     return {
         "type": "object",
-        "properties": {name: {"type": kind} for name, kind in sorted(types.items())},
+        "properties": {
+            **{name: {"type": kind} for name, kind in sorted(types.items())},
+            **_STORED_READ_RESULT_KEYS,
+        },
         "required": sorted(set(types) - per_statement),
         "additionalProperties": False,
     }
 
 
-def _relational_update_preview_output_schema() -> dict[str, object]:
-    cell_schema = {
-        "type": "object",
-        "properties": {"column": {"type": "string"}, "value": {}},
-        "required": ["column", "value"],
-        "additionalProperties": False,
-    }
-    names = (
-        "source_id",
-        "resource_id",
-        "resource_name",
-        "source_revision",
-        "resource_revision",
-        "where",
-        "assignments",
-        "matched_rows",
-        "samples",
-        "target_set_sha256",
-        "statement_sha256",
-        "checks",
-        "warnings",
-        "trust_classification",
-    )
-    hash_rule = {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"}
-    return {
+def relational_write_capability_declarations() -> CapabilityDeclarations:
+    input_schema: dict[str, object] = {
         "type": "object",
         "properties": {
-            "source_id": {"type": "string"},
-            "resource_id": {"type": "string"},
-            "resource_name": {"type": "string"},
-            "source_revision": {"type": "string"},
-            "resource_revision": {"type": "string"},
-            "where": {"type": "array", "items": {"type": "object"}},
-            "assignments": {"type": "array", "items": cell_schema},
-            "matched_rows": {"type": "integer", "minimum": 0},
-            "samples": {"type": "array", "items": {"type": "object"}},
-            "target_set_sha256": hash_rule,
-            "statement_sha256": hash_rule,
-            "checks": {
-                "type": "object",
-                "properties": {
-                    "compile_only": {"type": "string", "enum": ["passed"]},
-                    "target_set_fingerprinted": {"type": "boolean"},
-                    "row_level_security": {"type": "boolean"},
-                    "user_triggers": {"type": "boolean"},
-                    "rewrite_rules": {"type": "boolean"},
-                },
-                "required": [
-                    "compile_only",
-                    "target_set_fingerprinted",
-                    "row_level_security",
-                    "user_triggers",
-                    "rewrite_rules",
-                ],
-                "additionalProperties": False,
-            },
-            "warnings": {"type": "array", "items": {"type": "string"}},
-            "trust_classification": {
-                "type": "string",
-                "enum": ["untrusted_data"],
+            "source_id": {"type": "string", "pattern": SOURCE_ID_PATTERN},
+            "sql": {"type": "string", "minLength": 1, "maxLength": MAX_SQL_CHARACTERS},
+            "parameters": {
+                "type": "array",
+                "maxItems": 32_767,
+                "description": "Values for $1, $2, ... by index.",
             },
         },
-        "required": list(names),
+        "required": ["source_id", "sql"],
         "additionalProperties": False,
     }
-
-
-def _relational_update_output_schema() -> dict[str, object]:
-    hash_rule = {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"}
-    names = (
-        "receipt_id",
-        "outcome",
-        "source_id",
-        "resource_id",
-        "source_revision",
-        "resource_revision",
-        "preview_fingerprint",
-        "intent_sha256",
-        "target_set_sha256",
-        "affected_rows",
-        "committed_at",
-        "trust_classification",
-    )
-    return {
-        "type": "object",
-        "properties": {
-            "receipt_id": {
-                "type": "string",
-                "pattern": r"^effect-receipt:sha256:[0-9a-f]{64}$",
-            },
-            "outcome": {"type": "string", "enum": ["committed"]},
-            "source_id": {"type": "string"},
-            "resource_id": {"type": "string"},
-            "source_revision": {"type": "string"},
-            "resource_revision": {"type": "string"},
-            "preview_fingerprint": hash_rule,
-            "intent_sha256": hash_rule,
-            "target_set_sha256": hash_rule,
-            "affected_rows": {"type": "integer", "minimum": 1},
-            "committed_at": {"type": "string"},
-            "trust_classification": {
-                "type": "string",
-                "enum": ["untrusted_data"],
-            },
-        },
-        "required": list(names),
-        "additionalProperties": False,
+    count: dict[str, object] = {"type": "integer", "minimum": 0}
+    preview_properties: dict[str, object] = {
+        "source_id": {"type": "string"},
+        "table": {"type": "string"},
+        "operation": {"type": "string", "enum": ["insert", "update", "delete"]},
+        "sql": {"type": "string"},
+        "columns_changed": {"type": "array", "items": {"type": "string"}},
+        "affected_rows": count,
+        "inserted_rows": count,
+        "updated_rows": count,
+        "deleted_rows": count,
+        "skipped_rows": count,
+        "samples": {"type": "array", "maxItems": 5, "items": {"type": "object"}},
+        "triggers": {"type": "array", "items": {"type": "string"}},
+        "cascades": {"type": "array", "items": {"type": "string"}},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "verification": {"type": "string", "enum": ["rows", "count"]},
+        "intent_sha256": {"type": "string"},
+        "target_set_sha256": {"type": "string"},
+        "structure_sha256": {"type": "string"},
+        "trust_classification": {"type": "string"},
     }
-
-
-__all__ = [
-    "DATA_QUERY_EXECUTOR_ID",
-    "DATA_QUERY_TOOL_NAME",
-    "DataQueryDeclarations",
-    "DataQueryExecutor",
-    "RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID",
-    "RELATIONAL_UPDATE_EXECUTOR_ID",
-    "RELATIONAL_UPDATE_TOOL_NAME",
-    "RELATIONAL_UPSERT_TOOL_NAME",
-    "PostgreSQLReadResult",
-    "RelationalPreviewFingerprint",
-    "RelationalUpdatePreview",
-    "RelationalUpdatePreviewBackend",
-    "RelationalUpdatePreviewChecks",
-    "RelationalUpdatePreviewDeclarations",
-    "RelationalUpdatePreviewExecutor",
-    "RelationalUpdateBackend",
-    "RelationalUpdateDeclarations",
-    "RelationalUpdateExecutor",
-    "RelationalUpdateResult",
-    "RelationalUpdateSample",
-    "SQLiteReadResult",
-    "ReadTabularRequest",
-    "TABULAR_FILTER_OPERATORS",
-    "TabularFilter",
-    "TabularReadBackend",
-    "data_query_declarations",
-    "data_query_capability_declarations",
-    "relational_update_preview_declarations",
-    "relational_update_preview_capability_declarations",
-    "relational_upsert_declarations",
-    "relational_upsert_capability_declarations",
-    "RelationalUpsertResult",
-    "RelationalUpsertBackend",
-    "relational_update_declarations",
-    "relational_update_capability_declarations",
-]
-
-_NATIVE_COLUMNS_SCHEMA = {
-    "type": "array",
-    "items": {"type": "string", "minLength": 1, "maxLength": 256},
-    "maxItems": 512,
-    "uniqueItems": True,
-}
-
-
-@dataclass(frozen=True, slots=True)
-class RelationalUpsertResult:
-    data: FrozenJsonObject
-    effect_observation: EffectObservation
-
-
-class RelationalUpsertBackend(Protocol):
-    async def preview_upsert(
-        self, *, agent_id: str, intent: RelationalUpsertIntent
-    ) -> FrozenJsonObject: ...
-    async def execute_upsert(
-        self,
-        *,
-        agent_id: str,
-        execution: ToolExecution,
-        intent: RelationalUpsertIntent,
-        preview_fingerprint: str,
-    ) -> RelationalUpsertResult: ...
-
-
-def _upsert_intent(request: ToolExecution) -> RelationalUpsertIntent:
-    """Bind the model's batch to the evidence the runtime derived for it."""
-
-    return replace(
-        RelationalUpsertIntent.from_mapping(request.arguments),
-        evidence_call_ids=request.provenance.evidence_call_ids,
-    )
-
-
-class _RelationalUpsertRouting:
-    def __init__(
-        self,
-        agent_id: str,
-        backends: Mapping[str, RelationalUpsertBackend],
-        source_adapter_id: SourceAdapterLookup,
-    ) -> None:
-        self._agent_id = agent_id
-        self._backends = dict(backends)
-        self._source_adapter_id = source_adapter_id
-
-    async def _backend(self, intent: RelationalUpsertIntent) -> RelationalUpsertBackend:
-        return await _source_backend(
-            self._backends, self._source_adapter_id, self._agent_id, intent.source_id
-        )
-
-
-class RelationalUpsertPreviewExecutor(_RelationalUpsertRouting):
-    executor_id = "data.preview_upsert_rows.executor"
-
-    async def execute(self, request: ToolExecution) -> ToolOutput:
-        intent = _upsert_intent(request)
-        backend = await self._backend(intent)
-        return ToolOutput(
-            kind="data.preview_upsert_rows",
-            data=_without_fingerprint(
-                await backend.preview_upsert(agent_id=self._agent_id, intent=intent)
-            ),
-        )
-
-
-class RelationalUpsertExecutor(_RelationalUpsertRouting):
-    executor_id = "data.upsert_rows.executor"
-
-    async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        intent = _upsert_intent(request)
-        backend = await self._backend(intent)
-        preview = await backend.preview_upsert(agent_id=self._agent_id, intent=intent)
-        return FrozenJsonObject.from_mapping(
-            {
-                **{
-                    key: preview[key]
-                    for key in (
-                        "intent_sha256",
-                        "preview_fingerprint",
-                        "resource_revision",
-                        "target_set_sha256",
-                        "permission_fingerprint",
-                    )
-                },
-                "review": {
-                    **{
-                        key: preview[key]
-                        for key in (
-                            "input_count",
-                            "inserted_count",
-                            "updated_count",
-                            "unchanged_count",
-                            "identity_sequence_gaps_possible",
-                        )
-                    },
-                    "classifications": cast(
-                        tuple[object, ...], preview["classifications"]
-                    )[:5],
-                },
-            }
-        )
-
-    async def execute(self, request: ToolExecution) -> ToolOutput:
-        if request.approved_preflight is None:
-            raise ValueError("upsert dispatch requires its approved preflight")
-        intent = _upsert_intent(request)
-        backend = await self._backend(intent)
-        result = await backend.execute_upsert(
-            agent_id=self._agent_id,
-            execution=request,
-            intent=intent,
-            preview_fingerprint=cast(
-                str, request.approved_preflight["preview_fingerprint"]
-            ),
-        )
-        return ToolOutput(
-            kind="data.upsert_rows_result",
-            data=result.data,
-            effect_observation=result.effect_observation,
-        )
-
-
-_UPSERT_RECEIPT_SCHEMA: dict[str, object] = {
-    "type": "object",
-    "properties": {
-        "source_id": {"type": "string", "maxLength": 256},
-        "resource_id": {"type": "string", "maxLength": 256},
-        "intent_sha256": {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"},
-        "preview_fingerprint": {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"},
-        "target_set_sha256": {"type": ["string", "null"], "maxLength": 71},
-        "input_count": {"type": "integer", "minimum": 1, "maximum": 1000},
-        "inserted_count": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000},
-        "updated_count": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000},
-        "unchanged_count": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000},
-        "normalized_error_code": {"type": ["string", "null"], "maxLength": 128},
-        "identity_sequence_gaps_possible": {"type": "boolean"},
-    },
-    "required": [
-        "source_id",
-        "resource_id",
-        "intent_sha256",
-        "preview_fingerprint",
-        "target_set_sha256",
-        "input_count",
-        "inserted_count",
-        "updated_count",
-        "unchanged_count",
-        "normalized_error_code",
-        "identity_sequence_gaps_possible",
-    ],
-    "additionalProperties": False,
-}
-
-
-def relational_upsert_capability_declarations() -> CapabilityDeclarations:
-    properties: dict[str, object] = {
-        "source_id": {"type": "string", "pattern": SOURCE_ID_PATTERN},
-        "resource_id": {
-            "type": "string",
-            "pattern": RESOURCE_ID_PATTERN,
-        },
-        "key_columns": {**_NATIVE_COLUMNS_SCHEMA, "minItems": 1},
-        "insert_columns": {**_NATIVE_COLUMNS_SCHEMA, "minItems": 1},
-        "update_columns": {**_NATIVE_COLUMNS_SCHEMA, "minItems": 1},
-        "rows": {
-            "type": "array",
-            "minItems": 1,
-            "maxItems": 1000,
-            "items": {
-                "type": "object",
-                "additionalProperties": {
-                    "type": ["string", "number", "boolean", "null"]
-                },
-            },
-        },
+    write_properties: dict[str, object] = {
+        "receipt_id": {"type": "string"},
+        "outcome": {"type": "string", "enum": ["committed"]},
+        "source_id": {"type": "string"},
+        "table": {"type": "string"},
+        "operation": {"type": "string", "enum": ["insert", "update", "delete"]},
+        "sql": {"type": "string"},
+        "preview_fingerprint": {"type": "string"},
+        "intent_sha256": {"type": "string"},
+        "target_set_sha256": {"type": "string"},
+        "affected_rows": {"type": "integer", "minimum": 1},
+        "inserted_rows": count,
+        "updated_rows": count,
+        "deleted_rows": count,
+        "skipped_rows": count,
+        "committed_at": {"type": "string"},
+        "trust_classification": {"type": "string"},
     }
-    required = [
-        "source_id",
-        "resource_id",
-        "key_columns",
-        "insert_columns",
-        "update_columns",
-        "rows",
-    ]
     preview = Capability(
-        id="data.preview_upsert_rows",
+        id=RELATIONAL_WRITE_PREVIEW_CAPABILITY_ID,
         description=(
-            "Preview one exact uniform batch as inserts, updates or unchanged rows. Values are model-derived claims; "
-            "earlier reads of the same table in this run are recorded as evidence, not proof of truth. Identity values are allocated only on insert. "
-            "Execution briefly takes a table-wide EXCLUSIVE lock permitting ordinary reads, with bounded timeouts."
+            "Preview one SQL write without writing: the rows it would touch, counted "
+            "once each, with a bounded sample."
         ),
-        input_schema={
+        input_schema=input_schema,
+        output_kind=RELATIONAL_WRITE_PREVIEW_EVIDENCE_KIND,
+        output_schema={
             "type": "object",
-            "properties": properties,
-            "required": required,
+            "properties": preview_properties,
+            "required": list(preview_properties),
             "additionalProperties": False,
         },
-        output_kind="data.preview_upsert_rows",
-        output_schema=_upsert_output_schema(preview=True),
-        executor_id=RelationalUpsertPreviewExecutor.executor_id,
+        executor_id=RELATIONAL_WRITE_PREVIEW_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        derives_call_provenance=True,
     )
     write = Capability(
-        id="data.upsert_rows",
+        id=RELATIONAL_WRITE_CAPABILITY_ID,
         description=(
-            "Preview one exact upsert batch for approval, then apply it atomically once if approved and unchanged. "
-            "No chunking or replay. Unchanged rows consume the invocation and produce verified zero-change evidence. "
-            "Rollback does not restore identity sequence allocations."
+            "Preview one SQL write for runtime approval, then apply it exactly once "
+            "only if approved and the recheck finds the same rows and table."
         ),
-        input_schema={
+        input_schema=input_schema,
+        output_kind=RELATIONAL_WRITE_EVIDENCE_KIND,
+        output_schema={
             "type": "object",
-            "properties": properties,
-            "required": required,
+            "properties": write_properties,
+            "required": list(write_properties),
             "additionalProperties": False,
         },
-        output_kind="data.upsert_rows_result",
-        output_schema=_upsert_output_schema(preview=False),
-        executor_id=RelationalUpsertExecutor.executor_id,
+        executor_id=RELATIONAL_WRITE_EXECUTOR_ID,
         access_mode=AccessMode.WRITE,
         operational_effect=OperationalEffect.MUTATE_DATA,
-        effect_receipt_policy=EffectReceiptPolicy(
-            receipt_kind="data.upsert_rows",
-            payload_schema=_UPSERT_RECEIPT_SCHEMA,
-            success_evidence_basis=EffectEvidenceBasis.ADAPTER_VERIFIED,
-        ),
-        derives_call_provenance=True,
+        effect_receipt_policy=RELATIONAL_WRITE_RECEIPT_POLICY,
         execution_admission_policy=ExecutionAdmissionPolicy(
-            shape="preview_bound_postgresql_upsert",
+            shape="preview_bound_postgresql_write",
             inline_eligible=True,
             graph_v1_eligible=True,
             target_count_argument=None,
@@ -2329,37 +1504,33 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
         executor_ids=(preview.executor_id, write.executor_id),
         tool_views=(
             ToolView(
-                name=RELATIONAL_UPSERT_TOOL_NAME,
+                name=RELATIONAL_WRITE_TOOL_NAME,
                 capability_id=write.id,
-                description=RELATIONAL_UPSERT_DESCRIPTION,
+                description=RELATIONAL_WRITE_DESCRIPTION,
                 mode_capability_ids=(("preview", preview.id), ("apply", write.id)),
                 default_mode="apply",
                 presentation=ToolPresentation(
                     toolbox_id=ToolboxId.SOURCES,
                     load_mode=ToolLoadMode.ON_DEMAND,
                     text_trust=ToolTextTrust.CODE,
-                    summary=(
-                        "Write an exact relational batch in one approved call: insert "
-                        "missing rows, update existing rows, or leave them unchanged."
-                    ),
+                    summary="Insert, update or delete rows with one approved SQL statement.",
                     when_to_use=(
-                        "Call once to write a batch identified by exact conflict keys; "
-                        "the approval card shows the planned actions. Use mode=preview "
-                        "only to look first."
+                        "Call once to write; the approval card shows the rows. Use "
+                        "mode=preview only to look first."
                     ),
                     keywords=(
                         "data",
-                        "relational",
-                        "upsert",
-                        "insert",
-                        "update",
+                        "postgresql",
                         "rows",
                         "row",
                         "table",
+                        "database",
+                        "write",
+                        "insert",
+                        "update",
+                        "delete",
+                        "upsert",
                         "batch",
-                        "research",
-                        "preview",
-                        "apply",
                         "save",
                         "approval",
                     ),
@@ -2369,74 +1540,42 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
     )
 
 
-def _upsert_output_schema(*, preview: bool) -> dict[str, object]:
-    properties: dict[str, object] = {
-        "source_id": {"type": "string"},
-        "resource_id": {"type": "string"},
-        "resource_revision": {"type": "string"},
-        "intent_sha256": {"type": "string"},
-        "target_set_sha256": {"type": "string"},
-        "permission_fingerprint": {"type": "string"},
-        "input_count": {"type": "integer", "minimum": 1, "maximum": 1000},
-        "inserted_count": {"type": "integer", "minimum": 0, "maximum": 1000},
-        "updated_count": {"type": "integer", "minimum": 0, "maximum": 1000},
-        "unchanged_count": {"type": "integer", "minimum": 0, "maximum": 1000},
-        "classifications": {
-            "type": "array",
-            "maxItems": 1000,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "key": {"type": "object"},
-                    "action": {
-                        "type": "string",
-                        "enum": ["insert", "update", "unchanged"],
-                    },
-                },
-                "required": ["key", "action"],
-                "additionalProperties": False,
-            },
-        },
-        "evidence_call_ids": {
-            "type": "array",
-            "maxItems": 32,
-            "items": {"type": "string"},
-        },
-        "authorship": {"type": "string", "enum": ["model_derived"]},
-        "identity_sequence_gaps_possible": {"type": "boolean"},
-    }
-    if not preview:
-        properties.update(
-            {
-                "preview_fingerprint": {"type": "string"},
-                "receipt_id": {"type": "string"},
-                "committed_at": {"type": "string"},
-                "generated_identities": {
-                    "type": "array",
-                    "maxItems": 1000,
-                    "items": {"type": "object"},
-                },
-            }
-        )
-    return {
-        "type": "object",
-        "properties": properties,
-        "required": list(properties),
-        "additionalProperties": False,
-    }
-
-
-def relational_upsert_declarations(
+def relational_write_declarations(
     agent_id: str,
-    backends: Mapping[str, RelationalUpsertBackend],
+    backends: Mapping[str, RelationalWriteBackend],
     source_adapter_id: SourceAdapterLookup,
 ) -> DataQueryDeclarations:
-    declarations = relational_upsert_capability_declarations()
+    declarations = relational_write_capability_declarations()
     return DataQueryDeclarations(
         declarations.capabilities,
         (
-            RelationalUpsertPreviewExecutor(agent_id, backends, source_adapter_id),
-            RelationalUpsertExecutor(agent_id, backends, source_adapter_id),
+            RelationalWritePreviewExecutor(agent_id, backends, source_adapter_id),
+            RelationalWriteExecutor(agent_id, backends, source_adapter_id),
         ),
         declarations.tool_views,
     )
+
+
+__all__ = [
+    "DATA_QUERY_EXECUTOR_ID",
+    "DATA_QUERY_TOOL_NAME",
+    "DataQueryDeclarations",
+    "DataQueryExecutor",
+    "PostgreSQLReadResult",
+    "RELATIONAL_WRITE_EXECUTOR_ID",
+    "RELATIONAL_WRITE_PREVIEW_EXECUTOR_ID",
+    "RELATIONAL_WRITE_TOOL_NAME",
+    "RelationalWriteBackend",
+    "RelationalWriteExecutor",
+    "RelationalWritePreviewExecutor",
+    "VerifiedEffect",
+    "SQLiteReadResult",
+    "ReadTabularRequest",
+    "TABULAR_FILTER_OPERATORS",
+    "TabularFilter",
+    "TabularReadBackend",
+    "data_query_declarations",
+    "data_query_capability_declarations",
+    "relational_write_capability_declarations",
+    "relational_write_declarations",
+]

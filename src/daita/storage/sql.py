@@ -50,7 +50,6 @@ from ..catalog.models import (
     CatalogSnapshotRef,
     CatalogSummary,
     CatalogSync,
-    FacetKind,
     RelationshipKind,
     SourceCatalogSnapshot,
 )
@@ -257,7 +256,12 @@ def _require_nonforeign_read_resources(
         "SELECT data FROM snapshots WHERE agent_id = ?",
         (scope.agent_id,),
     ):
-        snapshot = decode_catalog_snapshot(data)
+        try:
+            snapshot = decode_catalog_snapshot(data)
+        except (TypeError, ValueError):
+            # A resource ID hashes its source, so a row the catalog cannot read
+            # cannot make this source's reads foreign; the catalog only advises.
+            continue
         for resource in snapshot.resources:
             if resource.id in requested and resource.source_id != scope.source_id:
                 raise SourcePermissionStateError(
@@ -1443,41 +1447,13 @@ class SQLStateStore:
                 and not update_resource_ids <= set(read_scope.resource_ids)
             ):
                 raise ValueError("PostgreSQL update scope must be a read subset")
-            snapshot = _current_source_snapshot(
-                connection,
-                read_scope.agent_id,
-                read_scope.source_id,
-            )
-            resources = (
-                {}
-                if snapshot is None
-                else {item.id: item for item in snapshot.resources}
-            )
-            facets = (
-                {}
-                if snapshot is None
-                else {
-                    item.resource_id: item
-                    for item in snapshot.facets
-                    if item.kind is FacetKind.TABULAR
-                }
-            )
             for scope in update_scopes:
-                resource = resources.get(scope.resource_id)
-                facet = facets.get(scope.resource_id)
-                if resource is None or facet is None:
-                    raise ValueError(
-                        "PostgreSQL update scope requires a current table resource"
-                    )
                 expected = relational_write_authorization_fingerprint(
-                    source=registration,
-                    resource=resource,
-                    facet=facet,
-                    scope=scope,
+                    source=registration, scope=scope
                 )
                 if scope.authorization_fingerprint != expected:
                     raise ValueError(
-                        "PostgreSQL update authorization fingerprint is stale"
+                        "PostgreSQL write authorization fingerprint is stale"
                     )
             connection.execute(
                 f"""INSERT INTO source_read_scopes(agent_id, source_id, data)
@@ -2295,6 +2271,35 @@ class SQLStateStore:
 
         return await settled_thread(read)
 
+    async def list_unreadable_snapshot_source_ids(
+        self, agent_id: str
+    ) -> tuple[str, ...]:
+        """Sources whose stored snapshot cannot be read, so a refresh can replace it."""
+
+        def read() -> tuple[str, ...]:
+            with _connect_read_only(self._database) as connection:
+                rows = connection.execute(
+                    "SELECT source_id, sync_id, data FROM snapshots "
+                    "WHERE agent_id = ? ORDER BY source_id",
+                    (agent_id,),
+                ).fetchall()
+            unreadable: list[str] = []
+            for source_id, sync_id, data in rows:
+                try:
+                    sync = decode_catalog_snapshot(data).sync
+                except (TypeError, ValueError):
+                    unreadable.append(source_id)
+                    continue
+                if (sync.agent_id, sync.source_id, sync.id) != (
+                    agent_id,
+                    source_id,
+                    sync_id,
+                ):
+                    unreadable.append(source_id)
+            return tuple(unreadable)
+
+        return await settled_thread(read)
+
     async def load_current_snapshot(
         self,
         ref: CatalogSnapshotRef,
@@ -2325,7 +2330,12 @@ class SQLStateStore:
             )
             if row is None or row[0] != ref.sync_id:
                 return None
-            snapshot = await settled_thread(_decode_catalog_snapshot, row[1])
+            try:
+                snapshot = await settled_thread(_decode_catalog_snapshot, row[1])
+            except (TypeError, ValueError):
+                raise CatalogStoreError(
+                    "stored catalog snapshot is undecodable"
+                ) from None
             if (
                 snapshot.sync.agent_id != ref.agent_id
                 or snapshot.sync.source_id != ref.source_id
@@ -2352,7 +2362,12 @@ class SQLStateStore:
                     "SELECT data FROM syncs WHERE agent_id = ? AND id = ?",
                     (agent_id, sync_id),
                 ).fetchone()
-            return None if row is None else decode_catalog_sync(row[0])
+            if row is None:
+                return None
+            try:
+                return decode_catalog_sync(row[0])
+            except (TypeError, ValueError):
+                raise CatalogStoreError("stored catalog sync is undecodable") from None
 
         return await settled_thread(read)
 
@@ -3759,7 +3774,11 @@ class SQLStateStore:
             snapshots: list[SourceCatalogSnapshot] = []
             generation_changed = False
             for ref in refs:
-                snapshot = await self.load_current_snapshot(ref)
+                try:
+                    snapshot = await self.load_current_snapshot(ref)
+                except CatalogStoreError:
+                    # A damaged row reads as missing; the next refresh replaces it.
+                    continue
                 if snapshot is None:
                     generation_changed = True
                     break
@@ -4349,30 +4368,8 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
             authorization_fingerprint=fingerprint,
         )
 
-    syncs: dict[tuple[str, str], CatalogSync] = {}
-    for agent_id, sync_id, source_id, data in connection.execute(
-        "SELECT agent_id, id, source_id, data FROM syncs"
-    ):
-        sync = decode_catalog_sync(data)
-        if (
-            sync.agent_id != agent_id
-            or sync.id != sync_id
-            or sync.source_id != source_id
-            or (agent_id, source_id) not in sources
-        ):
-            raise ValueError("stored catalog sync ownership is invalid")
-        syncs[(agent_id, sync_id)] = sync
-    for agent_id, source_id, sync_id, data in connection.execute(
-        "SELECT agent_id, source_id, sync_id, data FROM snapshots"
-    ):
-        snapshot = decode_catalog_snapshot(data)
-        if (
-            snapshot.sync.agent_id != agent_id
-            or snapshot.sync.source_id != source_id
-            or snapshot.sync.id != sync_id
-            or syncs.get((agent_id, sync_id)) != snapshot.sync
-        ):
-            raise ValueError("stored catalog snapshot ownership is invalid")
+    # `syncs` and `snapshots` are not read here: a damaged catalog row is rebuilt
+    # from its source, so it must not stop the home opening.
 
     run_ids: set[str] = set()
     run_inputs: dict[str, RunInput] = {}

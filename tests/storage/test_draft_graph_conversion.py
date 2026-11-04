@@ -315,7 +315,6 @@ async def test_revision_one_jobs_convert_with_complete_executability_ledger(
                 "jobs.inspect": "sha256:" + "4" * 64,
                 "jobs.read_results": "sha256:" + "5" * 64,
             },
-            resource_revisions={"resource-1": "sha256:" + "1" * 64},
             model_routes={"mock:scripted": "sha256:" + "6" * 64},
         ),
     )

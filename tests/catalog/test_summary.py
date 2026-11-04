@@ -3,10 +3,9 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
 
 import pytest
 
@@ -21,7 +20,7 @@ from daita.catalog import (
     ResourceKind,
 )
 from daita.catalog.models import CatalogSnapshotRef
-from daita.catalog.protocols import CatalogResourceNotFoundError, CatalogStoreError
+from daita.catalog.protocols import CatalogStoreError
 from daita.llm.models import FinishReason, ModelProfile, ModelResponse
 from daita.llm.providers.mock import MockModelProvider
 from daita.storage.sqlite import SQLiteStateStore
@@ -218,11 +217,6 @@ async def test_broad_catalog_discovery_matches_any_term_and_resource_kind(
         assert result.total_matches == 2
         assert result.returned_count == 2
         assert all("kind" in hit.matched_fields for hit in result.hits)
-        assert result.match_outcome.binding_status == "ambiguous"
-        assert result.match_outcome.source_status == "unique"
-        assert result.match_outcome.evidence_tier == "catalog_metadata"
-        assert result.match_outcome.candidate_count == 2
-        assert result.match_outcome.ambiguity_reasons == ("multiple_resources",)
     finally:
         await agent.close()
 
@@ -313,9 +307,6 @@ async def test_catalog_search_ranks_posting_candidates_before_unmatched_fallback
         )
         assert result.next_cursor is not None
         assert rank_count == 1
-        first_outcome = result.match_outcome
-        assert first_outcome.binding_status == "unique"
-        assert first_outcome.evidence_tier == "catalog_metadata"
         seen = {hit.resource_id for hit in result.hits}
         while result.next_cursor is not None:
             result = await agent.search_catalog(
@@ -326,7 +317,6 @@ async def test_catalog_search_ranks_posting_candidates_before_unmatched_fallback
                     cursor=result.next_cursor,
                 )
             )
-            assert result.match_outcome == first_outcome
             assert len(result.hits) <= 50
             for hit in result.hits:
                 assert hit.resource_id not in seen
@@ -569,14 +559,6 @@ async def test_indexed_search_normalizes_ranks_diversifies_and_exposes_evidence(
         exact_column = next(hit for hit in exact.hits if hit.name == "column_match")
         assert exact_column.match_reasons == ("structural_field_exact",)
         assert exact.hits[0].score > exact_column.score
-        assert exact.match_outcome.binding_status == "unique"
-        assert exact.match_outcome.source_status == "unique"
-        assert exact.match_outcome.evidence_tier == "exact_resource"
-        assert exact.match_outcome.candidate_count == 1
-        assert (
-            exact.match_outcome.candidate_bindings[0]["resource_id"]
-            == exact.hits[0].resource_id
-        )
         assert qualified.hits[0].name == "needle"
         assert qualified.hits[1].name == "main.needle"
         assert qualified.hits[0].score > exact.hits[0].score
@@ -634,18 +616,6 @@ async def test_embedded_exact_name_anchor_outranks_128_lookalikes_and_has_bounda
         assert result.total_matches == 129
         assert result.returned_count == 12
         assert result.truncated is True
-        assert result.match_outcome.binding_status == "unique"
-        assert result.match_outcome.candidate_count == 1
-        assert result.match_outcome.evidence_tier == "exact_resource"
-
-        broad = await agent.search_catalog(
-            CatalogSearchRequest(agent_id=agent.id, query="table", limit=1)
-        )
-        assert broad.match_outcome.binding_status == "ambiguous"
-        assert broad.match_outcome.source_status == "unique"
-        assert broad.match_outcome.candidate_count == 129
-        assert len(broad.match_outcome.candidate_bindings) == 12
-        assert broad.match_outcome.omitted_candidate_count == 117
 
         boundary = await agent.search_catalog(
             CatalogSearchRequest(
@@ -671,22 +641,6 @@ async def test_embedded_exact_name_anchor_outranks_128_lookalikes_and_has_bounda
         assert native_identity.hits[0].name == "stage_b_profile_probe"
         assert native_identity.hits[0].match_reasons == ("resource_name_exact_mention",)
 
-        context = await agent._embedded._data_view.catalog_context(
-            agent.id,
-            query,
-            limit=12,
-        )
-        context_resources = context["resources"]
-        assert isinstance(context_resources, tuple)
-        first = context_resources[0]
-        assert isinstance(first, Mapping)
-        assert first["resource_id"] == result.hits[0].resource_id
-        assert first["match_reasons"] == ("resource_name_exact_mention",)
-        # Scoped SQL without a describe grant needs the source-qualified name.
-        assert first["native_identity"] == f"main.{first['name']}"
-        assert context["total_matches"] == 129
-        assert context["returned_count"] == 12
-        assert context["truncated"] is True
     finally:
         await agent.close()
 
@@ -724,187 +678,11 @@ async def test_embedded_exact_duplicate_names_remain_source_scoped(
         assert all(
             hit.match_reasons == ("resource_name_exact_mention",) for hit in result.hits
         )
-        assert result.match_outcome.binding_status == "ambiguous"
-        assert result.match_outcome.source_status == "ambiguous"
-        assert result.match_outcome.evidence_tier == "exact_resource"
-        assert result.match_outcome.candidate_count == 2
-        assert result.match_outcome.ambiguity_reasons == ("multiple_sources",)
     finally:
         await agent.close()
 
 
-async def test_catalog_context_ranks_within_frozen_resource_ceiling(
-    tmp_path: Path,
-):
-    database = tmp_path / "catalog-context-ceiling.sqlite"
-    with sqlite3.connect(database) as connection:
-        connection.executescript("""
-            CREATE TABLE aaa_inventory (id INTEGER PRIMARY KEY);
-            CREATE TABLE zz_ranked_target (id INTEGER PRIMARY KEY);
-            CREATE TABLE zz_ranked_target_archive (id INTEGER PRIMARY KEY);
-            """)
-    agent = await Agent.create(
-        "catalog-context-ceiling", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
-    try:
-        source = await agent.attach(SQLiteSource(database))
-        resources = {
-            resource.name: resource
-            for resource in await agent.list_catalog_resources(source_id=source.id)
-        }
-        all_readable = frozenset(resource.id for resource in resources.values())
-
-        ranked = await agent._embedded._data_view.catalog_context(
-            agent.id,
-            "Profile zz_ranked_target.",
-            limit=1,
-            source_ids=(source.id,),
-            resource_ids=(),
-            readable_resource_ids=all_readable,
-        )
-        ranked_resources = ranked["resources"]
-        assert isinstance(ranked_resources, tuple)
-        first = ranked_resources[0]
-        assert isinstance(first, Mapping)
-        assert first["resource_id"] == resources["zz_ranked_target"].id
-        outcomes = ranked["match_outcomes"]
-        assert isinstance(outcomes, Mapping)
-        current = outcomes["current_query"]
-        assert isinstance(current, Mapping)
-        assert current["binding_status"] == "unique"
-        assert current["candidate_count"] == 1
-
-        archive_only = await agent._embedded._data_view.catalog_context(
-            agent.id,
-            "Profile zz_ranked_target.",
-            limit=12,
-            source_ids=(source.id,),
-            resource_ids=(),
-            readable_resource_ids=frozenset(
-                {
-                    resources["aaa_inventory"].id,
-                    resources["zz_ranked_target_archive"].id,
-                }
-            ),
-        )
-        archive_resources = archive_only["resources"]
-        assert isinstance(archive_resources, tuple)
-        archive_records = cast(tuple[Mapping[str, object], ...], archive_resources)
-        assert tuple(item["resource_id"] for item in archive_records) == (
-            resources["zz_ranked_target_archive"].id,
-        )
-        assert resources["zz_ranked_target"].id not in str(archive_only)
-
-        with pytest.raises(CatalogResourceNotFoundError):
-            await agent._embedded._data_view.catalog_context(
-                agent.id,
-                "Profile zz_ranked_target.",
-                limit=12,
-                source_ids=(source.id,),
-                resource_ids=(resources["zz_ranked_target"].id,),
-                readable_resource_ids=frozenset(
-                    {resources["zz_ranked_target_archive"].id}
-                ),
-            )
-    finally:
-        await agent.close()
-
-
-async def test_catalog_context_merges_current_and_prior_queries_by_contract_priority(
-    tmp_path: Path,
-):
-    database = tmp_path / "catalog-context-priority.sqlite"
-    with sqlite3.connect(database) as connection:
-        connection.executescript("""
-            CREATE TABLE prior_target (id INTEGER PRIMARY KEY);
-            CREATE TABLE current_target (id INTEGER PRIMARY KEY);
-            CREATE TABLE profile_metrics (id INTEGER PRIMARY KEY);
-            """)
-    agent = await Agent.create(
-        "catalog-context-priority", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
-    try:
-        source = await agent.attach(SQLiteSource(database))
-        view = agent._embedded._data_view
-        resources = await agent.list_catalog_resources(source_id=source.id)
-        readable_resource_ids = frozenset(resource.id for resource in resources)
-
-        continuity = await view.catalog_context(
-            agent.id,
-            "Profile it.",
-            prior_query="Use prior_target for this analysis.",
-            limit=12,
-            readable_resource_ids=readable_resource_ids,
-        )
-        continuity_resources = continuity["resources"]
-        assert isinstance(continuity_resources, tuple)
-        continuity_records = cast(
-            tuple[Mapping[str, object], ...], continuity_resources
-        )
-        assert tuple(item["name"] for item in continuity_records[:2]) == (
-            "prior_target",
-            "profile_metrics",
-        )
-        continuity_outcomes = continuity["match_outcomes"]
-        assert isinstance(continuity_outcomes, Mapping)
-        current_outcome = continuity_outcomes["current_query"]
-        prior_outcome = continuity_outcomes["prior_query"]
-        assert isinstance(current_outcome, Mapping)
-        assert isinstance(prior_outcome, Mapping)
-        assert current_outcome["evidence_tier"] == "catalog_metadata"
-        assert prior_outcome["evidence_tier"] == "exact_resource"
-        assert (
-            current_outcome["candidate_bindings"] != prior_outcome["candidate_bindings"]
-        )
-
-        switched = await view.catalog_context(
-            agent.id,
-            "Switch to current_target.",
-            prior_query="Use prior_target for this analysis.",
-            limit=12,
-            readable_resource_ids=readable_resource_ids,
-        )
-        switched_resources = switched["resources"]
-        assert isinstance(switched_resources, tuple)
-        switched_records = cast(tuple[Mapping[str, object], ...], switched_resources)
-        assert tuple(item["name"] for item in switched_records[:2]) == (
-            "current_target",
-            "prior_target",
-        )
-
-        prior = next(item for item in resources if item.name == "prior_target")
-        exact_id = await view.catalog_context(
-            agent.id,
-            "text that does not match catalog metadata",
-            resource_ids=(prior.id,),
-            limit=12,
-            readable_resource_ids=readable_resource_ids,
-        )
-        exact_resources = exact_id["resources"]
-        exact_sources = exact_id["sources"]
-        assert isinstance(exact_resources, tuple)
-        assert isinstance(exact_sources, tuple)
-        exact_records = cast(tuple[Mapping[str, object], ...], exact_resources)
-        source_records = cast(tuple[Mapping[str, object], ...], exact_sources)
-        assert tuple(item["resource_id"] for item in exact_records) == (prior.id,)
-        assert "source_revision" not in exact_records[0]
-        assert "sync_id" not in exact_records[0]
-        assert source_records[0]["source_id"] == source.id
-        assert exact_id["total_matches"] == 1
-        assert exact_id["returned_count"] == 1
-        assert exact_id["truncated"] is False
-        exact_outcomes = exact_id["match_outcomes"]
-        assert isinstance(exact_outcomes, Mapping)
-        exact_current = exact_outcomes["current_query"]
-        assert isinstance(exact_current, Mapping)
-        assert exact_current["evidence_tier"] == "explicit_resource_ids"
-        assert exact_current["binding_status"] == "unique"
-        assert exact_outcomes["prior_query"] is None
-    finally:
-        await agent.close()
-
-
-async def test_catalog_search_and_private_context_rank_across_more_than_64_sources(
+async def test_catalog_search_ranks_across_more_than_64_sources(
     tmp_path: Path,
 ):
     agent = await Agent.create(
@@ -919,10 +697,6 @@ async def test_catalog_search_and_private_context_rank_across_more_than_64_sourc
                 connection.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY)")
             source = await agent.attach(SQLiteSource(database))
             source_ids.append(source.id)
-        readable_resource_ids = frozenset(
-            resource.id for resource in await agent.list_catalog_resources()
-        )
-
         result = await agent.search_catalog(
             CatalogSearchRequest(
                 agent_id=agent.id,
@@ -940,41 +714,6 @@ async def test_catalog_search_and_private_context_rank_across_more_than_64_sourc
         assert result.returned_count == 3
         assert result.truncated is True
 
-        context = await agent._embedded._data_view.catalog_context(
-            agent.id,
-            "target",
-            limit=3,
-            source_ids=tuple(source_ids),
-            resource_ids=(),
-            readable_resource_ids=readable_resource_ids,
-        )
-        context_resources = context["resources"]
-        assert isinstance(context_resources, tuple)
-        context_records = cast(tuple[Mapping[str, object], ...], context_resources)
-        assert tuple(item["name"] for item in context_records) == (
-            "target",
-            "target_candidate_000",
-            "target_candidate_001",
-        )
-        assert context["total_matches"] == 65
-        assert context["returned_count"] == 3
-        assert context["truncated"] is True
-        broad_context = await agent._embedded._data_view.catalog_context(
-            agent.id,
-            "table",
-            limit=3,
-            source_ids=tuple(source_ids),
-            resource_ids=(),
-            readable_resource_ids=readable_resource_ids,
-        )
-        broad_outcomes = broad_context["match_outcomes"]
-        assert isinstance(broad_outcomes, Mapping)
-        broad_current = broad_outcomes["current_query"]
-        assert isinstance(broad_current, Mapping)
-        assert broad_current["binding_status"] == "ambiguous"
-        assert broad_current["candidate_count"] == 65
-        assert len(cast(tuple[object, ...], broad_current["candidate_bindings"])) == 12
-        assert broad_current["omitted_candidate_count"] == 53
     finally:
         await agent.close()
 
@@ -1137,7 +876,7 @@ async def test_failed_snapshot_decode_does_not_publish_a_cache_entry(
             return original_decode(value)
 
         monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", failing_decode)
-        with pytest.raises(ValueError, match="forced snapshot decode failure"):
+        with pytest.raises(CatalogStoreError, match="undecodable"):
             await reader.load_current_snapshot(ref)
         assert reader._decoded_catalog_snapshots == {}
 

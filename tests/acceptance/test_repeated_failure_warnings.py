@@ -23,7 +23,6 @@ from daita.jobs import JobState
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
-    MessageRole,
     ModelProfile,
     ModelRequest,
     ModelResponse,
@@ -84,12 +83,10 @@ def _profile(
 
 
 def _status(request: ModelRequest) -> str:
-    # Per-step status, including progress warnings, follows the transcript.
-    status = request.messages[-1]
-    assert status.role is MessageRole.SYSTEM
-    text = status.content[0]
-    assert isinstance(text, TextBlock)
-    return text.text
+    # Status, including progress warnings, is written once beside a tool result.
+    return "\n".join(
+        message.run_note for message in request.messages if message.run_note
+    )
 
 
 def _warned(request: ModelRequest) -> bool:
@@ -139,8 +136,8 @@ async def _foreground(tmp_path: Path) -> tuple[MockModelProvider, tuple[object, 
         (
             _refused("first"),
             _refused("second"),
-            _tool("exact-1", "toolbox_search", query="data_update_rows"),
-            _tool("exact-2", "toolbox_search", query="data_update_rows"),
+            _tool("exact-1", "toolbox_search", query="data_write"),
+            _tool("exact-2", "toolbox_search", query="data_write"),
             _stop("No row-count tool is callable here."),
             _refused("next-run"),
             _stop("Still no row-count tool."),
@@ -187,7 +184,7 @@ async def test_foreground_run_warns_after_second_identical_refusal(
     status = _status(provider.requests[4])
     assert "`warehouse_row_count`" in status
     assert "exact-name searches found no callable tool named" in status
-    assert "`data_update_rows`" in status
+    assert "`data_write`" in status
 
 
 async def test_foreground_transcript_results_and_budgets_match_without_warnings(
@@ -408,8 +405,8 @@ async def test_repeated_invalid_sql_warns_on_the_second_identical_query(
             if isinstance(block, ToolResultBlock)
         }
         assert codes == {
-            "sql-1": "sql_validation_failed",
-            "sql-2": "sql_validation_failed",
+            "sql-1": "query_invalid",
+            "sql-2": "query_invalid",
         }
         assert tuple(_warned(request) for request in provider.requests) == (
             False,

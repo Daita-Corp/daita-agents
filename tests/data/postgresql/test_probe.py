@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -45,6 +46,12 @@ class _Connection:
         if self.failure is not None:
             raise self.failure
         return self.rows
+
+    async def fetchrow(self, sql: str, *arguments: object):
+        self.fetches.append((sql, arguments))
+        if self.failure is not None:
+            raise self.failure
+        return self.rows[0] if self.rows else None
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -373,3 +380,99 @@ async def test_agent_postgresql_probe_persists_no_source_or_catalog_snapshot(
         assert await agent.list_catalog_resources() == ()
     finally:
         await agent.close()
+
+
+_READ_ONLY_ROLE: dict[str, object] = {
+    "role_name": "reader",
+    "rolsuper": False,
+    "rolbypassrls": False,
+    "rolcreaterole": False,
+    "rolcreatedb": False,
+    "builtin_roles": [],
+    "writable_tables": 0,
+    "creatable_schemas": 0,
+}
+
+
+async def _health(
+    monkeypatch: pytest.MonkeyPatch, connection: _Connection
+) -> tuple[Any, _Connection]:
+    monkeypatch.setattr(
+        "daita.adapters.postgresql._load_asyncpg", lambda: _Asyncpg(connection)
+    )
+    now = datetime(2026, 11, 4, tzinfo=UTC)
+    adapter = await _source(_Secrets()).open(
+        agent_id="agent", attached_at=now, clock=lambda: now
+    )
+    try:
+        return await adapter.health(), connection
+    finally:
+        await adapter.close()
+
+
+async def test_a_read_only_role_is_reported_with_its_name_and_no_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    health, connection = await _health(monkeypatch, _Connection([_READ_ONLY_ROLE]))
+
+    assert health.healthy
+    assert health.details["role"] == "reader"
+    assert health.details["read_only"] is True
+    assert health.details["warnings"] == ()
+    sql, arguments = connection.fetches[0]
+    assert "daita:postgresql.health" in sql
+    # Only the schemas this source was configured with are counted.
+    assert arguments == (["placeholder"],)
+
+
+@pytest.mark.parametrize(
+    ("grant", "read_only", "mentions"),
+    (
+        # A superuser implicitly holds every built-in role: one warning, not two.
+        (
+            {"rolsuper": True, "builtin_roles": ["pg_write_all_data"]},
+            False,
+            "superuser",
+        ),
+        ({"rolbypassrls": True}, True, "row-level security"),
+        ({"rolcreaterole": True}, True, "create roles"),
+        ({"rolcreatedb": True}, True, "create roles or databases"),
+        ({"builtin_roles": ["pg_read_all_data"]}, True, "pg_read_all_data"),
+        ({"builtin_roles": ["pg_read_server_files"]}, True, "pg_read_server_files"),
+        ({"builtin_roles": ["pg_write_all_data"]}, False, "pg_write_all_data"),
+        ({"builtin_roles": ["pg_execute_server_program"]}, False, "pg_execute"),
+        ({"writable_tables": 3}, False, "3 tables"),
+        ({"writable_tables": 1}, False, "1 table."),
+        ({"creatable_schemas": 1}, False, "create objects"),
+    ),
+)
+async def test_each_broad_grant_is_a_warning_and_a_write_grant_is_not_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+    grant: dict[str, object],
+    read_only: bool,
+    mentions: str,
+):
+    row = {**_READ_ONLY_ROLE, **grant}
+
+    health, _ = await _health(monkeypatch, _Connection([row]))
+
+    assert health.healthy
+    assert health.details["read_only"] is read_only
+    (warning,) = health.details["warnings"]
+    assert mentions in warning
+
+
+async def test_a_failed_health_query_is_unhealthy_and_leaks_no_server_text(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    diagnostic = "password=DO-NOT-EXPOSE host=attacker.example"
+
+    health, connection = await _health(
+        monkeypatch, _Connection(failure=RuntimeError(diagnostic))
+    )
+
+    assert not health.healthy
+    assert health.error_code == "postgresql_health_failed"
+    assert dict(health.details) == {}
+    assert diagnostic not in repr(health)
+    assert connection.close_calls == 1

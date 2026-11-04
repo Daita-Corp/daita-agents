@@ -32,7 +32,6 @@ from daita.catalog.models import (
     catalog_resource_id,
 )
 from daita.domains.data.capabilities import (
-    DataQueryError,
     ReadTabularRequest,
     TabularFilter,
 )
@@ -221,16 +220,6 @@ class _MemoryTabularBackend:
         self, request: ReadTabularRequest
     ) -> BoundedResultProjection:
         self.requests.append(request)
-        current = {
-            item.resource_id: item.revision
-            for item in await self._catalog.resource_schemas(
-                request.agent_id, request.source_id
-            )
-        }
-        if current.get(request.resource_id) != request.expected_revision:
-            raise DataQueryError(
-                "query_binding_stale", "The table changed since validation."
-            )
 
         def matches(row: Mapping[str, object], item: TabularFilter) -> bool:
             return _COMPARE[item.operator](row[item.column], item.value)

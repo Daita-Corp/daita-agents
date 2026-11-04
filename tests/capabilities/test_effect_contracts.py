@@ -61,19 +61,16 @@ def test_bindings_require_exact_coverage_and_are_immutable():
     bindings = ExecutionContractBindings(
         capability_contracts={"test.action": _DIGEST},
         tool_origins={"test.action": _DIGEST},
-        resource_revisions={"resource": _DIGEST},
         model_routes={"route": _DIGEST},
     )
     bindings.validate_coverage(
         capability_ids=("test.action",),
-        resource_ids=("resource",),
         route_ids=("route",),
         mcp_capability_ids=("test.action",),
     )
     with pytest.raises(ValueError, match="exact coverage"):
         bindings.validate_coverage(
             capability_ids=("test.action", "other"),
-            resource_ids=("resource",),
             route_ids=("route",),
             mcp_capability_ids=("test.action",),
         )

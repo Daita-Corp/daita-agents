@@ -97,9 +97,11 @@ def decode_artifact_binding(value: JsonValue) -> ArtifactResourceBinding:
     )
     return ArtifactResourceBinding(
         source_id=text(fields["source_id"], "artifact source_id"),
-        source_revision=text(fields["source_revision"], "artifact source_revision"),
+        source_revision=optional_text(
+            fields["source_revision"], "artifact source_revision"
+        ),
         resource_id=text(fields["resource_id"], "artifact resource_id"),
-        resource_revision=text(
+        resource_revision=optional_text(
             fields["resource_revision"], "artifact resource_revision"
         ),
     )

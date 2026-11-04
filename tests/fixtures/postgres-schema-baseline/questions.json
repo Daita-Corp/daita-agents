@@ -1,0 +1,107 @@
+[
+  {
+    "id": "q01-customer-count",
+    "category": "clean",
+    "question": "How many customers are in sales.customers?",
+    "sql": "SELECT count(*) FROM sales.customers",
+    "resources": ["sales.customers"]
+  },
+  {
+    "id": "q02-top-region",
+    "category": "clean",
+    "question": "Which region has the most customers?",
+    "sql": "SELECT region FROM sales.customers GROUP BY region ORDER BY count(*) DESC LIMIT 1",
+    "resources": ["sales.customers"]
+  },
+  {
+    "id": "q03-top-product-units",
+    "category": "foreign_key_join",
+    "question": "Which product name has sold the most units across all order items?",
+    "sql": "SELECT p.name FROM sales.order_items AS oi JOIN sales.products AS p ON p.product_id = oi.product_id GROUP BY p.name ORDER BY sum(oi.quantity) DESC LIMIT 1",
+    "resources": ["sales.order_items", "sales.products"]
+  },
+  {
+    "id": "q04-item-revenue",
+    "category": "clean",
+    "question": "What is the total order-item revenue, summing quantity times unit price over sales.order_items?",
+    "sql": "SELECT sum(quantity * unit_price) FROM sales.order_items",
+    "resources": ["sales.order_items"]
+  },
+  {
+    "id": "q05-shipped-orders",
+    "category": "enum",
+    "question": "How many current orders have status shipped? Do not use archive or legacy tables.",
+    "sql": "SELECT count(*) FROM sales.orders WHERE status = 'shipped'",
+    "resources": ["sales.orders"]
+  },
+  {
+    "id": "q06-product-sales-view",
+    "category": "view",
+    "question": "Using the sales.product_sales view, how many units of product_id 42 were sold?",
+    "sql": "SELECT units_sold FROM sales.product_sales WHERE product_id = 42",
+    "resources": ["sales.product_sales"]
+  },
+  {
+    "id": "q07-invoice-total",
+    "category": "domain",
+    "question": "What is the total invoiced amount in finance.invoices?",
+    "sql": "SELECT sum(amount) FROM finance.invoices",
+    "resources": ["finance.invoices"]
+  },
+  {
+    "id": "q08-payments-2026",
+    "category": "clean",
+    "question": "What is the total paid amount for payments made on or after 2026-01-01?",
+    "sql": "SELECT sum(paid_amount) FROM finance.payments WHERE paid_on >= DATE '2026-01-01'",
+    "resources": ["finance.payments"]
+  },
+  {
+    "id": "q09-page-views-day",
+    "category": "partition",
+    "question": "How many page views were recorded on 2026-03-15 (UTC) in the current partitioned page view table?",
+    "sql": "SELECT count(*) FROM events.page_views WHERE viewed_at >= TIMESTAMPTZ '2026-03-15 00:00:00+00' AND viewed_at < TIMESTAMPTZ '2026-03-16 00:00:00+00'",
+    "resources": ["events.page_views"]
+  },
+  {
+    "id": "q10-pricing-page-views",
+    "category": "partition",
+    "question": "How many page views of the /pricing path are in events.page_views?",
+    "sql": "SELECT count(*) FROM events.page_views WHERE path = '/pricing'",
+    "resources": ["events.page_views"]
+  },
+  {
+    "id": "q11-gold-won-pipeline",
+    "category": "foreign_key_join",
+    "question": "What is the total amount of won opportunities for gold-tier CRM accounts?",
+    "sql": "SELECT sum(o.amount) FROM crm.opportunities AS o JOIN crm.accounts AS a ON a.account_id = o.account_id WHERE a.tier = 'gold' AND o.stage = 'won'",
+    "resources": ["crm.opportunities", "crm.accounts"]
+  },
+  {
+    "id": "q12-example-com-contacts",
+    "category": "extension_type",
+    "question": "How many CRM contacts have an email address at example.com, ignoring case?",
+    "sql": "SELECT count(*) FROM crm.contacts WHERE lower(email::text) LIKE '%@example.com'",
+    "resources": ["crm.contacts"]
+  },
+  {
+    "id": "q13-crm-note-count",
+    "category": "unsupported_builtin_type",
+    "question": "How many notes are in crm.notes?",
+    "sql": "SELECT count(*) FROM crm.notes",
+    "resources": ["crm.notes"]
+  },
+  {
+    "id": "q14-mixed-case-accounts",
+    "category": "quoted_identifier",
+    "question": "How many rows are in the mixed-case table legacy.\"Accounts\" (not the lowercase legacy.accounts)?",
+    "sql": "SELECT count(*) FROM legacy.\"Accounts\"",
+    "resources": ["legacy.Accounts"]
+  },
+  {
+    "id": "q15-customers-with-account",
+    "category": "cross_schema_join",
+    "question": "How many sales customers have a CRM account?",
+    "sql": "SELECT count(DISTINCT c.customer_id) FROM sales.customers AS c JOIN crm.accounts AS a ON a.customer_id = c.customer_id",
+    "resources": ["sales.customers", "crm.accounts"]
+  }
+]

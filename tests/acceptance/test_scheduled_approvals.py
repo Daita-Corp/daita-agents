@@ -6,6 +6,7 @@ import json
 import signal
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,12 +31,12 @@ from daita.routines.models import (
     RoutineSchedule,
     RoutineState,
 )
-from tests.data.writes._upsert_support import Database
 from tests.support.host import (
     StartHost,
     bounded,
     client,
     pending_interaction,
+    routine_approval,
     short_root,
     value,
     work_folder,
@@ -43,7 +44,6 @@ from tests.support.host import (
 from tests.support.native_writes import (
     NOW,
     ScriptedResearchModel,
-    companies_structure,
     create_fixture,
     measured_step,
     patch_fake_postgresql,
@@ -51,6 +51,7 @@ from tests.support.native_writes import (
     scheduled_write_script,
 )
 from tests.support.workspace import workspace_for
+from tests.support.write_database import Database
 
 pytestmark = [pytest.mark.acceptance, pytest.mark.integration]
 
@@ -82,9 +83,7 @@ def _intent(source_id: str, schedule: RoutineSchedule) -> RoutineIntent:
 
 
 def _inserts(db: Any) -> int:
-    return len(
-        [item for item in db.log if item[0] == "fetch" and item[1].startswith("INSERT")]
-    )
+    return db.inserts()
 
 
 async def _scheduled_write(
@@ -157,10 +156,10 @@ async def test_a_scheduled_write_asks_notifies_and_commits_once_after_approval(
     harness, provider, db, sent, routine_id = await _scheduled_write(
         start_host, monkeypatch
     )
-    interaction = await pending_interaction(harness.http, NAME, timeout=30)
+    interaction = await routine_approval(harness, NAME, routine_id, timeout=30)
     assert interaction["kind"] == "tool_approval"
     approval = interaction["request"]["approval"]
-    assert approval.capability_id == "data.upsert_rows"
+    assert approval.capability_id == "data.write"
     assert approval.requester == TITLE
     assert f"Asked by: {TITLE}" in interaction["request"]["review_document"]
     await bounded(sent.texts)
@@ -188,6 +187,19 @@ async def test_a_scheduled_write_asks_notifies_and_commits_once_after_approval(
         assert not provider.steps
     finally:
         await remote.close()
+
+
+async def test_waiting_for_an_approval_fails_at_once_when_the_run_ends_without_asking(
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness, provider, _db, _sent, routine_id = await _scheduled_write(
+        start_host, monkeypatch
+    )
+    provider.replace_script([measured_step(response(text="Nothing to write."))])
+    started = time.monotonic()
+    with pytest.raises(AssertionError, match="ended without asking.*completed"):
+        await routine_approval(harness, NAME, routine_id, timeout=60)
+    assert time.monotonic() - started < 30
 
 
 async def test_a_denied_scheduled_write_finishes_with_the_refusal_and_writes_nothing(
@@ -322,7 +334,7 @@ async def test_a_host_killed_after_a_scheduled_write_dispatches_never_replays_it
 
     # Any replay after the restart would reach this database.
     replay = Database()
-    patch_fake_postgresql(monkeypatch, replay, companies_structure(replay))
+    patch_fake_postgresql(monkeypatch, replay)
     model = ScriptedResearchModel()
     restarted = await start_host(model=model, root=root)
     remote = await connect(NAME, cwd=restarted.work(), root=root)

@@ -329,12 +329,10 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
         agent_id=read_scope.agent_id,
         source_id=read_scope.source_id,
         resource_id="catalog-resource:sha256:" + "2" * 64,
+        table="public.orders",
         allowed_update_columns=("status", "amount"),
-        resource_revision="sha256:" + "5" * 64,
         allowed_operations=("update",),
         allowed_insert_columns=(),
-        key_columns=("id",),
-        generated_identity_columns=(),
         max_rows=10000,
         authorization_fingerprint="sha256:" + "4" * 64,
     )
@@ -492,6 +490,18 @@ def test_classified_tool_result_provenance_round_trips_without_entering_output()
     assert "sensitivity" not in block.output
     assert block.sensitivity is ModelSensitivity.RESTRICTED
     assert block.sensitivity_provenance["resource_ids"] == ("resource-1",)
+
+
+def test_a_run_note_round_trips_and_messages_without_one_keep_their_bytes() -> None:
+    result = ToolResultBlock(call_id="noted-call", output={"value": 1})
+    noted = CanonicalMessage(
+        MessageRole.TOOL, content=(result,), run_note="Budget pressure."
+    )
+    plain = CanonicalMessage(MessageRole.TOOL, content=(result,))
+
+    assert decode_message(encode_message(noted)) == noted
+    assert decode_message(encode_message(plain)) == plain
+    assert "run_note" not in encode_message(plain)
 
 
 def test_source_permission_codecs_reject_unknown_fields_and_noncanonical_sets() -> None:

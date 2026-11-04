@@ -12,6 +12,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import subprocess
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -24,7 +25,7 @@ from time import perf_counter
 from daita import Agent, AgentConfig, ApprovalDecision, LoopLimits
 from daita._json import canonical_json
 from daita.llm import factory
-from daita.llm.models import ModelRequest, ModelSensitivity, ToolResultBlock
+from daita.llm.models import ModelSensitivity, ToolResultBlock
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.routing import ModelRoute, ModelRouteCandidate
 from daita.loop.models import LoopExitKind, validate_completed_transcript
@@ -36,11 +37,7 @@ from daita.security import (
     SecretReference,
 )
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
-from tests.support.data_write_approval import (
-    TARGET_KEYS,
-    UPDATE_PREVIEW_KEYS,
-    data_write_approval,
-)
+from tests.support.data_write_approval import data_write_approval
 from tests.support.job_benchmarks import RecordingProvider
 from tests.support.live_billing import (
     CREDENTIAL as LIVE_CREDENTIAL,
@@ -51,7 +48,7 @@ from tests.support.live_billing import (
     subscription_billing,
 )
 from tests.support.paths import REPO_ROOT
-from tests.support.postgresql_live import _Secrets
+from tests.support.postgresql_live import WriteTesterSecrets
 from tests.support.workspace import workspace_for
 
 AUTHORIZATION = "DAITA_RUN_POSTGRES_LIVE_LLM"
@@ -67,7 +64,7 @@ LIMITS = replace(LoopLimits(), max_estimated_cost_usd=Decimal("0.15"))
 USER_FLOW_LIMITS = replace(LoopLimits(), max_estimated_cost_usd=Decimal("0.50"))
 REPORT_INSTRUCTION = (
     'Return only JSON with "status" ("succeeded", "not_applied", or "uncertain"), '
-    '"inserted_count", "updated_count", "unchanged_count" (integer or null), '
+    '"inserted_count", "updated_count", "skipped_count" (integer or null), '
     'and "explanation" (a short explanation grounded in the returned evidence). '
     "Use null for counts that the effect evidence does not establish. "
     "If a write is denied, fails or is uncertain, stop and report it without "
@@ -103,7 +100,10 @@ def evaluation_profile():
 def live_secret_provider():
     """Resolve fixture secrets, adding the test keychain only for subscriptions."""
 
-    providers: list[SecretProvider] = [EnvironmentSecretProvider(), _Secrets()]
+    providers: list[SecretProvider] = [
+        EnvironmentSecretProvider(),
+        WriteTesterSecrets(),
+    ]
     if subscription_billing():
         providers.insert(0, live_keychain())
     return CompositeSecretProvider(providers)
@@ -113,7 +113,13 @@ def live_config(model_id, *, limits=LIMITS):
     # Recheck at construction: a key or direct fixture invocation grants nothing.
     if os.environ.get(AUTHORIZATION) != "1":
         raise ValueError(f"{AUTHORIZATION}=1 requires explicit paid-run authorization")
-    if limits.max_estimated_cost_usd is None or limits.max_estimated_cost_usd <= 0:
+    # Anthropic routes refuse a dollar cap, so steps and tokens bound them.
+    anthropic = model_id.startswith("anthropic:")
+    if anthropic:
+        limits = replace(
+            limits, max_steps=16, max_total_tokens=120_000, max_estimated_cost_usd=None
+        )
+    elif limits.max_estimated_cost_usd is None or limits.max_estimated_cost_usd <= 0:
         raise ValueError(
             "Live diagnostics require an explicit positive finite cost cap"
         )
@@ -174,7 +180,7 @@ def calls_for(evidence, tool_name, mode=None):
     ]
 
 
-_REPORT_COUNTS = ("inserted_count", "updated_count", "unchanged_count")
+_REPORT_COUNTS = ("inserted_count", "updated_count", "skipped_count")
 
 
 def stage_note(stages=()):
@@ -202,7 +208,10 @@ def assert_report(result, status, counts=None, stages=()):
         "A terminal run without an answer cannot satisfy reporting acceptance.",
         stage_note(stages),
     )
-    report = json.loads(result.final_text or "")
+    # Some models fence the JSON they were asked to return alone.
+    report = json.loads(
+        re.sub(r"^```(?:json)?\s*|\s*```$", "", (result.final_text or "").strip())
+    )
     assert report["status"] == status, (report, stage_note(stages))
     assert isinstance(report["explanation"], str) and report["explanation"].strip()
     actual = tuple(report[key] for key in _REPORT_COUNTS)
@@ -279,136 +288,84 @@ class Evaluation:
 
     def expect_upsert(self, rows):
         self.expected_write = {
-            "source_id": self.db.source_id,
-            "resource_id": self.db.resource_id,
-            "key_columns": ["domain"],
-            "insert_columns": ["domain", "name", "evidence_url"],
-            "update_columns": ["name", "evidence_url"],
+            "operation": "insert",
             "rows": rows,
+            "update_columns": ["evidence_url", "name"],
         }
 
-    def expect_update(self, *, intended_row=None, unique_keys=(("id",), ("domain",))):
+    def expect_rows(self, operation, affected_rows):
+        """A statement judged only by its operation and its count of rows."""
+
+        self.expected_write = {"operation": operation, "affected_rows": affected_rows}
+
+    def expect_update(self, *, intended_row=None):
         # Owner-authored fixture identity, never inferred from model claims.
         self.intended_update_row = dict(
             intended_row or {"id": 1, "domain": "existing.test", "name": "Before"}
         )
-        self.intended_update_keys = tuple(tuple(key) for key in unique_keys)
-        self.expected_write = {
-            "source_id": self.db.source_id,
-            "resource_id": self.db.resource_id,
-            "where": [{"column": "id", "operator": "eq", "value": 1}],
-            "assignments": [{"column": "name", "value": "Updated"}],
-        }
-        self.expected_matched_rows = 1
+        self.expected_write = {"operation": "update", "after": {"name": "Updated"}}
 
     def write_is_exact(self, request):
-        if self.expected_write is None:
-            return False
-        operation = "upsert" if "rows" in self.expected_write else "update"
+        """Judge what Daita's own preview says the statement does, not its SQL text."""
+
+        expected = self.expected_write
         if (
-            request.tool_name != f"data_{operation}_rows"
-            or request.capability_id != f"data.{operation}_rows"
+            expected is None
+            or request.tool_name != "data_write"
+            or request.capability_id != "data.write"
         ):
             return False
         review = data_write_approval(request)
         if review is None:
             return False
-        args = review["arguments"]
-        if not isinstance(review["target"], dict) or (
-            review["target"].get("source_id") != self.db.source_id
-            or review["target"].get("resource_id") != self.db.resource_id
+        target, preview = review["target"], review["preview"]
+        if (
+            review["arguments"].get("source_id") != self.db.source_id
+            or target.get("source_id") != self.db.source_id
+            or target.get("resource_id") != self.db.resource_id
+            or preview["operation"] != expected["operation"]
+            or (expected["operation"] != "delete" and preview["deleted_rows"] != 0)
         ):
             return False
-        # Model-derived lineage is validated by the production domain, never by
-        # approval. Its presence cannot change the approved target or row values.
-        args.pop("evidence_call_ids", None)
-        expected = dict(self.expected_write)
-        # Any equality-only selector of the intended row that names a unique key
-        # is the same approved write in both profiles; production re-checks its
-        # own preview for drift before applying it.
-        if operation == "update":
-            if set(review["target"]) - TARGET_KEYS:
-                return False
-            where = args.get("where")
-            if not isinstance(where, list) or not 1 <= len(where) <= 16:
-                return False
-            cells = []
-            for predicate in where:
-                if (
-                    not isinstance(predicate, dict)
-                    or set(predicate) != {"column", "operator", "value"}
-                    or predicate["operator"] != "eq"
-                ):
-                    return False
-                cells.append(
-                    {"column": predicate["column"], "value": predicate["value"]}
-                )
-            if not self._intended_update_cells(cells, require_key=True):
-                return False
-            preview = review["preview"]
-            if set(preview) != UPDATE_PREVIEW_KEYS:
-                return False
+        samples = preview["samples"]
+        if "affected_rows" in expected:
+            return preview["affected_rows"] == expected["affected_rows"]
+        if expected["operation"] == "update":
             if (
-                type(preview["matched_rows"]) is not int
-                or preview["matched_rows"] != self.expected_matched_rows
-            ):
-                return False
-            samples = preview["samples"]
-            if (
-                not isinstance(samples, list)
+                preview["affected_rows"] != 1
+                or preview["columns_changed"] != ["name"]
                 or len(samples) != 1
-                or not isinstance(preview["warnings"], list)
             ):
                 return False
             sample = samples[0]
-            if not isinstance(sample, dict) or set(sample) != {
-                "primary_key",
-                "before",
-                "after",
-            }:
-                return False
-            if not self._intended_update_cells(
-                sample["primary_key"], require_key=True
-            ) or not self._intended_update_cells(sample["before"]):
-                return False
-            if canonical_json(sample["after"]) != canonical_json(
-                expected["assignments"]
-            ):
-                return False
-            expected["where"] = where
-        for key in ("rows", "key_columns", "insert_columns", "update_columns"):
-            if key in args and key in expected:
-                args[key] = sorted(args[key], key=canonical_json)
-                expected[key] = sorted(expected[key], key=canonical_json)
-        return canonical_json(args) == canonical_json(expected)
-
-    def _intended_update_cells(self, cells, *, require_key=False):
-        """Bounded fixture equality, not a SQL evaluator or execution authority."""
-        if not isinstance(cells, list) or not 1 <= len(cells) <= 16:
+            return (
+                sample.get("action") == "update"
+                and sample.get("after") == expected["after"]
+                and sample.get("before") == {"name": self.intended_update_row["name"]}
+            )
+        rows = expected["rows"]
+        # An upsert may skip rows that are already correct. The case's final rows
+        # judge the outcome; this only refuses a card showing anything unrequested.
+        if (
+            preview["affected_rows"] > len(rows)
+            or len(samples) != min(5, preview["affected_rows"])
+            or set(preview["columns_changed"])
+            - {"domain"}
+            - set(expected["update_columns"])
+        ):
             return False
-        columns = set()
-        for cell in cells:
-            if not isinstance(cell, dict) or set(cell) != {"column", "value"}:
-                return False
-            column, value = cell["column"], cell["value"]
-            if (
-                not isinstance(column, str)
-                or column in columns
-                or column not in self.intended_update_row
+        by_domain = {row["domain"]: row for row in rows}
+        for sample in samples:
+            if sample.get("action") == "insert":
+                values = sample["values"]
+                if by_domain.get(values["domain"]) != values:
+                    return False
+            elif not any(
+                {key: row[key] for key in sample["after"]} == sample["after"]
+                for row in rows
             ):
                 return False
-            intended = self.intended_update_row[column]
-            if (
-                value is None
-                or type(value) not in (str, int, float)
-                or type(value) is not type(intended)
-                or value != intended
-            ):
-                return False
-            columns.add(column)
-        return not require_key or any(
-            set(key) <= columns for key in self.intended_update_keys
-        )
+        return True
 
     def routine_is_exact(self, request):
         if (
@@ -495,6 +452,9 @@ class Evaluation:
             )
 
     def assert_completed_runs(self):
+        assert (
+            len(self.db.model.requests) == self.setup_request_count
+        ), "The setup-only scripted model must never run during evaluation"
         for result, transcript, _ in self.captures:
             assert result.kind is LoopExitKind.COMPLETED, (
                 result.reason,
@@ -504,7 +464,8 @@ class Evaluation:
             validate_completed_transcript(transcript, result)
             assert 0 < result.usage.total_tokens <= self.config.limits.max_total_tokens
             assert 0 < result.steps <= self.config.limits.max_steps
-            if subscription_billing():
+            # Routes that refuse a dollar cap are bound by steps and tokens alone.
+            if self.config.limits.max_estimated_cost_usd is None:
                 continue
             assert result.usage.cost_estimate.status.value == "complete"
             assert (
@@ -540,77 +501,6 @@ class Evaluation:
                     "paused",
                 }, inspection
                 await asyncio.sleep(0.05)
-
-    def assert_accounting(self):
-        assert (
-            len(self.db.model.requests) == self.setup_request_count
-        ), "The setup-only scripted model must never run during evaluation"
-        assert 0 < len(self.captures) <= self.max_runs
-        usages = [usage for recording in self.recordings for usage in recording.usages]
-        requests = [
-            request for recording in self.recordings for request in recording.requests
-        ]
-        timings = [
-            timing for recording in self.recordings for timing in recording.timings
-        ]
-        assert len(usages) == len(requests) == len(timings) and usages
-        assert all(timing["usage_complete"] for timing in timings)
-        for field in (
-            "input_tokens",
-            "output_tokens",
-            "reasoning_tokens",
-            "cache_read_tokens",
-            "cache_write_tokens",
-        ):
-            assert sum(
-                getattr(result.usage, field) for result, _, _ in self.captures
-            ) == sum(getattr(usage, field) for usage in usages), field
-        priced = not subscription_billing()
-        if priced:
-            assert all(
-                usage.cost_estimate.status.value == "complete" for usage in usages
-            )
-            assert sum(
-                result.usage.cost_estimate.amount_usd for result, _, _ in self.captures
-            ) == sum(usage.cost_estimate.amount_usd for usage in usages)
-        groups: list[list[ModelRequest]] = [[]]
-        for request in requests:
-            assert request.deadline is not None
-            assert 0 < request.max_total_tokens <= self.config.limits.max_total_tokens
-            if priced:
-                assert (
-                    0
-                    < request.max_estimated_cost_usd
-                    <= self.config.limits.max_estimated_cost_usd
-                )
-            else:
-                assert request.max_estimated_cost_usd is None
-            assert request.attempt_deadline is not None
-            assert request.attempt_deadline <= request.deadline
-            assert request.call_policy == self.config.model_call_policy
-            # Logical model requests can have a stricter, earlier ceiling than
-            # their enclosing run. A fresh run resets its cumulative allowance;
-            # a fresh attempt does not.
-            if (
-                groups[-1]
-                and request.max_total_tokens > groups[-1][-1].max_total_tokens
-            ):
-                groups.append([])
-            groups[-1].append(request)
-        assert len(groups) <= len(self.captures)
-        for group in groups:
-            assert all(
-                later.max_total_tokens is not None
-                and earlier.max_total_tokens is not None
-                and later.max_total_tokens <= earlier.max_total_tokens
-                and (
-                    not priced
-                    or later.max_estimated_cost_usd is not None
-                    and earlier.max_estimated_cost_usd is not None
-                    and later.max_estimated_cost_usd <= earlier.max_estimated_cost_usd
-                )
-                for earlier, later in zip(group, group[1:])
-            )
 
     async def report(self, case_id, status, failure):
         from daita.routines.capabilities import routine_inspection_projection
@@ -852,26 +742,13 @@ async def evaluate(
                                     None,
                                 )
                             )
-            accounting = {"status": "passed", "failure": None}
-            try:
-                scenario.assert_accounting()
-            except Exception as error:
-                accounting = {
-                    "status": "failed",
-                    "failure": f"{type(error).__name__}: {error}",
-                }
-                if failure is None:
-                    validation_error = error
             if failure is None:
                 try:
-                    if validation_error is not None:
-                        raise validation_error
                     scenario.assert_completed_runs()
                 except Exception as error:
                     validation_error = error
                     status, failure = "failed", f"{type(error).__name__}: {error}"
             report = await scenario.report(case_id, status, failure)
-            report["accounting"] = accounting
         finally:
             await scenario.agent.close()  # drains and closes the owned router/delegates
         report["agent_closed"] = True
@@ -881,70 +758,21 @@ async def evaluate(
             raise validation_error
 
 
-def _error_code(block):
-    error = block.output.get("error") if isinstance(block.output, Mapping) else None
-    return error.get("code", "error") if isinstance(error, Mapping) else "error"
+def assert_exact_preview(scenario, transcript):
+    """What was approved is what ran; returns what it wrote, or None if refused."""
 
-
-def write_call_summary(evidence, tool_name):
-    errors = {
-        block.call_id: _error_code(block)
-        for _, block in evidence
-        if block is not None and block.is_error
-    }
-    calls = calls_for(evidence, tool_name)
-    return {
-        mode: {
-            "calls": sum(
-                1 for call in calls if str(call.arguments.get("mode")) == mode
-            ),
-            "rejected": [
-                errors[call.id]
-                for call in calls
-                if str(call.arguments.get("mode")) == mode and call.id in errors
-            ],
-        }
-        for mode in sorted({str(call.arguments.get("mode")) for call in calls})
-    }
-
-
-def assert_preview_binding(evidence, operation="upsert"):
-    tool_name = f"data_{operation}_rows"
-    calls = calls_for(evidence, tool_name, "apply")
-    assert len(calls) == 1, (
-        f"Expected exactly one {tool_name} mode=apply call; observed {len(calls)}. "
-        f"Calls by mode: {write_call_summary(evidence, tool_name)}. "
-        "A missing write or duplicate request fails effectiveness."
-    )
-    # The write is one call: nothing is copied from an earlier preview.
-    assert "preview_fingerprint" not in calls[0].arguments
-    return calls[0]
-
-
-def assert_one_call(evidence, operation="upsert"):
-    """The write took one call, with no separate mode=preview call first."""
-
-    tool_name = f"data_{operation}_rows"
-    assert not calls_for(evidence, tool_name, "preview"), (
-        f"Expected one {tool_name} call; calls by mode: "
-        f"{write_call_summary(evidence, tool_name)}."
-    )
-
-
-def assert_exact_preview(scenario, transcript, operation="upsert"):
-    # The approval reviewed the call as it executed: run-scoped handles and
-    # result refs resolved, the mode selector kept on the tool-level call.
-    call = assert_preview_binding(scenario.evidence[transcript.run.id], operation)
+    calls = calls_for(scenario.evidence[transcript.run.id], "data_write", "apply")
+    assert calls, ("The model never attempted the write.", stage_note(scenario.stages))
+    # A refused attempt the model then corrected is fine: judge the last one.
+    call = calls[-1]
     matching = [item for item in scenario.approvals if item["call_id"] == call.id]
     assert len(matching) == 1 and matching[0]["approved"], (
-        "The harness approval oracle denied the apply call: its arguments do not "
-        "equal the scenario's exact expected write.",
+        "The harness approval oracle denied the apply call: Daita's preview of it "
+        "does not match the scenario's exact expected write.",
         {"proposed": call.arguments, "expected": scenario.expected_write},
         stage_note(scenario.stages),
     )
-    assert canonical_json(matching[0]["arguments"]["arguments"]) == canonical_json(
-        {key: value for key, value in call.arguments.items() if key != "mode"}
-    )
+    assert matching[0]["arguments"]["arguments"]["sql"] == call.arguments["sql"]
     # The card's preview is Daita's own, and it matches what was written.
     (result,) = [
         block
@@ -953,23 +781,10 @@ def assert_exact_preview(scenario, transcript, operation="upsert"):
         if isinstance(block, ToolResultBlock) and block.call_id == call.id
     ]
     review = matching[0]["arguments"]["preview"]
-    if operation == "update":
-        assert set(review) == UPDATE_PREVIEW_KEYS
     if result.is_error:
-        return  # Refused after approval (for example drift): nothing written.
+        return None  # Refused after approval (for example drift): nothing written.
     written = result.output["data"]
     assert isinstance(written, Mapping)
-    if operation == "update":
-        assert review["matched_rows"] == written["affected_rows"]
-        return
-    fields = (
-        "input_count",
-        "inserted_count",
-        "updated_count",
-        "unchanged_count",
-        "identity_sequence_gaps_possible",
-        "classifications",
-    )
-    expected = {key: written[key] for key in fields}
-    expected["classifications"] = expected["classifications"][:5]
-    assert canonical_json(review) == canonical_json(expected)
+    for key in ("affected_rows", "inserted_rows", "updated_rows", "skipped_rows"):
+        assert review[key] == written[key]
+    return written

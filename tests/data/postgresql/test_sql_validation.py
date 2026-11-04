@@ -1,7 +1,9 @@
+import logging
 from collections.abc import Mapping
 
 import pytest
 
+from daita.catalog.models import ResourceKind, catalog_resource_id
 from daita.domains.data.capabilities import data_query_capability_declarations
 from daita.domains.data.export_capabilities import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
@@ -10,68 +12,57 @@ from daita.domains.data.export_capabilities import (
 from daita.domains.data.sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
-    ResourceSchema,
+    SqlAnalysisError,
     analyze_postgresql_sql,
-    validate_postgresql_read,
+    validate_read,
 )
 
-_REVISION = "sha256:" + "1" * 64
-_SOURCE_REVISION = "sha256:" + "2" * 64
+_SOURCE = "source-postgresql"
 
 
-def _resource(
-    resource_id: str,
-    name: str,
-    columns: tuple[str, ...],
-    *,
-    schema: str = "sales",
-    resource_kind: str = "table",
-) -> ResourceSchema:
-    return ResourceSchema(
-        resource_id=resource_id,
-        source_id="source-postgresql",
-        name=name,
-        aliases=(f"{schema}.{name}",),
-        columns=columns,
-        revision=_REVISION,
-        source_revision=_SOURCE_REVISION,
-        resource_kind=resource_kind,
-    )
+def _table(name: str) -> str:
+    return catalog_resource_id(_SOURCE, ResourceKind.TABLE, f"sales.{name}")
 
 
-_ORDERS = _resource(
-    "resource-orders",
-    "orders",
-    (
-        "id",
-        "customer_id",
-        "status",
-        "total_amount",
-        "ordered_at",
-        "payload",
-    ),
-)
-_CUSTOMERS = _resource(
-    "resource-customers",
-    "customers",
-    ("id", "name", "region"),
-)
-_RESOURCES = (_ORDERS, _CUSTOMERS)
+def _view(name: str) -> str:
+    return catalog_resource_id(_SOURCE, ResourceKind.VIEW, f"sales.{name}")
 
 
 def _validate(
     sql: str,
     *,
     parameters: tuple[object, ...] = (),
-    resources: tuple[ResourceSchema, ...] = _RESOURCES,
-    allowed_resource_ids: tuple[str, ...] | None = None,
+    allowed: frozenset[str] | None = None,
+    schemas: tuple[str, ...] = ("sales",),
 ):
-    return validate_postgresql_read(
+    return validate_read(
         sql,
-        source_id="source-postgresql",
-        resources=resources,
+        dialect="postgresql",
+        source_id=_SOURCE,
         parameters=parameters,
-        allowed_resource_ids=allowed_resource_ids,
+        allowed_resource_ids=allowed,
+        schemas=schemas,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    (
+        ("SELECT id FROM sales.customers", "sales.customers"),
+        ("SELECT id FROM SALES.CUSTOMERS", "sales.customers"),
+        ('SELECT id FROM sales."customers"', "sales.customers"),
+        ('SELECT id FROM sales."Customers"', "sales.Customers"),
+        ("SELECT id FROM customers", "sales.customers"),
+    ),
+)
+def test_a_name_folds_as_the_server_does_and_hashes_forward(
+    sql: str, expected: str
+) -> None:
+    result = _validate(sql)
+
+    assert result.valid
+    assert result.resource_names == (
+        (catalog_resource_id(_SOURCE, ResourceKind.TABLE, expected), expected),
     )
 
 
@@ -185,37 +176,6 @@ def test_latest_order_dates_export_regression_is_valid() -> None:
     assert result.analysis.table_function_names == ()
 
 
-def test_cte_order_by_output_alias_wins_before_parent_scope_lookup() -> None:
-    result = _validate("""
-        WITH selected AS (
-          SELECT c.name AS customer_id
-          FROM sales.customers AS c
-          ORDER BY customer_id
-        )
-        SELECT selected.customer_id
-        FROM sales.orders AS o
-        CROSS JOIN selected
-        """)
-
-    assert result.valid, result.issues
-
-
-def test_cte_cannot_escape_to_same_named_parent_column_without_local_alias() -> None:
-    result = _validate("""
-        WITH selected AS (
-          SELECT c.name
-          FROM sales.customers AS c
-          ORDER BY customer_id
-        )
-        SELECT selected.name
-        FROM sales.orders AS o
-        CROSS JOIN selected
-        """)
-
-    assert not result.valid
-    assert "column_scope_escape" in result.issue_codes
-
-
 def test_scalar_function_inside_join_predicate_is_not_a_table_function() -> None:
     analysis = analyze_postgresql_sql(
         "SELECT o.id FROM sales.orders o JOIN sales.customers c "
@@ -247,103 +207,6 @@ def test_only_outer_relation_callable_is_classified_as_table_function() -> None:
 
 
 @pytest.mark.parametrize(
-    ("sql", "function_name"),
-    (
-        (
-            "SELECT o.id FROM sales.orders o "
-            "JOIN LATERAL lower(o.status) AS value ON true",
-            "LOWER",
-        ),
-        (
-            "SELECT o.id FROM sales.orders o JOIN LATERAL "
-            "pg_catalog.generate_series(1, 3) AS value ON true",
-            "PG_CATALOG.GENERATE_SERIES",
-        ),
-    ),
-)
-def test_relation_producing_function_position_is_rejected(
-    sql: str,
-    function_name: str,
-) -> None:
-    result = _validate(sql)
-
-    assert not result.valid
-    assert "function_not_allowed" in result.issue_codes
-    assert result.analysis is not None
-    assert function_name in result.analysis.table_function_names
-
-
-@pytest.mark.parametrize(
-    ("sql", "function_name"),
-    (
-        (
-            "SELECT pg_catalog.pg_read_file('/etc/passwd') FROM sales.orders o",
-            "PG_CATALOG.PG_READ_FILE",
-        ),
-        (
-            "SELECT pg_catalog.pg_sleep(1) FROM sales.orders o",
-            "PG_CATALOG.PG_SLEEP",
-        ),
-        (
-            "SELECT pg_catalog.lo_export(1, '/tmp/value') FROM sales.orders o",
-            "PG_CATALOG.LO_EXPORT",
-        ),
-        (
-            "SELECT pg_catalog.lo_import('/tmp/value') FROM sales.orders o",
-            "PG_CATALOG.LO_IMPORT",
-        ),
-        (
-            "SELECT pg_catalog.pg_advisory_lock(1) FROM sales.orders o",
-            "PG_CATALOG.PG_ADVISORY_LOCK",
-        ),
-        (
-            "SELECT pg_catalog.pg_terminate_backend(1) FROM sales.orders o",
-            "PG_CATALOG.PG_TERMINATE_BACKEND",
-        ),
-        (
-            "SELECT pg_catalog.set_config('search_path', 'public', false) "
-            "FROM sales.orders o",
-            "PG_CATALOG.SET_CONFIG",
-        ),
-        (
-            "SELECT pg_catalog.nextval('sales.sequence') FROM sales.orders o",
-            "PG_CATALOG.NEXTVAL",
-        ),
-        (
-            "SELECT pg_catalog.pg_ls_dir('/tmp') FROM sales.orders o",
-            "PG_CATALOG.PG_LS_DIR",
-        ),
-        (
-            "SELECT pg_catalog.current_setting('search_path') FROM sales.orders o",
-            "PG_CATALOG.CURRENT_SETTING",
-        ),
-        (
-            "SELECT pg_catalog.query_to_xml('SELECT 1', true, false, '') "
-            "FROM sales.orders o",
-            "PG_CATALOG.QUERY_TO_XML",
-        ),
-        ("SELECT random() FROM sales.orders o", "RANDOM"),
-        ("SELECT CURRENT_TIMESTAMP FROM sales.orders o", "CURRENT_TIMESTAMP"),
-        (
-            "SELECT public.custom_function(o.id) FROM sales.orders o",
-            "PUBLIC.CUSTOM_FUNCTION",
-        ),
-    ),
-)
-def test_external_state_and_untrusted_namespace_functions_fail_closed(
-    sql: str,
-    function_name: str,
-) -> None:
-    result = _validate(sql)
-
-    assert not result.valid
-    issue = next(item for item in result.issues if item.code == "function_not_allowed")
-    denied_functions = issue.details["functions"]
-    assert isinstance(denied_functions, tuple)
-    assert function_name in denied_functions
-
-
-@pytest.mark.parametrize(
     "sql",
     (
         "SELECT c.id FROM sales.customers c WHERE EXISTS "
@@ -352,9 +215,17 @@ def test_external_state_and_untrusted_namespace_functions_fail_closed(
         "SELECT recent.id FROM recent UNION ALL SELECT o.id FROM sales.orders o",
         "SELECT DISTINCT ON (o.customer_id) o.customer_id, o.id "
         "FROM sales.orders o ORDER BY o.customer_id, o.ordered_at DESC",
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) "
+        "SELECT r.n FROM r, sales.orders o",
+        "SELECT o.id FROM sales.orders o JOIN LATERAL "
+        "pg_catalog.generate_series(1, 3) AS value ON true",
+        "SELECT 'sales.orders'::regclass, o.status::public.custom_type "
+        "FROM sales.orders o",
+        "SELECT o.total_amount OPERATOR(pg_catalog.+) 1 FROM sales.orders o",
+        "SELECT o.id FROM ONLY sales.orders o",
     ),
 )
-def test_catalog_scoped_postgresql_query_shapes_remain_valid(sql: str) -> None:
+def test_ordinary_postgresql_query_shapes_remain_valid(sql: str) -> None:
     result = _validate(sql)
 
     assert result.valid, result.issues
@@ -363,29 +234,21 @@ def test_catalog_scoped_postgresql_query_shapes_remain_valid(sql: str) -> None:
 @pytest.mark.parametrize(
     ("sql", "issue_code"),
     (
-        ("SELECT 1", "resource_scope_empty"),
-        ("SELECT id FROM orders", "schema_qualification_required"),
-        ("SELECT o.missing FROM sales.orders o", "missing_column"),
-        (
-            "SELECT id FROM sales.orders o JOIN sales.customers c "
-            "ON o.customer_id = c.id",
-            "ambiguous_column",
-        ),
-        ("SELECT o.id FROM private.orders o", "unknown_resource"),
+        ("SELECT o.id FROM private.orders o", "schema_not_configured"),
         ("SELECT o.id FROM sales.orders o FOR UPDATE", "mutation_not_allowed"),
+        ("SELECT * INTO sales.copy FROM sales.orders", "mutation_not_allowed"),
         ("SELECT o.id FROM sales.orders o; SELECT 1", "multiple_statements"),
+        ("/* SELECT 1; */ DROP TABLE sales.orders", "mutation_not_allowed"),
+        ("TRUNCATE sales.orders", "mutation_not_allowed"),
+        ("COPY sales.orders TO '/tmp/out'", "read_statement_required"),
+        ("SET search_path = private", "read_statement_required"),
+        ("DO $$ BEGIN DELETE FROM sales.orders; END $$", "read_statement_required"),
+        ("COMMIT", "read_statement_required"),
+        ("VALUES (1)", "read_statement_required"),
         ("EXPLAIN SELECT o.id FROM sales.orders o", "explain_not_allowed"),
         (
             "SELECT o.total_amount OPERATOR(public.+) 1 FROM sales.orders o",
             "operator_not_allowed",
-        ),
-        (
-            "SELECT 'sales.orders'::regclass FROM sales.orders o",
-            "cast_type_not_allowed",
-        ),
-        (
-            "SELECT o.status::public.custom_type FROM sales.orders o",
-            "cast_type_not_allowed",
         ),
         (
             "WITH changed AS (DELETE FROM sales.orders RETURNING id) "
@@ -394,7 +257,7 @@ def test_catalog_scoped_postgresql_query_shapes_remain_valid(sql: str) -> None:
         ),
     ),
 )
-def test_invalid_statement_and_catalog_shapes_fail_closed(
+def test_invalid_statements_fail_closed_before_any_source_io(
     sql: str,
     issue_code: str,
 ) -> None:
@@ -404,14 +267,213 @@ def test_invalid_statement_and_catalog_shapes_fail_closed(
     assert issue_code in result.issue_codes
 
 
-def test_allowed_resource_scope_is_enforced() -> None:
-    result = _validate(
-        "SELECT c.id FROM sales.customers c",
-        allowed_resource_ids=("resource-orders",),
-    )
+@pytest.mark.parametrize(
+    "call",
+    (
+        "query_to_xml('select * from private.salaries', true, true, '')",
+        "pg_catalog.query_to_xml('select 1', true, true, '')",
+        "query_to_xmlschema('select 1', true, true, '')",
+        "query_to_xml_and_xmlschema('select 1', true, true, '')",
+        "table_to_xml('private.salaries', true, true, '')",
+        "table_to_xmlschema('private.salaries', true, true, '')",
+        "table_to_xml_and_xmlschema('private.salaries', true, true, '')",
+        "schema_to_xml('private', true, true, '')",
+        "database_to_xml(true, true, '')",
+        "cursor_to_xml('c', 1, true, true, '')",
+        "cursor_to_xmlschema('c', true, true, '')",
+        "ts_stat('select 1')",
+        "ts_rewrite('a'::tsquery, 'select 1')",
+        "QUERY_TO_XML('select 1', true, true, '')",
+        "public.custom_function(o.id)",
+        '"pg_read_file"(1)',
+    ),
+)
+def test_functions_refused_in_every_scope_never_reach_the_server(call: str) -> None:
+    result = _validate(f"SELECT {call} FROM sales.orders o")
 
     assert not result.valid
+    assert "function_not_allowed" in result.issue_codes
+
+
+@pytest.mark.parametrize(
+    "relation",
+    (
+        "public.custom_function(1)",
+        '"my schema".custom_function(1)',
+        "a.b.custom_function(1)",
+        '"custom_function"(1)',
+    ),
+)
+def test_a_relation_position_call_outside_pg_catalog_is_refused(relation: str) -> None:
+    result = _validate(f"SELECT * FROM sales.orders o, {relation} AS shown")
+
+    assert not result.valid
+    assert "function_not_allowed" in result.issue_codes
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT 1 ORDER BY 1 USING <",
+        "SELECT pg_read_file('/etc/passwd') FROM sales.orders ORDER BY 1 USING <",
+        "SELECT * FROM",
+    ),
+)
+def test_sql_that_fails_to_parse_is_refused_with_its_position(sql: str) -> None:
+    result = _validate(sql)
+
+    assert not result.valid and result.analysis is None
+    assert result.issue_codes == ("sql_parse_error",)
+    assert "line 1, column" in result.issues[0].message
+    assert "Rewrite" in result.issues[0].message
+
+
+def test_a_parse_refusal_is_logged_by_position_without_the_sql_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.INFO, logger="daita.data"):
+        _validate("SELECT 'private-value' ORDER BY 1 USING <")
+
+    assert "sql_parse_refused" in caplog.text and "column=" in caplog.text
+    assert "private-value" not in caplog.text
+
+
+def test_the_read_transaction_checks_called_functions_except_grammar_forms() -> None:
+    result = _validate(
+        "SELECT lower(o.status), coalesce(o.status, ''), CAST(o.id AS text), "
+        "pg_catalog.upper(o.status), now() FROM sales.orders o"
+    )
+
+    assert result.valid, result.issues
+    assert result.function_lookups == ("LOWER", "PG_CATALOG.UPPER")
+
+
+@pytest.mark.parametrize(
+    ("sql", "names"),
+    (
+        ("SELECT o.peek FROM sales.orders o", ("peek",)),
+        ("SELECT O.PEEK FROM sales.orders o", ("peek",)),
+        ('SELECT o."Peek" FROM sales.orders o', ("Peek",)),
+        ("SELECT (o).peek FROM sales.orders o", ("peek",)),
+        ("SELECT ((o)).peek FROM sales.orders o", ("peek",)),
+        ("SELECT (o.*).peek FROM sales.orders o", ("peek",)),
+        ("SELECT sales.orders.peek FROM sales.orders", ("peek",)),
+        ("SELECT id FROM sales.orders o WHERE o.peek = 'x'", ("peek",)),
+        ("SELECT (SELECT o2 FROM sales.orders o2 LIMIT 1).peek", ("peek",)),
+        ("SELECT id FROM sales.orders", ()),
+    ),
+)
+def test_every_attribute_form_reaches_the_server_lookup(
+    sql: str, names: tuple[str, ...]
+) -> None:
+    result = _validate(sql)
+
+    assert result.valid, result.issues
+    assert result.attribute_lookups == names
+
+
+def test_a_table_function_is_a_function_fact_and_not_a_relation() -> None:
+    result = _validate("SELECT * FROM sales.orders o, generate_series(1, 3) AS g")
+
+    assert result.valid, result.issues
+    assert result.resource_ids == (_table("orders"),)
+    assert result.function_lookups == ("GENERATE_SERIES",)
+
+
+def test_a_read_needs_no_table_at_all() -> None:
+    result = _validate("SELECT 1")
+
+    assert result.valid and result.resource_ids == ()
+
+
+def test_an_unqualified_name_across_schemas_is_left_for_a_live_lookup() -> None:
+    result = _validate("SELECT id FROM ORDERS", schemas=("legacy", "sales"))
+
+    assert result.valid
+    assert result.unqualified_relations == ("orders",)
+    assert result.resource_ids == ()
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT * FROM legacy.orders",
+        'SELECT * FROM "SALES".orders',
+    ),
+)
+def test_a_relation_outside_the_configured_schemas_names_how_to_add_it(
+    sql: str,
+) -> None:
+    result = _validate(sql)
+
+    assert result.issue_codes == ("schema_not_configured",)
+    assert "Add the schema" in result.issues[0].message
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT * FROM pg_tables",
+        "SELECT * FROM pg_catalog.pg_class",
+        "SELECT * FROM information_schema.tables",
+    ),
+)
+def test_system_catalogs_need_the_whole_source(sql: str) -> None:
+    assert _validate(sql).valid
+
+    selected = _validate(sql, allowed=frozenset({_table("orders")}))
+    assert selected.issue_codes == ("resource_out_of_scope",)
+    assert "catalog_describe" in selected.issues[0].message
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT * FROM sales.customers",
+        "SELECT * FROM customers",
+        'SELECT * FROM sales."Orders"',
+        'SELECT * FROM sales."ORDERS"',
+        "SELECT * FROM db.sales.orders",
+        "WITH orders AS (SELECT * FROM sales.customers) SELECT * FROM orders",
+        "SELECT * FROM sales.orders UNION ALL SELECT * FROM sales.customers",
+    ),
+)
+def test_selected_scope_refuses_every_other_name(sql: str) -> None:
+    result = _validate(sql, allowed=frozenset({_table("orders")}))
+
     assert "resource_out_of_scope" in result.issue_codes
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT * FROM sales.orders",
+        "SELECT * FROM ORDERS",
+        'SELECT * FROM sales."orders"',
+        "WITH o AS (SELECT * FROM sales.orders) SELECT * FROM o",
+    ),
+)
+def test_selected_scope_admits_its_table_however_it_is_spelled(sql: str) -> None:
+    result = _validate(sql, allowed=frozenset({_table("orders")}))
+
+    assert result.valid
+    assert result.resource_ids == (_table("orders"),)
+
+
+def test_selected_scope_admits_a_view_by_its_own_kind() -> None:
+    result = _validate(
+        "SELECT * FROM sales.recent", allowed=frozenset({_view("recent")})
+    )
+
+    assert result.valid and result.resource_ids == (_view("recent"),)
+
+
+def test_an_unqualified_system_catalog_name_never_means_a_namesake_table() -> None:
+    result = _validate(
+        "SELECT * FROM pg_tables", allowed=frozenset({_table("pg_tables")})
+    )
+
+    assert result.issue_codes == ("resource_out_of_scope",)
 
 
 @pytest.mark.parametrize(
@@ -450,13 +512,50 @@ def test_postgresql_parameters_are_contiguous_and_numbered(
         assert issue_code in result.issue_codes
 
 
-def test_canonical_sql_is_schema_exact_and_format_stable() -> None:
-    first = analyze_postgresql_sql("SELECT o.id FROM sales.orders o")
-    second = analyze_postgresql_sql("  SELECT o.id\nFROM sales.orders AS o;  ")
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT o.id\nFROM sales.orders AS o",
+        "select /* why */ o.id from sales.orders o -- trailing",
+        r"SELECT id FROM sales.items WHERE name ~ E'\\d+'",
+        "SELECT $1,$2",
+    ),
+)
+def test_the_server_receives_the_statement_as_written(sql: str) -> None:
+    assert analyze_postgresql_sql(sql).canonical_sql == sql
+    assert analyze_postgresql_sql(sql + " ;  ").canonical_sql == sql
 
-    assert "FROM ONLY sales.orders" in first.canonical_sql
-    assert second.canonical_sql == first.canonical_sql
-    assert second.sql_fingerprint == first.sql_fingerprint
+
+@pytest.mark.parametrize(
+    ("call", "name"),
+    (
+        ("ceiling(1)", "ceiling"),
+        ("mod(2, 3)", "mod"),
+        ("date_part('year', ts)", "date_part"),
+        ("now('x')", "now"),
+        ("NOW ()", "now"),
+    ),
+)
+def test_a_call_is_checked_as_written_not_as_the_parser_renames_it(
+    call: str, name: str
+) -> None:
+    result = _validate(f"SELECT {call} FROM sales.orders")
+    assert name in result.written_calls
+
+
+def test_a_quoted_call_keeps_its_case_for_the_function_rule() -> None:
+    """The tree reads "LOWER"(1) as lower(1), but the server keeps the quotes."""
+
+    result = _validate('SELECT "LOWER"(1), "evil"(2) FROM sales.orders')
+    assert {"LOWER", "evil"} <= set(result.written_calls)
+
+
+def test_grammar_and_qualified_calls_are_not_written_calls() -> None:
+    result = _validate(
+        "SELECT pg_catalog.lower(a) FROM sales.orders WHERE id IN (1) AND b = ANY ($1)",
+        parameters=(1,),
+    )
+    assert result.written_calls == ()
 
 
 def test_sql_and_parameter_inputs_are_bounded_before_execution() -> None:
@@ -493,3 +592,68 @@ def test_model_facing_sql_capabilities_publish_the_same_input_bounds() -> None:
         assert isinstance(parameter_schema, Mapping)
         assert sql_schema["maxLength"] == MAX_SQL_CHARACTERS
         assert parameter_schema["maxItems"] == MAX_SQL_PARAMETERS
+
+
+@pytest.mark.parametrize(
+    ("sql", "parameters"),
+    (
+        ("SELECT $1,$2", (1, 2)),
+        ("SELECT $1,$2,$3", (1, 2, 3)),
+        ("SELECT $1+$2", (1, 2)),
+        ("SELECT $1::int,$2::int", (1, 2)),
+        ("SELECT $1,'x',$2", (1, 2)),
+        ("SELECT * FROM t WHERE a IN ($1,$2)", (1, 2)),
+    ),
+)
+def test_numbered_parameters_need_no_space_between_them(
+    sql: str, parameters: tuple[int, ...]
+) -> None:
+    analysis = analyze_postgresql_sql(sql)
+    assert analysis.parameter_ordinals == tuple(range(1, len(parameters) + 1))
+
+
+@pytest.mark.parametrize(
+    ("sql", "kept"),
+    (
+        ("SELECT $1,$2, 'cost $1,$2'", "'cost $1,$2'"),
+        ("SELECT $1,$2, 'it''s $1,$2'", "'it''s $1,$2'"),
+        ("SELECT $1,$2, E'a\\'$1,$2'", "$1,$2"),
+        ('SELECT $1,$2 AS "$1,$2"', '"$1,$2"'),
+        ("SELECT $1,$2, $tag$ $1,$2 $tag$", " $1,$2 "),
+        ("SELECT $1,$2, $$ $1,$2 $$", " $1,$2 "),
+    ),
+)
+def test_spacing_parameters_leaves_literals_exactly_as_written(
+    sql: str, kept: str
+) -> None:
+    assert kept in analyze_postgresql_sql(sql).canonical_sql
+
+
+def test_a_comment_cannot_hide_a_statement_from_parameter_spacing() -> None:
+    analysis = analyze_postgresql_sql("SELECT $1,$2 /* $3,$4 */; DROP TABLE t -- $5,$6")
+    assert analysis.statement_count == 2
+
+
+def test_an_unterminated_dollar_quote_is_still_refused() -> None:
+    with pytest.raises(SqlAnalysisError, match="could not be parsed"):
+        analyze_postgresql_sql("SELECT $tag$ never closed")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        r"SELECT id FROM sales.items WHERE name ~ E'\\d+'",
+        r"SELECT E'a\\nb'",
+    ),
+)
+def test_a_backslash_in_an_escape_string_reaches_the_server_unchanged(sql: str) -> None:
+    result = _validate(sql)
+    assert not result.issues
+    assert result.analysis is not None and result.analysis.canonical_sql == sql
+
+
+@pytest.mark.parametrize(
+    "literal", ("E'plain'", r"E'a\nb'", r"E'it\'s'", r"'a\b'", r"$$a\b$$")
+)
+def test_strings_that_keep_their_meaning_still_read(literal: str) -> None:
+    assert not _validate(f"SELECT {literal} AS value").issues

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
 from functools import lru_cache
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
@@ -18,6 +18,17 @@ class EffectiveSourceScope:
 
     source_ids: frozenset[str]
     resource_ids: frozenset[str]
+    # source ID -> (display name, adapter id): the model addresses a source by
+    # its display name, and stored transcripts resolve those names later from
+    # this frozen record. Resources need no index: their ID is the hash of
+    # (source, kind, native name).
+    source_labels: Mapping[str, tuple[str, str]] = field(
+        default_factory=dict, hash=False
+    )
+    # Sources this run may read in full: the engine decides what exists, so
+    # resource_ids lists no tables for them. Runs stored before catalog tools took
+    # names list what the catalog knew, which resolves their stored calls the same.
+    unrestricted_source_ids: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         for name, maximum in (("source_ids", 256), ("resource_ids", 10_000)):
@@ -30,12 +41,57 @@ class EffectiveSourceScope:
             object.__setattr__(self, name, values)
         if self.resource_ids and not self.source_ids:
             raise ValueError("effective resources require an admitted source")
+        labels = {
+            source_id: (str(label[0]), str(label[1]))
+            for source_id, label in self.source_labels.items()
+        }
+        if any(
+            source_id not in self.source_ids or not label[0] or len(label[0]) > 2_048
+            for source_id, label in labels.items()
+        ):
+            raise ValueError("source labels must name admitted sources")
+        object.__setattr__(self, "source_labels", MappingProxyType(labels))
+        unrestricted = frozenset(self.unrestricted_source_ids)
+        if not unrestricted <= self.source_ids:
+            raise ValueError("unrestricted sources must be admitted sources")
+        object.__setattr__(self, "unrestricted_source_ids", unrestricted)
 
     def to_mapping(self) -> dict[str, object]:
-        return {
+        mapping: dict[str, object] = {
             "source_ids": tuple(sorted(self.source_ids)),
             "resource_ids": tuple(sorted(self.resource_ids)),
         }
+        if self.source_labels:
+            mapping["source_labels"] = {
+                source_id: list(self.source_labels[source_id])
+                for source_id in sorted(self.source_labels)
+            }
+        if self.unrestricted_source_ids:
+            mapping["unrestricted_source_ids"] = tuple(
+                sorted(self.unrestricted_source_ids)
+            )
+        return mapping
+
+    def covers(self, source_ids: Iterable[str], resource_ids: Iterable[str]) -> bool:
+        """Whether a record naming these sources and resources is inside this scope."""
+
+        sources = set(source_ids)
+        return sources <= self.source_ids and (
+            sources <= self.unrestricted_source_ids
+            or set(resource_ids) <= self.resource_ids
+        )
+
+    def sources_named(self, name: str) -> tuple[str, ...]:
+        """Return the IDs of every admitted source whose display name is ``name``."""
+
+        folded = name.strip().casefold()
+        return tuple(
+            sorted(
+                source_id
+                for source_id, (display_name, _) in self.source_labels.items()
+                if display_name.casefold() == folded
+            )
+        )
 
 
 SOURCE_REF_PREFIX = "s"
@@ -65,13 +121,17 @@ class ScopeRefs:
 
 @lru_cache(maxsize=8)
 def scope_refs(scope: EffectiveSourceScope | None) -> ScopeRefs:
-    """Number one frozen scope deterministically; one shared definition."""
+    """Number one frozen scope deterministically; one shared definition.
+
+    A scope that froze display names belongs to a run addressed by name. It was
+    never shown a handle, so a value like ``s2`` there is only a name.
+    """
 
     handles = {
         identity: f"{prefix}{index}"
         for prefix, identities in (
             ()
-            if scope is None
+            if scope is None or scope.source_labels
             else (
                 (SOURCE_REF_PREFIX, scope.source_ids),
                 (RESOURCE_REF_PREFIX, scope.resource_ids),
@@ -107,8 +167,69 @@ async def resolve_machine_source_scope(
     sources -= {catalog.session_source_id}
     if not sources:
         return EffectiveSourceScope(frozenset(), frozenset())
-    resources = await catalog.readable_resource_ids(agent_id, tuple(sorted(sources)))
-    return EffectiveSourceScope(sources, resources)
+    unrestricted, resources = await _read_access(agent_id, sources, (), catalog)
+    return EffectiveSourceScope(
+        sources, resources, unrestricted_source_ids=unrestricted
+    )
+
+
+# (sources it leaves unrestricted, the tables it lists for every other source)
+ReadNarrowing = tuple[frozenset[str], frozenset[str]]
+
+
+def run_read_narrowings(run: RunInput) -> tuple[ReadNarrowing, ...]:
+    """What a run's frozen scope and machine ceiling each allow."""
+
+    narrowings: list[ReadNarrowing] = []
+    prepared = run.resolved_source_scope
+    if prepared is not None:
+        narrowings.append((prepared.unrestricted_source_ids, prepared.resource_ids))
+    ceiling = run.execution_scope
+    if ceiling is not None:
+        narrowings.append(
+            (
+                frozenset(ceiling.unrestricted_source_ids),
+                frozenset(ceiling.allowed_resource_ids),
+            )
+        )
+    return tuple(narrowings)
+
+
+def narrowed_read_access(
+    source_id: str,
+    access: frozenset[str] | None,
+    narrowings: tuple[ReadNarrowing, ...],
+) -> frozenset[str] | None:
+    """One source's current access under a run's limits; None means unrestricted.
+
+    Listed IDs from other sources are harmless here: an ID hashes its source, so
+    it never matches a table of this one.
+    """
+
+    for unrestricted, listed in narrowings:
+        if source_id not in unrestricted:
+            access = listed if access is None else access & listed
+    return access
+
+
+async def _read_access(
+    agent_id: str,
+    sources: frozenset[str],
+    narrowings: tuple[ReadNarrowing, ...],
+    catalog: SourceScopeCatalog,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Split sources into unrestricted ones and the tables listed for the rest."""
+
+    current = await catalog.source_read_access(agent_id, tuple(sorted(sources)))
+    unrestricted: set[str] = set()
+    listed: set[str] = set()
+    for source_id, access in current.items():
+        access = narrowed_read_access(source_id, access, narrowings)
+        if access is None:
+            unrestricted.add(source_id)
+        else:
+            listed |= access
+    return frozenset(unrestricted), frozenset(listed)
 
 
 class SourceScopeCatalog(Protocol):
@@ -116,9 +237,9 @@ class SourceScopeCatalog(Protocol):
         self, agent_id: str, source_ids: tuple[str, ...] = ()
     ) -> tuple[Mapping[str, object], ...]: ...
 
-    async def readable_resource_ids(
-        self, agent_id: str, source_ids: tuple[str, ...] = ()
-    ) -> frozenset[str]: ...
+    async def source_read_access(
+        self, agent_id: str, source_ids: tuple[str, ...]
+    ) -> Mapping[str, frozenset[str] | None]: ...
 
     @property
     def session_source_id(self) -> str | None: ...
@@ -175,11 +296,19 @@ async def resolve_effective_source_scope(
         sources -= {catalog.session_source_id}
     if not sources:
         return empty
-    resources = await catalog.readable_resource_ids(
-        run.agent_id, tuple(sorted(sources))
+    unrestricted, resources = await _read_access(
+        run.agent_id, sources, run_read_narrowings(run), catalog
     )
-    if ceiling is not None:
-        resources &= frozenset(ceiling.allowed_resource_ids)
-    if prepared is not None:
-        resources &= prepared.resource_ids
-    return EffectiveSourceScope(sources, resources)
+    return EffectiveSourceScope(
+        sources,
+        resources,
+        {
+            source_id: (display_name, str(fact.get("adapter_id", "")))
+            for fact in facts
+            if isinstance(source_id := fact.get("source_id"), str)
+            and source_id in sources
+            and isinstance(display_name := fact.get("display_name"), str)
+            and display_name
+        },
+        unrestricted,
+    )

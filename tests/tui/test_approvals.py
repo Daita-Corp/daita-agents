@@ -84,24 +84,24 @@ async def test_approval_approve_deny_cancel_and_unreviewable(size, section):
     request = ApprovalRequest(
         run_id="run-1",
         call_id="call-1",
-        tool_name="data_update_rows",
-        capability_id="data.update_rows",
+        tool_name="data_write",
+        capability_id="data.write",
         arguments=FrozenJsonObject.from_mapping({"name": "safe"}),
         reason="update one row",
     )
     secret = ApprovalRequest(
         run_id="run-2",
         call_id="call-2",
-        tool_name="data_update_rows",
-        capability_id="data.update_rows",
+        tool_name="data_write",
+        capability_id="data.write",
         arguments=FrozenJsonObject.from_mapping({"password": "hidden-secret"}),
         reason="secret shaped",
     )
     oversized = ApprovalRequest(
         run_id="run-3",
         call_id="call-3",
-        tool_name="data_update_rows",
-        capability_id="data.update_rows",
+        tool_name="data_write",
+        capability_id="data.write",
         arguments=FrozenJsonObject.from_mapping({"blob": "x" * (70 * 1024)}),
         reason="too big",
     )

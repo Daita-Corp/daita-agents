@@ -21,6 +21,7 @@ from daita.domains.data.capabilities import (
     SqlReadResult,
 )
 from daita.domains.data.results import project_result_rows
+from daita.domains.data.sql import CheckedRead
 from daita.hosting.errors import AgentHomeError
 from daita.llm.models import (
     FinishReason,
@@ -55,15 +56,12 @@ class _StubReadBackend:
 
     async def execute_read(self, **request: object) -> SqlReadResult:
         self.calls.append(request)
-        revisions = request["expected_resource_revisions"]
-        assert isinstance(revisions, tuple)
+        read = cast(CheckedRead, request["read"])
         return SqlReadResult(
             source_id=str(request["source_id"]),
-            canonical_sql=str(request["sql"]),
+            canonical_sql=read.canonical_sql,
             sql_fingerprint="sha256:" + "1" * 64,
-            resource_ids=tuple(resource_id for resource_id, _ in revisions),
-            resource_revisions=revisions,
-            source_revision="memory:v1",
+            resource_ids=read.resource_ids,
             columns=("region", "revenue"),
             projection=project_result_rows(
                 ({"region": "north", "revenue": 15},), max_rows=100, max_bytes=16_384
@@ -278,9 +276,7 @@ async def test_type_with_only_tabular_reads_joins_a_sqlite_table_but_gets_no_sql
     regions_input = cast(tuple[Mapping[str, object], ...], data["inputs"])[0]
     assert regions_input["source_id"] == regions.id
     assert regions_input["columns"] == ("region", "revenue")
-    assert [dict(item) for item in regions_input["resource_revisions"]] == [  # type: ignore[attr-defined]
-        {"resource_id": regions_table.id, "revision": regions_table.current_revision}
-    ]
+    assert regions_input["resource_ids"] == (regions_table.id,)
 
 
 @pytest.mark.acceptance
@@ -306,13 +302,17 @@ async def test_registered_type_without_sql_attaches_catalogs_reopens_and_detache
             provider,
             (
                 _tool("search", "catalog_search", {"query": "regions revenue"}),
-                _tool("describe", "catalog_describe", {"resource_ids": [resource.id]}),
+                _tool(
+                    "describe",
+                    "catalog_describe",
+                    {"source_id": source.id, "name": resource.native_identity},
+                ),
                 _stop("The regions table has region and revenue."),
             ),
             source_scope_ids=(source.id,),
         )
         assert not results["search"].is_error
-        assert resource.id in repr(results["search"].output)
+        assert resource.native_identity in repr(results["search"].output)
         assert not results["describe"].is_error
         assert "revenue" in repr(results["describe"].output)
     finally:
@@ -413,6 +413,7 @@ async def test_unregistered_type_in_a_stored_home_degrades_without_breaking_sqli
         assert await agent.unavailable_sources() == (memory,)
         with pytest.raises(AgentHomeError, match="not registered"):
             await agent.refresh_source(memory.id)
+        assert not (await agent.check_source(memory.id)).healthy
         assert (await agent.refresh_source(customers.id)).id == customers.id
 
         (table,) = await agent.list_catalog_resources(source_id=customers.id)

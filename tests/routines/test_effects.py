@@ -273,12 +273,7 @@ async def _assignment(
     registry: CapabilityRegistry | None = None
 
     async def read_contracts(**kwargs):
-        assert (
-            kwargs["source_ids"]
-            == kwargs["resource_ids"]
-            == kwargs["connector_binding_ids"]
-            == ()
-        )
+        assert kwargs["connector_binding_ids"] == ()
         current_registry = registry
         assert current_registry is not None
         return ExecutionContractBindings(

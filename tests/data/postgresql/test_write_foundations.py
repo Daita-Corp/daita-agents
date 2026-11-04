@@ -21,10 +21,11 @@ from daita.catalog.models import (
 )
 from daita.context import _tool_guidance
 from daita.domains.data.capabilities import (
-    RELATIONAL_UPDATE_CAPABILITY_ID,
-    RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
-    relational_update_capability_declarations,
-    relational_update_preview_capability_declarations,
+    relational_write_capability_declarations,
+)
+from daita.domains.data.controller import (
+    RELATIONAL_WRITE_CAPABILITY_ID,
+    RELATIONAL_WRITE_PREVIEW_CAPABILITY_ID,
 )
 from daita.security import EmptySecretProvider, SecretReference
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
@@ -33,15 +34,13 @@ from tests.support.workspace import workspace_for
 NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 
 
-def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> None:
-    preview = relational_update_preview_capability_declarations()
-    update = relational_update_capability_declarations()
+def test_model_contract_makes_the_write_call_the_only_approval_trigger() -> None:
+    write = relational_write_capability_declarations()
 
-    assert preview.tool_views == ()
-    (view,) = update.tool_views
+    (view,) = write.tool_views
     assert view.mode_capability_ids == (
-        ("preview", RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID),
-        ("apply", RELATIONAL_UPDATE_CAPABILITY_ID),
+        ("preview", RELATIONAL_WRITE_PREVIEW_CAPABILITY_ID),
+        ("apply", RELATIONAL_WRITE_CAPABILITY_ID),
     )
     # One call writes; mode=preview is only for looking first.
     assert view.default_mode == "apply"
@@ -58,13 +57,13 @@ def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> No
     prompt = _tool_guidance(
         frozenset(
             {
-                RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
-                RELATIONAL_UPDATE_CAPABILITY_ID,
+                RELATIONAL_WRITE_PREVIEW_CAPABILITY_ID,
+                RELATIONAL_WRITE_CAPABILITY_ID,
             }
         ),
         (),
     )
-    assert "matched_rows" not in prompt
+    assert "affected_rows" not in prompt
     assert "approval card" not in prompt
 
 
@@ -407,7 +406,7 @@ async def test_committed_source_edit_deletes_only_the_previous_owned_credential(
 
 
 def test_postgresql_discovery_projects_write_relevant_column_facts():
-    column = postgresql_module._column(
+    column = postgresql_module.column_from_row(
         {
             "column_name": "account_id",
             "native_type": "bigint",
@@ -434,9 +433,9 @@ def test_postgresql_discovery_projects_write_relevant_column_facts():
         generated=False,
         updatable=False,
     )
-    assert "attidentity" in postgresql_module._COLUMNS_SQL
-    assert "attgenerated" in postgresql_module._COLUMNS_SQL
-    assert "is_updatable" in postgresql_module._COLUMNS_SQL
+    assert "attidentity" in postgresql_module.COLUMNS_SQL
+    assert "attgenerated" in postgresql_module.COLUMNS_SQL
+    assert "is_updatable" in postgresql_module.COLUMNS_SQL
 
 
 @pytest.mark.parametrize(

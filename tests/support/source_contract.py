@@ -121,6 +121,11 @@ async def assert_source_type_contract(
             registration.id,
             registration.adapter_id,
         )
+        # What a person sees at attach: the role, read-only status and warnings.
+        assert health.healthy
+        assert isinstance(health.details.get("role", ""), str)
+        assert isinstance(health.details.get("read_only", True), bool)
+        assert all(isinstance(item, str) for item in health.details.get("warnings", ()))  # type: ignore[attr-defined]
 
         rebuilt = source_type.from_registration(
             registration, secret_provider=secret_provider
@@ -189,14 +194,12 @@ async def assert_tabular_read_contract(
         *filters: TabularFilter,
         limit: int = 10_000,
         max_bytes: int = 4 * 1_024 * 1_024,
-        revision: str = resource.current_revision,
     ) -> BoundedResultProjection:
         projection = await backend.read_tabular(
             ReadTabularRequest(
                 agent_id=agent.id,
                 source_id=source_id,
                 resource_id=resource_id,
-                expected_revision=revision,
                 columns=columns,
                 filters=filters,
                 limit=limit,
@@ -243,10 +246,6 @@ async def assert_tabular_read_contract(
     assert by_rows.truncated and "row_limit" in by_rows.truncation_reasons
     by_bytes = await read(max_bytes=2)
     assert by_bytes.truncated and "byte_limit" in by_bytes.truncation_reasons
-
-    with pytest.raises(DaitaError) as stale:
-        await read(revision="sha256:" + "0" * 64)
-    assert stale.value.error_code == "query_binding_stale"
 
 
 async def assert_live_source_contract(
@@ -336,6 +335,7 @@ async def assert_live_source_contract(
             path_pattern=dataset_pattern,
             canonical_sql=validated.canonical_sql,
             sql_fingerprint=validated.sql_fingerprint,
+            resource_ids=None,
         )
     )
     assert rows.data["columns"] == ("n",)

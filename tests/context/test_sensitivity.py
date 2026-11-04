@@ -6,7 +6,6 @@ from datetime import UTC, datetime
 import pytest
 
 from daita import Agent, SQLiteSource
-from daita._json import FrozenJsonObject
 from daita.capabilities import (
     Capability,
     ToolExecution,
@@ -85,50 +84,8 @@ class _NoSourceCatalog:
         del agent_id, source_ids
         return ()
 
-    def empty_catalog_context(self, *, prior_query=None):
-        return self._empty_catalog_context(prior_query is not None)
-
-    async def catalog_context(
-        self,
-        agent_id,
-        query,
-        *,
-        prior_query=None,
-        limit,
-        source_ids=(),
-        resource_ids=(),
-        readable_resource_ids=None,
-    ):
-        del agent_id, query, limit, source_ids, resource_ids, readable_resource_ids
-        return self._empty_catalog_context(prior_query is not None)
-
-    @staticmethod
-    def _empty_catalog_context(has_prior):
-        no_match = {
-            "binding_status": "no_match",
-            "source_status": "no_match",
-            "evidence_tier": "none",
-            "candidate_count": 0,
-            "candidate_bindings": (),
-            "omitted_candidate_count": 0,
-            "ambiguity_reasons": (),
-            "assessment_provenance": "catalog_service",
-            "trust_classification": "untrusted_external_data",
-        }
-        return FrozenJsonObject.from_mapping(
-            {
-                "resources": (),
-                "sources": (),
-                "match_outcomes": {
-                    "current_query": no_match,
-                    "prior_query": no_match if has_prior else None,
-                },
-                "total_matches": 0,
-                "returned_count": 0,
-                "truncated": False,
-                "trust_classification": "untrusted_external_data",
-            }
-        )
+    async def source_directory(self, agent_id, source_ids):
+        return await self.source_routing_facts(agent_id, source_ids)
 
 
 class _StaticContextCatalog:
@@ -138,11 +95,20 @@ class _StaticContextCatalog:
     async def source_routing_facts(self, agent_id, source_ids=()):
         return ({"source_id": "source-static", "adapter_id": "sqlite"},)
 
+    async def source_read_access(self, agent_id, source_ids):
+        return {
+            source_id: await self.readable_resource_ids(agent_id, (source_id,))
+            for source_id in source_ids
+        }
+
     async def readable_resource_ids(self, agent_id, source_ids=()):
         return frozenset(("untrusted-resource",))
 
-    def empty_catalog_context(self, *, prior_query=None):
-        return _NoSourceCatalog._empty_catalog_context(prior_query is not None)
+    async def resource_names(self, agent_id, source_ids=()):
+        return {}
+
+    async def source_directory(self, agent_id, source_ids):
+        return await self.source_routing_facts(agent_id, source_ids)
 
     def __init__(self, sensitivity: ModelSensitivity | None) -> None:
         self.sensitivity = sensitivity
@@ -150,65 +116,6 @@ class _StaticContextCatalog:
     async def admitted_model_sensitivity(self, agent_id, source_ids=()):
         del agent_id, source_ids
         return self.sensitivity
-
-    async def catalog_context(
-        self,
-        agent_id,
-        query,
-        *,
-        prior_query=None,
-        limit,
-        source_ids=(),
-        resource_ids=(),
-        readable_resource_ids=None,
-    ):
-        del agent_id, query, prior_query, limit
-        del source_ids, resource_ids, readable_resource_ids
-        return FrozenJsonObject.from_mapping(
-            {
-                "resources": (
-                    {
-                        "kind": "table",
-                        "match_reasons": ("resource_name_exact_mention",),
-                        "name": "untrusted-resource",
-                        "resource_id": "untrusted-resource",
-                        "revision": "sha256:" + ("a" * 64),
-                        "sensitivity": "restricted",
-                        "source_id": "source-static",
-                    },
-                ),
-                "sources": (
-                    {
-                        "source_id": "source-static",
-                        "source_revision": "catalog:static",
-                        "sync_id": "sync-static",
-                    },
-                ),
-                "match_outcomes": {
-                    "current_query": {
-                        "binding_status": "unique",
-                        "source_status": "unique",
-                        "evidence_tier": "exact_resource",
-                        "candidate_count": 1,
-                        "candidate_bindings": (
-                            {
-                                "source_id": "source-static",
-                                "resource_id": "untrusted-resource",
-                            },
-                        ),
-                        "omitted_candidate_count": 0,
-                        "ambiguity_reasons": (),
-                        "assessment_provenance": "catalog_service",
-                        "trust_classification": "untrusted_external_data",
-                    },
-                    "prior_query": None,
-                },
-                "total_matches": 1,
-                "returned_count": 1,
-                "truncated": False,
-                "trust_classification": "untrusted_external_data",
-            }
-        )
 
 
 class _AdvisoryMemory:

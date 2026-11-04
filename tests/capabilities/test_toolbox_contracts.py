@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from daita.adapters.analytical_workspace.runtime import runtime_status
+from daita.capabilities import model_identity_schema
 from tests.capabilities._toolbox_support import (
     NOW,
     TOOLBOX_DEFINITIONS,
@@ -239,6 +240,8 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             "catalog_schema",
             "catalog_inspect",
             "catalog_traverse",
+            "data_update_rows",
+            "data_upsert_rows",
             "data_preview_update_rows",
             "data_preview_upsert_rows",
         }.isdisjoint(registry.tool_names)
@@ -266,13 +269,9 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
                 ("inputs", "data.query_combined"),
                 ("path_pattern", "data.query_files"),
             ),
-            "data_update_rows": (
-                ("preview", "data.preview_update_rows"),
-                ("apply", "data.update_rows"),
-            ),
-            "data_upsert_rows": (
-                ("preview", "data.preview_upsert_rows"),
-                ("apply", "data.upsert_rows"),
+            "data_write": (
+                ("preview", "data.preview_write"),
+                ("apply", "data.write"),
             ),
             "routine_save": (
                 ("create", "routines.create"),
@@ -295,8 +294,7 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             "catalog_search",
             "catalog_describe",
             "data_query",
-            "data_update_rows",
-            "data_upsert_rows",
+            "data_write",
             "semantic_save",
             "semantic_view",
             "skill_save",
@@ -362,7 +360,9 @@ async def test_contract_schema_survives_replacement_in_real_request(
         )
         contract = cast(Mapping[str, Any], _data(retained))["value"]
         view, primary = runtime._registry.resolve_tool(first)
-        assert contract["input_schema"] == primary.input_schema
+        assert canonical_json(contract["input_schema"]) == canonical_json(
+            model_identity_schema(primary.input_schema)
+        )
         if view.mode_capability_ids:
             assert contract["route_argument"] == view.mode_argument
             assert [
@@ -372,7 +372,11 @@ async def test_contract_schema_survives_replacement_in_real_request(
                 # Each route is stated as changes to the top-level schema, and
                 # applying them restores that route's exact input schema.
                 assert _route_schema(contract["input_schema"], route) == _plain(
-                    runtime._registry.capability(route["capability_id"]).input_schema
+                    model_identity_schema(
+                        runtime._registry.capability(
+                            route["capability_id"]
+                        ).input_schema
+                    )
                 )
         assert contract["complete"] is True
         assert contract["input_schema_digest"]

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -46,10 +46,10 @@ from daita.domains.data import (
 )
 from daita.domains.data.capabilities import ReadTabularRequest, SqlReadResult
 from daita.domains.data.results import project_result_rows
+from daita.domains.data.sql import CheckedRead
 from daita.llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
-from daita.scope import EffectiveSourceScope, scope_refs
 from tests.support.capability_runtime import execute_projected
 from tests.support.memory_source import MEMORY_ADAPTER_ID, MEMORY_TYPE, MemorySource
 from tests.support.workspace import workspace_for
@@ -276,10 +276,6 @@ async def test_combined_query_totals_revenue_by_region_across_two_sqlite_sources
     assert data["columns"] == ("region", "revenue")
     assert data["truncated"] is False
     assert data["resource_ids"] == tuple(sorted((shop.orders, shop.customers)))
-    assert {
-        item["resource_id"]: item["revision"]
-        for item in cast(tuple[Mapping[str, object], ...], data["resource_revisions"])
-    } == {resource_id: item.current_revision for resource_id, item in catalog.items()}
     inputs = cast(tuple[Mapping[str, object], ...], data["inputs"])
     assert [(item["alias"], item["source_id"], item["rows"]) for item in inputs] == [
         ("o", shop.orders_source, 3),
@@ -296,29 +292,26 @@ async def test_combined_query_totals_revenue_by_region_across_two_sqlite_sources
     )
 
 
-async def test_tabular_input_named_by_run_handles_joins_a_sqlite_input(
+async def test_tabular_input_named_by_display_and_native_names_joins_a_sqlite_input(
     tmp_path: Path,
 ):
     shop = await _shop(tmp_path, _MEMORY)
     try:
         regions_source, regions = await _regions(shop)
-        # The model may name the tabular input's identities by run handles.
-        refs = scope_refs(
-            EffectiveSourceScope(
-                frozenset({shop.customers_source, regions_source}),
-                frozenset({shop.customers, regions}),
-            )
-        )
+        (table,) = await shop.agent.list_catalog_resources(source_id=regions_source)
+        # The model names the tabular input's source by display name and its
+        # table by native name; the resolver supplies the exact IDs.
         result = await _call(
             shop,
             {
                 "inputs": (
                     _inputs(shop)[1],
-                    _tabular_regions(
-                        refs.handles[regions_source],
-                        refs.handles[regions],
-                        filters=({"column": "revenue", "operator": "gte", "value": 5},),
-                    ),
+                    {
+                        **_tabular_regions("Regions", table.native_identity),
+                        "filters": (
+                            {"column": "revenue", "operator": "gte", "value": 5},
+                        ),
+                    },
                 ),
                 "sql": REGION_CUSTOMERS,
             },
@@ -340,9 +333,7 @@ async def test_tabular_input_named_by_run_handles_joins_a_sqlite_input(
         {"column": "revenue", "operator": "gte", "value": 5}
     ]
     assert "canonical_sql" not in tabular
-    assert [dict(item) for item in tabular["resource_revisions"]] == [  # type: ignore[attr-defined]
-        {"resource_id": regions, "revision": table.current_revision}
-    ]
+    assert tabular["resource_ids"] == (regions,)
 
 
 async def test_an_input_with_no_rows_still_aggregates(tmp_path: Path):
@@ -368,32 +359,6 @@ async def test_an_input_with_no_rows_still_aggregates(tmp_path: Path):
         {"region": "north", "revenue": None},
         {"region": "south", "revenue": None},
     )
-
-
-async def test_sql_input_without_catalog_revisions_is_refused_before_any_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    shop = await _shop(tmp_path)
-    view = shop.agent._embedded._data_view
-    schemas = view.resource_schemas
-
-    async def without_revisions(agent_id: str, source_id: str, *args, **kwargs):
-        found = await schemas(agent_id, source_id, *args, **kwargs)
-        if source_id != shop.customers_source:
-            return found
-        return tuple(replace(item, revision=None) for item in found)
-
-    monkeypatch.setattr(view, "resource_schemas", without_revisions)
-    try:
-        reads = _wrap_sqlite_reads(shop.agent)
-        result = await _call(shop, {"inputs": _inputs(shop), "sql": REVENUE_BY_REGION})
-    finally:
-        await shop.agent.close()
-
-    error = _error(result)
-    assert error["code"] == "catalog_provenance_missing"
-    assert cast(Mapping[str, object], error["details"])["input_alias"] == "c"
-    assert reads.reads == []
 
 
 async def test_combining_sql_may_self_join_and_stack_inputs(tmp_path: Path):
@@ -478,7 +443,8 @@ async def test_definition_describes_only_the_routes_a_run_admits(tmp_path: Path)
     assert "Join sources" not in narrowed.description
     assert "Folder files" not in narrowed.description
     assert not {"inputs", "path_pattern"} & set(properties)
-    assert {"source_id", "resource_ids", "sql", "output"} <= set(properties)
+    assert {"source", "sql", "output"} <= set(properties)
+    assert "resource_ids" not in properties and "tables" not in properties
 
 
 async def test_two_inputs_on_one_sqlite_source_share_its_single_permit(tmp_path: Path):
@@ -626,7 +592,7 @@ async def test_input_past_its_internal_ceiling_refuses_the_whole_call(
     assert details["truncation_reasons"] == ("row_limit",)
 
 
-async def test_schema_change_after_validation_fails_the_whole_call_as_stale(
+async def test_schema_change_during_a_call_does_not_disturb_the_join(
     tmp_path: Path,
 ):
     shop = await _shop(tmp_path)
@@ -644,7 +610,7 @@ async def test_schema_change_after_validation_fails_the_whole_call_as_stale(
         await shop.agent.close()
 
     assert reads.reads == [shop.orders_source, shop.customers_source]
-    assert _error(result)["code"] == "catalog_source_stale"
+    assert not result.is_error, result.output
 
 
 @pytest.mark.parametrize("customers_form", ["sql", "tabular"])
@@ -671,6 +637,12 @@ async def test_input_outside_the_run_scope_is_refused_before_any_source_read(
         await shop.agent.close()
 
     error = _error(result)
+    if foreign == "resource" and customers_form == "sql":
+        # The in-scope source may be read in full; it has no such table, and the
+        # other source's table stays out of reach.
+        assert error["code"] == "query_invalid"
+        assert reads.reads == [shop.orders_source, shop.orders_source]
+        return
     assert error["code"] == (
         "source_scope_violation" if foreign == "source" else "resource_read_not_allowed"
     )
@@ -899,22 +871,19 @@ class _TargetsSource:
                 display_name="Targets",
                 configuration={},
                 attached_at=attached_at,
+                presentation_sensitivity=ModelSensitivity.CONFIDENTIAL,
             )
         )
 
 
 class _TargetsBackend:
     async def execute_read(self, **request: object) -> SqlReadResult:
-        revisions = cast(
-            tuple[tuple[str, str], ...], request["expected_resource_revisions"]
-        )
+        read = cast(CheckedRead, request["read"])
         return SqlReadResult(
             source_id=str(request["source_id"]),
-            canonical_sql=str(request["sql"]),
+            canonical_sql=read.canonical_sql,
             sql_fingerprint="sha256:" + "2" * 64,
-            resource_ids=tuple(resource_id for resource_id, _ in revisions),
-            resource_revisions=revisions,
-            source_revision="targets:v1",
+            resource_ids=read.resource_ids,
             columns=("region", "target"),
             projection=project_result_rows(
                 (

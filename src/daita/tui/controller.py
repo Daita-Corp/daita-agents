@@ -76,7 +76,7 @@ from .models import (
     CommandOutcome,
     UserInputError,
 )
-from .projection import artifact_delivery_messages
+from .projection import artifact_delivery_messages, connection_facts
 from .sanitization import MAX_DISPLAY_CHARACTERS, safe_display
 
 _LEARNING_WRITE_TOOLS = frozenset(
@@ -700,6 +700,21 @@ class PresentationController:
             raise UserInputError(
                 guidance + " The existing catalog is still available."
             ) from error
+
+    async def check_source(self, source_id: str) -> dict[str, object]:
+        """Live connection facts for one source; a failed check is a result."""
+
+        try:
+            facts = connection_facts(await self.require_agent().check_source(source_id))
+        except Exception:
+            facts = {"reachable": False}
+        if not facts["reachable"]:
+            facts["guidance"] = SOURCE_REFRESH_ERRORS.get(
+                str(facts.get("error_code")),
+                "The source could not be reached. Check that it is available and "
+                "that its connection settings are right.",
+            )
+        return facts
 
     async def detach_source(self, source_id: str) -> Any:
         return await self.require_agent().detach(source_id)

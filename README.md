@@ -25,8 +25,8 @@ access, budgets, and actions you authorize.
   them with `/learn`; every change waits for your approval.
 - **Deliver useful output.** Create reports backed by evidence and CSV or XLSX
   exports, including exact relational snapshots.
-- **Take controlled action.** Preview and approve scoped PostgreSQL updates or
-  upserts, and admit specific remote MCP actions. Durable receipts support
+- **Take controlled action.** Preview and approve scoped PostgreSQL inserts, updates and
+  deletes, and admit specific remote MCP actions. Durable receipts support
   inspection and recovery when an outcome is uncertain.
 
 Daita works with OpenAI, Anthropic, Gemini, Grok, Ollama, endpoints compatible

@@ -113,8 +113,7 @@ def _result_for_call(transcript, call_id: str) -> ToolResultBlock:
 def _provenance() -> ExactXlsxProvenance:
     return ExactXlsxProvenance(
         source_id="source-1",
-        source_revision="schema_version:7",
-        resource_revisions=(("resource-1", "sha256:" + "1" * 64),),
+        resource_ids=("resource-1",),
         sql_fingerprint="sha256:" + "2" * 64,
         parameters_sha256="sha256:" + "3" * 64,
         sensitivity=Sensitivity.CONFIDENTIAL,
@@ -188,11 +187,7 @@ def test_exact_xlsx_frozen_scalars_precision_and_fixed_provenance() -> None:
         ("Key", "Value"),
         ("Authorship", "exact_source_data"),
         ("Source ID", "source-1"),
-        ("Source Revision", "schema_version:7"),
-        (
-            "Resource Revisions",
-            '[["resource-1","sha256:1111111111111111111111111111111111111111111111111111111111111111"]]',
-        ),
+        ("Resources", '["resource-1"]'),
         ("SQL Fingerprint", "sha256:" + "2" * 64),
         ("Parameters SHA-256", "sha256:" + "3" * 64),
         (

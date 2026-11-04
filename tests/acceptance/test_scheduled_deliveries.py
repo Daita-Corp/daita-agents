@@ -550,7 +550,7 @@ class _OfflinePostgreSQLSource:
             adapter_id="postgresql",
             native_identity="postgresql://offline-d2/public/orders",
             display_name="Offline PostgreSQL",
-            configuration={},
+            configuration={"schemas": ("public",)},
             attached_at=NOW,
         )
 
@@ -674,10 +674,6 @@ async def test_scheduled_postgresql_xlsx_uses_the_same_inbox_path(
         source_io += 1
         return _Connection()
 
-    async def load_structure(*args: object, **kwargs: object) -> SimpleNamespace:
-        del args, kwargs
-        return SimpleNamespace(source_revision="catalog:offline-postgresql-d2")
-
     async def execute_exact(
         *args: object, **kwargs: object
     ) -> tuple[bytes, tuple[str, ...], int]:
@@ -697,7 +693,6 @@ async def test_scheduled_postgresql_xlsx_uses_the_same_inbox_path(
         del args, kwargs
 
     monkeypatch.setattr(postgresql_query_module, "_connect", connect)
-    monkeypatch.setattr(postgresql_query_module, "_load_structure", load_structure)
     monkeypatch.setattr(
         postgresql_query_module,
         "_execute_exact_tabular_query",
@@ -1074,7 +1069,7 @@ def _tool_result(transcript: object, call_id: str) -> ToolResultBlock:
     return block
 
 
-async def test_scheduled_routine_reads_an_attached_folder_and_refuses_a_changed_file(
+async def test_scheduled_routine_reads_an_attached_folder_as_it_is_now(
     tmp_path: Path,
 ) -> None:
     folder = tmp_path / "drop"
@@ -1107,7 +1102,7 @@ async def test_scheduled_routine_reads_an_attached_folder_and_refuses_a_changed_
             name="data_query",
             arguments={
                 "source_id": source.id,
-                "resource_ids": (resource.id,),
+                "path_pattern": "orders.csv",
                 "sql": "SELECT SUM(amount) AS total FROM data",
             },
         )
@@ -1150,8 +1145,8 @@ async def test_scheduled_routine_reads_an_attached_folder_and_refuses_a_changed_
 
         read = await occurrence(1)
         assert not read.is_error, read.output
-        # Eligibility no longer narrows scheduled runs, so combined queries are
-        # offered; the live session folder's file route stays excluded.
+        # Eligibility no longer narrows scheduled runs, so combined queries and
+        # the attached folder's file route are offered.
         (scheduled_query,) = [
             tool for tool in provider.requests[-1].tools if tool.name == "data_query"
         ]
@@ -1160,19 +1155,21 @@ async def test_scheduled_routine_reads_an_attached_folder_and_refuses_a_changed_
         )
         assert "Join sources" in scheduled_query.description
         assert "inputs" in properties
-        assert "Folder files" not in scheduled_query.description
-        assert "path_pattern" not in properties
+        assert "Folder files" in scheduled_query.description
+        assert "path_pattern" in properties
         data = cast(Mapping[str, object], read.output["data"])
         assert [dict(row) for row in cast(tuple[Any, ...], data["rows"])] == [
             {"total": 15}
         ]
 
-        # The file changed after cataloging: the unattended read is refused.
+        # The file changed after cataloging: the unattended read sees it as it is.
         orders.write_text("region,amount\nnorth,99\n", encoding="utf-8")
         provider.replace_script((_tools(query), _stop("The file changed.")))
-        refused = await occurrence(2)
-        assert refused.is_error
-        error = cast(Mapping[str, object], refused.output["error"])
-        assert error["code"] == "query_binding_stale"
+        changed = await occurrence(2)
+        assert not changed.is_error, changed.output
+        data = cast(Mapping[str, object], changed.output["data"])
+        assert [dict(row) for row in cast(tuple[Any, ...], data["rows"])] == [
+            {"total": 99}
+        ]
     finally:
         await agent.close()

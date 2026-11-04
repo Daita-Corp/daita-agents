@@ -15,6 +15,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Label, Static, Tree
 
 from ..models import source_type_label
+from ..projection import connection_lines
 from ..sanitization import safe_display, sanitize_terminal_text
 
 
@@ -84,6 +85,9 @@ class CatalogScreen(ModalScreen[SourceManagerAction | None]):
         self._graph_resources: dict[str, Mapping[str, object]] = {}
         self._graph_relationships: dict[str, Mapping[str, object]] = {}
         self._graph_busy = False
+        # Live checks answer once per source for the life of this screen.
+        self._connections: dict[str, dict[str, object]] = {}
+        self._checking: set[str] = set()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="catalog-browser"):
@@ -124,6 +128,7 @@ class CatalogScreen(ModalScreen[SourceManagerAction | None]):
                 id="catalog-help",
                 markup=False,
             )
+            yield Static("", id="source-connection", markup=False)
             with ItemGrid(id="source-actions", min_column_width=14):
                 yield Button("Add source", id="source-add", variant="primary")
                 yield Button("Refresh", id="source-refresh")
@@ -290,6 +295,7 @@ class CatalogScreen(ModalScreen[SourceManagerAction | None]):
         sources_visible = mode == "sources"
         self.query_one("#catalog-tree", Tree).display = sources_visible
         self.query_one("#source-actions", ItemGrid).display = sources_visible
+        self.query_one("#source-connection", Static).display = sources_visible
         self.query_one("#catalog-graph-view", Horizontal).display = not sources_visible
         self.query_one("#catalog-graph-actions", Horizontal).display = (
             not sources_visible
@@ -698,6 +704,38 @@ class CatalogScreen(ModalScreen[SourceManagerAction | None]):
                 + " selected  ·  Enter expands or collapses its resources"
             )
         self.query_one("#catalog-help", Static).update(message)
+        self._show_connection(source_id)
+
+    def _show_connection(self, source_id: str | None) -> None:
+        block = self.query_one("#source-connection", Static)
+        facts = None if source_id is None else self._connections.get(source_id)
+        if source_id is None:
+            block.update("")
+        elif facts is not None:
+            block.update("\n".join(connection_lines(facts)))
+        else:
+            block.update("Checking connection…")
+            if source_id not in self._checking:
+                self._checking.add(source_id)
+                self.run_worker(
+                    self._check_connection(source_id),
+                    name="catalog-connection-check",
+                    group="catalog-connection",
+                    exit_on_error=False,
+                )
+
+    async def _check_connection(self, source_id: str) -> None:
+        self._connections[source_id] = await self.app.controller.check_source(  # type: ignore[attr-defined]
+            source_id
+        )
+        self._checking.discard(source_id)
+        # The screen can be closing: still mounted, but its tree already gone.
+        if (
+            self.is_mounted
+            and self.query("#catalog-tree")
+            and self._selected_source_id() == source_id
+        ):
+            self._show_connection(source_id)
 
     def _summary_text(self) -> str:
         return (

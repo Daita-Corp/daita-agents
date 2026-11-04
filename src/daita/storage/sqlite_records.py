@@ -12,13 +12,6 @@ from hashlib import sha256
 from .._json import FrozenJsonObject, canonical_json
 from ..adapters.models import SourceRegistration
 from ..capabilities import EffectEvidenceBasis, EffectObservation, EffectOutcome
-from ..catalog.models import (
-    CatalogFacet,
-    CatalogResource,
-    FacetKind,
-    ResourceKind,
-    TabularFacet,
-)
 from ..llm.models import ModelSensitivity
 
 _SOURCE_PERMISSION_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -111,26 +104,24 @@ class SourceReadScope:
 
 @dataclass(frozen=True, slots=True)
 class RelationalWriteScope:
-    """Exact operation, structure, column and row authority for one resource."""
+    """The operations, columns and row limit a person allowed on one named table."""
 
     agent_id: str
     source_id: str
     resource_id: str
-    resource_revision: str
+    table: str
     allowed_operations: tuple[str, ...]
     allowed_insert_columns: tuple[str, ...]
     allowed_update_columns: tuple[str, ...]
-    key_columns: tuple[str, ...]
-    generated_identity_columns: tuple[str, ...]
     max_rows: int
     authorization_fingerprint: str
 
     def __post_init__(self) -> None:
         _permission_text(self.agent_id, "write scope agent_id")
+        _permission_text(self.table, "write scope table")
         for value, pattern, name in (
             (self.source_id, _SOURCE_PERMISSION_SOURCE_ID, "source_id"),
             (self.resource_id, _SOURCE_PERMISSION_RESOURCE_ID, "resource_id"),
-            (self.resource_revision, _SOURCE_PERMISSION_HASH, "resource_revision"),
             (
                 self.authorization_fingerprint,
                 _SOURCE_PERMISSION_HASH,
@@ -143,8 +134,6 @@ class RelationalWriteScope:
             "allowed_operations",
             "allowed_insert_columns",
             "allowed_update_columns",
-            "key_columns",
-            "generated_identity_columns",
         ):
             values = _canonical_permission_texts(
                 getattr(self, name),
@@ -154,32 +143,14 @@ class RelationalWriteScope:
             )
             object.__setattr__(self, name, values)
         operations = set(self.allowed_operations)
-        if not operations or not operations <= {"update", "upsert"}:
+        if not operations or not operations <= {"insert", "update", "delete"}:
             raise ValueError(
-                "write scope requires explicit update and/or upsert operations"
+                "write scope requires explicit insert, update or delete operations"
             )
-        if not self.key_columns or not self.allowed_update_columns:
-            raise ValueError("write scope requires exact keys and update columns")
-        if set(self.key_columns) & set(self.allowed_update_columns):
-            raise ValueError("write scope cannot authorize changing conflict keys")
-        if "upsert" not in operations and (
-            self.allowed_insert_columns or self.generated_identity_columns
-        ):
-            raise ValueError(
-                "update permission cannot authorize insertion or identity generation"
-            )
-        if "upsert" in operations and not set(self.key_columns) <= set(
-            self.allowed_insert_columns
-        ):
-            raise ValueError("upsert permission must admit every explicit conflict key")
-        if set(self.generated_identity_columns) & (
-            set(self.allowed_insert_columns)
-            | set(self.allowed_update_columns)
-            | set(self.key_columns)
-        ):
-            raise ValueError(
-                "generated identities must be omitted and outside conflict keys"
-            )
+        if bool(self.allowed_insert_columns) != ("insert" in operations):
+            raise ValueError("insert permission and insert columns go together")
+        if bool(self.allowed_update_columns) != ("update" in operations):
+            raise ValueError("update permission and update columns go together")
         if (
             not isinstance(self.max_rows, int)
             or isinstance(self.max_rows, bool)
@@ -190,12 +161,10 @@ class RelationalWriteScope:
     def constraints(self) -> dict[str, object]:
         """Canonical authority shared by permission review, codecs and grants."""
         return {
-            "resource_revision": self.resource_revision,
+            "table": self.table,
             "allowed_operations": self.allowed_operations,
             "allowed_insert_columns": self.allowed_insert_columns,
             "allowed_update_columns": self.allowed_update_columns,
-            "key_columns": self.key_columns,
-            "generated_identity_columns": self.generated_identity_columns,
             "max_rows": self.max_rows,
         }
 
@@ -208,11 +177,7 @@ class SourcePermissionResource:
     display_name: str
     resource_kind: str
     eligible_assignment_columns: tuple[str, ...] = ()
-    key_columns: tuple[str, ...] = ()
-    upsert_conflict_keys: tuple[tuple[str, ...], ...] = ()
     eligible_insert_columns: tuple[str, ...] = ()
-    eligible_upsert_update_columns: tuple[str, ...] = ()
-    generated_identity_columns: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -233,53 +198,16 @@ class SourcePermissionResource:
             maximum_characters=256,
         )
         object.__setattr__(self, "eligible_assignment_columns", columns)
-        for name in (
+        object.__setattr__(
+            self,
             "eligible_insert_columns",
-            "eligible_upsert_update_columns",
-            "generated_identity_columns",
-        ):
-            object.__setattr__(
-                self,
-                name,
-                _canonical_permission_texts(
-                    getattr(self, name),
-                    name,
-                    maximum_items=512,
-                    maximum_characters=256,
-                ),
-            )
-        if (
-            not isinstance(self.upsert_conflict_keys, tuple)
-            or len(self.upsert_conflict_keys) > 512
-        ):
-            raise ValueError("upsert conflict keys must be bounded")
-        object.__setattr__(
-            self,
-            "upsert_conflict_keys",
-            tuple(
-                _canonical_permission_texts(
-                    key,
-                    "upsert conflict key",
-                    maximum_items=512,
-                    maximum_characters=256,
-                )
-                for key in self.upsert_conflict_keys
-            ),
-        )
-        object.__setattr__(
-            self,
-            "key_columns",
             _canonical_permission_texts(
-                self.key_columns,
-                "key columns",
+                self.eligible_insert_columns,
+                "eligible_insert_columns",
                 maximum_items=512,
                 maximum_characters=256,
             ),
         )
-
-    @property
-    def relational_update_eligible(self) -> bool:
-        return bool(self.eligible_assignment_columns)
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,7 +308,6 @@ class SourcePermissionsInspection:
     source_id: str
     source_display_name: str
     adapter_id: str
-    catalog_generation: str | None
     state: SourcePermissionState
     resources: tuple[SourcePermissionResource, ...]
     # Whether the source's type declares native update or upsert writes.
@@ -403,11 +330,6 @@ class SourcePermissionsInspection:
             "permission inspection adapter_id",
             maximum=128,
         )
-        if self.catalog_generation is not None:
-            _permission_text(
-                self.catalog_generation,
-                "permission inspection catalog_generation",
-            )
         if not isinstance(self.state, SourcePermissionState):
             raise TypeError("permission inspection state must be SourcePermissionState")
         if self.state.read_scope.source_id != self.source_id:
@@ -439,7 +361,6 @@ class SourcePermissionsPreview:
     """One exact in-process confirmed transition; it is never persisted."""
 
     source_id: str
-    catalog_generation: str | None
     before: SourcePermissionState
     after: SourcePermissionState
     automatic_read_additions: tuple[str, ...]
@@ -453,11 +374,6 @@ class SourcePermissionsPreview:
             or _SOURCE_PERMISSION_SOURCE_ID.fullmatch(self.source_id) is None
         ):
             raise ValueError("permission preview source_id must be canonical")
-        if self.catalog_generation is not None:
-            _permission_text(
-                self.catalog_generation,
-                "permission preview catalog_generation",
-            )
         for state, name in ((self.before, "before"), (self.after, "after")):
             if not isinstance(state, SourcePermissionState):
                 raise TypeError(f"permission preview {name} must be state")
@@ -503,65 +419,15 @@ class SourcePermissionsPreview:
 def relational_write_authorization_fingerprint(
     *,
     source: SourceRegistration,
-    resource: CatalogResource,
-    facet: CatalogFacet,
     scope: RelationalWriteScope,
 ) -> str:
-    """Bind exact current structural and permission facts, excluding freshness."""
+    """Bind one scope to its source; the table and columns are read live at use."""
     if (
         not source.active
-        or resource.agent_id != source.agent_id
-        or resource.source_id != source.id
-        or resource.kind is not ResourceKind.TABLE
-        or facet.resource_id != resource.id
-        or facet.kind is not FacetKind.TABULAR
         or scope.agent_id != source.agent_id
         or scope.source_id != source.id
-        or scope.resource_id != resource.id
-        or scope.resource_revision != resource.current_revision
     ):
-        raise ValueError(
-            "write authorization requires exact current owned table structure"
-        )
-    tabular = TabularFacet.from_payload(facet.payload)
-    columns = {column.name: column for column in tabular.columns}
-    primary = {
-        column.name
-        for column in tabular.columns
-        if column.primary_key_ordinal is not None
-    }
-    for name in scope.allowed_update_columns:
-        column = columns.get(name)
-        if (
-            column is None
-            or not column.updatable
-            or column.identity
-            or column.generated
-            or name in primary
-        ):
-            raise ValueError("authorization update column is not eligible")
-    if not set(scope.allowed_insert_columns) <= set(columns) or not set(
-        scope.key_columns
-    ) <= set(columns):
-        raise ValueError("authorization column is not eligible")
-    if any(not columns[name].identity for name in scope.generated_identity_columns):
-        raise ValueError("authorization generated identity is not eligible")
-    if "update" in scope.allowed_operations and set(scope.key_columns) != primary:
-        raise ValueError("update authority requires the exact primary key")
-    if "upsert" in scope.allowed_operations:
-        if set(scope.key_columns) not in [
-            set(index.columns)
-            for index in tabular.indexes
-            if index.unique
-            and index.predicate is None
-            and index.write_conflict_supported
-        ]:
-            raise ValueError("upsert authority requires a supported conflict key")
-        if any(
-            columns[name].identity or columns[name].generated
-            for name in scope.allowed_insert_columns
-        ):
-            raise ValueError("explicit generated columns are not eligible")
+        raise ValueError("write authorization requires its own active source")
     return (
         "sha256:"
         + sha256(
@@ -570,8 +436,7 @@ def relational_write_authorization_fingerprint(
                     "agent_id": source.agent_id,
                     "adapter_id": source.adapter_id,
                     "source_id": source.id,
-                    "resource_id": resource.id,
-                    "structure": tabular.structural_payload(),
+                    "resource_id": scope.resource_id,
                     "authority": scope.constraints(),
                 }
             ).encode("utf-8")

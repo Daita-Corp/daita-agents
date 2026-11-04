@@ -101,9 +101,11 @@ async def test_source_free_user_run_projects_and_executes_workspace_file_tools(
             _call(
                 "search",
                 "file_search",
-                {"source_id": "s1", "query": "notes", "mode": "paths"},
+                {"source": "Working folder", "query": "notes", "mode": "paths"},
             ),
-            _call("read", "file_read", {"source_id": "s1", "path": "notes.txt"}),
+            _call(
+                "read", "file_read", {"source": "Working folder", "path": "notes.txt"}
+            ),
             _stop("found it"),
         )
     )
@@ -178,7 +180,7 @@ async def test_public_computer_search_executes_multi_root_schema_once(
                 "search",
                 "file_search",
                 {
-                    "source_id": "s1",
+                    "source": "This computer",
                     "paths": [str(downloads), str(documents)],
                     "glob": "*.csv",
                 },
@@ -255,9 +257,9 @@ async def test_files_only_scopes_the_run_to_the_session_folder_source(
 
             return read
 
-        for method_name in ("catalog_context", "semantic_resource_facts"):
-            monkeypatch.setattr(view, method_name, unexpected_source_read)
+        monkeypatch.setattr(view, "semantic_resource_facts", unexpected_source_read)
         for method_name in (
+            "source_directory",
             "source_routing_facts",
             "relational_write_applicable_source_ids",
             "admitted_model_sensitivity",
@@ -293,7 +295,11 @@ async def test_file_read_mixed_continuation_shape_fails_before_workspace_io(
             _call(
                 "invalid-continuation",
                 "file_read",
-                {"source_id": "s1", "cursor": "opaque-cursor", "position": "start"},
+                {
+                    "source": "Working folder",
+                    "cursor": "opaque-cursor",
+                    "position": "start",
+                },
             ),
             _stop(),
         )

@@ -7,6 +7,11 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from ...._json import FrozenJsonObject, canonical_json
+from ....storage.sqlite_records import (
+    RelationalWriteScope,
+    SourceReadMode,
+    SourceReadScope,
+)
 
 _SqlDialect = Literal["sqlite", "postgresql"]
 _MAX_VALIDATION_ISSUE_DETAILS_CHARACTERS = 1_536
@@ -367,27 +372,6 @@ class SqlTableReference:
 
 
 @dataclass(frozen=True, slots=True)
-class SqlColumnReference:
-    name: str
-    qualifier: str | None = None
-    resource_name: str | None = None
-    name_quoted: bool = False
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _required_text(self.name, "column name"))
-        for field_name in ("qualifier", "resource_name"):
-            value = getattr(self, field_name)
-            if value is not None:
-                object.__setattr__(
-                    self,
-                    field_name,
-                    _required_text(value, f"column {field_name}"),
-                )
-        if not isinstance(self.name_quoted, bool):
-            raise TypeError("column name_quoted must be a boolean")
-
-
-@dataclass(frozen=True, slots=True)
 class SqlAnalysis:
     sql: str
     canonical_sql: str
@@ -395,12 +379,8 @@ class SqlAnalysis:
     statement_type: str
     statement_count: int
     is_read: bool
-    has_limit: bool
     mutation_types: tuple[str, ...]
     tables: tuple[SqlTableReference, ...]
-    columns: tuple[SqlColumnReference, ...]
-    selected_columns: tuple[str, ...]
-    select_aliases: tuple[str, ...]
     positional_parameter_count: int
     parameter_ordinals: tuple[int, ...] = ()
     anonymous_parameter_count: int = 0
@@ -408,9 +388,9 @@ class SqlAnalysis:
     function_names: tuple[str, ...] = ()
     unresolved_function_names: tuple[str, ...] = ()
     table_function_names: tuple[str, ...] = ()
-    cast_type_names: tuple[str, ...] = ()
-    unsafe_cast_type_names: tuple[str, ...] = ()
     explicit_operator_names: tuple[str, ...] = ()
+    attribute_names: tuple[str, ...] = ()
+    written_call_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sql", _required_text(self.sql, "analysis sql"))
@@ -442,9 +422,9 @@ class SqlAnalysis:
             "function_names",
             "unresolved_function_names",
             "table_function_names",
-            "cast_type_names",
-            "unsafe_cast_type_names",
             "explicit_operator_names",
+            "attribute_names",
+            "written_call_names",
         ):
             values = tuple(getattr(self, field_name))
             if values != tuple(sorted(set(values))):
@@ -483,9 +463,12 @@ class SqlValidationResult:
     source_id: str
     analysis: SqlAnalysis | None
     resource_ids: tuple[str, ...]
-    resource_revisions: tuple[tuple[str, str], ...]
-    source_revision: str | None
     issues: tuple[SqlValidationIssue, ...]
+    resource_names: tuple[tuple[str, str], ...] = ()
+    function_lookups: tuple[str, ...] = ()
+    attribute_lookups: tuple[str, ...] = ()
+    written_calls: tuple[str, ...] = ()
+    unqualified_relations: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.valid, bool):
@@ -496,37 +479,179 @@ class SqlValidationResult:
         resource_ids = tuple(self.resource_ids)
         if len(resource_ids) != len(set(resource_ids)):
             raise ValueError("validation resource_ids must be unique")
-        resource_revisions = tuple(
-            sorted(tuple(item) for item in self.resource_revisions)
-        )
-        if any(
-            len(item) != 2
-            or not all(isinstance(value, str) and value.strip() for value in item)
-            for item in resource_revisions
-        ):
-            raise ValueError(
-                "validation resource_revisions must contain identifier/revision pairs"
-            )
-        revision_ids = tuple(item[0] for item in resource_revisions)
-        if len(revision_ids) != len(set(revision_ids)):
-            raise ValueError("validation resource_revisions must be unique")
-        if resource_revisions and set(revision_ids) != set(resource_ids):
-            raise ValueError(
-                "validation resource_revisions must cover every resolved resource"
-            )
-        if self.source_revision is not None:
-            source_revision = _required_text(
-                self.source_revision,
-                "validation source_revision",
-            )
-            if len(source_revision) > 1_024:
-                raise ValueError("validation source_revision exceeds 1024 characters")
         if self.valid != (self.analysis is not None and not self.issues):
             raise ValueError("validation validity must agree with analysis and issues")
         object.__setattr__(self, "resource_ids", resource_ids)
-        object.__setattr__(self, "resource_revisions", resource_revisions)
         object.__setattr__(self, "issues", tuple(self.issues))
 
     @property
     def issue_codes(self) -> tuple[str, ...]:
         return tuple(issue.code for issue in self.issues)
+
+
+@dataclass(frozen=True, slots=True)
+class CheckedRead:
+    """One read that passed policy; a backend executes it without validating it."""
+
+    canonical_sql: str
+    sql_fingerprint: str
+    parameters: tuple[object, ...] = ()
+    # Names the read transaction checks against the live server: called
+    # functions, and ``x.name`` reads the server could resolve to ``name(x)``.
+    function_lookups: tuple[str, ...] = ()
+    attribute_lookups: tuple[str, ...] = ()
+    written_calls: tuple[str, ...] = ()
+    # Names only the source can place: refused with candidates from a live lookup.
+    unqualified_relations: tuple[str, ...] = ()
+    # What the read touches, from the parse: (derived ID, full name).
+    resource_ids: tuple[str, ...] = ()
+    resource_names: tuple[tuple[str, str], ...] = ()
+    # This run's limit on the source; None means unrestricted. A folder read needs
+    # it for the files its pattern matches, and an unqualified name's candidates.
+    allowed_resource_ids: tuple[str, ...] | None = None
+    # A folder read names its files by pattern.
+    path_pattern: str | None = None
+
+    def to_mapping(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in self.__slots__}
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> CheckedRead:
+        return cls(**value)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
+class WriteFacts:
+    """What a source's ``describe`` says one write is: its target and columns."""
+
+    table: str
+    resource_id: str
+    operation: str
+    insert_columns: tuple[str, ...]
+    update_columns: tuple[str, ...]
+    # How the source runs it; only that source's adapter reads this.
+    statement: Mapping[str, object]
+    resource_ids: tuple[str, ...] = ()
+    resource_names: tuple[tuple[str, str], ...] = ()
+    allowed_resource_ids: tuple[str, ...] | None = None
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((*self.insert_columns, *self.update_columns)))
+
+    def to_mapping(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in self.__slots__}
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> WriteFacts:
+        return cls(**value)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
+class WritePreview:
+    """What a source says a write would touch, for the approval card."""
+
+    source_id: str
+    table: str
+    operation: str
+    sql: str
+    columns_changed: tuple[str, ...]
+    affected_rows: int
+    inserted_rows: int
+    updated_rows: int
+    deleted_rows: int
+    skipped_rows: int
+    samples: tuple[Mapping[str, object], ...]
+    triggers: tuple[str, ...]
+    cascades: tuple[str, ...]
+    warnings: tuple[str, ...]
+    # How far the source compares what it touched: "rows" or "count".
+    verification: str
+    intent_sha256: str
+    target_set_sha256: str
+    structure_sha256: str
+    preview_fingerprint: str
+
+    def to_mapping(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in self.__slots__}
+
+
+def write_facts(arguments: Mapping[str, object]) -> WriteFacts:
+    """The write the data domain prepared for one executor call."""
+
+    item = arguments["_write"]
+    assert isinstance(item, Mapping)
+    return WriteFacts.from_mapping(item)
+
+
+def write_permission_issue(
+    scope: RelationalWriteScope | None, facts: WriteFacts
+) -> SqlValidationIssue | None:
+    """Why stored permission does not cover this operation and these columns."""
+
+    table = facts.table
+    if scope is None:
+        return SqlValidationIssue(
+            "resource_write_not_allowed",
+            f"{table} has no write permission. A person enables writes for a table "
+            "with /sources.",
+            {"table": table},
+        )
+    needed = {facts.operation, *(("update",) if facts.update_columns else ())}
+    missing = sorted(needed - set(scope.allowed_operations))
+    if missing:
+        return SqlValidationIssue(
+            "write_operation_not_allowed",
+            f"{table} allows {', '.join(scope.allowed_operations)}, not "
+            f"{', '.join(missing)}.",
+            {"table": table, "allowed_operations": scope.allowed_operations},
+        )
+    for columns, allowed, code in (
+        (
+            facts.insert_columns,
+            scope.allowed_insert_columns,
+            "insert_column_not_allowed",
+        ),
+        (
+            facts.update_columns,
+            scope.allowed_update_columns,
+            "update_column_not_allowed",
+        ),
+    ):
+        refused = sorted(set(columns) - set(allowed))
+        if refused:
+            return SqlValidationIssue(
+                code,
+                f"{table} does not allow writing {', '.join(refused)}.",
+                {"table": table, "columns": refused, "allowed_columns": allowed},
+            )
+    return None
+
+
+def checked_reads(arguments: Mapping[str, object]) -> tuple[CheckedRead, ...]:
+    """The reads the data domain prepared for one executor call, in order."""
+
+    items = arguments["_reads"]
+    assert isinstance(items, tuple)
+    return tuple(CheckedRead.from_mapping(item) for item in items)
+
+
+def denied_relations(
+    read: CheckedRead, scope: SourceReadScope | None
+) -> tuple[str, ...] | None:
+    """The tables stored permission no longer admits; None when it reads nothing.
+
+    A read can queue after it was prepared, so this runs again at dispatch.
+    """
+
+    if scope is None or scope.mode is SourceReadMode.NONE:
+        return None
+    if scope.mode is SourceReadMode.ALL:
+        return ()
+    selected = frozenset(scope.resource_ids)
+    names = dict(read.resource_names)
+    return tuple(
+        names.get(resource_id, resource_id)
+        for resource_id in read.resource_ids
+        if resource_id not in selected
+    )

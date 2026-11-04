@@ -1157,8 +1157,7 @@ class ExactXlsxProvenance:
     """Runtime-owned safe facts used by the fixed XLSX provenance sheet."""
 
     source_id: str
-    source_revision: str
-    resource_revisions: tuple[tuple[str, str], ...]
+    resource_ids: tuple[str, ...]
     sql_fingerprint: str
     parameters_sha256: str
     sensitivity: Sensitivity
@@ -1167,7 +1166,6 @@ class ExactXlsxProvenance:
     def __post_init__(self) -> None:
         for value, name in (
             (self.source_id, "source_id"),
-            (self.source_revision, "source_revision"),
             (self.sql_fingerprint, "sql_fingerprint"),
             (self.parameters_sha256, "parameters_sha256"),
         ):
@@ -1177,14 +1175,11 @@ class ExactXlsxProvenance:
             raise ValueError("XLSX provenance sql_fingerprint must use sha256")
         if not self.parameters_sha256.startswith("sha256:"):
             raise ValueError("XLSX provenance parameters_sha256 must use sha256")
-        revisions = tuple(sorted(tuple(item) for item in self.resource_revisions))
-        if not revisions or len(revisions) > 64:
-            raise ValueError("XLSX provenance resource revisions exceed their bound")
-        if len({item[0] for item in revisions}) != len(revisions) or any(
-            not resource_id or not revision.startswith("sha256:")
-            for resource_id, revision in revisions
-        ):
-            raise ValueError("XLSX provenance resource revisions are invalid")
+        resource_ids = tuple(sorted(self.resource_ids))
+        if not resource_ids or len(resource_ids) > 64:
+            raise ValueError("XLSX provenance resources exceed their bound")
+        if len(set(resource_ids)) != len(resource_ids) or not all(resource_ids):
+            raise ValueError("XLSX provenance resources are invalid")
         if not isinstance(self.sensitivity, Sensitivity):
             raise TypeError("XLSX provenance sensitivity must be Sensitivity")
         if self.sensitivity is Sensitivity.UNKNOWN:
@@ -1195,7 +1190,7 @@ class ExactXlsxProvenance:
             or self.created_at.utcoffset() is None
         ):
             raise ValueError("XLSX provenance created_at must be timezone-aware")
-        object.__setattr__(self, "resource_revisions", revisions)
+        object.__setattr__(self, "resource_ids", resource_ids)
         object.__setattr__(
             self,
             "created_at",
@@ -1413,11 +1408,7 @@ class ExactXlsxRenderer:
                 ("Key", "Value"),
                 ("Authorship", ArtifactAuthorship.EXACT_SOURCE_DATA.value),
                 ("Source ID", self._provenance.source_id),
-                ("Source Revision", self._provenance.source_revision),
-                (
-                    "Resource Revisions",
-                    canonical_json(self._provenance.resource_revisions),
-                ),
+                ("Resources", canonical_json(self._provenance.resource_ids)),
                 ("SQL Fingerprint", self._provenance.sql_fingerprint),
                 ("Parameters SHA-256", self._provenance.parameters_sha256),
                 (

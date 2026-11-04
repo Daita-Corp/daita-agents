@@ -38,6 +38,7 @@ TABLE = (
     ),
     Route("DELETE", "/sources/{source_id}", "detach"),
     Route("POST", "/sources/{source_id}/refresh", "refresh_source"),
+    Route("POST", "/sources/{source_id}/check", "check_source"),
     Route("GET", "/sources/{source_id}/permissions", "inspect_source_permissions"),
     Route(
         "POST", "/sources/{source_id}/permissions/preview", "preview_source_permissions"
@@ -45,8 +46,8 @@ TABLE = (
     Route("POST", "/sources/{source_id}/permissions/apply", "apply_source_permissions"),
     Route(
         "GET",
-        "/sources/{source_id}/resources/{resource_id}/update-readiness",
-        "relational_update_readiness",
+        "/sources/{source_id}/tables/{table}/write-readiness",
+        "relational_write_readiness",
     ),
 )
 MEMBERS = frozenset(route.member for route in TABLE)

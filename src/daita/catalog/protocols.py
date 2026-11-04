@@ -77,6 +77,10 @@ class CatalogStore(Protocol):
         source_ids: tuple[str, ...],
     ) -> tuple[CatalogSnapshotRef, ...]: ...
 
+    async def list_unreadable_snapshot_source_ids(
+        self, agent_id: str
+    ) -> tuple[str, ...]: ...
+
     async def load_current_snapshot(
         self,
         ref: CatalogSnapshotRef,

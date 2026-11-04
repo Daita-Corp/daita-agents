@@ -1255,7 +1255,7 @@ CREATE TABLE write_acceptance.companies (
 );
 GRANT CONNECT ON DATABASE daita_large_fixture TO daita_large_write_tester;
 GRANT USAGE ON SCHEMA write_acceptance TO daita_large_write_tester;
--- Table-level UPDATE is required by PostgreSQL's EXCLUSIVE table lock.
+-- UPDATE on a column lets a write lock its target rows with FOR UPDATE.
 -- Daita's separate permission scopes still restrict operations and columns.
 GRANT SELECT, UPDATE ON write_acceptance.companies TO daita_large_write_tester;
 GRANT INSERT (domain, name, evidence_url, notes)

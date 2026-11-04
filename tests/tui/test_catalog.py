@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from typing import Any
+
+from daita.adapters.models import SourceHealth
+from daita.host.client import connect
+from daita.tui.controller import SOURCE_REFRESH_ERRORS
 from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.tui._support import (
     Button,
@@ -80,7 +86,12 @@ async def test_source_permissions_picker_remains_interactive_after_command_submi
                     is True
                 )
                 assert await pilot.click(listing, offset=(2, 0)) is True
-                await pilot.pause()
+                await settle_until(
+                    pilot,
+                    lambda: app.screen is permissions
+                    and "Records"
+                    in str(permissions.query_one("#perm-body", Static).content),
+                )
 
                 assert app.screen is permissions
                 assert isinstance(permissions, PermissionsScreen)
@@ -95,6 +106,115 @@ async def test_source_permissions_picker_remains_interactive_after_command_submi
         await opened.close()
 
 
+def _permissions_app(stored_max_rows: int = 25):
+    """A permission screen over one stored scope on one table; records previews."""
+
+    tickets = SimpleNamespace(
+        resource_id="resource-tickets",
+        display_name="support.tickets",
+        resource_kind="table",
+        eligible_assignment_columns=("priority", "ticket_status"),
+        eligible_insert_columns=(),
+    )
+    state = SimpleNamespace(
+        read_scope=SimpleNamespace(mode=SimpleNamespace(value="all"), resource_ids=()),
+        relational_write_scopes=(
+            SimpleNamespace(
+                table="support.tickets",
+                allowed_operations=("update",),
+                allowed_insert_columns=(),
+                allowed_update_columns=("priority", "ticket_status"),
+                max_rows=stored_max_rows,
+                constraints=lambda: {
+                    "table": "support.tickets",
+                    "allowed_operations": ("update",),
+                    "allowed_insert_columns": (),
+                    "allowed_update_columns": ("priority", "ticket_status"),
+                    "max_rows": stored_max_rows,
+                },
+            ),
+        ),
+    )
+    inspection = SimpleNamespace(
+        source_id="source-postgresql",
+        source_display_name="Support PostgreSQL",
+        adapter_id="postgresql",
+        state=state,
+        resources=(tickets,),
+        supports_relational_writes=True,
+    )
+    previews: list[dict[str, object]] = []
+
+    async def inspect(source_id: str):
+        return inspection
+
+    async def preview(**kwargs: object):
+        previews.append(kwargs)
+        return SimpleNamespace(
+            source_id=inspection.source_id,
+            before=state,
+            after=state,
+            confirmation_fingerprint="sha256:" + "1" * 64,
+        )
+
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    app.controller.inspect_source_permissions = inspect  # type: ignore[method-assign]
+    app.controller.preview_source_permissions = preview  # type: ignore[method-assign]
+    return app, inspection, previews
+
+
+def _pick(app: DaitaApp, *identities: str) -> None:
+    picker = app.screen
+    assert isinstance(picker, SelectionScreen)
+    listing = picker.query_one("#picker-options", OptionList)
+    for identity in identities:
+        listing.highlighted = next(
+            index
+            for index in range(listing.option_count)
+            if str(listing.get_option_at_index(index).id) == identity
+        )
+        if picker._multi:
+            picker.action_toggle_selected()
+    picker.action_confirm()
+
+
+async def test_choosing_no_operations_revokes_the_table():
+    app, inspection, previews = _permissions_app()
+    async with app.run_test(size=(100, 32)) as pilot:
+        await app.push_screen(PermissionsScreen(source_id=inspection.source_id))
+        permissions = app.screen
+        assert await pilot.click("#perm-write") is True
+        await pilot.pause()
+        _pick(app, "resource-tickets")
+        await pilot.pause()
+        _pick(app)
+        await pilot.pause()
+
+        assert app.screen is permissions
+        assert previews[-1]["relational_write_scopes"] == {}
+        app.exit(0)
+
+
+async def test_editing_a_scope_keeps_its_row_limit_unless_one_is_typed():
+    for typed, expected in (("", 25), ("7", 7)):
+        app, inspection, previews = _permissions_app(stored_max_rows=25)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await app.push_screen(PermissionsScreen(source_id=inspection.source_id))
+            app.screen.query_one("#perm-max-rows", Input).value = typed
+            assert await pilot.click("#perm-write") is True
+            await pilot.pause()
+            _pick(app, "resource-tickets")
+            await pilot.pause()
+            _pick(app, "update")
+            await pilot.pause()
+            _pick(app, "priority")
+            await pilot.pause()
+
+            updates = previews[-1]["relational_write_scopes"]
+            assert updates["support.tickets"]["max_rows"] == expected
+            app.exit(0)
+
+
 async def test_source_permissions_configures_exact_relational_write_scope():
     read_scope = SimpleNamespace(mode=SimpleNamespace(value="all"), resource_ids=())
     initial_state = SimpleNamespace(
@@ -103,18 +223,15 @@ async def test_source_permissions_configures_exact_relational_write_scope():
     )
     tickets = SimpleNamespace(
         resource_id="resource-tickets",
-        key_columns=("ticket_id",),
         display_name="support.tickets",
         resource_kind="table",
         eligible_assignment_columns=("priority", "ticket_status"),
-        relational_update_eligible=True,
-        upsert_conflict_keys=(),
+        eligible_insert_columns=("ticket_id", "priority", "ticket_status"),
     )
     inspection = SimpleNamespace(
         source_id="source-postgresql",
         source_display_name="Support PostgreSQL",
         adapter_id="postgresql",
-        catalog_generation="sync-one",
         state=initial_state,
         resources=(tickets,),
         supports_relational_writes=True,
@@ -132,11 +249,14 @@ async def test_source_permissions_configures_exact_relational_write_scope():
         assert isinstance(updates, dict)
         scopes = tuple(
             SimpleNamespace(
-                resource_id=resource_id,
+                table=table,
                 **columns,
-                constraints=lambda columns=columns: dict(columns),
+                constraints=lambda table=table, columns=columns: {
+                    "table": table,
+                    **columns,
+                },
             )
-            for resource_id, columns in updates.items()
+            for table, columns in updates.items()
         )
         after = SimpleNamespace(
             read_scope=SimpleNamespace(
@@ -147,7 +267,6 @@ async def test_source_permissions_configures_exact_relational_write_scope():
         )
         return SimpleNamespace(
             source_id=inspection.source_id,
-            catalog_generation=inspection.catalog_generation,
             before=initial_state,
             after=after,
             confirmation_fingerprint="sha256:" + "1" * 64,
@@ -193,7 +312,7 @@ async def test_source_permissions_configures_exact_relational_write_scope():
         await pilot.pause()
         choose_single(app, tickets.resource_id)
         await pilot.pause()
-        choose_single(app, "update")
+        choose_multi(app, "update")
         await pilot.pause()
         choose_multi(app, "priority")
         await pilot.pause()
@@ -205,12 +324,10 @@ async def test_source_permissions_configures_exact_relational_write_scope():
                 "read_mode": "all",
                 "read_resource_ids": (),
                 "relational_write_scopes": {
-                    tickets.resource_id: {
+                    tickets.display_name: {
                         "allowed_operations": ("update",),
                         "allowed_insert_columns": (),
                         "allowed_update_columns": ("priority",),
-                        "key_columns": ("ticket_id",),
-                        "generated_identity_columns": (),
                         "max_rows": 100,
                     },
                 },
@@ -253,7 +370,7 @@ async def test_source_edit_screen_reviews_and_switches_atomically(
             command_task = asyncio.create_task(
                 app._open_command_screen("source_edit", {})
             )
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, SourceEditScreen))
             assert isinstance(app.screen, SourceEditScreen)
             app.screen.query_one("#edit-source-path", Input).value = str(edited_path)
             apply_button = app.screen.query_one("#edit-source-apply", Button)
@@ -369,6 +486,45 @@ async def test_source_edit_rejects_a_zero_resource_preview_without_confirmation(
             edit.query_one("#source-edit-error").render()
         )
         app.exit(0)
+
+
+async def test_a_damaged_catalog_row_does_not_stop_the_app_or_sources(
+    tmp_path: Path, start_host: StartHost
+):
+    database = tmp_path / "damaged.sqlite"
+    _create_sqlite_source(database, "records")
+    harness = await start_host()
+    first = await remote_agent(harness, "damaged-catalog")
+    source = await first.attach(SQLiteSource(database, name="Records"))
+    await first.close()
+    (state,) = harness.root.glob("**/state.db")
+    with sqlite3.connect(state) as connection:
+        connection.execute("UPDATE snapshots SET data = '{not json'")
+    opened = await connect("damaged-catalog", cwd=harness.work(), root=harness.root)
+    app = DaitaApp(
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
+    )
+    app.controller.agent = opened
+    try:
+        async with app.run_test(size=(100, 34)) as pilot:
+            await app._show_chat()
+            composer = app.screen.query_one(Composer)
+            composer.load_text("/sources")
+            composer.action_submit()
+            await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
+            assert isinstance(app.screen, CatalogScreen)
+            assert source.id in app.screen._sources_by_id
+
+            def repaired() -> bool:
+                with sqlite3.connect(state) as connection:
+                    row = connection.execute("SELECT data FROM snapshots").fetchone()
+                return row is not None and row[0] != "{not json"
+
+            # Opening noticed the row and the background refresh replaced it.
+            await settle_until(pilot, repaired)
+            app.exit(0)
+    finally:
+        await opened.close()
 
 
 async def test_catalog_command_opens_grouped_named_resource_tree(
@@ -507,7 +663,7 @@ async def test_catalog_command_opens_grouped_named_resource_tree(
                 composer = app.screen.query_one(Composer)
                 composer.load_text(f"/source refresh {first.id}")
                 composer.action_submit()
-                await pilot.pause()
+                await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
                 assert isinstance(app.screen, CatalogScreen)
                 refresh_notice = app.screen.query_one("#catalog-notice", Static)
                 assert str(refresh_notice.content) == (
@@ -550,7 +706,7 @@ async def test_catalog_tree_graph_explores_relationship_neighborhoods(
             composer = app.screen.query_one(Composer)
             composer.load_text("/sources")
             composer.action_submit()
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
 
             screen = app.screen
             assert isinstance(screen, CatalogScreen)
@@ -634,7 +790,7 @@ async def test_sources_manager_routes_actions_for_the_selected_source(
             composer = app.screen.query_one(Composer)
             composer.load_text("/sources")
             composer.action_submit()
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
 
             assert isinstance(app.screen, CatalogScreen)
             assert await pilot.click("#source-edit") is True
@@ -648,10 +804,10 @@ async def test_sources_manager_routes_actions_for_the_selected_source(
             assert edit._source.id == source.id
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
             assert isinstance(app.screen, CatalogScreen)
             assert await pilot.click("#source-permissions") is True
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, PermissionsScreen))
             permissions = app.screen
             assert isinstance(permissions, PermissionsScreen)
             assert permissions._source_id == source.id
@@ -660,17 +816,17 @@ async def test_sources_manager_routes_actions_for_the_selected_source(
             )
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
             assert isinstance(app.screen, CatalogScreen)
             assert await pilot.click("#source-detach") is True
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("n")
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
             assert isinstance(app.screen, CatalogScreen)
 
             await pilot.press("escape")
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, ChatScreen))
             assert isinstance(app.screen, ChatScreen)
             app.exit(0)
     finally:
@@ -755,7 +911,7 @@ async def test_empty_catalog_refresh_opens_catalog_without_an_onboarding_loop(
             assert "0 resources" in str(source_node.label)
             assert str(source_node.children[0].label) == "No current resources"
             await pilot.press("escape")
-            await pilot.pause()
+            await settle_until(pilot, lambda: isinstance(app.screen, ChatScreen))
             assert isinstance(app.screen, ChatScreen)
             assert "Catalog refresh completed, but found no resources" in str(
                 app.screen.query_one("#notice-bar", Static).content
@@ -763,3 +919,150 @@ async def test_empty_catalog_refresh_opens_catalog_without_an_onboarding_loop(
             app.exit(0)
     finally:
         await opened.close()
+
+
+def _health(source_id: str, **fields: object) -> SourceHealth:
+    return SourceHealth(
+        agent_id="agent",
+        source_id=source_id,
+        adapter_id="postgresql",
+        checked_at=datetime(2026, 11, 4, tzinfo=UTC),
+        **{"healthy": True, **fields},  # type: ignore[arg-type]
+    )
+
+
+def _agent_checking(check_source: Any) -> Any:
+    async def close() -> None: ...
+
+    return SimpleNamespace(check_source=check_source, close=close)
+
+
+def _sources_screen(*names: str) -> CatalogScreen:
+    return CatalogScreen(
+        summary=SimpleNamespace(
+            active_source_count=len(names), resource_count=0, relationship_count=0
+        ),
+        sources=tuple(
+            SimpleNamespace(id=f"source-{name}", display_name=name, adapter_id="sqlite")
+            for name in names
+        ),
+        resources=(),
+    )
+
+
+async def test_sources_opens_at_once_and_shows_each_connection_check_once():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    release = asyncio.Event()
+    asked: list[str] = []
+
+    async def check_source(source_id: str) -> SourceHealth:
+        asked.append(source_id)
+        await release.wait()
+        return _health(
+            source_id,
+            details={
+                "role": "analyst",
+                "read_only": False,
+                "warnings": ("This role can create objects in a configured schema.",),
+            },
+        )
+
+    app.controller.agent = _agent_checking(check_source)
+    async with app.run_test(size=(100, 34)) as pilot:
+        screen = _sources_screen("Alpha", "Beta")
+        await app.push_screen(screen)
+        await settle_until(pilot, lambda: bool(screen.query("#source-connection")))
+        block = screen.query_one("#source-connection", Static)
+
+        # The screen is up and usable while the server has not answered.
+        assert str(block.content) == "Checking connection…"
+        tree = screen.query_one("#catalog-tree", Tree)
+        await pilot.press("down", "down")
+        assert tree.cursor_line == 2
+
+        release.set()
+        await settle_until(pilot, lambda: str(block.content) != "Checking connection…")
+        await pilot.press("up")
+        await pilot.pause()
+
+        assert str(block.content) == (
+            "Connected as analyst · can change data\n"
+            "This role can create objects in a configured schema."
+        )
+        # Moving between sources again does not ask the server again.
+        assert sorted(asked) == ["source-Alpha", "source-Beta"]
+        app.exit(0)
+
+
+async def test_server_text_in_a_connection_check_is_sanitized():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+
+    async def check_source(source_id: str) -> SourceHealth:
+        return _health(
+            source_id,
+            details={"role": "ev\x1b[31mil\x07", "read_only": True, "warnings": ()},
+        )
+
+    app.controller.agent = _agent_checking(check_source)
+    async with app.run_test(size=(100, 34)) as pilot:
+        screen = _sources_screen("Alpha")
+        await app.push_screen(screen)
+        block = screen.query_one("#source-connection", Static)
+        await settle_until(pilot, lambda: str(block.content).startswith("Connected"))
+
+        shown = str(block.content)
+        assert "\x1b" not in shown and "\x07" not in shown
+        assert shown == "Connected as ev?[31mil? · read-only"
+        app.exit(0)
+
+
+async def test_an_unreachable_or_failing_check_says_so_and_keeps_the_screen_usable():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+
+    async def check_source(source_id: str) -> SourceHealth:
+        if source_id == "source-Broken":
+            raise RuntimeError("password=DO-NOT-EXPOSE")
+        return _health(source_id, healthy=False, error_code="postgresql_connect_failed")
+
+    app.controller.agent = _agent_checking(check_source)
+    async with app.run_test(size=(100, 34)) as pilot:
+        screen = _sources_screen("Alpha", "Broken")
+        await app.push_screen(screen)
+        block = screen.query_one("#source-connection", Static)
+        await settle_until(pilot, lambda: str(block.content).startswith("Not reach"))
+
+        assert str(block.content) == (
+            "Not reachable\n" + SOURCE_REFRESH_ERRORS["postgresql_connect_failed"]
+        )
+        await pilot.press("down", "down")
+        await settle_until(pilot, lambda: str(block.content) != "Checking connection…")
+
+        assert isinstance(app.screen, CatalogScreen)
+        assert str(block.content).startswith("Not reachable")
+        assert "DO-NOT-EXPOSE" not in str(block.content)
+        app.exit(0)
+
+
+async def test_closing_sources_during_a_connection_check_does_not_crash_the_app():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def check_source(source_id: str) -> SourceHealth:
+        entered.set()
+        await release.wait()
+        return _health(source_id)
+
+    app.controller.agent = _agent_checking(check_source)
+    async with app.run_test(size=(100, 34)) as pilot:
+        screen = _sources_screen("Alpha")
+        await app.push_screen(screen)
+        await asyncio.wait_for(entered.wait(), timeout=10)
+
+        # While the screen is closing it can still be mounted with its tree gone.
+        await screen.query_one("#catalog-tree").remove()
+        release.set()
+        await pilot.pause(0.1)
+
+        assert app.is_running
+        assert app._exception is None
+        app.exit(0)

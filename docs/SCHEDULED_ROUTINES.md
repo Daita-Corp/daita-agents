@@ -12,7 +12,7 @@ the time. The background host must be running for routines to progress (see
 | Field | Meaning |
 | --- | --- |
 | `title` | A short name shown on the work board and approval cards. |
-| `prompt` | A self-contained instruction for each run. Name sources and tables by their catalog names, not by a run's `s1`/`t1` handles. |
+| `prompt` | A self-contained instruction for each run. Name sources and tables by their catalog names. |
 | `schedule` | When it runs (below). |
 | `sources` | Optional source names or ids. Omitted means every current source. |
 | `run_immediately` | Creation only: also run once now. Interval and calendar schedules only. |
@@ -84,7 +84,7 @@ local computer files and creating, changing or running routines and jobs. Its
 scope is fixed when the run starts: a source added later is seen by the next
 run, not the current one.
 
-When a run wants to write (a PostgreSQL update or upsert, an admitted MCP
+When a run wants to write (a PostgreSQL insert, update or delete, an admitted MCP
 action), it pauses and the host opens an approval naming the routine. A desktop
 notification appears if no window is watching; opening `daita` shows the card.
 Approve and the run continues; deny and the model gets the refusal and carries

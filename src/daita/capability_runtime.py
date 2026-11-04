@@ -57,6 +57,9 @@ from .capabilities import (
     ToolOutputValidationError,
     ToolRecovery,
     ToolView,
+    model_identity_key,
+    model_identity_schema,
+    model_output_schema,
     omit_unset_arguments,
     recovery_details,
     tool_call_mode,
@@ -97,7 +100,7 @@ from .loop.models import (
 )
 from .loop.session import RunCancellationToken, RunSession
 from .observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
-from .scope import SOURCE_REF_PREFIX, EffectiveSourceScope, scope_refs
+from .scope import EffectiveSourceScope
 
 if TYPE_CHECKING:
     from .domains.analysis.domain import AnalysisCapabilityDomain
@@ -165,6 +168,7 @@ class MachineRunScope:
     capability_ids: tuple[str, ...]
     connector_binding_ids: tuple[str, ...]
     contract_bindings: ExecutionContractBindings
+    unrestricted_source_ids: tuple[str, ...] = ()
 
 
 # Builds the scope at run start: (origin, named source ids, model route ids).
@@ -445,7 +449,8 @@ class StepToolProjection:
             )
             if policy is None or ceiling is None:
                 continue
-            part = f"{entry.view.name} at most {ceiling} {policy.target_count_argument}"
+            argument = model_identity_key(cast(str, policy.target_count_argument))
+            part = f"{entry.view.name} at most {ceiling} {argument}"
             if (
                 durable is not None
                 and policy.graph_v1_eligible
@@ -809,8 +814,6 @@ class CapabilityRuntime:
         try:
             current = await self._execution_contract_reader(
                 agent_id=run.agent_id,
-                source_ids=scope.allowed_source_ids,
-                resource_ids=scope.allowed_resource_ids,
                 capability_ids=scope.allowed_capability_ids,
                 connector_binding_ids=scope.allowed_connector_binding_ids,
                 model_route_ids=scope.eligible_model_routes,
@@ -824,7 +827,6 @@ class CapabilityRuntime:
             }
             current.validate_coverage(
                 capability_ids=scope.allowed_capability_ids,
-                resource_ids=scope.allowed_resource_ids,
                 route_ids=scope.eligible_model_routes,
                 mcp_capability_ids=origins,
             )
@@ -4376,7 +4378,7 @@ def _catalog_entry_material(entry: RunToolCatalogEntry) -> dict[str, object]:
         "description": entry.view.description,
         "presentation_sensitivity": entry.view.presentation_sensitivity.value,
         "connector_presentation": entry.view.connector_presentation,
-        "input_schema": entry.capability.input_schema,
+        "input_schema": model_identity_schema(entry.capability.input_schema),
         "input_schema_digest": entry.input_schema_digest,
         "output_kind": entry.capability.output_kind,
         "data_access": entry.capability.access_mode.value,
@@ -4429,8 +4431,8 @@ def _tool_contract(
     if include_schemas:
         contract.update(
             complete=True,
-            input_schema=entry.capability.input_schema,
-            output_schema=entry.capability.output_schema,
+            input_schema=model_identity_schema(entry.capability.input_schema),
+            output_schema=model_output_schema(entry.capability.output_schema),
             output_kind=entry.capability.output_kind,
             data_access=entry.capability.access_mode.value,
             operational_effect=entry.capability.operational_effect.value,
@@ -4445,8 +4447,8 @@ def _tool_contract(
                         "route": mode,
                         "capability_id": route.capability.id,
                         **_route_input_contract(
-                            entry.capability.input_schema,
-                            route.capability.input_schema,
+                            model_identity_schema(entry.capability.input_schema),
+                            model_identity_schema(route.capability.input_schema),
                         ),
                         "output_kind": route.capability.output_kind,
                         "data_access": route.capability.access_mode.value,
@@ -5372,13 +5374,12 @@ def _validate_output_execution_scope(
 
 
 def _source_pressure_key(run: RunInput, call: ToolCall) -> str:
-    source_id = call.arguments.get("source_id")
-    if isinstance(source_id, str):
-        # A source handle and its full ID share one per-source gate.
-        return (
-            scope_refs(run.resolved_source_scope).resolve(SOURCE_REF_PREFIX, source_id)
-            or source_id
-        )
+    source = call.arguments.get("source", call.arguments.get("source_id"))
+    if isinstance(source, str):
+        # A source's display name and its full ID share one per-source gate.
+        scope = run.resolved_source_scope
+        named = () if scope is None else scope.sources_named(source)
+        return named[0] if len(named) == 1 else source
     return "__agent_local__"
 
 

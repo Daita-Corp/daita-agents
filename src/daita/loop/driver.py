@@ -77,6 +77,7 @@ from .models import (
     ToolBatchInterruption,
     ToolBatchOutcome,
     Transcript,
+    build_run_note,
     validate_completed_transcript,
 )
 from .session import RunCancellationToken, RunSession, RunSessionOptions
@@ -121,8 +122,6 @@ class ContextBuilder(Protocol):
         tool_context: object,
         previous_request_input_tokens: int | None = None,
         remaining_tokens: int | None = None,
-        request_input_growth_tokens: int | None = None,
-        previous_response_output_tokens: int | None = None,
         remaining_steps: int | None = None,
     ) -> ModelRequest: ...
 
@@ -531,7 +530,7 @@ class AgentLoop:
         sensitivity = run.history_sensitivity
         previous_request_input_tokens: int | None = None
         request_input_growth_tokens: int | None = None
-        previous_response_output_tokens: int | None = None
+        noted_warnings: set[str] = set()
         run_route: object | None = None if prepared is None else prepared.run_route
         limits = (
             _effective_run_limits(self._limits, run)
@@ -612,8 +611,6 @@ class AgentLoop:
                     remaining_tokens=max(
                         0, limits.max_total_tokens - usage.total_tokens
                     ),
-                    request_input_growth_tokens=request_input_growth_tokens,
-                    previous_response_output_tokens=previous_response_output_tokens,
                     remaining_steps=limits.max_steps - step + 1,
                 )
                 sensitivity = max(
@@ -745,7 +742,6 @@ class AgentLoop:
                     else None
                 )
                 previous_request_input_tokens = response.request_input_tokens
-                previous_response_output_tokens = response.usage.output_tokens
                 assistant = _assistant_message(response)
                 if self._observer is not None:
                     assert model_duration_ms is not None
@@ -875,9 +871,33 @@ class AgentLoop:
                     session.evidence.record_outer_result(
                         result.call_id, failed=result.is_error
                     )
+                    run_note = None
+                    if result is results[-1]:
+                        warnings = session.evidence.progress_warnings(
+                            frozenset(
+                                entry.view.name
+                                for entry in getattr(
+                                    step_tool_projection, "callable_entries", ()
+                                )
+                            )
+                        )
+                        run_note = build_run_note(
+                            remaining_tokens=max(
+                                0, limits.max_total_tokens - usage.total_tokens
+                            ),
+                            remaining_steps=limits.max_steps - step,
+                            request_input_tokens=previous_request_input_tokens,
+                            request_input_growth_tokens=request_input_growth_tokens,
+                            response_output_tokens=response.usage.output_tokens,
+                            new_warnings=tuple(
+                                item for item in warnings if item not in noted_warnings
+                            ),
+                        )
+                        noted_warnings.update(warnings)
                     tool_message = CanonicalMessage(
                         role=MessageRole.TOOL,
                         content=(result,),
+                        run_note=run_note,
                     )
                     if outcome.interruption_kind is None:
                         await writer.append(

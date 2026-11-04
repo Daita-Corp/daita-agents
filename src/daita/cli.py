@@ -66,7 +66,11 @@ from .observation import summarize_diagnostics
 from .routines.capabilities import routine_inspection_projection, routine_projection
 from .security import SecretReference
 from .terminal import run_terminal_application
-from .tui.projection import run_failure_notice, tool_outcome_summary
+from .tui.projection import (
+    connection_facts,
+    run_failure_notice,
+    tool_outcome_summary,
+)
 from .work_board import work_board_projection
 from .workspace import working_directory
 
@@ -288,19 +292,12 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_revoke.add_argument("--yes", action="store_true")
 
     readiness = commands.add_parser(
-        "relational-update-readiness",
-        help="inspect one resource and assignment-column update scope",
+        "relational-write-readiness",
+        help="inspect one table's write scope against the live source",
     )
     readiness.add_argument("name")
     readiness.add_argument("source_id")
-    readiness.add_argument("resource_id")
-    readiness.add_argument(
-        "--assignment-column",
-        action="append",
-        dest="assignment_columns",
-        required=True,
-        help="exact catalog column proposed for assignment; repeat as needed",
-    )
+    readiness.add_argument("table", help="full table name, as in sales.orders")
 
     detach = commands.add_parser("detach", help="detach a source")
     detach.add_argument("name")
@@ -1294,10 +1291,16 @@ async def _execute(args: argparse.Namespace) -> object:
         if args.command == "attach":
             source = _source_from_attach_args(args)
             registration = await agent.attach(source)
+            try:
+                connection = connection_facts(await agent.check_source(registration.id))
+            except Exception:
+                # The source is attached; a failed check only leaves it unconfirmed.
+                connection = {"reachable": False}
             return {
                 "source_id": registration.id,
                 "adapter": registration.adapter_id,
                 "name": registration.display_name,
+                "connection": connection,
             }
         if args.command == "mcp":
             if args.mcp_command in {"inspect", "attach"}:
@@ -1363,11 +1366,9 @@ async def _execute(args: argparse.Namespace) -> object:
             if not args.yes:
                 raise ValueError("mcp revoke requires --yes")
             return _mcp_status_mapping(await agent.revoke_mcp_server(args.binding_id))
-        if args.command == "relational-update-readiness":
-            readiness_result = await agent.relational_update_readiness(
-                args.source_id,
-                args.resource_id,
-                tuple(args.assignment_columns),
+        if args.command == "relational-write-readiness":
+            readiness_result = await agent.relational_write_readiness(
+                args.source_id, args.table
             )
             return {
                 "readiness": readiness_result.to_mapping(),

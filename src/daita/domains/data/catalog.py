@@ -2,25 +2,31 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from hashlib import sha256
-from typing import Protocol
+from typing import cast
 
 from ..._json import FrozenJsonObject
 from ...adapters.folder import SessionFolderSource
 from ...adapters.models import SourceRegistration
-from ...adapters.protocols import SourceStore
+from ...adapters.protocols import (
+    DESCRIBE_MAX_COLUMNS,
+    SUMMARY_MAX_COLUMNS,
+    SourcePermissionStore,
+    column_summary,
+)
 from ...adapters.registry import SourceOperation, SourceTypeRegistry
 from ...catalog.models import (
-    CatalogDescribeRequest,
+    CATALOG_SCHEMA_TOOL_DEFAULT_RELATIONSHIPS,
     CatalogResource,
     CatalogSchemaRequest,
     CatalogSearchRequest,
-    CatalogSearchResult,
     CatalogTraversalRequest,
     ResourceKind,
     Sensitivity,
+    catalog_resource_id,
 )
-from ...catalog.protocols import CatalogResourceNotFoundError, CatalogStore
+from ...catalog.protocols import CatalogStore, CatalogStoreError
 from ...catalog.service import CatalogService
 from ...llm.models import ModelSensitivity
 from ...semantics import SemanticResourceFact
@@ -29,32 +35,16 @@ from ...storage.sqlite_records import (
     SourcePermissionStateError,
     SourceReadMode,
     SourceReadScope,
-    relational_write_authorization_fingerprint,
 )
 from .sql import ResourceSchema
 
-
-class CatalogPermissionStore(SourceStore, Protocol):
-    async def load_source_read_scope(
-        self,
-        agent_id: str,
-        source_id: str,
-    ) -> SourceReadScope | None: ...
-
-    async def list_relational_write_scopes(
-        self,
-        agent_id: str,
-        source_id: str,
-    ) -> tuple[RelationalWriteScope, ...]: ...
+_CATALOG_PARTIAL = (
+    "The catalog holds only part of this source, so the object count is a floor. "
+    "catalog_search and catalog_describe read the source live."
+)
 
 
 # The source operation each relational write-scope operation requires.
-RELATIONAL_WRITE_OPERATIONS = {
-    "update": SourceOperation.RELATIONAL_UPDATE,
-    "upsert": SourceOperation.RELATIONAL_UPSERT,
-}
-
-
 class CatalogDataView:
     """Translate catalog records without creating a second catalog owner."""
 
@@ -62,7 +52,7 @@ class CatalogDataView:
         self,
         store: CatalogStore,
         service: CatalogService,
-        sources: CatalogPermissionStore,
+        sources: SourcePermissionStore,
         source_types: SourceTypeRegistry,
         session_source: SessionFolderSource | None = None,
     ) -> None:
@@ -161,15 +151,6 @@ class CatalogDataView:
             else ()
         )
 
-    def empty_catalog_context(
-        self,
-        *,
-        prior_query: str | None = None,
-    ) -> FrozenJsonObject:
-        """Project the catalog-owned no-match result without reading source state."""
-
-        return self._service.empty_catalog_context(prior_query=prior_query)
-
     async def readable_resource_ids(
         self,
         agent_id: str,
@@ -180,6 +161,54 @@ class CatalogDataView:
         resources = await self._admitted_resources(agent_id, source_ids)
         return frozenset(resource.id for resource in resources)
 
+    async def non_table_resource_ids(self, agent_id: str) -> Mapping[str, str]:
+        """Each view or file's ID, keyed by the ID its name hashes to as a table."""
+
+        return {
+            catalog_resource_id(
+                resource.source_id, ResourceKind.TABLE, resource.native_identity
+            ): resource.id
+            for resource in await self._store.list_resources(agent_id)
+            if resource.kind is not ResourceKind.TABLE
+        }
+
+    async def source_read_access(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...],
+    ) -> Mapping[str, frozenset[str] | None]:
+        """Each source's stored read scope: None when it may read in full.
+
+        Reads permission records only, so a failing catalog cannot affect it.
+        """
+
+        access: dict[str, frozenset[str] | None] = {}
+        for registration in await self._active_registrations(agent_id, source_ids):
+            scope = await self._sources.load_source_read_scope(
+                agent_id, registration.id
+            )
+            if scope is None:
+                raise SourcePermissionStateError(
+                    "active source is missing its read scope"
+                )
+            self._require_owned_read_scope(registration.id, agent_id, scope)
+            access[registration.id] = (
+                None
+                if scope.mode is SourceReadMode.ALL
+                else frozenset(scope.resource_ids)
+            )
+        return access
+
+    async def resource_names(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+    ) -> Mapping[str, str]:
+        """Map each current readable resource ID to the native name the model uses."""
+
+        resources = await self._admitted_resources(agent_id, source_ids)
+        return {resource.id: resource.native_identity for resource in resources}
+
     async def admitted_model_sensitivity(
         self,
         agent_id: str,
@@ -188,7 +217,7 @@ class CatalogDataView:
         """Classify the exact current readable scope, or fail closed with None."""
 
         try:
-            resources = await self._admitted_resources(agent_id, source_ids)
+            await self.source_read_access(agent_id, source_ids)
         except SourcePermissionStateError:
             return None
         sensitivities: list[ModelSensitivity] = []
@@ -203,10 +232,7 @@ class CatalogDataView:
             not source_ids or self._session_source.source_id in source_ids
         ):
             sensitivities.append(self._session_source.presentation_sensitivity)
-        for resource in resources:
-            if resource.sensitivity is Sensitivity.UNKNOWN:
-                return None
-            sensitivities.append(ModelSensitivity(resource.sensitivity.value))
+        # A source's classification covers every table in it, cataloged or not.
         if not sensitivities:
             return ModelSensitivity.PUBLIC
         return max(sensitivities, key=lambda item: item.routing_rank)
@@ -216,27 +242,10 @@ class CatalogDataView:
         agent_id: str,
         source_ids: tuple[str, ...],
     ) -> tuple[CatalogResource, ...]:
-        """Resolve the one exact current resource scope used by reads and routing."""
-
-        # The uncataloged session source admits no catalog resources.
-        selected_source_ids = frozenset(source_ids) - {self.session_source_id}
-        if source_ids and not selected_source_ids:
-            return ()
-        registrations = tuple(
-            registration
-            for registration in await self._sources.list_sources(agent_id)
-            if self._available(registration, agent_id)
-            and (not selected_source_ids or registration.id in selected_source_ids)
-        )
-        if selected_source_ids and selected_source_ids != {
-            item.id for item in registrations
-        }:
-            raise SourcePermissionStateError(
-                "selected source scope is not active for this agent"
-            )
+        """Resolve the cataloged resources catalog tools and routing may show."""
 
         admitted: list[CatalogResource] = []
-        for registration in registrations:
+        for registration in await self._active_registrations(agent_id, source_ids):
             scope = await self._sources.load_source_read_scope(
                 agent_id,
                 registration.id,
@@ -255,19 +264,34 @@ class CatalogDataView:
                 if resource.agent_id == agent_id
                 and resource.source_id == registration.id
             )
-            current_by_id = {resource.id: resource for resource in current}
-            if scope.mode is SourceReadMode.NONE:
-                continue
-            elif scope.mode is SourceReadMode.ALL:
+            if scope.mode is SourceReadMode.ALL:
                 admitted.extend(current)
             else:
-                if not set(scope.resource_ids) <= set(current_by_id):
-                    raise SourcePermissionStateError(
-                        "active source read scope references a resource outside "
-                        "the current catalog"
-                    )
-                admitted.extend(current_by_id[item] for item in scope.resource_ids)
+                # A stored ID for a table that no longer exists simply never matches.
+                selected = frozenset(scope.resource_ids)
+                admitted.extend(item for item in current if item.id in selected)
         return tuple(admitted)
+
+    async def _active_registrations(
+        self, agent_id: str, source_ids: tuple[str, ...]
+    ) -> tuple[SourceRegistration, ...]:
+        # The uncataloged session source has no registration or stored scope.
+        selected_source_ids = frozenset(source_ids) - {self.session_source_id}
+        if source_ids and not selected_source_ids:
+            return ()
+        registrations = tuple(
+            registration
+            for registration in await self._sources.list_sources(agent_id)
+            if self._available(registration, agent_id)
+            and (not selected_source_ids or registration.id in selected_source_ids)
+        )
+        if selected_source_ids and selected_source_ids != {
+            item.id for item in registrations
+        }:
+            raise SourcePermissionStateError(
+                "selected source scope is not active for this agent"
+            )
+        return registrations
 
     @staticmethod
     def _require_owned_read_scope(
@@ -284,22 +308,235 @@ class CatalogDataView:
                 "active source read scope ownership is invalid"
             )
 
-    async def search(
-        self,
-        request: CatalogSearchRequest,
-        *,
-        readable_resource_ids: frozenset[str] | None = None,
-    ) -> CatalogSearchResult:
+    async def lookup_sources(
+        self, agent_id: str, source_ids: tuple[str, ...] = ()
+    ) -> tuple[tuple[str, str, str | None], ...]:
+        """(source ID, adapter ID, SQL dialect) of each current readable source."""
+
+        facts = await self.source_routing_facts(agent_id, source_ids)
+        return tuple(
+            (
+                cast(str, fact["source_id"]),
+                adapter := cast(str, fact["adapter_id"]),
+                (
+                    None
+                    if (source_type := self._source_types.get(adapter)) is None
+                    else source_type.sql_dialect
+                ),
+            )
+            for fact in facts
+        )
+
+    async def _catalog_extent(
+        self, agent_id: str, source_id: str
+    ) -> tuple[int | None, bool]:
+        """(object count, whether the catalog holds only part of the source)."""
+
+        count = 0
+        partial = False
+        try:
+            for ref in await self._store.list_current_snapshot_refs(
+                agent_id, (source_id,)
+            ):
+                snapshot = await self._store.load_current_snapshot(ref)
+                if snapshot is None:  # a sync replaced it while reading
+                    return None, False
+                count += len(snapshot.resources)
+                partial = partial or snapshot.sync.truncated
+        except CatalogStoreError:
+            return None, False
+        return count, partial
+
+    async def source_directory(
+        self, agent_id: str, source_ids: tuple[str, ...]
+    ) -> tuple[FrozenJsonObject, ...]:
+        """Each source's routing facts plus type, dialect, schemas and object count.
+
+        The count advises: a failing catalog leaves it, and the note that the
+        catalog holds only part of the source, unknown.
+        """
+
+        directory: list[FrozenJsonObject] = []
+        for fact in await self.source_routing_facts(agent_id, source_ids):
+            source_id = cast(str, fact["source_id"])
+            source_type = self._source_types.get(cast(str, fact["adapter_id"]))
+            count, partial = await self._catalog_extent(agent_id, source_id)
+            directory.append(
+                FrozenJsonObject.from_mapping(
+                    {
+                        **fact.to_dict(),
+                        "type": None if source_type is None else source_type.label,
+                        "dialect": (
+                            None if source_type is None else source_type.sql_dialect
+                        ),
+                        "schemas": await self.source_schemas(agent_id, source_id),
+                        "approximate_objects": count,
+                        **({"catalog_partial": _CATALOG_PARTIAL} if partial else {}),
+                    }
+                )
+            )
+        return tuple(directory)
+
+    async def catalog_hits(
+        self, request: CatalogSearchRequest
+    ) -> tuple[Mapping[str, object], ...]:
+        """Ranked matches from the catalog snapshot, with their column summaries."""
+
         readable = await self.readable_resource_ids(
-            request.agent_id,
-            request.source_ids,
+            request.agent_id, request.source_ids
         )
-        if readable_resource_ids is not None:
-            readable &= readable_resource_ids
-        return await self._service.search(
-            request,
-            readable_resource_ids=readable,
+        result = await self._service.search(request, readable_resource_ids=readable)
+        names = await self.resource_names(request.agent_id, request.source_ids)
+        matched = [
+            hit for hit in result.hits if "unmatched_fallback" not in hit.match_reasons
+        ]
+        tabular = {
+            item.resource.id: item.tabular
+            for source_id in {hit.source_id for hit in matched}
+            for item in await self._service.tabular_resources(
+                request.agent_id, source_id
+            )
+        }
+        hits: list[Mapping[str, object]] = []
+        for hit in matched:
+            facet = tabular.get(hit.resource_id)
+            columns = () if facet is None else facet.columns
+            hits.append(
+                {
+                    "source_id": hit.source_id,
+                    "name": names.get(hit.resource_id, hit.name),
+                    "kind": hit.kind.value,
+                    "columns": column_summary(
+                        ", ".join(
+                            f"{column.name} {column.native_type}"
+                            for column in columns[:SUMMARY_MAX_COLUMNS]
+                        ),
+                        len(columns),
+                    ),
+                    "row_estimate": (
+                        None if facet is None else facet.row_count_estimate
+                    ),
+                }
+            )
+        return tuple(hits)
+
+    async def cached_description(
+        self, agent_id: str, source_id: str, name: str
+    ) -> Mapping[str, object] | None:
+        """The catalog's last description of one readable table, or None."""
+
+        if source_id == self.session_source_id:
+            return None
+        readable = await self.readable_resource_ids(agent_id, (source_id,))
+        folded = name.lower()
+        current = tuple(
+            item
+            for item in await self._service.tabular_resources(agent_id, source_id)
+            if item.resource.id in readable
         )
+        found = next(
+            (
+                item
+                for spelling in (name, folded, f"main.{folded}")
+                for item in current
+                if item.resource.native_identity == spelling
+            ),
+            None,
+        )
+        if found is None:
+            suffixed = [
+                item
+                for item in current
+                if item.resource.native_identity.endswith(f".{name}")
+            ]
+            if len(suffixed) != 1:
+                return None
+            found = suffixed[0]
+        facet = found.tabular
+        return {
+            "name": found.resource.native_identity,
+            "kind": found.resource.kind.value,
+            "revision": found.resource.current_revision,
+            "comment": None,
+            "row_estimate": facet.row_count_estimate,
+            "partitions": 0,
+            "columns": [
+                {
+                    "name": column.name,
+                    "type": column.native_type,
+                    "nullable": column.nullable,
+                    **({"comment": column.comment} if column.comment else {}),
+                }
+                for column in facet.columns[:DESCRIBE_MAX_COLUMNS]
+            ],
+            "columns_truncated": len(facet.columns) > DESCRIBE_MAX_COLUMNS,
+            "primary_key": [
+                column.name
+                for column in sorted(
+                    (item for item in facet.columns if item.primary_key_ordinal),
+                    key=lambda item: cast(int, item.primary_key_ordinal),
+                )
+            ],
+            "unique_keys": [
+                list(index.columns)
+                for index in facet.indexes
+                if index.unique and index.predicate is None
+            ],
+            "relationships": await self._cataloged_relationships(
+                agent_id, source_id, found.resource.id
+            ),
+        }
+
+    async def _cataloged_relationships(
+        self, agent_id: str, source_id: str, resource_id: str
+    ) -> list[Mapping[str, object]]:
+        """Relationships by name, including links declared across sources."""
+
+        # Every source's readable set: a declared link needs its far endpoint.
+        projection = await self._service.schema_slice(
+            CatalogSchemaRequest(
+                agent_id=agent_id,
+                resource_ids=(resource_id,),
+                source_id=source_id,
+                limit=1,
+                include_relationships=True,
+                max_join_depth=1,
+                relationship_limit=CATALOG_SCHEMA_TOOL_DEFAULT_RELATIONSHIPS,
+            ),
+            readable_resource_ids=await self.readable_resource_ids(agent_id),
+        )
+        known = {
+            item.id: item
+            for item in await self._store.list_resources(agent_id)
+            if item.agent_id == agent_id
+        }
+        relationships: list[Mapping[str, object]] = []
+        for raw in cast(
+            tuple[Mapping[str, object], ...], projection.get("relationships", ())
+        ):
+            start = known.get(cast(str, raw.get("from_resource_id")))
+            end = known.get(cast(str, raw.get("to_resource_id")))
+            if start is None or end is None:
+                continue
+            relationships.append(
+                {
+                    "from": start.native_identity,
+                    "from_source_id": start.source_id,
+                    "from_kind": start.kind.value,
+                    "to": end.native_identity,
+                    "to_source_id": end.source_id,
+                    "to_kind": end.kind.value,
+                    "columns": [
+                        [pair["source_field"], pair["target_field"]]
+                        for pair in cast(
+                            tuple[Mapping[str, object], ...],
+                            raw.get("field_pairs", ()),
+                        )
+                    ],
+                    "provenance": raw.get("provenance"),
+                }
+            )
+        return relationships
 
     async def schema_slice(
         self,
@@ -314,23 +551,6 @@ class CatalogDataView:
         if readable_resource_ids is not None:
             readable &= readable_resource_ids
         return await self._service.schema_slice(
-            request,
-            readable_resource_ids=readable,
-        )
-
-    async def describe(
-        self,
-        request: CatalogDescribeRequest,
-        *,
-        readable_resource_ids: frozenset[str] | None = None,
-    ) -> FrozenJsonObject:
-        # Every source's readable set, as traverse uses: the service applies the
-        # source_id narrowing itself, and a declared link listed from that source
-        # still needs its readable far endpoint.
-        readable = await self.readable_resource_ids(request.agent_id)
-        if readable_resource_ids is not None:
-            readable &= readable_resource_ids
-        return await self._service.describe(
             request,
             readable_resource_ids=readable,
         )
@@ -482,6 +702,17 @@ class CatalogDataView:
             return None
         return registration.adapter_id
 
+    async def source_schemas(self, agent_id: str, source_id: str) -> tuple[str, ...]:
+        """The source's configured schemas in search order; empty when it has none."""
+
+        registration = await self._sources.load_source(agent_id, source_id)
+        schemas = (
+            None if registration is None else registration.configuration.get("schemas")
+        )
+        return (
+            tuple(cast(tuple[str, ...], schemas)) if isinstance(schemas, tuple) else ()
+        )
+
     async def resource_identity(
         self,
         agent_id: str,
@@ -567,210 +798,38 @@ class CatalogDataView:
             for resource in sorted(resources.values(), key=lambda item: item.id)
         )
 
-    async def catalog_context(
-        self,
-        agent_id: str,
-        query: str,
-        *,
-        prior_query: str | None = None,
-        limit: int,
-        source_ids: tuple[str, ...] = (),
-        resource_ids: tuple[str, ...] = (),
-        readable_resource_ids: frozenset[str] | None = None,
-    ) -> FrozenJsonObject:
-        """Project exact IDs or rank within a current-readable frozen ceiling."""
+    async def relational_write_scopes(
+        self, agent_id: str, source_id: str
+    ) -> Mapping[str, RelationalWriteScope]:
+        """One source's stored write scopes by table ID: permission records only."""
 
-        readable = await self.readable_resource_ids(agent_id, source_ids)
-        if readable_resource_ids is not None:
-            readable &= readable_resource_ids
-        unreadable_resource_id = next(
-            (
-                resource_id
-                for resource_id in resource_ids
-                if resource_id not in readable
-            ),
-            None,
-        )
-        if unreadable_resource_id is not None:
-            raise CatalogResourceNotFoundError(agent_id, unreadable_resource_id)
-        return await self._service.catalog_context(
-            agent_id,
-            query,
-            prior_query=prior_query,
-            limit=limit,
-            source_ids=source_ids,
-            resource_ids=resource_ids,
-            readable_resource_ids=readable,
-        )
-
-    async def relational_write_scope_issue(
-        self,
-        agent_id: str,
-        source_id: str,
-        resource_id: str,
-        assignment_columns: tuple[str, ...],
-        *,
-        operation: str = "update",
-        insert_columns: tuple[str, ...] = (),
-        key_columns: tuple[str, ...] = (),
-        row_count: int | None = None,
-    ) -> tuple[str, str] | None:
-        """Validate one exact current update authorization without source I/O."""
-
-        readable = await self.readable_resource_ids(agent_id, (source_id,))
-        if resource_id not in readable:
-            return (
-                "resource_read_not_allowed",
-                "The requested resource is not available for reading.",
+        return {
+            scope.resource_id: scope
+            for scope in await self._sources.list_relational_write_scopes(
+                agent_id, source_id
             )
-        registration = await self._sources.load_source(agent_id, source_id)
-        if (
-            registration is None
-            or registration.agent_id != agent_id
-            or registration.id != source_id
-            or not registration.active
-            or operation not in RELATIONAL_WRITE_OPERATIONS
-            or not self._source_types.supports(
-                registration.adapter_id, RELATIONAL_WRITE_OPERATIONS[operation]
-            )
-        ):
-            return (
-                "resource_update_not_allowed",
-                "The requested resource is not authorized for PostgreSQL updates.",
-            )
-        current = next(
-            (
-                item
-                for item in await self._service.tabular_resources(agent_id, source_id)
-                if item.resource.id == resource_id
-                and item.resource.kind is ResourceKind.TABLE
-            ),
-            None,
-        )
-        if current is None:
-            return (
-                "resource_update_not_allowed",
-                "The requested resource is not authorized for PostgreSQL updates.",
-            )
-        scopes = await self._sources.list_relational_write_scopes(
-            agent_id,
-            source_id,
-        )
-        scope = next(
-            (item for item in scopes if item.resource_id == resource_id),
-            None,
-        )
-        if scope is None:
-            return (
-                "resource_update_not_allowed",
-                "The requested resource is not authorized for PostgreSQL updates.",
-            )
-        if (
-            not isinstance(scope, RelationalWriteScope)
-            or scope.agent_id != agent_id
-            or scope.source_id != source_id
-        ):
-            raise SourcePermissionStateError(
-                "stored PostgreSQL update scope ownership is invalid"
-            )
-        if operation not in scope.allowed_operations:
-            return (
-                "resource_write_not_allowed",
-                "This relational operation is not explicitly authorized.",
-            )
-        if key_columns and set(key_columns) != set(scope.key_columns):
-            return (
-                "write_key_not_allowed",
-                "The requested conflict key differs from the exact permission.",
-            )
-        if not set(insert_columns) <= set(scope.allowed_insert_columns):
-            return (
-                "insert_column_not_allowed",
-                "One or more insertion columns are not authorized.",
-            )
-        if row_count is not None and row_count > scope.max_rows:
-            return (
-                "write_row_limit",
-                "The exact batch exceeds the admitted row ceiling.",
-            )
-        requested_columns = frozenset(assignment_columns)
-        if not requested_columns <= frozenset(scope.allowed_update_columns):
-            return (
-                "update_column_not_allowed",
-                "One or more assignment columns are not authorized for this table.",
-            )
-        try:
-            expected = relational_write_authorization_fingerprint(
-                source=registration,
-                resource=current.resource,
-                facet=current.facet,
-                scope=scope,
-            )
-        except (TypeError, ValueError):
-            expected = None
-        if scope.authorization_fingerprint != expected:
-            return (
-                "resource_update_scope_stale",
-                "The PostgreSQL update scope is stale; configure source permissions again.",
-            )
-        return None
-
-    async def load_relational_write_scope(
-        self,
-        agent_id: str,
-        source_id: str,
-        resource_id: str,
-    ) -> RelationalWriteScope | None:
-        scopes = await self._sources.list_relational_write_scopes(agent_id, source_id)
-        scope = next((item for item in scopes if item.resource_id == resource_id), None)
-        if scope is None:
-            return None
-        issue = await self.relational_write_scope_issue(
-            agent_id,
-            source_id,
-            resource_id,
-            scope.allowed_update_columns,
-            operation=scope.allowed_operations[0],
-        )
-        if issue is not None:
-            return None
-        return scope
+        }
 
     async def relational_write_applicable_source_ids(
-        self,
-        agent_id: str,
-        source_ids: tuple[str, ...] = (),
-        *,
-        operation: str = "update",
+        self, agent_id: str, source_ids: tuple[str, ...] = ()
     ) -> frozenset[str]:
+        """Active writable sources with at least one stored write scope."""
+
         selected = frozenset(source_ids)
         applicable: set[str] = set()
         for registration in await self._sources.list_sources(agent_id):
             if (
-                registration.agent_id != agent_id
-                or not registration.active
-                or operation not in RELATIONAL_WRITE_OPERATIONS
-                or not self._source_types.supports(
-                    registration.adapter_id, RELATIONAL_WRITE_OPERATIONS[operation]
+                self._available(registration, agent_id)
+                and self._source_types.supports(
+                    registration.adapter_id, SourceOperation.RELATIONAL_WRITE
                 )
-                or (selected and registration.id not in selected)
-            ):
-                continue
-            for scope in await self._sources.list_relational_write_scopes(
-                agent_id,
-                registration.id,
-            ):
-                issue = await self.relational_write_scope_issue(
-                    agent_id,
-                    registration.id,
-                    scope.resource_id,
-                    scope.allowed_update_columns,
-                    operation=operation,
+                and (not selected or registration.id in selected)
+                and await self._sources.list_relational_write_scopes(
+                    agent_id, registration.id
                 )
-                if issue is None:
-                    applicable.add(registration.id)
-                    break
+            ):
+                applicable.add(registration.id)
         return frozenset(applicable)
 
 
-__all__ = ["RELATIONAL_WRITE_OPERATIONS", "CatalogDataView"]
+__all__ = ["CatalogDataView"]

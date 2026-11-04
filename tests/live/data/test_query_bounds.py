@@ -26,6 +26,7 @@ from daita.security import SecretReference
 from tests.catalog._schema_support import _OBSERVED_AT
 from tests.data.postgresql._large_fixture_support import ATTACHED_SCHEMAS, _Secrets
 from tests.support.capability_runtime import execute_projected
+from tests.support.checked_read import checked_read
 from tests.support.workspace import workspace_for
 
 pytestmark = [
@@ -235,15 +236,16 @@ async def test_statement_deadline_cancels_the_server_query_and_cleans_up(
         _capability, executor = registry.resolve_execution(DATA_QUERY_CAPABILITY_ID)
         backend = executor._backends["postgresql"]  # type: ignore[attr-defined]
         assert isinstance(backend, PostgreSQLQueryBackend)
+        readable = (await agent.list_catalog_resources(source_id=source_id))[0]
         with pytest.raises(PostgreSQLQueryError) as timed_out:
             await backend.execute_read(
                 agent_id=agent.id,
                 source_id=source_id,
-                sql=(
+                read=checked_read(
                     "SELECT count(*) FROM billing.invoice_lines AS a "
-                    "CROSS JOIN billing.invoices AS b"
+                    "CROSS JOIN billing.invoices AS b",
+                    resource_id=readable.id,
                 ),
-                parameters=(),
                 max_rows=10,
                 max_bytes=1_024,
                 timeout_seconds=0.3,

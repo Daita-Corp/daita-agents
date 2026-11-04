@@ -29,7 +29,7 @@ from daita.adapters.sqlite_query import SQLiteQueryBackend
 from daita.artifacts.models import ArtifactError
 from daita.config import AgentConfig, AnalysisLimits
 from daita.distribution import OutcomeState
-from daita.llm.models import FinishReason, ModelResponse, ModelUsage
+from daita.llm.models import FinishReason, ModelResponse, ModelUsage, ToolCall
 from daita.llm.pricing import CostEstimate
 from daita.loop.models import LoopExitKind, LoopLimits, RunOrigin
 from tests.artifacts._public_surface_support import _profile, _tool
@@ -92,6 +92,61 @@ async def test_public_agent_runs_python_and_dependent_cell(tmp_path):
         assert not Path(generation["scratch"]).exists()
         with pytest.raises(ProcessLookupError):
             os.kill(generation["pid"], 0)
+    finally:
+        await agent.close()
+
+
+async def test_python_reads_results_under_the_keys_direct_results_show(tmp_path):
+    database = tmp_path / "values.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE numbers (n INTEGER)")
+    code = (
+        "args = {'source': 'values', 'sql': 'SELECT n FROM numbers'}\n"
+        "for r in [tools.call('data_query', args), "
+        "tools.batch([{'name': 'data_query', 'arguments': args}])[0]]:\n"
+        "    data = r['output']['data']\n"
+        "    assert data['source'] == 'values', r\n"
+        "    assert data['tables'] == ['main.numbers'], r\n"
+        "    assert not {'source_id', 'resource_ids'} & set(data), r\n"
+        "    print(r)\n"
+    )
+    model = ToolboxAwareMockModelProvider(
+        (
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(ToolCall("python", "python_execute", {"code": code}),),
+            ),
+            ModelResponse(finish_reason=FinishReason.STOP, text="Read."),
+        )
+    )
+    agent = await Agent.create(
+        "python-names",
+        root=tmp_path,
+        model=model,
+        model_profile=replace(_profile(model), context_window_tokens=64_000),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        source = await agent.attach_sqlite(database, name="values")
+        result = await agent.run("Read the numbers with Python.")
+        assert result.kind is LoopExitKind.COMPLETED, result
+        transcript = await agent.transcript(result.run_id)
+        block = next(
+            output for call, output in transcript.tool_pairs if call.id == "python"
+        )
+        assert block is not None and not block.is_error, block
+        assert block.output["data"]["status"] == "success", block  # type: ignore[index]
+        assert "source_id" not in str(block.output["data"]["stdout"])  # type: ignore[index]
+        assert source.id not in str(block.output)
+        # Stored evidence keeps the identities the read executed with.
+        children = [
+            record
+            for record in await agent.analysis_evidence(result.run_id)
+            if record.kind == "child"
+        ]
+        assert children and all(
+            source.id in canonical_json(record.facts) for record in children
+        )
     finally:
         await agent.close()
 
@@ -172,7 +227,7 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
                         "python_execute",
                         {
                             "code": "import json\n"
-                            "assert tools.call('file_read', {'source_id':'s1', 'path':'values.sqlite'})['is_error']\n"
+                            "assert tools.call('file_read', {'source':'Working folder', 'path':'values.sqlite'})['is_error']\n"
                             f"assert tools.call('data_query', {{'source_id':{excluded.id!r}, 'resource_ids':[{excluded_resource.id!r}], 'sql':'SELECT n FROM secret'}})['is_error']\n"
                             f"r = tools.call('data_query', {{'source_id':{source.id!r}, 'resource_ids':[{resource.id!r}], 'sql':'SELECT n FROM numbers'}})\n"
                             "assert not r['is_error'], r\n"
@@ -467,7 +522,7 @@ async def test_batch_reads_overlap_finish_out_of_order_and_retain_individual_err
                 "batch",
                 "python_execute",
                 {
-                    "code": "rs = tools.batch([{'name':'file_read','arguments':{'source_id':'s1','path':p}} for p in ['one.txt','missing.txt','two.txt']])\nassert [r['is_error'] for r in rs] == [False,True,False], rs\nassert [rs[i]['output']['data']['content'] for i in [0,2]] == ['17','25'], rs\nprint('ordered')",
+                    "code": "rs = tools.batch([{'name':'file_read','arguments':{'source':'Working folder','path':p}} for p in ['one.txt','missing.txt','two.txt']])\nassert [r['is_error'] for r in rs] == [False,True,False], rs\nassert [rs[i]['output']['data']['content'] for i in [0,2]] == ['17','25'], rs\nprint('ordered')",
                 },
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="42"),
@@ -549,7 +604,10 @@ async def test_batch_rejects_whole_envelopes_before_io_and_counts_attempts(
 
     monkeypatch.setattr(LocalWorkspaceBackend, "read", read)
     calls = [
-        {"name": "file_read", "arguments": {"source_id": "s1", "path": "one.txt"}}
+        {
+            "name": "file_read",
+            "arguments": {"source": "Working folder", "path": "one.txt"},
+        }
         for _ in range(3)
     ]
     if failure == "malformed":
@@ -618,7 +676,7 @@ async def test_batch_interruption_settles_dispatched_and_queued_children(
             settled.set()
 
     monkeypatch.setattr(LocalWorkspaceBackend, "read", read)
-    code = "tools.batch([{'name':'file_read','arguments':{'source_id':'s1','path':p}} for p in ['one.txt','two.txt','three.txt']])"
+    code = "tools.batch([{'name':'file_read','arguments':{'source':'Working folder','path':p}} for p in ['one.txt','two.txt','three.txt']])"
     model = ToolboxAwareMockModelProvider(
         (
             _tool(
@@ -704,7 +762,7 @@ async def test_batch_trace_exhaustion_dispatches_nothing_and_retains_requested_u
                 "batch",
                 "python_execute",
                 {
-                    "code": "tools.batch([{'name':'file_read','arguments':{'source_id':'s1','path':'one.txt'}}]*3)",
+                    "code": "tools.batch([{'name':'file_read','arguments':{'source':'Working folder','path':'one.txt'}}]*3)",
                 },
             ),
             ModelResponse(
@@ -744,7 +802,7 @@ async def test_python_threads_serialize_batches_and_keep_each_response_identity(
     workspace = workspace_for(tmp_path)
     for name in ("one", "two"):
         (workspace.root / f"{name}.txt").write_text(name)
-    code = "from concurrent.futures import ThreadPoolExecutor\ndef fetch(name):\n rs = tools.batch([{'name':'file_read','arguments':{'source_id':'s1','path':name+'.txt'}}]*2)\n assert all(not r['is_error'] and r['output']['data']['content'] == name for r in rs), rs\n return name\nwith ThreadPoolExecutor(max_workers=2) as pool:\n print(list(pool.map(fetch, ['one','two'])))"
+    code = "from concurrent.futures import ThreadPoolExecutor\ndef fetch(name):\n rs = tools.batch([{'name':'file_read','arguments':{'source':'Working folder','path':name+'.txt'}}]*2)\n assert all(not r['is_error'] and r['output']['data']['content'] == name for r in rs), rs\n return name\nwith ThreadPoolExecutor(max_workers=2) as pool:\n print(list(pool.map(fetch, ['one','two'])))"
     model = ToolboxAwareMockModelProvider(
         (
             _tool(
@@ -871,7 +929,7 @@ async def test_batch_uses_distinct_source_lanes_and_rechecks_revoked_authority(
         agent.run("Use Python to read the connected numbers tables.")
     )
     try:
-        await asyncio.wait_for(second.wait(), timeout=5)
+        await asyncio.wait_for(asyncio.gather(first.wait(), second.wait()), timeout=5)
         assert calls.count(sources[0].id) == calls.count(sources[1].id) == 1
         preview = await agent.preview_source_permissions(
             source_id=sources[0].id,
@@ -938,7 +996,7 @@ async def test_worker_rejects_stale_batch_response_identity_without_replay(
                 "batch",
                 "python_execute",
                 {
-                    "code": "tools.batch([{'name':'file_read','arguments':{'source_id':'s1','path':'one.txt'}}])",
+                    "code": "tools.batch([{'name':'file_read','arguments':{'source':'Working folder','path':'one.txt'}}])",
                 },
             ),
             ModelResponse(
@@ -1225,7 +1283,6 @@ async def test_exact_arrow_export_bind_compute_and_reopen(tmp_path, handoff):
         "parser",
         "parser_bound",
         "decoded_bound",
-        "drift",
         "revocation",
         "deletion",
         "cancel",
@@ -1351,9 +1408,6 @@ async def test_capture_failure_retains_publication_without_query_replay(
             ),
         )
     )
-    if failure == "drift":
-        with sqlite3.connect(database) as connection:
-            connection.execute("ALTER TABLE numbers ADD COLUMN extra TEXT")
     task = asyncio.create_task(
         agent.run("Use Python with the connected numbers table.")
     )

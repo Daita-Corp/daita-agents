@@ -125,11 +125,29 @@ class JobOwner:
         conversation_id: str,
         sources: Iterable[str] = (),
         refs: ScopeRefs | None = None,
+        within: frozenset[str] | None = None,
     ) -> Job:
+        """Start a job; ``within`` is the scope of the run asking, when one is."""
+
         text = clean_text(objective, MAX_OBJECTIVE_CHARACTERS, lines=True)
         if not text:
             raise JobError("job_objective_required", "A job needs an objective.")
-        source_ids = await self.resolve_sources(tuple(sources), refs)
+        source_ids = await self.resolve_sources(tuple(sources), refs, within=within)
+        if not source_ids and within is not None:
+            # A job naming no source reads every current one, unless the run
+            # asking reads fewer: model text never widens that run's scope.
+            active = {
+                item.id
+                for item in await self._store.list_sources(self.agent_id)
+                if item.active
+            }
+            if active - within:
+                source_ids = tuple(sorted(active & within))
+                if not source_ids:
+                    raise JobError(
+                        "job_source_outside_run",
+                        "This run reads no source a job can read.",
+                    )
         now = self._clock()
         job = Job(
             job_id=self._id_factory("job"),
@@ -148,22 +166,36 @@ class JobOwner:
         return admitted
 
     async def resolve_sources(
-        self, requested: tuple[str, ...], refs: ScopeRefs | None = None
+        self,
+        requested: tuple[str, ...],
+        refs: ScopeRefs | None = None,
+        *,
+        within: frozenset[str] | None = None,
     ) -> tuple[str, ...]:
-        """Resolve source handles, names or ids against current sources."""
+        """Resolve source names or ids (or a stored run's handles) to current sources.
+
+        With ``within``, a source outside it is as unknown as one that does not
+        exist, and a refusal lists only the sources inside.
+        """
 
         if not requested:
             return ()
         registrations = tuple(
             item
             for item in await self._store.list_sources(self.agent_id)
-            if item.active
+            if item.active and (within is None or item.id in within)
         )
         try:
             return _resolve_sources(requested, registrations, refs)
         except RoutineError as error:
             raise JobError(
-                "job_source_unknown", str(error), _recovery(error.details)
+                (
+                    error.code
+                    if error.code == "source_ambiguous"
+                    else "job_source_unknown"
+                ),
+                str(error),
+                _recovery(error.details),
             ) from None
 
     async def list(
@@ -546,7 +578,7 @@ def _recovery(details: Mapping[str, object]) -> ToolRecovery | None:
         return None
     constraint = recovery.get("constraint")
     return (
-        ToolRecovery(RecoveryKind.CORRECT_ARGUMENTS, constraint)
+        ToolRecovery(RecoveryKind(recovery["kind"]), constraint)
         if isinstance(constraint, str) and constraint
         else None
     )

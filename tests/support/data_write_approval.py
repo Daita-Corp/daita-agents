@@ -7,18 +7,22 @@ from typing import Any
 from daita import ApprovalRequest
 
 APPROVAL_KEYS = frozenset({"arguments", "target", "preview"})
-TARGET_KEYS = frozenset(
-    {"source_id", "resource_id", "name", "aliases", "source_name", "revision"}
-)
-UPDATE_PREVIEW_KEYS = frozenset({"matched_rows", "samples", "warnings"})
-UPSERT_PREVIEW_KEYS = frozenset(
+TARGET_KEYS = frozenset({"source_id", "resource_id", "name", "source_name"})
+PREVIEW_KEYS = frozenset(
     {
-        "classifications",
-        "identity_sequence_gaps_possible",
-        "input_count",
-        "inserted_count",
-        "unchanged_count",
-        "updated_count",
+        "sql",
+        "operation",
+        "columns_changed",
+        "affected_rows",
+        "inserted_rows",
+        "updated_rows",
+        "deleted_rows",
+        "skipped_rows",
+        "samples",
+        "triggers",
+        "cascades",
+        "warnings",
+        "verification",
     }
 )
 

@@ -73,7 +73,7 @@ def routine_record(
 def execution_scope(occurrence: RoutineOccurrence) -> ExecutionScope:
     return ExecutionScope(
         contract_bindings=frozen_execution_bindings(
-            ("catalog.describe", "data.query"), ("resource-1",), ("mock:routine",)
+            ("catalog.describe", "data.query"), ("mock:routine",)
         ),
         scope_id=f"scope:{occurrence.occurrence_id}",
         revision=1,

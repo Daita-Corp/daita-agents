@@ -104,13 +104,17 @@ from ...loop.session import RunSession
 from ...scope import (
     EffectiveSourceScope,
     SourceScopeCatalog,
+    narrowed_read_access,
     resolve_effective_source_scope,
+    run_read_narrowings,
 )
 from .controller import DATA_EXPORT_TABULAR_CAPABILITY_ID, TEXT_READ_CAPABILITY_ID
 from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
+    CheckedRead,
     ResourceSchema,
+    checked_reads,
 )
 
 DOCUMENT_CREATE_CAPABILITY_ID = "artifact.create_document"
@@ -211,9 +215,8 @@ class ExactTabularExportResult:
     format: str
     adapter_id: str
     source_id: str
-    source_revision: str
     sql_fingerprint: str
-    resource_revisions: tuple[tuple[str, str], ...]
+    resource_ids: tuple[str, ...]
     columns: tuple[str, ...]
     row_count: int
     content: bytes
@@ -226,21 +229,17 @@ class ExactTabularExportResult:
         for value, name in (
             (self.adapter_id, "adapter_id"),
             (self.source_id, "source_id"),
-            (self.source_revision, "source_revision"),
             (self.sql_fingerprint, "sql_fingerprint"),
         ):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"exact tabular {name} must be non-empty text")
         if not self.sql_fingerprint.startswith("sha256:"):
             raise ValueError("exact tabular sql_fingerprint must use sha256")
-        revisions = tuple(sorted(tuple(item) for item in self.resource_revisions))
-        if not revisions or len(revisions) > 64:
-            raise ValueError("exact tabular resource revisions exceed their bound")
-        if len({item[0] for item in revisions}) != len(revisions) or any(
-            not resource_id or not revision.startswith("sha256:")
-            for resource_id, revision in revisions
-        ):
-            raise ValueError("exact tabular resource revisions are invalid")
+        resource_ids = tuple(sorted(self.resource_ids))
+        if not resource_ids or len(resource_ids) > 64:
+            raise ValueError("exact tabular resources exceed their bound")
+        if len(set(resource_ids)) != len(resource_ids) or not all(resource_ids):
+            raise ValueError("exact tabular resources are invalid")
         columns = tuple(self.columns)
         if (
             not 1 <= len(columns) <= MAX_CSV_COLUMNS
@@ -268,7 +267,7 @@ class ExactTabularExportResult:
             or self.sensitivity is Sensitivity.UNKNOWN
         ):
             raise ValueError("exact tabular sensitivity must be resolved")
-        object.__setattr__(self, "resource_revisions", revisions)
+        object.__setattr__(self, "resource_ids", resource_ids)
         object.__setattr__(self, "columns", columns)
         types = tuple(self.column_types)
         if self.format == "arrow" and (
@@ -292,8 +291,7 @@ class ExactTabularExportBackend(Protocol):
         *,
         agent_id: str,
         source_id: str,
-        sql: str,
-        parameters: tuple[object, ...],
+        read: CheckedRead,
         format_name: str,
         parameters_sha256: str,
         created_at: datetime,
@@ -485,22 +483,19 @@ class DataExportTabularExecutor:
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         source_id = request.arguments["source_id"]
-        sql = request.arguments["sql"]
         parameters = request.arguments.get("parameters", ())
-        resource_ids = request.arguments["resource_ids"]
         adapter_id = request.arguments["_adapter_id"]
         format_name = request.arguments["output"]
         filename = request.arguments.get("filename")
         assert isinstance(source_id, str)
-        assert isinstance(sql, str)
         assert isinstance(parameters, tuple)
-        assert isinstance(resource_ids, tuple)
         assert isinstance(adapter_id, str)
         assert isinstance(format_name, str) and format_name in {"csv", "xlsx", "arrow"}
         assert filename is None or isinstance(filename, str)
         if format_name == "arrow" and self._arrow_bounds is None:
             raise ValueError("Arrow is not admitted by this runtime")
         bounds = self._arrow_bounds if format_name == "arrow" else None
+        (read,) = checked_reads(request.arguments)
         completed = {"rows": 0, "columns": 0, "bytes": 0}
         backend = self._backends.get(adapter_id)
         if backend is None:
@@ -517,8 +512,7 @@ class DataExportTabularExecutor:
                 result = await backend.execute_exact_tabular(
                     agent_id=self._agent_id,
                     source_id=source_id,
-                    sql=sql,
-                    parameters=parameters,
+                    read=read,
                     format_name=format_name,
                     parameters_sha256=parameters_sha256,
                     created_at=self._clock(),
@@ -553,8 +547,6 @@ class DataExportTabularExecutor:
             result.adapter_id != adapter_id
             or result.source_id != source_id
             or result.format != format_name
-            or frozenset(item[0] for item in result.resource_revisions)
-            != frozenset(resource_ids)
         ):
             raise ValueError("exact tabular backend returned different execution facts")
         media_type = {
@@ -573,13 +565,8 @@ class DataExportTabularExecutor:
             extensions,
         )
         bindings = tuple(
-            ArtifactResourceBinding(
-                source_id=result.source_id,
-                source_revision=result.source_revision,
-                resource_id=resource_id,
-                resource_revision=revision,
-            )
-            for resource_id, revision in result.resource_revisions
+            ArtifactResourceBinding(source_id=result.source_id, resource_id=resource_id)
+            for resource_id in result.resource_ids
         )
         draft = ArtifactDraft(
             content=result.content,
@@ -602,11 +589,7 @@ class DataExportTabularExecutor:
                 "format": format_name,
                 "filename": safe_filename,
                 "source_id": result.source_id,
-                "source_revision": result.source_revision,
-                "resource_revisions": tuple(
-                    {"resource_id": resource_id, "revision": revision}
-                    for resource_id, revision in result.resource_revisions
-                ),
+                "resource_ids": result.resource_ids,
                 "row_count": result.row_count,
                 "column_count": len(result.columns),
                 **(
@@ -2122,40 +2105,30 @@ class ArtifactCapabilityDomain:
                 source_id = lineage.get("source_id")
                 if not isinstance(source_id, str):
                     continue
-                readable = await self._catalog.readable_resource_ids(
+                current = await self._catalog.source_read_access(
                     run.agent_id, (source_id,)
                 )
-                schemas = {
-                    item.resource_id: item
-                    for item in await self._catalog.resource_schemas(
-                        run.agent_id, source_id
+                access = narrowed_read_access(
+                    source_id,
+                    current.get(source_id, frozenset()),
+                    run_read_narrowings(run),
+                )
+                resource_id = lineage.get("resource_id")
+                touched = (
+                    (resource_id,)
+                    if isinstance(resource_id, str)
+                    else lineage.get("resource_ids", ())
+                )
+                if not isinstance(touched, (list, tuple)):
+                    raise CapabilityInputError(
+                        "analysis_input_invalid",
+                        "Input resource lineage is invalid.",
                     )
-                }
-                revisions = lineage.get("resource_revisions", ())
-                if isinstance(lineage.get("resource_id"), str):
-                    revisions = (
-                        {
-                            "resource_id": lineage["resource_id"],
-                            "revision": lineage.get("resource_revision"),
-                        },
+                if access is not None and any(item not in access for item in touched):
+                    raise CapabilityInputError(
+                        "analysis_input_revoked",
+                        "Permission to read an input table was revoked.",
                     )
-                if isinstance(revisions, (list, tuple)):
-                    for item in revisions:
-                        if not isinstance(item, Mapping):
-                            raise CapabilityInputError(
-                                "analysis_input_invalid",
-                                "Input resource lineage is invalid.",
-                            )
-                        resource_id = str(item.get("resource_id"))
-                        if (
-                            resource_id not in readable
-                            or resource_id not in schemas
-                            or schemas[resource_id].revision != item.get("revision")
-                        ):
-                            raise CapabilityInputError(
-                                "analysis_input_revoked",
-                                "The input resource authority or structural revision changed.",
-                            )
         return validated
 
     async def _validated_current_run_evidence(
@@ -2848,7 +2821,6 @@ class ArtifactCapabilityDomain:
         )
         bindings: dict[tuple[str, str], ArtifactResourceBinding] = {}
         sensitivities = [draft.sensitivity]
-        schema_cache: dict[str, dict[str, ResourceSchema]] = {}
         for evidence in evidence_results:
             call_id = evidence.call.id
             block = evidence.block
@@ -2859,65 +2831,18 @@ class ArtifactCapabilityDomain:
                 continue
             for lineage in relational_lineage(data):
                 source_id = lineage.get("source_id")
-                source_revision = lineage.get("source_revision")
-                if not isinstance(source_id, str) or not isinstance(
-                    source_revision, str
-                ):
+                touched = lineage.get("resource_ids")
+                if not isinstance(source_id, str) or not isinstance(touched, tuple):
                     raise CapabilityInputError(
                         "invalid_argument_value",
                         "Artifact evidence source identity is unavailable.",
                         {"name": "evidence_call_ids", "call_id": call_id},
                     )
-                raw_revisions = lineage.get("resource_revisions")
-                resources = tuple(
-                    (resource_id, revision)
-                    for item in (
-                        raw_revisions if isinstance(raw_revisions, tuple) else ()
-                    )
-                    if isinstance(item, Mapping)
-                    and isinstance((resource_id := item.get("resource_id")), str)
-                    and isinstance((revision := item.get("revision")), str)
-                )
-                schemas = schema_cache.get(source_id)
-                if schemas is None:
-                    schemas = {
-                        item.resource_id: item
-                        for item in await self._catalog.resource_schemas(
-                            run.agent_id,
-                            source_id,
+                for resource_id in touched:
+                    if isinstance(resource_id, str):
+                        bindings[(source_id, resource_id)] = ArtifactResourceBinding(
+                            source_id=source_id, resource_id=resource_id
                         )
-                    }
-                    schema_cache[source_id] = schemas
-                for resource_id, resource_revision in resources:
-                    schema = schemas.get(resource_id)
-                    if (
-                        schema is None
-                        or schema.revision != resource_revision
-                        or schema.source_revision != source_revision
-                    ):
-                        raise CapabilityInputError(
-                            "invalid_argument_value",
-                            "Artifact evidence is no longer current in the catalog.",
-                            {"name": "evidence_call_ids", "call_id": call_id},
-                        )
-                    resource_binding = ArtifactResourceBinding(
-                        source_id=source_id,
-                        source_revision=source_revision,
-                        resource_id=resource_id,
-                        resource_revision=resource_revision,
-                    )
-                    key = (source_id, resource_id)
-                    if key in bindings and bindings[key] != resource_binding:
-                        raise CapabilityInputError(
-                            "invalid_argument_value",
-                            "Artifact evidence contains conflicting resource revisions.",
-                            {"name": "evidence_call_ids", "call_id": call_id},
-                        )
-                    bindings[key] = resource_binding
-                    try:
-                        sensitivities.append(Sensitivity(schema.sensitivity_class))
-                    except ValueError:
-                        sensitivities.append(Sensitivity.RESTRICTED)
         return replace(
             draft,
             sensitivity=_resolved_sensitivity(tuple(sensitivities)),
@@ -3059,9 +2984,9 @@ def _tabular_export_capability(
                 "resource_ids": {
                     "type": "array",
                     "items": resource_id_schema(),
-                    "minItems": 1,
                     "maxItems": 64,
                     "uniqueItems": True,
+                    "readOnly": True,
                 },
                 "sql": {
                     "type": "string",
@@ -3076,7 +3001,7 @@ def _tabular_export_capability(
                 "output": {"type": "string", "enum": formats},
                 "filename": {"type": "string", "minLength": 1, "maxLength": 120},
             },
-            "required": ["source_id", "resource_ids", "sql", "output"],
+            "required": ["source_id", "sql", "output"],
             "additionalProperties": False,
         },
         output_kind=TABULAR_EXPORT_OUTPUT_KIND,
@@ -3111,21 +3036,15 @@ def _tabular_export_capability(
                 "adapter_id": {"type": "string", "enum": list(adapter_ids)},
                 "filename": {"type": "string"},
                 "source_id": {"type": "string"},
-                "source_revision": {"type": "string"},
-                "resource_revisions": {
+                "resource_ids": {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": 64,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "resource_id": {"type": "string"},
-                            "revision": {"type": "string"},
-                        },
-                        "required": ["resource_id", "revision"],
-                        "additionalProperties": False,
-                    },
+                    "items": {"type": "string"},
                 },
+                # Exports stored before reads stopped binding revisions.
+                "source_revision": {"type": "string"},
+                "resource_revisions": {"type": "array"},
                 "row_count": {"type": "integer", "minimum": 0},
                 "column_count": {
                     "type": "integer",
@@ -3138,8 +3057,6 @@ def _tabular_export_capability(
                 "format",
                 "filename",
                 "source_id",
-                "source_revision",
-                "resource_revisions",
                 "row_count",
                 "column_count",
             ],

@@ -57,10 +57,10 @@ validation, bounds and canonical bytes.
 
 Daita is a persistent, read-first data agent. Each agent has an **agent home**
 (`~/.daita/agents/<name>/`) holding one SQLite database plus memory, skills,
-artifacts and model configuration. The agent connects to data sources through a
-catalog, answers questions through a single model loop, and can run scheduled
+artifacts and model configuration. The agent reads data sources directly, with a
+catalog as advice, answers questions through a single model loop, and can run scheduled
 **routines** and durable **jobs** in the background. Writes to external systems
-(PostgreSQL update/upsert, admitted MCP actions) are narrowly scoped, explicitly
+(PostgreSQL insert/update/delete, admitted MCP actions) are narrowly scoped, explicitly
 enabled, approved and receipted.
 
 One run looks like this:
@@ -95,7 +95,7 @@ Runs come from two places:
 | `CapabilityRegistry` | Capability, tool-view and executor declarations; schema projection and validation | `capabilities.py` |
 | `CapabilityRuntime` | The one boundary from a tool call to execution | `capability_runtime.py` |
 | Capability domains | Applicability, binding and semantics per area (data, artifacts, analysis, memory, skills, semantics, jobs, routines, distribution, MCP) | `domains/`, and each area's `capabilities.py` |
-| Catalog | Source and resource truth: schemas, relationships, declared links, freshness | `catalog/` |
+| Catalog | Advisory source facts: schemas, relationships, declared links, freshness | `catalog/` |
 | Adapters / source types | Source admission, discovery and bounded I/O | `adapters/`, `adapters/registry.py` |
 | Artifacts | Committed artifact bytes, manifests, renderers, delivery | `artifacts/` |
 | Jobs | Background jobs: one `Job` record (checklist, delegations, answers); `JobOwner`, `JobSupervisor` | `jobs/` |
@@ -123,9 +123,11 @@ These protect users. Each comes with the reason it exists.
    labeled untrusted. Authority comes only from code-owned capability metadata,
    current permissions and a person's approvals. Never infer access or effects
    from a tool name or description. *Why: prompt injection.*
-4. **The catalog is structural truth, and SQL is validated against it before any
-   source I/O.** Connector guardrails still apply during execution. *Why: model
-   text cannot be trusted to name real resources or safe queries.*
+4. **The source is the truth for data work, and policy is enforced before any
+   source I/O.** SQL is parsed and checked against the run's name scope and
+   function rules; the engine resolves names inside a read-only transaction. The
+   catalog is advisory and never grants or denies access. *Why: model text cannot
+   be trusted, and a cached description of a source cannot be trusted either.*
 5. **External effects are approved at the time, receipted and never replayed.**
    Every external effect is approved by a person at the time, bound to its exact
    arguments, receipted before dispatch, and never retried or replayed. An
@@ -146,7 +148,9 @@ These protect users. Each comes with the reason it exists.
    Any change to stored records or home files needs a home migration, a golden
    fixture and a refreshed release contract. Released migrations, checksums,
    decoders and fixtures never change. Newer, damaged or unknown homes fail
-   closed without rewriting state. *Why: upgrades must never lose user data.*
+   closed without rewriting state. The one exception is catalog rows: they can be
+   rebuilt from the source, so a damaged one is rebuilt rather than failing
+   closed. *Why: upgrades must never lose user data.*
 10. **State mutation is atomic and cancellation-safe.** *Why: interrupted
     processes must leave a consistent home.*
 11. **Optional and heavy dependencies are imported lazily.** Importing `daita` or

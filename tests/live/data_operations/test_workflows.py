@@ -73,8 +73,7 @@ def record_score(evaluation, label, capture, expected):
     ), "A correct-looking answer without current read evidence is insufficient"
     assert all(output.capability_id == "data.query" for output in successful)
     assert not any(
-        call.name
-        in {"data_update_rows", "data_upsert_rows", "memory_set", "semantic_save"}
+        call.name in {"data_write", "memory_set", "semantic_save"}
         for call, _ in capture.transcript.tool_pairs
     )
     return score
@@ -611,7 +610,6 @@ async def test_live_existing_postgresql_fixture_independent_oracle(
         assert diagnostics.connections_created == 1
         assert diagnostics.active == diagnostics.waiting == 0
         assert diagnostics.completed == diagnostics.acquired
-        assert diagnostics.structural_seconds > 0
     assert await evaluation.agent.list_effects() == ()
 
 

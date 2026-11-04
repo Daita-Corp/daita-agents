@@ -10,17 +10,18 @@ import asyncio
 import os
 from collections.abc import Callable, Mapping
 from time import monotonic
+from typing import Any, cast
 
 import pytest
 
 from daita import ApprovalDecision
-from daita._json import thaw_json
 from daita.capabilities import EffectOutcome
 from daita.storage.sqlite_records import EffectResolutionDecision
 from tests.support.postgresql_live import (
     _ROLE,
     _TABLE,
     Fixture,
+    batch_upsert,
     row,
 )
 
@@ -33,6 +34,12 @@ pytestmark = [
         reason="set DAITA_RUN_POSTGRES_WRITE_RELEASE=1 for the disposable postgres-large fixture",
     ),
 ]
+
+
+def _counts(database: Fixture) -> tuple[object, object, object]:
+    data = database.model.results["write"].output["data"]
+    assert isinstance(data, Mapping)
+    return data["inserted_rows"], data["updated_rows"], data["skipped_rows"]
 
 
 async def test_fixture_role_is_restricted_and_cannot_delete_or_create(
@@ -53,7 +60,7 @@ async def test_fixture_role_is_restricted_and_cannot_delete_or_create(
     )
 
 
-async def test_mixed_upsert_generated_identity_exact_receipt_and_unchanged_repeat(
+async def test_mixed_upsert_has_an_exact_receipt_and_a_repeat_updates_again(
     database: Fixture,
 ) -> None:
     await database.seed()
@@ -74,11 +81,8 @@ async def test_mixed_upsert_generated_identity_exact_receipt_and_unchanged_repea
     await database.run()
     receipt = await database.receipt(EffectOutcome.SUCCEEDED)
     assert receipt.payload is not None
-    assert (
-        receipt.payload["inserted_count"],
-        receipt.payload["updated_count"],
-        receipt.payload["unchanged_count"],
-    ) == (1, 1, 1)
+    assert receipt.payload["affected_rows"] == 3
+    assert _counts(database) == (1, 2, 0)
     actual = await database.rows()
     assert [(item["domain"], item["name"]) for item in actual] == [
         ("existing.test", "After"),
@@ -87,12 +91,7 @@ async def test_mixed_upsert_generated_identity_exact_receipt_and_unchanged_repea
     ]
     assert actual[0]["id"] == 1 and actual[0]["notes"] == "Retained"
     assert actual[1]["id"] > 1 and actual[1]["notes"] is None
-    output = database.model.results["write"].output["data"]
-    assert isinstance(output, Mapping)
-    assert thaw_json(output["generated_identities"]) == [
-        {"key": {"domain": "new.test"}, "values": {"id": actual[1]["id"]}},
-    ]
-    assert database.probe.mutations == 2 and database.probe.server_commits == 1
+    assert database.probe.mutations == 1 and database.probe.server_commits == 1
     assert len(database.approvals) == 1
     approved_arguments = database.approvals[0].arguments["arguments"]
     assert isinstance(approved_arguments, Mapping)
@@ -105,11 +104,9 @@ async def test_mixed_upsert_generated_identity_exact_receipt_and_unchanged_repea
     assert len(receipts) == 2
     repeated = next(item for item in receipts if item.receipt_id != receipt.receipt_id)
     assert repeated.outcome is EffectOutcome.SUCCEEDED and repeated.payload is not None
-    assert (
-        repeated.payload["inserted_count"],
-        repeated.payload["updated_count"],
-        repeated.payload["unchanged_count"],
-    ) == (0, 0, 3)
+    # ON CONFLICT DO UPDATE rewrites a matching row, whether or not it differs.
+    assert repeated.payload["affected_rows"] == 3
+    assert _counts(database) == (0, 3, 0)
     assert database.probe.mutations == 2 and database.probe.server_commits == 2
     assert await database.rows() == actual
     await database.reopen()
@@ -238,11 +235,9 @@ async def test_second_insert_unique_violation_rolls_back_entire_batch(
     receipt = await database.receipt(EffectOutcome.NOT_APPLIED)
     assert receipt.payload is not None
     assert receipt.payload["normalized_error_code"] == "write_constraint_violation"
-    assert (
-        receipt.payload["inserted_count"] == 0 and receipt.payload["updated_count"] == 0
-    )
-    assert receipt.payload["identity_sequence_gaps_possible"] is True
-    assert database.probe.mutations == 1 and database.probe.commit_attempts == 0
+    assert receipt.payload["affected_rows"] == 0
+    # The one statement raised, so nothing was reported as written.
+    assert database.probe.mutations == 0 and database.probe.commit_attempts == 0
     assert await database.rows() == expected_rows
     # Sequences are intentionally not a rollback guarantee.
     assert (
@@ -282,31 +277,27 @@ async def test_wrong_reported_update_count_rolls_back_real_mutation(
     assert await database.rows() == before
 
 
-@pytest.mark.parametrize(
-    "invalid", ["duplicate_key", "null_key", "row_limit", "update_only", "identity"]
-)
+@pytest.mark.parametrize("invalid", ["row_limit", "update_only", "identity"])
 async def test_invalid_batch_is_rejected_before_native_dispatch(
     database: Fixture, invalid: str
 ) -> None:
     await database.permissions(
         "update" if invalid == "update_only" else "upsert", max_rows=2
     )
-    rows = [row()]
-    if invalid == "duplicate_key":
-        rows = [row(), row()]
-    elif invalid == "null_key":
-        rows = [{**row(), "domain": None}]
-    elif invalid == "row_limit":
-        rows = [row(f"row-{i}.test") for i in range(3)]
-    database.upsert(rows)
-    if invalid == "identity":
-        database.model.arguments["insert_columns"] = (
-            "id",
-            "domain",
-            "name",
-            "evidence_url",
+    # Enabling writes reads the table live; a policy refusal must not connect.
+    connected = len(database.probe.connections)
+    if invalid == "row_limit":
+        database.upsert([row(f"row-{i}.test") for i in range(3)])
+    elif invalid == "identity":
+        database.model.configure(
+            {
+                "source_id": database.source_id,
+                "sql": f"INSERT INTO {_TABLE} (id, domain) VALUES ($1, $2)",
+                "parameters": [42, "new.test"],
+            }
         )
-        database.model.arguments["rows"] = [{**row(), "id": 42}]
+    else:
+        database.upsert([row()])
     # Some invalid scopes reject toolbox load; still submit the exact preview
     # to establish a structured denial, without accepting an empty script.
     result = await database.agent.run("Preview only the requested fixture batch.")
@@ -314,7 +305,27 @@ async def test_invalid_batch_is_rejected_before_native_dispatch(
     assert database.model.results["preview"].is_error
     assert "write" not in database.model.results
     assert not database.approvals and not await database.agent.list_effects()
-    assert not database.probe.connections and not await database.rows()
+    if invalid == "row_limit":
+        # The read-only preview counts the rows, and refuses above the scope's limit.
+        assert database.probe.mutations == 0
+    else:
+        assert len(database.probe.connections) == connected
+    assert not await database.rows()
+
+
+@pytest.mark.parametrize("invalid", ["duplicate_key", "null_key"])
+async def test_a_batch_only_the_server_can_refuse_rolls_back_whole(
+    database: Fixture, invalid: str
+) -> None:
+    await database.permissions("upsert", max_rows=2)
+    database.upsert(
+        [row(), row()] if invalid == "duplicate_key" else [{**row(), "domain": None}]
+    )
+    await database.run()
+    assert database.model.results["write"].is_error
+    receipt = await database.receipt(EffectOutcome.NOT_APPLIED)
+    assert receipt.payload is not None and receipt.payload["affected_rows"] == 0
+    assert database.probe.mutations == 0 and not await database.rows()
 
 
 @pytest.mark.parametrize("operation", ["update", "upsert"])
@@ -366,47 +377,43 @@ async def test_real_lock_timeout_is_bounded_and_does_not_mutate(
     database.update() if operation == "update" else database.upsert([row()])
     transaction = database.admin.transaction()
     await transaction.start()
-    # Blocks row writers and EXCLUSIVE, but permits the read-only preview.
+    # Blocks the brief table lock PostgreSQL takes to plan a write.
     await database.admin.execute(f"LOCK TABLE {_TABLE} IN SHARE MODE")
     started = monotonic()
     try:
         await database.run()
     finally:
         await transaction.rollback()
-    if operation == "update":
-        # PostgreSQL EXPLAIN acquires the UPDATE statement's table lock even
-        # though the preview transaction is read-only. No effect is reserved.
-        assert not await database.agent.list_effects()
-        assert database.probe.write_pid is None
-        error = database.model.results["preview"].output["error"]
-        assert isinstance(error, Mapping) and error["code"] == "write_lock_timeout"
-    else:
-        receipt = await database.receipt(EffectOutcome.NOT_APPLIED)
-        assert receipt.payload is not None
-        assert receipt.payload["normalized_error_code"] == "write_lock_timeout"
+    preview = database.model.results["preview"]
+    assert preview.is_error
+    assert cast(Mapping[str, Any], preview.output["error"])["code"] == (
+        "write_lock_timeout"
+    )
+    assert await database.agent.list_effects() == ()
     assert monotonic() - started < 15
     assert database.probe.mutations == 0 and await database.rows() == before
 
 
-async def test_concurrent_insert_while_waiting_is_detected_after_exclusive_lock(
+async def test_a_concurrent_insert_of_the_same_key_refuses_while_waiting(
     database: Fixture,
 ) -> None:
     database.upsert([row()])
     transaction = database.admin.transaction()
+    task = None
     await transaction.start()
-    await database.admin.execute(f"LOCK TABLE {_TABLE} IN ROW EXCLUSIVE MODE")
-    task = asyncio.create_task(database.run())
+    await database.admin.execute(
+        f"INSERT INTO {_TABLE} (domain, name, evidence_url) VALUES "
+        "('new.test', 'Concurrent writer', 'https://evidence.test/new.test')"
+    )
     try:
+        task = asyncio.create_task(database.run())
         await _wait_for_lock(database)
-        await database.admin.execute(
-            f"INSERT INTO {_TABLE} (domain, name, evidence_url) VALUES ('new.test', 'Concurrent writer', 'https://evidence.test/new.test')"
-        )
         await transaction.commit()
         await task
     finally:
-        if not task.done():
+        if task is not None and not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+            await asyncio.gather(task, return_exceptions=True)
         if database.admin.is_in_transaction():
             await transaction.rollback()
     receipt = await database.receipt(EffectOutcome.NOT_APPLIED)
@@ -530,12 +537,10 @@ async def test_bounded_batch_size_records_real_transaction_duration(
         read_mode="all",
         read_resource_ids=(),
         relational_write_scopes={
-            database.cells_resource_id: {
-                "allowed_operations": ("upsert",),
+            "write_acceptance.cells": {
+                "allowed_operations": ("insert", "update"),
                 "allowed_insert_columns": ("k", "v"),
                 "allowed_update_columns": ("v",),
-                "key_columns": ("k",),
-                "generated_identity_columns": (),
                 "max_rows": 1000,
             }
         },
@@ -545,32 +550,26 @@ async def test_bounded_batch_size_records_real_transaction_duration(
         confirmation_fingerprint=preview.confirmation_fingerprint,
     )
     database.model.configure(
-        "upsert",
-        {
-            "source_id": database.source_id,
-            "resource_id": database.cells_resource_id,
-            "key_columns": ("k",),
-            "insert_columns": ("k", "v"),
-            "update_columns": ("v",),
-            "rows": [{"k": i, "v": i} for i in range(count)],
-        },
+        batch_upsert(
+            database.source_id,
+            "write_acceptance.cells",
+            ["k", "v"],
+            "k",
+            [{"k": i, "v": i} for i in range(count)],
+        )
     )
     started = monotonic()
     await database.run()
     elapsed = monotonic() - started
     receipt = await database.receipt(EffectOutcome.SUCCEEDED)
     assert receipt.payload is not None
-    assert (
-        receipt.payload["input_count"],
-        receipt.payload["inserted_count"],
-        receipt.payload["updated_count"],
-        receipt.payload["unchanged_count"],
-    ) == (count, count, 0, 0)
+    assert receipt.payload["affected_rows"] == count
+    assert _counts(database) == (count, 0, 0)
     actual = await database.admin.fetch(
         "SELECT k, v FROM write_acceptance.cells ORDER BY k"
     )
     assert [tuple(item) for item in actual] == [(i, i) for i in range(count)]
-    assert database.probe.mutations == count and database.probe.server_commits == 1
+    assert database.probe.mutations == 1 and database.probe.server_commits == 1
     record_property("batch_rows", count)
     record_property("scripted_agent_wall_seconds", round(elapsed, 6))
     record_property(
@@ -581,12 +580,13 @@ async def test_bounded_batch_size_records_real_transaction_duration(
 async def test_wide_batch_cannot_bypass_byte_and_exact_approval_limits(
     database: Fixture,
 ) -> None:
+    connected = len(database.probe.connections)
     database.upsert([row(f"company-{i:04d}.test") for i in range(1000)])
     await database.run()
     error = database.model.results["preview"].output["error"]
-    assert isinstance(error, Mapping) and error["code"] == "upsert_invalid_batch"
+    assert isinstance(error, Mapping) and error["code"] == "write_too_large"
     assert "64 KiB" in str(error["message"])
-    assert not database.probe.connections and not database.approvals
+    assert len(database.probe.connections) == connected and not database.approvals
     assert not await database.agent.list_effects() and not await database.rows()
 
 

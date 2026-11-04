@@ -19,7 +19,7 @@ from .adapters import (
     PostgreSQLSource,
     SQLiteSource,
 )
-from .adapters.postgresql_write import RelationalUpdateReadiness
+from .adapters.postgresql_write import RelationalWriteReadiness
 from .adapters.registry import (
     SourceBackendContext,
     SourceOperation,
@@ -207,7 +207,7 @@ __all__ = [
     "OutcomeReference",
     "OutcomeState",
     "PostgreSQLSource",
-    "RelationalUpdateReadiness",
+    "RelationalWriteReadiness",
     "RetryPolicy",
     "RoutineIntent",
     "RoutineState",

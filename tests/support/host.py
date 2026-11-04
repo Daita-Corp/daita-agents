@@ -38,6 +38,7 @@ from daita.llm.models import (
     ModelUsage,
 )
 from daita.llm.pricing import CostEstimate
+from daita.routines.models import ACTIVE_OCCURRENCE_DISPOSITIONS
 from tests.llm._subscription_support import _jwt
 from tests.support.mcp import MemoryKeychain
 
@@ -286,6 +287,44 @@ async def pending_interaction(
         return pending[0] if pending else None
 
     return await bounded(probe, timeout=timeout)
+
+
+async def routine_approval(
+    harness: HostHarness, agent: str, routine_id: str, timeout: float = 10.0
+) -> dict[str, Any]:
+    """The routine's pending approval; fail at once if its run ended first.
+
+    Polls over HTTP because an attached client would count as watching the agent,
+    which suppresses the notification a scheduled approval must send.
+    """
+
+    base = f"/v1/agents/{agent}"
+
+    async def probe() -> dict[str, Any] | None:
+        pending = value(await harness.http.get(f"{base}/interactions"))
+        if pending:
+            return pending[0]
+        inspection = value(await harness.http.get(f"{base}/routines/{routine_id}"))
+        assert inspection is not None
+        ended = next(
+            (
+                item
+                for item in inspection.recent_occurrences
+                if item.run_terminal_at is not None
+                or item.disposition not in ACTIVE_OCCURRENCE_DISPOSITIONS
+                or item.failure_code is not None
+            ),
+            None,
+        )
+        if ended is not None:
+            raise AssertionError(
+                f"run {ended.terminal_run_id or ended.reserved_run_id} ended "
+                "without asking for approval: disposition "
+                f"{ended.disposition.value}, failure_code {ended.failure_code}"
+            )
+        return None
+
+    return await bounded(probe, timeout=timeout, interval=0.2)
 
 
 def fake_openai_device_login(

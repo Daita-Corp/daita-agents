@@ -873,7 +873,7 @@ async def test_parallel_skill_and_data_reads_start_together_and_keep_order(
         skill_store = agent._embedded._skill_store
         data_view = agent._embedded._data_view
         original_read = skill_store.read_skill_with_digest
-        original_search = data_view.search
+        original_search = data_view.catalog_hits
         started: set[str] = set()
         release = asyncio.Event()
 
@@ -892,7 +892,7 @@ async def test_parallel_skill_and_data_reads_start_together_and_keep_order(
             return await original_search(request, **kwargs)
 
         monkeypatch.setattr(skill_store, "read_skill_with_digest", slow_read)
-        monkeypatch.setattr(data_view, "search", slow_search)
+        monkeypatch.setattr(data_view, "catalog_hits", slow_search)
         run = RunInput(
             id="parallel-run",
             agent_id=agent.id,

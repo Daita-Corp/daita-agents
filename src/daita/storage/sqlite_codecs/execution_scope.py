@@ -28,6 +28,14 @@ from .common import (
 )
 
 
+def _with_field(value, name: str, default: object):
+    """A stored record with one field defaulted, for records older than it."""
+
+    if not isinstance(value, dict) or not isinstance(value.get("fields"), dict):
+        return value
+    return {**value, "fields": {name: default, **value["fields"]}}
+
+
 def encode_execution_scope(value: ExecutionScope):
     if not isinstance(value, ExecutionScope):
         raise TypeError("execution scope codec requires ExecutionScope")
@@ -47,6 +55,7 @@ def encode_execution_scope(value: ExecutionScope):
             "allowed_source_ids": list(value.allowed_source_ids),
             "allowed_connector_binding_ids": list(value.allowed_connector_binding_ids),
             "allowed_resource_ids": list(value.allowed_resource_ids),
+            "unrestricted_source_ids": list(value.unrestricted_source_ids),
             "allowed_capability_ids": list(value.allowed_capability_ids),
             "allowed_access_modes": plain_encode(
                 tuple(sorted(item.value for item in value.allowed_access_modes))
@@ -77,7 +86,7 @@ def encode_execution_scope(value: ExecutionScope):
 
 def decode_execution_scope(value) -> ExecutionScope:
     fields = record_fields(
-        value,
+        _with_field(value, "unrestricted_source_ids", []),
         "ExecutionScope",
         (
             "scope_id",
@@ -93,6 +102,7 @@ def decode_execution_scope(value) -> ExecutionScope:
             "allowed_source_ids",
             "allowed_connector_binding_ids",
             "allowed_resource_ids",
+            "unrestricted_source_ids",
             "allowed_capability_ids",
             "allowed_access_modes",
             "allowed_operational_effects",
@@ -176,6 +186,13 @@ def decode_execution_scope(value) -> ExecutionScope:
             text(item, "execution scope resource id")
             for item in sequence(
                 fields["allowed_resource_ids"], "execution scope resource ids"
+            )
+        ),
+        unrestricted_source_ids=tuple(
+            text(item, "execution scope unrestricted source id")
+            for item in sequence(
+                fields["unrestricted_source_ids"],
+                "execution scope unrestricted source ids",
             )
         ),
         allowed_capability_ids=tuple(
@@ -300,8 +317,10 @@ def encode_execution_contract_bindings(value: ExecutionContractBindings):
 
 
 def decode_execution_contract_bindings(value) -> ExecutionContractBindings:
+    # Scopes stored before reads stopped binding catalog revisions carry a map of
+    # them; nothing compares it any more.
     fields = record_fields(
-        value,
+        _with_field(value, "resource_revisions", {}),
         "ExecutionContractBindings",
         (
             "capability_contracts",
@@ -310,6 +329,7 @@ def decode_execution_contract_bindings(value) -> ExecutionContractBindings:
             "model_routes",
         ),
     )
+    del fields["resource_revisions"]
     maps: dict[str, dict[str, str]] = {}
     for name, raw in fields.items():
         if not isinstance(raw, dict):

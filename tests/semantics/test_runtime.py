@@ -459,7 +459,7 @@ async def test_catalog_and_transcript_evidence_fail_before_approval(tmp_path):
         ):
             await agent.learn(prompt)
         assert tuple(_error_code(item) for item in _tool_results(provider)) == (
-            "resource_read_not_allowed",
+            "semantic_unknown_resource",
             "source_scope_violation",
             "semantic_unknown_field",
             "result_ref_invalid",
@@ -759,3 +759,115 @@ async def test_natural_language_and_learn_route_to_semantics_without_new_command
         "/learn  Booked revenue uses invoices.booked_at. "
     )
     assert routed == "/learn Booked revenue uses invoices.booked_at."
+
+
+async def test_a_note_on_a_view_in_a_source_read_in_full_binds_its_catalog_entry(
+    tmp_path,
+):
+    database = tmp_path / "views.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, status TEXT)")
+        connection.execute("CREATE VIEW open_orders AS SELECT id, status FROM orders")
+
+    async def approve(request):
+        return ApprovalDecision.APPROVE
+
+    provider = MockModelProvider(
+        (
+            _call(
+                ToolCall("load", "toolbox_load", {"tool_names": ["semantic_save"]}),
+            ),
+            _call(
+                ToolCall(
+                    "save",
+                    "semantic_save",
+                    {
+                        "id": "open-orders-meaning",
+                        "kind": "glossary",
+                        "statement": "Open orders await shipping.",
+                        "subject": {
+                            "sources": ["Views"],
+                            "tables": ["main.open_orders"],
+                            "fields": [
+                                {"table": "main.open_orders", "field_name": "status"}
+                            ],
+                        },
+                        "evidence": [{"kind": "user_assertion"}],
+                    },
+                ),
+            ),
+            _stop("Saved."),
+        ),
+        provider_id="mock:semantic-view",
+    )
+    agent = await Agent.create(
+        "semantic-on-view",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=provider,
+        model_profile=_profile(provider),
+        approval_handler=approve,
+    )
+    try:
+        source = await agent.attach_sqlite(database, name="Views")
+        view = next(
+            item
+            for item in await agent.list_catalog_resources(source_id=source.id)
+            if item.name == "open_orders"
+        )
+        result = await agent.learn("Open orders await shipping.")
+        assert result.reason == "completed", result
+        (saved,) = await agent._embedded._store.list_semantic_annotations(agent.id)
+        assert saved.subject.resource_ids == (view.id,)
+    finally:
+        await agent.close()
+
+
+async def test_a_note_on_a_table_the_catalog_has_not_seen_is_refused_by_name(
+    tmp_path,
+):
+    database = tmp_path / "fresh.db"
+    sqlite3.connect(database).close()
+    provider = MockModelProvider(
+        (
+            _call(ToolCall("load", "toolbox_load", {"tool_names": ["semantic_save"]})),
+            _call(
+                ToolCall(
+                    "save",
+                    "semantic_save",
+                    {
+                        "id": "fresh-meaning",
+                        "kind": "glossary",
+                        "statement": "Fresh holds new rows.",
+                        "subject": {
+                            "sources": ["Fresh"],
+                            "tables": ["main.fresh"],
+                            "fields": [{"table": "main.fresh", "field_name": "id"}],
+                        },
+                        "evidence": [{"kind": "user_assertion"}],
+                    },
+                ),
+            ),
+            _stop("Refused."),
+        ),
+        provider_id="mock:semantic-uncataloged",
+    )
+    agent = await Agent.create(
+        "semantic-uncataloged",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=provider,
+        model_profile=_profile(provider),
+    )
+    try:
+        await agent.attach_sqlite(database, name="Fresh")
+        # Created after attach and never refreshed: the catalog has no entry.
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE fresh(id INTEGER PRIMARY KEY)")
+        await agent.learn("Fresh holds new rows.")
+        (refusal,) = (item for item in _tool_results(provider) if item.is_error)
+        assert _error_code(refusal) == "semantic_unknown_resource"
+        assert "catalog-resource:" not in repr(refusal.output)
+        assert await agent.list_semantic_annotations() == ()
+    finally:
+        await agent.close()

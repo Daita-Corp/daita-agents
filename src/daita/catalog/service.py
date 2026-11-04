@@ -13,26 +13,20 @@ from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from .._json import FrozenJsonObject, canonical_json
 from .models import (
-    CATALOG_MATCH_CANDIDATE_BINDING_LIMIT,
     CATALOG_MAX_LIMIT,
     CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH,
     CATALOG_SCHEMA_MAX_RELATIONSHIPS,
-    CATALOG_SCHEMA_TOOL_DEFAULT_RELATIONSHIPS,
-    CATALOG_TRAVERSAL_MAX_DEPTH,
     CATALOG_TRAVERSAL_MAX_EDGES,
     CATALOG_TRAVERSAL_MAX_NODES,
     CATALOG_TRAVERSAL_MAX_PATHS,
-    CatalogDescribeDetail,
-    CatalogDescribeRequest,
     CatalogFacet,
     CatalogLink,
     CatalogLinkStaleReason,
     CatalogLinkStatus,
-    CatalogMatchOutcome,
     CatalogPath,
     CatalogPathStep,
     CatalogRelationship,
@@ -288,29 +282,6 @@ class CatalogService:
         self._source_indexes: dict[tuple[str, str, str], _SourceCatalogIndex] = {}
         self._source_index_lock = asyncio.Lock()
         self._search_cursor_key = secrets.token_bytes(32)
-
-    def empty_catalog_context(
-        self,
-        *,
-        prior_query: str | None = None,
-    ) -> FrozenJsonObject:
-        """Return the catalog-owned assessment for an explicitly empty ceiling."""
-
-        no_match = _catalog_match_outcome(None).to_payload()
-        return FrozenJsonObject.from_mapping(
-            {
-                "resources": (),
-                "sources": (),
-                "match_outcomes": {
-                    "current_query": no_match,
-                    "prior_query": no_match if prior_query is not None else None,
-                },
-                "total_matches": 0,
-                "returned_count": 0,
-                "truncated": False,
-                "trust_classification": "untrusted_external_data",
-            }
-        )
 
     async def summary(self, agent_id: str) -> CatalogSummary:
         """Project active source counts from their current committed snapshots."""
@@ -801,7 +772,6 @@ class CatalogService:
         return CatalogSearchResult(
             request=request,
             hits=hits,
-            match_outcome=_catalog_match_outcome(selection),
             total_matches=len(matched_hits),
             returned_count=len(hits),
             truncated=truncated,
@@ -1139,72 +1109,6 @@ class CatalogService:
             ),
         )
 
-    async def describe(
-        self,
-        request: CatalogDescribeRequest,
-        *,
-        readable_resource_ids: frozenset[str] | None = None,
-    ) -> FrozenJsonObject:
-        """Describe current catalog structure at one detail level, without source I/O.
-
-        Identity detail lists resource identities and labeled estimates only.
-        Schema and relationship detail resolve multi-hop join paths in code at
-        the maximum supported depth, so no follow-up traversal is required.
-        """
-
-        if not isinstance(request, CatalogDescribeRequest):
-            raise TypeError("request must be a CatalogDescribeRequest record")
-        if request.detail is CatalogDescribeDetail.IDENTITY:
-            return await self._project_current(
-                request.agent_id,
-                request.source_id,
-                lambda active_source_ids, indexes, _links: self._identity_from_indexes(
-                    request,
-                    active_source_ids,
-                    indexes,
-                    readable_resource_ids=readable_resource_ids,
-                ),
-            )
-        relationships_only = request.detail is CatalogDescribeDetail.RELATIONSHIPS
-        schema_request = CatalogSchemaRequest(
-            agent_id=request.agent_id,
-            query=request.query,
-            resource_ids=request.resource_ids,
-            source_id=request.source_id,
-            limit=request.effective_limit,
-            include_relationships=True,
-            max_join_depth=CATALOG_TRAVERSAL_MAX_DEPTH,
-            relationship_limit=(
-                CATALOG_SCHEMA_MAX_RELATIONSHIPS
-                if relationships_only
-                else CATALOG_SCHEMA_TOOL_DEFAULT_RELATIONSHIPS
-            ),
-        )
-        projection = await self._project_current(
-            request.agent_id,
-            request.source_id,
-            lambda active_source_ids, indexes, links: self._schema_slice_from_indexes(
-                schema_request,
-                active_source_ids,
-                indexes,
-                readable_resource_ids=readable_resource_ids,
-                include_describe_facts=True,
-                links=links,
-            ),
-        )
-        if relationships_only:
-            return _relationship_description(projection)
-        value = projection.to_dict()
-        return FrozenJsonObject.from_mapping(
-            {
-                "detail": CatalogDescribeDetail.SCHEMA.value,
-                **value,
-                "estimates": _estimates_summary(
-                    cast(tuple[Mapping[str, object], ...], value["resources"])
-                ),
-            }
-        )
-
     async def _project_current(
         self,
         agent_id: str,
@@ -1265,208 +1169,6 @@ class CatalogService:
                 break
         raise CatalogStoreError("catalog snapshot generation changed repeatedly")
 
-    def _identity_from_indexes(
-        self,
-        request: CatalogDescribeRequest,
-        active_source_ids: tuple[str, ...],
-        indexes: tuple[_SourceCatalogIndex, ...],
-        *,
-        readable_resource_ids: frozenset[str] | None = None,
-    ) -> FrozenJsonObject:
-        resources_by_id: dict[str, CatalogResource] = {}
-        index_by_resource_id: dict[str, _SourceCatalogIndex] = {}
-        syncs_by_source_id: dict[str, CatalogSync] = {}
-        scope_filtered = False
-        for index in indexes:
-            sync = index.snapshot.sync
-            if (
-                sync.agent_id != request.agent_id
-                or sync.source_id not in active_source_ids
-                or index.agent_id != request.agent_id
-                or index.source_id != sync.source_id
-                or index.sync_id != sync.id
-                or sync.source_id in syncs_by_source_id
-            ):
-                raise CatalogStoreError("catalog index set has invalid ownership")
-            syncs_by_source_id[sync.source_id] = sync
-            for resource in index.resources_by_id.values():
-                if (
-                    readable_resource_ids is not None
-                    and resource.id not in readable_resource_ids
-                ):
-                    if request.source_id in (None, resource.source_id):
-                        scope_filtered = True
-                    continue
-                if resource.id in resources_by_id:
-                    raise CatalogStoreError("catalog index set repeats a resource")
-                resources_by_id[resource.id] = resource
-                index_by_resource_id[resource.id] = index
-
-        def order(resource: CatalogResource) -> tuple[str, str, str]:
-            return (
-                resource.native_identity.casefold(),
-                resource.native_identity,
-                resource.id,
-            )
-
-        if request.resource_ids:
-            basis = "resource_ids"
-            selected: dict[str, CatalogResource] = {}
-            for resource_id in request.resource_ids:
-                candidate = resources_by_id.get(resource_id)
-                if candidate is None:
-                    raise CatalogResourceNotFoundError(request.agent_id, resource_id)
-                if (
-                    request.source_id is not None
-                    and candidate.source_id != request.source_id
-                ):
-                    raise CatalogStoreError(
-                        "catalog describe resource is outside requested source scope"
-                    )
-                selected[candidate.id] = candidate
-            candidates = tuple(sorted(selected.values(), key=order))
-        elif request.query is not None:
-            basis = "query"
-            search = self._search_indexes(
-                CatalogSearchRequest(
-                    agent_id=request.agent_id,
-                    query=request.query,
-                    source_ids=(
-                        () if request.source_id is None else (request.source_id,)
-                    ),
-                    resource_kinds=(
-                        ResourceKind.TABLE,
-                        ResourceKind.VIEW,
-                        ResourceKind.FILE,
-                    ),
-                    limit=CATALOG_MAX_LIMIT,
-                ),
-                tuple(
-                    index
-                    for index in indexes
-                    if request.source_id is None or index.source_id == request.source_id
-                ),
-                readable_resource_ids=readable_resource_ids,
-                include_fallback=False,
-            )
-            matched: list[CatalogResource] = []
-            for hit in search.hits:
-                if hit.match_reasons == ("relationship_neighbor",):
-                    continue
-                hit_resource = resources_by_id.get(hit.resource_id)
-                if (
-                    hit_resource is None
-                    or hit_resource.current_revision != hit.revision
-                ):
-                    raise _CatalogGenerationChanged
-                if self._is_tabular_resource(
-                    index_by_resource_id[hit_resource.id], hit_resource.id
-                ):
-                    matched.append(hit_resource)
-            candidates = tuple(matched)
-        else:
-            basis = "source"
-            candidates = tuple(
-                sorted(
-                    (
-                        resource
-                        for resource in resources_by_id.values()
-                        if resource.source_id == request.source_id
-                        and self._is_tabular_resource(
-                            index_by_resource_id[resource.id], resource.id
-                        )
-                    ),
-                    key=order,
-                )
-            )
-
-        context = canonical_json(
-            {
-                "agent_id": request.agent_id,
-                "detail": request.detail.value,
-                "query": request.query,
-                "resource_ids": request.resource_ids,
-                "source_id": request.source_id,
-                "candidates": tuple(
-                    (resource.id, resource.current_revision) for resource in candidates
-                ),
-            }
-        ).encode("utf-8")
-
-        def cursor_for(position: int) -> str:
-            return (
-                f"{position}."
-                + hmac.new(
-                    self._search_cursor_key,
-                    b"describe:" + context + f":{position}".encode(),
-                    "sha256",
-                ).hexdigest()
-            )
-
-        position = 0
-        if request.cursor is not None:
-            if re.fullmatch(r"[1-9][0-9]{0,5}\.[0-9a-f]{64}", request.cursor) is None:
-                raise CatalogStoreError("catalog describe cursor is invalid or stale")
-            position = int(request.cursor.partition(".")[0])
-            if position >= len(candidates) or not hmac.compare_digest(
-                request.cursor, cursor_for(position)
-            ):
-                raise CatalogStoreError("catalog describe cursor is invalid or stale")
-        page = candidates[position : position + request.effective_limit]
-        truncated = position + len(page) < len(candidates)
-        resource_payloads: list[dict[str, object]] = []
-        selected_source_ids: set[str] = set()
-        for resource in page:
-            index = index_by_resource_id[resource.id]
-            sync = index.snapshot.sync
-            if (
-                resource.current_sync_id != sync.id
-                or sync.status is not CatalogSyncStatus.SUCCEEDED
-            ):
-                raise CatalogStoreError("catalog resource sync is not current")
-            selected_source_ids.add(resource.source_id)
-            resource_payloads.append(
-                _with_estimates(
-                    {
-                        "kind": resource.kind.value,
-                        "name": resource.native_identity,
-                        "resource_id": resource.id,
-                        "revision": resource.current_revision,
-                        "source_id": resource.source_id,
-                    },
-                    _estimates_payload(
-                        index.facets_by_resource_id.get(resource.id, ())
-                    ),
-                )
-            )
-        source_ids = sorted(
-            selected_source_ids
-            | ({request.source_id} if request.source_id is not None else set())
-        )
-        return FrozenJsonObject.from_mapping(
-            {
-                "detail": CatalogDescribeDetail.IDENTITY.value,
-                "coverage": {
-                    "basis": basis,
-                    "complete": position == 0 and not truncated,
-                    "offset": position,
-                    "returned": len(resource_payloads),
-                    "scope_filtered": scope_filtered,
-                    "total": len(candidates),
-                },
-                "estimates": _estimates_summary(resource_payloads),
-                "next_cursor": cursor_for(position + len(page)) if truncated else None,
-                "resources": resource_payloads,
-                "sources": tuple(
-                    _sync_payload(syncs_by_source_id[source_id])
-                    for source_id in source_ids
-                    if source_id in syncs_by_source_id
-                ),
-                "truncated": truncated,
-                "trust_classification": "untrusted_external_data",
-            }
-        )
-
     def _schema_slice_from_indexes(
         self,
         request: CatalogSchemaRequest,
@@ -1474,7 +1176,6 @@ class CatalogService:
         indexes: tuple[_SourceCatalogIndex, ...],
         *,
         readable_resource_ids: frozenset[str] | None = None,
-        include_describe_facts: bool = False,
         links: tuple[CatalogLink, ...] = (),
     ) -> FrozenJsonObject:
         resources_by_id: dict[str, CatalogResource] = {}
@@ -1774,11 +1475,6 @@ class CatalogService:
                     "unique_key_fields": structural["unique_key_fields"],
                 }
             )
-            if include_describe_facts:
-                _with_estimates(
-                    resource_payloads[-1],
-                    _estimates_payload(facets_by_resource_id.get(resource.id, ())),
-                )
             columns_truncated = columns_truncated or resource_columns_truncated
             primary_keys_truncated = (
                 primary_keys_truncated or resource_primary_keys_truncated
@@ -1945,15 +1641,11 @@ class CatalogService:
             )
 
         source_payloads = tuple(
-            (
-                _sync_payload(sync)
-                if include_describe_facts
-                else {
-                    "source_id": sync.source_id,
-                    "source_revision": sync.source_revision,
-                    "sync_id": sync.id,
-                }
-            )
+            {
+                "source_id": sync.source_id,
+                "source_revision": sync.source_revision,
+                "sync_id": sync.id,
+            }
             for sync in sorted(
                 selected_syncs_by_id.values(),
                 key=lambda item: (item.source_id, item.id),
@@ -2996,206 +2688,6 @@ class CatalogService:
             endpoints.append(endpoint)
         return endpoints[0], endpoints[1]
 
-    async def catalog_context(
-        self,
-        agent_id: str,
-        query: str,
-        *,
-        prior_query: str | None = None,
-        limit: int,
-        source_ids: tuple[str, ...] = (),
-        resource_ids: tuple[str, ...] = (),
-        readable_resource_ids: frozenset[str] | None = None,
-    ) -> FrozenJsonObject:
-        """Project exact IDs, or query-rank indexes inside a resource ceiling."""
-
-        request_limit = (
-            CATALOG_MAX_LIMIT if resource_ids else min(limit, CATALOG_MAX_LIMIT)
-        )
-        current_request = CatalogSearchRequest(
-            agent_id=agent_id,
-            query=query,
-            # This private request ranks only the indexes scoped below. Keeping
-            # its selector empty avoids applying the public 64-source request
-            # bound to a frozen run scope that may contain up to 256 sources.
-            source_ids=(),
-            limit=request_limit,
-        )
-        prior_request = (
-            None
-            if prior_query is None
-            else CatalogSearchRequest(
-                agent_id=agent_id,
-                query=prior_query,
-                source_ids=(),
-                limit=request_limit,
-            )
-        )
-        for attempt in range(2):
-            active_source_ids = await self._active_source_ids(agent_id)
-            scoped_source_ids = (
-                tuple(
-                    source_id
-                    for source_id in active_source_ids
-                    if source_id in source_ids
-                )
-                if source_ids
-                else active_source_ids
-            )
-            refs = (
-                ()
-                if not active_source_ids
-                else await self._store.list_current_snapshot_refs(
-                    agent_id,
-                    active_source_ids,
-                )
-            )
-            await self._evict_stale_indexes(agent_id, active_source_ids, refs)
-            selected_refs = tuple(
-                ref for ref in refs if ref.source_id in scoped_source_ids
-            )
-            indexes: list[_SourceCatalogIndex] = []
-            generation_changed = False
-            for ref in selected_refs:
-                try:
-                    indexes.append(await self._index_for_ref(ref))
-                except _CatalogGenerationChanged:
-                    generation_changed = True
-                    break
-            if generation_changed:
-                if attempt == 0:
-                    continue
-                break
-
-            indexed = tuple(indexes)
-            source_hints = await self._source_hints(
-                agent_id,
-                frozenset(scoped_source_ids),
-            )
-            resources_by_id = {
-                resource.id: resource
-                for index in indexed
-                for resource in index.resources_by_id.values()
-            }
-            if resource_ids:
-                selected_resources: dict[str, CatalogResource] = {}
-                for resource_id in resource_ids:
-                    resource = resources_by_id.get(resource_id)
-                    if resource is None or (
-                        readable_resource_ids is not None
-                        and resource_id not in readable_resource_ids
-                    ):
-                        raise CatalogResourceNotFoundError(agent_id, resource_id)
-                    selected_resources[resource_id] = resource
-                all_hits = tuple(
-                    _resource_id_hit(resource)
-                    for resource in sorted(
-                        selected_resources.values(),
-                        key=_resource_search_tie_key,
-                    )
-                )
-                current_outcome = _catalog_match_outcome(
-                    None,
-                    explicit_resource_hits=all_hits,
-                )
-                prior_outcome = None
-            else:
-                link_graph = _current_link_graph(
-                    await self._store.list_catalog_links(agent_id),
-                    indexed,
-                    readable_resource_ids,
-                )
-                current_selection = self._select_index_hits(
-                    current_request,
-                    indexed,
-                    readable_resource_ids=readable_resource_ids,
-                    source_hints=source_hints,
-                    link_graph=link_graph,
-                )
-                prior_selection = (
-                    None
-                    if prior_request is None
-                    else self._select_index_hits(
-                        prior_request,
-                        indexed,
-                        readable_resource_ids=readable_resource_ids,
-                        source_hints=source_hints,
-                        link_graph=link_graph,
-                    )
-                )
-                all_hits = _merge_context_selections(
-                    current_selection,
-                    prior_selection,
-                )
-                current_outcome = _catalog_match_outcome(current_selection)
-                prior_outcome = (
-                    None
-                    if prior_selection is None
-                    else _catalog_match_outcome(prior_selection)
-                )
-
-            hits = all_hits[: min(limit, CATALOG_MAX_LIMIT)]
-            index_by_source_id = {index.source_id: index for index in indexed}
-            source_ids_in_hits = {hit.source_id for hit in hits}
-            projection = FrozenJsonObject.from_mapping(
-                {
-                    "sources": [
-                        {
-                            "source_id": source_id,
-                            "source_revision": index_by_source_id[
-                                source_id
-                            ].snapshot.sync.source_revision,
-                            "sync_id": index_by_source_id[source_id].sync_id,
-                        }
-                        for source_id in sorted(source_ids_in_hits)
-                    ],
-                    "resources": [
-                        {
-                            "kind": hit.kind.value,
-                            "match_reasons": hit.match_reasons,
-                            "name": hit.name,
-                            # Source-qualified identity lets scoped SQL address
-                            # the resource without a separate describe grant.
-                            "native_identity": resources_by_id[
-                                hit.resource_id
-                            ].native_identity,
-                            "resource_id": hit.resource_id,
-                            "revision": hit.revision,
-                            "sensitivity": hit.sensitivity.value,
-                            "source_id": hit.source_id,
-                        }
-                        for hit in hits
-                    ],
-                    "match_outcomes": {
-                        "current_query": current_outcome.to_payload(),
-                        "prior_query": (
-                            None
-                            if prior_outcome is None
-                            else prior_outcome.to_payload()
-                        ),
-                    },
-                    "total_matches": len(all_hits),
-                    "returned_count": len(hits),
-                    "truncated": len(all_hits) > len(hits),
-                    "trust_classification": "untrusted_external_data",
-                }
-            )
-
-            current_active_source_ids = await self._active_source_ids(agent_id)
-            current_refs = (
-                ()
-                if not current_active_source_ids
-                else await self._store.list_current_snapshot_refs(
-                    agent_id,
-                    current_active_source_ids,
-                )
-            )
-            if current_active_source_ids == active_source_ids and current_refs == refs:
-                return projection
-            if attempt == 1:
-                break
-        raise CatalogStoreError("catalog snapshot generation changed repeatedly")
-
 
 def _resource_join_key(resource: CatalogResource) -> tuple[str, str, str]:
     return (
@@ -3579,111 +3071,6 @@ def _embedded_exact_anchor_candidate(
     )
 
 
-def _resource_id_hit(resource: CatalogResource) -> CatalogSearchHit:
-    return CatalogSearchHit(
-        resource_id=resource.id,
-        source_id=resource.source_id,
-        kind=resource.kind,
-        name=resource.name,
-        revision=resource.current_revision,
-        sensitivity=resource.sensitivity,
-        score=0.0,
-        matched_fields=(),
-        match_reasons=("resource_id_exact",),
-    )
-
-
-def _merge_context_selections(
-    current: _CatalogHitSelection,
-    prior: _CatalogHitSelection | None,
-) -> tuple[CatalogSearchHit, ...]:
-    prior_exact = () if prior is None else prior.exact_anchors
-    prior_broad = () if prior is None else prior.broad_matches
-    prior_source_hints = () if prior is None else prior.source_hint_matches
-    prior_neighbors = () if prior is None else prior.relationship_neighbors
-    ordered = (
-        current.exact_anchors,
-        prior_exact,
-        current.broad_matches,
-        prior_broad,
-        current.source_hint_matches,
-        prior_source_hints,
-        current.relationship_neighbors,
-        prior_neighbors,
-    )
-    selected: list[CatalogSearchHit] = []
-    selected_ids: set[str] = set()
-    for group in ordered:
-        for hit in group:
-            if hit.resource_id in selected_ids:
-                continue
-            selected.append(hit)
-            selected_ids.add(hit.resource_id)
-    return tuple(selected)
-
-
-def _catalog_match_outcome(
-    selection: _CatalogHitSelection | None,
-    *,
-    explicit_resource_hits: tuple[CatalogSearchHit, ...] = (),
-) -> CatalogMatchOutcome:
-    """Assess the complete strongest evidence tier without score-gap selection."""
-
-    if explicit_resource_hits:
-        evidence_tier = "explicit_resource_ids"
-        candidates = explicit_resource_hits
-    elif selection is not None and selection.exact_anchors:
-        evidence_tier = "exact_resource"
-        candidates = selection.exact_anchors
-    elif selection is not None and selection.broad_matches:
-        evidence_tier = "catalog_metadata"
-        candidates = selection.broad_matches
-    elif selection is not None and selection.source_hint_matches:
-        evidence_tier = "source_hint"
-        candidates = selection.source_hint_matches
-    else:
-        evidence_tier = "none"
-        candidates = ()
-
-    candidate_count = len(candidates)
-    source_counts: dict[str, int] = {}
-    for hit in candidates:
-        source_counts[hit.source_id] = source_counts.get(hit.source_id, 0) + 1
-    binding_status = (
-        "no_match"
-        if candidate_count == 0
-        else "unique" if candidate_count == 1 else "ambiguous"
-    )
-    source_status = (
-        "no_match"
-        if not source_counts
-        else "unique" if len(source_counts) == 1 else "ambiguous"
-    )
-    ambiguity_reasons: list[str] = []
-    if len(source_counts) > 1:
-        ambiguity_reasons.append("multiple_sources")
-    if any(count > 1 for count in source_counts.values()):
-        ambiguity_reasons.append("multiple_resources")
-    retained = candidates[:CATALOG_MATCH_CANDIDATE_BINDING_LIMIT]
-    return CatalogMatchOutcome(
-        binding_status=binding_status,
-        source_status=source_status,
-        evidence_tier=evidence_tier,
-        candidate_count=candidate_count,
-        candidate_bindings=tuple(
-            FrozenJsonObject.from_mapping(
-                {
-                    "source_id": hit.source_id,
-                    "resource_id": hit.resource_id,
-                }
-            )
-            for hit in retained
-        ),
-        omitted_candidate_count=candidate_count - len(retained),
-        ambiguity_reasons=tuple(ambiguity_reasons),
-    )
-
-
 def _rank_index_candidate(
     resource: CatalogResource,
     postings: tuple[_IndexedPosting, ...],
@@ -3865,96 +3252,6 @@ def _diversify_candidates(
         remaining.remove(best)
     selected.extend(sorted(remaining, key=lambda candidate: candidate.rank_key))
     return tuple(selected)
-
-
-def _sync_payload(sync: CatalogSync) -> dict[str, object]:
-    return {
-        "observed_at": (
-            None if sync.completed_at is None else sync.completed_at.isoformat()
-        ),
-        "source_id": sync.source_id,
-        "source_revision": sync.source_revision,
-        "sync_id": sync.id,
-    }
-
-
-_ESTIMATES_NOTE = (
-    "Estimates are approximate connector statistics from discovery time, "
-    "never exact counts; use data_query for exact counts."
-)
-
-
-def _estimates_payload(facets: tuple[CatalogFacet, ...]) -> dict[str, object] | None:
-    tabular = next(
-        (facet for facet in facets if facet.kind is FacetKind.TABULAR),
-        None,
-    )
-    if tabular is None:
-        return None
-    return _decode_tabular_facet(tabular).estimates_payload(tabular.observed_at)
-
-
-def _estimates_summary(resources: Iterable[Mapping[str, object]]) -> dict[str, object]:
-    resources = tuple(resources)
-    available = sum(1 for item in resources if "estimates" in item)
-    return {
-        "approximate": True,
-        "available": available,
-        "unavailable": len(resources) - available,
-        "note": _ESTIMATES_NOTE,
-    }
-
-
-def _with_estimates(
-    payload: dict[str, object], estimates: dict[str, object] | None
-) -> dict[str, object]:
-    if estimates is not None:
-        payload["estimates"] = estimates
-    return payload
-
-
-_RELATIONSHIP_RESOURCE_FIELDS = (
-    "kind",
-    "name",
-    "resource_id",
-    "revision",
-    "selection_role",
-    "source_id",
-)
-
-
-def _relationship_description(projection: FrozenJsonObject) -> FrozenJsonObject:
-    """Keep join paths and identities from one schema projection, without fields."""
-
-    value = projection.to_dict()
-    bounds = cast(Mapping[str, object], value["bounds"])
-    truncation = cast(Mapping[str, object], value["truncation"])
-    return FrozenJsonObject.from_mapping(
-        {
-            "detail": CatalogDescribeDetail.RELATIONSHIPS.value,
-            "bounds": {
-                name: bounds[name]
-                for name in ("join_depth", "relationships", "resources")
-            },
-            "paths": value["paths"],
-            "relationships": value["relationships"],
-            "resources": tuple(
-                {
-                    name: cast(Mapping[str, object], resource)[name]
-                    for name in _RELATIONSHIP_RESOURCE_FIELDS
-                }
-                for resource in cast(tuple[object, ...], value["resources"])
-            ),
-            "selection": value["selection"],
-            "sources": value["sources"],
-            "total_matches": value["total_matches"],
-            "truncation": {
-                name: truncation[name]
-                for name in ("paths", "reason", "relationships", "resources")
-            },
-            "trust_classification": value["trust_classification"],
-        }
-    )
 
 
 def _neighbor_payload(resource: CatalogResource) -> dict[str, object]:

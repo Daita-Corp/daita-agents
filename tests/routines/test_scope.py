@@ -72,7 +72,7 @@ def _scheduled_scope(
 ) -> ExecutionScope:
     return ExecutionScope(
         contract_bindings=frozen_execution_bindings(
-            capability_ids, (), ("mock:routine",), registry=registry
+            capability_ids, ("mock:routine",), registry=registry
         ),
         scope_id="scope-routine-1",
         revision=1,
@@ -130,6 +130,9 @@ async def test_empty_machine_source_ceiling_never_queries_all_current_sources():
         async def source_routing_facts(self, agent_id, source_ids=()):
             raise AssertionError("an empty machine ceiling cannot enumerate sources")
 
+        async def source_read_access(self, agent_id, source_ids):
+            raise AssertionError("an empty machine ceiling cannot read scopes")
+
         async def readable_resource_ids(self, agent_id, source_ids=()):
             raise AssertionError("an empty machine ceiling cannot enumerate resources")
 
@@ -166,7 +169,7 @@ def test_nonroutine_scope_cannot_use_mcp_only_relaxation() -> None:
     with pytest.raises(ValueError, match="non-routine execution scope"):
         ExecutionScope(
             contract_bindings=frozen_execution_bindings(
-                ("test.scheduled",), (), ("mock:routine",)
+                ("test.scheduled",), ("mock:routine",)
             ),
             scope_id="scope-followup",
             revision=1,
@@ -215,7 +218,7 @@ async def test_scheduled_catalog_projects_its_whole_fixed_scope_and_nothing_outs
 
     async def read_contracts(**kwargs):
         return frozen_execution_bindings(
-            kwargs["capability_ids"], (), ("mock:routine",), registry=registry
+            kwargs["capability_ids"], ("mock:routine",), registry=registry
         )
 
     runtime = CapabilityRuntime(
@@ -299,7 +302,7 @@ def test_scheduled_origin_rejects_code_owned_instruction_authority() -> None:
 
 @pytest.mark.parametrize(
     "changed_family",
-    ("capability_contracts", "resource_revisions", "model_routes", "tool_origins"),
+    ("capability_contracts", "model_routes", "tool_origins"),
 )
 @pytest.mark.parametrize(
     "machine_origin", [RunOrigin.SCHEDULED_ROUTINE, RunOrigin.JOB_EVENT]
@@ -338,7 +341,6 @@ async def test_machine_calls_revalidate_retained_contracts_after_preparation(
     bindings = ExecutionContractBindings(
         capability_contracts={capability.id: registry.contract_digest(capability.id)},
         tool_origins={capability.id: origin},
-        resource_revisions={"resource-1": "sha256:" + "e" * 64},
         model_routes=_model_execution_contracts(
             model, model.model_profile, None, policy
         ),
@@ -427,7 +429,6 @@ def test_scope_codec_rejects_missing_extra_and_malformed_execution_bindings() ->
     binding_fields = encoded["fields"]["contract_bindings"]["fields"]
     for family in (
         "capability_contracts",
-        "resource_revisions",
         "model_routes",
         "tool_origins",
     ):
@@ -445,3 +446,10 @@ def test_scope_codec_rejects_missing_extra_and_malformed_execution_bindings() ->
         with pytest.raises(ValueError):
             decode_execution_scope(altered)
     assert binding_fields["tool_origins"] == {}
+    # A scope stored when contracts still bound catalog revisions keeps decoding.
+    stored = copy.deepcopy(encoded)
+    del stored["fields"]["unrestricted_source_ids"]
+    stored["fields"]["contract_bindings"]["fields"]["resource_revisions"] = {
+        "resource-1": "sha256:" + "1" * 64
+    }
+    assert decode_execution_scope(stored).unrestricted_source_ids == ()

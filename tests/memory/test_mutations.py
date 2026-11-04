@@ -60,16 +60,8 @@ async def test_explicit_correction_is_one_approved_foreground_memory_write(tmp_p
             == second.sensitivity_provenance["static_context_sha256"]
         )
         assert first.tools == second.tools
-        assert (
-            f"Remaining model requests including this one: {EAGER_LIMITS.max_steps - provider.requests.index(first)}."
-            in _system_text(first)
-        )
-        assert (
-            f"Remaining model requests including this one: {EAGER_LIMITS.max_steps - provider.requests.index(second)}."
-            in _system_text(second)
-        )
         transcript = await agent.transcript(result.run_id)
-        assert second.messages[1:-1] == transcript.messages[:-1]
+        assert second.messages[1:] == transcript.messages[:-1]
         tool_result = _tool_results(provider)[0]
         assert tool_result.output["data"] == FrozenJsonObject.from_mapping(
             {"target": "memory", "replaced": True}

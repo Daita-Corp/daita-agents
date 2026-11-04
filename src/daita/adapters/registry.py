@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Protocol
 from ..config import HostCapacityLimits, PostgreSQLReadLimits
 from ..security import SecretProvider
 from .models import SourceRegistration
-from .protocols import ResourceSource, SourceStore
+from .protocols import ResourceSource, SourcePermissionStore
 
 if TYPE_CHECKING:
     from ..domains.data.catalog import CatalogDataView
@@ -31,13 +31,14 @@ class SourceOperation(str, Enum):
     SQL_READ = "sql_read"
     TABULAR_EXPORT = "tabular_export"
     PROFILE = "profile"
-    RELATIONAL_UPDATE = "relational_update"
-    RELATIONAL_UPSERT = "relational_upsert"
+    RELATIONAL_WRITE = "relational_write"
     TABULAR_READ = "tabular_read"
     FILE_SEARCH = "file_search"
     TEXT_READ = "text_read"
     # SQL over files a live folder matches by path pattern, not by catalog.
     PATH_QUERY = "path_query"
+    # Bounded name search and description straight from the source.
+    LIVE_LOOKUP = "live_lookup"
 
 
 # Operations whose validation and execution depend on the type's SQL dialect.
@@ -45,6 +46,7 @@ _SQL_OPERATIONS = frozenset(SourceOperation) - {
     SourceOperation.TABULAR_READ,
     SourceOperation.FILE_SEARCH,
     SourceOperation.TEXT_READ,
+    SourceOperation.LIVE_LOOKUP,
 }
 
 
@@ -52,7 +54,7 @@ _SQL_OPERATIONS = frozenset(SourceOperation) - {
 class SourceBackendContext:
     """Host-owned dependencies a source type may use to build its backends."""
 
-    store: SourceStore
+    store: SourcePermissionStore
     catalog: CatalogDataView
     secret_provider: SecretProvider
     clock: Callable[[], datetime]
@@ -163,12 +165,12 @@ class SourceTypeRegistry:
             raise ValueError(
                 f"source type {source_type.adapter_id} is already registered"
             )
-        from ..domains.data.sql import read_validator
+        from ..domains.data.sql import SQL_READ_DIALECTS
 
-        # An SQL type the validators cannot check would be offered SQL and refused.
+        # An SQL type the read policy cannot check would be offered SQL and refused.
         if (
             source_type.sql_dialect is not None
-            and read_validator(source_type.sql_dialect) is None
+            and source_type.sql_dialect not in SQL_READ_DIALECTS
         ):
             raise ValueError(
                 f"source type {source_type.adapter_id} uses unsupported SQL "
@@ -204,11 +206,12 @@ def _sqlite_operations(
 ) -> Mapping[SourceOperation, object]:
     from .sqlite_query import SQLiteQueryBackend
 
-    backend = SQLiteQueryBackend(context.store, context.catalog)
+    backend = SQLiteQueryBackend(context.store)
     return {
         SourceOperation.SQL_READ: backend,
         SourceOperation.TABULAR_EXPORT: backend,
         SourceOperation.PROFILE: backend,
+        SourceOperation.LIVE_LOOKUP: backend,
     }
 
 
@@ -220,7 +223,6 @@ def _postgresql_operations(
 
     reads = PostgreSQLQueryBackend(
         context.store,
-        context.catalog,
         context.secret_provider,
         read_limits=context.postgresql_reads,
         source_capacity=context.host_capacity.postgresql_read_capacity,
@@ -229,7 +231,6 @@ def _postgresql_operations(
     )
     writes = PostgreSQLWriteBackend(
         context.store,
-        context.catalog,
         context.secret_provider,
         clock=context.clock,
     )
@@ -237,8 +238,8 @@ def _postgresql_operations(
         SourceOperation.SQL_READ: reads,
         SourceOperation.TABULAR_EXPORT: reads,
         SourceOperation.PROFILE: reads,
-        SourceOperation.RELATIONAL_UPDATE: writes,
-        SourceOperation.RELATIONAL_UPSERT: writes,
+        SourceOperation.LIVE_LOOKUP: reads,
+        SourceOperation.RELATIONAL_WRITE: writes,
     }
 
 
@@ -253,6 +254,7 @@ def _folder_operations(
         SourceOperation.PATH_QUERY: backend,
         SourceOperation.FILE_SEARCH: backend,
         SourceOperation.TEXT_READ: backend,
+        SourceOperation.LIVE_LOOKUP: backend,
     }
 
 
@@ -283,6 +285,7 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
                     SourceOperation.SQL_READ,
                     SourceOperation.TABULAR_EXPORT,
                     SourceOperation.PROFILE,
+                    SourceOperation.LIVE_LOOKUP,
                 }
             ),
             create_backends=_sqlite_operations,
@@ -299,8 +302,8 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
                     SourceOperation.SQL_READ,
                     SourceOperation.TABULAR_EXPORT,
                     SourceOperation.PROFILE,
-                    SourceOperation.RELATIONAL_UPDATE,
-                    SourceOperation.RELATIONAL_UPSERT,
+                    SourceOperation.LIVE_LOOKUP,
+                    SourceOperation.RELATIONAL_WRITE,
                 }
             ),
             create_backends=_postgresql_operations,
@@ -319,6 +322,7 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
                             SourceOperation.PATH_QUERY,
                             SourceOperation.FILE_SEARCH,
                             SourceOperation.TEXT_READ,
+                            SourceOperation.LIVE_LOOKUP,
                         }
                     ),
                     create_backends=_folder_operations,

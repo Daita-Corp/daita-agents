@@ -2,6 +2,68 @@
 
 ## 1.3.0 (unreleased)
 
+### One write tool: `data_write`
+
+The model writes to PostgreSQL with one SQL statement (`INSERT`, `UPDATE` or `DELETE`)
+through `data_write`, previewed and approved as before. It replaces `data_update_rows`
+and `data_upsert_rows`.
+
+- **Write scopes** name a table, `insert`, `update` and `delete` operations, columns and
+  a row limit. Upgrading converts stored scopes: `update` stays `update`, `upsert`
+  becomes `insert` and `update`, and delete is never granted.
+  A scope already refused as stale is dropped rather than revived.
+  `Agent.preview_source_permissions(relational_write_scopes=...)` is now keyed by full
+  table name, without `key_columns` or `generated_identity_columns`.
+- **Verified writes.** PostgreSQL receives each read and write exactly as written, so
+  `E'\\d+'` now works. Before a write, PostgreSQL reports what the statement targets;
+  before commit, Daita compares the rows it touched with the rows on the card and rolls
+  back if they differ. The card says whether it checks `rows` or only the `count`.
+  Refusals are a fixed list of six. `UPDATE` and `DELETE` without `WHERE` are now a card
+  warning, as are time, randomness and a row matched twice. A statement that cannot be
+  previewed fails with `write_preview_failed` and PostgreSQL's own message. A preview now
+  takes a brief table lock, so it can time out behind a schema change.
+- **The catalog no longer gates writes.** A table with no catalog entry can be enabled
+  and written, and unrelated DDL no longer fails a write.
+- **Triggers and cascading foreign keys** no longer refuse a table; the approval card
+  names them and says their effects are not previewed.
+- **Removed:** `Agent.relational_update_readiness` and
+  `Agent.relational_upsert_readiness` become `Agent.relational_write_readiness(source_id,
+  table)`, `RelationalUpdateReadiness` becomes `RelationalWriteReadiness`, and
+  `daita relational-update-readiness` becomes `daita relational-write-readiness`.
+  Generated identities are no longer returned, since a statement cannot have its own
+  `RETURNING`.
+
+### Attach never fails on size, and the catalog keeps up
+
+A large source now attaches. Discovery reads up to 1,000 tables, 512 columns and 256
+indexes per table and 2,000 relationships, and on PostgreSQL stops reading table
+structure after 60 seconds. Whatever is cut stays reachable through `catalog_search`,
+`catalog_describe` and queries, and the source is marked truncated; the model is told
+the catalog holds only part of it. `DiscoveryLimitError` is gone.
+
+- **The catalog refreshes itself.** It refreshes on attach, on `Agent.refresh_source`,
+  when a search or describe finds a table the catalog lacks or has wrong, and when a
+  query fails because a table or column does not exist. Automatic refreshes run in the
+  background, never delay a read, and run at most once per source every five minutes.
+  On PostgreSQL a miss on a schema-qualified name re-reads only that schema.
+- **Revoking a source no longer waits for a refresh.**
+- **No re-preview after a sync.** A catalog sync between previewing and applying source
+  permissions no longer forces a new preview.
+- **Connection check.** `Agent.check_source(source_id)` asks the live source whether it
+  is reachable, which role Daita connects as, whether that role can only read, and
+  warns about broad grants such as a superuser role. `/sources` shows it for the
+  selected source, attaching a source shows it, and `daita attach` prints it as
+  `connection`. The host serves it at `POST /sources/{source_id}/check`.
+- **PostgreSQL shows only what the role can read.** A composite primary key appears only
+  if the role can read every column of it. A partition is listed on its own unless a
+  readable parent in the configured schemas holds it, so a role granted only a child
+  partition can find it.
+- **A damaged catalog row no longer stops work.** Reads and approved writes
+  continue, the home still opens, and the catalog is rebuilt from the source.
+- **`semantic_save` on a table with no catalog entry** is refused with
+  `semantic_unknown_resource` and says reads are unaffected, instead of
+  `resource_read_not_allowed`.
+
 ### Routines are a title, a prompt and a schedule
 
 A routine now holds what a person asked for: a title, a prompt, a schedule

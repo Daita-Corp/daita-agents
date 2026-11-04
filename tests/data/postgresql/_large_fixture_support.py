@@ -94,7 +94,6 @@ def _tool_results(provider: MockModelProvider) -> tuple[ToolResultBlock, ...]:
 class _BulkUpdateProvider:
     def __init__(self) -> None:
         self._source_id = ""
-        self._resource_id = ""
         self._desired_priority = ""
         self._phase = 0
         self._matched_rows = 0
@@ -115,11 +114,9 @@ class _BulkUpdateProvider:
         self,
         *,
         source_id: str,
-        resource_id: str,
         desired_priority: str,
     ) -> None:
         self._source_id = source_id
-        self._resource_id = resource_id
         self._desired_priority = desired_priority
         self._phase = 0
         self._matched_rows = 0
@@ -127,16 +124,11 @@ class _BulkUpdateProvider:
     def _plan(self) -> dict[str, object]:
         return {
             "source_id": self._source_id,
-            "resource_id": self._resource_id,
-            "where": [
-                {
-                    "column": "ticket_status",
-                    "operator": "eq",
-                    "value": "waiting",
-                },
-                {"column": "category", "operator": "eq", "value": "billing"},
-            ],
-            "assignments": [{"column": "priority", "value": self._desired_priority}],
+            "sql": (
+                "UPDATE support.tickets SET priority = $1 "
+                "WHERE ticket_status = 'waiting' AND category = 'billing'"
+            ),
+            "parameters": [self._desired_priority],
         }
 
     @staticmethod
@@ -157,7 +149,7 @@ class _BulkUpdateProvider:
                     ToolCall(
                         id="bulk-load-update-tools",
                         name="toolbox_load",
-                        arguments={"tool_names": ["data_update_rows"]},
+                        arguments={"tool_names": ["data_write"]},
                     ),
                 ),
             )
@@ -170,7 +162,7 @@ class _BulkUpdateProvider:
                 tool_calls=(
                     ToolCall(
                         id="bulk-preview",
-                        name="data_update_rows",
+                        name="data_write",
                         arguments={**self._plan(), "mode": "preview"},
                     ),
                 ),
@@ -180,7 +172,7 @@ class _BulkUpdateProvider:
             assert preview.is_error is False
             data = preview.output["data"]
             assert isinstance(data, Mapping)
-            matched_rows = data["matched_rows"]
+            matched_rows = data["affected_rows"]
             assert isinstance(matched_rows, int)
             assert matched_rows > 1
             self._matched_rows = matched_rows
@@ -190,7 +182,7 @@ class _BulkUpdateProvider:
                 tool_calls=(
                     ToolCall(
                         id="bulk-update",
-                        name="data_update_rows",
+                        name="data_write",
                         arguments=self._plan(),
                     ),
                 ),
@@ -211,7 +203,6 @@ class _BulkUpdateProvider:
                         name="data_query",
                         arguments={
                             "source_id": self._source_id,
-                            "resource_ids": (self._resource_id,),
                             "sql": (
                                 "SELECT priority, COUNT(*) AS matched_rows "
                                 "FROM support.tickets "

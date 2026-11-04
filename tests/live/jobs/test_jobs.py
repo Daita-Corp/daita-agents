@@ -18,13 +18,11 @@ from typing import Any
 import pytest
 
 from daita import Agent, ApprovalDecision, ApprovalRequest, LoopLimits, SQLiteSource
-from daita.adapters.mcp import SDKMCPClientFactory
 from daita.distribution import DeliverySubjectKind, OutcomeState
 from daita.jobs import ChecklistStatus, DelegationState, Job, JobState
 from tests.support.jobs import in_state, wait_for_job
 from tests.support.live_billing import cost_cap, live_provider
-from tests.support.mcp import mock_transport
-from tests.support.native_writes import create_fixture
+from tests.support.postgresql_live import WriteTesterSecrets, live_write_source
 from tests.support.workspace import workspace_for
 
 pytestmark = [
@@ -42,7 +40,7 @@ _LIMITS = LoopLimits(
     max_steps=24,
     max_total_tokens=200_000,
     max_wall_time_seconds=600,
-    max_estimated_cost_usd=cost_cap(Decimal("1.00")),
+    max_estimated_cost_usd=cost_cap(Decimal("1.00"), _MODEL),
 )
 _TWO_PARTS = (
     "Compare the orders and the refunds tables. These are two independent "
@@ -223,13 +221,8 @@ async def test_live_job_asks_and_uses_the_answer(
 
 async def test_live_job_performs_one_approved_write(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     record_property: Callable[[str, object], None],
 ) -> None:
-    fixture, _scripted, db, alpha, *_rest, batch, clock, _approvals = (
-        await create_fixture(tmp_path, monkeypatch)
-    )
-    await fixture.close()
     profile, provider = _provider()
     asked: list[ApprovalRequest] = []
 
@@ -237,45 +230,41 @@ async def test_live_job_performs_one_approved_write(
         asked.append(request)
         return ApprovalDecision.APPROVE
 
-    agent = await Agent.open(
-        "native-acceptance",
-        root=tmp_path,
-        workspace=workspace_for(tmp_path),
-        model=provider,
-        model_profile=profile,
-        limits=_LIMITS,
-        clock=lambda: clock[0],
-        mcp_client_factory=SDKMCPClientFactory(http_transport=mock_transport(alpha)),
-        approval_handler=approve,
-    )
-    (row,) = batch["rows"]
-    try:
-        job = await agent.start_job(
-            "Add one company to the companies table: domain "
-            f"{row['domain']}, name {row['name']}, evidence URL "
-            f"{row['evidence_url']}. Upsert it on domain, then report what you saved.",
-            sources=(str(batch["source_id"]),),
+    async with live_write_source(tmp_path, "native-acceptance") as source:
+        agent = await Agent.open(
+            "native-acceptance",
+            root=tmp_path,
+            workspace=workspace_for(tmp_path),
+            model=provider,
+            model_profile=profile,
+            limits=_LIMITS,
+            secret_provider=WriteTesterSecrets(),
+            mcp_client_factory=source.research_factory,
+            approval_handler=approve,
         )
-        done = await wait_for_job(
-            agent,
-            job.job_id,
-            in_state(JobState.DONE, JobState.FAILED, JobState.WAITING_FOR_YOU),
-            timeout=_JOB_TIMEOUT,
-        )
-        _record(record_property, done)
-        assert done.state is JobState.DONE, done.failure_code or done.question
-        writes = [
-            request for request in asked if request.capability_id == "data.upsert_rows"
-        ]
-        assert len(writes) == 1 and writes[0].requester
-        inserts = [
-            item
-            for item in db.log
-            if item[0] == "fetch" and item[1].startswith("INSERT")
-        ]
-        assert len(inserts) == 1
-        assert db.rows[row["domain"]]["name"] == row["name"]
-        receipts = await agent.list_effects()
-        assert len(receipts) == 1
-    finally:
-        await agent.close()
+        domain, name, url = source.parameters
+        try:
+            job = await agent.start_job(
+                f"Add one company to write_acceptance.companies: domain {domain}, "
+                f"name {name}, evidence URL {url}. Upsert it on domain, then report "
+                "what you saved.",
+                sources=(source.source_id,),
+            )
+            done = await wait_for_job(
+                agent,
+                job.job_id,
+                in_state(JobState.DONE, JobState.FAILED, JobState.WAITING_FOR_YOU),
+                timeout=_JOB_TIMEOUT,
+            )
+            _record(record_property, done)
+            assert done.state is JobState.DONE, done.failure_code or done.question
+            writes = [
+                request for request in asked if request.capability_id == "data.write"
+            ]
+            assert len(writes) == 1 and writes[0].requester
+            rows = await source.rows()
+            assert set(rows) == {domain} and rows[domain]["name"] == name
+            receipts = await agent.list_effects()
+            assert len(receipts) == 1
+        finally:
+            await agent.close()

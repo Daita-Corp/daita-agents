@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import re
 import secrets
 import sqlite3
@@ -40,14 +41,14 @@ from ..adapters.mcp import (
     mcp_binding_from_inspection,
     mcp_execution_origin_digest,
 )
-from ..adapters.models import DiscoveryRequest, SourceRegistration
+from ..adapters.models import DiscoveryRequest, SourceHealth, SourceRegistration
 from ..adapters.postgresql import (
     POSTGRESQL_ADAPTER_ID,
     PostgreSQLProbeResult,
     PostgreSQLSource,
 )
 from ..adapters.postgresql_query import PostgreSQLReadDiagnostics
-from ..adapters.postgresql_write import RelationalUpdateReadiness
+from ..adapters.postgresql_write import PostgreSQLWriteBackend, RelationalWriteReadiness
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.registry import (
     SourceBackendContext,
@@ -75,7 +76,6 @@ from ..capabilities import (
     ApprovalRequest,
     Capability,
     CapabilityDeclarations,
-    CapabilityInputError,
     CapabilityRegistry,
     EffectOutcome,
     ExecutionContractBindings,
@@ -102,7 +102,9 @@ from ..catalog.models import (
     CatalogSync,
     CatalogSyncStatus,
     RelationshipFieldPair,
+    SourceCatalogSnapshot,
 )
+from ..catalog.protocols import CatalogStoreError
 from ..catalog.service import CatalogService
 from ..config import (
     AgentConfig,
@@ -110,7 +112,11 @@ from ..config import (
     HostCapacityLimits,
     PostgreSQLReadLimits,
 )
-from ..context import AgentContextBuilder, _project_completed_history
+from ..context import (
+    AgentContextBuilder,
+    _project_completed_history,
+    run_scope_names,
+)
 from ..distribution import (
     DISTRIBUTION_DOMAIN_OWNER_ID,
     DeliveryInspection,
@@ -137,12 +143,9 @@ from ..domains.data import (
     data_query_declarations,
     exact_export_declarations,
     exact_export_outputs,
-    relational_update_declarations,
-    relational_update_preview_declarations,
-    relational_upsert_declarations,
+    relational_write_declarations,
     source_file_declarations,
 )
-from ..domains.data.catalog import RELATIONAL_WRITE_OPERATIONS
 from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
 from ..domains.mcp import (
     MCP_DOMAIN_OWNER_ID,
@@ -150,6 +153,7 @@ from ..domains.mcp import (
     activate_mcp_domain,
     validate_mcp_model_compatibility,
 )
+from ..errors import DaitaError
 from ..identity import AgentIdentity
 from ..jobs.capabilities import (
     JOB_DOMAIN_OWNER_ID,
@@ -365,28 +369,6 @@ def _backends_with(backends: SourceBackends, method: str) -> tuple[Any, ...]:
     )
 
 
-async def _relational_upsert_readiness(
-    data_view: CatalogDataView,
-    backends: SourceBackends,
-    agent_id: str,
-    constraints: FrozenJsonObject,
-) -> FrozenJsonObject:
-    adapter_id = await data_view.source_adapter_id(
-        agent_id, str(constraints["source_id"])
-    )
-    backend = (
-        None
-        if adapter_id is None
-        else backends[SourceOperation.RELATIONAL_UPSERT].get(adapter_id)
-    )
-    if backend is None:
-        raise CapabilityInputError(
-            "resource_write_not_allowed",
-            "Explicit current upsert permission is required.",
-        )
-    return cast(FrozenJsonObject, await backend.upsert_readiness(agent_id, constraints))
-
-
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_DISCOVERED_AGENTS = 100
 # Scheduled and job runs may use every capability except these owners'
@@ -405,6 +387,9 @@ def machine_run_excluded_owners(origin: RunOrigin) -> frozenset[str]:
 
 _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
 _RUN_ADMISSION_DRAIN_SECONDS = 30.0
+# A model typo must not cost a discovery per query.
+_SOURCE_REFRESH_MIN_SECONDS = 300.0
+_LOGGER = logging.getLogger("daita.hosting")
 _T = TypeVar("_T")
 
 
@@ -422,27 +407,15 @@ async def _current_execution_contracts(
     model_contracts: Mapping[str, str],
     *,
     agent_id: str,
-    source_ids: tuple[str, ...],
-    resource_ids: tuple[str, ...],
     capability_ids: tuple[str, ...],
     connector_binding_ids: tuple[str, ...],
     model_route_ids: tuple[str, ...],
 ) -> ExecutionContractBindings:
-    """Read exact current structural/admission references at the composition boundary."""
+    """Read exact current admission references at the composition boundary."""
 
     identity = await store.load_identity()
     if identity is None or identity.id != agent_id:
         raise ValueError("execution contract agent identity changed")
-    resources: dict[str, str] = {}
-    for resource_id in resource_ids:
-        resource = await store.load_resource(agent_id, resource_id)
-        if (
-            resource is None
-            or resource.agent_id != agent_id
-            or resource.source_id not in source_ids
-        ):
-            raise ValueError("execution contract resource identity changed")
-        resources[resource_id] = resource.current_revision
     expected_origins = {
         view.capability_id: view.origin_revision_digest
         for name in registry.tool_names
@@ -475,14 +448,12 @@ async def _current_execution_contracts(
             for capability_id in capability_ids
         },
         tool_origins=origins,
-        resource_revisions=resources,
         model_routes={
             route_id: model_contracts[route_id] for route_id in model_route_ids
         },
     )
     result.validate_coverage(
         capability_ids=capability_ids,
-        resource_ids=resource_ids,
         route_ids=model_route_ids,
         mcp_capability_ids=expected_origins,
     )
@@ -639,6 +610,8 @@ class EmbeddedAgent:
         self._mcp_commit_lock = asyncio.Lock()
         self._source_management_lock = asyncio.Lock()
         self._source_commit_lock = asyncio.Lock()
+        self._source_refreshes: dict[str, asyncio.Task[None]] = {}
+        self._source_refresh_started: dict[str, float] = {}
         self._source_permission_lock = asyncio.Lock()
         self._source_permission_confirmation_key = secrets.token_bytes(32)
         self._source_permission_previews: dict[str, SourcePermissionsPreview] = {}
@@ -1347,7 +1320,6 @@ class EmbeddedAgent:
         data_view = CatalogDataView(
             store, catalog_service, store, registry, session_source=session_source
         )
-        catalog = catalog_declarations(identity.id, data_view)
         host_capacity = host_capacity or HostCapacityLimits()
         backend_context = SourceBackendContext(
             store=store,
@@ -1370,6 +1342,16 @@ class EmbeddedAgent:
         for source_type in registry.types():
             for operation, backend in source_type.backends(backend_context).items():
                 source_backends[operation][source_type.adapter_id] = backend
+
+        def request_refresh(source_id: str, names: tuple[str, ...]) -> None:
+            embedded.request_source_refresh(source_id, names)
+
+        catalog = catalog_declarations(
+            identity.id,
+            data_view,
+            source_backends[SourceOperation.LIVE_LOOKUP],
+            request_refresh=request_refresh,
+        )
         if admission_cleanup is not None:
             for backend in _backends_with(source_backends, "close"):
                 admission_cleanup.push_async_callback(backend.close)
@@ -1422,25 +1404,16 @@ class EmbeddedAgent:
             combined_engine=combined_engine,
             tabular_backends=source_backends[SourceOperation.TABULAR_READ],
             path_backends=source_backends[SourceOperation.PATH_QUERY],
+            request_refresh=request_refresh,
             file_outputs=(
                 exact_export_outputs(allow_arrow=export_arrow_bounds is not None)
                 if relational_export is not None
                 else ()
             ),
         )
-        relational_update_preview = relational_update_preview_declarations(
+        relational_write = relational_write_declarations(
             identity.id,
-            source_backends[SourceOperation.RELATIONAL_UPDATE],
-            data_view.source_adapter_id,
-        )
-        relational_update = relational_update_declarations(
-            identity.id,
-            source_backends[SourceOperation.RELATIONAL_UPDATE],
-            data_view.source_adapter_id,
-        )
-        relational_upsert = relational_upsert_declarations(
-            identity.id,
-            source_backends[SourceOperation.RELATIONAL_UPSERT],
+            source_backends[SourceOperation.RELATIONAL_WRITE],
             data_view.source_adapter_id,
         )
         if hosted != (workspace is None and workspace_backend is None):
@@ -1464,18 +1437,14 @@ class EmbeddedAgent:
             if registration.active and registry.get(registration.adapter_id)
         )
         for registration in available_sources:
-            for scope in await store.list_relational_write_scopes(
+            if await store.list_relational_write_scopes(
                 identity.id, registration.id
+            ) and not registry.supports(
+                registration.adapter_id, SourceOperation.RELATIONAL_WRITE
             ):
-                if any(
-                    not registry.supports(
-                        registration.adapter_id, RELATIONAL_WRITE_OPERATIONS[name]
-                    )
-                    for name in scope.allowed_operations
-                ):
-                    raise AgentHomeError(
-                        "stored relational write scope is foreign to its source type"
-                    )
+                raise AgentHomeError(
+                    "stored relational write scope is foreign to its source type"
+                )
         source_capacities = {
             f"source:{registration.id}": registry.read_capacity(
                 registration.adapter_id, host_capacity
@@ -1544,9 +1513,7 @@ class EmbeddedAgent:
             catalog,
             relational_query,
             relational_export,
-            relational_update_preview,
-            relational_update,
-            relational_upsert,
+            relational_write,
             source_files,
         )
         memory_declarations = _domain_declarations(MEMORY_DOMAIN_OWNER_ID, memory)
@@ -1571,12 +1538,12 @@ class EmbeddedAgent:
             registry,
             relational_export_available=relational_export is not None,
             combined_query_available=combined_engine is not None,
-            transcript_loader=store.load,
             source_files_available=source_files is not None,
             path_query_available=any(
                 capability.id == PATH_QUERY_CAPABILITY_ID
                 for capability in relational_query.capabilities
             ),
+            write_backends=source_backends[SourceOperation.RELATIONAL_WRITE],
         )
         skill_domain = SkillCapabilityDomain(
             skill_declaration_bundle, transcript_loader=store.load
@@ -1652,6 +1619,9 @@ class EmbeddedAgent:
                 artifact_store,
                 observer=observer,
                 **({"limits": analysis_limits} if analysis_limits is not None else {}),
+                scope_names=lambda agent_id, scope: run_scope_names(
+                    data_view, agent_id, scope
+                ),
             )
         )
         base_domains = (
@@ -1670,9 +1640,7 @@ class EmbeddedAgent:
             *catalog.executors,
             *relational_query.executors,
             *(relational_export.executors if relational_export is not None else ()),
-            *relational_update_preview.executors,
-            *relational_update.executors,
-            *relational_upsert.executors,
+            *relational_write.executors,
             *(source_files.executors if source_files is not None else ()),
             *memory.executors,
             *skills.executors,
@@ -1701,8 +1669,6 @@ class EmbeddedAgent:
         async def read_execution_contracts(
             *,
             agent_id: str,
-            source_ids: tuple[str, ...],
-            resource_ids: tuple[str, ...],
             capability_ids: tuple[str, ...],
             connector_binding_ids: tuple[str, ...],
             model_route_ids: tuple[str, ...],
@@ -1712,8 +1678,6 @@ class EmbeddedAgent:
                 capabilities,
                 model_contracts,
                 agent_id=agent_id,
-                source_ids=source_ids,
-                resource_ids=resource_ids,
                 capability_ids=capability_ids,
                 connector_binding_ids=connector_binding_ids,
                 model_route_ids=model_route_ids,
@@ -1767,7 +1731,6 @@ class EmbeddedAgent:
         )
         if artifact_domain is not None:
             artifact_domain.bind_capability_registry(capabilities)
-        data_domain.bind_capability_registry(capabilities)
 
         async def resolve_run_sources(run: RunInput):
             return await resolve_effective_source_scope(run, data_view)
@@ -1836,7 +1799,6 @@ class EmbeddedAgent:
                 nonlocal capabilities
                 # No await: every reader switches before another task can run.
                 capability_runtime._replace_catalog(next_registry, next_domains)
-                data_domain.bind_capability_registry(next_registry)
                 if artifact_domain is not None:
                     artifact_domain.bind_capability_registry(next_registry)
                 capabilities = next_registry
@@ -1876,7 +1838,7 @@ class EmbeddedAgent:
                     else FrozenJsonObject.from_mapping(
                         {
                             **workspace_backend.model_context().to_dict(),
-                            "source_id": session_source.source_id,
+                            "source": session_source.display_name,
                         }
                     )
                 ),
@@ -1916,8 +1878,11 @@ class EmbeddedAgent:
             )
             # The scope lists sources and resources together; a source with
             # nothing readable contributes nothing.
+            unrestricted = tuple(sorted(sources.unrestricted_source_ids))
             source_tuple = (
-                tuple(sorted(sources.source_ids)) if sources.resource_ids else ()
+                tuple(sorted(sources.source_ids))
+                if sources.resource_ids or unrestricted
+                else ()
             )
             resource_tuple = tuple(sorted(sources.resource_ids))
             capability_ids = machine_run_capability_ids(
@@ -1927,12 +1892,11 @@ class EmbeddedAgent:
             return MachineRunScope(
                 source_ids=source_tuple,
                 resource_ids=resource_tuple,
+                unrestricted_source_ids=unrestricted,
                 capability_ids=capability_ids,
                 connector_binding_ids=connector_ids,
                 contract_bindings=await read_execution_contracts(
                     agent_id=identity.id,
-                    source_ids=source_tuple,
-                    resource_ids=resource_tuple,
                     capability_ids=capability_ids,
                     connector_binding_ids=connector_ids,
                     model_route_ids=model_route_ids,
@@ -1952,17 +1916,14 @@ class EmbeddedAgent:
                 and capabilities.resolve_domain_owner(capability_id) not in excluded
             )
             sources = parent.allowed_source_ids
+            unrestricted = parent.unrestricted_source_ids
+            # An ID hashes its source, so tables of a dropped source never match.
             resources = parent.allowed_resource_ids
             if source_ids:
                 sources = tuple(sorted(set(sources) & set(source_ids)))
-                kept: list[str] = []
-                for resource_id in resources:
-                    resource = await store.load_resource(identity.id, resource_id)
-                    if resource is not None and resource.source_id in sources:
-                        kept.append(resource_id)
-                resources = tuple(kept)
-                if not resources:
-                    sources = ()
+                unrestricted = tuple(sorted(set(unrestricted) & set(source_ids)))
+                if not sources:
+                    resources = ()
             bindings = parent.contract_bindings
             return replace(
                 parent,
@@ -1970,6 +1931,7 @@ class EmbeddedAgent:
                 allowed_capability_ids=capability_ids,
                 allowed_source_ids=sources,
                 allowed_resource_ids=resources,
+                unrestricted_source_ids=unrestricted,
                 contract_bindings=ExecutionContractBindings(
                     capability_contracts={
                         key: value
@@ -1980,11 +1942,6 @@ class EmbeddedAgent:
                         key: value
                         for key, value in bindings.tool_origins.items()
                         if key in capability_ids
-                    },
-                    resource_revisions={
-                        key: value
-                        for key, value in bindings.resource_revisions.items()
-                        if key in resources
                     },
                     model_routes=dict(bindings.model_routes),
                 ),
@@ -2240,6 +2197,7 @@ class EmbeddedAgent:
         try:
             await job_supervisor.start()
             await routine_supervisor.start()
+            await embedded._rebuild_unreadable_catalogs()
         except BaseException:
             await embedded.close()
             raise
@@ -3951,12 +3909,11 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "source-attach", self._source_management_lock
         ):
-            async with self._source_commit_lock:
-                self._require_open()
-                return await self._attach_source_locked(
-                    source,
-                    attached_at=attached_at,
-                )
+            self._require_open()
+            return await self._attach_source_locked(
+                source,
+                attached_at=attached_at,
+            )
 
     async def _attach_source_locked(
         self,
@@ -3964,7 +3921,11 @@ class EmbeddedAgent:
         *,
         attached_at: datetime,
         persisted_registration: SourceRegistration | None = None,
+        refresh_schemas: tuple[str, ...] = (),
+        previous: SourceCatalogSnapshot | None = None,
     ) -> SourceRegistration:
+        """Discover under the management lock; only the commit takes the commit lock."""
+
         adapter = await source.open(
             agent_id=self.identity.id,
             attached_at=attached_at,
@@ -4007,18 +3968,22 @@ class EmbeddedAgent:
                     requested_at=sync.started_at,
                     agent_root=None if self._home is None else self._home.parent.parent,
                     agent_home=self._home,
+                    refresh_schemas=refresh_schemas,
+                    previous=previous,
                 )
             )
-            await self._store.commit_snapshot(
-                discovery.snapshot,
-                registration=registration,
-            )
-            self._admission_coordinator.configure_source_resource_capacity(
-                f"source:{registration.id}",
-                self._source_types.read_capacity(
-                    registration.adapter_id, self._host_capacity
-                ),
-            )
+            async with self._source_commit_lock:
+                self._require_open()
+                await self._store.commit_snapshot(
+                    discovery.snapshot,
+                    registration=registration,
+                )
+                self._admission_coordinator.configure_source_resource_capacity(
+                    f"source:{registration.id}",
+                    self._source_types.read_capacity(
+                        registration.adapter_id, self._host_capacity
+                    ),
+                )
             return registration
         except BaseException as error:
             if isinstance(error, ResourceAdapterError):
@@ -4416,10 +4381,6 @@ class EmbeddedAgent:
                         "permission confirmation is unknown or expired; preview again"
                     )
                 current = await self._inspect_source_permissions_locked(source_id)
-                if current.catalog_generation != preview.catalog_generation:
-                    raise ValueError(
-                        "source catalog changed after preview; preview again"
-                    )
                 if current.state == preview.after:
                     return current
                 if current.state != preview.before:
@@ -4428,10 +4389,10 @@ class EmbeddedAgent:
                     )
 
                 update_mapping = {
-                    scope.resource_id: {
+                    scope.table: {
                         key: value
                         for key, value in scope.constraints().items()
-                        if key != "resource_revision"
+                        if key != "table"
                     }
                     for scope in preview.after.relational_write_scopes
                 }
@@ -4475,8 +4436,6 @@ class EmbeddedAgent:
     ) -> SourcePermissionsPreview:
         return await _build_source_permissions_preview(
             self._store,
-            self._catalog_service,
-            self._data_view,
             self._source_types,
             self.identity.id,
             self._source_permission_confirmation_key,
@@ -4484,47 +4443,26 @@ class EmbeddedAgent:
             read_mode=read_mode,
             read_resource_ids=read_resource_ids,
             relational_write_scopes=relational_write_scopes,
+            inspect_write_table=self._write_backend().inspect_write_table,
         )
 
-    async def relational_upsert_readiness(
-        self, source_id: str, resource_id: str
-    ) -> FrozenJsonObject:
-        async with self._source_commit_lock:
-            self._require_open()
-            permission = await self._data_view.load_relational_write_scope(
-                self.identity.id, source_id, resource_id
-            )
-            if permission is None:
-                raise ValueError("exact current upsert permission is required")
-            constraints = FrozenJsonObject.from_mapping(
-                {
-                    "source_id": source_id,
-                    "resource_id": resource_id,
-                    **permission.constraints(),
-                }
-            )
-            return await _relational_upsert_readiness(
-                self._data_view, self._source_backends, self.identity.id, constraints
-            )
+    def _write_backend(self) -> PostgreSQLWriteBackend:
+        # The PostgreSQL readiness record also reports other sources as unavailable.
+        return cast(
+            PostgreSQLWriteBackend,
+            self._source_backends[SourceOperation.RELATIONAL_WRITE][
+                POSTGRESQL_ADAPTER_ID
+            ],
+        )
 
-    async def relational_update_readiness(
-        self,
-        source_id: str,
-        resource_id: str,
-        assignment_columns: tuple[str, ...],
-    ) -> RelationalUpdateReadiness:
-        """Inspect one exact PostgreSQL update scope without mutating state."""
+    async def relational_write_readiness(
+        self, source_id: str, table: str
+    ) -> RelationalWriteReadiness:
+        """Inspect one table's stored write scope without mutating state."""
 
         self._require_open()
-        # The PostgreSQL readiness record also reports other sources as unavailable.
-        backend = self._source_backends[SourceOperation.RELATIONAL_UPDATE][
-            POSTGRESQL_ADAPTER_ID
-        ]
-        return await backend.relational_update_readiness(
-            agent_id=self.identity.id,
-            source_id=source_id,
-            resource_id=resource_id,
-            assignment_columns=assignment_columns,
+        return await self._write_backend().relational_write_readiness(
+            agent_id=self.identity.id, source_id=source_id, table=table
         )
 
     async def _retire_source_backends(self, source_id: str) -> None:
@@ -4564,29 +4502,174 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "source-refresh", self._source_management_lock
         ):
-            async with self._source_commit_lock:
-                self._require_open()
-                registration = await self._store.load_source(
-                    self.identity.id, source_id
+            refreshed = await self._refresh_source_locked(source_id)
+            if refreshed is None:
+                raise ValueError("unknown active source for this agent")
+            return refreshed
+
+    async def check_source(self, source_id: str) -> SourceHealth:
+        """Ask the live source who Daita connects as and what that can change.
+
+        It takes no lock and no lease, so it answers while a discovery runs. A
+        source that cannot be reached is a result with an error code, not a raise.
+        """
+
+        self._require_open()
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        registration = await self._store.load_source(self.identity.id, source_id)
+        if registration is None or not registration.active:
+            raise ValueError("unknown active source for this agent")
+
+        def unhealthy(code: str) -> SourceHealth:
+            try:
+                return SourceHealth(
+                    agent_id=self.identity.id,
+                    source_id=registration.id,
+                    adapter_id=registration.adapter_id,
+                    healthy=False,
+                    checked_at=self._clock(),
+                    error_code=code,
                 )
-                if registration is None or not registration.active:
-                    raise ValueError("unknown active source for this agent")
-                try:
-                    source = self._source_types.require(
-                        registration.adapter_id
-                    ).from_registration(
-                        registration,
-                        secret_provider=default_secret_provider(
-                            self._secret_provider or self._keychain
-                        ),
-                    )
-                except (TypeError, ValueError) as error:
-                    raise AgentHomeError(str(error)) from error
-                return await self._attach_source_locked(
-                    source,
-                    attached_at=registration.attached_at,
-                    persisted_registration=registration,
-                )
+            except ValueError:
+                return unhealthy("source_check_failed")
+
+        try:
+            source = self._source_types.require(
+                registration.adapter_id
+            ).from_registration(
+                registration,
+                secret_provider=default_secret_provider(
+                    self._secret_provider or self._keychain
+                ),
+            )
+            adapter = await source.open(
+                agent_id=self.identity.id,
+                attached_at=registration.attached_at,
+                clock=self._clock,
+            )
+            try:
+                return await adapter.health()
+            finally:
+                await adapter.close()
+        except (
+            DaitaError,
+            ImportError,
+            OSError,
+            TimeoutError,
+            TypeError,
+            ValueError,
+        ) as error:
+            return unhealthy(
+                error.error_code
+                if isinstance(error, DaitaError)
+                else "source_check_failed"
+            )
+
+    async def _refresh_source_locked(
+        self, source_id: str, names: tuple[str, ...] = ()
+    ) -> SourceRegistration | None:
+        """Refresh under the management lock; None when the source is gone."""
+
+        async with self._source_commit_lock:
+            self._require_open()
+            registration = await self._store.load_source(self.identity.id, source_id)
+        if registration is None or not registration.active:
+            return None
+        try:
+            source = self._source_types.require(
+                registration.adapter_id
+            ).from_registration(
+                registration,
+                secret_provider=default_secret_provider(
+                    self._secret_provider or self._keychain
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise AgentHomeError(str(error)) from error
+        refresh_schemas, previous = await self._refresh_scope(registration, names)
+        return await self._attach_source_locked(
+            source,
+            attached_at=registration.attached_at,
+            persisted_registration=registration,
+            refresh_schemas=refresh_schemas,
+            previous=previous,
+        )
+
+    async def _refresh_scope(
+        self, registration: SourceRegistration, names: tuple[str, ...]
+    ) -> tuple[tuple[str, ...], SourceCatalogSnapshot | None]:
+        """The schemas the names sit in, with the snapshot to keep the others from.
+
+        A name outside the configured schemas, or an unqualified one, refreshes all.
+        """
+
+        configured = registration.configuration.get("schemas")
+        parts = [name.partition(".") for name in names]
+        if not names or not isinstance(configured, tuple):
+            return (), None
+        if not all(dot and schema in configured for schema, dot, _ in parts):
+            return (), None
+        schemas = tuple(dict.fromkeys(schema for schema, _, _ in parts))
+        try:
+            refs = await self._store.list_current_snapshot_refs(
+                self.identity.id, (registration.id,)
+            )
+            return schemas, (
+                await self._store.load_current_snapshot(refs[0]) if refs else None
+            )
+        except CatalogStoreError:
+            return schemas, None
+
+    async def _rebuild_unreadable_catalogs(self) -> None:
+        """Replace damaged catalog rows from their sources, in the background."""
+
+        active = {
+            source.id
+            for source in await self._store.list_sources(self.identity.id)
+            if source.active
+        }
+        for source_id in await self._store.list_unreadable_snapshot_source_ids(
+            self.identity.id
+        ):
+            if source_id in active:
+                self.request_source_refresh(source_id)
+
+    def request_source_refresh(
+        self, source_id: str, names: tuple[str, ...] = ()
+    ) -> None:
+        """Refresh one source's catalog in the background; never waits, never raises."""
+
+        loop = asyncio.get_running_loop()
+        started = self._source_refresh_started.get(source_id)
+        if (
+            self._closed
+            or source_id in self._source_refreshes
+            or (
+                started is not None
+                and loop.time() - started < _SOURCE_REFRESH_MIN_SECONDS
+            )
+        ):
+            return
+        self._source_refresh_started[source_id] = loop.time()
+        task = loop.create_task(self._refresh_source_in_background(source_id, names))
+        self._source_refreshes[source_id] = task
+        task.add_done_callback(lambda _: self._source_refreshes.pop(source_id, None))
+
+    async def _refresh_source_in_background(
+        self, source_id: str, names: tuple[str, ...]
+    ) -> None:
+        # No admission lease: one queued on the lock would hold slots that
+        # foreground runs, routines and jobs share.
+        try:
+            async with self._source_management_lock:
+                await self._refresh_source_locked(source_id, names)
+        except Exception as error:
+            # Error text can hold secrets; a failed sync is already recorded and
+            # the current snapshot stays.
+            _LOGGER.warning(
+                "background catalog refresh failed: %s", type(error).__name__
+            )
 
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
         self._require_open()
@@ -4725,6 +4808,10 @@ class EmbeddedAgent:
 
     async def _finish_close(self) -> None:
         first_error: BaseException | None = None
+        refreshes = tuple(self._source_refreshes.values())
+        for refresh in refreshes:
+            refresh.cancel()
+        await asyncio.gather(*refreshes, return_exceptions=True)
         await self._admission_coordinator.begin_draining()
         try:
             await self._routine_supervisor.close()

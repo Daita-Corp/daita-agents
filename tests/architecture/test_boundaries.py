@@ -1,8 +1,10 @@
 import ast
 import inspect
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from functools import cache
 from pathlib import Path
+
+import pytest
 
 import daita
 from daita.capabilities import AccessMode, CallTargetLane, OperationalEffect
@@ -341,7 +343,7 @@ def test_local_workspace_backend_is_explicit_and_conditionally_composed():
     assert "SessionFolderSource.for_workspace(identity.id, workspace)" in compose_text
     assert "session_workspace=workspace_backend" in compose_text
     assert "SourceTypeRegistry(source_types, local_files=not hosted)" in compose_text
-    assert "relational_upsert,\n            source_files,\n        )" in compose_text
+    assert "relational_write,\n            source_files,\n        )" in compose_text
 
 
 def test_bound_text_edit_has_one_artifact_producer_and_publication_owner():
@@ -578,7 +580,7 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["data_query"] == "data"
         assert resolved["file_search"] == "data"
         assert resolved["file_read"] == "data"
-        assert resolved["data_update_rows"] == "data"
+        assert resolved["data_write"] == "data"
         assert resolved["memory_set"] == "memory"
         assert resolved["skill_view"] == "skills"
         assert resolved["semantic_view"] == "semantics"
@@ -596,7 +598,7 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         # Each route keeps its own required arguments; the merged provider
         # schema lists them all.
         for capability_id, required in (
-            ("data.query", {"source_id", "resource_ids"}),
+            ("data.query", {"source_id"}),
             ("data.query_combined", {"inputs", "sql"}),
             ("data.query_files", {"source_id", "path_pattern", "sql"}),
         ):
@@ -607,14 +609,11 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
             assert required <= set(route_required)
         query_properties = query_schema.get("properties")
         assert isinstance(query_properties, Mapping)
-        assert {
-            "source_id",
-            "resource_ids",
-            "sql",
-            "statements",
-            "inputs",
-            "path_pattern",
-        } <= set(query_properties)
+        # The model names the source; the tables a read touches come from its SQL.
+        assert {"source", "sql", "statements", "inputs", "path_pattern"} <= set(
+            query_properties
+        )
+        assert not {"source_id", "resource_ids", "tables"} & set(query_properties)
     finally:
         await agent.close()
 
@@ -722,7 +721,7 @@ def test_public_surface_is_focused():
         "OutcomeState",
         "FolderSource",
         "PostgreSQLSource",
-        "RelationalUpdateReadiness",
+        "RelationalWriteReadiness",
         "RelationalWriteScope",
         "RetryPolicy",
         "RoutineIntent",
@@ -953,11 +952,14 @@ def test_deleted_lifecycle_systems_remain_absent():
 # through the composed SourceTypeRegistry.
 _SOURCE_TYPE_LITERAL_FILES = frozenset(
     {
+        # Frozen historical conversion of records that name their adapter.
+        "storage/home_migrations/revision_0004.py",
         "adapters/sqlite.py",  # SQLite adapter owns its adapter id
         "adapters/sqlite_query.py",  # SQLite read/export backend checks its own type
         "adapters/postgresql.py",  # PostgreSQL adapter owns its adapter id
         "adapters/postgresql_query.py",  # PostgreSQL read backend checks its own type
         "adapters/postgresql_write.py",  # PostgreSQL write backend checks its own type
+        "adapters/postgresql_write_sql.py",  # PostgreSQL write language
         "adapters/registry.py",  # built-in SourceType registrations
         "domains/data/sql/analysis.py",  # SQL dialect parsing
         "domains/data/sql/contracts.py",  # SQL dialect identifier rules
@@ -1309,8 +1311,7 @@ async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_bran
         assert effect_tools == {
             "artifact_save_local",
             "artifact_set_export_location",
-            "data_update_rows",
-            "data_upsert_rows",
+            "data_write",
             "job_cancel",
             "job_start",
             "memory_set",
@@ -1338,9 +1339,9 @@ async def test_database_writes_register_only_the_relational_write_slice(
             for name in registry.tool_names
             for capability_id in registry.tool_capability_ids(name)
         }
-        preview_capability = "data.preview_update_rows"
-        update_tool = "data_update_rows"
-        update_capability = "data.update_rows"
+        preview_capability = "data.preview_write"
+        update_tool = "data_write"
+        update_capability = "data.write"
         forbidden_tools = {
             "data_preview_sqlite_update",
             "data_update_sqlite",
@@ -1350,7 +1351,8 @@ async def test_database_writes_register_only_the_relational_write_slice(
             "data.sqlite.update",
         }
 
-        assert "data_preview_update_rows" not in registry.tool_names
+        assert "data_update_rows" not in registry.tool_names
+        assert "data_upsert_rows" not in registry.tool_names
         preview = registry.resolve_tool_mode(update_tool, "preview")[1]
         assert preview.id == preview_capability
         assert preview.access_mode is AccessMode.READ
@@ -1374,7 +1376,7 @@ async def test_database_writes_register_only_the_relational_write_slice(
         for dormant_name in forbidden_tools | forbidden_capabilities:
             assert f'"{dormant_name}"' not in package_text
             assert f"'{dormant_name}'" not in package_text
-        assert "class RelationalUpdateExecutor" in package_text
+        assert "class RelationalWriteExecutor" in package_text
         write_backend = (PACKAGE / "adapters" / "postgresql_write.py").read_text(
             encoding="utf-8"
         )
@@ -1390,8 +1392,8 @@ async def test_database_writes_register_only_the_relational_write_slice(
         capabilities_owner = (
             PACKAGE / "domains" / "data" / "capabilities.py"
         ).read_text(encoding="utf-8")
-        assert ".execute_update(" in capabilities_owner
-        assert ".execute_update(" not in controller
+        assert "backend.apply(" in capabilities_owner
+        assert "backend.apply(" not in controller
         assert ".execute_update(" not in (PACKAGE / "loop" / "driver.py").read_text(
             encoding="utf-8"
         )
@@ -1433,16 +1435,14 @@ def test_database_write_control_plane_keeps_current_owners():
     tui_commands = (PACKAGE / "tui" / "commands.py").read_text(encoding="utf-8")
     tui_controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
 
-    assert "relational_update_readiness" in agent_methods
-    assert "relational_update_readiness" in embedded_methods
-    assert "relational_update_readiness" in backend_methods
-    assert _class_owners("RelationalUpdateReadiness") == {
-        "adapters/postgresql_write.py"
-    }
-    assert "relational_update_readiness" not in controller
-    assert "relational_update_readiness" not in context
-    assert ".relational_update_readiness(" in cli
-    assert ".relational_update_readiness(" not in terminal
+    assert "relational_write_readiness" in agent_methods
+    assert "relational_write_readiness" in embedded_methods
+    assert "relational_write_readiness" in backend_methods
+    assert _class_owners("RelationalWriteReadiness") == {"adapters/postgresql_write.py"}
+    assert "relational_write_readiness" not in controller
+    assert "relational_write_readiness" not in context
+    assert ".relational_write_readiness(" in cli
+    assert ".relational_write_readiness(" not in terminal
     assert "inspect_source_permissions" in tui_controller
     assert "preview_source_permissions" in tui_controller
     assert "apply_source_permissions" in tui_controller
@@ -2046,12 +2046,11 @@ def test_catalog_summary_is_not_loop_or_storage_state():
 
 def test_catalog_describe_extends_existing_catalog_and_capability_owners():
     assert _class_owners("CatalogSchemaRequest") == {"catalog/models.py"}
-    assert _class_owners("CatalogDescribeRequest") == {"catalog/models.py"}
     service_methods = _class_methods(
         PACKAGE / "catalog" / "service.py",
         "CatalogService",
     )
-    assert {"describe", "schema_slice"} <= service_methods
+    assert "schema_slice" in service_methods
     capabilities = (PACKAGE / "catalog" / "capabilities.py").read_text(encoding="utf-8")
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     loop = _python_text(PACKAGE / "loop")
@@ -2059,7 +2058,7 @@ def test_catalog_describe_extends_existing_catalog_and_capability_owners():
     assert 'CATALOG_DESCRIBE_EVIDENCE_KIND = "catalog.description"' in capabilities
     for removed in ("catalog_schema", "catalog_inspect", "catalog_traverse"):
         assert f'name="{removed}"' not in capabilities
-    assert "catalog_declarations(identity.id, data_view)" in embedded
+    assert "catalog_declarations(" in embedded
     assert "catalog_service = CatalogService(store, store)" in embedded
     assert "catalog_describe" not in loop
     for prohibited in (
@@ -2106,23 +2105,12 @@ def test_catalog_indexed_retrieval_is_private_and_catalog_owned():
     service = (PACKAGE / "catalog" / "service.py").read_text(encoding="utf-8")
     storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
     loop = _python_text(PACKAGE / "loop")
-    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
-    context_tree = ast.parse(context)
-    toolbox = (PACKAGE / "capabilities.py").read_text(encoding="utf-8")
 
-    assert _class_owners("CatalogMatchOutcome") == {"catalog/models.py"}
     assert "search" not in protocol_methods
     assert "search" not in storage_methods
     assert "_SourceCatalogIndex" in service
     assert "_source_indexes" in service
     assert "_compile_source_index" in service
-    assert "_catalog_match_outcome" in service
-    assert "_catalog_match_outcome" not in {
-        node.name
-        for node in ast.walk(context_tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    assert "CatalogMatchOutcome" not in toolbox
     assert "_catalog_search_reason" not in storage
     assert "_SourceCatalogIndex" not in storage
     assert "CatalogSearchHit" not in storage
@@ -2523,32 +2511,21 @@ def test_native_write_contracts_are_neutral_and_use_the_existing_domain():
     from dataclasses import fields
 
     from daita.domains.data.capabilities import (
-        relational_update_capability_declarations,
-        relational_update_preview_capability_declarations,
-        relational_upsert_capability_declarations,
+        relational_write_capability_declarations,
     )
 
-    declarations = (
-        relational_update_preview_capability_declarations(),
-        relational_update_capability_declarations(),
-        relational_upsert_capability_declarations(),
-    )
+    declarations = (relational_write_capability_declarations(),)
     assert {view.name for bundle in declarations for view in bundle.tool_views} == {
-        "data_update_rows",
-        "data_upsert_rows",
+        "data_write",
     }
     assert {
         view.name: view.mode_capability_ids
         for bundle in declarations
         for view in bundle.tool_views
     } == {
-        "data_update_rows": (
-            ("preview", "data.preview_update_rows"),
-            ("apply", "data.update_rows"),
-        ),
-        "data_upsert_rows": (
-            ("preview", "data.preview_upsert_rows"),
-            ("apply", "data.upsert_rows"),
+        "data_write": (
+            ("preview", "data.preview_write"),
+            ("apply", "data.write"),
         ),
     }
     for bundle in declarations:
@@ -2564,12 +2541,10 @@ def test_native_write_contracts_are_neutral_and_use_the_existing_domain():
         "agent_id",
         "source_id",
         "resource_id",
-        "resource_revision",
+        "table",
         "allowed_operations",
         "allowed_insert_columns",
         "allowed_update_columns",
-        "key_columns",
-        "generated_identity_columns",
         "max_rows",
         "authorization_fingerprint",
     }
@@ -2793,3 +2768,52 @@ def test_raw_tool_call_detector_catches_each_raw_reader_form():
         "    call.arguments\n"
     )
     assert _raw_tool_call_reads("reader.py", ast.parse(identity_only)) == []
+
+
+def _catalog_consumers(paths: Iterable[Path]) -> dict[str, set[str]]:
+    consulting: dict[str, set[str]] = {}
+    for path in paths:
+        names: set[str] = set()
+        for node in ast.walk(_tree(path)):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module is not None
+                and "catalog" in node.module.split(".")
+            ):
+                names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.arg) and node.arg == "catalog":
+                names.add("catalog parameter")
+        consulting_names = names - {"ResourceKind", "catalog_resource_id"}
+        if consulting_names:
+            consulting[path.name] = consulting_names
+    return consulting
+
+
+def test_read_io_never_consults_the_catalog():
+    """Catalog IDs can be derived from a name; catalog state is never read."""
+
+    assert (
+        _catalog_consumers(
+            (
+                PACKAGE / "adapters" / "postgresql_query.py",
+                PACKAGE / "adapters" / "sqlite_query.py",
+                PACKAGE / "domains" / "data" / "sql" / "analysis.py",
+                PACKAGE / "domains" / "data" / "sql" / "contracts.py",
+                PACKAGE / "domains" / "data" / "sql" / "duckdb_read.py",
+                PACKAGE / "domains" / "data" / "sql" / "read_validation.py",
+            )
+        )
+        == {}
+    )
+
+
+def test_write_io_never_consults_the_catalog():
+    assert (
+        _catalog_consumers(
+            (
+                PACKAGE / "adapters" / "postgresql_write.py",
+                PACKAGE / "adapters" / "postgresql_write_sql.py",
+            )
+        )
+        == {}
+    )

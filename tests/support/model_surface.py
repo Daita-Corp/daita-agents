@@ -23,7 +23,7 @@ import os
 import re
 import sqlite3
 import tempfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,7 +31,7 @@ from typing import Any
 from unittest.mock import patch
 
 from daita import Agent, LocalWorkspace
-from daita._json import FrozenJsonObject
+from daita._json import FrozenJsonObject, canonical_json
 from daita.capabilities import (
     RESERVED_TOOL_NAMES,
     TOOLBOX_DEFINITIONS,
@@ -83,23 +83,33 @@ LANES: tuple[tuple[str, CallTargetLane | None], ...] = (
     ("machine", None),
 )
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+# A resource, source, relationship or link ID, a run-local handle as a JSON string
+# value, or a canonical identity key the model never sends.
+_IDENTITY_TEXT = re.compile(
+    r"catalog-(?:resource|relationship|link):sha256:|source:(?:workspace:)?sha256:"
+    r'|"[st][1-9][0-9]{0,4}"|(?:source|resource)_(?:id|ref)s?\b|relationship_ids?\b'
+)
 
 
 def _script() -> tuple[ModelResponse, ...]:
-    def calls(name: str, arguments: Mapping[str, object]) -> ModelResponse:
-        call = ToolCall(id=f"call-{name}", name=name, arguments=dict(arguments))
+    def calls(
+        name: str, arguments: Mapping[str, object], call_id: str | None = None
+    ) -> ModelResponse:
+        call = ToolCall(
+            id=call_id or f"call-{name}", name=name, arguments=dict(arguments)
+        )
         return ModelResponse(finish_reason=FinishReason.TOOL_CALLS, tool_calls=(call,))
 
     return (
         calls("catalog_search", {"query": "orders"}),
         calls(
             "data_query",
-            {
-                "source_id": "s1",
-                "resource_ids": ["t1"],
-                "sql": "SELECT COUNT(*) AS order_count FROM orders",
-            },
+            {"source": "shop", "sql": "SELECT COUNT(*) AS order_count FROM orders"},
         ),
+        # Contracts render identity arguments too; inspect a routed tool and a
+        # grant-bearing one so the snapshot covers that rendering.
+        calls("toolbox_inspect", {"tool_name": "data_query"}, "call-inspect-query"),
+        calls("toolbox_inspect", {"tool_name": "routine_save"}, "call-inspect-routine"),
         calls("toolbox_load", {"tool_names": list(ON_DEMAND_LOAD)}),
         ModelResponse(finish_reason=FinishReason.STOP, text="There are 3 orders."),
     )
@@ -276,7 +286,7 @@ def _requests(
                         model_tool_result(
                             block,
                             request.tool_result_refs.get(block.call_id),
-                            request.scope_refs,
+                            request.scope_names,
                         )
                     )
         step: dict[str, object] = {
@@ -296,7 +306,9 @@ def _requests(
     }
 
 
-async def _capture(root: Path) -> dict[str, object]:
+async def _fixture_run(root: Path) -> tuple[Agent, MockModelProvider]:
+    """Run the scripted fixture agent once; the caller closes the agent."""
+
     database, workspace = _seed(root)
     downloads = root / "downloads"
     downloads.mkdir()
@@ -332,6 +344,15 @@ async def _capture(root: Path) -> dict[str, object]:
             raise RuntimeError(
                 f"surface fixture tool call failed; the script is stale: {failed}"
             )
+    except BaseException:
+        await agent.close()
+        raise
+    return agent, provider
+
+
+async def _capture(root: Path) -> dict[str, object]:
+    agent, provider = await _fixture_run(root)
+    try:
         registry = agent._embedded._capabilities
         return {
             "toolboxes": {
@@ -343,6 +364,75 @@ async def _capture(root: Path) -> dict[str, object]:
         }
     finally:
         await agent.close()
+
+
+def model_visible_text(request: ModelRequest) -> Iterator[str]:
+    """Everything one request shows a model: tools, text, calls and rendered results."""
+
+    for tool in request.tools:
+        yield canonical_json({"d": tool.description, "s": tool.input_schema})
+    for message in request.messages:
+        for call in message.tool_calls:
+            yield canonical_json(call.arguments)
+        for block in message.content:
+            if isinstance(block, TextBlock):
+                yield block.text
+            elif isinstance(block, ToolResultBlock):
+                yield canonical_json(
+                    model_tool_result(
+                        block,
+                        request.tool_result_refs.get(block.call_id),
+                        request.scope_names,
+                    )
+                )
+
+
+def identity_leaks(
+    requests: Iterable[ModelRequest], definitions: Iterable[ToolDefinition] = ()
+) -> list[str]:
+    """Each ID, handle or canonical identity key shown to a model, with context."""
+
+    shown = [
+        *(
+            canonical_json({"d": d.description, "s": d.input_schema})
+            for d in definitions
+        ),
+        *(text for request in requests for text in model_visible_text(request)),
+    ]
+    return [
+        text[max(0, match.start() - 80) : match.end() + 20]
+        for text in shown
+        for match in _IDENTITY_TEXT.finditer(text)
+    ]
+
+
+def capture_requests() -> tuple[tuple[ModelRequest, ...], tuple[ToolDefinition, ...]]:
+    """Return the fixture run's model requests and every registry tool definition.
+
+    Assertions over what the model was actually shown (instructions, tool
+    definitions, rendered results) start here rather than from the snapshot,
+    whose result entries keep only key structure.
+    """
+
+    async def capture(
+        root: Path,
+    ) -> tuple[tuple[ModelRequest, ...], tuple[ToolDefinition, ...]]:
+        agent, provider = await _fixture_run(root)
+        try:
+            registry = agent._embedded._capabilities
+            definitions = tuple(
+                registry.tool_definition(name, lane=lane)
+                for name in sorted(registry.tool_names)
+                for _, lane in LANES
+            )
+        finally:
+            await agent.close()
+        return tuple(provider.requests), definitions
+
+    with tempfile.TemporaryDirectory(prefix="daita-model-surface-") as directory:
+        root = Path(directory).resolve()
+        with _fixed_host():
+            return asyncio.run(capture(root))
 
 
 def _normalise(text: str, root: Path) -> str:
@@ -449,5 +539,7 @@ __all__ = [
     "compute_surface_text",
     "describe_changes",
     "digest_text",
+    "identity_leaks",
+    "model_visible_text",
     "write_snapshot",
 ]

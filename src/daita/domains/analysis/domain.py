@@ -50,7 +50,7 @@ from ...capability_runtime import CapabilityFailure
 from ...catalog.models import Sensitivity
 from ...config import AnalysisLimits
 from ...hosting.execution_governor import PermitLease, RunAdmissionCoordinator
-from ...llm.models import ModelSensitivity, ToolCall
+from ...llm.models import ModelSensitivity, ToolCall, with_scope_names
 from ...loop.analysis import (
     AnalysisEvidence,
     AnalysisTraceCapacityError,
@@ -60,6 +60,7 @@ from ...loop.analysis import (
 from ...loop.models import RunInput, RunOrigin
 from ...loop.session import RunSession
 from ...observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
+from ...scope import EffectiveSourceScope
 from ..data.export_capabilities import ArtifactCapabilityDomain
 
 OWNER = "analysis"
@@ -130,8 +131,12 @@ class AnalysisCapabilityDomain:
         *,
         limits: AnalysisLimits = AnalysisLimits(),
         observer: AgentObserver | None = None,
+        scope_names: (
+            Callable[[str, EffectiveSourceScope], Awaitable[Mapping[str, str]]] | None
+        ) = None,
     ) -> None:
         self._coordinator = coordinator
+        self._scope_names = scope_names
         self._evidence_owner = evidence_owner
         self._artifacts = artifacts
         self._limits = limits
@@ -868,10 +873,27 @@ class AnalysisCapabilityDomain:
                 cell_deadline,
             )
             await revalidate()
+            names = (
+                None
+                if self._scope_names is None or request.source_scope is None
+                else await self._scope_names(current_run.agent_id, request.source_scope)
+            )
+
+            async def named_broker(
+                name: str, arguments: Mapping[str, object]
+            ) -> dict[str, object]:
+                # Python reads what a direct result shows; evidence keeps the IDs.
+                response = await broker(name, arguments)
+                return (
+                    response
+                    if names is None
+                    else cast(dict[str, object], with_scope_names(response, names))
+                )
+
             result = await worker.execute(
                 str(request.arguments["code"]),
                 deadline=cell_deadline,
-                broker=broker,
+                broker=named_broker,
                 compute=compute,
                 inputs=input_manifest,
             )

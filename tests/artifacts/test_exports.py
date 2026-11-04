@@ -41,7 +41,7 @@ from daita.domains.data.export_capabilities import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
     exact_export_capability_declarations,
 )
-from daita.domains.data.sql import ResourceSchema
+from daita.domains.data.sql import CheckedRead, ResourceSchema
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -53,6 +53,7 @@ from daita.llm.models import (
 )
 from daita.loop.models import LoopExitKind
 from daita.security import EmptySecretProvider
+from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
 from tests.support.toolbox_model import (
     ToolboxAwareMockModelProvider as MockModelProvider,
 )
@@ -457,6 +458,11 @@ class _SourceStore:
     def __init__(self, registration: SourceRegistration | None) -> None:
         self.registration = registration
 
+    async def load_source_read_scope(
+        self, agent_id: str, source_id: str
+    ) -> SourceReadScope:
+        return SourceReadScope(agent_id, source_id, SourceReadMode.ALL)
+
     async def register_source(self, registration: SourceRegistration):
         self.registration = registration
         return registration
@@ -531,7 +537,7 @@ class _BackendConnection:
 
 
 @pytest.mark.parametrize("format_name", ("csv", "xlsx"))
-async def test_postgresql_backend_contract_revalidates_and_executes_once_without_live_db(
+async def test_postgresql_backend_executes_the_checked_read_once_without_live_db(
     monkeypatch: pytest.MonkeyPatch,
     format_name: str,
 ) -> None:
@@ -541,7 +547,7 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
         adapter_id="postgresql",
         native_identity="offline-contract",
         display_name="Offline PostgreSQL",
-        configuration={},
+        configuration={"schemas": ("public",)},
         attached_at=datetime(2026, 8, 1, tzinfo=UTC),
     )
     source_revision = "sha256:" + "3" * 64
@@ -564,10 +570,6 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
         del args, kwargs
         return connection
 
-    async def load_structure(*args: object, **kwargs: object):
-        del args, kwargs
-        return SimpleNamespace(source_revision=source_revision)
-
     async def execute_exact(*args: object, **kwargs: object):
         nonlocal exact_calls
         exact_calls += 1
@@ -582,21 +584,23 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
         closed = True
 
     monkeypatch.setattr(postgresql_query_module, "_connect", connect)
-    monkeypatch.setattr(postgresql_query_module, "_load_structure", load_structure)
     monkeypatch.setattr(
         postgresql_query_module, "_execute_exact_tabular_query", execute_exact
     )
     monkeypatch.setattr(postgresql_query_module, "_close_postgresql_connection", close)
     backend = postgresql_query_module.PostgreSQLQueryBackend(
         _SourceStore(registration),
-        _CatalogSchemas((resource,)),
         EmptySecretProvider(),
     )
     result = await backend.execute_exact_tabular(
         agent_id=agent_id,
         source_id=registration.id,
-        sql="SELECT amount FROM public.orders WHERE amount = $1",
-        parameters=(Decimal("1.20"),),
+        read=CheckedRead(
+            canonical_sql="SELECT amount FROM public.orders WHERE amount = $1",
+            sql_fingerprint="sha256:" + "1" * 64,
+            parameters=(Decimal("1.20"),),
+            resource_ids=("resource-orders",),
+        ),
         format_name=format_name,
         parameters_sha256="sha256:" + "0" * 64,
         created_at=datetime(2026, 8, 1, tzinfo=UTC),
@@ -611,8 +615,7 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
     assert closed
     assert result.content == b'"amount"\r\n1.20\r\n'
     assert result.format == format_name
-    assert result.resource_revisions == ((resource.resource_id, resource.revision),)
-    assert result.source_revision == source_revision
+    assert result.resource_ids == ("resource-orders",)
 
 
 def test_semantic_csv_tool_schema_cannot_accept_rows_bytes_or_provenance() -> None:
@@ -869,8 +872,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
         assert set(export_data) == {
             "adapter_id",
             "source_id",
-            "source_revision",
-            "resource_revisions",
+            "resource_ids",
             "format",
             "filename",
             "row_count",
@@ -946,7 +948,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
             (),
             "sql_validation_failed",
         ),
-        ("SELECT * FROM missing", (), "resource_read_not_allowed"),
+        ("SELECT * FROM missing", (), "query_invalid"),
     ),
 )
 async def test_csv_export_reuses_current_sql_and_catalog_validation(
@@ -1052,10 +1054,11 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
         )
         with sqlite3.connect(database) as connection:
             connection.execute("ALTER TABLE records ADD COLUMN changed TEXT")
+        # Unrelated DDL no longer stops an export: the source answers.
         stale = await agent.run("Export this as CSV.")
         stale_block = _result_for_call(await agent.transcript(stale.run_id), "stale")
-        assert _error_code(stale_block) == "catalog_source_stale"
-        assert stale.artifacts == ()
+        assert not stale_block.is_error, stale_block.output
+        assert len(stale.artifacts) == 1
 
         await agent.detach(source_id)
         provider.replace_script(

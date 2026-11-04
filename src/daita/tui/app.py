@@ -952,10 +952,14 @@ class DaitaApp(App[int]):
                 await self._handle_command(f"/schedule {when}")
             return
         if screen_name == "source_setup":
-            await self._await_modal(SourceSetupScreen())
+            setup = SourceSetupScreen()
+            await self._await_modal(setup)
             await self._reload_sources()
             await self._refresh_status()
             await self._show_home_guidance()
+            chat = self.chat()
+            if chat is not None and setup.connection_notice[0]:
+                chat.show_notice(setup.connection_notice[0])
             return
         if screen_name == "source_edit":
             changed = await self._await_modal(
@@ -1152,8 +1156,10 @@ class DaitaApp(App[int]):
             selected_source_id = action.source_id
 
             if action.kind == "add":
-                if await self._await_modal(SourceSetupScreen()):
-                    notice = "Source attached."
+                setup = SourceSetupScreen()
+                if await self._await_modal(setup):
+                    notice, notice_warning = setup.connection_notice
+                    notice = notice or "Source attached."
                     await self._reload_sources()
                     await self._refresh_status()
                 continue

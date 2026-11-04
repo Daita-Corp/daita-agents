@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -267,6 +268,27 @@ async def test_sources_resolve_by_name_or_id_and_unknown_names_are_refused(
     assert "Sales" in str(unknown.value.details)
 
 
+async def test_two_sources_sharing_a_name_are_refused_as_ambiguous(
+    store: SQLiteStateStore,
+) -> None:
+    await _source(store, "Sales")
+    await _source(store, "SALES")
+    with pytest.raises(RoutineError) as ambiguous:
+        await _owner(store).prepare(
+            RoutineIntent(
+                title=_INTENT.title,
+                prompt=_INTENT.prompt,
+                schedule=_INTENT.schedule,
+                sources=("sales",),
+            ),
+            conversation_id="conversation-1",
+            identity="ambiguous",
+        )
+    assert ambiguous.value.code == "source_ambiguous"
+    assert "SALES (" in str(ambiguous.value.details)
+    assert "Sales (" in str(ambiguous.value.details)
+
+
 async def test_card_shows_title_local_schedule_prompt_and_sources(
     store: SQLiteStateStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -360,7 +382,9 @@ async def test_resume_resets_the_failure_count(store: SQLiteStateStore) -> None:
     assert resumed.consecutive_failures == 0
 
 
-async def test_sources_accept_the_origin_runs_handles(tmp_path: Path) -> None:
+async def test_sources_accept_only_a_stored_origin_runs_handles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     database = tmp_path / "crm.sqlite"
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE companies (name TEXT NOT NULL)")
@@ -378,9 +402,9 @@ async def test_sources_accept_the_origin_runs_handles(tmp_path: Path) -> None:
         source = await agent.attach(SQLiteSource(database, name="CRM"))
         origin = await agent.run("Report companies weekly.")
         assert origin.conversation_id is not None
-        transcript = await agent.transcript(origin.run_id)
-        handle = scope_refs(transcript.run.resolved_source_scope).handles[source.id]
         owner = agent._embedded._routine_owner
+        current = await owner._store.load(origin.run_id)
+        assert current.run.resolved_source_scope is not None
 
         def intent(*sources: str) -> RoutineIntent:
             return RoutineIntent(
@@ -389,6 +413,34 @@ async def test_sources_accept_the_origin_runs_handles(tmp_path: Path) -> None:
                 schedule=_INTENT.schedule,
                 sources=sources,
             )
+
+        # A run that froze display names was never shown a handle.
+        with pytest.raises(RoutineError) as new_run:
+            await owner.prepare(
+                intent("s1"),
+                conversation_id=origin.conversation_id,
+                identity="handles-new-run",
+                origin_run_id=origin.run_id,
+            )
+        assert new_run.value.code == "routine_source_unknown"
+
+        # A run stored before names were used keeps the handles it issued.
+        stored = replace(
+            current,
+            run=replace(
+                current.run,
+                resolved_source_scope=replace(
+                    current.run.resolved_source_scope, source_labels={}
+                ),
+            ),
+        )
+        assert stored.run.resolved_source_scope is not None
+
+        async def load_stored(run_id: str) -> object:
+            return stored
+
+        monkeypatch.setattr(owner._store, "load", load_stored)
+        handle = scope_refs(stored.run.resolved_source_scope).handles[source.id]
 
         prepared = await owner.prepare(
             intent(handle),

@@ -59,7 +59,10 @@ known suffix in order, validate the complete staged home, and publish `state.db`
 last. Hash-bound journals recover staging, partial commit, and rollback states.
 Publication failure restores the prior home, and one rollback bundle is retained.
 Newer, unsupported, reordered, checksum-edited, or damaged homes fail closed
-without a state rewrite.
+without a state rewrite. The exception is a damaged catalog row (`syncs` or
+`snapshots`): it can be rebuilt from the source, so the home opens and a
+background refresh replaces the row. Upgrading a home from before revision 4 still reads
+those rows and fails closed on a damaged one.
 
 Every supported production revision has one immutable whole-home golden fixture.
 Tests cover every supported-to-current path, durable-data preservation, failure

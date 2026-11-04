@@ -141,7 +141,6 @@ async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
     scope = ExecutionScope(
         contract_bindings=frozen_execution_bindings(
             ("test.lookup",),
-            ("resource-1",),
             (provider.provider_id,),
             registry=tools._projection._runtime._registry,
         ),
@@ -1153,3 +1152,61 @@ async def test_embedded_streaming_persists_only_one_finalized_sqlite_message(tmp
     )
     assert transcript.messages[-1].content == (TextBlock("SQLite canonical final."),)
     assert "sqlite draft sentinel" not in repr(transcript)
+
+
+async def test_run_status_is_written_once_and_never_edits_an_earlier_request(tmp_path):
+    from pathlib import Path
+
+    from daita import SQLiteSource
+    from tests.support.workspace import workspace_for
+
+    root = Path(tmp_path)
+    (root / "shop.sqlite").touch()
+    query = {"source": "Shop", "sql": "SELECT 1 AS n"}
+    provider = MockModelProvider(
+        (
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(ToolCall("one", "data_query", query),),
+            ),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(ToolCall("two", "data_query", query),),
+            ),
+            ModelResponse(finish_reason=FinishReason.STOP, text="One."),
+        )
+    )
+    agent = await Agent.create(
+        "append-only-status",
+        root=root,
+        workspace=workspace_for(root),
+        model=provider,
+        model_profile=provider.model_profile,
+        limits=LoopLimits(max_steps=3),
+    )
+    try:
+        await agent.attach(SQLiteSource(root / "shop.sqlite", name="Shop"))
+        result = await agent.run("Count.")
+        assert result.kind is LoopExitKind.COMPLETED
+        transcript = await agent.transcript(result.run_id)
+    finally:
+        await agent.close()
+
+    first, second, third = provider.requests
+    # Each request extends the one before it, byte for byte.
+    assert first.messages == second.messages[: len(first.messages)]
+    assert second.messages == third.messages[: len(second.messages)]
+    assert all(
+        message.role is not MessageRole.SYSTEM
+        for request in provider.requests
+        for message in request.messages[1:]
+    )
+    # Only the last step mattered, and the note is stored with the transcript.
+    notes = [
+        (cast(ToolResultBlock, message.content[0]).call_id, message.run_note)
+        for message in transcript.messages
+        if message.role is MessageRole.TOOL
+    ]
+    assert notes[0] == ("one", None)
+    assert notes[1][0] == "two" and "last model request" in str(notes[1][1])
+    assert third.messages[-1].run_note == notes[1][1]

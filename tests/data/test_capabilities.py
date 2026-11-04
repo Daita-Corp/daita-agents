@@ -10,6 +10,7 @@ from typing import cast
 import pytest
 
 from daita._json import FrozenJsonObject, canonical_json, thaw_json
+from daita.adapters import SQLiteQueryError
 from daita.adapters.registry import SourceOperation, SourceTypeRegistry
 from daita.capabilities import (
     CallTargetLane,
@@ -39,13 +40,12 @@ from daita.domains.data import (
     exact_export_capability_declarations,
     exact_export_outputs,
     project_result_rows,
-    relational_update_capability_declarations,
-    relational_update_preview_capability_declarations,
-    relational_upsert_capability_declarations,
+    relational_write_capability_declarations,
     source_file_capability_declarations,
 )
 from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import RunInput
+from tests.support.checked_read import checked_read
 
 
 def test_data_query_is_one_backend_neutral_model_tool() -> None:
@@ -67,11 +67,9 @@ def test_data_query_is_one_backend_neutral_model_tool() -> None:
         "parameters",
         "statements",
     }
-    # Exactly one of sql or statements is enforced by the data domain.
-    assert set(cast(list[str], capability.input_schema["required"])) == {
-        "source_id",
-        "resource_ids",
-    }
+    # Exactly one of sql or statements is enforced by the data domain, which
+    # also derives resource_ids from the SQL.
+    assert set(cast(list[str], capability.input_schema["required"])) == {"source_id"}
     assert set(properties).isdisjoint(
         {"adapter", "adapter_id", "backend", "connection", "executor_id"}
     )
@@ -97,9 +95,9 @@ def test_data_export_is_one_backend_neutral_model_tool() -> None:
         "output",
         "filename",
     }
+    # The data domain derives resource_ids from the SQL.
     assert set(cast(list[str], capability.input_schema["required"])) == {
         "source_id",
-        "resource_ids",
         "sql",
         "output",
     }
@@ -164,6 +162,10 @@ class _Catalog:
     def session_source_id(self) -> str | None:
         return None
 
+    async def source_schemas(self, agent_id: str, source_id: str) -> tuple[str, ...]:
+        del agent_id
+        return ("public",) if source_id == "source-postgresql" else ()
+
     def __init__(self) -> None:
         self.write_applicability_calls: list[str] = []
         self.routing_enabled = True
@@ -224,11 +226,9 @@ class _Catalog:
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
-        *,
-        operation: str = "update",
     ) -> frozenset[str]:
         del agent_id, source_ids
-        self.write_applicability_calls.append(operation)
+        self.write_applicability_calls.append("write")
         return frozenset()
 
     async def resource_identity(
@@ -257,6 +257,12 @@ class _Catalog:
         return (
             (schema, self.sqlite_other) if source_id == "source-sqlite" else (schema,)
         )
+
+    async def source_read_access(self, agent_id, source_ids):
+        return {
+            source_id: await self.readable_resource_ids(agent_id, (source_id,))
+            for source_id in source_ids
+        }
 
     async def readable_resource_ids(
         self,
@@ -294,17 +300,13 @@ def _domain(catalog: _Catalog, *, source_files: bool = False) -> DataCapabilityD
     export_bundle = exact_export_capability_declarations(
         adapter_ids=("sqlite", "postgresql")
     )
-    preview_bundle = relational_update_preview_capability_declarations()
-    update_bundle = relational_update_capability_declarations()
-    upsert_bundle = relational_upsert_capability_declarations()
+    write_bundle = relational_write_capability_declarations()
     file_bundle = source_file_capability_declarations()
     capabilities = (
         *catalog_bundle.capabilities,
         *query_bundle.capabilities,
         *export_bundle.capabilities,
-        *preview_bundle.capabilities,
-        *update_bundle.capabilities,
-        *upsert_bundle.capabilities,
+        *write_bundle.capabilities,
         *(file_bundle.capabilities if source_files else ()),
     )
     return DataCapabilityDomain(
@@ -316,9 +318,7 @@ def _domain(catalog: _Catalog, *, source_files: bool = False) -> DataCapabilityD
                 *catalog_bundle.tool_views,
                 *query_bundle.tool_views,
                 *export_bundle.tool_views,
-                *preview_bundle.tool_views,
-                *update_bundle.tool_views,
-                *upsert_bundle.tool_views,
+                *write_bundle.tool_views,
                 *(file_bundle.tool_views if source_files else ()),
             ),
         ),
@@ -344,9 +344,7 @@ async def test_mixed_relational_catalog_projects_each_semantic_tool_once(
     assert projected.count(DATA_QUERY_TOOL_NAME) == (
         tool_name in {None, DATA_QUERY_TOOL_NAME}
     )
-    assert catalog.write_applicability_calls == (
-        ["update", "upsert"] if tool_name is None else []
-    )
+    assert catalog.write_applicability_calls == (["write"] if tool_name is None else [])
 
 
 _SESSION_SOURCE = "source:workspace:sha256:" + "5" * 64
@@ -432,7 +430,7 @@ async def test_folder_file_tools_project_only_with_a_folder_source_in_scope(
                 "path_pattern": "x.csv",
                 "sql": "SELECT * FROM data",
             },
-            "path_pattern_unsupported",
+            "source_operation_unsupported",
         ),
         (
             "data_query",
@@ -498,8 +496,12 @@ async def test_exact_relational_projection_rechecks_current_source_admission():
 
 
 async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
+    class WholeSources(_Catalog):
+        async def source_read_access(self, agent_id, source_ids):
+            return dict.fromkeys(source_ids)
+
     domain = object.__new__(DataCapabilityDomain)
-    domain._catalog = cast(DataDomainCatalog, _Catalog())
+    domain._catalog = cast(DataDomainCatalog, WholeSources())
     domain._source_types = SourceTypeRegistry()
 
     sqlite = await domain._validate_sql(
@@ -523,16 +525,6 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
 
     assert sqlite["_adapter_id"] == "sqlite"
     assert postgresql["_adapter_id"] == "postgresql"
-    with pytest.raises(CapabilityInputError, match="belong to the selected source"):
-        await domain._validate_sql(
-            _run(),
-            operation=SourceOperation.SQL_READ,
-            arguments={
-                "source_id": "source-sqlite",
-                "resource_ids": ("resource-postgresql",),
-                "sql": "SELECT id FROM items",
-            },
-        )
     with pytest.raises(CapabilityInputError, match="does not support relational"):
         await domain._validate_sql(
             _run(),
@@ -554,28 +546,12 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
             },
         )
     assert unknown_source.value.code == "sql_source_not_available"
-    with pytest.raises(CapabilityInputError) as unknown_resource:
-        await domain._validate_sql(
-            _run(),
-            operation=SourceOperation.SQL_READ,
-            arguments={
-                "source_id": "source-sqlite",
-                "resource_ids": ("resource-missing",),
-                "sql": "SELECT id FROM items",
-            },
-        )
-    assert unknown_resource.value.code == "resource_read_not_allowed"
-    with pytest.raises(CapabilityInputError) as target_mismatch:
-        await domain._validate_sql(
-            _run(),
-            operation=SourceOperation.SQL_READ,
-            arguments={
-                "source_id": "source-sqlite",
-                "resource_ids": ("resource-sqlite",),
-                "sql": "SELECT id FROM other_items",
-            },
-        )
-    assert target_mismatch.value.code == "sql_resource_target_mismatch"
+
+
+def _prepared_read(resource_id: str) -> dict[str, object]:
+    return checked_read(
+        "SELECT id FROM items", resource_id=resource_id, name="items"
+    ).to_mapping()
 
 
 class _ReadBackend:
@@ -611,8 +587,6 @@ class _ReadBackend:
             canonical_sql="SELECT id FROM items",
             sql_fingerprint="sha256:" + "5" * 64,
             resource_ids=(resource_id,),
-            resource_revisions=((resource_id, "sha256:" + "6" * 64),),
-            source_revision="sha256:" + "7" * 64,
             columns=("id",),
             projection=projection,
         )
@@ -636,6 +610,7 @@ async def test_data_query_routes_each_catalog_binding_to_exactly_one_backend() -
                     "resource_ids": (f"resource-{adapter_id}",),
                     "sql": "SELECT id FROM items",
                     "_adapter_id": adapter_id,
+                    "_reads": (_prepared_read(f"resource-{adapter_id}"),),
                 },
             )
         )
@@ -668,6 +643,7 @@ async def test_data_query_inline_byte_limit_reports_truncation() -> None:
                 "resource_ids": ("resource-sqlite",),
                 "sql": "SELECT id, detail FROM items",
                 "_adapter_id": "sqlite",
+                "_reads": (_prepared_read("resource-sqlite"),),
             },
         )
     )
@@ -685,6 +661,45 @@ async def test_data_query_inline_byte_limit_reports_truncation() -> None:
     assert utf8_bytes <= byte_limit
 
 
+@pytest.mark.parametrize("undefined", (True, False))
+async def test_a_missing_object_asks_for_a_refresh_and_the_error_reaches_the_model(
+    undefined: bool,
+) -> None:
+    failure = SQLiteQueryError(
+        "query_invalid", "no such table: items", undefined_object=undefined
+    )
+
+    class Failing:
+        async def execute_read(self, **arguments: object) -> object:
+            raise failure
+
+    requested: list[tuple[str, tuple[str, ...]]] = []
+    executor = DataQueryExecutor(
+        "agent-relational",
+        {"sqlite": Failing()},  # type: ignore[dict-item]
+        request_refresh=lambda source_id, names: requested.append((source_id, names)),
+    )
+
+    with pytest.raises(SQLiteQueryError) as raised:
+        await executor.execute(
+            ToolExecution(
+                run_id="run-relational",
+                call_id="call-sqlite",
+                capability_id=DATA_QUERY_CAPABILITY_ID,
+                arguments={
+                    "source_id": "source-sqlite",
+                    "resource_ids": ("resource-sqlite",),
+                    "sql": "SELECT id FROM items",
+                    "_adapter_id": "sqlite",
+                    "_reads": (_prepared_read("resource-sqlite"),),
+                },
+            )
+        )
+
+    assert raised.value is failure
+    assert requested == ([("source-sqlite", ("items",))] if undefined else [])
+
+
 class _ExportBackend:
     def __init__(self, adapter_id: str) -> None:
         self.adapter_id = adapter_id
@@ -699,9 +714,8 @@ class _ExportBackend:
             format=str(arguments["format_name"]),
             adapter_id=self.adapter_id,
             source_id=str(arguments["source_id"]),
-            source_revision="sha256:" + "7" * 64,
             sql_fingerprint="sha256:" + "5" * 64,
-            resource_revisions=((resource_id, "sha256:" + "6" * 64),),
+            resource_ids=(resource_id,),
             columns=("id",),
             row_count=1,
             content=b"id\r\n1\r\n",
@@ -730,15 +744,13 @@ async def test_data_export_routes_each_catalog_binding_to_exactly_one_backend() 
                     "sql": "SELECT id FROM items",
                     "output": "csv",
                     "_adapter_id": adapter_id,
+                    "_reads": (_prepared_read(f"resource-{adapter_id}"),),
                 },
             )
         )
         assert output.data["adapter_id"] == adapter_id
         assert output.data["source_id"] == f"source-{adapter_id}"
-        revisions = output.data["resource_revisions"]
-        assert isinstance(revisions, tuple) and len(revisions) == 1
-        assert revisions[0]["resource_id"] == f"resource-{adapter_id}"
-        assert revisions[0]["revision"] == "sha256:" + "6" * 64
+        assert output.data["resource_ids"] == (f"resource-{adapter_id}",)
         assert output.artifact is not None
         assert output.artifact.provenance.resource_bindings[0].resource_id == (
             f"resource-{adapter_id}"

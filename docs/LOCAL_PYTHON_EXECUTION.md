@@ -65,12 +65,13 @@ publication fails, earlier references remain available and `save_status="failed"
 reports the incomplete set. Check references before claiming that every requested
 file was retained. Candidates alone are not delivered artifacts.
 
-The version-1 worker helpers are ordinary Python objects. In these examples
-`source_id` is the session folder source's ID from the run context:
+The version-1 worker helpers are ordinary Python objects. Sources and tables go
+by name here too, and results use the same keys and names as a direct tool
+result. In these examples the session folder source is named `Working folder`:
 
 ```python
 import json
-result = tools.call("file_read", {"source_id": source_id, "path": "sales.json"})
+result = tools.call("file_read", {"source": "Working folder", "path": "sales.json"})
 if result["is_error"]:
     raise ValueError(result["output"])
 data = result["output"]["data"]
@@ -84,8 +85,8 @@ the same result shape for each element, in submission order:
 
 ```python
 results = tools.batch([
-    {"name": "file_read", "arguments": {"source_id": source_id, "path": "sales.json"}},
-    {"name": "file_read", "arguments": {"source_id": source_id, "path": "rates.json"}},
+    {"name": "file_read", "arguments": {"source": "Working folder", "path": "sales.json"}},
+    {"name": "file_read", "arguments": {"source": "Working folder", "path": "rates.json"}},
 ])
 for result in results:
     if result["is_error"]:
@@ -167,7 +168,7 @@ For example, with `file_read` already callable:
 import csv
 import io
 
-result = tools.call("file_read", {"source_id": source_id, "path": "sales.csv"})
+result = tools.call("file_read", {"source": "Working folder", "path": "sales.csv"})
 if result["is_error"]:
     raise ValueError(result["output"])
 data = result["output"]["data"]
@@ -188,10 +189,9 @@ adequate coverage before claiming a total for the whole file. Retain completenes
 truncation, per-root search coverage and other reported limitations in derived
 outputs and conclusions.
 
-For database work, reuse sufficient current catalog evidence. Obtain missing
-schemas and resolved relationship paths through one `catalog_describe` call;
-`detail=identity` lists tables without columns. Load it through the ordinary
-toolbox if needed. Matching field names alone do not establish a join;
+For database work, reuse sufficient current evidence. Obtain a missing schema with
+`catalog_describe`, which reads one table, or lists a schema, from the live source.
+Load it through the ordinary toolbox if needed. Matching field names alone do not establish a join;
 ambiguous mappings or relationships can require ordinary clarification.
 
 For query results, use the returned `columns` and `rows`, including aliases and

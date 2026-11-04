@@ -187,8 +187,21 @@ async def test_projection_opens_exact_owner_item_and_restores_composer(
             await pilot.resize_terminal(140, 40)
             await pilot.pause()
             await pilot.click(listing, offset=(2, 0))
-            await pilot.pause()
             screen_type, selector, expected_id = targets[section]
+
+            def opened_on_item() -> bool:
+                screen = app.screen
+                if not isinstance(screen, screen_type):
+                    return False
+                if section == "sources":
+                    return screen._selected_source_id() == expected_id
+                picked = screen.query_one(selector, OptionList)
+                return (
+                    picked.highlighted is not None
+                    and picked.get_option_at_index(picked.highlighted).id == expected_id
+                )
+
+            await settle_until(pilot, opened_on_item)
             assert isinstance(app.screen, screen_type)
             if section == "sources":
                 assert app.screen._selected_source_id() == expected_id

@@ -13,7 +13,6 @@ from .models import (
     source_registration_id,
 )
 from .protocols import (
-    DiscoveryLimitError,
     ResourceAdapter,
     ResourceAdapterError,
     ResourceNotFoundError,
@@ -53,7 +52,6 @@ from .postgresql_query import PostgreSQLQueryBackend, PostgreSQLQueryError
 # isort: on
 
 __all__ = [
-    "DiscoveryLimitError",
     "DiscoveryRequest",
     "DiscoveryResult",
     "MCPAdmissionError",

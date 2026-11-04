@@ -7,6 +7,7 @@ from daita.capability_runtime import CapabilityRuntime
 from daita.domains.analysis.domain import AnalysisCapabilityDomain
 from daita.hosting.execution_governor import RunAdmissionCoordinator
 from daita.llm.errors import ContextWindowExceeded
+from daita.loop.models import build_run_note
 from tests.support.kernel import (
     NOW,
     AgentContextBuilder,
@@ -127,7 +128,7 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
     assert not hasattr(snapshot, "final_static_messages")
 
 
-async def test_step_status_follows_the_transcript_and_keeps_a_stable_prefix():
+async def test_a_request_carries_no_per_step_status():
     catalog = _SnapshotCatalog()
     profile = ModelProfile(
         id="mock:step-status",
@@ -152,54 +153,55 @@ async def test_step_status_follows_the_transcript_and_keeps_a_stable_prefix():
         )
         for step, remaining in ((1, 10_000), (2, 7_500))
     )
-    # Budget status changes per step but never rewrites the cacheable prefix.
-    assert first.messages[:-1] == second.messages[:-1] == (first.messages[0], user)
-    assert "Token budget left" not in repr(first.messages[0])
-    for request, remaining in ((first, 10_000), (second, 7_500)):
-        status = request.messages[-1]
-        assert status.role is MessageRole.SYSTEM
-        assert f"{remaining} tokens" in repr(status)
+    assert first.messages == second.messages == (first.messages[0], user)
+    assert "This run has a token budget" in repr(first.messages[0])
 
     unbounded = builder.project(
         snapshot, (user,), step=1, tool_context=projection.project(tools, (user,))
     )
     assert unbounded.messages[1:] == (user,)
-    assert "This run has a token budget" in repr(first.messages[0])
     assert "This run has a token budget" not in repr(unbounded.messages[0])
 
-
-async def test_budget_pressure_forecast_uses_measured_output_not_profile_maximum():
-    catalog = _SnapshotCatalog()
-    profile = ModelProfile(
-        id="mock:large-output",
-        context_window_tokens=400_000,
-        max_output_tokens=128_000,
-        supports_tools=True,
+    # A one-step run has no tool result to carry its last-request status.
+    only = builder.project(
+        snapshot,
+        (user,),
+        step=1,
+        tool_context=projection.project(tools, (user,)),
+        remaining_steps=1,
     )
-    builder = AgentContextBuilder(catalog, profile=profile)
-    run = replace(_run("run-forecast"), source_scope_ids=("source-snapshot",))
-    user = run.start_message()
-    projection = ContextToolProjectionAdapter(())
-    tools = await projection.prepare_run(run)
-    snapshot = await builder.prepare(run, (user,), tools, max_total_tokens=100_000)
+    assert only.messages[:2] == (only.messages[0], user)
+    assert only.messages[-1].role is MessageRole.SYSTEM
+    assert "last model request" in repr(only.messages[-1])
 
-    def status(remaining: int) -> str:
-        request = builder.project(
-            snapshot,
-            (user,),
-            step=2,
-            tool_context=projection.project(tools, (user,)),
+
+def test_a_run_note_appears_only_when_it_matters():
+    def note(remaining: int, steps: int = 10, warnings=()) -> str | None:
+        return build_run_note(
             remaining_tokens=remaining,
-            previous_request_input_tokens=2_000,
+            remaining_steps=steps,
+            request_input_tokens=2_000,
             request_input_growth_tokens=500,
-            previous_response_output_tokens=150,
+            response_output_tokens=150,
+            new_warnings=warnings,
         )
-        return repr(request.messages[-1])
 
     # 2 x 2,000 input + 3 x 500 growth + 2 x 2,048 output floor = 9,596 tokens.
-    assert "9596 tokens, allowing 2048 output" in status(98_000)
-    assert "Budget pressure" not in status(98_000)
-    assert "Budget pressure" in status(9_000)
+    assert note(98_000) is None
+    assert "Budget pressure" in str(note(9_000))
+    assert "9596" in str(note(9_000))
+    assert "last model request" in str(note(98_000, steps=1))
+    assert note(98_000, warnings=("Stop repeating this.",)) == "Stop repeating this."
+    assert (
+        build_run_note(
+            remaining_tokens=10,
+            remaining_steps=10,
+            request_input_tokens=None,
+            request_input_growth_tokens=None,
+            response_output_tokens=0,
+        )
+        is None
+    )
 
 
 async def test_optional_context_uses_run_allowance_without_rejecting_mandatory_input():
@@ -217,9 +219,6 @@ async def test_optional_context_uses_run_allowance_without_rejecting_mandatory_i
     tools = await projection.prepare_run(run)
     wide = await builder.prepare(run, (user,), tools, max_total_tokens=100_000)
     narrow = await builder.prepare(run, (user,), tools, max_total_tokens=1_000)
-    wide_request = builder.project(
-        wide, (user,), step=1, tool_context=projection.project(tools, (user,))
-    )
     narrow_request = builder.project(
         narrow,
         (user,),
@@ -227,12 +226,7 @@ async def test_optional_context_uses_run_allowance_without_rejecting_mandatory_i
         tool_context=projection.project(tools, (user,)),
         remaining_tokens=1,
     )
-    assert '"returned_count":1' in repr(wide_request.messages[0])
-    assert '"returned_count":0' in repr(narrow_request.messages[0])
-    assert "Token budget left for this run (not a routine ceiling): 1 tokens" in repr(
-        narrow_request.messages[-1]
-    )
-    assert narrow_request.messages[-2] == user
+    assert narrow_request.messages[-1] == user
     assert wide.initial_sensitivity == narrow.initial_sensitivity
     assert (
         wide.initial_sensitivity_provenance["source_ids"]
@@ -584,6 +578,64 @@ def test_token_estimate_is_conservative_accounting_not_raw_byte_count():
     estimate = _estimate_input_tokens(request)
 
     assert estimate > len(("a" * 3_000).encode("utf-8"))
+
+
+def test_token_estimate_charges_only_what_a_provider_receives():
+    def request(provenance: Mapping[str, object]) -> ModelRequest:
+        call = ToolCall("lookup-1", "lookup", {})
+        return ModelRequest(
+            messages=(
+                CanonicalMessage(role=MessageRole.USER, content=(TextBlock("q"),)),
+                CanonicalMessage(role=MessageRole.ASSISTANT, tool_calls=(call,)),
+                CanonicalMessage(
+                    role=MessageRole.TOOL,
+                    content=(
+                        ToolResultBlock(
+                            call_id=call.id,
+                            output={"rows": [1]},
+                            sensitivity=ModelSensitivity.INTERNAL,
+                            sensitivity_provenance=provenance,
+                        ),
+                    ),
+                ),
+            ),
+            sensitivity=ModelSensitivity.INTERNAL,
+            sensitivity_provenance=provenance,
+        )
+
+    # Every adapter renders through model_tool_result, which omits provenance, so
+    # a run scope's worth of IDs must not read as hundreds of thousands of tokens.
+    listed = {"authority": "scope", "resource_ids": ["x" * 80] * 1_000}
+    assert _estimate_input_tokens(request(listed)) == _estimate_input_tokens(
+        request({"authority": "scope"})
+    )
+
+
+def test_token_estimate_prices_rendered_names_rather_than_stored_ids():
+    identity = "catalog-resource:sha256:" + "a" * 64
+    call = ToolCall("lookup-1", "lookup", {})
+
+    def request(scope_names: Mapping[str, str]) -> ModelRequest:
+        return ModelRequest(
+            messages=(
+                CanonicalMessage(role=MessageRole.USER, content=(TextBlock("q"),)),
+                CanonicalMessage(role=MessageRole.ASSISTANT, tool_calls=(call,)),
+                CanonicalMessage(
+                    role=MessageRole.TOOL,
+                    content=(
+                        ToolResultBlock(
+                            call_id=call.id, output={"resource_ids": [identity] * 50}
+                        ),
+                    ),
+                ),
+            ),
+            scope_names=scope_names,
+        )
+
+    assert (
+        _estimate_input_tokens(request({identity: "t"}))
+        < _estimate_input_tokens(request({identity: "t" * 80})) - 2_000
+    )
 
 
 @pytest.mark.parametrize("arrow", (False, True))

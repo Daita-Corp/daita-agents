@@ -59,7 +59,11 @@ from .common import (
     sequence,
     text,
 )
-from .execution_scope import decode_execution_scope, encode_execution_scope
+from .execution_scope import (
+    _with_field,
+    decode_execution_scope,
+    encode_execution_scope,
+)
 
 
 def encode_run_input(value: RunInput) -> str:
@@ -161,8 +165,14 @@ def _decode_resolved_source_scope(value: JsonValue) -> EffectiveSourceScope | No
     if value is None:
         return None
     fields = mapping(value, "resolved source scope")
-    if set(fields) != {"source_ids", "resource_ids"}:
+    # Scopes stored before sources were addressed by name carry no labels, and
+    # those from before unrestricted reads list every table they could read.
+    if set(fields) - {"source_labels", "unrestricted_source_ids"} != {
+        "source_ids",
+        "resource_ids",
+    }:
         raise ValueError("resolved source scope fields are invalid")
+    labels = mapping(fields.get("source_labels", {}), "scope source labels")
     return EffectiveSourceScope(
         source_ids=frozenset(
             text(item, "scope source ID")
@@ -172,6 +182,26 @@ def _decode_resolved_source_scope(value: JsonValue) -> EffectiveSourceScope | No
             text(item, "scope resource ID")
             for item in sequence(fields["resource_ids"], "scope resource IDs")
         ),
+        source_labels={
+            text(source_id, "scope source ID"): _decode_source_label(label)
+            for source_id, label in labels.items()
+        },
+        unrestricted_source_ids=frozenset(
+            text(item, "scope unrestricted source ID")
+            for item in sequence(
+                fields.get("unrestricted_source_ids", []),
+                "scope unrestricted source IDs",
+            )
+        ),
+    )
+
+
+def _decode_source_label(value: JsonValue) -> tuple[str, str]:
+    label = sequence(value, "scope source label")
+    if len(label) != 2:
+        raise ValueError("scope source label must be [display name, adapter]")
+    return text(label[0], "scope source display name"), text(
+        label[1], "scope source adapter"
     )
 
 
@@ -383,15 +413,25 @@ def _encode_message(value: CanonicalMessage) -> dict[str, JsonValue]:
             "tool_calls": [_encode_tool_call(item) for item in value.tool_calls],
             "provider_id": value.provider_id,
             "provider_metadata": plain_encode(value.provider_metadata),
+            # Omitted when absent, so messages without one stay byte-identical.
+            **({} if value.run_note is None else {"run_note": value.run_note}),
         },
     )
 
 
 def _decode_message(value: JsonValue) -> CanonicalMessage:
     fields = record_fields(
-        value,
+        # Omitted when absent, so older messages decode as they were.
+        _with_field(value, "run_note", None),
         "CanonicalMessage",
-        ("role", "content", "tool_calls", "provider_id", "provider_metadata"),
+        (
+            "role",
+            "content",
+            "tool_calls",
+            "provider_id",
+            "provider_metadata",
+            "run_note",
+        ),
     )
     content: list[TextBlock | ToolResultBlock] = []
     for item in sequence(fields["content"], "message content"):
@@ -415,6 +455,7 @@ def _decode_message(value: JsonValue) -> CanonicalMessage:
         ),
         provider_id=optional_text(fields["provider_id"], "message provider_id"),
         provider_metadata=metadata,
+        run_note=optional_text(fields["run_note"], "message run_note"),
     )
 
 

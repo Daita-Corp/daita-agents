@@ -6,9 +6,18 @@ from typing import Any
 
 import pytest
 
-from daita import Agent, AgentConfig, HostCapacityLimits
+from daita import (
+    Agent,
+    AgentConfig,
+    FolderSource,
+    HostCapacityLimits,
+    PostgreSQLSource,
+    SQLiteSource,
+)
 from daita.adapters.models import DiscoveryResult, SourceRegistration
+from daita.adapters.sqlite import SQLiteResourceAdapter
 from daita.catalog.models import CatalogSync, CatalogSyncStatus, SourceCatalogSnapshot
+from daita.hosting import embedded as embedded_module
 from daita.hosting.embedded import AgentHomeError, HostActiveError
 from daita.hosting.execution_governor import PermitKind, WorkloadClass
 from daita.llm.models import (
@@ -17,8 +26,12 @@ from daita.llm.models import (
     ModelRequest,
     ModelResponse,
     TextBlock,
+    ToolCall,
 )
+from daita.llm.providers.mock import MockModelProvider
+from daita.security import SecretReference
 from daita.storage.sqlite_records import SourceReadMode
+from tests.support.source_refresh import settled
 from tests.support.workspace import workspace_for
 
 
@@ -362,6 +375,299 @@ async def test_foreground_run_does_not_hold_a_broad_host_mutation_lock(
     provider.release.set()
     await asyncio.wait_for(run, timeout=1)
     await asyncio.wait_for(agent.close(), timeout=1)
+
+
+async def test_a_refresh_stuck_in_discovery_blocks_neither_work_nor_close(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "shop.sqlite"
+    _sqlite_database(database)
+    provider = MockModelProvider(
+        (
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        "describe",
+                        "catalog_describe",
+                        {"source": "Shop", "name": "invoices"},
+                    ),
+                    ToolCall(
+                        "read",
+                        "data_query",
+                        {"source": "Shop", "sql": "SELECT count(*) AS n FROM records"},
+                    ),
+                ),
+            ),
+            ModelResponse(finish_reason=FinishReason.STOP, text="Done."),
+        )
+    )
+    agent = await Agent.create(
+        "stuck-refresh",
+        root=tmp_path,
+        model=provider,
+        model_profile=provider.model_profile,
+        workspace=workspace_for(tmp_path),
+    )
+    source = await agent.attach(SQLiteSource(database, name="Shop"))
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE invoices (id INTEGER)")
+    entered = asyncio.Event()
+    original = SQLiteResourceAdapter.discover
+
+    async def stuck(self, request):
+        entered.set()
+        await asyncio.Event().wait()
+        return await original(self, request)
+
+    monkeypatch.setattr(SQLiteResourceAdapter, "discover", stuck)
+
+    run = await asyncio.wait_for(agent.run("Look at invoices."), timeout=5)
+    (_, describe), (_, read) = await agent.tool_evidence(run.run_id)
+    assert describe is not None and not describe.is_error
+    assert read is not None and not read.is_error
+    data: Any = read.output["data"]
+    assert [dict(row) for row in data["rows"]] == [{"n": 1}]
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    refresh = agent._embedded._source_refreshes[source.id]
+    assert not refresh.done()
+
+    preview = await asyncio.wait_for(
+        agent.preview_source_permissions(
+            source_id=source.id,
+            read_mode=SourceReadMode.NONE,
+            read_resource_ids=(),
+            relational_write_scopes={},
+        ),
+        timeout=5,
+    )
+    await asyncio.wait_for(
+        agent.apply_source_permissions(
+            source_id=source.id,
+            confirmation_fingerprint=preview.confirmation_fingerprint,
+        ),
+        timeout=5,
+    )
+    await asyncio.wait_for(agent.catalog_summary(), timeout=5)
+
+    await asyncio.wait_for(agent.close(), timeout=5)
+    assert refresh.cancelled()
+    agent._embedded.request_source_refresh(source.id)
+    assert not agent._embedded._source_refreshes
+
+
+async def test_a_connection_check_answers_while_a_discovery_is_stuck(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "shop.sqlite"
+    _sqlite_database(database)
+    agent = await Agent.create(
+        "check-while-stuck", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    source = await agent.attach(SQLiteSource(database, name="Shop"))
+    entered = asyncio.Event()
+
+    async def stuck(self, request):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(SQLiteResourceAdapter, "discover", stuck)
+    agent._embedded.request_source_refresh(source.id)
+    await asyncio.wait_for(entered.wait(), timeout=5)
+
+    health = await asyncio.wait_for(agent.check_source(source.id), timeout=5)
+
+    assert health.healthy
+    assert health.details["read_only"] is True
+    await asyncio.wait_for(agent.close(), timeout=5)
+
+
+async def test_a_connection_check_reports_a_missing_source_instead_of_raising(
+    tmp_path,
+):
+    database = tmp_path / "shop.sqlite"
+    _sqlite_database(database)
+    folder = tmp_path / "drop"
+    folder.mkdir()
+    root = tmp_path / "state"
+    agent = await Agent.create(
+        "check-missing", root=root, workspace=workspace_for(root)
+    )
+    try:
+        sqlite_source = await agent.attach(SQLiteSource(database, name="Shop"))
+        folder_source = await agent.attach(FolderSource(folder, name="Drop"))
+        for source in (sqlite_source, folder_source):
+            health = await agent.check_source(source.id)
+            assert health.healthy and health.details["read_only"] is True
+            assert "role" not in health.details
+
+        database.unlink()
+        folder.rmdir()
+
+        for source in (sqlite_source, folder_source):
+            health = await agent.check_source(source.id)
+            assert not health.healthy and health.error_code
+            assert (health.source_id, health.agent_id) == (source.id, agent.id)
+        with pytest.raises(ValueError, match="unknown active source"):
+            await agent.check_source("source:sha256:" + "0" * 64)
+    finally:
+        await agent.close()
+
+
+async def test_a_failed_postgresql_check_gives_a_code_and_no_connection_text(
+    tmp_path, monkeypatch
+):
+    password = "database-password-do-not-expose"
+    diagnostic = f"postgresql://reader:{password}@db.example.test/shop refused"
+
+    class Transaction:
+        async def start(self) -> None: ...
+
+        async def commit(self) -> None: ...
+
+        async def rollback(self) -> None: ...
+
+    class Connection:
+        def transaction(self, **_: object) -> Transaction:
+            return Transaction()
+
+        async def execute(self, *_: object) -> None: ...
+
+        async def fetch(self, *_: object) -> list[object]:
+            return []
+
+        async def close(self) -> None: ...
+
+    class Driver:
+        reachable = True
+
+        async def connect(self, **_: object) -> Connection:
+            if not self.reachable:
+                raise OSError(diagnostic)
+            return Connection()
+
+    class Secrets:
+        async def resolve(self, reference: object) -> str:
+            return password
+
+    driver = Driver()
+    monkeypatch.setattr("daita.adapters.postgresql._load_asyncpg", lambda: driver)
+    agent = await Agent.create(
+        "check-postgresql",
+        root=tmp_path,
+        secret_provider=Secrets(),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        source = await agent.attach(
+            PostgreSQLSource(
+                host="db.example.test",
+                database="shop",
+                username="reader",
+                credential=SecretReference.keychain("check-postgresql:password"),
+                schemas=("public",),
+                ssl_mode="disable",
+                secret_provider=Secrets(),
+            )
+        )
+        driver.reachable = False
+
+        health = await agent.check_source(source.id)
+
+        assert not health.healthy
+        assert health.error_code == "postgresql_connect_failed"
+        assert dict(health.details) == {}
+        assert password not in repr(health) and "db.example.test" not in repr(health)
+    finally:
+        await agent.close()
+
+
+async def test_a_refresh_for_qualified_names_rereads_only_their_schemas(
+    tmp_path, monkeypatch
+):
+    agent = await Agent.create(
+        "schema-refresh", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+
+    class FixtureAdapter:
+        def __init__(self, registration):
+            self.registration = registration
+
+        async def discover(self, request):
+            now = datetime.now(UTC)
+            sync = CatalogSync(
+                id=request.sync_id,
+                agent_id=request.agent_id,
+                source_id=request.source_id,
+                adapter_id="postgresql",
+                status=CatalogSyncStatus.SUCCEEDED,
+                started_at=request.requested_at,
+                completed_at=now,
+                source_revision="catalog:sha256:" + "3" * 64,
+            )
+            return DiscoveryResult(
+                request=request,
+                snapshot=SourceCatalogSnapshot(sync=sync, resources=(), revisions=()),
+                completed_at=now,
+            )
+
+        async def inspect(self, resource):
+            raise AssertionError("empty fixture has no resources")
+
+        async def health(self):
+            raise AssertionError("refresh must not require a health call")
+
+        async def close(self):
+            pass
+
+    class FixtureSource:
+        async def open(self, *, agent_id, attached_at, clock):
+            return FixtureAdapter(
+                SourceRegistration.build(
+                    agent_id=agent_id,
+                    adapter_id="postgresql",
+                    native_identity="offline-schema-refresh",
+                    display_name="Offline fixture",
+                    configuration={
+                        "database": "shop",
+                        "host": "localhost",
+                        "port": 5432,
+                        "schemas": ("public", "sales"),
+                        "ssl_mode": "require",
+                        "username": "reader",
+                    },
+                    attached_at=attached_at,
+                )
+            )
+
+    try:
+        source = await agent.attach(FixtureSource())
+        requested = []
+
+        async def record(opened, **keywords):
+            requested.append((keywords["refresh_schemas"], keywords["previous"]))
+            return keywords["persisted_registration"]
+
+        monkeypatch.setattr(agent._embedded, "_attach_source_locked", record)
+        monkeypatch.setattr(embedded_module, "_SOURCE_REFRESH_MIN_SECONDS", 0)
+        for names in (
+            ("sales.orders",),
+            ("sales.orders", "public.users", "sales.items"),
+            ("orders",),
+            ("archive.orders",),
+            ("sales.orders", "orders"),
+            (),
+        ):
+            agent._embedded.request_source_refresh(source.id, names)
+            await settled(agent)
+
+        schemas = [item[0] for item in requested]
+        assert schemas == [("sales",), ("sales", "public"), (), (), (), ()]
+        previous = [item[1] for item in requested]
+        assert all(item.sync.source_id == source.id for item in previous[:2])
+        assert previous[2:] == [None] * 4
+    finally:
+        await agent.close()
 
 
 @pytest.mark.parametrize("capacity", (1, 4, 8))
