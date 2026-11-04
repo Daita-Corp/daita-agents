@@ -13,11 +13,11 @@ from daita import Agent, SQLiteSource
 from daita._json import canonical_json
 from daita.adapters.sqlite import SQLiteResourceAdapter
 from daita.catalog.protocols import CatalogStoreError
-from daita.errors import StateCompatibilityError
 from daita.hosting import embedded as embedded_module
 from daita.llm.models import FinishReason, ModelResponse, ToolCall, ToolResultBlock
 from daita.llm.providers.mock import MockModelProvider
 from daita.storage.sqlite import SQLiteStateStore
+from daita.storage.sqlite_codecs import decode_catalog_snapshot
 from tests.support.source_refresh import settled, sync_count
 from tests.support.workspace import workspace_for
 
@@ -210,7 +210,7 @@ async def test_a_damaged_catalog_row_does_not_stop_a_run(
         )
     )
     agent = await Agent.create(
-        "damaged-catalog",
+        "reads-without-catalog",
         root=tmp_path,
         workspace=workspace_for(tmp_path),
         model=provider,
@@ -237,11 +237,83 @@ async def test_a_damaged_catalog_row_does_not_stop_a_run(
         assert described["answered_from"] == "live"
     finally:
         await agent.close()
-    # Opening the home still fails closed on the damaged row.
-    with pytest.raises(StateCompatibilityError):
-        await Agent.open(
-            "damaged-catalog", root=tmp_path, workspace=workspace_for(tmp_path)
+    # Damaged again at rest: opening rebuilds the row instead of refusing the home.
+    _damage(agent, "snapshots", stored)
+    reopened = await _open_agent(tmp_path, _read_call("count", "companies"))
+    try:
+        await _assert_read_answers(reopened)
+        await settled(reopened)
+        assert _snapshot_decodes(reopened)
+        listed = await reopened.list_catalog_resources()
+        assert [item.name for item in listed] == ["companies"]
+    finally:
+        await reopened.close()
+
+
+def _damage(agent: Agent, table: str, stored: str) -> None:
+    with sqlite3.connect(agent.home / "state.db") as connection:
+        connection.execute(f"UPDATE {table} SET data = ?", (stored,))
+
+
+def _snapshot_decodes(agent: Agent) -> bool:
+    with sqlite3.connect(agent.home / "state.db") as connection:
+        ((data,),) = connection.execute("SELECT data FROM snapshots")
+    return decode_catalog_snapshot(data) is not None
+
+
+async def _open_agent(tmp_path: Path, *calls: ToolCall) -> Agent:
+    provider = MockModelProvider(
+        (
+            ModelResponse(finish_reason=FinishReason.TOOL_CALLS, tool_calls=calls),
+            ModelResponse(finish_reason=FinishReason.STOP, text="Done."),
         )
+    )
+    return await Agent.open(
+        "reads-without-catalog",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=provider,
+        model_profile=provider.model_profile,
+    )
+
+
+async def _assert_read_answers(agent: Agent) -> None:
+    run = await agent.run("How many companies are there?")
+    await _assert_counted_two(agent, run.run_id)
+
+
+async def test_a_damaged_sync_row_alone_does_not_stop_opening(tmp_path: Path) -> None:
+    database = tmp_path / "crm.sqlite"
+    _create_companies(database)
+    agent = await _create_agent(tmp_path)
+    await agent.attach(SQLiteSource(database, name="CRM"))
+    _damage(agent, "syncs", "{not json")
+    await agent.close()
+    reopened = await _open_agent(tmp_path, _read_call("count", "companies"))
+    try:
+        await _assert_read_answers(reopened)
+    finally:
+        await reopened.close()
+
+
+async def test_an_unreachable_source_leaves_a_damaged_catalog_usable_and_honest(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "crm.sqlite"
+    _create_companies(database)
+    agent = await _create_agent(tmp_path)
+    await agent.attach(SQLiteSource(database, name="CRM"))
+    _damage(agent, "snapshots", "{not json")
+    await agent.close()
+    database.unlink()
+    reopened = await _open_agent(tmp_path, _read_call("count", "companies"))
+    try:
+        await settled(reopened)
+        run = await reopened.run("How many companies are there?")
+        ((_, result),) = await reopened.tool_evidence(run.run_id)
+        assert result is not None and result.is_error, result
+    finally:
+        await reopened.close()
 
 
 async def test_a_read_needs_no_table_and_reports_the_source_classification(

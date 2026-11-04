@@ -89,7 +89,9 @@ serves it at `POST /sources/{source_id}/check`.
 
 A catalog row that cannot be decoded while the agent is open raises
 `CatalogStoreError`, which every run path treats as advisory, so reads and approved
-writes continue. Opening a home with a damaged row still fails closed. A
+writes continue. Opening a home with a damaged row succeeds, and a background
+refresh of that source replaces the row; a lookup that finds the catalog unreadable
+requests the same refresh. A
 `semantic_save` on a table with no catalog entry is refused with
 `semantic_unknown_resource`, which says reads are unaffected.
 

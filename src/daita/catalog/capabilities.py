@@ -221,10 +221,11 @@ class CatalogSearchExecutor:
         for (source_id, name), hit in merged.items():
             if hit["seen_live"] and (source_id, name) not in in_catalog:
                 missed.setdefault(source_id, []).append(name)
-        if not catalog_failed:
-            for source_id, names in missed.items():
-                if source_id != session:
-                    self._request_refresh(source_id, tuple(names))
+        if catalog_failed:  # unreadable, so rebuilt whole from its source
+            missed = {source_id: [] for source_id, _, _ in sources}
+        for source_id, names in missed.items():
+            if source_id != session:
+                self._request_refresh(source_id, tuple(names))
         hits = list(merged.values())
         return ToolOutput(
             kind=CATALOG_SEARCH_EVIDENCE_KIND,
@@ -279,10 +280,12 @@ class CatalogDescribeExecutor:
             )
         except CatalogStoreError:
             catalog_failed = True
-        if backend is not None and not unreachable and not catalog_failed:
+        if backend is not None and not unreachable:
             stale = _disagreement(live, cached)
-            if stale is not None and source_id != self._service.session_source_id:
-                self._request_refresh(source_id, (stale,))
+            if (
+                stale is not None or catalog_failed
+            ) and source_id != self._service.session_source_id:
+                self._request_refresh(source_id, () if stale is None else (stale,))
         # A cached answer never overrides a live one, and a table the live source
         # no longer has is gone even if the catalog remembers it.
         if live is not None:

@@ -2197,6 +2197,7 @@ class EmbeddedAgent:
         try:
             await job_supervisor.start()
             await routine_supervisor.start()
+            await embedded._rebuild_unreadable_catalogs()
         except BaseException:
             await embedded.close()
             raise
@@ -4619,6 +4620,20 @@ class EmbeddedAgent:
             )
         except CatalogStoreError:
             return schemas, None
+
+    async def _rebuild_unreadable_catalogs(self) -> None:
+        """Replace damaged catalog rows from their sources, in the background."""
+
+        active = {
+            source.id
+            for source in await self._store.list_sources(self.identity.id)
+            if source.active
+        }
+        for source_id in await self._store.list_unreadable_snapshot_source_ids(
+            self.identity.id
+        ):
+            if source_id in active:
+                self.request_source_refresh(source_id)
 
     def request_source_refresh(
         self, source_id: str, names: tuple[str, ...] = ()

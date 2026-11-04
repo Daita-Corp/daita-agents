@@ -2271,6 +2271,35 @@ class SQLStateStore:
 
         return await settled_thread(read)
 
+    async def list_unreadable_snapshot_source_ids(
+        self, agent_id: str
+    ) -> tuple[str, ...]:
+        """Sources whose stored snapshot cannot be read, so a refresh can replace it."""
+
+        def read() -> tuple[str, ...]:
+            with _connect_read_only(self._database) as connection:
+                rows = connection.execute(
+                    "SELECT source_id, sync_id, data FROM snapshots "
+                    "WHERE agent_id = ? ORDER BY source_id",
+                    (agent_id,),
+                ).fetchall()
+            unreadable: list[str] = []
+            for source_id, sync_id, data in rows:
+                try:
+                    sync = decode_catalog_snapshot(data).sync
+                except (TypeError, ValueError):
+                    unreadable.append(source_id)
+                    continue
+                if (sync.agent_id, sync.source_id, sync.id) != (
+                    agent_id,
+                    source_id,
+                    sync_id,
+                ):
+                    unreadable.append(source_id)
+            return tuple(unreadable)
+
+        return await settled_thread(read)
+
     async def load_current_snapshot(
         self,
         ref: CatalogSnapshotRef,
@@ -3745,7 +3774,11 @@ class SQLStateStore:
             snapshots: list[SourceCatalogSnapshot] = []
             generation_changed = False
             for ref in refs:
-                snapshot = await self.load_current_snapshot(ref)
+                try:
+                    snapshot = await self.load_current_snapshot(ref)
+                except CatalogStoreError:
+                    # A damaged row reads as missing; the next refresh replaces it.
+                    continue
                 if snapshot is None:
                     generation_changed = True
                     break
@@ -4335,30 +4368,8 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
             authorization_fingerprint=fingerprint,
         )
 
-    syncs: dict[tuple[str, str], CatalogSync] = {}
-    for agent_id, sync_id, source_id, data in connection.execute(
-        "SELECT agent_id, id, source_id, data FROM syncs"
-    ):
-        sync = decode_catalog_sync(data)
-        if (
-            sync.agent_id != agent_id
-            or sync.id != sync_id
-            or sync.source_id != source_id
-            or (agent_id, source_id) not in sources
-        ):
-            raise ValueError("stored catalog sync ownership is invalid")
-        syncs[(agent_id, sync_id)] = sync
-    for agent_id, source_id, sync_id, data in connection.execute(
-        "SELECT agent_id, source_id, sync_id, data FROM snapshots"
-    ):
-        snapshot = decode_catalog_snapshot(data)
-        if (
-            snapshot.sync.agent_id != agent_id
-            or snapshot.sync.source_id != source_id
-            or snapshot.sync.id != sync_id
-            or syncs.get((agent_id, sync_id)) != snapshot.sync
-        ):
-            raise ValueError("stored catalog snapshot ownership is invalid")
+    # `syncs` and `snapshots` are not read here: a damaged catalog row is rebuilt
+    # from its source, so it must not stop the home opening.
 
     run_ids: set[str] = set()
     run_inputs: dict[str, RunInput] = {}

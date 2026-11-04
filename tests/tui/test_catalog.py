@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from daita.adapters.models import SourceHealth
+from daita.host.client import connect
 from daita.tui.controller import SOURCE_REFRESH_ERRORS
 from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.tui._support import (
@@ -480,6 +481,45 @@ async def test_source_edit_rejects_a_zero_resource_preview_without_confirmation(
             edit.query_one("#source-edit-error").render()
         )
         app.exit(0)
+
+
+async def test_a_damaged_catalog_row_does_not_stop_the_app_or_sources(
+    tmp_path: Path, start_host: StartHost
+):
+    database = tmp_path / "damaged.sqlite"
+    _create_sqlite_source(database, "records")
+    harness = await start_host()
+    first = await remote_agent(harness, "damaged-catalog")
+    source = await first.attach(SQLiteSource(database, name="Records"))
+    await first.close()
+    (state,) = harness.root.glob("**/state.db")
+    with sqlite3.connect(state) as connection:
+        connection.execute("UPDATE snapshots SET data = '{not json'")
+    opened = await connect("damaged-catalog", cwd=harness.work(), root=harness.root)
+    app = DaitaApp(
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
+    )
+    app.controller.agent = opened
+    try:
+        async with app.run_test(size=(100, 34)) as pilot:
+            await app._show_chat()
+            composer = app.screen.query_one(Composer)
+            composer.load_text("/sources")
+            composer.action_submit()
+            await settle_until(pilot, lambda: isinstance(app.screen, CatalogScreen))
+            assert isinstance(app.screen, CatalogScreen)
+            assert source.id in app.screen._sources_by_id
+
+            def repaired() -> bool:
+                with sqlite3.connect(state) as connection:
+                    row = connection.execute("SELECT data FROM snapshots").fetchone()
+                return row is not None and row[0] != "{not json"
+
+            # Opening noticed the row and the background refresh replaced it.
+            await settle_until(pilot, repaired)
+            app.exit(0)
+    finally:
+        await opened.close()
 
 
 async def test_catalog_command_opens_grouped_named_resource_tree(

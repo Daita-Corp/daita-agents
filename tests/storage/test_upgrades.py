@@ -766,6 +766,8 @@ async def test_damaged_current_home_fails_before_any_write(
     (
         "UPDATE messages SET data = '{}' WHERE run_id = 'run-preserved'",
         "UPDATE runs SET result = '{}' WHERE id = 'run-preserved'",
+        "UPDATE sources SET data = '{}'",
+        "UPDATE source_read_scopes SET data = '{}'",
     ),
 )
 async def test_corrupt_current_records_fail_before_any_write(

@@ -58,8 +58,8 @@ the catalog holds only part of it. `DiscoveryLimitError` is gone.
   if the role can read every column of it. A partition is listed on its own unless a
   readable parent in the configured schemas holds it, so a role granted only a child
   partition can find it.
-- **A damaged catalog row no longer stops work.** While the agent is open, reads and
-  approved writes continue; opening a home with a damaged row still fails.
+- **A damaged catalog row no longer stops work.** Reads and approved writes
+  continue, the home still opens, and the catalog is rebuilt from the source.
 - **`semantic_save` on a table with no catalog entry** is refused with
   `semantic_unknown_resource` and says reads are unaffected, instead of
   `resource_read_not_allowed`.

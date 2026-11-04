@@ -148,7 +148,9 @@ These protect users. Each comes with the reason it exists.
    Any change to stored records or home files needs a home migration, a golden
    fixture and a refreshed release contract. Released migrations, checksums,
    decoders and fixtures never change. Newer, damaged or unknown homes fail
-   closed without rewriting state. *Why: upgrades must never lose user data.*
+   closed without rewriting state. The one exception is catalog rows: they can be
+   rebuilt from the source, so a damaged one is rebuilt rather than failing
+   closed. *Why: upgrades must never lose user data.*
 10. **State mutation is atomic and cancellation-safe.** *Why: interrupted
     processes must leave a consistent home.*
 11. **Optional and heavy dependencies are imported lazily.** Importing `daita` or
