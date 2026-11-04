@@ -21,6 +21,13 @@ _CONTINUATION_KEY = "anthropic_continuation"
 
 _OPAQUE_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
 
+# A machine run starts from a system message, which moves to the system field.
+# Messages must still start with a user turn and cannot end on an assistant one.
+_RUN_START_TURN: dict[str, object] = {
+    "role": "user",
+    "content": [{"type": "text", "text": "Begin the run the system prompt describes."}],
+}
+
 
 def _message_input(
     messages: tuple[CanonicalMessage, ...],
@@ -94,15 +101,23 @@ def _message_input(
                 "canonical message produced no Anthropic content blocks",
             )
         role = "assistant" if message.role is MessageRole.ASSISTANT else "user"
+        if role == "assistant" and _awaits_user_turn(provider_messages):
+            provider_messages.append(_RUN_START_TURN)
         provider_messages.append({"role": role, "content": content})
 
-    if not provider_messages:
+    system = "\n\n".join(part for part in system_parts if part.strip()).strip()
+    if not provider_messages and not system:
         raise ModelProviderError(
             ProviderErrorCode.INVALID_REQUEST,
             "canonical request produced no Anthropic messages",
         )
-    system = "\n\n".join(part for part in system_parts if part.strip()).strip()
+    if _awaits_user_turn(provider_messages):
+        provider_messages.append(_RUN_START_TURN)
     return system or None, provider_messages
+
+
+def _awaits_user_turn(messages: list[dict[str, object]]) -> bool:
+    return not messages or messages[-1]["role"] == "assistant"
 
 
 def _continuation_blocks(

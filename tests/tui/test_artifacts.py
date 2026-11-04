@@ -197,6 +197,7 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
     )
 
 
+@pytest.mark.tui_driven
 @pytest.mark.integration
 async def test_artifact_command_manages_registered_files_after_history_clear(
     tmp_path, start_host: StartHost
@@ -317,6 +318,7 @@ async def test_artifact_command_manages_registered_files_after_history_clear(
         await reopened.close()
 
 
+@pytest.mark.tui_driven
 async def test_artifact_manager_browses_all_pages_and_returns_from_deleted_last_page(
     monkeypatch,
 ):
@@ -363,6 +365,7 @@ async def test_artifact_manager_browses_all_pages_and_returns_from_deleted_last_
             app.exit(0)
 
 
+@pytest.mark.tui_driven
 @pytest.mark.parametrize("code", ["artifact_busy", "artifact_storage_failed"])
 async def test_artifact_manager_shows_deletion_failures_and_reloads_inventory(
     monkeypatch, code
@@ -442,6 +445,7 @@ def test_generated_artifact_rows_show_readable_names_and_distinct_row_numbers():
     assert second.lstrip().startswith("2 ")
 
 
+@pytest.mark.tui_driven
 @pytest.mark.parametrize("size", [(80, 24), (100, 38)])
 async def test_artifact_manager_gives_previews_space_and_supports_keyboard_browsing(
     monkeypatch, size

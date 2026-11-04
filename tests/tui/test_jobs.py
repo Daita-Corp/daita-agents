@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from daita.jobs import JobState
 from daita.llm.models import ToolCall
 from tests.support.host import StartHost, host_workspace, remote_agent
@@ -48,6 +50,7 @@ async def test_jobs_command_opens_interactive_manager_without_model_calls():
         assert outcome.message == "Usage: /jobs"
 
 
+@pytest.mark.tui_driven
 async def test_machine_origin_observations_do_not_project_into_foreground_chat(
     start_host: StartHost,
 ):
@@ -156,6 +159,7 @@ async def test_machine_origin_observations_do_not_project_into_foreground_chat(
         await opened.close()
 
 
+@pytest.mark.tui_driven
 async def test_jobs_screen_shows_the_checklist_and_answers_a_waiting_job(
     tmp_path, monkeypatch
 ):

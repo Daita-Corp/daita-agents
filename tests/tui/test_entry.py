@@ -15,6 +15,7 @@ from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.support.workspace import workspace_for
 
 
+@pytest.mark.tui_driven
 async def test_empty_root_opens_create_screen_inside_textual(start_host: StartHost):
     harness = await start_host()
     app = DaitaApp(root=harness.root, workspace=host_workspace(harness))
@@ -27,6 +28,7 @@ async def test_empty_root_opens_create_screen_inside_textual(start_host: StartHo
     assert app.return_value == 0
 
 
+@pytest.mark.tui_driven
 async def test_requested_missing_agent_does_not_prompt_before_app(
     start_host: StartHost,
 ):

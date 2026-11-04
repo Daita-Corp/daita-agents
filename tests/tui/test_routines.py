@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tests.tui._support import (
     UTC,
     Button,
@@ -39,6 +41,7 @@ async def test_routines_command_opens_records_and_routes_create_through_agent_lo
     assert "routine_save" in update.run_message
 
 
+@pytest.mark.tui_driven
 async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatch):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     observed = datetime(2026, 8, 28, 12, tzinfo=UTC)
@@ -152,6 +155,7 @@ async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatc
         app.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_routines_screen_keeps_actions_inside_compact_panel(monkeypatch):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
 

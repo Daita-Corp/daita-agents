@@ -50,6 +50,7 @@ def test_every_advertised_slash_root_is_the_recognized_builtin_set():
     }
 
 
+@pytest.mark.tui_driven
 async def test_typed_command_palette_navigates_and_inserts_without_submitting(
     start_host: StartHost,
 ):
@@ -147,6 +148,7 @@ async def test_typed_command_palette_navigates_and_inserts_without_submitting(
         await opened.close()
 
 
+@pytest.mark.tui_driven
 async def test_skill_and_source_completions_are_plain_and_selectable(
     tmp_path: Path, start_host: StartHost
 ):
@@ -204,6 +206,7 @@ async def test_skill_and_source_completions_are_plain_and_selectable(
         await opened.close()
 
 
+@pytest.mark.tui_driven
 async def test_selection_screen_filters_without_reordering():
     class Harness(App[tuple[str, ...] | None]):
         def compose(self) -> ComposeResult:
@@ -236,6 +239,7 @@ async def test_selection_screen_filters_without_reordering():
     assert app.return_value == ("b",)
 
 
+@pytest.mark.tui_driven
 async def test_selection_screen_secondary_action_is_distinct_from_options():
     class Harness(App[tuple[str, ...] | None]):
         def compose(self) -> ComposeResult:
@@ -271,6 +275,7 @@ async def test_selection_screen_secondary_action_is_distinct_from_options():
     assert app.return_value == ("create",)
 
 
+@pytest.mark.tui_driven
 async def test_selection_screen_tertiary_action_does_not_require_a_selection():
     class Harness(App[tuple[str, ...] | None]):
         def compose(self) -> ComposeResult:
@@ -324,6 +329,7 @@ async def test_selection_screen_tertiary_action_does_not_require_a_selection():
     assert app.return_value == ("delete",)
 
 
+@pytest.mark.tui_driven
 async def test_multi_selection_shows_literal_marks_and_continue_button():
     class Harness(App[tuple[str, ...] | None]):
         def compose(self) -> ComposeResult:

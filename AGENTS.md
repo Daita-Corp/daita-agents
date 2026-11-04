@@ -347,7 +347,9 @@ and sanitize untrusted text before printing it (invariant 12). Add tests in
 3. Open screens from `DaitaApp._open_command_screen` (`tui/app.py`).
 4. Use the public `Agent` API through the controller, and sanitize every
    displayed value (invariant 12).
-5. Add tests in `tests/tui/` with Textual's `App.run_test`.
+5. Add tests in `tests/tui/` with Textual's `App.run_test`. A test that uses
+   `App.run_test` carries the `tui_driven` marker; CI runs it without blocking a
+   merge.
 
 ## Development setup
 

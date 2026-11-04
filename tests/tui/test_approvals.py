@@ -77,6 +77,7 @@ def test_tool_projection_and_approval_document():
     ) == (None, False)
 
 
+@pytest.mark.tui_driven
 @pytest.mark.parametrize(
     "size,section", [((80, 24), "chat"), ((80, 24), "artifacts"), ((140, 32), "work")]
 )
@@ -170,6 +171,7 @@ async def test_approval_approve_deny_cancel_and_unreviewable(size, section):
         too_small.exit(0)
 
 
+@pytest.mark.tui_driven
 async def test_destructive_confirm_requires_explicit_yes():
     class Harness(App[bool]):
         def compose(self) -> ComposeResult:
