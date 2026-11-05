@@ -282,7 +282,7 @@ async def test_python_guidance_follows_applicable_loaded_projection(
     )
     assert (
         "Python requested reads:"
-        in cast(TextBlock, before.messages[-1].content[0]).text
+        in cast(TextBlock, before.messages[-1].content[-1]).text
     ) is (available and requested_reads)
 
     call = ToolCall(
@@ -314,7 +314,7 @@ async def test_python_guidance_follows_applicable_loaded_projection(
     assert callable_python is available
     system = cast(TextBlock, request.messages[0].content[0]).text
     assert ("Python workspace:" in system) is callable_python
-    start = cast(TextBlock, request.messages[-len(messages)].content[0]).text
+    start = cast(TextBlock, request.messages[-len(messages)].content[-1]).text
     assert "Python requested reads:" not in system
     assert ("Python requested reads:" in start) is (available and requested_reads)
     assert _carries_messages(request, messages)

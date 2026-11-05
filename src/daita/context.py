@@ -252,7 +252,7 @@ class RunContextSnapshot:
     # frozen scope; every rendered tool result shows these instead of IDs.
     scope_names: Mapping[str, str] = field(default_factory=dict)
     # Run-start time, effect state and question-specific procedures. Rendered
-    # only on the start message so the system text stays identical across runs.
+    # after the question on the start message only, so the system text stays identical across runs.
     start_context: str = ""
 
     def __post_init__(self) -> None:
@@ -2192,7 +2192,7 @@ def _with_start_context(
 ) -> CanonicalMessage:
     if not start_context:
         return message
-    return replace(message, content=(TextBlock(start_context), *message.content))
+    return replace(message, content=(*message.content, TextBlock(start_context)))
 
 
 def _question_guidance(

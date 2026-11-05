@@ -102,7 +102,7 @@ def _call(name: str, arguments: dict[str, object]) -> ModelResponse:
 
 
 def _request_text(request: ModelRequest) -> tuple[str, ...]:
-    # The last user message is the run start; its leading block is start context.
+    # The last user message is the run start; its last block is start context.
     last_user = max(
         (i for i, m in enumerate(request.messages) if m.role is MessageRole.USER),
         default=-1,
@@ -111,7 +111,7 @@ def _request_text(request: ModelRequest) -> tuple[str, ...]:
         block.text
         for index, message in enumerate(request.messages)
         if message.role is not MessageRole.SYSTEM
-        for block in (message.content[-1:] if index == last_user else message.content)
+        for block in (message.content[:-1] if index == last_user else message.content)
         if isinstance(block, TextBlock)
     )
 

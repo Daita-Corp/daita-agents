@@ -1,5 +1,5 @@
 {
-  "surface_digest": "sha256:d630fea912da3a09006243307bdbf06c1df094506e171d824664689aaf8416c8",
+  "surface_digest": "sha256:6fc1ad00972cd0b883d5028b035b29fa8ee4e3007d1deac551d25af046d2c41e",
   "recorded_on": "2026-11-05",
   "cases": {
     "tests/live/analysis/test_public_journeys.py::test_real_model_dependent_cells_and_error_correction": "passed",

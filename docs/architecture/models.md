@@ -54,7 +54,7 @@ turns on top-level automatic caching for the conversation tail. The count call s
 the same arguments, so counting shares the markers. They are sent regardless of the
 model profile's `supports_prompt_caching` flag. Cache read and write tokens are
 accounted and priced, and count in full toward input tokens. OpenAI and Gemini are
-unchanged and render the start message's leading context block joined by a newline.
+unchanged and render the start message's trailing context block joined by a newline.
 
 The router owns model retries. API SDK retries are disabled on owned clients and
 on borrowed-client request views without changing or closing the caller's client.

@@ -72,7 +72,7 @@ async def test_hosted_run_does_not_claim_the_host_timezone_as_the_users(
     try:
         await agent.run("Check again Wednesday at 5pm.")
         # The run-start time rides on the start message, not the cached system.
-        start_block = provider.requests[0].messages[-1].content[0]
+        start_block = provider.requests[0].messages[-1].content[-1]
         assert isinstance(start_block, TextBlock)
         system_text = start_block.text
         assert "User-local IANA timezone is unknown" in system_text
@@ -157,7 +157,7 @@ async def test_relative_schedule_starts_after_approval_and_uses_trusted_local_ti
     try:
         origin = await agent.run("Update me now and again in five minutes.")
         # The run-start time rides on the start message, not the cached system.
-        start_block = provider.requests[0].messages[-1].content[0]
+        start_block = provider.requests[0].messages[-1].content[-1]
         assert isinstance(start_block, TextBlock)
         system_text = start_block.text
         assert "user-local Wednesday 2026-09-23 11:00:00 -0500" in system_text

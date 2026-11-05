@@ -129,7 +129,7 @@ turn. The system text depends only on the callable tool set, so it changes only 
 `toolbox_load` changes the tools, and that request already rewrites the provider
 cache. The run-start time, the unresolved-effect notice and question-specific
 procedures are computed once at preparation (`RunContextSnapshot.start_context`)
-and render as a leading text block on the current run's start message, in the request
+and render as a text block after the question on the current run's start message, in the request
 only. The transcript and stored start message are unchanged, and earlier runs'
 history renders without the block. The directory's approximate object count is
 rounded to two significant figures. A full sliding window drops its oldest turn,

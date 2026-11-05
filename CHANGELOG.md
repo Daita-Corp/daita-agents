@@ -314,7 +314,7 @@ agent, except the current run's first user turn.
 
 - **Start context moves to the question.** The run-start time, the unresolved-effect
   notice and question-specific procedures (SQL dates, Python requested reads, export
-  requests) are computed once per run and shown as a leading block on the start
+  requests) are computed once per run and shown as a block after the question on the start
   message, in the request only. The transcript and stored message are unchanged.
 - **Python guidance is steady.** It shows whenever `python_execute` is callable, not
   chosen from the question's words or earlier results.
