@@ -12,6 +12,7 @@ import pytest_asyncio
 from google import genai
 
 from daita.llm import ModelCallPolicy, ModelProviderError, ProviderErrorCode
+from daita.llm._lifecycle import AttemptLifecycle
 from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -56,9 +57,17 @@ def request(**kwargs):
         "eof_without_terminal",
     ],
 )
-async def test_actual_sdk_liveness_and_release(family, scenario):
+async def test_actual_sdk_liveness_and_release(family, scenario, monkeypatch):
     sdk: Any
     provider: Any
+    attempts = []
+    finish = AttemptLifecycle.finish
+
+    def record_attempt(attempt, error):
+        attempts.append(attempt)
+        finish(attempt, error)
+
+    monkeypatch.setattr(AttemptLifecycle, "finish", record_attempt)
     async with endpoint(scenario, family=family) as (url, paths, _writes):
         http = httpx.AsyncClient(trust_env=False)
         if family == "openai":
@@ -143,10 +152,29 @@ async def test_actual_sdk_liveness_and_release(family, scenario):
                         assert diagnostic["timeout_reason"] == "attempt_deadline"
                     else:
                         assert diagnostic["first_substantive_progress_seconds"] is None
-                        assert diagnostic["timeout_reason"] == "first_progress"
+                        # A busy runner can push the last sign of life so late that
+                        # the attempt deadline comes first; only then is it correct.
+                        attempt = attempts[-1]
+                        signs = [
+                            mark
+                            for mark in (attempt.dispatched, attempt.last_alive)
+                            if mark is not None
+                        ]
+                        stall_came_first = bool(signs) and (
+                            max(signs) + POLICY.first_progress_timeout_seconds
+                            < attempt.request.attempt_deadline
+                        )
+                        assert diagnostic["timeout_reason"] == "first_progress" or (
+                            diagnostic["timeout_reason"] == "attempt_deadline"
+                            and not stall_came_first
+                        )
                     # SDK cold imports can synchronously block the event loop;
                     # the supervising await must still return within the later guard.
-            assert len(paths) == 1
+            if scenario in {"silent", "startup_only"}:
+                # The same stall can expire the attempt before the request lands.
+                assert len(paths) <= 1
+            else:
+                assert len(paths) == 1
             assert not provider._native_owner.poisoned
             assert not provider._native_owner.tasks
             await provider.close()

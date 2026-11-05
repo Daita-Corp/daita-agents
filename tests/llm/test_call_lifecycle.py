@@ -225,6 +225,26 @@ async def test_retired_attempt_cannot_restart_or_accept_late_output(phase):
     assert not life.owner.tasks
 
 
+def test_late_sign_of_life_cannot_outlast_the_attempt_deadline(monkeypatch):
+    from types import SimpleNamespace
+
+    from daita.llm._lifecycle import AttemptLifecycle
+    from tests.llm._call_policy_support import request
+
+    now = [100.0]
+    monkeypatch.setattr(
+        asyncio, "get_running_loop", lambda: SimpleNamespace(time=lambda: now[0])
+    )
+    life = AttemptLifecycle(NativeOwner(), request(), observable=True)
+    life.dispatch()
+    now[0] = 150
+    life.alive()
+    assert life._expiry() == (210, "first_progress")
+    now[0] = 170
+    life.alive()
+    assert life._expiry() == (220, "attempt_deadline")
+
+
 def test_virtual_progress_changes_only_idle_deadline(monkeypatch):
     from types import SimpleNamespace
 
