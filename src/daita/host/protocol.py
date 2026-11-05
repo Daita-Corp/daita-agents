@@ -94,6 +94,8 @@ REMOTE_AGENT_SURFACE: Final = frozenset(
         "detach",
         "refresh_source",
         "check_source",
+        "check_link",
+        "check_catalog_link",
         "resolve_source",
         "inspect_source_permissions",
         "preview_source_permissions",

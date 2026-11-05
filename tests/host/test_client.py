@@ -421,6 +421,10 @@ async def _errors(agent: Any, seeded: Seeded) -> object:
         lambda: agent.read_artifact("artifact-missing"),
         lambda: agent.resolve_source("no such source"),
         lambda: agent.inspect_source_permissions("source-missing"),
+        lambda: agent.check_link(
+            "source-missing", "t", ("a",), "source-missing", "t", ("a",)
+        ),
+        lambda: agent.check_catalog_link("link-missing"),
         lambda: agent.run(""),
     ):
         try:

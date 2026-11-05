@@ -2799,6 +2799,7 @@ def test_read_io_never_consults_the_catalog():
                 PACKAGE / "adapters" / "sqlite_query.py",
                 PACKAGE / "domains" / "data" / "sql" / "analysis.py",
                 PACKAGE / "domains" / "data" / "sql" / "contracts.py",
+                PACKAGE / "domains" / "data" / "key_read.py",
                 PACKAGE / "domains" / "data" / "sql" / "duckdb_read.py",
                 PACKAGE / "domains" / "data" / "sql" / "read_validation.py",
             )

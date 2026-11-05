@@ -49,6 +49,7 @@ _COMMON_WORDS = frozenset(
 # What a source's own failure can raise; a lookup then says so instead of failing.
 _LOOKUP_FAILURES = (DaitaError, ImportError, OSError, TimeoutError)
 _TRUST = "untrusted_external_data"
+_MAX_LINK_CANDIDATES = 8
 
 RefreshRequest = Callable[[str, tuple[str, ...]], None]
 
@@ -87,6 +88,14 @@ class CatalogProjection(Protocol):
     async def cached_description(
         self, agent_id: str, source_id: str, name: str
     ) -> Mapping[str, object] | None: ...
+
+    async def link_candidates(
+        self,
+        agent_id: str,
+        source_id: str,
+        description: Mapping[str, object],
+        known: Sequence[Mapping[str, object]],
+    ) -> Sequence[Mapping[str, object]]: ...
 
 
 def _query_words(query: str) -> tuple[str, ...]:
@@ -293,6 +302,7 @@ class CatalogDescribeExecutor:
             if cached is not None and cached["name"] == live["name"]:
                 answer["revision"] = cached.get("revision")
                 answer["relationships"] = _merged_relationships(
+                    source_id,
                     cast(Sequence[Mapping[str, object]], live.get("relationships", ())),
                     cast(
                         Sequence[Mapping[str, object]], cached.get("relationships", ())
@@ -317,6 +327,23 @@ class CatalogDescribeExecutor:
             )
         else:
             answer = {}
+        if (
+            answer.get("columns")
+            and "tables" not in answer
+            and source_id != self._service.session_source_id
+        ):
+            try:
+                candidates = await self._service.link_candidates(
+                    self._agent_id,
+                    source_id,
+                    answer,
+                    cast(
+                        Sequence[Mapping[str, object]], answer.get("relationships", ())
+                    ),
+                )
+            except CatalogStoreError:
+                candidates = ()
+            answer = {**answer, "link_candidates": candidates}
         visible = self._scoped(request.source_scope, source_id, answer)
         if visible is None:
             raise CapabilityInputError(
@@ -389,6 +416,23 @@ class CatalogDescribeExecutor:
                 for end in ("from", "to")
             )
         ]
+        candidates = [
+            {key: value for key, value in item.items() if key != "to_kind"}
+            for item in cast(
+                Sequence[Mapping[str, object]], answer.get("link_candidates", ())
+            )
+            if _visible(
+                scope,
+                session,
+                cast(str, item["to_source_id"]),
+                item["to_kind"],
+                cast(str, item["to"]),
+            )
+        ][:_MAX_LINK_CANDIDATES]
+        if candidates:
+            scoped["link_candidates"] = candidates
+        else:
+            scoped.pop("link_candidates", None)
         return scoped
 
 
@@ -425,19 +469,38 @@ def _column_types(description: Mapping[str, object]) -> list[tuple[object, objec
 
 
 def _merged_relationships(
-    live: Sequence[Mapping[str, object]], cached: Sequence[Mapping[str, object]]
+    source_id: str,
+    live: Sequence[Mapping[str, object]],
+    cached: Sequence[Mapping[str, object]],
 ) -> list[Mapping[str, object]]:
     """Live keys, plus the links only the catalog knows, such as declared ones."""
 
-    seen = {(item["from"], item["to"], repr(item["columns"])) for item in live}
-    return [
-        *live,
-        *(
-            item
-            for item in cached
-            if (item["from"], item["to"], repr(item["columns"])) not in seen
-        ),
+    def key(item: Mapping[str, object]) -> tuple[object, ...]:
+        # Live keys name no source; they are this one's.
+        pairs = cast(Sequence[Sequence[object]], item["columns"])
+        return (
+            item["from"],
+            item.get("from_source_id", source_id),
+            item["to"],
+            item.get("to_source_id", source_id),
+            tuple(tuple(pair) for pair in pairs),
+        )
+
+    cataloged = {key(item): item for item in cached}
+    # The live source has no row counts; the catalog's estimates join its keys.
+    merged = [
+        {
+            **item,
+            **{
+                name: value
+                for name, value in cataloged.get(key(item), {}).items()
+                if name.endswith("_row_estimate")
+            },
+        }
+        for item in live
     ]
+    seen = {key(item) for item in live}
+    return merged + [item for item in cached if key(item) not in seen]
 
 
 def catalog_declarations(
@@ -611,6 +674,7 @@ def _describe_output_schema() -> dict[str, object]:
         "comment": "string",
         "dialect": "string",
         "kind": "string",
+        "link_candidates": "array",
         "name": "string",
         "note": "string",
         "partitions": "integer",

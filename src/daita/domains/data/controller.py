@@ -442,7 +442,7 @@ class DataCapabilityDomain:
                     "Catalog search requires a non-empty query.",
                 )
         if capability.id == DATA_QUERY_COMBINED_CAPABILITY_ID:
-            arguments = await self._prepare_combined_query(run, arguments)
+            arguments = await self._prepare_combined_query(run, call, arguments)
         if capability.id in SOURCE_FILE_CAPABILITY_IDS:
             arguments = await self._prepare_source_file_call(run, capability, arguments)
         if capability.id in _RELATIONAL_READ_CAPABILITIES:
@@ -1053,7 +1053,7 @@ class DataCapabilityDomain:
         )
 
     async def _prepare_combined_query(
-        self, run: RunInput, arguments: Mapping[str, object]
+        self, run: RunInput, call: ToolCall, arguments: Mapping[str, object]
     ) -> FrozenJsonObject:
         """Validate every input as one single-source read, then the combining SQL.
 
@@ -1071,6 +1071,13 @@ class DataCapabilityDomain:
                 {"aliases": aliases},
                 recovery=_CORRECT_SQL,
             )
+        # The call keeps the table names the model sent; arguments hold IDs.
+        sent = call.arguments.get("inputs")
+        sent_tables = {
+            raw["alias"]: raw.get("table", raw.get("resource_id"))
+            for raw in (sent if isinstance(sent, (list, tuple)) else ())
+            if isinstance(raw, Mapping)
+        }
         prepared: list[dict[str, object]] = []
         for alias, item in zip(aliases, inputs, strict=True):
             tabular = "sql" not in item
@@ -1087,17 +1094,37 @@ class DataCapabilityDomain:
                 }
             )
             try:
-                await self._validate_source_scope(run, single, read)
+                # A tabular resource may be unlisted: the source serves it, and
+                # its read permission is checked against the stored scope below.
+                await self._validate_source_scope(
+                    run,
+                    single,
+                    (
+                        FrozenJsonObject.from_mapping({"source_id": item["source_id"]})
+                        if tabular
+                        else read
+                    ),
+                )
                 self._validate_execution_resource_scope(run, single, read)
-                await self._validate_resource_read_scope(run, single, read)
                 if tabular:
-                    validated = await self._validate_tabular_read(run, item)
-                elif "path_pattern" in item:
-                    validated = await self._validate_folder_input(run, item)
-                else:
-                    validated = await self._validate_sql(
-                        run, read, operation=SourceOperation.SQL_READ
+                    sent_name = sent_tables.get(alias)
+                    validated = await self._validate_tabular_read(
+                        run,
+                        item,
+                        (
+                            sent_name
+                            if isinstance(sent_name, str) and "sha256:" not in sent_name
+                            else None
+                        ),
                     )
+                else:
+                    await self._validate_resource_read_scope(run, single, read)
+                    if "path_pattern" in item:
+                        validated = await self._validate_folder_input(run, item)
+                    else:
+                        validated = await self._validate_sql(
+                            run, read, operation=SourceOperation.SQL_READ
+                        )
             except CapabilityInputError as error:
                 raise CapabilityInputError(
                     error.code,
@@ -1166,15 +1193,32 @@ class DataCapabilityDomain:
         )
 
     async def _validate_tabular_read(
-        self, run: RunInput, item: Mapping[str, object]
+        self, run: RunInput, item: Mapping[str, object], sent_name: str | None
     ) -> FrozenJsonObject:
-        """Check one tabular input against the current catalog before any I/O."""
+        """Check one tabular input's scope and filters before any I/O.
+
+        The catalog only advises: it names the table when it lists it. A table
+        or column it does not list is the source's to serve or refuse.
+        """
 
         # capabilities imports this module, so its records load at call time.
         from .capabilities import TabularFilter
 
         source_id = cast(str, item["source_id"])
         resource_id = cast(str, item["resource_id"])
+        try:
+            identity = await self._catalog.resource_identity(run.agent_id, resource_id)
+        except CatalogStoreError:
+            identity = None
+        access = await self._read_access_in_run(run, source_id)
+        if (identity is not None and identity[0] != source_id) or (
+            access is not None and resource_id not in access
+        ):
+            raise CapabilityInputError(
+                "resource_read_not_allowed",
+                _RESOURCE_READ_DENIED_MESSAGE,
+                recovery=_COPY_CATALOG_IDS,
+            )
         adapter_id = await self._catalog.source_adapter_id(run.agent_id, source_id)
         if adapter_id is None:
             raise CapabilityInputError(
@@ -1190,34 +1234,9 @@ class DataCapabilityDomain:
                 {"source_id": source_id},
                 recovery=_CORRECT_SQL,
             )
-        resource = next(
-            (
-                schema
-                for schema in await self._catalog.resource_schemas(
-                    run.agent_id, source_id
-                )
-                if schema.resource_id == resource_id
-            ),
-            None,
-        )
-        if resource is None:
-            raise CapabilityInputError(
-                "sql_resource_source_mismatch",
-                "The resource must belong to the selected source.",
-                {"resource_id": resource_id, "source_id": source_id},
-                recovery=_CORRECT_SQL,
-            )
-        if resource.revision is None or resource.source_revision is None:
-            raise CapabilityInputError(
-                "catalog_provenance_missing",
-                "The resource has no current catalog revision; refresh the source.",
-                {"resource_id": resource_id},
-            )
         try:
-            filters = tuple(
-                TabularFilter.from_mapping(cast(Mapping[str, object], value))
-                for value in cast(tuple[object, ...], item.get("filters", ()))
-            )
+            for filter_value in cast(tuple[object, ...], item.get("filters", ())):
+                TabularFilter.from_mapping(cast(Mapping[str, object], filter_value))
         except ValueError as error:
             raise CapabilityInputError(
                 "tabular_filter_invalid",
@@ -1225,27 +1244,18 @@ class DataCapabilityDomain:
                 {"resource_id": resource_id},
                 recovery=_CORRECT_SQL,
             ) from error
-        columns = cast(tuple[str, ...], item["columns"])
-        unknown = sorted(
-            {*columns, *(value.column for value in filters)} - set(resource.columns)
-        )
-        if unknown:
-            raise CapabilityInputError(
-                "tabular_column_unknown",
-                "Every column and filter column must exist in the resource's "
-                "current catalog schema.",
-                {
-                    "resource_id": resource_id,
-                    "unknown_columns": tuple(unknown),
-                    "available_columns": resource.columns,
-                },
-                recovery=_CORRECT_SQL,
-            )
+        name = sent_name
+        try:
+            for schema in await self._catalog.resource_schemas(run.agent_id, source_id):
+                if schema.resource_id == resource_id:
+                    name = schema.name
+        except CatalogStoreError:
+            pass
         return FrozenJsonObject.from_mapping(
             {
                 **item,
                 "_adapter_id": adapter_id,
-                "_resource_name": resource.name,
+                **({} if name is None else {"_resource_name": name}),
             }
         )
 
@@ -1363,17 +1373,20 @@ class DataCapabilityDomain:
 
 
 def _endpoint_source_ids(data: Mapping[str, object]) -> set[str]:
-    """Other sources a description names through its declared links."""
+    """Other sources a description names through its links and join candidates."""
 
-    relationships = data.get("relationships")
     return {
-        cast(str, relationship[key])
-        for relationship in cast(
-            tuple[Mapping[str, object], ...],
-            relationships if isinstance(relationships, (tuple, list)) else (),
+        cast(str, item[key])
+        for name, keys in (
+            ("relationships", ("from_source_id", "to_source_id")),
+            ("link_candidates", ("to_source_id",)),
         )
-        for key in ("from_source_id", "to_source_id")
-        if key in relationship
+        for item in cast(
+            tuple[Mapping[str, object], ...],
+            data.get(name) if isinstance(data.get(name), (tuple, list)) else (),
+        )
+        for key in keys
+        if key in item
     }
 
 

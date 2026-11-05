@@ -1,0 +1,420 @@
+[
+  {
+    "id": "q01-enterprise-customers",
+    "category": "single_source",
+    "question": "How many customers are in the enterprise segment?",
+    "expected": "12",
+    "sources": [
+      "sqlite"
+    ],
+    "oracle": {
+      "source_id": "CRM database",
+      "sql": "SELECT COUNT(*) FROM customers WHERE segment = 'enterprise'"
+    }
+  },
+  {
+    "id": "q02-shipped-order-value",
+    "category": "single_source",
+    "question": "What is the total value of all shipped orders?",
+    "expected": "99450",
+    "sources": [
+      "postgresql"
+    ],
+    "oracle": {
+      "source_id": "Sales database",
+      "sql": "SELECT SUM(total) FROM sales.orders WHERE status = 'shipped'"
+    }
+  },
+  {
+    "id": "q03-hardware-products",
+    "category": "single_source",
+    "question": "How many products are in the Hardware category?",
+    "expected": "7",
+    "sources": [
+      "folder"
+    ],
+    "oracle": {
+      "source_id": "Business files",
+      "path_pattern": "products.jsonl",
+      "sql": "SELECT COUNT(*) FROM data WHERE category = 'Hardware'"
+    }
+  },
+  {
+    "id": "q04-german-order-value",
+    "category": "cross_source",
+    "question": "What is the total value of orders placed by customers in Germany?",
+    "expected": "46805",
+    "sources": [
+      "postgresql",
+      "sqlite"
+    ],
+    "oracle": {
+      "inputs": [
+        {
+          "alias": "o",
+          "source_id": "Sales database",
+          "sql": "SELECT customer_id, SUM(total) AS total, COUNT(*) AS orders FROM sales.orders GROUP BY customer_id"
+        },
+        {
+          "alias": "c",
+          "source_id": "CRM database",
+          "sql": "SELECT id, segment, country FROM customers"
+        }
+      ],
+      "sql": "SELECT SUM(o.total) FROM o JOIN c ON c.id = o.customer_id WHERE c.country = 'DE'"
+    }
+  },
+  {
+    "id": "q05-top-country-target",
+    "category": "cross_source",
+    "question": "What is the annual sales target of the country where we have the most customers?",
+    "expected": "1200000",
+    "sources": [
+      "sqlite",
+      "folder"
+    ],
+    "oracle": {
+      "inputs": [
+        {
+          "alias": "c",
+          "source_id": "CRM database",
+          "sql": "SELECT country, COUNT(*) AS customers FROM customers GROUP BY country"
+        },
+        {
+          "alias": "t",
+          "source_id": "Business files",
+          "path_pattern": "country_targets.csv",
+          "sql": "SELECT country, annual_target FROM data"
+        }
+      ],
+      "sql": "SELECT t.annual_target FROM c JOIN t ON t.country = c.country ORDER BY c.customers DESC LIMIT 1"
+    }
+  },
+  {
+    "id": "q06-big-target-order-value",
+    "category": "cross_source",
+    "question": "What is the total value of orders placed by customers in countries whose annual sales target is above 1,000,000?",
+    "expected": "68985",
+    "sources": [
+      "postgresql",
+      "sqlite",
+      "folder"
+    ],
+    "oracle": {
+      "inputs": [
+        {
+          "alias": "o",
+          "source_id": "Sales database",
+          "sql": "SELECT customer_id, SUM(total) AS total, COUNT(*) AS orders FROM sales.orders GROUP BY customer_id"
+        },
+        {
+          "alias": "c",
+          "source_id": "CRM database",
+          "sql": "SELECT id, segment, country FROM customers"
+        },
+        {
+          "alias": "t",
+          "source_id": "Business files",
+          "path_pattern": "country_targets.csv",
+          "sql": "SELECT country, annual_target FROM data"
+        }
+      ],
+      "sql": "SELECT SUM(o.total) FROM o JOIN c ON c.id = o.customer_id JOIN t ON t.country = c.country WHERE t.annual_target > 1000000"
+    }
+  },
+  {
+    "id": "q07-orders-from-crm-customers",
+    "category": "planted_mismatch",
+    "question": "How many orders were placed by customers listed in the CRM?",
+    "expected": "2885",
+    "sources": [
+      "postgresql",
+      "sqlite"
+    ],
+    "oracle": {
+      "inputs": [
+        {
+          "alias": "o",
+          "source_id": "Sales database",
+          "sql": "SELECT customer_id, SUM(total) AS total, COUNT(*) AS orders FROM sales.orders GROUP BY customer_id"
+        },
+        {
+          "alias": "c",
+          "source_id": "CRM database",
+          "sql": "SELECT id, segment, country FROM customers"
+        }
+      ],
+      "sql": "SELECT SUM(o.orders) FROM o JOIN c ON c.id = o.customer_id"
+    },
+    "mismatch": {
+      "left": "sales.orders.customer_id",
+      "right": "customers.id",
+      "left_unmatched": 2,
+      "right_unmatched": 1,
+      "row_level": {
+        "left_unmatched": 115,
+        "right_unmatched": 1
+      },
+      "mentions": [
+        "orphan",
+        "\\b5[12]\\b",
+        "no (?:matching )?(?:CRM|customer)",
+        "unmatched",
+        "not (?:in|found in) the CRM",
+        "missing from (?:the )?CRM",
+        "without (?:a )?(?:CRM|customer)",
+        "115"
+      ]
+    }
+  },
+  {
+    "id": "q08-customers-never-ordered",
+    "category": "planted_mismatch",
+    "question": "How many customers in the CRM have never placed an order?",
+    "expected": "1",
+    "sources": [
+      "postgresql",
+      "sqlite"
+    ],
+    "oracle": {
+      "inputs": [
+        {
+          "alias": "o",
+          "source_id": "Sales database",
+          "sql": "SELECT customer_id, SUM(total) AS total, COUNT(*) AS orders FROM sales.orders GROUP BY customer_id"
+        },
+        {
+          "alias": "c",
+          "source_id": "CRM database",
+          "sql": "SELECT id, segment, country FROM customers"
+        }
+      ],
+      "sql": "SELECT COUNT(*) FROM c LEFT JOIN o ON o.customer_id = c.id WHERE o.customer_id IS NULL"
+    },
+    "mismatch": {
+      "left": "sales.orders.customer_id",
+      "right": "customers.id",
+      "left_unmatched": 2,
+      "right_unmatched": 1,
+      "row_level": {
+        "left_unmatched": 115,
+        "right_unmatched": 1
+      },
+      "mentions": [
+        "orphan",
+        "\\b5[12]\\b",
+        "no (?:matching )?(?:CRM|customer)",
+        "unmatched",
+        "not (?:in|found in) the CRM",
+        "\\b115\\b"
+      ],
+      "answer_is_mismatch": true
+    }
+  },
+  {
+    "id": "q09-pro-plan-invoiced",
+    "category": "planted_mismatch",
+    "question": "What is the total invoiced amount for accounts on the pro plan?",
+    "expected": "19159",
+    "sources": [
+      "postgresql",
+      "sqlite"
+    ],
+    "oracle": {
+      "inputs": [
+        {
+          "alias": "i",
+          "source_id": "Sales database",
+          "sql": "SELECT account_code, SUM(amount) AS amount FROM sales.invoices GROUP BY account_code"
+        },
+        {
+          "alias": "a",
+          "source_id": "CRM database",
+          "sql": "SELECT account_code, plan FROM accounts"
+        }
+      ],
+      "sql": "SELECT SUM(amount) FROM (SELECT i.amount FROM i JOIN a ON i.account_code = a.account_code WHERE a.plan = 'pro' UNION ALL SELECT i.amount FROM i JOIN a ON UPPER(TRIM(i.account_code)) = UPPER(TRIM(a.account_code)) AND i.account_code <> a.account_code WHERE a.plan = 'pro') AS matched"
+    },
+    "mismatch": {
+      "left": "sales.invoices.account_code",
+      "right": "accounts.account_code",
+      "left_unmatched": 3,
+      "right_unmatched": 3,
+      "row_level": {
+        "left_unmatched": 6,
+        "right_unmatched": 3
+      },
+      "mentions": [
+        "case",
+        "whitespace",
+        "trailing",
+        "trim",
+        "ACC-013",
+        "ACC-022",
+        "ACC-034",
+        "spelled",
+        "formatting",
+        "normaliz",
+        "unmatched",
+        "near.match",
+        "did(?: not|n't) match",
+        "no (?:exact )?match"
+      ],
+      "near_matches": true
+    }
+  },
+  {
+    "id": "q10-hardware-revenue",
+    "category": "planted_mismatch",
+    "question": "How much revenue did the Hardware category bring in, counting quantity times each product's list price over all order items?",
+    "expected": "4950000",
+    "sources": [
+      "postgresql",
+      "folder"
+    ],
+    "requires_aggregation": "sales.order_items has 120,000 rows, above the 50,000 rows all combined-query inputs share",
+    "oracle": {
+      "inputs": [
+        {
+          "alias": "i",
+          "source_id": "Sales database",
+          "sql": "SELECT product_id, SUM(quantity) AS units FROM sales.order_items GROUP BY product_id"
+        },
+        {
+          "alias": "p",
+          "source_id": "Business files",
+          "path_pattern": "products.jsonl",
+          "sql": "SELECT product_id, category, unit_price FROM data"
+        }
+      ],
+      "sql": "SELECT SUM(i.units * p.unit_price) FROM i JOIN p ON i.product_id = p.product_id WHERE p.category = 'Hardware'"
+    },
+    "mismatch": {
+      "left": "sales.order_items.product_id",
+      "right": "products.product_id",
+      "left_unmatched": 0,
+      "right_unmatched": 3,
+      "row_level": {
+        "left_unmatched": 0,
+        "right_unmatched": 3
+      },
+      "types_differ": true,
+      "mentions": [
+        "zero-?pad",
+        "leading zero",
+        "padded",
+        "\\b(?:varchar|text|string)\\b",
+        "\\bcast",
+        "unmatched",
+        "no order items",
+        "never sold|not sold"
+      ]
+    }
+  },
+  {
+    "id": "q11-untargeted-country-customers",
+    "category": "planted_mismatch",
+    "question": "How many customers are in a country that has no sales target?",
+    "expected": "7",
+    "sources": [
+      "sqlite",
+      "folder"
+    ],
+    "oracle": {
+      "inputs": [
+        {
+          "alias": "c",
+          "source_id": "CRM database",
+          "sql": "SELECT country, COUNT(*) AS customers FROM customers GROUP BY country"
+        },
+        {
+          "alias": "t",
+          "source_id": "Business files",
+          "path_pattern": "country_targets.csv",
+          "sql": "SELECT country, annual_target FROM data"
+        }
+      ],
+      "sql": "SELECT COALESCE(SUM(c.customers), 0) FROM c LEFT JOIN t ON t.country = c.country WHERE t.country IS NULL"
+    },
+    "mismatch": {
+      "left": "customers.country",
+      "right": "country_targets.country",
+      "left_unmatched": 1,
+      "right_unmatched": 1,
+      "row_level": {
+        "left_unmatched": 7,
+        "right_unmatched": 1
+      },
+      "mentions": [
+        "BR",
+        "Brazil",
+        "JP",
+        "Japan",
+        "no target",
+        "unmatched",
+        "without a target",
+        "no (?:sales )?target",
+        "lack(?:s|ing)? a target",
+        "without (?:a )?(?:sales )?target",
+        "not (?:in|listed in) (?:the )?(?:country_)?targets"
+      ],
+      "answer_is_mismatch": true
+    }
+  },
+  {
+    "id": "q12-eli-pro-accounts",
+    "category": "planted_mismatch",
+    "question": "How many pro-plan accounts does Eli manage?",
+    "expected": "5",
+    "sources": [
+      "sqlite",
+      "folder"
+    ],
+    "oracle": {
+      "inputs": [
+        {
+          "alias": "a",
+          "source_id": "CRM database",
+          "sql": "SELECT account_code, plan FROM accounts"
+        },
+        {
+          "alias": "m",
+          "source_id": "Business files",
+          "path_pattern": "account_managers.csv",
+          "sql": "SELECT account_code, manager FROM data"
+        }
+      ],
+      "sql": "SELECT COUNT(*) FROM (SELECT a.account_code FROM a JOIN m ON a.account_code = m.account_code WHERE a.plan = 'pro' AND m.manager = 'Eli' UNION ALL SELECT a.account_code FROM a JOIN m ON UPPER(TRIM(a.account_code)) = UPPER(TRIM(m.account_code)) AND a.account_code <> m.account_code WHERE a.plan = 'pro' AND m.manager = 'Eli') AS matched"
+    },
+    "mismatch": {
+      "left": "accounts.account_code",
+      "right": "account_managers.account_code",
+      "left_unmatched": 5,
+      "right_unmatched": 5,
+      "row_level": {
+        "left_unmatched": 5,
+        "right_unmatched": 5
+      },
+      "mentions": [
+        "case",
+        "whitespace",
+        "trailing",
+        "trim",
+        "ACC-025",
+        "ACC-037",
+        "spelled",
+        "formatting",
+        "normaliz",
+        "ACC-013",
+        "ACC-022",
+        "ACC-034",
+        "unmatched",
+        "no (?:exact )?match",
+        "did(?: not|n't) match",
+        "near.match",
+        "\\b5 of 50\\b"
+      ],
+      "near_matches": true
+    }
+  }
+]

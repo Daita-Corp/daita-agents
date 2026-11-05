@@ -31,7 +31,15 @@ source relationships in one edge set, labelled `provenance: "declared"` with
 are read fresh for each projection, outside the per-source index cache. Readable
 and run-scope filters apply to both link endpoints, so traversal never crosses
 a resource outside scope. `catalog_describe` lists each current link leaving the
-table it describes, by name, when the run may read the far endpoint.
+table it describes, by name, when the run may read the far endpoint. Each
+relationship carries `from_row_estimate` and `to_row_estimate` when the catalog
+has them. For a table with key-like columns (a name ending in `_id`, `_key`, `_code` or
+`_uuid`, or a unique key other than `id`), `catalog_describe` also lists up to
+eight `link_candidates`: columns of readable tables in other sources with the
+same name or a matching `<name>_id` to `id` pairing and a compatible type, not
+already linked, with `status: "unconfirmed"` and the far table's
+`to_row_estimate`. A candidate is a hint. It grants no read authority and is
+never declared or stored.
 
 `catalog_search` always asks both the catalog snapshot and the live source, through
 one bounded lookup of table and column names (`pg_class` and `pg_attribute` in the
@@ -101,6 +109,21 @@ an error code, not a raise. The result is not model-visible and not stored.
 `/sources` shows it for the selected source, attach shows it, and the host
 serves it at `POST /sources/{source_id}/check`.
 
+`Agent.check_link(from_source_id, from_table, from_columns, to_source_id,
+to_table, to_columns)` and `Agent.check_catalog_link(link_id)` return a
+`LinkCheck`: how well two key columns join, from a bounded read of each side's
+distinct keys (`domains/data/key_read.py`). Each side goes through the normal
+read path, with the same scope and read policy as `data_query`, and takes the
+source's admission permit; no catalog entry is needed. `match_rate` is the share
+of distinct non-null `from` keys found on the `to` side, with both key counts,
+the matched counts and the key types read (so `"1"` against `1` shows). A side
+that hits its bound (50,000 keys, 16 MiB, 10 seconds) sets `from_truncated` or
+`to_truncated` and makes the result `partial`. An unreachable source, an
+unknown table or a refused read is a result with an `error_code`; only an
+unknown or detached source, or an unknown link id, raises `ValueError`. It is
+on demand, not a model tool, and the host serves it at `POST /links/check` and
+`POST /links/{link_id}/check`.
+
 A catalog row that cannot be decoded while the agent is open raises
 `CatalogStoreError`, which every run path treats as advisory, so reads and approved
 writes continue. Opening a home with a damaged row succeeds, and a background
@@ -163,13 +186,15 @@ also refuses `load_extension`. Do not duplicate any of this in a generic policy
 layer.
 
 `data_query` with `inputs` routes to `data.query_combined`, a foreground-only
-read that joins two to four sources. Each SQL input `{alias, source_id, sql}`
+read that joins two to sixteen sources. Each SQL input `{alias, source_id, sql}`
 takes the single-source path unchanged: run scope, the read policy for the source
 type's `sql_dialect` and that type's registry backend. A folder input adds
 `path_pattern` and takes the folder route below. A tabular input `{alias, source_id, resource_id,
 columns, filters}` names one resource of a type that declares `TABULAR_READ`; it
-takes the same scope checks, every column and filter column must be in the
-current catalog schema, and filters are only AND-combined `eq`, `in`, `lt`,
+takes the same run-scope and stored-permission checks; the catalog only
+names the table, so an unlisted table or column is the source's to serve or
+refuse (`tabular_columns_unavailable` when it returns other columns), and
+filters are only AND-combined `eq`, `in`, `lt`,
 `lte`, `gt` and `gte` on scalar values. Its backend receives one
 `ReadTabularRequest` and returns a `BoundedResultProjection`.
 It serves types without SQL; the built-in types read through SQL inputs instead,
@@ -179,10 +204,27 @@ and `data_query` is offered only while a source with `SQL_READ` is in scope.
 A run withholds the `data_query` routes no in-scope source can serve: export
 needs a `TABULAR_EXPORT` source and `path_pattern` needs a folder source.
 A tool definition describes only the routes its run admits.
-Inputs read at most an internal, model-invisible
-ceiling (`COMBINED_QUERY_INPUT_MAX_ROWS`/`_BYTES`); an input that reaches it
-refuses the whole call with `combined_input_truncated`, so no join ever sees
-incomplete input; an input with no rows still joins and aggregates. The
+Inputs share one budget (`COMBINED_QUERY_TOTAL_MAX_ROWS`/`_BYTES`) enforced
+while they read: sources read concurrently, one input at a time within a source
+(the call already holds one admission permit per source), each read granted an
+equal share of what is left. An input that overflows its share is read again
+alone with what the finished reads left; one that still does not fit refuses the
+whole call with `combined_input_truncated`, so no join ever sees incomplete
+input; an input with no rows still joins and aggregates. The first failing input
+cancels the rest and its own error is returned, with the alias in its details
+as `input_alias`. The budget is 50,000 rows and 32 MiB for all inputs together;
+SQLite stops fetching at its byte share and PostgreSQL prefetches at most 256
+rows, so a read does not hold much past its share. Inputs are read separately
+(`rows`, `read_at` and `read_ms` per input, `read_consistency` in the result),
+not as one snapshot. The result also carries the worker's `join_checks` and
+advisory `warnings` (unmatched keys, key types of different families, an
+unfinished check). After the result is safe, the worker measures each
+`a.x = b.y` equality in the combining query: both key types, both row counts and
+the rows with no match on the other side and how many of those would match
+ignoring case and surrounding spaces, within one five-second budget
+(`equality_joins` in `sql/duckdb_read.py`, `_send_join_checks` in
+`adapters/local_file_query.py`). A check that fails or runs out of time leaves a
+gap and the status `partial`; it never changes or blocks the result. The
 combining `sql` is one DuckDB SELECT or UNION validated before execution to
 read every alias and nothing else: no table functions, file, HTTP or extension
 access. It runs in the same private DuckDB worker as folder-source SQL, one

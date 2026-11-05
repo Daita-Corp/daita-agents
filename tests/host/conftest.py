@@ -32,7 +32,7 @@ from daita import (
 )
 from daita._json import FrozenJsonObject
 from daita.adapters.mcp import SDKMCPClientFactory
-from daita.adapters.models import SourceHealth, SourceRegistration
+from daita.adapters.models import LinkCheck, SourceHealth, SourceRegistration
 from daita.adapters.postgresql import PostgreSQLProbeResult, PostgreSQLProbeSchema
 from daita.adapters.postgresql_write import RelationalWriteReadiness
 from daita.adapters.protocols import ResourceSource
@@ -343,6 +343,36 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
                         "read_only": False,
                         "warnings": ("This role can create roles or databases.",),
                     },
+                ),
+            ),
+            LinkCheck: (
+                LinkCheck(
+                    from_source_id=source.id,
+                    from_table="orders",
+                    from_columns=("customer_id", "region"),
+                    to_source_id="other-source",
+                    to_table="crm.customers",
+                    to_columns=("id", "region"),
+                    checked_at=NOW,
+                    match_rate=0.98,
+                    partial=True,
+                    from_keys=100,
+                    to_keys=120,
+                    matched_from=98,
+                    matched_to=98,
+                    from_key_types=("int", "str"),
+                    to_key_types=("Decimal", "str"),
+                    from_truncated=True,
+                ),
+                LinkCheck(
+                    from_source_id=source.id,
+                    from_table="orders",
+                    from_columns=("id",),
+                    to_source_id=source.id,
+                    to_table="missing",
+                    to_columns=("id",),
+                    checked_at=NOW,
+                    error_code="query_invalid",
                 ),
             ),
             tuple[SourceRegistration, ...]: (await agent.list_sources(),),

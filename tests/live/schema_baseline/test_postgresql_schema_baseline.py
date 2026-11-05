@@ -15,7 +15,6 @@ import json
 import os
 import platform
 import re
-import shutil
 import sqlite3
 import subprocess
 import time
@@ -23,7 +22,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -42,6 +41,15 @@ from daita.evaluation import BenchmarkJudgment, measure_observer_events
 from daita.llm.models import FinishReason, ModelResponse, ToolCall
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import SecretReference
+from tests.support.live_comparison import (
+    ANSWER_FORMAT,
+    OUTCOMES,
+    answer_record,
+    claude_code_version,
+    normalize,
+    run_claude_code,
+    system_summary,
+)
 from tests.support.paths import FIXTURES_ROOT, REPO_ROOT
 from tests.support.workspace import workspace_for
 
@@ -57,7 +65,6 @@ _CLAUDE = "DAITA_SCHEMA_BASELINE_CLAUDE_EXECUTABLE"
 _REPEATS = "DAITA_SCHEMA_BASELINE_REPEATS"
 _DAITA_MAX_TOKENS = "DAITA_SCHEMA_BASELINE_DAITA_MAX_TOKENS"
 _READER = ("daita_baseline_reader", "daita_baseline_reader_password")
-_ANSWER_FORMAT = " Finish with the final answer as a single value on the last line."
 _DATABASE = "daita_schema_baseline"
 _FIXTURE = FIXTURES_ROOT / "postgres-schema-baseline"
 _CREDENTIAL = SecretReference.keychain("fixture:postgres-schema-baseline")
@@ -101,19 +108,6 @@ _STALE_STEPS = (
         "add_unrelated_table",
         "CREATE TABLE crm.unrelated_scratch (id integer PRIMARY KEY, note text)",
     ),
-)
-# shortcut: keyword heuristic for live answers, replace with labeled judgments
-# once the head-to-head comparison needs per-answer human review.
-_REFUSAL = re.compile(
-    r"\b(cannot|can't|can not|unable|not available|isn't available|"
-    r"not (?:in|part of) the catalog|no access|don't have access|not cataloged|"
-    r"not accessible|couldn't|could not|not found|no answer|n/a)\b",
-    re.IGNORECASE,
-)
-_CLARIFICATION = re.compile(
-    r"\b(clarify|could you confirm|can you confirm|please confirm|please specify|"
-    r"which (?:one|table)|did you mean|do you mean)\b",
-    re.IGNORECASE,
 )
 
 _INVENTORY_SQL = """
@@ -259,33 +253,6 @@ def _questions() -> list[dict[str, Any]]:
     return json.loads((_FIXTURE / "questions.json").read_text())
 
 
-def _normalize(value: object) -> str:
-    if isinstance(value, Mapping) and "value" in value:
-        value = value["value"]  # Tagged JSON projection, e.g. decimals.
-    try:
-        number = Decimal(str(value))
-    except InvalidOperation:
-        return str(value).strip()
-    if number == number.to_integral_value():
-        return str(number.quantize(Decimal(1)))
-    return format(number.normalize(), "f")
-
-
-def _answer_in_text(expected: str, text: str) -> bool:
-    flattened = text.replace(",", "").replace("$", "")
-    if re.fullmatch(r"-?\d+(\.\d+)?", expected):
-        candidates = {expected}
-        if "." in expected:
-            candidates.add(f"{Decimal(expected):.2f}")
-        else:
-            candidates.add(f"{expected}.00")
-        return any(
-            re.search(rf"(?<![\d.]){re.escape(item)}(?!\d|\.\d)", flattened)
-            for item in candidates
-        )
-    return re.search(rf"(?<!\w){re.escape(expected)}(?!\w)", text, re.I) is not None
-
-
 async def _connect_admin(target: _Target) -> Any:
     import asyncpg
 
@@ -330,7 +297,7 @@ async def _ground_truth(
     admin: Any, questions: Sequence[Mapping[str, Any]]
 ) -> dict[str, str]:
     return {
-        item["id"]: _normalize(await admin.fetchval(item["sql"])) for item in questions
+        item["id"]: normalize(await admin.fetchval(item["sql"])) for item in questions
     }
 
 
@@ -517,9 +484,9 @@ def _first_value(rows: object) -> str | None:
         return None
     row = rows[0]
     if isinstance(row, Mapping):
-        return _normalize(next(iter(row.values()))) if row else None
+        return normalize(next(iter(row.values()))) if row else None
     if isinstance(row, Sequence) and not isinstance(row, str) and row:
-        return _normalize(row[0])
+        return normalize(row[0])
     return None
 
 
@@ -876,9 +843,6 @@ async def test_postgresql_schema_baseline(
     assert len(report["questions"]) == len(questions)
 
 
-_OUTCOMES = ("correct", "confident_wrong", "no_answer", "incomplete")
-
-
 async def test_the_question_set_answers_from_the_source_with_an_empty_catalog(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -923,71 +887,6 @@ async def test_the_question_set_answers_from_the_source_with_an_empty_catalog(
             {},
             {"function_policy": 1},
         ), run["id"]
-
-
-def _last_line(text: str) -> str:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return lines[-1] if lines else ""
-
-
-def _classify(expected: str, text: str, completed: bool) -> str:
-    """Score Daita and Claude Code answers with one rule.
-
-    ``incomplete`` is a run stopped by a limit or an error; ``no_answer`` is an
-    honest decline or clarification request; only the requested last line can
-    be correct or confidently wrong.
-    """
-
-    last = _last_line(text)
-    if not completed or not last:
-        return "incomplete"
-    if _answer_in_text(expected, last):
-        return "correct"
-    declines = (_REFUSAL, _CLARIFICATION)
-    if any(item.search(last) for item in declines) or (
-        not re.search(r"\d", last) and any(item.search(text) for item in declines)
-    ):
-        return "no_answer"
-    return "confident_wrong"
-
-
-def _answer_record(expected: str, text: str, completed: bool) -> dict[str, object]:
-    return {
-        "outcome": _classify(expected, text, completed),
-        "expected": expected,
-        "final_text": text[:2_000],
-        # Audit only: the value appears somewhere but not on the scored line.
-        "answer_elsewhere": not _answer_in_text(expected, _last_line(text))
-        and _answer_in_text(expected, text),
-        "asked_clarification": _CLARIFICATION.search(text) is not None,
-    }
-
-
-def _system_summary(runs: Sequence[Mapping[str, Any]]) -> dict[str, object]:
-    count = max(len(runs), 1)
-    costs = [run["cost_usd"] for run in runs]
-    turns = sum(int(run["turns"]) for run in runs)
-    return {
-        "runs": len(runs),
-        "outcomes": {
-            name: sum(1 for run in runs if run["outcome"] == name) for name in _OUTCOMES
-        },
-        "answer_elsewhere": sum(1 for run in runs if run["answer_elsewhere"]),
-        "mean_run_seconds": round(
-            sum(float(run["run_seconds"]) for run in runs) / count, 1
-        ),
-        "total_turns": turns,
-        "total_tool_calls": sum(int(run["tool_calls"]) for run in runs),
-        "total_tokens": sum(int(run["total_tokens"]) for run in runs),
-        "mean_input_tokens_per_turn": round(
-            sum(int(run["input_tokens"]) for run in runs) / max(turns, 1)
-        ),
-        "total_cost_usd": (
-            None
-            if None in costs
-            else str(round(sum(Decimal(str(c)) for c in costs), 4))
-        ),
-    }
 
 
 def _daita_limits() -> LoopLimits:
@@ -1089,7 +988,7 @@ async def _run_daita(
             for question in questions:
                 result, measured = await _measured_run(
                     agent,
-                    question["question"] + _ANSWER_FORMAT,
+                    question["question"] + ANSWER_FORMAT,
                     source_id,
                     events,
                     trips,
@@ -1105,7 +1004,7 @@ async def _run_daita(
                         "id": question["id"],
                         "category": question["category"],
                         "repeat": repeat,
-                        **_answer_record(
+                        **answer_record(
                             truth[question["id"]],
                             result.final_text or "",
                             result.kind is LoopExitKind.COMPLETED,
@@ -1128,172 +1027,6 @@ async def _run_daita(
                 )
     finally:
         await provider.close()
-
-
-async def _ask_claude_code(
-    executable: str,
-    model: str,
-    question: Mapping[str, Any],
-    target: _Target,
-    workdir: Path,
-    config: Path,
-) -> dict[str, Any]:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        # A fresh top-level session: no parent-session settings such as
-        # CLAUDE_EFFORT, and no harness configuration.
-        if not key.startswith(("CLAUDE", "DAITA_"))
-    } | {
-        "PGHOST": target.host,
-        "PGPORT": str(target.port),
-        "PGDATABASE": _DATABASE,
-        "PGUSER": _READER[0],
-        "PGPASSWORD": _READER[1],
-        "PGSSLMODE": target.ssl_mode,
-        # Empty config: no user CLAUDE.md, plugins, hooks, memory or login, while
-        # keeping Claude Code's default prompt and tools (unlike --bare).
-        "CLAUDE_CONFIG_DIR": str(config),
-    }
-    prompt = (
-        "A PostgreSQL database is reachable with psql; its connection settings "
-        "are already in the environment. Answer from that database: "
-        + question["question"]
-        + _ANSWER_FORMAT
-    )
-    started = time.perf_counter()
-    # An empty working directory and Bash limited to psql: Claude Code sees the
-    # database and nothing in this repository, which holds the answer SQL.
-    process = await asyncio.create_subprocess_exec(
-        executable,
-        "-p",
-        prompt,
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--model",
-        model,
-        "--tools",
-        "Bash",
-        "--allowedTools",
-        "Bash(psql:*)",
-        "--permission-mode",
-        "dontAsk",
-        "--strict-mcp-config",
-        "--no-session-persistence",
-        "--max-budget-usd",
-        os.environ.get(_MAX_COST, "0.50"),
-        cwd=workdir,
-        env=env,
-        # claude -p appends piped stdin to the prompt; never inherit the caller's.
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        async with asyncio.timeout(600):
-            stdout, stderr = await process.communicate()
-    except TimeoutError:
-        process.kill()
-        await process.wait()
-        stdout, stderr = b"", b"timed out after 600 seconds"
-    events = []
-    for line in stdout.decode(errors="replace").splitlines():
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    commands = [
-        str(block.get("input", {}).get("command", ""))[:1_000]
-        for event in events
-        if event.get("type") == "assistant"
-        for block in event.get("message", {}).get("content", ())
-        if block.get("type") == "tool_use"
-    ]
-    result: dict[str, Any] = next(
-        (event for event in reversed(events) if event.get("type") == "result"), {}
-    )
-    usage = result.get("usage") or {}
-    completed = result.get("subtype") == "success" and not result.get("is_error")
-    input_tokens = sum(
-        int(usage.get(key) or 0)
-        for key in (
-            "input_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-        )
-    )
-    return {
-        "completed": completed,
-        "final_text": str(result.get("result") or "") if completed else "",
-        "run_seconds": round(time.perf_counter() - started, 3),
-        "turns": int(result.get("num_turns") or 0),
-        "tool_calls": len(commands),
-        "commands": commands,
-        "input_tokens": input_tokens,
-        "output_tokens": int(usage.get("output_tokens") or 0),
-        "cache_read_tokens": int(usage.get("cache_read_input_tokens") or 0),
-        "total_tokens": input_tokens + int(usage.get("output_tokens") or 0),
-        "cost_usd": result.get("total_cost_usd"),
-        "exit": result.get("subtype") or f"exit {process.returncode}",
-        "api_error_status": result.get("api_error_status"),
-        "error": (
-            str(result.get("result"))[:500]
-            if result.get("is_error")
-            else stderr.decode(errors="replace")[-500:] if not result else None
-        ),
-    }
-
-
-async def _run_claude_code(
-    model: str,
-    questions: Sequence[Mapping[str, Any]],
-    truth: Mapping[str, str],
-    target: _Target,
-    root: Path,
-    entry: dict[str, Any],
-    repeat: int,
-) -> None:
-    executable = os.environ.get(_CLAUDE) or shutil.which("claude")
-    if executable is None:
-        pytest.fail(f"claude is not on PATH; set {_CLAUDE}")
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        pytest.fail(
-            "Claude Code runs with an empty config, so it needs ANTHROPIC_API_KEY"
-        )
-    for question in questions:
-        workdir = root / question["id"]
-        config = root / f"{question['id']}-config"
-        workdir.mkdir(parents=True)
-        config.mkdir()
-        run = await _ask_claude_code(
-            executable, model, question, target, workdir, config
-        )
-        # Auth, billing and other API rejections are setup failures, not answers.
-        if run["api_error_status"] or (
-            run["error"] and "authenticate" in run["error"].lower()
-        ):
-            pytest.fail(f"Claude Code could not call the model: {run['error']}")
-        completed = run.pop("completed")
-        text = run.pop("final_text")
-        entry["questions"].append(
-            {
-                "id": question["id"],
-                "category": question["category"],
-                "repeat": repeat,
-                **_answer_record(truth[question["id"]], text, completed),
-                **run,
-            }
-        )
-
-
-def _claude_code_version() -> str | None:
-    executable = os.environ.get(_CLAUDE) or shutil.which("claude")
-    if executable is None:
-        return None
-    return subprocess.run(
-        (executable, "--version"), capture_output=True, text=True, check=False
-    ).stdout.strip()
 
 
 def _comparison_markdown(report: Mapping[str, Any]) -> str:
@@ -1324,7 +1057,7 @@ def _comparison_markdown(report: Mapping[str, Any]) -> str:
         outcomes = summary["outcomes"]
         lines.append(
             f"| {name} | {system['model']} | {summary['runs']} | "
-            + " | ".join(str(outcomes[item]) for item in _OUTCOMES)
+            + " | ".join(str(outcomes[item]) for item in OUTCOMES)
             + f" | {summary['mean_run_seconds']} | {summary['total_turns']} | "
             f"{summary['total_tool_calls']} | {summary['total_tokens']} | "
             f"{summary['mean_input_tokens_per_turn']} | "
@@ -1398,7 +1131,7 @@ async def test_daita_and_claude_code_answer_the_question_set(
     report: dict[str, Any] = {
         "environment": environment,
         "claude_code_version": (
-            _claude_code_version() if "claude_code" in systems else None
+            claude_code_version(_CLAUDE) if "claude_code" in systems else None
         ),
         "repeats": repeats,
         "limits": {
@@ -1433,13 +1166,34 @@ async def test_daita_and_claude_code_answer_the_question_set(
                         target, model_id, questions, truth, trips, root, entry, repeat
                     )
                 else:
-                    await _run_claude_code(
-                        model, questions, truth, target, root, entry, repeat
+                    await run_claude_code(
+                        model,
+                        questions,
+                        truth,
+                        root,
+                        entry,
+                        repeat,
+                        executable_env=_CLAUDE,
+                        preamble=(
+                            "A PostgreSQL database is reachable with psql; its "
+                            "connection settings are already in the environment. "
+                            "Answer from that database: "
+                        ),
+                        environment={
+                            "PGHOST": target.host,
+                            "PGPORT": str(target.port),
+                            "PGDATABASE": _DATABASE,
+                            "PGUSER": _READER[0],
+                            "PGPASSWORD": _READER[1],
+                            "PGSSLMODE": target.ssl_mode,
+                        },
+                        allowed_tools="Bash(psql:*)",
+                        max_cost=os.environ.get(_MAX_COST, "0.50"),
                     )
     finally:
         # Paid results survive a later failure.
         for entry in report["systems"].values():
-            entry["summary"] = _system_summary(entry["questions"])
+            entry["summary"] = system_summary(entry["questions"])
         (directory / f"{stem}.json").write_text(
             json.dumps(report, indent=2, sort_keys=True, default=str) + "\n"
         )

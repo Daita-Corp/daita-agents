@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import re
+from collections.abc import Mapping, Sequence
 from hashlib import sha256
 from typing import cast
 
@@ -27,7 +28,7 @@ from ...catalog.models import (
     catalog_resource_id,
 )
 from ...catalog.protocols import CatalogStore, CatalogStoreError
-from ...catalog.service import CatalogService
+from ...catalog.service import CatalogService, CatalogTabularResource
 from ...llm.models import ModelSensitivity
 from ...semantics import SemanticResourceFact
 from ...storage.sqlite_records import (
@@ -42,6 +43,31 @@ _CATALOG_PARTIAL = (
     "The catalog holds only part of this source, so the object count is a floor. "
     "catalog_search and catalog_describe read the source live."
 )
+
+
+_KEY_SUFFIXES = ("_id", "_key", "_code", "_uuid")
+_INTEGERS = frozenset(
+    "int integer tinyint smallint mediumint bigint int2 int4 int8 serial bigserial "
+    "smallserial numeric decimal number".split()
+)
+_TEXTS = frozenset("text varchar char character nvarchar nchar string citext".split())
+
+
+def _type_family(native_type: str) -> str | None:
+    """Integers and numerics together, text together, anything else exact."""
+
+    folded = re.sub(r"\(.*?\)", "", native_type.lower()).strip()
+    word = folded.split(" ", 1)[0]
+    if not folded or folded == "unknown":
+        return None
+    if word in _INTEGERS:
+        return "numeric"
+    return "text" if word in _TEXTS else folded
+
+
+def _compatible(left: str, right: str) -> bool:
+    family = _type_family(left)
+    return family is not None and family == _type_family(right)
 
 
 # The source operation each relational write-scope operation requires.
@@ -483,16 +509,140 @@ class CatalogDataView:
                 if index.unique and index.predicate is None
             ],
             "relationships": await self._cataloged_relationships(
-                agent_id, source_id, found.resource.id
+                agent_id, source_id, found.resource.id, current
             ),
         }
 
+    async def link_candidates(
+        self,
+        agent_id: str,
+        source_id: str,
+        description: Mapping[str, object],
+        known: Sequence[Mapping[str, object]],
+    ) -> list[Mapping[str, object]]:
+        """Unconfirmed joins from a table's key-like columns to other sources.
+
+        A hint only: it grants no read authority and is never declared or stored.
+        """
+
+        name = cast(str, description["name"])
+        columns = {
+            cast(str, column["name"]).lower(): (
+                cast(str, column["name"]),
+                cast(str, column["type"]),
+            )
+            for column in cast(Sequence[Mapping[str, object]], description["columns"])
+        }
+        keyed = {
+            column.lower()
+            for key in (
+                description.get("primary_key", ()),
+                *cast(Sequence[Sequence[str]], description.get("unique_keys", ())),
+            )
+            for column in cast(Sequence[str], key)
+        } - {"id"}
+        key_like = {
+            column
+            for column in columns
+            if column.endswith(_KEY_SUFFIXES) or column in keyed
+        }
+        if not key_like:
+            return []
+        declared = set()
+        for relation in known:
+            for left, right in cast(Sequence[Sequence[str]], relation["columns"]):
+                if relation["from"] == name and (
+                    relation.get("from_source_id", source_id) == source_id
+                ):
+                    declared.add(
+                        (left, relation.get("to_source_id", source_id), relation["to"])
+                        + (right,)
+                    )
+                elif relation["to"] == name and (
+                    relation.get("to_source_id", source_id) == source_id
+                ):
+                    declared.add(
+                        (
+                            right,
+                            relation.get("from_source_id", source_id),
+                            relation["from"],
+                            left,
+                        )
+                    )
+        readable = await self.readable_resource_ids(agent_id)
+        found: dict[tuple[str, str, str, str], Mapping[str, object]] = {}
+        for registration in await self._active_registrations(agent_id, ()):
+            if registration.id == source_id:
+                continue
+            try:
+                resources = await self._service.tabular_resources(
+                    agent_id, registration.id
+                )
+            except CatalogStoreError:
+                continue
+            for item in resources:
+                if item.resource.id not in readable:
+                    continue
+                target = item.resource.native_identity
+                bare = target.rsplit(".", 1)[-1].lower()
+                primary = [
+                    column.name
+                    for column in item.tabular.columns
+                    if column.primary_key_ordinal
+                ]
+                for column in item.tabular.columns:
+                    for own in key_like:
+                        by_name = own == column.name.lower()
+                        stem = own.removesuffix("_id")
+                        by_stem = (
+                            own.endswith("_id")
+                            and bare in (stem, f"{stem}s")
+                            and (
+                                column.name.lower() == "id" or primary == [column.name]
+                            )
+                        )
+                        own_name, own_type = columns[own]
+                        if not (by_name or by_stem) or not _compatible(
+                            own_type, column.native_type
+                        ):
+                            continue
+                        if (own_name, registration.id, target, column.name) in declared:
+                            continue
+                        estimate = item.tabular.row_count_estimate
+                        found[(own_name, registration.id, target, column.name)] = {
+                            "column": own_name,
+                            "to": target,
+                            "to_source_id": registration.id,
+                            "to_kind": item.resource.kind.value,
+                            "to_column": column.name,
+                            **(
+                                {}
+                                if estimate is None
+                                else {"to_row_estimate": estimate}
+                            ),
+                            "status": "unconfirmed",
+                            "_exact": by_name,
+                        }
+        ordered = sorted(
+            found.items(),
+            key=lambda entry: (not entry[1]["_exact"], entry[0][1:], entry[0][0]),
+        )
+        return [
+            {key: value for key, value in candidate.items() if key != "_exact"}
+            for _, candidate in ordered
+        ]
+
     async def _cataloged_relationships(
-        self, agent_id: str, source_id: str, resource_id: str
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        current: Sequence[CatalogTabularResource],
     ) -> list[Mapping[str, object]]:
         """Relationships by name, including links declared across sources."""
 
         # Every source's readable set: a declared link needs its far endpoint.
+        readable = await self.readable_resource_ids(agent_id)
         projection = await self._service.schema_slice(
             CatalogSchemaRequest(
                 agent_id=agent_id,
@@ -503,7 +653,7 @@ class CatalogDataView:
                 max_join_depth=1,
                 relationship_limit=CATALOG_SCHEMA_TOOL_DEFAULT_RELATIONSHIPS,
             ),
-            readable_resource_ids=await self.readable_resource_ids(agent_id),
+            readable_resource_ids=readable,
         )
         known = {
             item.id: item
@@ -511,9 +661,29 @@ class CatalogDataView:
             if item.agent_id == agent_id
         }
         relationships: list[Mapping[str, object]] = []
-        for raw in cast(
+        raws = cast(
             tuple[Mapping[str, object], ...], projection.get("relationships", ())
-        ):
+        )
+        # One lookup per other source; a resource past its catalog budget has none.
+        estimates = {
+            item.resource.id: item.tabular.row_count_estimate for item in current
+        }
+        for other in {
+            end.source_id
+            for raw in raws
+            for key in ("from_resource_id", "to_resource_id")
+            if (end := known.get(cast(str, raw.get(key)))) is not None
+            and end.source_id != source_id
+        }:
+            try:
+                estimates.update(
+                    (item.resource.id, item.tabular.row_count_estimate)
+                    for item in await self._service.tabular_resources(agent_id, other)
+                    if item.resource.id in readable
+                )
+            except CatalogStoreError:
+                pass
+        for raw in raws:
             start = known.get(cast(str, raw.get("from_resource_id")))
             end = known.get(cast(str, raw.get("to_resource_id")))
             if start is None or end is None:
@@ -534,6 +704,11 @@ class CatalogDataView:
                         )
                     ],
                     "provenance": raw.get("provenance"),
+                    **{
+                        f"{side}_row_estimate": estimate
+                        for side, resource in (("from", start), ("to", end))
+                        if (estimate := estimates.get(resource.id)) is not None
+                    },
                 }
             )
         return relationships

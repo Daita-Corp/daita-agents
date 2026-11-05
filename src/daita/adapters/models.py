@@ -425,9 +425,51 @@ class SourceHealth:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class LinkCheck:
+    """What a live read says about how well two columns join.
+
+    ``match_rate`` is the share of distinct non-null ``from`` keys that also
+    appear among the ``to`` keys; the key counts and ``*_key_types`` (the value
+    types read, so ``"1"`` against ``1`` shows) explain it. A read that hit its
+    bound makes the check ``partial``: the rate is then only a partial rate. The
+    ``from`` side is a sample when ``from_truncated``, and matches can be
+    under-counted when ``to_truncated``. When ``error_code`` is set nothing was
+    compared and the numbers are ``None`` or empty.
+    """
+
+    from_source_id: str
+    from_table: str
+    from_columns: tuple[str, ...]
+    to_source_id: str
+    to_table: str
+    to_columns: tuple[str, ...]
+    checked_at: datetime
+    match_rate: float | None = None
+    partial: bool = False
+    from_keys: int | None = None
+    to_keys: int | None = None
+    matched_from: int | None = None
+    matched_to: int | None = None
+    from_key_types: tuple[str, ...] = ()
+    to_key_types: tuple[str, ...] = ()
+    from_truncated: bool = False
+    to_truncated: bool = False
+    error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        _aware(self.checked_at, "link check checked_at")
+        if self.error_code is not None and (
+            not isinstance(self.error_code, str)
+            or _ERROR_CODE.fullmatch(self.error_code) is None
+        ):
+            raise ValueError("link check error_code is invalid")
+
+
 __all__ = [
     "DiscoveryRequest",
     "DiscoveryResult",
+    "LinkCheck",
     "ResourceRef",
     "ResourceSnapshot",
     "SourceHealth",

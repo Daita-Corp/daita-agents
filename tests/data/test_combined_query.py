@@ -14,6 +14,7 @@ import pytest
 
 import daita.domains.data.capabilities as data_capabilities
 from daita import Agent, AgentConfig, SQLiteSource
+from daita._json import FrozenJsonObject, canonical_json
 from daita.adapters.models import (
     DiscoveryRequest,
     DiscoveryResult,
@@ -24,7 +25,12 @@ from daita.adapters.models import (
 )
 from daita.adapters.protocols import StaleResourceError
 from daita.adapters.registry import SourceBackendContext, SourceOperation, SourceType
-from daita.capabilities import CallTargetLane, CapabilityRegistry
+from daita.capabilities import (
+    CallTargetLane,
+    CapabilityRegistry,
+    ToolExecution,
+    ToolOutput,
+)
 from daita.capability_runtime import CapabilityRuntime
 from daita.catalog.models import (
     CatalogFacet,
@@ -44,10 +50,21 @@ from daita.domains.data import (
     DATA_QUERY_COMBINED_CAPABILITY_ID,
     DATA_QUERY_COMBINED_EVIDENCE_KIND,
 )
-from daita.domains.data.capabilities import ReadTabularRequest, SqlReadResult
+from daita.domains.data.capabilities import (
+    DataQueryCombinedExecutor,
+    DataQueryError,
+    ReadTabularRequest,
+    SqlReadResult,
+)
 from daita.domains.data.results import project_result_rows
 from daita.domains.data.sql import CheckedRead
-from daita.llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
+from daita.llm.models import (
+    ModelProfile,
+    ModelSensitivity,
+    ToolCall,
+    ToolResultBlock,
+    model_tool_result,
+)
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
 from tests.support.capability_runtime import execute_projected
@@ -223,7 +240,7 @@ def _error(result: ToolResultBlock) -> Mapping[str, object]:
 
 
 class _CountingBackend:
-    """Delegate source reads, counting them and running a hook before each."""
+    """Delegate source reads, recording them and running a hook before each."""
 
     def __init__(
         self,
@@ -233,12 +250,22 @@ class _CountingBackend:
         self.delegate = delegate
         self.before = before
         self.reads: list[str] = []
+        self.requests: list[Mapping[str, object]] = []
+        self.active: dict[str, int] = {}
+        self.peak: dict[str, int] = {}
 
     async def execute_read(self, **request: object) -> SqlReadResult:
-        self.reads.append(cast(str, request["source_id"]))
+        source = cast(str, request["source_id"])
+        self.reads.append(source)
+        self.requests.append(request)
         if self.before is not None:
             self.before(request)
-        return await self.delegate.execute_read(**request)  # type: ignore[attr-defined]
+        self.active[source] = self.active.get(source, 0) + 1
+        self.peak[source] = max(self.peak.get(source, 0), self.active[source])
+        try:
+            return await self.delegate.execute_read(**request)  # type: ignore[attr-defined]
+        finally:
+            self.active[source] -= 1
 
 
 def _wrap_sqlite_reads(
@@ -450,6 +477,7 @@ async def test_definition_describes_only_the_routes_a_run_admits(tmp_path: Path)
 async def test_two_inputs_on_one_sqlite_source_share_its_single_permit(tmp_path: Path):
     shop = await _shop(tmp_path)
     try:
+        reads = _wrap_sqlite_reads(shop.agent)
         result = await asyncio.wait_for(
             _call(
                 shop,
@@ -481,6 +509,8 @@ async def test_two_inputs_on_one_sqlite_source_share_its_single_permit(tmp_path:
     assert tuple(dict(row) for row in _data(result)["rows"]) == (  # type: ignore[attr-defined]
         {"n": 5},
     )
+    assert reads.reads == [shop.orders_source] * 2
+    assert reads.peak == {shop.orders_source: 1}
 
 
 class _RecordingCoordinator:
@@ -538,35 +568,27 @@ async def test_input_permits_are_taken_once_each_in_sorted_source_order(
     assert recorder.events[2:] == ["release source:source:b", "release source:source:a"]
 
 
-async def test_input_exactly_at_its_row_ceiling_joins_and_past_its_bytes_refuses(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("form", "limit", "alias", "reason"),
+    [
+        ("sql", ("ROWS", 2), "o", "row_limit"),
+        ("tabular", ("ROWS", 3), "r", "row_limit"),
+        ("sql", ("BYTES", 16), "o", "byte_limit"),
+    ],
+    ids=["sql_rows", "tabular_rows", "sql_bytes"],
+)
+async def test_input_over_the_shared_budget_refuses_the_call_with_no_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    form: str,
+    limit: tuple[str, int],
+    alias: str,
+    reason: str,
 ):
-    # Both inputs return exactly three rows.
-    monkeypatch.setattr(data_capabilities, "COMBINED_QUERY_INPUT_MAX_ROWS", 3)
-    shop = await _shop(tmp_path)
-    try:
-        at_ceiling = await _call(
-            shop, {"inputs": _inputs(shop), "sql": REVENUE_BY_REGION}
-        )
-        monkeypatch.setattr(data_capabilities, "COMBINED_QUERY_INPUT_MAX_BYTES", 16)
-        past_bytes = await _call(
-            shop, {"inputs": _inputs(shop), "sql": REVENUE_BY_REGION}
-        )
-    finally:
-        await shop.agent.close()
-
-    assert _data(at_ceiling)["truncated"] is False
-    error = _error(past_bytes)
-    assert error["code"] == "combined_input_truncated"
-    details = cast(Mapping[str, object], error["details"])
-    assert details["truncation_reasons"] == ("byte_limit",)
-
-
-@pytest.mark.parametrize("orders_form", ["sql", "tabular"])
-async def test_input_past_its_internal_ceiling_refuses_the_whole_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, orders_form: str
-):
-    monkeypatch.setattr(data_capabilities, "COMBINED_QUERY_INPUT_MAX_ROWS", 2)
+    # Even alone, with the budget the other input freed, the input does not fit.
+    monkeypatch.setattr(
+        data_capabilities, f"COMBINED_QUERY_TOTAL_MAX_{limit[0]}", limit[1]
+    )
     shop = await _shop(tmp_path, _MEMORY)
     try:
         arguments: dict[str, object] = {
@@ -574,7 +596,7 @@ async def test_input_past_its_internal_ceiling_refuses_the_whole_call(
             "sql": REVENUE_BY_REGION,
         }
         scope = None
-        if orders_form == "tabular":
+        if form == "tabular":
             regions_source, regions = await _regions(shop)
             arguments = {
                 "inputs": (_tabular_regions(regions_source, regions), _inputs(shop)[1]),
@@ -588,8 +610,46 @@ async def test_input_past_its_internal_ceiling_refuses_the_whole_call(
     error = _error(result)
     assert error["code"] == "combined_input_truncated"
     details = cast(Mapping[str, object], error["details"])
-    assert details["alias"] == ("r" if orders_form == "tabular" else "o")
-    assert details["truncation_reasons"] == ("row_limit",)
+    assert details["alias"] == alias
+    assert details["truncation_reasons"] == (reason,)
+    assert result.is_error and "data" not in result.output
+
+
+async def test_input_too_big_for_its_first_share_is_read_again_with_what_is_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Five order rows and three customer rows: each first gets 4, the customers
+    # use 3, so the orders read again alone with 5.
+    monkeypatch.setattr(data_capabilities, "COMBINED_QUERY_TOTAL_MAX_ROWS", 8)
+    shop = await _shop(tmp_path)
+    try:
+        reads = _wrap_sqlite_reads(shop.agent)
+        orders, customers = _inputs(shop)
+        result = await _call(
+            shop,
+            {
+                "inputs": (
+                    {**orders, "sql": "SELECT customer_id, total FROM orders"},
+                    customers,
+                ),
+                "sql": "SELECT COUNT(*) AS n FROM o JOIN c ON c.id = o.customer_id",
+            },
+        )
+    finally:
+        await shop.agent.close()
+
+    data = _data(result)
+    assert tuple(dict(row) for row in data["rows"]) == ({"n": 5},)  # type: ignore[attr-defined]
+    assert data["truncated"] is False
+    order_reads = [
+        cast(int, item["max_rows"])
+        for item in reads.requests
+        if item["source_id"] == shop.orders_source
+    ]
+    assert len(order_reads) == 2 and order_reads[1] > order_reads[0]
+    inputs = cast(tuple[Mapping[str, object], ...], data["inputs"])
+    assert [item["rows"] for item in inputs] == [5, 3]
+    assert all(cast(int, item["read_ms"]) >= 0 for item in inputs)
 
 
 async def test_schema_change_during_a_call_does_not_disturb_the_join(
@@ -731,11 +791,6 @@ async def test_combining_sql_outside_the_input_aliases_is_rejected_before_execut
             {"filters": ({"column": "revenue", "operator": "lt", "value": {"n": 2}},)},
             "tabular_filter_invalid",
         ),
-        ({"columns": ("region", "country")}, "tabular_column_unknown"),
-        (
-            {"filters": ({"column": "tier", "operator": "eq", "value": "gold"},)},
-            "tabular_column_unknown",
-        ),
     ],
     ids=[
         "not_equal",
@@ -747,11 +802,9 @@ async def test_combining_sql_outside_the_input_aliases_is_rejected_before_execut
         "eq_array",
         "range_null",
         "range_object",
-        "unknown_column",
-        "unknown_filter_column",
     ],
 )
-async def test_tabular_input_outside_equality_in_and_range_on_catalog_columns_is_refused(
+async def test_tabular_input_outside_equality_in_and_range_is_refused(
     tmp_path: Path, changes: Mapping[str, object], code: str
 ):
     shop = await _shop(tmp_path, _MEMORY)
@@ -984,3 +1037,411 @@ async def test_tabular_input_on_a_type_without_tabular_reads_is_refused(
     assert error["code"] == "tabular_source_adapter_unsupported"
     assert cast(Mapping[str, object], error["details"])["input_alias"] == "t"
     assert reads.reads == []
+
+
+class _ScriptedBackend:
+    """A SQL backend returning fixed rows within the grant it is given."""
+
+    def __init__(
+        self,
+        rows: tuple[dict[str, object], ...] = ({"n": 1},),
+        during: Callable[[Mapping[str, object]], object] | None = None,
+    ) -> None:
+        self.rows = rows
+        self.during = during
+        self.requests: list[Mapping[str, object]] = []
+
+    async def execute_read(self, **request: object) -> SqlReadResult:
+        self.requests.append(request)
+        if self.during is not None:
+            await cast(Callable[..., object], self.during)(request)  # type: ignore[misc]
+        read = cast(CheckedRead, request["read"])
+        return SqlReadResult(
+            source_id=str(request["source_id"]),
+            canonical_sql=read.canonical_sql,
+            sql_fingerprint=read.sql_fingerprint,
+            resource_ids=(),
+            columns=("n",),
+            projection=project_result_rows(
+                self.rows,
+                max_rows=cast(int, request["max_rows"]),
+                max_bytes=cast(int, request["max_bytes"]),
+            ),
+        )
+
+
+class _ScriptedEngine:
+    def __init__(self, **extra: object) -> None:
+        self.extra = extra
+
+    async def query_relations(self, **_: object) -> FrozenJsonObject:
+        return FrozenJsonObject.from_mapping(
+            {
+                "canonical_sql": "SELECT 1",
+                "columns": ("n",),
+                "rows": ({"n": 1},),
+                "observed_rows": 1,
+                "returned_rows": 1,
+                "utf8_bytes": 7,
+                "row_limit": 100,
+                "byte_limit": 16_384,
+                "truncated": False,
+                "truncation_reasons": (),
+                "sql_fingerprint": "sha256:" + "3" * 64,
+                **self.extra,
+            }
+        )
+
+
+def _direct_execution(*placements: tuple[str, str]) -> ToolExecution:
+    """Inputs as (alias, source); the source is also its backend's name."""
+
+    read = CheckedRead(
+        canonical_sql="SELECT 1", sql_fingerprint="sha256:" + "1" * 64
+    ).to_mapping()
+    return ToolExecution(
+        run_id="run",
+        call_id="call",
+        capability_id=DATA_QUERY_COMBINED_CAPABILITY_ID,
+        arguments={
+            "inputs": tuple(
+                {
+                    "alias": alias,
+                    "source_id": source,
+                    "sql": "SELECT 1",
+                    "_adapter_id": source,
+                    "_reads": (read,),
+                }
+                for alias, source in placements
+            ),
+            "sql": "SELECT 1",
+            "_sql_fingerprint": "sha256:" + "2" * 64,
+        },
+    )
+
+
+def _direct(
+    backends: Mapping[str, object],
+    engine: object | None = None,
+    clock: Callable[[], float] = lambda: 0.0,
+) -> DataQueryCombinedExecutor:
+    return DataQueryCombinedExecutor(
+        "agent",
+        cast(Mapping[str, object], backends),  # type: ignore[arg-type]
+        cast(object, engine or _ScriptedEngine()),  # type: ignore[arg-type]
+        clock=clock,
+    )
+
+
+async def test_sources_read_at_the_same_time_and_one_source_one_input_at_a_time():
+    started: dict[str, asyncio.Event] = {"a": asyncio.Event(), "b": asyncio.Event()}
+    active = {"a": 0, "b": 0}
+    peak = {"a": 0, "b": 0}
+
+    async def during(request: Mapping[str, object]) -> None:
+        source = cast(str, request["source_id"])
+        other = "b" if source == "a" else "a"
+        active[source] += 1
+        peak[source] = max(peak[source], active[source])
+        started[source].set()
+        # Each source's first read can only finish once the other has started.
+        await asyncio.wait_for(started[other].wait(), timeout=10)
+        active[source] -= 1
+
+    backends = {
+        "a": _ScriptedBackend(during=during),
+        "b": _ScriptedBackend(during=during),
+    }
+    output = await _direct(backends).execute(
+        _direct_execution(("x", "a"), ("y", "b"), ("z", "a"))
+    )
+
+    assert peak == {"a": 1, "b": 1}
+    assert [len(item.requests) for item in backends.values()] == [2, 1]
+    assert [item["alias"] for item in output.data["inputs"]] == ["x", "y", "z"]  # type: ignore[attr-defined]
+
+
+async def test_concurrent_grants_never_exceed_the_shared_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(data_capabilities, "COMBINED_QUERY_TOTAL_MAX_ROWS", 30)
+    monkeypatch.setattr(data_capabilities, "COMBINED_QUERY_TOTAL_MAX_BYTES", 3_000)
+    outstanding = {"rows": 0, "bytes": 0}
+    peak = {"rows": 0, "bytes": 0}
+    started = 0
+    first_wave = asyncio.Event()
+
+    async def during(request: Mapping[str, object]) -> None:
+        nonlocal started
+        outstanding["rows"] += cast(int, request["max_rows"])
+        outstanding["bytes"] += cast(int, request["max_bytes"])
+        for key in peak:
+            peak[key] = max(peak[key], outstanding[key])
+        started += 1
+        if started == 3:
+            first_wave.set()
+        # The three sources' first reads are all in flight together.
+        await asyncio.wait_for(first_wave.wait(), timeout=10)
+        outstanding["rows"] -= cast(int, request["max_rows"])
+        outstanding["bytes"] -= cast(int, request["max_bytes"])
+
+    backends = {name: _ScriptedBackend(during=during) for name in "abc"}
+    await _direct(backends).execute(
+        _direct_execution(*((f"{name}{n}", name) for n in (1, 2) for name in "abc"))
+    )
+
+    assert peak["rows"] <= 30 and peak["bytes"] <= 3_000
+    first = [item.requests[0]["max_rows"] for item in backends.values()]
+    second = [item.requests[1]["max_rows"] for item in backends.values()]
+    # Small first reads freed budget for the reads that started later.
+    assert max(cast(list[int], first)) < min(cast(list[int], second))
+
+
+async def test_failed_input_cancels_its_sibling_and_reports_its_own_error():
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+
+    async def slow(request: Mapping[str, object]) -> None:
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            sibling_cancelled.set()
+            raise
+
+    async def fail(request: Mapping[str, object]) -> None:
+        await sibling_started.wait()
+        raise DataQueryError("source_read_failed", "The source refused the read.")
+
+    backends = {"a": _ScriptedBackend(during=fail), "b": _ScriptedBackend(during=slow)}
+    with pytest.raises(DataQueryError) as raised:
+        await asyncio.wait_for(
+            _direct(backends).execute(_direct_execution(("x", "a"), ("y", "b"))),
+            timeout=10,
+        )
+
+    assert raised.value.code == "source_read_failed"
+    assert raised.value.details["input_alias"] == "x"  # type: ignore[attr-defined]
+    assert sibling_cancelled.is_set()
+
+
+async def test_cancelling_the_call_cancels_the_reads_and_propagates():
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def hang(request: Mapping[str, object]) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    backends = {"a": _ScriptedBackend(during=hang), "b": _ScriptedBackend(during=hang)}
+    task = asyncio.ensure_future(
+        _direct(backends).execute(_direct_execution(("x", "a"), ("y", "b")))
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()
+
+
+@pytest.mark.parametrize("elapsed", [15.0, 14.995])
+async def test_inputs_past_the_shared_deadline_are_not_read(elapsed: float):
+    times = iter((0.0, elapsed))
+    backends = {"a": _ScriptedBackend(), "b": _ScriptedBackend()}
+    with pytest.raises(DataQueryError) as raised:
+        await _direct(backends, clock=lambda: next(times)).execute(
+            _direct_execution(("x", "a"), ("y", "b"))
+        )
+
+    assert raised.value.code == "query_time_limit"
+    assert not any(item.requests for item in backends.values())
+
+
+async def test_result_reports_read_times_and_how_the_joins_matched():
+    checks = (
+        {
+            "left": "o.customer_id",
+            "right": "c.id",
+            "left_type": "BIGINT",
+            "right_type": "INTEGER",
+            "left_rows": 5,
+            "right_rows": 3,
+            "left_unmatched": 2,
+            "right_unmatched": 1,
+        },
+        {
+            "left": "o.code",
+            "right": "c.code",
+            "left_type": "VARCHAR",
+            "right_type": "BIGINT",
+            "left_rows": 5,
+            "right_rows": 3,
+            "left_unmatched": 0,
+            "right_unmatched": 0,
+        },
+        {
+            "left": "o.tag",
+            "right": "c.tag",
+            "left_type": "VARCHAR",
+            "right_type": "VARCHAR",
+            "left_rows": 5,
+            "right_rows": 3,
+            "left_unmatched": 2,
+            "right_unmatched": 1,
+            "left_near_matches": 1,
+            "right_near_matches": 0,
+        },
+    )
+    backends = {"a": _ScriptedBackend(), "b": _ScriptedBackend()}
+    engine = _ScriptedEngine(join_checks=checks, join_checks_status="partial")
+    data = (
+        await _direct(backends, engine).execute(
+            _direct_execution(("x", "a"), ("y", "b"))
+        )
+    ).data
+    plain = (
+        await _direct(backends).execute(_direct_execution(("x", "a"), ("y", "b")))
+    ).data
+
+    assert "read_at" in str(data["read_consistency"])
+    assert len(data["join_checks"]) == 3  # type: ignore[arg-type]
+    warnings = cast(tuple[str, ...], data["warnings"])
+    assert (
+        "o.customer_id = c.id: 2 of 5 rows in o.customer_id have no match; "
+        "1 of 3 rows in c.id have no match." in warnings
+    )
+    # BIGINT and INTEGER are one family; VARCHAR and BIGINT are not.
+    assert sum("key types differ" in item for item in warnings) == 1
+    assert any("o.code = c.code" in item for item in warnings)
+    # Near matches are named once, only for the side that has them, and a
+    # clean mismatch adds no format warning.
+    assert sum("case and surrounding spaces" in item for item in warnings) == 1
+    assert any("1 unmatched rows in o.tag would match" in item for item in warnings)
+    assert len(warnings) == 5 and "unaffected" in warnings[-1]
+    # An engine with no check results adds neither key.
+    assert "join_checks" not in plain and "warnings" not in plain
+
+
+async def test_older_stored_combined_result_still_validates(tmp_path: Path):
+    agent = await _agent(tmp_path)
+    try:
+        registry: CapabilityRegistry = agent._embedded._capabilities
+        stored = {
+            "byte_limit": 16_384,
+            "canonical_sql": "SELECT 1",
+            "columns": ("n",),
+            "inputs": ({"alias": "o", "source_id": "s", "rows": 1},),
+            "resource_ids": (),
+            "returned_rows": 1,
+            "row_limit": 100,
+            "rows": ({"n": 1},),
+            "sql_fingerprint": "sha256:" + "3" * 64,
+            "tables_touched": (),
+            "timing": {"elapsed_ms": 1},
+            "total_rows": 1,
+            "truncated": False,
+            "truncation_reasons": (),
+            "trust_classification": "untrusted_external_data",
+            "utf8_bytes": 7,
+        }
+        output = ToolOutput(kind=DATA_QUERY_COMBINED_EVIDENCE_KIND, data=stored)
+        assert registry.validate_output(DATA_QUERY_COMBINED_CAPABILITY_ID, output)
+        newer = ToolOutput(
+            kind=DATA_QUERY_COMBINED_EVIDENCE_KIND,
+            data={**stored, "read_consistency": "x", "join_checks": (), "warnings": ()},
+        )
+        assert registry.validate_output(DATA_QUERY_COMBINED_CAPABILITY_ID, newer)
+    finally:
+        await agent.close()
+
+
+class _BrokenStore:
+    def __getattr__(self, name: str) -> object:
+        from daita.catalog.protocols import CatalogStoreError
+
+        raise CatalogStoreError(name)
+
+
+@pytest.mark.parametrize("catalog", ["unlisted", "failing"])
+async def test_tabular_input_reads_without_the_catalog_and_shows_no_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, catalog: str
+):
+    shop = await _shop(tmp_path, _MEMORY)
+    try:
+        regions_source, _ = await _regions(shop)
+        if catalog == "failing":
+            monkeypatch.setattr(
+                shop.agent._embedded._data_view, "_store", _BrokenStore()
+            )
+        # "ghost" is no catalog table; the source serves what it is asked for.
+        result = await _call(
+            shop,
+            {
+                "inputs": (
+                    _inputs(shop)[1],
+                    _tabular_regions("Regions", "ghost"),
+                ),
+                "sql": REGION_CUSTOMERS,
+            },
+            scope=(shop.customers_source, regions_source),
+        )
+    finally:
+        await shop.agent.close()
+
+    data = _data(result)
+    assert len(data["rows"]) == 2  # type: ignore[arg-type]
+    shown = canonical_json(model_tool_result(result, "r1"))
+    assert "catalog-resource:" not in shown and "source:sha256" not in shown
+    names = [item["name"] for item in data["tables_touched"]]  # type: ignore[attr-defined]
+    assert "ghost" in names
+
+
+async def test_source_that_cannot_serve_a_column_gives_a_corrective_failure(
+    tmp_path: Path,
+):
+    shop = await _shop(tmp_path, _MEMORY)
+    try:
+        regions_source, regions = await _regions(shop)
+        registry: CapabilityRegistry = shop.agent._embedded._capabilities
+        _, executor = registry.resolve_execution(DATA_QUERY_COMBINED_CAPABILITY_ID)
+        memory = executor._tabular_backends[MEMORY_ADAPTER_ID]  # type: ignore[attr-defined]
+
+        class _WithoutCountry:
+            async def read_tabular(self, request: ReadTabularRequest):
+                served = tuple(c for c in request.columns if c != "country")
+                return await memory.read_tabular(
+                    ReadTabularRequest(
+                        agent_id=request.agent_id,
+                        source_id=request.source_id,
+                        resource_id=request.resource_id,
+                        columns=served,
+                        filters=request.filters,
+                        limit=request.limit,
+                        max_bytes=request.max_bytes,
+                    )
+                )
+
+        executor._tabular_backends[MEMORY_ADAPTER_ID] = _WithoutCountry()  # type: ignore[attr-defined]
+        result = await _call(
+            shop,
+            {
+                "inputs": (
+                    _inputs(shop)[1],
+                    _tabular_regions(
+                        regions_source, regions, columns=("region", "country")
+                    ),
+                ),
+                "sql": REGION_CUSTOMERS,
+            },
+            scope=(shop.customers_source, regions_source),
+        )
+    finally:
+        await shop.agent.close()
+
+    error = _error(result)
+    assert error["code"] == "tabular_columns_unavailable"
+    assert cast(Mapping[str, object], error["details"])["alias"] == "r"

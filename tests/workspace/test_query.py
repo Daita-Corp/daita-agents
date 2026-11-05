@@ -13,16 +13,18 @@ import time
 from collections.abc import Mapping
 from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 from daita import Agent, LocalFileAccess, LocalWorkspace
-from daita._json import FrozenJsonObject
+from daita._json import FrozenJsonObject, thaw_json
 from daita.adapters import local_file_query as query_module
 from daita.adapters.local_file_query import (
+    LocalFileQueryBackend,
     LocalFileQueryError,
     LocalFileQueryLimits,
+    QueryRelation,
 )
 from daita.adapters.local_workspace import (
     LocalWorkspaceBackend,
@@ -34,6 +36,7 @@ from daita.domains.data.sql import (
     DuckDBReadValidationError,
     validate_duckdb_read,
 )
+from daita.domains.data.sql.duckdb_read import equality_joins
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -625,11 +628,10 @@ def test_worker_pipe_connection_reset_is_a_closed_stream() -> None:
         "status": "success",
         "data": {},
     }
+    received: dict[str, object] = {"final": final}
     connection = cast(Connection, ResetConnection())
-    assert (
-        query_module._receive_messages(connection, final, LocalFileQueryLimits())
-        is final
-    )
+    query_module._receive_messages(connection, received, LocalFileQueryLimits())
+    assert received["final"] is final
 
 
 async def test_concurrent_queries_wait_for_the_worker_instead_of_failing(
@@ -919,3 +921,343 @@ async def test_hosted_registry_contains_no_folder_query_authority(
         assert PATH_QUERY_EXECUTOR_ID not in hosted._capabilities._executors
     finally:
         await hosted.close()
+
+
+def _thawed(payload: FrozenJsonObject) -> dict[str, Any]:
+    return cast(dict[str, Any], thaw_json(payload))
+
+
+def _relation_query(
+    sql: str, relations: tuple[query_module.QueryRelation, ...]
+) -> tuple[str, str]:
+    names = tuple(item.name for item in relations)
+    checked = validate_duckdb_read(sql, names)
+    return checked.canonical_sql, checked.sql_fingerprint
+
+
+async def test_combined_query_reports_planted_join_mismatches_and_key_types(
+    tmp_path: Path,
+) -> None:
+    backend = LocalFileQueryBackend(scratch_parent=tmp_path / "scratch")
+    orders = QueryRelation(
+        "orders",
+        ("id", "customer_id", "tag"),
+        (
+            {"id": 1, "customer_id": 1, "tag": "acc-1"},
+            {"id": 2, "customer_id": 2, "tag": "ACC-1 "},
+            {"id": 3, "customer_id": 99, "tag": "x"},
+            {"id": 4, "customer_id": None, "tag": "y"},
+        ),
+    )
+    customers = QueryRelation(
+        "customers",
+        ("id", "name", "tag"),
+        (
+            {"id": 1, "name": "a", "tag": "acc-1"},
+            {"id": 2, "name": "b", "tag": "acc-2"},
+            {"id": 7, "name": "c", "tag": "ACC-1"},
+        ),
+    )
+    sql, fingerprint = _relation_query(
+        "SELECT o.id, c.name FROM orders AS o JOIN customers AS c "
+        "ON o.customer_id = c.id AND o.tag = c.tag",
+        (orders, customers),
+    )
+    try:
+        payload = _thawed(
+            await backend.query_relations(
+                relations=(orders, customers),
+                canonical_sql=sql,
+                sql_fingerprint=fingerprint,
+            )
+        )
+    finally:
+        await backend.close()
+
+    assert payload["join_checks_status"] == "complete"
+    assert payload["join_checks"] == [
+        {
+            "left": "o.customer_id",
+            "right": "c.id",
+            "left_type": "BIGINT",
+            "right_type": "BIGINT",
+            "left_rows": 4,
+            "right_rows": 3,
+            # 99 and the NULL key have no customer; customer 7 has no order.
+            "left_unmatched": 2,
+            "right_unmatched": 1,
+            "left_near_matches": 0,
+            "right_near_matches": 0,
+        },
+        {
+            "left": "o.tag",
+            "right": "c.tag",
+            "left_type": "VARCHAR",
+            "right_type": "VARCHAR",
+            "left_rows": 4,
+            "right_rows": 3,
+            "left_unmatched": 3,
+            "right_unmatched": 2,
+            # Only 'ACC-1 ' (padded, upper) and 'ACC-1' (upper) differ in format.
+            "left_near_matches": 1,
+            "right_near_matches": 1,
+        },
+    ]
+    assert len(payload["rows"]) == 1
+
+
+async def test_combined_query_of_sixteen_relations_without_a_join_has_no_checks(
+    tmp_path: Path,
+) -> None:
+    backend = LocalFileQueryBackend(scratch_parent=tmp_path / "scratch")
+    relations = tuple(
+        QueryRelation(f"t{index}", ("v",), ({"v": index},)) for index in range(16)
+    )
+    sql, fingerprint = _relation_query(
+        " UNION ALL ".join(f"SELECT v FROM t{index}" for index in range(16)),
+        relations,
+    )
+    try:
+        payload = _thawed(
+            await backend.query_relations(
+                relations=relations, canonical_sql=sql, sql_fingerprint=fingerprint
+            )
+        )
+    finally:
+        await backend.close()
+
+    assert payload["join_checks"] == []
+    assert payload["join_checks_status"] == "complete"
+    assert len(payload["rows"]) == 16
+
+
+async def test_combined_query_keeps_its_rows_when_a_join_check_cannot_run(
+    tmp_path: Path,
+) -> None:
+    backend = LocalFileQueryBackend(scratch_parent=tmp_path / "scratch")
+    left = QueryRelation("a", ("k",), ({"k": "1"}, {"k": "abc"}))
+    right = QueryRelation("b", ("id",), ({"id": 1},))
+    # The filter keeps the unparseable key away from the query's own cast, which
+    # the diagnostic count (it has no WHERE) still has to evaluate.
+    sql, fingerprint = _relation_query(
+        "SELECT a.k FROM a JOIN b ON CAST(a.k AS BIGINT) = b.id WHERE a.k <> 'abc'",
+        (left, right),
+    )
+    try:
+        payload = _thawed(
+            await backend.query_relations(
+                relations=(left, right), canonical_sql=sql, sql_fingerprint=fingerprint
+            )
+        )
+    finally:
+        await backend.close()
+
+    assert len(payload["rows"]) == 1
+    assert payload["join_checks_status"] == "partial"
+    (check,) = payload["join_checks"]
+    assert check["left_unmatched"] is None
+    assert check["right_rows"] == 1
+
+
+def test_join_checks_that_run_out_of_time_report_what_they_could_not_measure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import duckdb
+
+    from daita.domains.data.sql.duckdb_read import EqualityJoin
+
+    class Sent:
+        messages: list[bytes] = []
+
+        def send_bytes(self, value: bytes) -> None:
+            self.messages.append(value)
+
+    slow = "SELECT count(*) FROM range(100000000000)"
+    quick = "SELECT 3"
+    joins = (
+        EqualityJoin(
+            "a.x", "b.y", quick, quick, slow, quick, quick, quick, quick, quick
+        ),
+        EqualityJoin(
+            "a.x", "b.z", quick, quick, quick, quick, quick, quick, quick, quick
+        ),
+    )
+    monkeypatch.setattr(query_module, "_JOIN_CHECK_SECONDS", 0.3)
+    sent = Sent()
+    connection = duckdb.connect(":memory:")
+    started = time.monotonic()
+    query_module._send_join_checks(cast(Connection, sent), connection, joins, 1_000_000)
+
+    assert time.monotonic() - started < 5
+    message = json.loads(sent.messages[0])
+    assert message["status"] == "partial"
+    assert message["checks"][0]["left_unmatched"] is None
+    assert message["checks"][0]["left_rows"] == 3
+
+
+async def test_combined_query_result_survives_a_join_check_step_that_never_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(query_module, "_private_worker_entry", _result_then_hang)
+    monkeypatch.setattr(query_module, "_JOIN_CHECK_SECONDS", 0.2)
+    backend = LocalFileQueryBackend(scratch_parent=tmp_path / "scratch")
+    relation = QueryRelation("t", ("v",), ({"v": 1},))
+    sql, fingerprint = _relation_query("SELECT v FROM t", (relation,))
+    started = time.monotonic()
+    try:
+        payload = _thawed(
+            await backend.query_relations(
+                relations=(relation,), canonical_sql=sql, sql_fingerprint=fingerprint
+            )
+        )
+    finally:
+        await backend.close()
+
+    assert payload["rows"] == [{"v": 1}]
+    assert payload["join_checks_status"] == "unavailable"
+    assert payload["join_checks"] == []
+    assert time.monotonic() - started < 10
+
+
+def _result_then_hang(connection: Connection, scratch_text: str) -> None:
+    del scratch_text
+    connection.recv_bytes()
+    connection.send_bytes(
+        json.dumps(
+            {"kind": "final", "status": "success", "data": {"rows": [{"v": 1}]}}
+        ).encode("utf-8")
+    )
+    time.sleep(60)
+
+
+_JOIN_COLUMNS = {
+    "orders": frozenset({"id", "customer_id", "code"}),
+    "customers": frozenset({"cid", "name", "code"}),
+}
+
+
+def _joins(sql: str) -> tuple[object, ...]:
+    return equality_joins(
+        validate_duckdb_read(sql, ("orders", "customers")).canonical_sql,
+        _JOIN_COLUMNS,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "labels"),
+    (
+        (
+            "SELECT 1 FROM orders o JOIN customers c ON o.customer_id = c.cid",
+            [("o.customer_id", "c.cid")],
+        ),
+        (
+            "SELECT 1 FROM orders JOIN customers ON customer_id = cid",
+            [("customer_id", "cid")],
+        ),
+        (
+            "SELECT 1 FROM orders o JOIN customers c USING (code)",
+            [("o.code", "c.code")],
+        ),
+        (
+            "SELECT 1 FROM orders o, customers c WHERE o.customer_id = c.cid AND o.id > 1",
+            [("o.customer_id", "c.cid")],
+        ),
+        (
+            "WITH big AS (SELECT * FROM orders WHERE id > 1) "
+            "SELECT 1 FROM big b JOIN (SELECT cid FROM customers) d ON b.customer_id = d.cid",
+            [("b.customer_id", "d.cid")],
+        ),
+        (
+            "SELECT 1 FROM orders o JOIN customers c "
+            "ON CAST(o.customer_id AS VARCHAR) = TRIM(c.cid)",
+            [("CAST(o.customer_id AS TEXT)", "TRIM(c.cid)")],
+        ),
+        (
+            "SELECT 1 FROM orders o JOIN customers c ON o.customer_id > c.cid "
+            "AND (o.id = 1 OR o.code = c.code) AND o.id = o.customer_id "
+            "AND o.code = (SELECT max(code) FROM customers)",
+            [],
+        ),
+    ),
+)
+def test_equality_joins_find_only_plain_column_to_column_equalities(
+    sql: str, labels: list[tuple[str, str]]
+) -> None:
+    assert [(item.left, item.right) for item in _joins(sql)] == labels  # type: ignore[attr-defined]
+
+
+def test_equality_join_diagnostics_run_and_count_null_keys_as_unmatched() -> None:
+    import duckdb
+
+    connection = duckdb.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE orders AS SELECT * FROM (VALUES (1, 1), (2, NULL), (3, 9)) t(id, customer_id)"
+    )
+    connection.execute(
+        "CREATE TABLE customers AS SELECT * FROM (VALUES (1, 'a'), (5, 'b')) t(cid, name)"
+    )
+    (join,) = _joins(
+        "WITH o2 AS (SELECT * FROM orders) "
+        "SELECT 1 FROM o2 o JOIN customers c ON o.customer_id = c.cid"
+    )
+
+    def value(sql: str, column: int = 0) -> object:
+        return connection.execute(sql).fetchall()[0][column]
+
+    assert value("DESCRIBE " + join.left_key_sql, 1) == "INTEGER"  # type: ignore[attr-defined]
+    assert value(join.left_rows_sql) == 3  # type: ignore[attr-defined]
+    assert value(join.right_rows_sql) == 2  # type: ignore[attr-defined]
+    assert value(join.left_unmatched_sql) == 2  # type: ignore[attr-defined]
+    assert value(join.right_unmatched_sql) == 1  # type: ignore[attr-defined]
+    assert value(join.left_near_sql) == 0  # type: ignore[attr-defined]
+    assert value(join.right_near_sql) == 0  # type: ignore[attr-defined]
+
+
+def test_near_match_diagnostics_see_case_and_padding_through_alias_cte_and_cast() -> (
+    None
+):
+    import duckdb
+
+    connection = duckdb.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE orders AS SELECT * FROM (VALUES "
+        "(1, 'ACC-1 '), (2, 'acc-1'), (3, 'ACC-2'), (4, NULL)) t(id, code)"
+    )
+    connection.execute(
+        "CREATE TABLE customers AS SELECT * FROM (VALUES "
+        "(10, 'acc-1'), (11, 'acc-9')) t(cid, code)"
+    )
+
+    def counts(sql: str, columns: dict[str, frozenset[str]]) -> tuple[object, ...]:
+        (join,) = equality_joins(
+            validate_duckdb_read(sql, ("orders", "customers")).canonical_sql, columns
+        )
+        return tuple(
+            connection.execute(text).fetchall()[0][0]
+            for text in (
+                join.left_unmatched_sql,
+                join.left_near_sql,
+                join.right_unmatched_sql,
+                join.right_near_sql,
+            )
+        )
+
+    # 'ACC-1 ' is near the customer's 'acc-1'; 'ACC-2' and NULL are not.
+    assert counts(
+        "WITH o2 AS (SELECT * FROM orders) "
+        "SELECT 1 FROM o2 o JOIN customers c ON o.code = c.code",
+        _JOIN_COLUMNS,
+    ) == (3, 1, 1, 0)
+    assert counts(
+        "SELECT 1 FROM orders o JOIN customers c "
+        "ON CAST(o.code AS VARCHAR) = CAST(c.code AS VARCHAR)",
+        _JOIN_COLUMNS,
+    ) == (3, 1, 1, 0)
+
+
+def test_equality_joins_never_raise_and_are_capped() -> None:
+    assert equality_joins("not sql at all (", {}) == ()
+    many = " ".join(
+        f"JOIN customers c{n} ON o.customer_id = c{n}.cid" for n in range(20)
+    )
+    assert len(equality_joins(f"SELECT 1 FROM orders o {many}", _JOIN_COLUMNS)) == 16
