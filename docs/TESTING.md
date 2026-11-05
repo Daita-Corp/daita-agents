@@ -269,6 +269,11 @@ with `DAITA_RUN_POSTGRES_LARGE_FIXTURE=1` and
 runs in one transaction on that server's `postgres` database and always rolls back,
 so it leaves no schemas, tables or roles behind.
 
+`tests/live/data/test_bulk_discovery.py` runs under the same gate and the same
+rollback. It checks that PostgreSQL's bulk discovery statements say exactly what the
+per-table statements say, and times attaching 1,000 and 1,500 tables through a local
+proxy that adds 50 ms to every round trip.
+
 The scheduled-write case (`tests/live/routines/test_scheduled_write.py`) runs a
 real model's one-time routine in a real host while no client watches: the run
 asks to upsert one row into the real `postgres-large` fixture, the host
