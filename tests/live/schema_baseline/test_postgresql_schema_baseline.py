@@ -200,7 +200,8 @@ class _RoundTrips:
 
         self.counts: Counter[str] = Counter()
         # A bounded user read is one prepare plus cursor fetches; count the prepare.
-        for name in ("execute", "fetch", "fetchrow", "fetchval", "prepare"):
+        # Bulk discovery reads open `Connection.cursor`, which user reads never use.
+        for name in ("execute", "fetch", "fetchrow", "fetchval", "prepare", "cursor"):
             original = getattr(asyncpg.Connection, name)
 
             def counted(

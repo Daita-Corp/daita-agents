@@ -197,7 +197,9 @@ async def test_waiting_for_an_approval_fails_at_once_when_the_run_ends_without_a
     )
     provider.replace_script([measured_step(response(text="Nothing to write."))])
     started = time.monotonic()
-    with pytest.raises(AssertionError, match="ended without asking.*completed"):
+    # The poll can see the run before it finishes finalizing, so pin that it
+    # ended cleanly, not which disposition it had reached.
+    with pytest.raises(AssertionError, match="ended without asking.*failure_code None"):
         await routine_approval(harness, NAME, routine_id, timeout=60)
     assert time.monotonic() - started < 30
 

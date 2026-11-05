@@ -71,8 +71,10 @@ _MAX_PROBE_ROW_FIELDS = 16
 _CONNECT_TIMEOUT_SECONDS = 8.0
 _COMMAND_TIMEOUT_SECONDS = 8.0
 _CLEANUP_TIMEOUT_SECONDS = 1.0
-# Per-table metadata is two round trips each; a slow source keeps what was read.
+# Bounds reading table detail; a slow source keeps what was read.
 _DISCOVERY_SECONDS = 60.0
+# Each cursor fetch is a round trip, so the batch sets how latency scales with size.
+_BULK_FETCH_ROWS = 5_000
 
 # The system catalogs list everything, whether or not this role can read it, and
 # a name it cannot use only misleads. Every metadata query goes through these.
@@ -140,10 +142,8 @@ ORDER BY n.nspname, c.relname
 LIMIT $2
 """
 
-COLUMNS_SQL = f"""
-/* daita:postgresql.columns */
-SELECT
-    a.attname AS column_name,
+# The single-table and bulk statements share these fragments so they cannot drift.
+_COLUMN_FIELDS_SQL = """    a.attname AS column_name,
     format_type(a.atttypid, a.atttypmod) AS native_type,
     type_ns.nspname AS type_schema,
     type_def.typname AS type_name,
@@ -164,8 +164,8 @@ SELECT
         FROM pg_enum AS e
         WHERE e.enumtypid = CASE WHEN type_def.typtype = 'd'
                                  THEN type_def.typbasetype ELSE a.atttypid END
-    ) AS enum_values
-FROM pg_namespace AS n
+    ) AS enum_values"""
+_COLUMN_SOURCES_SQL = f"""FROM pg_namespace AS n
 JOIN pg_class AS rel ON rel.relnamespace = n.oid
 JOIN pg_attribute AS a
   ON a.attrelid = rel.oid
@@ -189,17 +189,37 @@ LEFT JOIN (
           SELECT 1 FROM unnest(con.conkey) AS part(attnum)
           WHERE NOT pg_catalog.has_column_privilege(con.conrelid, part.attnum, 'SELECT')
       )
-) AS pk ON pk.conrelid = rel.oid AND pk.attnum = a.attnum
+) AS pk ON pk.conrelid = rel.oid AND pk.attnum = a.attnum"""
+
+COLUMNS_SQL = f"""
+/* daita:postgresql.columns */
+SELECT
+{_COLUMN_FIELDS_SQL}
+{_COLUMN_SOURCES_SQL}
 WHERE n.nspname = $1 AND rel.relname = $2
   AND pg_catalog.has_schema_privilege(n.oid, 'USAGE')
 ORDER BY a.attnum
 LIMIT $3
 """
 
-INDEXES_SQL = """
-/* daita:postgresql.indexes */
-SELECT
-    idx.relname AS index_name,
+_BULK_COLUMNS_SQL = f"""
+/* daita:postgresql.bulk_columns */
+SELECT * FROM (
+    SELECT
+        n.nspname AS schema_name,
+        rel.relname AS resource_name,
+{_COLUMN_FIELDS_SQL},
+        row_number() OVER (PARTITION BY rel.oid ORDER BY a.attnum) AS column_rank
+{_COLUMN_SOURCES_SQL}
+    JOIN unnest($1::text[], $2::text[]) AS wanted(schema_name, resource_name)
+      ON wanted.schema_name = n.nspname AND wanted.resource_name = rel.relname
+    WHERE pg_catalog.has_schema_privilege(n.oid, 'USAGE')
+) AS ranked
+WHERE column_rank <= $3
+ORDER BY schema_name, resource_name, ordinal
+"""
+
+_INDEX_FIELDS_SQL = """    idx.relname AS index_name,
     am.amname AS index_kind,
     array_agg(att.attname ORDER BY key.ordinality)
         FILTER (WHERE att.attname IS NOT NULL) AS columns,
@@ -210,8 +230,8 @@ SELECT
      AND bool_and(opc.opcdefault AND opc_ns.nspname = 'pg_catalog'
                   AND ind.indcollation[key.ordinality - 1] = att.attcollation))
         AS write_conflict_supported,
-    pg_get_expr(ind.indpred, ind.indrelid) AS predicate
-FROM pg_namespace AS n
+    pg_get_expr(ind.indpred, ind.indrelid) AS predicate"""
+_INDEX_SOURCES_SQL = """FROM pg_namespace AS n
 JOIN pg_class AS rel ON rel.relnamespace = n.oid
 JOIN pg_index AS ind ON ind.indrelid = rel.oid
 JOIN pg_class AS idx ON idx.oid = ind.indexrelid
@@ -221,18 +241,45 @@ CROSS JOIN LATERAL unnest(ind.indkey)
 LEFT JOIN pg_attribute AS att
   ON att.attrelid = rel.oid AND att.attnum = key.attnum
 JOIN pg_opclass AS opc ON opc.oid = ind.indclass[key.ordinality - 1]
-JOIN pg_namespace AS opc_ns ON opc_ns.oid = opc.opcnamespace
-WHERE n.nspname = $1
-  AND rel.relname = $2
-  AND key.ordinality <= ind.indnkeyatts
-GROUP BY idx.relname, am.amname, ind.indisunique, ind.indpred, ind.indrelid,
-         ind.indisvalid, ind.indisready, ind.indimmediate, ind.indexprs
+JOIN pg_namespace AS opc_ns ON opc_ns.oid = opc.opcnamespace"""
+# The bulk statement selects and partitions by schema, table name and oid.
+_INDEX_GROUP_SQL = """GROUP BY n.nspname, rel.relname, rel.oid, idx.relname, am.amname,
+         ind.indisunique, ind.indpred, ind.indrelid, ind.indisvalid, ind.indisready,
+         ind.indimmediate, ind.indexprs
 HAVING bool_and(
     att.attnum IS NULL
     OR pg_catalog.has_column_privilege(rel.oid, att.attnum, 'SELECT')
-)
+)"""
+
+INDEXES_SQL = f"""
+/* daita:postgresql.indexes */
+SELECT
+{_INDEX_FIELDS_SQL}
+{_INDEX_SOURCES_SQL}
+WHERE n.nspname = $1
+  AND rel.relname = $2
+  AND key.ordinality <= ind.indnkeyatts
+{_INDEX_GROUP_SQL}
 ORDER BY idx.relname
 LIMIT $3
+"""
+
+_BULK_INDEXES_SQL = f"""
+/* daita:postgresql.bulk_indexes */
+SELECT * FROM (
+    SELECT
+        n.nspname AS schema_name,
+        rel.relname AS resource_name,
+{_INDEX_FIELDS_SQL},
+        row_number() OVER (PARTITION BY rel.oid ORDER BY idx.relname) AS index_rank
+{_INDEX_SOURCES_SQL}
+    JOIN unnest($1::text[], $2::text[]) AS wanted(schema_name, resource_name)
+      ON wanted.schema_name = n.nspname AND wanted.resource_name = rel.relname
+    WHERE key.ordinality <= ind.indnkeyatts
+{_INDEX_GROUP_SQL}
+) AS ranked
+WHERE index_rank <= $3
+ORDER BY schema_name, resource_name, index_name
 """
 
 _RELATIONSHIPS_SQL = f"""
@@ -896,6 +943,58 @@ class PostgreSQLStructure:
     truncated: bool = False
 
 
+async def _read_by_table(
+    connection: Any,
+    sql: str,
+    wanted: Sequence[tuple[str, str]],
+    limit: int,
+    deadline: float,
+    build: Callable[[tuple[str, str], list[Any]], None],
+) -> int:
+    """Stream one bulk statement and hand `build` each table's rows once all arrived.
+
+    Only one table's raw rows are held. Returns how many leading `wanted` tables
+    finished; the budget cutting the stream discards the table in progress.
+    """
+
+    loop = asyncio.get_running_loop()
+    if not wanted or (remaining := deadline - loop.time()) <= 0:
+        return 0
+    position = {key: index for index, key in enumerate(wanted)}
+    current: tuple[str, str] | None = None
+    rows: list[Any] = []
+    try:
+        # A fetch that outlasts the budget aborts only this savepoint, so the
+        # relationships and estimates reads can still run.
+        async with connection.transaction():
+            cursor = await connection.cursor(
+                sql,
+                [schema for schema, _ in wanted],
+                [name for _, name in wanted],
+                limit + 1,
+                timeout=remaining,
+            )
+            while (remaining := deadline - loop.time()) > 0:
+                batch = await cursor.fetch(_BULK_FETCH_ROWS, timeout=remaining)
+                for row in batch:
+                    key = (
+                        _row_text(row, "schema_name"),
+                        _row_text(row, "resource_name"),
+                    )
+                    if key != current:
+                        if current is not None:
+                            build(current, rows)
+                        current, rows = key, []
+                    rows.append(row)
+                if len(batch) < _BULK_FETCH_ROWS:
+                    if current is not None:
+                        build(current, rows)
+                    return len(wanted)
+    except TimeoutError:
+        pass
+    return position[current] if current is not None else 0
+
+
 async def _load_structure(
     connection: Any,
     registration: SourceRegistration,
@@ -924,7 +1023,8 @@ async def _load_structure(
     )
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _DISCOVERY_SECONDS
-    tables: list[_TableStructure] = []
+    listed: list[tuple[str, str, ResourceKind, TabularFacet | None]] = []
+    wanted: list[tuple[str, str]] = []
     for row in resource_rows[:max_resources]:
         schema = _row_text(row, "schema_name")
         name = _row_text(row, "resource_name")
@@ -937,42 +1037,73 @@ async def _load_structure(
                 catalog_resource_id(registration.id, kind, f"{schema}.{name}")
             )
         )
-        if facet is not None:
-            tabular = TabularFacet.from_payload(facet.payload)
-            columns, indexes = tabular.columns, tabular.indexes
+        tabular = (
+            TabularFacet.from_payload(facet.payload) if facet is not None else None
+        )
+        if tabular is not None:
             # The previous read may have been cut at these limits.
-            truncated |= len(columns) >= max_columns or len(indexes) >= max_indexes
-        elif loop.time() >= deadline:
-            truncated = True
-            continue
+            truncated |= (
+                len(tabular.columns) >= max_columns
+                or len(tabular.indexes) >= max_indexes
+            )
         else:
-            column_rows = await connection.fetch(
-                COLUMNS_SQL,
-                schema,
-                name,
-                max_columns + 1,
-            )
-            columns = columns_from_rows(column_rows, max_columns)
-            index_rows = await connection.fetch(
-                INDEXES_SQL,
-                schema,
-                name,
-                max_indexes + 1,
-            )
-            truncated |= len(column_rows) > max_columns or len(index_rows) > max_indexes
-            known_columns = {column.name for column in columns}
-            indexes = tuple(
-                index
-                for row in index_rows[:max_indexes]
-                if (index := _index(row, known_columns)) is not None
-            )
+            wanted.append((schema, name))
+        listed.append((schema, name, kind, tabular))
+
+    columns: dict[tuple[str, str], tuple[TabularColumn, ...]] = {}
+    indexes: dict[tuple[str, str], tuple[TabularIndex, ...]] = {}
+
+    def build_columns(key: tuple[str, str], rows: list[Any]) -> None:
+        nonlocal truncated
+        columns[key] = columns_from_rows(rows, max_columns)
+        truncated |= len(rows) > max_columns
+
+    def build_indexes(key: tuple[str, str], rows: list[Any]) -> None:
+        nonlocal truncated
+        known_columns = {column.name for column in columns.get(key, ())}
+        indexes[key] = tuple(
+            index
+            for row in rows[:max_indexes]
+            if (index := _index(row, known_columns)) is not None
+        )
+        truncated |= len(rows) > max_indexes
+
+    # A quarter of the budget is left so tables whose columns arrived can get indexes.
+    read = await _read_by_table(
+        connection,
+        _BULK_COLUMNS_SQL,
+        wanted,
+        max_columns,
+        deadline - _DISCOVERY_SECONDS / 4,
+        build_columns,
+    )
+    done = await _read_by_table(
+        connection,
+        _BULK_INDEXES_SQL,
+        wanted[:read],
+        max_indexes,
+        deadline,
+        build_indexes,
+    )
+    truncated |= done < len(wanted)
+    read_keys = set(wanted[:done])
+    tables: list[_TableStructure] = []
+    for schema, name, kind, tabular in listed:
+        key = (schema, name)
+        if tabular is not None:
+            table_columns, table_indexes = tabular.columns, tabular.indexes
+        elif key in read_keys:
+            table_columns = columns.get(key, ())
+            table_indexes = indexes.get(key, ())
+        else:
+            continue
         tables.append(
             _TableStructure(
                 schema=schema,
                 name=name,
                 kind=kind,
-                columns=columns,
-                indexes=indexes,
+                columns=table_columns,
+                indexes=table_indexes,
             )
         )
     relationship_rows = await connection.fetch(

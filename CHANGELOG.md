@@ -41,6 +41,11 @@ structure after 60 seconds. Whatever is cut stays reachable through `catalog_sea
 `catalog_describe` and queries, and the source is marked truncated; the model is told
 the catalog holds only part of it. `DiscoveryLimitError` is gone.
 
+- **PostgreSQL discovery no longer slows with table count.** It takes five statements
+  however many tables there are, instead of two per table, so a source over a slow
+  network keeps all its tables rather than running out of time. Catalog contents and
+  every limit are unchanged. Attaching 869 tables at 50 ms latency went from about 61 s,
+  truncated at 540 tables, to about 2 s with all of them.
 - **The catalog refreshes itself.** It refreshes on attach, on `Agent.refresh_source`,
   when a search or describe finds a table the catalog lacks or has wrong, and when a
   query fails because a table or column does not exist. Automatic refreshes run in the
