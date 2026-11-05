@@ -125,7 +125,7 @@ preview = await agent.preview_source_permissions(
         "max_rows": 100,
     }},
 )
-# Inspect the exact before/after state and confirmation before applying it.
+# Inspect the before/after state and confirmation before applying it.
 await agent.apply_source_permissions(
     source_id=source_id,
     confirmation_fingerprint=preview.confirmation_fingerprint,
@@ -194,8 +194,8 @@ and the card warns first.
 
 An immutable local receipt is reserved before dispatch and records the run and call
 identity, fingerprints, expected count, outcome and affected count when known. A write
-is never retried or replayed. Receipts from before `data_write` (kinds
-`data.update_rows` and `data.upsert_rows`) keep decoding, displaying and resolving.
+is never retried or replayed. Receipts from before `data_write`, kinds `data.update_rows`
+and `data.upsert_rows`, still decode, list and resolve.
 
 ## Outcomes and failures
 

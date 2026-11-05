@@ -10,6 +10,7 @@ from _shared import (
     example_root,
     final_response,
     parser,
+    query_rows,
     seed_sales_database,
     tool_response,
 )
@@ -24,31 +25,27 @@ async def run() -> None:
         agent = await create_offline_agent("catalog-joins", root, model)
         try:
             source = await agent.attach(SQLiteSource(database, name="Sales"))
-            resources = {
-                resource.name: resource
-                for resource in await agent.list_catalog_resources(source_id=source.id)
-            }
             model.extend(
                 tool_response(
                     "find-orders",
                     "catalog_search",
-                    {"query": "orders customers", "source_id": source.id, "limit": 5},
+                    {"query": "orders customers", "source": "Sales", "limit": 5},
+                ),
+                tool_response(
+                    "describe-orders",
+                    "catalog_describe",
+                    {"source": "Sales", "name": "orders"},
                 ),
                 tool_response(
                     "join-orders",
                     "data_query",
                     {
-                        "source_id": source.id,
-                        "resource_ids": (
-                            resources["orders"].id,
-                            resources["customers"].id,
-                        ),
+                        "source": "Sales",
                         "sql": (
                             "SELECT o.id, c.name, o.status, o.amount "
                             "FROM orders AS o JOIN customers AS c "
                             "ON c.id = o.customer_id ORDER BY o.id"
                         ),
-                        "parameters": [],
                     },
                 ),
                 final_response(
@@ -57,6 +54,7 @@ async def run() -> None:
             )
             result = await agent.run("Join orders to their customers.")
             transcript = await agent.transcript(result.run_id)
+            print(f"rows: {await query_rows(agent, result.run_id)}")
             print(f"answer: {result.final_text}")
             print(f"run: {result.run_id} ({result.kind.value})")
             print(f"persisted messages: {len(transcript.messages)}")

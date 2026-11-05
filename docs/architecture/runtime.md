@@ -41,12 +41,12 @@ Actual consumption is never clipped to an authorization or reservation ceiling.
 Unknown machine-run usage consumes at least its reservation; it is never recorded
 as measured zero. Exhausted cumulative budgets prevent subsequent reservation.
 
-Daita supports catalog-backed SQLite, PostgreSQL and folder reads, foreground
-local computer file access through the live session folder source with a
-bounded-workspace option for typed callers, and explicitly admitted
-server-neutral remote MCP reads and external actions. SQL is validated against
-the current catalog before source I/O. Local file reads are descriptor-contained
-and revision-bound. MCP calls
+Daita supports SQLite, PostgreSQL and folder reads straight from the source,
+foreground local computer file access through the live session folder source with
+a bounded-workspace option for typed callers, and explicitly admitted
+server-neutral remote MCP reads and external actions. SQL goes through one read
+policy before source I/O, which needs no catalog lookup. Local file reads are
+descriptor-contained, and a read cursor stays bound to the bytes it started on. MCP calls
 revalidate the exact binding revision, remote identity, and schemas.
 
 Agent identity, source registrations, current catalog snapshots, declared
@@ -57,8 +57,8 @@ the agent home.
 ## Composition and public API
 
 `daita.agent.Agent` is a thin public facade. It validates caller inputs and
-delegates to `EmbeddedAgent`; it does not implement model progression, catalog
-truth, capability execution, or persistence.
+delegates to `EmbeddedAgent`; it does not implement model progression, the
+catalog, capability execution, or persistence.
 
 `daita.hosting.embedded.EmbeddedAgent` is the composition root. It admits the
 agent home, holds the process-level writer lock, composes the
@@ -112,8 +112,10 @@ catalog operations, SQL validation, source I/O, policy, and feature lifecycle st
 stay outside the loop.
 
 `daita.context.AgentContextBuilder` creates each model request from
-the current transcript, current catalog, projected tool definitions, and model
-profile. It keeps complete tool exchanges together and labels catalog, tool,
+the current transcript, a short directory of the run's sources, projected tool
+definitions, and model profile. The directory lists each source by display name
+with its type, dialect, schemas and approximate object count, and marks a source
+whose catalog holds only part of it (`catalog_partial`). It keeps complete tool exchanges together and labels catalog, tool,
 file, memory, skill, and data content as untrusted. Untrusted content cannot
 become an instruction or grant authority.
 
@@ -164,11 +166,11 @@ label. These labels affect information handling, never execution authority.
 Scheduled reasoning starts from its approved self-contained instruction and
 exact retained skills, without unrelated conversation history or mutable memory.
 
-The catalog is authoritative for current source and resource identity,
-schemas, facets, relationships, and freshness. A current validated tool result
-is authoritative only for the values it returned. Model text, prior assistant
-claims, preferences, and procedures cannot establish structural or source
-facts.
+The source is authoritative for what it holds. The catalog is a stored snapshot
+that advises discovery and never grants or denies access. A current validated
+tool result is authoritative only for the values it returned. Model text, prior
+assistant claims, preferences, and procedures cannot establish structural or
+source facts.
 
 Machine-originated runs carry one `ExecutionScope` in their `RunStartEnvelope`,
 built when the run starts and fixed for that run (invariant 6). The composition
@@ -201,10 +203,13 @@ not another execution path.
 
 `toolbox_search` accepts a natural-language `query`, optional bounded
 `limit`, and an opaque continuation `cursor` over the run's applicable catalog.
-Catalog and toolbox search rank lexical matches first and include labeled
-unmatched fallbacks; bounded pages retain access to every scoped candidate.
+Toolbox search ranks lexical matches first and includes labeled unmatched
+fallbacks; bounded pages retain access to every scoped candidate.
+`catalog_search` asks the source and the catalog together and lists the source's
+hits first, in the source's order, then hits only the catalog has, in catalog order
+without unmatched fallbacks, cut to `limit`.
 The framework context includes an ephemeral bounded connector directory built
-from current catalog, MCP binding, and skill metadata, alongside one compact toolbox
+from the source directory, MCP binding, and skill metadata, alongside one compact toolbox
 manifest. The manifest derives prepared-candidate access modes and operational effects
 from immutable capability metadata; compact group summaries do not imply missing
 connector permissions. Local discovery
@@ -292,9 +297,9 @@ Conversation continuity is a bounded projection of completed runs, not a
 session runtime or resumable loop.
 
 `MEMORY.md`, `USER.md`, and retained `SKILL.md` content are bounded advisory
-text. They are not catalog truth, evidence, policy, authorization, executors,
+text. They are not source facts, evidence, policy, authorization, executors,
 or plugins. Semantic annotations are also advisory and must remain grounded in
-current resource identity and evidence. Learning uses the ordinary foreground
+current table names and evidence. Learning uses the ordinary foreground
 loop and explicit capabilities; there is no background learning agent.
 
 Operational effects use the fixed governance branch immediately before the

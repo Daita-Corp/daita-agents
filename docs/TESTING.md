@@ -276,9 +276,9 @@ proxy that adds 50 ms to every round trip.
 
 The scheduled-write case (`tests/live/routines/test_scheduled_write.py`) runs a
 real model's one-time routine in a real host while no client watches: the run
-asks to upsert one row into the real `postgres-large` fixture, the host
-notifies, the test approves through the interaction route, and exactly one
-receipted write follows. Because a scheduled run may use every write tool, two
+asks to upsert one row into the real `postgres-large` fixture with
+`data_write`, the host notifies, the test approves through the interaction route,
+and exactly one receipted write follows. Because a scheduled run may write, two
 more cases check what the model attempts: a routine whose research result
 carries an injected write instruction asks for no write at all, and a routine
 whose write is denied reports the refusal without asking again or trying

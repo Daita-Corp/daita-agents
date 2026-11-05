@@ -12,8 +12,8 @@ access, budgets, and actions you authorize.
 
 ## What Daita can do
 
-- **Understand your data.** Explore SQLite and PostgreSQL catalogs, follow
-  relationships between resources, and run durable data profiles without
+- **Understand your data.** Explore SQLite and PostgreSQL schemas, follow
+  relationships between tables, and run durable data profiles without
   changing source data.
 - **Answer across systems.** Query admitted databases, local CSV, TSV, JSON,
   NDJSON, and Parquet files, and remote MCP tools using current source evidence.
@@ -58,7 +58,7 @@ approvals continue; `daita host status` shows it.
 The first launch guides you through creating an agent, configuring a model, and
 optionally attaching a data source for reading. The launch directory becomes
 the default local working directory of the session folder source, which also
-accepts explicit local paths. You can attach other folders as cataloged sources.
+accepts explicit local paths. You can attach other folders as sources.
 
 Try asking:
 
@@ -88,11 +88,12 @@ Approvals bring Chat into focus and stay above the composer until resolved.
 
 ## Authority stays explicit
 
-Database connections start with read access only. Daita validates SQL against
-the current catalog, checks tool calls against current scope and permissions,
-and treats source content, remote output, memory, and skills as untrusted input.
-Saved knowledge helps interpret data; it cannot grant access or override
-current source facts.
+Database connections start with read access only. Daita sends reads straight
+to the source after one read policy checks the SQL and the tables it names
+against current scope and permissions. The catalog advises and never grants or
+denies a read. Source content, remote output, memory, and skills are untrusted
+input. Saved knowledge helps interpret data; it cannot grant access or override
+what the source reports.
 
 External effects require exact permissions and a person's approval at the time,
 in scheduled and background runs too. Native writes use a preview from the current run and transactional

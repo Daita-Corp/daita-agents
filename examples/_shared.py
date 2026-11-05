@@ -150,3 +150,18 @@ async def create_offline_agent(
         model_profile=OFFLINE_PROFILE,
         id_factory=sequential_ids(),
     )
+
+
+async def query_rows(agent: Agent, run_id: str) -> list[dict[str, object]]:
+    """Return the ``data_query`` rows; raise if any tool call in the run failed."""
+
+    rows = None
+    for call, result in await agent.tool_evidence(run_id):
+        if result is None or result.is_error:
+            error = dict(result.output) if result else "no result"
+            raise RuntimeError(f"{call.name} failed: {error}")
+        if call.name == "data_query":
+            rows = [dict(row) for row in result.output["data"]["rows"]]
+    if rows is None:
+        raise RuntimeError("the run made no data_query call")
+    return rows

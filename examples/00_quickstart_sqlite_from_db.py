@@ -1,4 +1,4 @@
-"""Ask one grounded question of a cataloged SQLite source with Daita."""
+"""Ask one grounded question of an attached SQLite source with Daita."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from _shared import (
     example_root,
     final_response,
     parser,
+    query_rows,
     seed_sales_database,
     tool_response,
 )
@@ -24,23 +25,21 @@ async def run() -> None:
         agent = await create_offline_agent("quickstart", root, model)
         try:
             source = await agent.attach(SQLiteSource(database, name="Sales"))
-            resources = await agent.list_catalog_resources(source_id=source.id)
             model.extend(
                 tool_response(
                     "count-orders",
                     "data_query",
                     {
-                        "source_id": source.id,
-                        "resource_ids": (resources[0].id,),
+                        "source": "Sales",
                         "sql": "SELECT COUNT(*) AS order_count FROM orders",
-                        "parameters": [],
                     },
                 ),
                 final_response("There are 3 orders."),
             )
             result = await agent.run("How many orders are there?")
             print(f"state root: {root}")
-            print(f"source: {source.display_name} ({source.id})")
+            print(f"source: {source.display_name}")
+            print(f"rows: {await query_rows(agent, result.run_id)}")
             print(f"answer: {result.final_text}")
             print(f"run: {result.run_id} ({result.kind.value})")
         finally:

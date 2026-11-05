@@ -6,12 +6,14 @@ home unless you supply a dedicated `--root`.
 
 | Example | What it shows |
 | --- | --- |
-| `00_quickstart_sqlite_from_db.py` | Attach a SQLite database and ask a grounded question. |
-| `02_catalog_assisted_joins.py` | Use catalog relationships to guide a query across tables. |
+| `00_quickstart_sqlite_from_db.py` | Attach a SQLite database and ask a grounded question; the model addresses it by source name. |
+| `02_catalog_assisted_joins.py` | Search and describe tables in the catalog, then join them by name in one `data_query`. |
 | `03_offline_assignments_and_recovery.py` | Schedule work, reopen the host, and investigate a lost action response. |
 | `10_csv_to_sqlite_data_app.py` | Build a local data workflow from CSV and SQLite. |
 
-The data examples use read-only catalog and data tools. Production providers
+The data examples script a model that calls `catalog_search`,
+`catalog_describe` and `data_query` with source display names and table names,
+never IDs, and print the rows the tool actually returned. Production providers
 are configured through `daita.create_llm_provider()` and their supported secret
 or SDK settings; no example contains an API key.
 
@@ -63,9 +65,9 @@ another dispatch. Its automatic approval callback is for simulated I/O only;
 use the TUI or an exact human approval handler for real actions. No live service,
 credentials, model call, or external database is used.
 
-Native company research/upsert is exercised offline by
-`tests/data/writes/test_public_writes.py`, with the real data/runtime/scheduler owners
-and deterministic PostgreSQL I/O. The guided permission acceptance is in
+Approval-gated `data_write` (preview, exact SQL approval, one receipt) is
+exercised offline by `tests/data/writes/test_public_writes.py`, with
+deterministic PostgreSQL I/O. The guided permission acceptance is in
 `tests/acceptance/test_product_workflows.py`. See [relational write authoring](../docs/RELATIONAL_WRITES.md)
 for the runnable public API pattern against a separately admitted target.
 

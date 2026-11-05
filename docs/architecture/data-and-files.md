@@ -5,14 +5,18 @@
 > The invariants in `AGENTS.md` are the hard rules. Everything else here can
 > change through *Proposing architecture changes* in `AGENTS.md`.
 
-Source types, catalog truth, data queries and writes, folders and artifacts.
+Source types, the catalog, data queries and writes, folders and artifacts.
 
 ## Data, catalog and adapters
 
-`daita.catalog` holds normalized structural truth and implements catalog
-search, inspection, and traversal. Data code consumes catalog contracts rather
-than building another schema graph or querying source clients for planning
-facts.
+The source answers; the catalog advises. `daita.catalog` stores a normalized
+snapshot of each source's structure and implements catalog search and
+inspection. Data code reads the source directly. No read, export or scope check
+waits on a catalog entry or revision, and a missing, stale or unreadable catalog
+never grants or denies access. The model sees source display names and table
+names, never source, resource or relationship IDs: `CapabilityRegistry.resolve_call`
+turns names into IDs where a call enters the runtime, and `model_tool_result`
+renames the IDs in a result or drops those the run's scope does not name.
 
 A `CatalogRelationship` belongs to one source snapshot. A `CatalogLink` is an
 agent-owned declared reference between fields of two resources, possibly in
@@ -23,14 +27,15 @@ catalog. Links survive detach and reattach because source and resource IDs are
 stable. Currency is computed, never stored: a link is current while both
 sources are active and every paired field exists in a current tabular facet;
 otherwise it is stale as `source_inactive`, `resource_missing` or
-`field_missing`. Unrelated column changes keep a link current. Search
-neighbours, traversal and schema join selection merge current links with
-source relationships in one edge set, labelled `provenance: "declared"` with
-`cross_source`; sources joined by current links form one join group, so
+`field_missing`. Unrelated column changes keep a link current. The catalog
+service merges current links with source relationships in one edge set, labelled
+`provenance: "declared"` with `cross_source`, for search neighbours, schema
+slices and traversal; sources joined by current links form one join group, so
 `cross_source_unsupported` remains only for seeds with no linking group. Links
 are read fresh for each projection, outside the per-source index cache. Readable
-and run-scope filters apply to both link endpoints, so traversal never crosses
-a resource outside scope. `catalog_describe` lists each current link leaving the
+and run-scope filters apply to both link endpoints, so a projection never
+crosses a resource outside scope. No model tool traverses the catalog.
+`catalog_describe` lists each current link leaving the
 table it describes, by name, when the run may read the far endpoint. Each
 relationship carries `from_row_estimate` and `to_row_estimate` when the catalog
 has them. For a table with key-like columns (a name ending in `_id`, `_key`, `_code` or
@@ -150,8 +155,9 @@ credentials remain secret references and are resolved only at the integration
 boundary.
 
 The read policy belongs in `daita.domains.data.sql`; connector guardrails still
-apply during execution. The data domain parses each statement once, before any
-source I/O, and the backend receives the result as a `CheckedRead`, runs its
+apply during execution. The data domain calls `validate_read`
+(`sql/read_validation.py`, parsing in `sql/analysis.py`) once per statement, before
+any source I/O, and the backend receives the result as a `CheckedRead`, runs its
 canonical SQL and never validates again. It does recheck the source's stored read
 scope at dispatch, because the runtime prepares a read before it takes the source
 permit, so revoked permission still stops a queued read. SQL that cannot be parsed is refused with
@@ -161,7 +167,8 @@ no data-modifying CTE, `SELECT INTO` or locking clause. A source read in full
 configured schemas, and system catalogs. A SELECTED or narrowed scope folds each
 name, hashes it forward with `catalog_resource_id` and tests the listed IDs, with
 no catalog lookup, and refuses system catalogs. A relation in another schema is
-refused naming the schema. A result's classification comes from its source's
+refused naming the schema. A refused name returns `resource_read_not_allowed`, with
+close names from the catalog when it has them. A result's classification comes from its source's
 registration, never from catalog resources. The source reports everything else:
 a missing table or column comes back as `query_invalid` with the server's message,
 hint and position. Other failures cross by SQLSTATE category only, because their
@@ -186,14 +193,15 @@ also refuses `load_extension`. Do not duplicate any of this in a generic policy
 layer.
 
 `data_query` with `inputs` routes to `data.query_combined`, a foreground-only
-read that joins two to sixteen sources. Each SQL input `{alias, source_id, sql}`
-takes the single-source path unchanged: run scope, the read policy for the source
-type's `sql_dialect` and that type's registry backend. A folder input adds
-`path_pattern` and takes the folder route below. A tabular input `{alias, source_id, resource_id,
-columns, filters}` names one resource of a type that declares `TABULAR_READ`; it
-takes the same run-scope and stored-permission checks; the catalog only
-names the table, so an unlisted table or column is the source's to serve or
-refuse (`tabular_columns_unavailable` when it returns other columns), and
+read that joins two to sixteen sources. The model names each source by display
+name; the runtime resolves it before the data domain sees the call. Each SQL input
+`{alias, source, sql}` takes the single-source path unchanged: run scope, the read
+policy for the source type's `sql_dialect` and that type's registry backend. A
+folder input, which must be an attached folder, adds `path_pattern` and takes the
+folder route below. A tabular input `{alias, source, table, columns, filters}`
+names one table of a type that declares `TABULAR_READ`; it takes the same
+run-scope and stored-permission checks; the catalog only advises, so an unlisted
+table or column is the source's to serve or refuse (`tabular_columns_unavailable` when it returns other columns), and
 filters are only AND-combined `eq`, `in`, `lt`,
 `lte`, `gt` and `gte` on scalar values. Its backend receives one
 `ReadTabularRequest` and returns a `BoundedResultProjection`.
@@ -229,7 +237,7 @@ combining `sql` is one DuckDB SELECT or UNION validated before execution to
 read every alias and nothing else: no table functions, file, HTTP or extension
 access. It runs in the same private DuckDB worker as folder-source SQL, one
 query at a time; a concurrent call waits for the worker. The result carries the union of input tables, the highest input
-sensitivity and per-input lineage (`source_id`, `read_at`, and `canonical_sql`/`sql_fingerprint` for SQL inputs or
+sensitivity and per-input lineage (`source`, `read_at`, and `canonical_sql`/`sql_fingerprint` for SQL inputs or
 `columns`/`filters` for tabular inputs). Declared catalog links
 inform discovery and join paths only; they grant no read authority.
 
@@ -289,8 +297,9 @@ some calls, hides others and drops the case of a quoted one; reads keep their na
 expands views to their base tables.
 
 `RelationalWriteScope` binds a table name, explicit `insert`, `update` and `delete`
-operations, insert and update columns and a row limit, and reads no catalog. Stored
-receipts of kind `data.update_rows` and `data.upsert_rows` keep decoding and resolving.
+operations, insert and update columns and a row limit, and reads no catalog.
+Receipts from the removed tools (`data.update_rows`, `data.upsert_rows`) still decode, list
+and resolve.
 A native write in a scheduled or job run asks a person at the time, exactly as a
 foreground write does; the card carries the routine or job title. Full request
 sensitivity must fit the source's classification. DDL, `TRUNCATE`, `COPY`, `MERGE`,
@@ -327,11 +336,11 @@ folder source:
   it. Explicit `source_scope_ids` narrow catalog sources and never drop it.
 
 Private Daita state is rejected when targeted, pruned from broader searches and
-refused as an attached root. `file_search` and `file_read` take a folder
-`source_id`; `file_search` supports one root or a bounded multi-root set with one
+refused as an attached root. `file_search` and `file_read` take a folder source's
+display name as `source`; `file_search` supports one root or a bounded multi-root set with one
 shared budget, qualified matches, and per-root coverage, and `file_read` returns
 bounded chunks, `position=end` tail windows and opaque cursors. `data_query` with
-`source_id`, `path_pattern` and `sql` queries one homogeneous dataset matched
+`source`, `path_pattern` and `sql` queries one homogeneous dataset matched
 against a folder's current files and exposes only the relation `data`; live and
 attached folders share this one route. An attached folder answers only for data files within its `subpaths` that the run may
 read, decided from each file itself: search skips any other file, read refuses it
@@ -384,7 +393,7 @@ HTML table from earlier successful results in the current run, cited by their
 visible `result_ref` values in `evidence_refs`. The runtime resolves each ref to
 its call, and the artifact domain authenticates each result against the immutable registry and
 persisted transcript, rejects failed, stale, reordered, cross-run, or tampered
-lineage, inherits the highest result sensitivity, and preserves current
+lineage, inherits the highest result sensitivity, and records
 the relational tables each result read, per input for a combined query. The artifact remains explicitly
 derived analysis rather than exact or complete source data. Exact complete
 relational export remains the separate `data.export_tabular` capability, reached
