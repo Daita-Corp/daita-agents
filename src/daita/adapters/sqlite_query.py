@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TypeVar
 
+from .._json import canonical_json
 from ..artifacts.models import ArtifactError
 from ..artifacts.renderers import (
     ExactArrowRenderer,
@@ -203,10 +204,8 @@ class SQLiteQueryBackend:
             max_bytes=max_bytes,
             timeout_seconds=statement_timeout,
         )
-        projection = project_result_rows(
-            rows,
-            max_rows=max_rows,
-            max_bytes=max_bytes,
+        projection = await asyncio.to_thread(
+            project_result_rows, rows, max_rows=max_rows, max_bytes=max_bytes
         )
         return SQLiteReadResult(
             source_id=source_id,
@@ -682,6 +681,7 @@ def _run_query_sync(
             sql,
             parameters,
             max_rows,
+            max_bytes,
         )
         connection.set_authorizer(None)
         connection.execute("COMMIT")
@@ -860,6 +860,7 @@ def _execute_user_query(
     sql: str,
     parameters: tuple[object, ...],
     max_rows: int,
+    max_bytes: int,
 ) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...]]:
     cursor = connection.execute(sql, parameters)
     if cursor.description is None:
@@ -868,12 +869,23 @@ def _execute_user_query(
             "SQLite read did not return tabular results.",
         )
     columns = _unique_columns(tuple(item[0] for item in cursor.description))
-    raw_rows = cursor.fetchmany(max_rows + 1)
-    rows = tuple(
-        {column: _json_value(value) for column, value in zip(columns, raw, strict=True)}
-        for raw in raw_rows
-    )
-    return columns, rows
+    # Stop at the first row past either limit so a wide table is never held
+    # whole; that row stays so the projection still reports the truncation.
+    rows: list[Mapping[str, object]] = []
+    projected_bytes = 2
+    while len(rows) < max_rows + 1 and projected_bytes <= max_bytes:
+        raw = cursor.fetchone()
+        if raw is None:
+            break
+        row = {
+            column: _json_value(value)
+            for column, value in zip(columns, raw, strict=True)
+        }
+        rows.append(row)
+        projected_bytes += len(canonical_json(row).encode("utf-8")) + (
+            1 if len(rows) > 1 else 0
+        )
+    return columns, tuple(rows)
 
 
 def _read_only_authorizer(

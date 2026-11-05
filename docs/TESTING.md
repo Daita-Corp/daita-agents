@@ -743,6 +743,61 @@ names a disposable `daita_schema_baseline` database. Its paid Daita-versus-Claud
 Code comparison also needs `DAITA_RUN_LIVE_SCHEMA_BASELINE_COMPARISON=1`. Reports go to the
 ignored `live-evidence/schema-baseline/` and stay out of git. See its `README.md`.
 
+### Cross-source benchmark
+
+`tests/live/cross_source` asks 12 questions that need PostgreSQL, SQLite and a
+folder of files together, with known answers and planted key mismatches. Rerun
+it after any change to combined queries. Run it only after explicit
+authorization; the paid comparison spends model and Claude Code budget. See its
+`README.md` for the fixtures, scoring, cost bounds and every setting.
+
+The offline proof needs no server and no model (a scripted model runs the
+oracle calls for the SQLite and folder questions):
+
+```bash
+.venv/bin/python -m pytest tests/live/cross_source -k sqlite_and_folder \
+  -o addopts="--tb=short -q --strict-markers"
+```
+
+The full oracle runs all 12 questions without a model. It needs a disposable
+PostgreSQL 13+ whose database is named `daita_cross_source` (the seed drops
+schema `sales`):
+
+```bash
+docker compose -f tests/fixtures/cross-source-benchmark/compose.yaml up -d --wait
+export DAITA_CROSS_SOURCE_POSTGRES_URL=postgresql://postgres:fixture_admin_password@127.0.0.1:55435/daita_cross_source
+.venv/bin/python -m pytest tests/live/cross_source -k full_oracle \
+  -o addopts="--tb=short -q --strict-markers" -s
+docker compose -f tests/fixtures/cross-source-benchmark/compose.yaml down
+```
+
+The paid Daita-versus-Claude Code comparison also needs
+`DAITA_RUN_LIVE_CROSS_SOURCE_COMPARISON=1`, `ANTHROPIC_API_KEY`, and `psql`,
+`sqlite3`, `duckdb` and `claude` on `PATH`. Start with
+`DAITA_CROSS_SOURCE_REPEATS=1`: a Daita run has no dollar cap, only the loop
+limits.
+
+```bash
+DAITA_RUN_LIVE_CROSS_SOURCE_COMPARISON=1 \
+.venv/bin/python -m pytest tests/live/cross_source -k claude_code \
+  -o addopts="--tb=short -q --strict-markers" -o faulthandler_timeout=0 -s
+```
+
+Reports go to the ignored `live-evidence/cross-source/` and stay out of git.
+
+### Combined-query soak
+
+`tests/slow/data/test_combined_query_soak.py` runs combined `data_query` calls
+through a real agent, SQLite and folder inputs and a scripted model, one
+subprocess per case so peak memory is its own. It is the evidence behind the
+shared row and byte budget. Set `DAITA_SOAK_REPORT_DIR` for the JSON report and
+run with `-s` for the table; `DAITA_SOAK_MATRIX=1` adds the 25k, 50k and 100k
+budget comparison.
+
+```bash
+.venv/bin/python -m pytest tests/slow/data -o addopts="--tb=short -q --strict-markers" -s
+```
+
 ## Model-surface gate
 
 Scripted models replay old behavior, so a change to what the model is shown

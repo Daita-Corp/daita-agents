@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -11,12 +12,19 @@ import pytest
 
 from daita import Agent, FolderSource, SQLiteSource
 from daita._json import canonical_json
+from daita.adapters.models import SourceRegistration
+from daita.capabilities import ToolOutput
+from daita.catalog.capabilities import (
+    CATALOG_DESCRIBE_CAPABILITY_ID,
+    CATALOG_DESCRIBE_EVIDENCE_KIND,
+)
 from daita.catalog.protocols import CatalogStoreError
 from daita.context import _estimate_input_tokens
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
     ModelResponse,
+    ModelSensitivity,
     ToolCall,
     ToolResultBlock,
     model_tool_result,
@@ -453,5 +461,213 @@ async def test_hunting_for_a_table_cannot_exhaust_the_context_window(
         result = await agent.run("How many shipped orders are there?")
         assert result.reason == "completed"
         assert max(_estimate_input_tokens(item) for item in provider.requests) < 60_000
+    finally:
+        await agent.close()
+
+
+_ESTIMATES = {"main.orders": 1_000, "main.customers": 50, "main.products": 7}
+
+
+def _crm(path: Path) -> Path:
+    with sqlite3.connect(path) as connection:
+        connection.executescript("""
+            CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE products (sku_code TEXT, label TEXT);
+            CREATE TABLE notes (note_key TEXT);
+            """)
+    return path
+
+
+def _shop_with_keys(path: Path) -> Path:
+    with sqlite3.connect(path) as connection:
+        connection.executescript("""
+            CREATE TABLE customers (id INTEGER PRIMARY KEY);
+            CREATE TABLE orders (
+              id INTEGER PRIMARY KEY,
+              customer_id INTEGER REFERENCES customers(id),
+              sku_code TEXT,
+              note_key INTEGER
+            );
+            """)
+    return path
+
+
+def _with_estimates(agent: Agent) -> None:
+    """SQLite reports no row counts, so give the real catalog some."""
+
+    service = agent._embedded._catalog_service
+    real = service.tabular_resources
+
+    async def estimated(agent_id: str, source_id: str) -> tuple[object, ...]:
+        return tuple(
+            replace(
+                item,
+                tabular=replace(
+                    item.tabular,
+                    row_count_estimate=_ESTIMATES.get(item.resource.native_identity),
+                ),
+            )
+            for item in await real(agent_id, source_id)
+        )
+
+    service.tabular_resources = estimated  # type: ignore[method-assign,assignment]
+
+
+def _candidates(result: ToolResultBlock) -> list[Mapping[str, object]]:
+    return list(
+        cast(Sequence[Mapping[str, object]], _data(result).get("link_candidates", ()))
+    )
+
+
+async def _two_sources(
+    agent: Agent, tmp_path: Path
+) -> tuple[SourceRegistration, SourceRegistration]:
+    shop = await agent.attach(
+        SQLiteSource(_shop_with_keys(tmp_path / "shop.sqlite"), name="Shop")
+    )
+    crm = await agent.attach(SQLiteSource(_crm(tmp_path / "crm.sqlite"), name="CRM"))
+    return shop, crm
+
+
+async def test_describe_suggests_unconfirmed_joins_to_other_sources(
+    tmp_path: Path,
+) -> None:
+    agent, provider = await _agent(tmp_path, _describe("orders"))
+    try:
+        _with_estimates(agent)
+        await _two_sources(agent, tmp_path)
+        (result,) = await _results(agent)
+        data = _data(result)
+        # The foreign key is a hint with row counts from the catalog.
+        (relationship,) = cast(Sequence[Mapping[str, object]], data["relationships"])
+        assert relationship["from_row_estimate"] == 1_000
+        assert relationship["to_row_estimate"] == 50
+        # An equal name comes first, then the id convention; id alone, another
+        # type and the same source's customers table give nothing.
+        assert [
+            (item["column"], item["to"], item["to_column"], item.get("to_row_estimate"))
+            for item in _candidates(result)
+        ] == [
+            ("sku_code", "main.products", "sku_code", 7),
+            ("customer_id", "main.customers", "id", 50),
+        ]
+        assert {item["status"] for item in _candidates(result)} == {"unconfirmed"}
+        assert await agent.list_catalog_links() == ()
+        rendered = canonical_json(
+            model_tool_result(result, None, provider.requests[-1].scope_names)
+        )
+        assert '"to_source":"CRM"' in rendered
+        assert "sha256:" not in rendered.replace(str(data.get("revision")), "")
+        # An older stored result has no candidates and still validates.
+        old = {k: v for k, v in data.items() if k != "link_candidates"}
+        agent._embedded._capabilities.validate_output(
+            CATALOG_DESCRIBE_CAPABILITY_ID,
+            ToolOutput(kind=CATALOG_DESCRIBE_EVIDENCE_KIND, data=old),
+        )
+    finally:
+        await agent.close()
+
+
+async def test_a_more_sensitive_candidate_source_raises_the_describe_sensitivity(
+    tmp_path: Path,
+) -> None:
+    agent, _provider = await _agent(tmp_path / "home", _describe("orders"))
+    try:
+        await agent.attach(
+            SQLiteSource(_shop_with_keys(tmp_path / "shop.sqlite"), name="Shop")
+        )
+        folder = tmp_path / "restricted"
+        folder.mkdir()
+        (folder / "products.csv").write_text("sku_code,label\nA1,Anvil\n", "utf-8")
+        restricted = await agent.attach(
+            FolderSource(
+                folder, name="Restricted", sensitivity=ModelSensitivity.RESTRICTED
+            )
+        )
+        (result,) = await _results(agent)
+        candidates = _candidates(result)
+        assert any(item["to_source_id"] == restricted.id for item in candidates)
+        # The candidate's source is not a declared link, yet it counts.
+        assert result.sensitivity is ModelSensitivity.RESTRICTED
+        assert result.sensitivity_provenance is not None
+        assert restricted.id in cast(
+            tuple[str, ...], result.sensitivity_provenance["source_ids"]
+        )
+    finally:
+        await agent.close()
+
+
+async def test_describe_shows_estimates_on_declared_links_and_does_not_repeat_them(
+    tmp_path: Path,
+) -> None:
+    agent, _provider = await _agent(tmp_path, _describe("orders"))
+    try:
+        _with_estimates(agent)
+        shop, crm = await _two_sources(agent, tmp_path)
+
+        async def resource(source_id: str, name: str) -> str:
+            return next(
+                item.id
+                for item in await agent.list_catalog_resources(source_id=source_id)
+                if item.name == name
+            )
+
+        await agent.declare_catalog_link(
+            await resource(shop.id, "orders"),
+            await resource(crm.id, "customers"),
+            (("customer_id", "id"),),
+        )
+        (result,) = await _results(agent)
+        declared = next(
+            item
+            for item in cast(
+                Sequence[Mapping[str, object]], _data(result)["relationships"]
+            )
+            if item.get("provenance") == "declared"
+        )
+        assert (declared["from_row_estimate"], declared["to_row_estimate"]) == (
+            1_000,
+            50,
+        )
+        assert [item["column"] for item in _candidates(result)] == ["sku_code"]
+    finally:
+        await agent.close()
+
+
+async def test_describe_suggests_nothing_from_unreadable_sources_or_a_failing_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent, _provider = await _agent(tmp_path, _describe("orders", "scoped"))
+    try:
+        _shop, crm = await _two_sources(agent, tmp_path)
+        products = next(
+            item
+            for item in await agent.list_catalog_resources(source_id=crm.id)
+            if item.name == "products"
+        )
+        preview = await agent.preview_source_permissions(
+            source_id=crm.id,
+            read_mode="selected",
+            read_resource_ids=(products.id,),
+            relational_write_scopes={},
+        )
+        await agent.apply_source_permissions(
+            source_id=crm.id, confirmation_fingerprint=preview.confirmation_fingerprint
+        )
+        (scoped,) = await _results(agent)
+        assert [item["to"] for item in _candidates(scoped)] == ["main.products"]
+    finally:
+        await agent.close()
+
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    agent, _provider = await _agent(broken, _describe("orders"))
+    try:
+        await _two_sources(agent, broken)
+        for owner in (agent._embedded._catalog_service, agent._embedded._data_view):
+            monkeypatch.setattr(owner, "_store", _BrokenCatalogStore())
+        (result,) = await _results(agent)
+        assert _data(result)["answered_from"] == "live"
+        assert _candidates(result) == []
     finally:
         await agent.close()

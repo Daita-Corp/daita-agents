@@ -20,7 +20,7 @@ from .adapters.mcp import (
     MCPServerInspection,
     MCPToolSelection,
 )
-from .adapters.models import SourceHealth, SourceRegistration
+from .adapters.models import LinkCheck, SourceHealth, SourceRegistration
 from .adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
@@ -1252,6 +1252,37 @@ class Agent:
         """
 
         return await self._embedded.check_source(source_id)
+
+    async def check_link(
+        self,
+        from_source_id: str,
+        from_table: str,
+        from_columns: tuple[str, ...],
+        to_source_id: str,
+        to_table: str,
+        to_columns: tuple[str, ...],
+    ) -> LinkCheck:
+        """Read two columns from their live sources and report how well they join.
+
+        ``match_rate`` is the share of distinct ``from`` keys found on the ``to``
+        side. It is ``partial`` when a read hit its bound: the ``from`` side is
+        then a sample, and matches can be under-counted. An unreachable source,
+        an unknown table or a refused read is a result with an error code; only
+        an unknown or detached source raises ``ValueError``.
+        """
+
+        return await self._embedded.check_link(
+            from_source_id, from_table, from_columns, to_source_id, to_table, to_columns
+        )
+
+    async def check_catalog_link(self, link_id: str) -> LinkCheck:
+        """Check a declared catalog link the way ``check_link`` checks two columns.
+
+        An unknown link id raises ``ValueError``; a link whose endpoints cannot
+        be named or are stale is a result with an error code.
+        """
+
+        return await self._embedded.check_catalog_link(link_id)
 
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
         return await self._embedded.list_sources()

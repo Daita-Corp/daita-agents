@@ -103,7 +103,8 @@ not execution authority. SQLite sources and MCP bindings remain capacity one;
 analysis retains one computation lane and an independent parser lane. A
 combined `data_query` holds each distinct input source's permit once, acquired
 in sorted source-ID order, so inputs sharing a capacity-one source cannot
-deadlock. Keyed permits do not replace the mutation lock.
+deadlock. Under that permit the executor reads one input at a time within a
+source and different sources at the same time. Keyed permits do not replace the mutation lock.
 
 The loop depends on the small `ModelProvider`, `ContextBuilder`, `ToolRuntime`, and
 transcript-store protocols through those session boundaries. Provider payloads,

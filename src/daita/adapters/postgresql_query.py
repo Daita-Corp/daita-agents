@@ -67,8 +67,8 @@ from .protocols import (
 )
 
 _T = TypeVar("_T")
-_MAX_QUERY_ROWS = 10_000
-_MAX_QUERY_BYTES = 16 * 1_024 * 1_024
+_MAX_QUERY_ROWS = 100_000
+_MAX_QUERY_BYTES = 64 * 1_024 * 1_024
 _MAX_RESULT_COLUMNS = 512
 _MAX_VALUE_DEPTH = 32
 _BOUNDED_RESULT_MARKER = "/* daita:postgresql.bounded_result */"
@@ -768,13 +768,13 @@ class PostgreSQLQueryBackend:
             or isinstance(max_rows, bool)
             or not 1 <= max_rows <= _MAX_QUERY_ROWS
         ):
-            raise ValueError("max_rows must be from one through 10000")
+            raise ValueError("max_rows must be from one through 100000")
         if (
             not isinstance(max_bytes, int)
             or isinstance(max_bytes, bool)
             or not 2 <= max_bytes <= _MAX_QUERY_BYTES
         ):
-            raise ValueError("max_bytes must be from two through 16777216")
+            raise ValueError("max_bytes must be from two through 67108864")
         registration, read_scope = await self._admit(agent_id, source_id, read)
 
         connection = None
@@ -843,10 +843,8 @@ class PostgreSQLQueryBackend:
         if failure is not None:
             raise failure
 
-        projection = project_result_rows(
-            rows,
-            max_rows=max_rows,
-            max_bytes=max_bytes,
+        projection = await asyncio.to_thread(
+            project_result_rows, rows, max_rows=max_rows, max_bytes=max_bytes
         )
         if value_limited:
             reasons = tuple(
@@ -1573,7 +1571,9 @@ async def _execute_user_query(
     statement = await connection.prepare(bounded_sql, timeout=timeout_seconds)
     cursor = statement.cursor(
         *parameters,
-        prefetch=max_rows + 1,
+        # asyncpg buffers a whole prefetch batch before the byte tally sees a row.
+        # shortcut: one batch can still hold 256 rows past the budget, upgrade to size-adaptive cursor.fetch(n) if wide rows prove a problem
+        prefetch=min(256, max_rows + 1),
         timeout=timeout_seconds,
     )
     rows: list[Mapping[str, object]] = []

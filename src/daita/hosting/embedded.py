@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hmac
 import logging
 import re
@@ -41,7 +42,12 @@ from ..adapters.mcp import (
     mcp_binding_from_inspection,
     mcp_execution_origin_digest,
 )
-from ..adapters.models import DiscoveryRequest, SourceHealth, SourceRegistration
+from ..adapters.models import (
+    DiscoveryRequest,
+    LinkCheck,
+    SourceHealth,
+    SourceRegistration,
+)
 from ..adapters.postgresql import (
     POSTGRESQL_ADAPTER_ID,
     PostgreSQLProbeResult,
@@ -147,6 +153,13 @@ from ..domains.data import (
     source_file_declarations,
 )
 from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
+from ..domains.data.key_read import (
+    KeyEndpoint,
+    KeyRead,
+    checked_key_read,
+    compare_keys,
+    read_keys,
+)
 from ..domains.mcp import (
     MCP_DOMAIN_OWNER_ID,
     MCPActivatedBinding,
@@ -276,6 +289,7 @@ from ..storage.sqlite_records import (
     EffectResolutionDecision,
     SourcePermissionsInspection,
     SourcePermissionsPreview,
+    SourcePermissionStateError,
     SourceReadMode,
     validate_effect_receipt_id,
 )
@@ -336,6 +350,7 @@ from .errors import (
 )
 from .execution_governor import (
     AdmissionClosedError,
+    AdmissionError,
     AdmissionLease,
     CoordinatorDiagnostics,
     RunAdmissionCoordinator,
@@ -389,6 +404,9 @@ _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
 _RUN_ADMISSION_DRAIN_SECONDS = 30.0
 # A model typo must not cost a discovery per query.
 _SOURCE_REFRESH_MIN_SECONDS = 300.0
+LINK_CHECK_MAX_KEYS = 50_000
+LINK_CHECK_MAX_BYTES = 16 * 1_024 * 1_024
+LINK_CHECK_TIMEOUT_SECONDS = 10.0
 _LOGGER = logging.getLogger("daita.hosting")
 _T = TypeVar("_T")
 
@@ -4565,6 +4583,205 @@ class EmbeddedAgent:
                 if isinstance(error, DaitaError)
                 else "source_check_failed"
             )
+
+    async def check_link(
+        self,
+        from_source_id: str,
+        from_table: str,
+        from_columns: tuple[str, ...],
+        to_source_id: str,
+        to_table: str,
+        to_columns: tuple[str, ...],
+    ) -> LinkCheck:
+        """Read both columns from their live sources and report how well they join.
+
+        Each side is one bounded read through the same policy as ``data_query``;
+        no catalog is consulted. An unreachable source, unknown table or refused
+        read is a result with an error code, not a raise.
+        """
+
+        self._require_open()
+        endpoints = []
+        for source_id, table, columns in (
+            (from_source_id, from_table, from_columns),
+            (to_source_id, to_table, to_columns),
+        ):
+            if (
+                not isinstance(source_id, str)
+                or not source_id
+                or not isinstance(table, str)
+                or not table
+                or not isinstance(columns, tuple)
+                or not columns
+                or len(set(columns)) != len(columns)
+                or any(not isinstance(item, str) or not item for item in columns)
+            ):
+                raise ValueError(
+                    "a link side needs a source, a table and unique column names"
+                )
+            if (
+                await self._data_view.source_adapter_id(self.identity.id, source_id)
+                is None
+            ):
+                raise ValueError("unknown active source for this agent")
+            endpoints.append(KeyEndpoint(source_id, table, columns))
+        left, right = endpoints
+        if len(left.columns) != len(right.columns):
+            raise ValueError("both sides of a link need the same number of columns")
+
+        def result(**fields: Any) -> LinkCheck:
+            return LinkCheck(
+                from_source_id=left.source_id,
+                from_table=left.table,
+                from_columns=left.columns,
+                to_source_id=right.source_id,
+                to_table=right.table,
+                to_columns=right.columns,
+                **fields,
+            )
+
+        try:
+            # Both reads pass policy before either takes a permit or reads.
+            reads = [await self._prepare_link_read(item) for item in endpoints]
+            async with AsyncExitStack() as permits:
+                # One permit per distinct source, in sorted order, so two checks
+                # on capacity-one sources cannot deadlock.
+                deadline = (
+                    asyncio.get_running_loop().time() + 3 * LINK_CHECK_TIMEOUT_SECONDS
+                )
+                for source_id in sorted({left.source_id, right.source_id}):
+                    await permits.enter_async_context(
+                        await self._admission_coordinator.source_resource_permit(
+                            f"source:{source_id}", deadline=deadline
+                        )
+                    )
+                if left.source_id == right.source_id:
+                    first = await reads[0]()
+                    second = await reads[1]()
+                else:
+                    outcomes = await asyncio.gather(
+                        reads[0](), reads[1](), return_exceptions=True
+                    )
+                    for outcome in outcomes:
+                        if isinstance(outcome, BaseException):
+                            raise outcome
+                    first, second = outcomes  # type: ignore[assignment]
+        except (
+            DaitaError,
+            AdmissionError,
+            SourcePermissionStateError,
+            ImportError,
+            OSError,
+            TimeoutError,
+            TypeError,
+            ValueError,
+        ) as error:
+            return result(
+                checked_at=self._clock(),
+                error_code=(
+                    error.error_code
+                    if isinstance(error, DaitaError)
+                    else (
+                        "link_check_timeout"
+                        if isinstance(error, TimeoutError)
+                        else "link_check_failed"
+                    )
+                ),
+            )
+        comparison = compare_keys(first, second)
+        return result(
+            checked_at=min(first.read_at, second.read_at),
+            match_rate=comparison.match_rate,
+            partial=first.truncated or second.truncated,
+            from_keys=comparison.left_keys,
+            to_keys=comparison.right_keys,
+            matched_from=comparison.matched_left,
+            matched_to=comparison.matched_right,
+            from_key_types=comparison.left_key_types,
+            to_key_types=comparison.right_key_types,
+            from_truncated=first.truncated,
+            to_truncated=second.truncated,
+        )
+
+    async def _prepare_link_read(
+        self, endpoint: KeyEndpoint
+    ) -> Callable[[], Awaitable[KeyRead]]:
+        """Validate one side's read against the source's scope; return it unrun."""
+
+        agent_id, source_id = self.identity.id, endpoint.source_id
+        adapter_id = await self._data_view.source_adapter_id(agent_id, source_id) or ""
+        source_type = self._source_types.get(adapter_id)
+        sql_backend = self._source_backends[SourceOperation.SQL_READ].get(adapter_id)
+        access = await self._data_view.source_read_access(agent_id, (source_id,))
+        read = checked_key_read(
+            endpoint,
+            source_type.sql_dialect if source_type and sql_backend else None,
+            access=access.get(source_id, frozenset()),
+            schemas=await self._data_view.source_schemas(agent_id, source_id),
+        )
+        return functools.partial(
+            read_keys,
+            endpoint,
+            agent_id=agent_id,
+            read=read,
+            sql_backend=sql_backend,
+            tabular_backend=self._source_backends[SourceOperation.TABULAR_READ].get(
+                adapter_id
+            ),
+            max_keys=LINK_CHECK_MAX_KEYS,
+            max_bytes=LINK_CHECK_MAX_BYTES,
+            timeout_seconds=LINK_CHECK_TIMEOUT_SECONDS,
+        )
+
+    async def check_catalog_link(self, link_id: str) -> LinkCheck:
+        """Check one declared catalog link against the live sources."""
+
+        self._require_open()
+        if not isinstance(link_id, str) or not link_id:
+            raise ValueError("link_id must be a non-empty string")
+        status = next(
+            (
+                item
+                for item in await self.list_catalog_links()
+                if item.link.id == link_id
+            ),
+            None,
+        )
+        if status is None:
+            raise ValueError("unknown catalog link for this agent")
+        link = status.link
+        names: Mapping[str, str] = {}
+        error_code = None if status.stale_reason is None else status.stale_reason.value
+        if error_code is None:
+            try:
+                names = await self._data_view.resource_names(
+                    self.identity.id, (link.from_source_id, link.to_source_id)
+                )
+            except (DaitaError, OSError, ValueError):
+                error_code = "link_check_failed"
+        from_table = names.get(link.from_resource_id)
+        to_table = names.get(link.to_resource_id)
+        if error_code is None and (from_table is None or to_table is None):
+            error_code = "link_endpoint_unknown"
+        if error_code is not None:
+            return LinkCheck(
+                from_source_id=link.from_source_id,
+                from_table=from_table or link.from_resource_id,
+                from_columns=tuple(item.source_field for item in link.field_pairs),
+                to_source_id=link.to_source_id,
+                to_table=to_table or link.to_resource_id,
+                to_columns=tuple(item.target_field for item in link.field_pairs),
+                checked_at=self._clock(),
+                error_code=error_code,
+            )
+        return await self.check_link(
+            link.from_source_id,
+            cast(str, from_table),
+            tuple(item.source_field for item in link.field_pairs),
+            link.to_source_id,
+            cast(str, to_table),
+            tuple(item.target_field for item in link.field_pairs),
+        )
 
     async def _refresh_source_locked(
         self, source_id: str, names: tuple[str, ...] = ()

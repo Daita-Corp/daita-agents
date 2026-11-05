@@ -36,7 +36,7 @@ from ..adapters.mcp import (
     MCPServerInspection,
     MCPToolSelection,
 )
-from ..adapters.models import SourceHealth, SourceRegistration
+from ..adapters.models import LinkCheck, SourceHealth, SourceRegistration
 from ..adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLProbeSchema,
@@ -601,6 +601,7 @@ for _record in (
     DeliveryView,
     FolderSource,
     IntervalSchedule,
+    LinkCheck,
     LocalWorkspace,
     MCPAuthentication,
     MCPBindingStatus,

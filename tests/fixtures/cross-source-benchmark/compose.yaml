@@ -1,0 +1,19 @@
+name: daita-cross-source-benchmark
+
+# Empty disposable server; the harness applies seed.sql itself on every run.
+services:
+  postgres:
+    image: postgres:16.14-alpine
+    environment:
+      POSTGRES_DB: daita_cross_source
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: fixture_admin_password
+    ports:
+      - "127.0.0.1:${DAITA_CROSS_SOURCE_POSTGRES_PORT:-55435}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d daita_cross_source"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data

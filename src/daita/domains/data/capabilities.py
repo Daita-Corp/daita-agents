@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
 import time
@@ -100,21 +101,29 @@ _DATA_QUERY_USAGE = (
 )
 
 
+COMBINED_QUERY_MAX_INPUTS = 16
+# One budget shared by every input, enforced while the reads run. An input that
+# cannot fit refuses the whole call: a join over incomplete input is never returned.
+COMBINED_QUERY_TOTAL_MAX_ROWS = 50_000
+COMBINED_QUERY_TOTAL_MAX_BYTES = 32 * 1_024 * 1_024
 _DATA_QUERY_COMBINED_CAPABILITY_DESCRIPTION = (
-    "Join or aggregate data from 2 to 4 sources in one bounded read. Each input "
-    "runs read-only SQL in its own source's dialect on exact catalog resources, "
-    "or reads exact catalog columns of one resource with optional eq, in and "
-    "range filters; sql is one DuckDB SELECT or UNION, at most 8 KiB, that "
-    "reads every input alias and nothing else. Limits: 5s per input, 15s for "
-    "all inputs, 100 rows and 16 KB in the result. An input too large to join "
-    "completely refuses the call, so aggregate or filter inside each input."
+    f"Join or aggregate data from 2 to {COMBINED_QUERY_MAX_INPUTS} sources in "
+    "one bounded read. Each input runs read-only SQL in its own source's dialect "
+    "on exact tables, or reads exact columns of one table with optional eq, in "
+    "and range filters; sql is one DuckDB SELECT or UNION, at most 8 KiB, that "
+    "reads every input alias and nothing else. Limits: 5s per input, 15s for all "
+    f"inputs, {COMBINED_QUERY_TOTAL_MAX_ROWS:,} rows shared by all inputs, 100 "
+    "rows and 16 KB in the result. An input too large to join completely "
+    "refuses the call, so aggregate or filter inside each input. The result "
+    "reports join match counts."
 )
 _DATA_QUERY_COMBINED_USAGE = (
-    " Join sources: inputs is 2-4 {alias, source, sql} in each "
-    "source's dialect, with path_pattern for a folder, or {alias, source, table, "
-    "columns, filters} for "
-    "a source without SQL; sql is one DuckDB SELECT or UNION over the aliases "
-    "(8 KiB). Aggregate or filter in each input: one too large refuses the call."
+    f" Join sources: inputs is 2-{COMBINED_QUERY_MAX_INPUTS} {{alias, source, "
+    "sql} in each source's dialect, with path_pattern for a folder, or {alias, "
+    "source, table, columns, filters} for a source without SQL; sql is one "
+    "DuckDB SELECT or UNION over the aliases (8 KiB). Inputs share "
+    f"{COMBINED_QUERY_TOTAL_MAX_ROWS:,} rows; aggregate or filter in each "
+    "input: one too large refuses the call. The result reports join match counts."
 )
 _DATA_QUERY_PATH_USAGE = (
     " Folder files: query relation data by path_pattern, matched against the "
@@ -550,13 +559,6 @@ class DataQueryExecutor:
         )
 
 
-COMBINED_QUERY_MAX_INPUTS = 4
-# Internal per-input ceilings the model never sees. An input that reaches
-# either refuses the whole call: a join over incomplete input is never returned.
-COMBINED_QUERY_INPUT_MAX_ROWS = 10_000
-COMBINED_QUERY_INPUT_MAX_BYTES = 4 * 1_024 * 1_024
-
-
 class CombinedQueryEngine(Protocol):
     async def query_relations(
         self,
@@ -581,7 +583,7 @@ _ENGINE_ERRORS = {
 
 @dataclass(frozen=True, slots=True)
 class _InputRead:
-    """One complete input read and the lineage it contributes."""
+    """One input read and the lineage it contributes."""
 
     columns: tuple[str, ...]
     projection: BoundedResultProjection
@@ -590,11 +592,141 @@ class _InputRead:
     lineage: dict[str, object]
 
 
+class _ReadBudget:
+    """Rows and bytes not yet granted to a running or finished read.
+
+    Outstanding grants plus settled usage never exceed the total, so memory is
+    bounded while the reads run. One event loop owns it: no lock.
+    """
+
+    def __init__(self, rows: int, size: int) -> None:
+        self._rows = rows
+        self._bytes = size
+
+    def grant(self, waiting: int) -> tuple[int, int]:
+        """Reserve an equal share of what is left for one of ``waiting`` reads."""
+
+        share = (self._rows // waiting, self._bytes // waiting)
+        self._rows -= share[0]
+        self._bytes -= share[1]
+        return share
+
+    def settle(self, granted: tuple[int, int], used: tuple[int, int]) -> None:
+        """Return the part of a grant its read did not use."""
+
+        self._rows += granted[0] - used[0]
+        self._bytes += granted[1] - used[1]
+
+
+# LocalFileQueryLimits rejects a shorter query time.
+_MIN_READ_SECONDS = 0.01
+_Attempts = dict[int, tuple["_InputRead | None", tuple[int, int], tuple[str, ...]]]
+_READ_CONSISTENCY = (
+    "Inputs were read separately at the read_at times shown, so they are not one "
+    "consistent snapshot."
+)
+_NUMERIC_TYPES = (
+    "BIGINT",
+    "INTEGER",
+    "HUGEINT",
+    "SMALLINT",
+    "TINYINT",
+    "DOUBLE",
+    "FLOAT",
+    "DECIMAL",
+)
+
+
+def _type_family(name: str) -> str:
+    upper = name.upper()
+    return "NUMERIC" if upper.startswith(_NUMERIC_TYPES) else upper
+
+
+def _join_warnings(checks: object, status: object) -> tuple[str, ...]:
+    """Advisory notes on how the joins matched; none of them blocks the result."""
+
+    warnings: list[str] = []
+    for check in cast(tuple[Mapping[str, object], ...], checks or ()):
+        left, right = check.get("left"), check.get("right")
+        parts = []
+        for side, key in (("left", left), ("right", right)):
+            unmatched = cast(int, check.get(f"{side}_unmatched") or 0)
+            if unmatched > 0:
+                rows = check.get(f"{side}_rows")
+                of = "" if rows is None else f" of {rows}"
+                parts.append(f"{unmatched}{of} rows in {key} have no match")
+        if parts:
+            warnings.append(f"{left} = {right}: {'; '.join(parts)}.")
+        for side, key in (("left", left), ("right", right)):
+            near = cast(int, check.get(f"{side}_near_matches") or 0)
+            if near > 0:
+                warnings.append(
+                    f"{left} = {right}: {near} unmatched rows in {key} would match "
+                    "if case and surrounding spaces were ignored, so the keys may "
+                    "be formatted differently. If they name the same thing, "
+                    "normalize them inside the inputs and retry, and tell the user."
+                )
+        types = (check.get("left_type"), check.get("right_type"))
+        if all(isinstance(item, str) and item != "NULL" for item in types) and (
+            _type_family(cast(str, types[0])) != _type_family(cast(str, types[1]))
+        ):
+            warnings.append(
+                f"{left} = {right}: key types differ ({types[0]} and {types[1]}), "
+                "so matches may be missed or coerced."
+            )
+    if status in ("partial", "unavailable"):
+        warnings.append(
+            "The join match check could not finish; the result itself is unaffected."
+        )
+    return tuple(warnings)
+
+
+def _first_error(failure: BaseException) -> BaseException:
+    while isinstance(failure, BaseExceptionGroup):
+        failure = failure.exceptions[0]
+    return failure
+
+
+def _name_input(error: Exception, alias: str) -> None:
+    """Add the failing alias to the details the model is shown with the error."""
+
+    details = getattr(error, "details", None)
+    if details is None or isinstance(details, Mapping):
+        try:
+            error.details = FrozenJsonObject.from_mapping(  # type: ignore[attr-defined]
+                {**(details or {}), "input_alias": alias}
+            )
+        except AttributeError:
+            pass
+
+
+def _truncated(item: Mapping[str, object], reasons: tuple[str, ...]) -> Exception:
+    alias = item["alias"]
+    return CapabilityInputError(
+        "combined_input_truncated",
+        f"Input {alias} returned more rows or bytes than can be joined "
+        "completely, so no result was returned.",
+        {
+            "alias": alias,
+            "source_id": item["source_id"],
+            "truncation_reasons": reasons or ("budget_spent",),
+        },
+        recovery=ToolRecovery(
+            RecoveryKind.CORRECT_ARGUMENTS,
+            f"Aggregate or filter inside input {alias} so it returns fewer "
+            "rows, then retry the combined query.",
+        ),
+    )
+
+
 class DataQueryCombinedExecutor:
     """Join complete bounded per-source reads in the private DuckDB worker.
 
     Each input runs through its source's registry backend, as SQL or as a
-    tabular read, within one shared input deadline.
+    tabular read. Sources are read concurrently and the inputs of one source one
+    at a time, inside one shared deadline and one shared row and byte budget.
+    The caller already holds one admission permit per source for the whole
+    call, so this executor takes none.
     """
 
     executor_id = DATA_QUERY_COMBINED_EXECUTOR_ID
@@ -620,39 +752,38 @@ class DataQueryCombinedExecutor:
         inputs = cast(tuple[Mapping[str, object], ...], request.arguments["inputs"])
         started = self._clock()
         deadline = started + DATA_QUERY_TOTAL_TIMEOUT_SECONDS
-        reads: list[tuple[str, _InputRead]] = []
-        for item in inputs:
-            alias = cast(str, item["alias"])
-            remaining_seconds = deadline - self._clock()
-            if remaining_seconds <= 0:
-                raise DataQueryError(
-                    "query_time_limit",
-                    "The inputs exceeded the total read deadline of "
-                    f"{DATA_QUERY_TOTAL_TIMEOUT_SECONDS:g} seconds.",
+        budget = _ReadBudget(
+            COMBINED_QUERY_TOTAL_MAX_ROWS, COMBINED_QUERY_TOTAL_MAX_BYTES
+        )
+        attempts: _Attempts = {}
+        # A child task keeps the TaskGroup's own cancel of its parent (which
+        # Python 3.11 never takes back) off this call's task, so
+        # ``cancelling()`` below means only an outside cancellation.
+        reading = asyncio.ensure_future(
+            self._read_groups(inputs, budget, deadline, attempts)
+        )
+        try:
+            await reading
+        except BaseExceptionGroup as failure:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling() > 0:
+                raise asyncio.CancelledError from None
+            raise _first_error(failure) from None
+        # An input that did not fit its share is read again, alone, with what the
+        # finished reads left; if it still does not fit, the call is refused.
+        for index in sorted(attempts):
+            read, grant, reasons = attempts[index]
+            if read is None:
+                read, _, again = await self._read_input(
+                    inputs[index], budget, 1, deadline, beyond=grant
                 )
-            timeout = min(DATA_QUERY_STATEMENT_TIMEOUT_SECONDS, remaining_seconds)
-            read = await (
-                self._read_sql(item, timeout)
-                if "sql" in item
-                else self._read_tabular(item, timeout)
-            )
-            if read.projection.truncated:
-                raise CapabilityInputError(
-                    "combined_input_truncated",
-                    f"Input {alias} returned more rows or bytes than can be "
-                    "joined completely, so no result was returned.",
-                    {
-                        "alias": alias,
-                        "source_id": item["source_id"],
-                        "truncation_reasons": read.projection.truncation_reasons,
-                    },
-                    recovery=ToolRecovery(
-                        RecoveryKind.CORRECT_ARGUMENTS,
-                        f"Aggregate or filter inside input {alias} so it "
-                        "returns fewer rows, then retry the combined query.",
-                    ),
-                )
-            reads.append((alias, read))
+                if read is None:
+                    raise _truncated(inputs[index], again or reasons)
+                attempts[index] = read, grant, ()
+        reads = [
+            (cast(str, item["alias"]), cast(_InputRead, attempts[index][0]))
+            for index, item in enumerate(inputs)
+        ]
         try:
             payload = await self._engine.query_relations(
                 relations=tuple(
@@ -695,6 +826,7 @@ class DataQueryCombinedExecutor:
                 "inputs": tuple(
                     {"alias": alias, **read.lineage} for alias, read in reads
                 ),
+                "read_consistency": _READ_CONSISTENCY,
                 "resource_ids": tuple(sorted(touched)),
                 "sql_fingerprint": payload["sql_fingerprint"],
                 "tables_touched": tables_touched(names.items()),
@@ -707,9 +839,95 @@ class DataQueryCombinedExecutor:
                 },
             }
         )
+        if "join_checks" in payload:
+            data["join_checks"] = payload["join_checks"]
+        warnings = _join_warnings(
+            payload.get("join_checks"), payload.get("join_checks_status")
+        )
+        if warnings:
+            data["warnings"] = warnings
         return ToolOutput(kind=DATA_QUERY_COMBINED_EVIDENCE_KIND, data=data)
 
-    async def _read_sql(self, item: Mapping[str, object], timeout: float) -> _InputRead:
+    async def _read_groups(
+        self,
+        inputs: tuple[Mapping[str, object], ...],
+        budget: _ReadBudget,
+        deadline: float,
+        attempts: _Attempts,
+    ) -> None:
+        """Read each source's inputs in order, the sources at the same time."""
+
+        groups: dict[str, list[int]] = {}
+        for index, item in enumerate(inputs):
+            groups.setdefault(cast(str, item["source_id"]), []).append(index)
+        ungranted = len(inputs)
+
+        async def read_group(indexes: list[int]) -> None:
+            nonlocal ungranted
+            for index in indexes:
+                waiting, ungranted = ungranted, ungranted - 1
+                attempts[index] = await self._read_input(
+                    inputs[index], budget, waiting, deadline
+                )
+
+        async with asyncio.TaskGroup() as group:
+            for indexes in groups.values():
+                group.create_task(read_group(indexes))
+
+    async def _read_input(
+        self,
+        item: Mapping[str, object],
+        budget: _ReadBudget,
+        waiting: int,
+        deadline: float,
+        beyond: tuple[int, int] | None = None,
+    ) -> tuple[_InputRead | None, tuple[int, int], tuple[str, ...]]:
+        """Read one input within its share; None when it did not fit.
+
+        ``beyond`` is the grant a first attempt failed with: a repeat that gets
+        no more than that cannot do better, so it is not run. The rows of an
+        input that did not fit are dropped, never joined.
+        """
+
+        remaining = deadline - self._clock()
+        if remaining < _MIN_READ_SECONDS:
+            raise DataQueryError(
+                "query_time_limit",
+                "The inputs exceeded the total read deadline of "
+                f"{DATA_QUERY_TOTAL_TIMEOUT_SECONDS:g} seconds.",
+            )
+        grant = budget.grant(waiting)
+        rows, size = grant
+        if (
+            rows < 1
+            or size < 2
+            or (beyond is not None and rows <= beyond[0] and size <= beyond[1])
+        ):
+            budget.settle(grant, (0, 0))
+            return None, grant, ()
+        timeout = min(DATA_QUERY_STATEMENT_TIMEOUT_SECONDS, remaining)
+        used = (0, 0)
+        try:
+            began = self._clock()
+            read = await (
+                self._read_sql(item, timeout, rows, size)
+                if "sql" in item
+                else self._read_tabular(item, timeout, rows, size)
+            )
+            read.lineage["read_ms"] = _elapsed_ms(began, self._clock())
+            if read.projection.truncated:
+                return None, grant, read.projection.truncation_reasons
+            used = (read.projection.returned_rows, read.projection.utf8_bytes)
+            return read, grant, ()
+        except Exception as error:
+            _name_input(error, cast(str, item["alias"]))
+            raise
+        finally:
+            budget.settle(grant, used)
+
+    async def _read_sql(
+        self, item: Mapping[str, object], timeout: float, rows: int, size: int
+    ) -> _InputRead:
         source_id = cast(str, item["source_id"])
         backend = self._backends.get(cast(str, item["_adapter_id"]))
         if backend is None:
@@ -721,8 +939,8 @@ class DataQueryCombinedExecutor:
             agent_id=self._agent_id,
             source_id=source_id,
             read=checked_reads(item)[0],
-            max_rows=COMBINED_QUERY_INPUT_MAX_ROWS,
-            max_bytes=COMBINED_QUERY_INPUT_MAX_BYTES,
+            max_rows=rows,
+            max_bytes=size,
             timeout_seconds=timeout,
         )
         if not isinstance(result, SqlReadResult) or result.source_id != source_id:
@@ -743,7 +961,7 @@ class DataQueryCombinedExecutor:
         )
 
     async def _read_tabular(
-        self, item: Mapping[str, object], timeout: float
+        self, item: Mapping[str, object], timeout: float, rows: int, size: int
     ) -> _InputRead:
         backend = self._tabular_backends.get(cast(str, item["_adapter_id"]))
         if backend is None:
@@ -762,20 +980,35 @@ class DataQueryCombinedExecutor:
                 resource_id=resource_id,
                 columns=columns,
                 filters=filters,
-                limit=COMBINED_QUERY_INPUT_MAX_ROWS,
-                max_bytes=COMBINED_QUERY_INPUT_MAX_BYTES,
+                limit=rows,
+                max_bytes=size,
                 timeout_seconds=timeout,
             )
         )
-        if not isinstance(projection, BoundedResultProjection) or any(
-            set(row) != set(columns) for row in projection.rows
-        ):
-            raise ValueError("tabular backend returned different columns")
+        if not isinstance(projection, BoundedResultProjection):
+            raise ValueError("tabular backend returned a different result type")
+        if any(set(row) != set(columns) for row in projection.rows):
+            # The source could not serve a requested column.
+            raise CapabilityInputError(
+                "tabular_columns_unavailable",
+                f"Input {item['alias']} could not return exactly the requested "
+                "columns of that table.",
+                {"alias": item["alias"], "source_id": item["source_id"]},
+                recovery=ToolRecovery(
+                    RecoveryKind.CORRECT_ARGUMENTS,
+                    "Request only columns this table has; catalog_describe "
+                    "lists the ones it knows.",
+                ),
+            )
         return _InputRead(
             columns=columns,
             projection=projection,
             resource_ids=(resource_id,),
-            resource_names=((resource_id, cast(str, item["_resource_name"])),),
+            resource_names=(
+                ((resource_id, cast(str, item["_resource_name"])),)
+                if "_resource_name" in item
+                else ()
+            ),
             lineage={
                 "source_id": item["source_id"],
                 "read_at": read_at,
@@ -1262,7 +1495,7 @@ def _query_declarations(
                     "description": (
                         "Use with sql as one DuckDB SELECT over these aliases "
                         "to join sources. Each input is either sql in its own "
-                        "source's dialect, or exact catalog columns of one "
+                        "source's dialect, or exact columns of one "
                         "table with optional AND-combined filters "
                         "(eq, in, lt, lte, gt, gte)."
                     ),
@@ -1334,6 +1567,8 @@ _STORED_READ_RESULT_KEYS: dict[str, object] = {
 
 
 def _combined_query_output_schema() -> dict[str, object]:
+    # Results stored before these were reported still validate.
+    later = {"join_checks": "array", "read_consistency": "string", "warnings": "array"}
     types = {
         "byte_limit": "integer",
         "canonical_sql": "string",
@@ -1355,7 +1590,7 @@ def _combined_query_output_schema() -> dict[str, object]:
     return {
         "type": "object",
         "properties": {
-            **{name: {"type": kind} for name, kind in sorted(types.items())},
+            **{name: {"type": kind} for name, kind in sorted((types | later).items())},
             **_STORED_READ_RESULT_KEYS,
         },
         "required": sorted(types),

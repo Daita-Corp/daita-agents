@@ -11,6 +11,7 @@ from daita.adapters import sqlite_query as sqlite_query_module
 from daita.adapters.models import DiscoveryRequest
 from daita.adapters.registry import SourceTypeRegistry
 from daita.catalog.models import SourceCatalogSnapshot, TabularFacet
+from daita.domains.data.results import project_result_rows
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -512,3 +513,25 @@ async def test_sqlite_more_indexes_and_relationships_than_the_limits_keep_the_fi
     assert cut.sync.truncated is True
     assert [index.name for index in _tabular(cut, "parent").indexes] == ["by_a", "by_b"]
     assert len(cut.relationships) == 2
+
+
+async def test_sqlite_read_stops_at_its_byte_budget_instead_of_holding_a_wide_table(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "wide_rows.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE blobs (value TEXT)")
+        connection.executemany("INSERT INTO blobs VALUES (?)", [("x" * 1_000,)] * 2_000)
+    admitted = sqlite_query_module._regular_unaliased_path(str(database))
+
+    _columns, rows = await sqlite_query_module._run_query(
+        admitted,
+        "SELECT value FROM blobs",
+        (),
+        max_rows=100_000,
+        max_bytes=5_000,
+    )
+    projection = project_result_rows(rows, max_rows=100_000, max_bytes=5_000)
+
+    assert "byte_limit" in projection.truncation_reasons
+    assert projection.total_rows <= 7

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -64,6 +65,8 @@ _ALLOWED_FUNCTIONS = frozenset(
         "VAR_SAMP",
     }
 )
+_MAX_JOIN_CHECKS = 16
+_MAX_JOIN_LABEL = 128
 _SCHEME_OR_ABSOLUTE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.-]*://|/|\\\\)")
 
 
@@ -294,6 +297,178 @@ def validate_duckdb_read(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class EqualityJoin:
+    """One equality join with code-built diagnostic SQL (all read-only)."""
+
+    left: str
+    right: str
+    left_key_sql: str
+    right_key_sql: str
+    left_unmatched_sql: str
+    right_unmatched_sql: str
+    left_rows_sql: str
+    right_rows_sql: str
+    left_near_sql: str
+    right_near_sql: str
+
+
+def equality_joins(
+    canonical_sql: str, columns: Mapping[str, frozenset[str]]
+) -> tuple[EqualityJoin, ...]:
+    """Find each column-to-column equality join of a validated SELECT.
+
+    ``columns`` maps each input relation to its column names. Anything that is
+    not a plain equality between two different from-items is skipped; this
+    never raises, so a diagnostic gap cannot affect a query result.
+    """
+
+    try:
+        return _equality_joins(canonical_sql, columns)
+    except Exception:  # noqa: BLE001 - diagnostics must not fail a valid query
+        return ()
+
+
+def _conjuncts(node: Any, exp: Any) -> Iterator[Any]:
+    if isinstance(node, exp.Paren):
+        yield from _conjuncts(node.this, exp)
+    elif isinstance(node, exp.And):
+        yield from _conjuncts(node.this, exp)
+        yield from _conjuncts(node.expression, exp)
+    elif node is not None:
+        yield node
+
+
+def _equality_joins(
+    canonical_sql: str, columns: Mapping[str, frozenset[str]]
+) -> tuple[EqualityJoin, ...]:
+    sqlglot, exp, _ = _load_sqlglot()
+    known = {
+        name.casefold(): {c.casefold() for c in cs} for name, cs in columns.items()
+    }
+    root = sqlglot.parse_one(canonical_sql, read="duckdb")
+    with_clause = root.args.get("with_") or root.args.get("with")
+    prefix = with_clause.sql(dialect="duckdb") + " " if with_clause else ""
+    found: dict[tuple[str, str], EqualityJoin] = {}
+
+    def side_item(side: Any, items: list[Any], names: list[str]) -> int | None:
+        if side.find(exp.Subquery, exp.Select) is not None:
+            return None
+        owners: set[int] = set()
+        for column in side.find_all(exp.Column):
+            if column.table:
+                matches = [
+                    i
+                    for i, n in enumerate(names)
+                    if n.casefold() == column.table.casefold()
+                ]
+            else:
+                # Unqualified names resolve only when every from-item is a
+                # known input relation and exactly one has the column.
+                if any(
+                    not isinstance(i, exp.Table) or i.name.casefold() not in known
+                    for i in items
+                ):
+                    return None
+                matches = [
+                    i
+                    for i, item in enumerate(items)
+                    if column.name.casefold() in known[item.name.casefold()]
+                ]
+            if len(matches) != 1:
+                return None
+            owners.add(matches[0])
+        return next(iter(owners)) if len(owners) == 1 else None
+
+    def add(eq: Any, items: list[Any], names: list[str]) -> None:
+        left, right = eq.this, eq.expression
+        li, ri = side_item(left, items, names), side_item(right, items, names)
+        if li is None or ri is None or li == ri:
+            return
+        label = (left.sql(dialect="duckdb"), right.sql(dialect="duckdb"))
+        sides = []
+        for side, index in ((left, li), (right, ri)):
+            side = side.copy()
+            for column in side.find_all(exp.Column):
+                column.set("table", exp.to_identifier(names[index]))
+            sides.append(side.sql(dialect="duckdb"))
+        lexpr, rexpr = sides
+        litem, ritem = (
+            items[li].sql(dialect="duckdb"),
+            items[ri].sql(dialect="duckdb"),
+        )
+        condition = f"{lexpr} = {rexpr}"
+        near = (
+            f"lower(trim(CAST({lexpr} AS VARCHAR))) = "
+            f"lower(trim(CAST({rexpr} AS VARCHAR)))"
+        )
+        join = EqualityJoin(
+            left=label[0][:_MAX_JOIN_LABEL],
+            right=label[1][:_MAX_JOIN_LABEL],
+            left_key_sql=f"{prefix}SELECT {lexpr} AS k FROM {litem}",
+            right_key_sql=f"{prefix}SELECT {rexpr} AS k FROM {ritem}",
+            left_unmatched_sql=(
+                f"{prefix}SELECT count(*) FROM {litem} WHERE NOT EXISTS "
+                f"(SELECT 1 FROM {ritem} WHERE {condition})"
+            ),
+            right_unmatched_sql=(
+                f"{prefix}SELECT count(*) FROM {ritem} WHERE NOT EXISTS "
+                f"(SELECT 1 FROM {litem} WHERE {condition})"
+            ),
+            left_rows_sql=f"{prefix}SELECT count(*) FROM {litem}",
+            right_rows_sql=f"{prefix}SELECT count(*) FROM {ritem}",
+            # Unmatched rows that would match if case and padding were ignored.
+            left_near_sql=(
+                f"{prefix}SELECT count(*) FROM {litem} WHERE NOT EXISTS "
+                f"(SELECT 1 FROM {ritem} WHERE {condition}) AND EXISTS "
+                f"(SELECT 1 FROM {ritem} WHERE {near})"
+            ),
+            right_near_sql=(
+                f"{prefix}SELECT count(*) FROM {ritem} WHERE NOT EXISTS "
+                f"(SELECT 1 FROM {litem} WHERE {condition}) AND EXISTS "
+                f"(SELECT 1 FROM {litem} WHERE {near})"
+            ),
+        )
+        found.setdefault((join.left_unmatched_sql, join.right_unmatched_sql), join)
+
+    for select in root.find_all(exp.Select):
+        source = select.args.get("from_") or select.args.get("from")
+        joins = select.args.get("joins") or []
+        if source is None:
+            continue
+        items = [source.this, *(j.this for j in joins)]
+        names = [i.alias_or_name for i in items]
+        if not all(names):
+            continue
+        for position, join in enumerate(joins, start=1):
+            candidates = list(_conjuncts(join.args.get("on"), exp))
+            for using in join.args.get("using") or []:
+                name = using.name.casefold()
+                holders = [
+                    i
+                    for i in range(position + 1)
+                    if isinstance(items[i], exp.Table)
+                    and name in known.get(items[i].name.casefold(), ())
+                ]
+                if position in holders and len(holders) == 2:
+                    other = next(i for i in holders if i != position)
+                    candidates.append(
+                        exp.EQ(
+                            this=exp.column(using.name, names[other]),
+                            expression=exp.column(using.name, names[position]),
+                        )
+                    )
+            for candidate in candidates:
+                if isinstance(candidate, exp.EQ):
+                    add(candidate, items, names)
+        for candidate in _conjuncts(
+            select.args["where"].this if select.args.get("where") else None, exp
+        ):
+            if isinstance(candidate, exp.EQ):
+                add(candidate, items, names)
+    return tuple(found.values())[:_MAX_JOIN_CHECKS]
+
+
 def _load_sqlglot() -> tuple[Any, Any, Any]:
     try:
         import sqlglot
@@ -317,6 +492,8 @@ def _function_name(node: Any) -> str:
 __all__ = [
     "MAX_FILE_QUERY_SQL_CHARACTERS",
     "DuckDBReadValidationError",
+    "EqualityJoin",
     "ValidatedDuckDBRead",
+    "equality_joins",
     "validate_duckdb_read",
 ]

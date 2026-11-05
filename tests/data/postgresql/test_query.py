@@ -101,6 +101,40 @@ async def test_postgresql_backend_preserves_credential_failure(
     assert str(raised.value) == "PostgreSQL credential resolution failed."
 
 
+async def test_postgresql_backend_admits_a_large_combined_input_grant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend, registration = _backend()
+    reached_connection = False
+
+    async def stop_at_connect(*args: object, **kwargs: object) -> object:
+        nonlocal reached_connection
+        del args, kwargs
+        reached_connection = True
+        raise PostgreSQLSourceError("postgresql_connect_failed", "stop.")
+
+    monkeypatch.setattr(postgresql_query_module, "_connect", stop_at_connect)
+    read = checked_read("SELECT amount FROM public.orders")
+
+    with pytest.raises(postgresql_query_module.PostgreSQLQueryError):
+        await backend.execute_read(
+            agent_id=registration.agent_id,
+            source_id=registration.id,
+            read=read,
+            max_rows=100_000,
+            max_bytes=64 * 1024 * 1024,
+        )
+    assert reached_connection
+    with pytest.raises(ValueError, match="max_rows"):
+        await backend.execute_read(
+            agent_id=registration.agent_id,
+            source_id=registration.id,
+            read=read,
+            max_rows=100_001,
+            max_bytes=65_536,
+        )
+
+
 class _FailingExecutor:
     executor_id = "test.postgresql.failure.executor"
 

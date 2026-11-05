@@ -69,6 +69,39 @@ the catalog holds only part of it. `DiscoveryLimitError` is gone.
   `semantic_unknown_resource` and says reads are unaffected, instead of
   `resource_read_not_allowed`.
 
+### Cross-source joins
+
+A combined `data_query` now joins 2 to 16 sources, up from 4, and tells the model how
+well the join matched.
+
+- **Limits.** All inputs share 50,000 rows and 32 MiB, enforced while they read, within
+  one 15-second deadline. Sources read at the same time and the inputs of one source one
+  at a time. An input that overflows its share is read again alone with what is left;
+  one that still does not fit refuses the call with `combined_input_truncated`. A failing
+  input cancels the others and returns its own error code, with the alias in its details
+  as `input_alias`.
+- **Join checks.** Each result reports `rows`, `read_at` and `read_ms` per input,
+  `read_consistency` (inputs are read separately, not as one snapshot), `join_checks`
+  (key types, row counts, rows with no match, and how many of those would match
+  ignoring case and surrounding spaces, for each equality in the join) and
+  `warnings`. The checks run after the result is safe, never block it, and report
+  `partial` if they cannot finish.
+- **The catalog no longer gates tabular inputs.** An unlisted table or column is the
+  source's to serve or refuse.
+- **Smaller reads.** SQLite stops fetching at its byte share, and PostgreSQL prefetches
+  at most 256 rows.
+- **Link hints.** `catalog_describe` relationships carry `from_row_estimate` and
+  `to_row_estimate`, and it lists `link_candidates`, unconfirmed joins to other sources.
+  A candidate grants no read access and is never declared.
+- **Link check.** `Agent.check_link(...)` and `Agent.check_catalog_link(link_id)` read
+  the key columns of both sides once, within bounds, and return a `LinkCheck` with the
+  match rate. A read that hits its bound makes the result `partial`. The host serves
+  both. They are not model tools.
+- **Removed:** the tabular-input error codes `sql_resource_source_mismatch`,
+  `catalog_provenance_missing` and `tabular_column_unknown`, which no longer occur.
+  `daita.domains.data.COMBINED_QUERY_INPUT_MAX_ROWS` and `_BYTES` are replaced by
+  `COMBINED_QUERY_TOTAL_MAX_ROWS` and `_BYTES`, now totals for the whole call.
+
 ### Routines are a title, a prompt and a schedule
 
 A routine now holds what a person asked for: a title, a prompt, a schedule

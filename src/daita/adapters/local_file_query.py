@@ -46,8 +46,11 @@ _MAX_REQUEST_BYTES = 512 * 1_024
 _RESPONSE_OVERHEAD_BYTES = 16 * 1_024
 # Internal source reads (combined-query inputs, catalog discovery) may return
 # more rows than one model-visible result; they are never shown to a model.
-_MAX_READ_ROWS = 10_000
-_MAX_READ_BYTES = 4 * _MIB
+_MAX_READ_ROWS = 100_000
+_MAX_READ_BYTES = 64 * _MIB
+# describe() bounds only its schema output.
+_MAX_DESCRIBE_BYTES = 4 * _MIB
+_JOIN_CHECK_SECONDS = 5.0
 _MAX_COLUMN_NAME_BYTES = 256
 _MAX_VALUE_DEPTH = 16
 _POLL_SECONDS = 0.01
@@ -231,7 +234,7 @@ class LocalFileQueryBackend:
             None,
             placeholder.canonical_sql,
             placeholder.sql_fingerprint,
-            limits=replace(self._limits, max_result_bytes=_MAX_READ_BYTES),
+            limits=replace(self._limits, max_result_bytes=_MAX_DESCRIBE_BYTES),
             describe=True,
         )
         schemas = cast(list[object], payload["schemas"])
@@ -352,7 +355,7 @@ def _run_private_worker(
     termination: str | None = None
     peak_spill = 0
     peak_rss = 0
-    final: dict[str, object] | None = None
+    received: dict[str, Any] = {}
     try:
         if manifest is not None:
             manifest.revalidate()
@@ -403,9 +406,19 @@ def _run_private_worker(
             observed_rss = _process_rss_bytes(process.pid)
             if observed_rss is not None:
                 peak_rss = max(peak_rss, observed_rss)
-            final = _receive_messages(live_parent, final, limits)
+            _receive_messages(live_parent, received, limits)
+            final = received.get("final")
             if cancellation.is_set():
                 termination = "cancelled"
+            elif final is not None and final.get("status") == "success":
+                # The result is in hand: only the optional join checks remain,
+                # and they may never turn it into a failure.
+                if (
+                    now - received["final_at"] > _JOIN_CHECK_SECONDS + 1.0
+                    or peak_spill > limits.max_spill_bytes
+                    or peak_rss > limits.max_worker_rss_bytes
+                ):
+                    termination = "after_result"
             elif now - started >= limits.max_query_seconds:
                 termination = "timeout"
             elif peak_spill > limits.max_spill_bytes:
@@ -422,7 +435,8 @@ def _run_private_worker(
             process.kill()
             process.join(timeout=1.0)
         process.join()
-        final = _receive_messages(live_parent, final, limits)
+        _receive_messages(live_parent, received, limits)
+        final = received.get("final")
         peak_spill = max(peak_spill, _directory_bytes(scratch))
         if termination == "cancelled":
             raise _WorkerCancelled()
@@ -475,6 +489,15 @@ def _run_private_worker(
             )
         if manifest is not None:
             manifest.revalidate()
+        if relations is not None and not describe:
+            checks = received.get("join_checks")
+            payload = {
+                **payload,
+                "join_checks": [] if checks is None else checks["checks"],
+                "join_checks_status": (
+                    "unavailable" if checks is None else checks["status"]
+                ),
+            }
         return payload
     except _WorkerCancelled as error:
         raise asyncio.CancelledError from error
@@ -526,6 +549,7 @@ def _private_worker_entry(
     descriptors: list[int] = []
     duckdb_connection: Any | None = None
     final: dict[str, object]
+    final_sent = False
     response_bound = _response_bound(LocalFileQueryLimits().max_result_bytes)
     try:
         _set_worker_limits()
@@ -580,6 +604,27 @@ def _private_worker_entry(
             )
         _revalidate_descriptors(descriptors, bindings)
         final = {"kind": "final", "status": "success", "data": data}
+        if relations is not None and request.get("describe") is not True:
+            # The rows go out before any optional join diagnostics run.
+            _send_message(connection, final, response_bound)
+            final_sent = True
+            try:
+                from ..domains.data.sql.duckdb_read import equality_joins
+
+                _send_join_checks(
+                    connection,
+                    duckdb_connection,
+                    equality_joins(
+                        str(request["canonical_sql"]),
+                        {
+                            item["name"]: frozenset(c["name"] for c in item["columns"])
+                            for item in relations
+                        },
+                    ),
+                    response_bound,
+                )
+            except BaseException:  # noqa: BLE001,S110 - checks are optional
+                pass
     except ImportError as error:
         final = {
             "kind": "final",
@@ -615,11 +660,75 @@ def _private_worker_entry(
                 os.close(descriptor)
             except OSError:
                 pass
-        try:
-            _send_message(connection, final, response_bound)
-        except (BrokenPipeError, EOFError, OSError):
-            pass
+        if not final_sent:
+            try:
+                _send_message(connection, final, response_bound)
+            except (BrokenPipeError, EOFError, OSError):
+                pass
         connection.close()
+
+
+def _send_join_checks(
+    connection: _PipeEndpoint,
+    duckdb_connection: Any,
+    joins: tuple[Any, ...],
+    response_bound: int,
+) -> None:
+    """Measure each equality join within one shared time budget; send the result."""
+
+    deadline = time.monotonic() + _JOIN_CHECK_SECONDS
+    timer = threading.Timer(_JOIN_CHECK_SECONDS, duckdb_connection.interrupt)
+    timer.daemon = True
+    timer.start()
+
+    def scalar(sql: str, column: int = 0) -> object:
+        if time.monotonic() >= deadline:
+            return None
+        try:
+            return duckdb_connection.execute(sql).fetchall()[0][column]
+        except BaseException:  # noqa: BLE001 - a failed check leaves a gap
+            return None
+
+    def near(unmatched: object, sql: str) -> object:
+        # Only unmatched rows can be near matches.
+        return scalar(sql) if unmatched else unmatched
+
+    checks: list[dict[str, object]] = []
+    try:
+        for join in joins:
+            left_rows = scalar(join.left_rows_sql)
+            right_rows = scalar(join.right_rows_sql)
+            left_unmatched = scalar(join.left_unmatched_sql)
+            right_unmatched = scalar(join.right_unmatched_sql)
+            checks.append(
+                {
+                    "left": join.left,
+                    "right": join.right,
+                    "left_type": scalar("DESCRIBE " + join.left_key_sql, 1),
+                    "right_type": scalar("DESCRIBE " + join.right_key_sql, 1),
+                    "left_rows": left_rows,
+                    "right_rows": right_rows,
+                    "left_unmatched": left_unmatched,
+                    "right_unmatched": right_unmatched,
+                    "left_near_matches": near(left_unmatched, join.left_near_sql),
+                    "right_near_matches": near(right_unmatched, join.right_near_sql),
+                }
+            )
+    finally:
+        timer.cancel()
+    partial = any(value is None for check in checks for value in check.values())
+    encoded = canonical_json(
+        {
+            "kind": "join_checks",
+            "status": "partial" if partial else "complete",
+            "checks": checks,
+        }
+    ).encode("utf-8")
+    if len(encoded) > response_bound:
+        encoded = canonical_json(
+            {"kind": "join_checks", "status": "partial", "checks": []}
+        ).encode("utf-8")
+    connection.send_bytes(encoded)
 
 
 def _request_mapping(
@@ -656,7 +765,7 @@ def _request_mapping(
 _RELATION_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _RELATION_TYPES = frozenset({"NULL", "BOOLEAN", "BIGINT", "DOUBLE", "VARCHAR", "JSON"})
 _DECIMAL_TYPE = re.compile(r"DECIMAL\(38,([0-9]|[12][0-9]|3[0-7])\)")
-_MAX_RELATIONS = 8
+_MAX_RELATIONS = 16
 _MAX_RELATION_COLUMNS = 512
 
 
@@ -1611,9 +1720,11 @@ def _send_message(
 
 def _receive_messages(
     connection: _PipeEndpoint,
-    final: dict[str, object] | None,
+    received: dict[str, Any],
     limits: LocalFileQueryLimits,
-) -> dict[str, object] | None:
+) -> None:
+    """Record the worker's last ``final`` and ``join_checks`` in ``received``."""
+
     while connection.poll(0):
         try:
             raw = connection.recv_bytes(
@@ -1631,14 +1742,21 @@ def _receive_messages(
         if not isinstance(message, dict) or message.get("kind") not in {
             "ready",
             "final",
+            "join_checks",
         }:
             raise LocalFileQueryError(
                 "folder_query_invalid",
                 "The private file-query worker returned an invalid result.",
             )
         if message.get("kind") == "final":
-            final = message
-    return final
+            received["final"] = message
+            received.setdefault("final_at", time.monotonic())
+        elif message.get("kind") == "join_checks":
+            # Optional diagnostics: a malformed report is dropped, not fatal.
+            if message.get("status") in {"complete", "partial"} and isinstance(
+                message.get("checks"), list
+            ):
+                received["join_checks"] = message
 
 
 def _create_private_scratch(parent: Path) -> Path:
