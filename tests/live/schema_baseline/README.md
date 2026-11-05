@@ -50,7 +50,8 @@ head-to-head) can run the same set.
 Round trips are counted by wrapping `asyncpg.Connection` methods and reading
 Daita's `/* daita:postgresql.<name> */` statement tags, so the count survives
 loader rewrites as long as statements stay tagged. A bounded user read counts
-as its `prepare`; cursor fetches are not counted.
+as its `prepare`; cursor fetches are not counted, and a bulk discovery read
+counts once as its `Connection.cursor` call.
 
 `test_daita_and_claude_code_answer_the_question_set` (optional, paid) asks
 Daita and Claude Code the same 15 questions with the same Anthropic model.

@@ -53,11 +53,25 @@ every column of it; a readable unique key still appears.
 
 Attach never fails on size. Discovery reads at most `DiscoveryRequest`'s 1,000
 tables, 512 columns and 256 indexes per table, and 2,000 relationships, and
-PostgreSQL stops reading per-table structure after 60 seconds. What a limit cuts
-stays reachable through the live tools, and `CatalogSync.truncated` is set. A
-primary key shows whole or not at all, and an index or foreign key that names a
-cut column is dropped. `source_directory` adds `catalog_partial` for a truncated
-source, so the model knows the object count is a floor and looks live.
+PostgreSQL stops reading table detail after 60 seconds. What a limit cuts stays
+reachable through the live tools, and `CatalogSync.truncated` is set. A primary key
+shows whole or not at all, and an index or foreign key that names a cut column is
+dropped. `source_directory` adds `catalog_partial` for a truncated source, so the
+model knows the object count is a floor and looks live.
+
+PostgreSQL discovery sends five tagged statements however many tables there are:
+resources, bulk columns, bulk indexes, relationships and estimates. The two bulk
+statements read through a server-side cursor in batches of `_BULK_FETCH_ROWS`, and
+rows are grouped by table in Python so only one table's raw rows are held. Each
+batch is a round trip, so the batch size sets how latency scales with catalog size.
+They share their SQL fragments with the single-table `COLUMNS_SQL` and `INDEXES_SQL`
+that live describe uses, so the two cannot drift. Each bulk read runs in a savepoint
+with the time left in the discovery budget as its timeout, rather than the 8-second
+command timeout, because one statement now reads what a thousand did. The column read
+stops with a quarter of the budget left, so the tables whose columns arrived can still
+get their indexes. When the budget ends a read, the table in progress is dropped and
+the tables before it are kept with both their columns and indexes, so a kept table
+never shows a falsely empty index list.
 
 The catalog refreshes on attach, on an explicit `Agent.refresh_source`, when
 `catalog_describe` or `catalog_search` finds a table the catalog lacks or
