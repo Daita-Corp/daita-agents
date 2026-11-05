@@ -145,12 +145,11 @@ state loss cannot make a revoked candidate eligible to save.
 ## Relevant procedures
 
 The context builder supplies general Python operating guidance only while
-`python_execute` is callable. It adds fixed CSV, database, query-result or chart
-procedures when the current request names that work; successful typed file/query
-result metadata can also select the CSV or query/database procedures. Previous
-conversation tasks and arbitrary result text do not select these procedures.
-Selection is a presentation hint, not discovery, schema evidence or authority.
-Non-tabular computation has no mandatory CSV, database or chart checklist.
+`python_execute` is callable. The fixed CSV, database, query-result and chart
+procedures show whenever it is callable, gated only by which tools are available, not
+by the question's words or earlier results. This keeps the prompt prefix stable for
+provider caching. The guidance is a presentation hint, not discovery, schema evidence
+or authority, and non-tabular computation needs no CSV, database or chart checklist.
 
 An explicit `tools.call`, `tools.batch` or admitted capture request also supplies
 loading guidance before Python becomes callable. Load Python and the required

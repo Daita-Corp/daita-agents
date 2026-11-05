@@ -448,9 +448,17 @@ class AnthropicMessagesProvider:
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": messages,
+            # Automatic caching moves a breakpoint to the end of the growing tail.
+            "cache_control": {"type": "ephemeral"},
         }
         if system is not None:
-            arguments["system"] = system
+            arguments["system"] = [
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
         if request.tools:
             arguments["tools"] = [
                 {

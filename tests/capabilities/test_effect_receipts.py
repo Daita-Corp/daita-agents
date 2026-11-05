@@ -452,7 +452,7 @@ async def test_reopened_foreground_context_reports_bounded_durable_effect_block(
         await agent.run("Are the requested values present? Do not repeat any action.")
         system = "\n".join(
             block.text
-            for block in provider.requests[-1].messages[0].content
+            for block in provider.requests[-1].messages[-1].content
             if isinstance(block, TextBlock)
         )
         assert '"unresolved_effects"' in system
@@ -473,7 +473,7 @@ async def test_reopened_foreground_context_reports_bounded_durable_effect_block(
         await agent.run("Report current status.")
         system = "\n".join(
             block.text
-            for block in provider.requests[-1].messages[0].content
+            for block in provider.requests[-1].messages[-1].content
             if isinstance(block, TextBlock)
         )
         assert '"unresolved_effects"' not in system

@@ -18,8 +18,9 @@ under full read access a run reads any data file within the folder's
 `subpaths`, decided from the file's format and path when the call runs.
 
 The prompt never carries catalog results ranked for the question. It holds a short
-directory of each source's name, type, dialect, schemas and approximate object count,
-the same for every question. `catalog_search` and `catalog_describe` find tables when
+directory of each source's name, type, dialect, schemas and approximate object count
+(rounded to two significant figures, so small drift in a source does not change the
+prompt), the same for every question. `catalog_search` and `catalog_describe` find tables when
 the model needs them, asking the live source as well as the catalog, and show only
 what the run may read.
 
@@ -197,7 +198,9 @@ terminal. The framework never substitutes a smaller final context or a post-limi
 model request. Compact owner-defined results reduce growth without truncating the
 exact transcript or weakening the retained contracts.
 
-Procedure guidance follows the authenticated callable working set. When a needed
+Procedure guidance follows the authenticated callable working set. The run-start
+time and question-specific notes ride on the question, not the instructions, so
+repeated questions reuse the provider's prompt cache. When a needed
 tool is a prepared candidate but is not loaded, guidance names the exact load and
 requires invocation on a later step. Missing access is a scope limitation; search
 cannot grant it. Missing columns and keys remain unknown. Current source evidence

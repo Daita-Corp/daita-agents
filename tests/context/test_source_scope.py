@@ -51,11 +51,12 @@ def _stop(text: str) -> ModelResponse:
 
 def _user_texts(request: object) -> tuple[str, ...]:
     messages = getattr(request, "messages")
+    users = [message for message in messages if message.role is MessageRole.USER]
+    # The last user message is the run start; its leading block is start context.
     return tuple(
         block.text
-        for message in messages
-        if message.role is MessageRole.USER
-        for block in message.content
+        for message in users
+        for block in (message.content[-1:] if message is users[-1] else message.content)
         if isinstance(block, TextBlock)
     )
 

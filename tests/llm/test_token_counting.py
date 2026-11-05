@@ -394,6 +394,31 @@ async def test_invalid_counts_never_admit_generation(kind, count):
     assert len(paths) == 1 and is_count(paths[0])
 
 
+@pytest.mark.parametrize("stream", [False, True])
+async def test_anthropic_requests_mark_the_cacheable_prefix_and_count_the_same_request(
+    stream,
+):
+    bodies = {}
+
+    def respond(request):
+        counting = is_count(request.url.path)
+        bodies["count" if counting else "generate"] = json.loads(request.content)
+        if counting:
+            return httpx.Response(200, json=count_response("anthropic", 10))
+        return httpx.Response(503, json={"error": {"message": "offline"}})
+
+    async with provider_at("anthropic", respond) as provider:
+        with pytest.raises(ModelProviderError):
+            await invoke(provider, input_request(remaining=7000), stream)
+    generate, count = bodies["generate"], bodies["count"]
+    assert generate["cache_control"] == {"type": "ephemeral"}
+    assert isinstance(generate["system"], list)
+    assert generate["system"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert count == {
+        k: v for k, v in generate.items() if k not in {"max_tokens", "stream"}
+    }
+
+
 @pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
 @pytest.mark.parametrize("stream", [False, True])
 async def test_output_cap_reserves_counted_input(kind, stream):

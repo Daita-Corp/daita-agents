@@ -36,6 +36,7 @@ __all__ = (
     "_prepared_request",
     "_profile",
     "_project_completed_history",
+    "_carries_messages",
     "_request_text",
     "_simple_conversation_record",
     "_stop",
@@ -524,10 +525,31 @@ def _analytical_conversation_record(
 
 
 def _request_text(request: ModelRequest) -> tuple[str, ...]:
+    # The current run's start message is the last user message; its leading
+    # block is the builder's start context, so only its last block is the user's.
+    last_user = max(
+        (i for i, m in enumerate(request.messages) if m.role is MessageRole.USER),
+        default=-1,
+    )
     return tuple(
         block.text
-        for message in request.messages
-        if message.role.value != "system"
-        for block in message.content
+        for index, message in enumerate(request.messages)
+        if message.role is not MessageRole.SYSTEM
+        for block in (message.content[-1:] if index == last_user else message.content)
         if isinstance(block, TextBlock)
+    )
+
+
+def _carries_messages(
+    request: ModelRequest, messages: tuple[CanonicalMessage, ...]
+) -> bool:
+    """The request ends with these messages; the start may add leading context."""
+
+    tail = request.messages[len(request.messages) - len(messages) :]
+    start, original = tail[0], messages[0]
+    return (
+        tail[1:] == messages[1:]
+        and start.role is original.role
+        and start.content[len(start.content) - len(original.content) :]
+        == original.content
     )

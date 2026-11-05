@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import aclosing
 from dataclasses import replace
+from decimal import Decimal
 from typing import Any, cast
 
 import pytest
@@ -925,9 +926,23 @@ def _anthropic_message_start() -> dict[str, object]:
 
 
 async def test_anthropic_native_stream_handles_forward_events_and_fallback_blocks():
+    start = _anthropic_message_start()
+    message = cast(dict[str, Any], start["message"])
+    message["model"] = "claude-opus-4-8"
+    message["usage"] = {
+        "input_tokens": 1_000_000,
+        "cache_read_input_tokens": 100_000,
+        "cache_creation_input_tokens": 200_000,
+        "cache_creation": {
+            "ephemeral_5m_input_tokens": 100_000,
+            "ephemeral_1h_input_tokens": 100_000,
+        },
+        "service_tier": "standard",
+        "inference_geo": "global",
+    }
     client = _AnthropicClient(
         (
-            _anthropic_message_start(),
+            start,
             {"type": "future_metadata", "value": "ignored"},
             {
                 "type": "content_block_start",
@@ -954,13 +969,13 @@ async def test_anthropic_native_stream_handles_forward_events_and_fallback_block
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": "end_turn"},
-                "usage": {"output_tokens": 1},
+                "usage": {"output_tokens": 100_000},
             },
             {"type": "message_stop"},
         )
     )
     provider = AnthropicMessagesProvider(
-        "test-model",
+        "claude-opus-4-8",
         client=cast(Any, client),
     )
 
@@ -972,6 +987,10 @@ async def test_anthropic_native_stream_handles_forward_events_and_fallback_block
     completed = cast(ModelStreamCompleted, events[-1])
     assert completed.response.text == "Hello"
     assert client.messages.arguments is not None
+    usage = completed.response.usage
+    assert usage.input_tokens == 1_000_000 + 100_000 + 200_000
+    assert (usage.cache_read_tokens, usage.cache_write_tokens) == (100_000, 200_000)
+    assert usage.cost_estimate.amount_usd == Decimal("9.175")
 
 
 async def test_anthropic_native_no_argument_tool_call_finishes_as_empty_object():

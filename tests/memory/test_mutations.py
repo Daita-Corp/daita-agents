@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from daita.capabilities import CapabilityInputError
-from daita.llm.models import ToolCall
+from daita.llm.models import ModelRequest, ToolCall
 from daita.memory.capabilities import apply_memory_edit
 from tests.support.approval_learning import (
     EAGER_LIMITS,
@@ -22,6 +22,7 @@ from tests.support.approval_learning import (
     _tool_results,
     workspace_for,
 )
+from tests.support.conversations import _carries_messages
 
 
 async def test_explicit_correction_is_one_approved_foreground_memory_write(tmp_path):
@@ -61,7 +62,9 @@ async def test_explicit_correction_is_one_approved_foreground_memory_write(tmp_p
         )
         assert first.tools == second.tools
         transcript = await agent.transcript(result.run_id)
-        assert second.messages[1:] == transcript.messages[:-1]
+        assert _carries_messages(
+            ModelRequest(messages=second.messages[1:]), transcript.messages[:-1]
+        )
         tool_result = _tool_results(provider)[0]
         assert tool_result.output["data"] == FrozenJsonObject.from_mapping(
             {"target": "memory", "replaced": True}

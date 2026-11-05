@@ -120,8 +120,21 @@ file, memory, skill, and data content as untrusted. Untrusted content cannot
 become an instruction or grant authority.
 
 Preparation freezes core instructions, admitted metadata, prior continuity, and
-safe artifact destinations. Each step adds code-owned procedure guidance only for
-its authenticated callable tool projection and reports the remaining run allowance.
+safe artifact destinations. Each step shows code-owned procedure guidance for its
+authenticated callable tool projection (Python guidance shows whenever
+`python_execute` is callable) and reports the remaining run allowance.
+The request prefix (tools, then system text, then messages) is byte-identical across
+the steps of a run and across runs of one agent, except the current run's first user
+turn. The system text depends only on the callable tool set, so it changes only when
+`toolbox_load` changes the tools, and that request already rewrites the provider
+cache. The run-start time, the unresolved-effect notice and question-specific
+procedures are computed once at preparation (`RunContextSnapshot.start_context`)
+and render as a leading text block on the current run's start message, in the request
+only. The transcript and stored start message are unchanged, and earlier runs'
+history renders without the block. The directory's approximate object count is
+rounded to two significant figures. A full sliding window drops its oldest turn,
+which shifts the cached history; memory, user profile, skill index and directory
+changes also change the system text when they happen.
 Optional discovery and prior continuity are fitted against the configured input
 window, with a separate conservative footprint allowance derived from the effective
 cumulative run limit. Fixed instructions, current input, and pinned schemas form
