@@ -230,7 +230,7 @@ before changing that area.
 | Area | Summary | Notes |
 | --- | --- | --- |
 | Runtime | Composition, the loop, context building, budgets, source scope, capability execution, approval and observation | [`runtime.md`](docs/architecture/runtime.md) |
-| Data and files | Source types and operations, catalog and declared links, SQL validation, combined queries, relational writes, folders, artifacts | [`data-and-files.md`](docs/architecture/data-and-files.md) |
+| Data and files | Source types and operations, catalog and declared links, the read policy, combined queries, relational writes, folders, artifacts | [`data-and-files.md`](docs/architecture/data-and-files.md) |
 | MCP | Admitted bindings, call-time rechecks and approved actions | [`mcp.md`](docs/architecture/mcp.md) |
 | Jobs and routines | Checklist jobs, supervision, routine schedules, machine-run limits, outcomes and deliveries | [`jobs-and-routines.md`](docs/architecture/jobs-and-routines.md) |
 | Persistence | State boundary, home revisions, migrations, upgrades, release contract | [`persistence.md`](docs/architecture/persistence.md) |
@@ -277,12 +277,16 @@ Check the scheduled-run limits in `docs/architecture/jobs-and-routines.md`.
    declares `TABULAR_READ`, and `assert_live_source_contract` for a live,
    uncataloged source. A source without SQL needs only discovery and a
    `TABULAR_READ` backend to join combined queries.
-3. Keep discovery in the catalog and source I/O in the adapter. Extend the
-   existing adapter, catalog and concrete domain.
+3. Make discovery honour the `DiscoveryRequest` limits as a budget and mark
+   what it cuts `truncated` rather than failing on size. Implement `health()`
+   (`SourceHealth`); `Agent.check_source` calls it. The catalog only records
+   what discovery found.
 4. Declare stable `Capability`, `Executor` and optional `ToolView` identities and
    compose them through `CapabilityRegistry` in `EmbeddedAgent`.
-5. Validate current facts before I/O, keep connector guardrails, and return
-   bounded schema-validated `ToolOutput`.
+5. Reads go through the one read policy, `validate_read` in
+   `domains/data/sql/read_validation.py`, which the data controller runs before
+   source I/O. A new SQL dialect must fit that policy; do not add a validator.
+   Return bounded schema-validated `ToolOutput`.
 6. Add focused contract tests and one public end-to-end test.
 
 ### Add a model provider
@@ -543,8 +547,11 @@ protects the user in its place.
   content.
 - **Effect (operational effect)**: a change outside the run's own records, such as a
   database write or an MCP action, declared through `OperationalEffect`.
-- **Exact**: bound to specific identities, revisions or digests and rechecked
-  before use. If something drifted, the operation fails rather than adapting.
+- **Exact**: for an effect, bound to the arguments a person approved and to
+  digests of the live state it acts on, rechecked before dispatch. For a
+  database write that is the SQL, parameters, live table structure and the rows
+  it touches; for an MCP action, the admitted tool mapping. If something
+  drifted, the effect fails rather than adapting.
 - **Foreground run / machine run**: a run a person started, versus a machine
   run: a routine occurrence, job run or sub-run, which asks a person before
   effects.
@@ -554,8 +561,10 @@ protects the user in its place.
   finalized with its evidence; the only truth about whether the effect happened.
 - **Sensitivity**: an information-handling classification. It never confers
   execution authority.
-- **Source scope**: the sources and resources a run may read, frozen when the run
-  is prepared.
+- **Source scope**: the sources a run may read, frozen when the run is
+  prepared. A source is read in full or limited to listed tables. Table names
+  are checked by name at each read, and the stored read scope (all, selected or
+  none) is rechecked at dispatch.
 - **Untrusted content**: anything not authored by Daita's code: model text,
   catalog metadata, file contents, tool and MCP results, memory, skills.
 
@@ -587,10 +596,10 @@ protects the user in its place.
 | `src/daita/capabilities.py` | declarations and registry |
 | `src/daita/capability_runtime.py` | common execution mechanics |
 | `src/daita/context.py` | model-request construction |
-| `src/daita/scope.py` | effective source and resource scope |
+| `src/daita/scope.py` | effective source scope: admitted sources, tables and display names |
 | `src/daita/adapters/registry.py` | source type registry and built-in source types |
 | `src/daita/adapters/folder.py` | folder source type: attached and session folders |
-| `src/daita/domains/data/sql/` | catalog-scoped SQL validation |
+| `src/daita/domains/data/sql/` | the read policy (`read_validation.py`) and SQL analysis |
 | `src/daita/domains/analysis/` | local Python analysis |
 | `src/daita/domains/mcp.py` | MCP projection and call-time rechecks |
 | `src/daita/jobs/` | checklist job records (`models.py`), owner, supervisor and the job tools |

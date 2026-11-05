@@ -1,17 +1,21 @@
 # Context and source scope
 
 Daita discovers currently admitted readable sources for an ordinary question.
-There is no selected-source mode. Every data call still names its exact source
-and resource, and current permissions are checked before I/O.
+There is no selected-source mode. Every data call names its source by display
+name and its tables or files by native name, and current permissions are
+checked before I/O. The source answers; the catalog only advises.
 
 In practice, Daita can search across sources you have made readable, but it
 does not guess which table or connector you meant when a consequential choice
 is ambiguous. Source content, prior answers, and saved knowledge can guide an
-investigation; they cannot add access or replace current catalog facts.
+investigation; they cannot add access or replace what the source reports now.
 
 A source you have made fully readable lets a run read anything PostgreSQL or
 SQLite resolves in it, cataloged or not. A source limited to selected tables stays
-limited to them, checked from the name in the SQL with no catalog lookup.
+limited to them, checked from the name in the SQL with no catalog lookup. The
+catalog never grants or denies a read. An attached folder works the same way:
+under full read access a run reads any data file within the folder's
+`subpaths`, decided from the file's format and path when the call runs.
 
 The prompt never carries catalog results ranked for the question. It holds a short
 directory of each source's name, type, dialect, schemas and approximate object count,

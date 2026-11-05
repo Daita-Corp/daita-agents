@@ -2,35 +2,159 @@
 
 ## 1.3.0 (unreleased)
 
+Daita's agent now works with your data where it lives. The model names sources and
+tables, never IDs. Reads go straight to the source, and the catalog only advises.
+One tool, `data_write`, makes every PostgreSQL write. Large sources attach instead of
+failing, and a combined query can join up to 16 sources. Routines and background jobs
+are simpler: a routine is a title, a prompt and a schedule, and a job is an agent run
+with a checklist. Every effect is approved by a person at the time, so standing grants
+are gone.
+
+### Upgrading from 1.2
+
+An existing home migrates automatically to home revision 4 the first time it opens.
+
+- **Write scopes.** Stored scopes convert on upgrade: `update` stays `update`, `upsert`
+  becomes `insert` and `update`, and delete is never granted. A scope whose table is
+  gone from the catalog or changed since it was granted was already refused as stale,
+  and it is dropped rather than revived. `Agent.preview_source_permissions(
+  relational_write_scopes=...)` is now keyed by full table name, and a scope no longer
+  has `key_columns` or `generated_identity_columns`.
+- **Renamed or removed tools and APIs.** Update any caller, stored routine or prompt
+  that names one:
+  - `data_update_rows` and `data_upsert_rows` are replaced by `data_write`.
+  - `data_query` takes `source`, the source's display name, instead of `source_id`,
+    and no longer takes `resource_ids`. `catalog_search` and `catalog_describe` take
+    `source` the same way.
+  - `Agent.relational_update_readiness` and `Agent.relational_upsert_readiness` are
+    replaced by `Agent.relational_write_readiness(source_id, table)`,
+    `RelationalUpdateReadiness` by `RelationalWriteReadiness`, and
+    `daita relational-update-readiness` by `daita relational-write-readiness`.
+  - Jobs and routines: see the lists of removed tools, methods and commands in
+    "Routines are a title, a prompt and a schedule" and "Background jobs are checklist
+    runs" below.
+  - Old transcripts that hold results of the removed write tools still replay, and
+    their receipts (`data.update_rows`, `data.upsert_rows`) still decode, list and
+    resolve.
+- **Large sources attach truncated.** Attaching a source over the discovery limits no
+  longer raises `DiscoveryLimitError`, which is removed. The source attaches with a
+  truncated catalog. The model's source directory says the catalog holds only part of
+  the source (`catalog_partial`), and tables outside it stay readable and describable
+  live. The TUI permission pickers still list only cataloged tables, so a table past
+  the limits cannot be granted there, and a granted table that falls past them can be
+  dropped when someone re-picks the list.
+- **Limits.**
+  - *Discovery:* 1,000 tables, 512 columns and 256 indexes per table, and 2,000
+    relationships. PostgreSQL stops reading table structure after 60 seconds.
+  - *`data_query`:* up to 8 statements per call; 64 tables per call (16 in a job run);
+    5 seconds per statement and 15 seconds in total; 100 rows and 16 KB shared by all
+    statements; SQL up to 65,536 characters; up to 128 parameters. `output=csv`,
+    `xlsx` or `arrow` exports one statement in full, up to 100,000 rows and 60 seconds.
+  - *Combined queries:* 2 to 16 inputs; the inputs share 50,000 rows and 32 MiB within
+    the 15-second deadline; the joining SQL is one DuckDB statement of at most 8 KiB.
+  - *`data_write`:* one statement of at most 64 KiB on one table; an `INSERT ...
+    VALUES` inserts at most 1,000 rows; the approval card shows up to 5 sample rows.
+  - *`catalog_search`:* up to 50 hits (default 12) for a query of up to 1,024
+    characters. *`catalog_describe`:* up to 256 columns, and a schema or folder lists
+    at most 100 tables.
+  - *Link checks:* each check reads at most 50,000 keys and 16 MiB, with 10 seconds
+    per read.
+- **Stored shapes.** Home revision 4 also changes what a user may notice:
+  - SQLite table names with uppercase letters now have one identity per name, as
+    SQLite itself does, so their resource IDs change. The migration rewrites every
+    stored reference that must keep matching.
+  - A stored routine, job or MCP tool is converted as described in its section below.
+  - Old records keep decoding; a record that no longer needs a catalog revision simply
+    stops requiring it.
+
+### The model works with names, not IDs
+
+The model refers to a source by its display name and to a table by its name. It never
+sees or copies a source ID, resource ID or handle.
+
+- **Tool arguments.** `data_query`, `data_write`, `catalog_search` and
+  `catalog_describe` take `source`, the display name shown in the source directory.
+  `data_query` has no `source_id` or `resource_ids`.
+- **Duplicate names.** Two sources in one run with the same display name refuse the
+  call with `source_ambiguous`, listing the candidates by display name and adapter. A
+  name that matches none refuses with `source_unknown` and lists the run's source
+  names.
+- **Results.** A result shows names where it once showed IDs: a field `x_source_id`
+  becomes `x_source` and `x_resource_ids` becomes `x_tables`. An ID outside the run's
+  scope shows as null, or as "a table outside this run" inside text.
+
+### Reads go to the source
+
+The source answers and the catalog advises. A stale, empty or damaged catalog can no
+longer fail a read.
+
+- **One read policy, before any source I/O.** A read is exactly one `SELECT`, set
+  operation (`UNION`, `INTERSECT`, `EXCEPT`) or `WITH` statement, including `WITH
+  RECURSIVE`, on PostgreSQL and SQLite. A read the policy refuses returns
+  `sql_validation_failed`, whose `details.issues` lists every problem by code:
+  `multiple_statements`, `mutation_not_allowed`, `read_statement_required`,
+  `explain_not_allowed`, `sql_too_large`, `function_not_allowed`,
+  `operator_not_allowed` and the parameter checks. SQL that fails to parse is
+  refused with the issue `sql_parse_error` and never runs.
+- **PostgreSQL functions.** Two checks apply. Before the read, a function that
+  cannot be resolved, `*_to_xml`, `cursor_to_*`, `ts_stat` and `ts_rewrite` are
+  issues `function_not_allowed`, and an explicit operator outside `pg_catalog` is
+  `operator_not_allowed`. Then the server says what each called name resolves to
+  on the pinned search path (`pg_proc`), and a refusal there is the error
+  `function_not_allowed`. A `pg_catalog` function is allowed only when no overload
+  of its name is volatile; `random`, `clock_timestamp`, `timeofday`,
+  `gen_random_uuid` and `timezone` are the exceptions and are allowed. A function
+  shadowed by another schema is refused. On SQLite, table-valued functions such as
+  `pragma_table_info` are issues `function_not_allowed`.
+- **Name scope without the catalog.** Daita folds each table name and hashes it to the
+  ID the stored permission lists, so a table the catalog has never seen is readable if
+  it is granted. A read refused only for scope (issues `resource_out_of_scope` for a
+  table outside the run, `schema_not_configured` for a schema not attached to the
+  source) returns `resource_read_not_allowed`, naming the tables and close readable
+  names.
+- **Several schemas.** When a PostgreSQL source has several configured schemas, an
+  unqualified table name is refused at execution with the error `unqualified_relation`,
+  which lists the readable schema-qualified candidates. With one schema, unqualified
+  names resolve in it.
+- **Introspection SQL only for a full read scope.** Reading `pg_catalog`,
+  `information_schema` or `sqlite_master` needs a run that may read the whole source;
+  otherwise it is a scope refusal (`resource_read_not_allowed`) that points to
+  `catalog_search` and `catalog_describe`.
+- **Errors by SQLSTATE category.** Timeout (57014) is `postgresql_query_timeout`;
+  insufficient privilege (42501) is `not_permitted`; other class 42 errors are
+  `query_invalid`, with the server's hint and position; a read-only violation (25006)
+  is `read_only_violation`; class 22 is `query_data_error`; class 08 is
+  `postgresql_connection_failed`; the rest are `postgresql_query_failed` with the
+  SQLSTATE. Only safe text crosses to the model.
+- **`catalog_search` and `catalog_describe` ask the live source.** Every search checks
+  the live source as well as the catalog and says whether each hit was seen live.
+  `catalog_describe` reports `answered_from` (live or cache).
+- **SQLite resource IDs fold case.** `Orders` and `orders` are one table, as SQLite
+  treats them.
+
 ### One write tool: `data_write`
 
 The model writes to PostgreSQL with one SQL statement (`INSERT`, `UPDATE` or `DELETE`)
-through `data_write`, previewed and approved as before. It replaces `data_update_rows`
-and `data_upsert_rows`.
+through `data_write`, previewed and approved as before. Daita builds the preview,
+shows it on the approval card, re-checks it for drift after approval and writes once
+with a receipt, in foreground, routine, job and sub-runs alike. `mode=preview` only
+shows the preview.
 
 - **Write scopes** name a table, `insert`, `update` and `delete` operations, columns and
-  a row limit. Upgrading converts stored scopes: `update` stays `update`, `upsert`
-  becomes `insert` and `update`, and delete is never granted.
-  A scope already refused as stale is dropped rather than revived.
-  `Agent.preview_source_permissions(relational_write_scopes=...)` is now keyed by full
-  table name, without `key_columns` or `generated_identity_columns`.
+  a row limit.
 - **Verified writes.** PostgreSQL receives each read and write exactly as written, so
   `E'\\d+'` now works. Before a write, PostgreSQL reports what the statement targets;
   before commit, Daita compares the rows it touched with the rows on the card and rolls
   back if they differ. The card says whether it checks `rows` or only the `count`.
-  Refusals are a fixed list of six. `UPDATE` and `DELETE` without `WHERE` are now a card
+  Refusals are a fixed list of six. `UPDATE` and `DELETE` without `WHERE` are a card
   warning, as are time, randomness and a row matched twice. A statement that cannot be
-  previewed fails with `write_preview_failed` and PostgreSQL's own message. A preview now
+  previewed fails with `write_preview_failed` and PostgreSQL's own message. A preview
   takes a brief table lock, so it can time out behind a schema change.
 - **The catalog no longer gates writes.** A table with no catalog entry can be enabled
   and written, and unrelated DDL no longer fails a write.
-- **Triggers and cascading foreign keys** no longer refuse a table; the approval card
+- **Triggers and cascading foreign keys** do not refuse a table; the approval card
   names them and says their effects are not previewed.
-- **Removed:** `Agent.relational_update_readiness` and
-  `Agent.relational_upsert_readiness` become `Agent.relational_write_readiness(source_id,
-  table)`, `RelationalUpdateReadiness` becomes `RelationalWriteReadiness`, and
-  `daita relational-update-readiness` becomes `daita relational-write-readiness`.
-  Generated identities are no longer returned, since a statement cannot have its own
+- Generated identities are not returned, since a statement cannot have its own
   `RETURNING`.
 
 ### Attach never fails on size, and the catalog keeps up
@@ -183,9 +307,8 @@ the limits and continues it. This replaces the task-graph job system.
 
 ### Smoother interactive tools
 
-Tools no longer make the model copy back values Daita already holds, a
-relational write is one call and one approval, and a call with several
-argument mistakes gets all of them back at once.
+Tools no longer make the model copy back values Daita already holds, and a call
+with several argument mistakes gets all of them back at once.
 
 - **Argument errors.** Every structural problem in a call's arguments comes
   back in one `invalid_arguments` error whose `details.issues` lists up to 32
@@ -194,12 +317,6 @@ argument mistakes gets all of them back at once.
   per-problem codes (`missing_arguments`, `unexpected_arguments`,
   `invalid_argument_type`, `invalid_argument_value`) now appear inside
   `issues` instead of as the error code.
-- **One-call writes.** `data_update_rows` and `data_upsert_rows` default to
-  `mode=apply`: Daita builds the preview, shows it on the approval card,
-  re-checks it for drift after approval and writes once with a receipt, in
-  foreground, routine, job and sub-runs alike. `mode=preview` still only
-  shows the preview. `preview_fingerprint` and `expected_affected_rows` are
-  removed from the arguments and from preview results.
 - **No copied values.** `python_execute` drops `expected_state`; a result says
   `state_reset: true` when the interpreter was replaced. `semantic_save` drops
   `catalog_revisions` and `expected_sha256`, and `semantic_save` with

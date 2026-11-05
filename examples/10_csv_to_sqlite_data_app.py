@@ -13,6 +13,7 @@ from _shared import (
     example_root,
     final_response,
     parser,
+    query_rows,
     tool_response,
 )
 from daita import SQLiteSource
@@ -68,20 +69,17 @@ async def run() -> None:
         agent = await create_offline_agent("csv-data-app", root, model)
         try:
             source = await agent.attach(SQLiteSource(database, name="CSV orders"))
-            resources = await agent.list_catalog_resources(source_id=source.id)
             model.extend(
                 tool_response(
                     "summarize-csv-orders",
                     "data_query",
                     {
-                        "source_id": source.id,
-                        "resource_ids": (resources[0].id,),
+                        "source": "CSV orders",
                         "sql": (
                             "SELECT status, COUNT(*) AS order_count, "
                             "SUM(amount) AS total_amount FROM csv_orders "
                             "GROUP BY status ORDER BY status"
                         ),
-                        "parameters": [],
                     },
                 ),
                 final_response(
@@ -91,6 +89,7 @@ async def run() -> None:
             result = await agent.run("Summarize CSV orders by status.")
             print(f"CSV: {csv_path}")
             print(f"SQLite: {database}")
+            print(f"rows: {await query_rows(agent, result.run_id)}")
             print(f"answer: {result.final_text}")
         finally:
             await agent.close()

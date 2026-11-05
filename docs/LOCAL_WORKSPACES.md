@@ -5,7 +5,7 @@ launch directory sets the default for relative paths, but you can also give an
 absolute or `~/` path. These files reach the agent through the **session folder
 source**: a live folder source built for each session from the working
 directory and never stored in the agent home. You can also attach a folder as a
-durable, cataloged source (see [Attached folders](#attached-folders)).
+durable source (see [Attached folders](#attached-folders)).
 To change an existing text file, Daita first creates an edit artifact and then
 asks for approval before saving to that exact file.
 
@@ -35,7 +35,7 @@ The terminal status and `/workspace` command show computer access and the
 working directory. Use
 `/files <question>` for a turn scoped to the session folder source only, which
 omits attached source, MCP, and source-job tools. Ordinary user turns may use
-both the session folder source and the selected data sources.
+both the session folder source and the attached data sources.
 
 For headless use:
 
@@ -80,8 +80,8 @@ source.
 
 ## Read boundary
 
-`file_search`, `file_read`, and `data_query` with `path_pattern` take the
-session folder source's `source_id` and accept working-relative, absolute, and
+`file_search`, `file_read`, and `data_query` with `path_pattern` name the
+session folder source by its display name and accept working-relative, absolute, and
 `~/` paths in computer mode. `file_search` accepts either one `path` or a
 `paths` list of one to eight roots. A paths-mode filename search may omit
 `query` when it supplies a filename-only glob such as `*.csv`; traversal is
@@ -110,7 +110,7 @@ Bounded-workspace mode continues to expose only relative paths.
 
 ## Structured file queries
 
-`data_query` with `source_id`, `path_pattern`, and `sql` analyzes one
+`data_query` with `source`, `path_pattern`, and `sql` analyzes one
 homogeneous CSV, TSV, JSON-records/NDJSON, or Parquet dataset in the session
 folder source. Its `path_pattern` follows
 the same path rules and is expanded by Daita without a shell. Daita opens and
@@ -164,7 +164,7 @@ machine-originated runs receive no ambient local edit authority.
 
 ## Attached folders
 
-Attach a folder to catalog its files as a durable source:
+Attach a folder to make its data files a durable source:
 
 ```python
 from daita import FolderSource
@@ -189,11 +189,15 @@ and its catalog sync is marked truncated. `catalog_search` finds files by name
 or column, and declared catalog links can join a file to a database table.
 Scheduled routines and background jobs can read an attached folder in their scope.
 
-An attached folder answers only for its readable cataloged files. `file_search`
-and `file_read` reach them by root-relative path; `data_query` with `path_pattern`
-matches the folder's current files and reads them as one relation named `data`;
-a combined `data_query` input takes the same `path_pattern`. Every match must be
-readable in the run, or the whole read is refused naming the file. A file that
-changed since the last refresh is read as it is now.
+An attached folder answers from its files as they are now; the catalog does not
+decide what can be read. Under full read access a run reads every data file
+within the folder's `subpaths`, decided live from the file's format and path,
+including files added since the last refresh. Under selected read access it reads
+only the selected files. Other files are not readable through an attached
+folder. `file_search` and `file_read` reach readable files by root-relative path;
+`data_query` with `path_pattern` matches the folder's current files and reads
+them as one relation named `data`; a combined `data_query` input takes the same
+`path_pattern`. Every match must be readable in the run, or the whole read is
+refused naming the file.
 Attached folders are always contained to their root and are unavailable in
 hosted compositions.
