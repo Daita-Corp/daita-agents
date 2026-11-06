@@ -1,0 +1,622 @@
+{
+ "keys": {
+  "sales.customers": [
+   [
+    "customer_id"
+   ]
+  ],
+  "sales.products": [
+   [
+    "product_id"
+   ],
+   [
+    "sku"
+   ]
+  ],
+  "sales.orders": [
+   [
+    "order_id"
+   ]
+  ],
+  "sales.order_items": [
+   [
+    "order_item_id"
+   ]
+  ],
+  "sales.returns": [
+   [
+    "return_id"
+   ]
+  ],
+  "sales.order_status_history": [
+   [
+    "order_id"
+   ]
+  ],
+  "finance.invoices": [
+   [
+    "invoice_id"
+   ]
+  ],
+  "finance.payments": [
+   [
+    "payment_id"
+   ]
+  ],
+  "finance.revenue_entries": [
+   [
+    "entry_id"
+   ]
+  ],
+  "finance.currencies": [
+   [
+    "code"
+   ]
+  ],
+  "finance.fx_rates": [
+   [
+    "currency",
+    "rate_on"
+   ]
+  ],
+  "crm.accounts": [
+   [
+    "account_id"
+   ],
+   [
+    "customer_id"
+   ]
+  ],
+  "crm.opportunities": [
+   [
+    "opportunity_id"
+   ]
+  ],
+  "crm.contacts": [
+   [
+    "contact_id"
+   ]
+  ],
+  "crm.notes": [
+   [
+    "note_id"
+   ]
+  ],
+  "crm.subscriptions": [
+   [
+    "subscription_id"
+   ]
+  ],
+  "crm.account_segments": [
+   [
+    "account_id"
+   ]
+  ],
+  "events.sessions": [
+   [
+    "session_id"
+   ]
+  ],
+  "events.clicks": [
+   [
+    "click_id"
+   ]
+  ],
+  "events.signups": [
+   [
+    "signup_id"
+   ]
+  ],
+  "events.signup_referrals": [
+   [
+    "referral_id"
+   ]
+  ]
+ },
+ "queries": [
+  {
+   "id": "p01-h09-shipping-fee",
+   "sql": "SELECT sum(o.shipping_fee) FROM sales.orders o JOIN sales.order_items oi ON oi.order_id = o.order_id WHERE o.ordered_at >= '2026-03-01' AND o.ordered_at < '2026-04-01' AND oi.quantity > 2",
+   "fan_out": true,
+   "why": "Benchmark h09 trap: orders.shipping_fee repeated once per matching order item (order_items.order_id is not unique)."
+  },
+  {
+   "id": "p02-avg-fee-by-status",
+   "sql": "SELECT o.status, avg(o.shipping_fee) AS avg_fee FROM sales.orders AS o INNER JOIN sales.order_items AS oi ON o.order_id = oi.order_id GROUP BY o.status",
+   "fan_out": true,
+   "why": "AVG of an order column weighted by item count."
+  },
+  {
+   "id": "p03-invoice-amount-payments",
+   "sql": "SELECT sum(i.amount) FROM finance.invoices i JOIN finance.payments p ON p.invoice_id = i.invoice_id",
+   "fan_out": true,
+   "why": "payments.invoice_id is not unique by schema; labelled by keys (data-dependent: seed data happens to have one payment per invoice)."
+  },
+  {
+   "id": "p04-count-customers-orders",
+   "sql": "SELECT c.region, count(c.customer_id) FROM sales.customers c JOIN sales.orders o ON o.customer_id = c.customer_id GROUP BY c.region",
+   "fan_out": true,
+   "why": "COUNT(col) on the customers side repeated per order."
+  },
+  {
+   "id": "p05-count-account-tier-opps",
+   "sql": "SELECT count(a.tier) FROM crm.accounts a JOIN crm.opportunities op ON op.account_id = a.account_id",
+   "fan_out": true,
+   "why": "COUNT(a.tier) repeated per opportunity."
+  },
+  {
+   "id": "p06-invoice-amount-revenue",
+   "sql": "SELECT sum(i.amount) AS invoiced FROM finance.invoices i JOIN finance.revenue_entries re ON re.invoice_id = i.invoice_id WHERE re.booked_on >= '2026-01-01'",
+   "fan_out": true,
+   "why": "revenue_entries.invoice_id is not unique by schema (data-dependent: seed has one entry per invoice)."
+  },
+  {
+   "id": "p07-fee-left-join",
+   "sql": "SELECT o.status, sum(o.shipping_fee) FROM sales.orders o LEFT JOIN sales.order_items oi ON oi.order_id = o.order_id GROUP BY o.status",
+   "fan_out": true,
+   "why": "LEFT JOIN still repeats order rows per item."
+  },
+  {
+   "id": "p08-mrr-contacts",
+   "sql": "SELECT sum(s.mrr) FROM crm.subscriptions s JOIN crm.contacts c ON c.account_id = s.account_id",
+   "fan_out": true,
+   "why": "Many-to-many through account_id: subscriptions repeated per contact."
+  },
+  {
+   "id": "p09-opp-amount-notes",
+   "sql": "SELECT sum(op.amount) FROM crm.opportunities op JOIN crm.notes n ON n.account_id = op.account_id",
+   "fan_out": true,
+   "why": "Opportunities repeated per note on the account."
+  },
+  {
+   "id": "p10-avg-price-product-items",
+   "sql": "SELECT avg(p.unit_price) FROM sales.products p JOIN sales.order_items oi ON oi.product_id = p.product_id",
+   "fan_out": true,
+   "why": "Product price weighted by items sold."
+  },
+  {
+   "id": "p11-count-sessions-clicks",
+   "sql": "SELECT count(s.session_id) FROM events.sessions s JOIN events.clicks k ON k.session_id = s.session_id",
+   "fan_out": true,
+   "why": "Sessions repeated per click (no rows in seed: labelled by keys)."
+  },
+  {
+   "id": "p12-cte-orders-items",
+   "sql": "WITH big AS (SELECT order_id, shipping_fee FROM sales.orders WHERE status = 'paid') SELECT sum(b.shipping_fee) FROM big b JOIN sales.order_items oi ON oi.order_id = b.order_id",
+   "fan_out": true,
+   "why": "CTE is a plain filter of orders; still repeated per item."
+  },
+  {
+   "id": "p13-subquery-from",
+   "sql": "SELECT sum(x.shipping_fee) FROM (SELECT order_id, shipping_fee FROM sales.orders WHERE status = 'paid') x JOIN sales.order_items oi ON oi.order_id = x.order_id",
+   "fan_out": true,
+   "why": "Derived table without aggregation keeps order rows; repeated per item."
+  },
+  {
+   "id": "p14-three-way-region",
+   "sql": "SELECT c.region, sum(o.shipping_fee) FROM sales.customers c JOIN sales.orders o ON o.customer_id = c.customer_id JOIN sales.order_items oi ON oi.order_id = o.order_id GROUP BY c.region",
+   "fan_out": true,
+   "why": "Orders joined to items downstream of customers."
+  },
+  {
+   "id": "p15-invoices-via-customer-orders",
+   "sql": "SELECT sum(i.amount) FROM finance.invoices i JOIN sales.customers c ON c.customer_id = i.customer_id JOIN sales.orders o ON o.customer_id = c.customer_id",
+   "fan_out": true,
+   "why": "Invoice->customer is N:1, but customer->orders is 1:N, so invoices repeat per order."
+  },
+  {
+   "id": "p16-using-unqualified",
+   "sql": "SELECT sum(shipping_fee) FROM sales.orders JOIN sales.order_items USING (order_id)",
+   "fan_out": true,
+   "why": "Unqualified column and USING join; shipping_fee belongs to orders."
+  },
+  {
+   "id": "p17-using-amount",
+   "sql": "SELECT sum(amount) FROM finance.invoices JOIN finance.payments USING (invoice_id)",
+   "fan_out": true,
+   "why": "USING join, unqualified amount belongs to invoices; payments.invoice_id not unique (data-dependent)."
+  },
+  {
+   "id": "p18-avg-item-price-returns",
+   "sql": "SELECT avg(oi.unit_price) FROM sales.order_items oi JOIN sales.returns r ON r.order_item_id = oi.order_item_id",
+   "fan_out": true,
+   "why": "returns.order_item_id is not unique; an item can be returned several times (data-dependent in seed)."
+  },
+  {
+   "id": "p19-expression-agg",
+   "sql": "SELECT sum(oi.quantity * oi.unit_price) FROM sales.order_items oi JOIN sales.returns r ON r.order_item_id = oi.order_item_id",
+   "fan_out": true,
+   "why": "Aggregated expression over item columns; returns not unique per item (data-dependent)."
+  },
+  {
+   "id": "p20-count-accounts-left-contacts",
+   "sql": "SELECT a.tier, count(a.account_id) FROM crm.accounts a LEFT JOIN crm.contacts c ON c.account_id = a.account_id GROUP BY a.tier",
+   "fan_out": true,
+   "why": "Classic wrong count: accounts repeated per contact."
+  },
+  {
+   "id": "p21-case-sum",
+   "sql": "SELECT sum(CASE WHEN o.status = 'paid' THEN o.shipping_fee ELSE 0 END) FROM sales.orders o JOIN sales.order_items oi ON oi.order_id = o.order_id",
+   "fan_out": true,
+   "why": "Aggregate over CASE of an orders column."
+  },
+  {
+   "id": "p22-round-sum",
+   "sql": "SELECT round(sum(o.shipping_fee), 2) AS fees FROM sales.orders o JOIN sales.order_items oi ON oi.order_id = o.order_id",
+   "fan_out": true,
+   "why": "Aggregate wrapped in a function."
+  },
+  {
+   "id": "p23-ratio-with-count-star",
+   "sql": "SELECT sum(o.shipping_fee) / count(*) FROM sales.orders o JOIN sales.order_items oi ON oi.order_id = o.order_id",
+   "fan_out": true,
+   "why": "SUM(o.shipping_fee) still fans out even though COUNT(*) does not count."
+  },
+  {
+   "id": "p24-avg-two-joins",
+   "sql": "SELECT avg(i.amount) FROM finance.invoices i JOIN finance.revenue_entries re ON re.invoice_id = i.invoice_id JOIN finance.payments p ON p.invoice_id = i.invoice_id",
+   "fan_out": true,
+   "why": "Invoices joined to two non-unique children (data-dependent in seed)."
+  },
+  {
+   "id": "p25-mrr-via-account-opps",
+   "sql": "SELECT sum(s.mrr) FROM crm.subscriptions s JOIN crm.accounts a ON a.account_id = s.account_id JOIN crm.opportunities op ON op.account_id = a.account_id",
+   "fan_out": true,
+   "why": "Subscription->account N:1 safe, account->opportunities 1:N repeats subscriptions."
+  },
+  {
+   "id": "p26-opp-amount-active-subs",
+   "sql": "SELECT sum(op.amount) FROM crm.accounts a JOIN crm.opportunities op ON op.account_id = a.account_id JOIN crm.subscriptions s ON s.account_id = a.account_id WHERE s.status = 'active'",
+   "fan_out": true,
+   "why": "Opportunities repeated per active subscription of the same account."
+  },
+  {
+   "id": "p27-having",
+   "sql": "SELECT o.customer_id, sum(o.shipping_fee) AS fees FROM sales.orders o JOIN sales.order_items oi ON oi.order_id = o.order_id GROUP BY o.customer_id HAVING sum(o.shipping_fee) > 100",
+   "fan_out": true,
+   "why": "Fan-out in both select and HAVING."
+  },
+  {
+   "id": "p28-comma-join",
+   "sql": "SELECT sum(o.shipping_fee) FROM sales.orders o, sales.order_items oi WHERE oi.order_id = o.order_id AND oi.quantity > 1",
+   "fan_out": true,
+   "why": "Implicit comma join with equality in WHERE."
+  },
+  {
+   "id": "p29-bridge-product-price",
+   "sql": "SELECT p.category, sum(p.unit_price) FROM sales.products p JOIN sales.order_items oi ON oi.product_id = p.product_id JOIN sales.orders o ON o.order_id = oi.order_id WHERE o.status = 'paid' GROUP BY p.category",
+   "fan_out": true,
+   "why": "Many-to-many through the order_items bridge: product price repeated per sale."
+  },
+  {
+   "id": "p30-count-region-sessions",
+   "sql": "SELECT count(c.region) FROM sales.customers c JOIN events.sessions s ON s.customer_id = c.customer_id",
+   "fan_out": true,
+   "why": "Customers repeated per session (no sessions in seed: labelled by keys)."
+  },
+  {
+   "id": "p31-count-name-invoices",
+   "sql": "SELECT count(c.full_name) FROM sales.customers c JOIN finance.invoices i ON i.customer_id = c.customer_id",
+   "fan_out": true,
+   "why": "Customers repeated per invoice."
+  },
+  {
+   "id": "p32-revenue-entries-payments",
+   "sql": "SELECT sum(re.amount) FROM finance.revenue_entries re JOIN finance.payments p ON p.invoice_id = re.invoice_id",
+   "fan_out": true,
+   "why": "Join on invoice_id, non-unique on both sides by schema (data-dependent: unique in seed)."
+  },
+  {
+   "id": "p33-cte-items-side",
+   "sql": "WITH items AS (SELECT order_id, quantity FROM sales.order_items) SELECT sum(o.shipping_fee) FROM sales.orders o JOIN items i ON i.order_id = o.order_id",
+   "fan_out": true,
+   "why": "CTE is an unaggregated projection of order_items; non-unique order_id."
+  },
+  {
+   "id": "p34-filter-clause",
+   "sql": "SELECT sum(o.shipping_fee) FILTER (WHERE o.status = 'shipped') FROM sales.orders o JOIN sales.order_items oi ON oi.order_id = o.order_id",
+   "fan_out": true,
+   "why": "FILTER does not change the repeated rows."
+  },
+  {
+   "id": "p35-extra-on-condition",
+   "sql": "SELECT sum(s.mrr) FROM crm.subscriptions s JOIN crm.contacts c ON c.account_id = s.account_id AND c.email LIKE '%@example.com'",
+   "fan_out": true,
+   "why": "Equality on non-unique account_id plus a filter."
+  },
+  {
+   "id": "p36-self-join",
+   "sql": "SELECT avg(a.quantity) FROM sales.order_items a JOIN sales.order_items b ON b.order_id = a.order_id AND b.order_item_id <> a.order_item_id",
+   "fan_out": true,
+   "why": "Self join on non-unique order_id repeats each item per sibling."
+  },
+  {
+   "id": "p37-quoted-identifiers",
+   "sql": "SELECT SUM(\"o\".\"shipping_fee\") FROM \"sales\".\"orders\" AS \"o\" JOIN \"sales\".\"order_items\" AS \"oi\" ON \"oi\".\"order_id\" = \"o\".\"order_id\"",
+   "fan_out": true,
+   "why": "Quoted identifiers, same shape as h09."
+  },
+  {
+   "id": "p38-right-join",
+   "sql": "SELECT sum(o.shipping_fee) FROM sales.order_items oi RIGHT JOIN sales.orders o ON o.order_id = oi.order_id",
+   "fan_out": true,
+   "why": "RIGHT JOIN with orders as the preserved side; repeated per item."
+  },
+  {
+   "id": "p39-lowercase-agg-alias-join",
+   "sql": "select c.customer_id, count(c.region) as n from sales.customers as c join sales.orders as o on c.customer_id = o.customer_id join sales.order_items as oi on oi.order_id = o.order_id group by c.customer_id",
+   "fan_out": true,
+   "why": "Lowercase SQL; customers repeated per order and item."
+  },
+  {
+   "id": "p40-unqualified-three-way",
+   "sql": "SELECT tier, sum(mrr) FROM crm.accounts a JOIN crm.subscriptions s ON s.account_id = a.account_id JOIN crm.contacts c ON c.account_id = a.account_id GROUP BY tier",
+   "fan_out": true,
+   "why": "Unqualified tier and mrr; subscriptions repeated per contact."
+  },
+  {
+   "id": "n01-h09-exists",
+   "sql": "SELECT sum(o.shipping_fee) FROM sales.orders o WHERE o.ordered_at >= '2026-03-01' AND o.ordered_at < '2026-04-01' AND EXISTS (SELECT 1 FROM sales.order_items oi WHERE oi.order_id = o.order_id AND oi.quantity > 2)",
+   "fan_out": false,
+   "why": "EXISTS semi-join: each order counted once."
+  },
+  {
+   "id": "n02-items-to-orders",
+   "sql": "SELECT sum(oi.quantity * oi.unit_price) FROM sales.order_items oi JOIN sales.orders o ON o.order_id = oi.order_id WHERE o.status = 'paid'",
+   "fan_out": false,
+   "why": "order_items -> orders is N:1 on orders' primary key; item rows not repeated."
+  },
+  {
+   "id": "n03-items-to-products",
+   "sql": "SELECT p.category, sum(oi.quantity) FROM sales.order_items oi JOIN sales.products p ON p.product_id = oi.product_id GROUP BY p.category",
+   "fan_out": false,
+   "why": "Join to products primary key."
+  },
+  {
+   "id": "n04-count-star",
+   "sql": "SELECT count(*) FROM sales.orders o JOIN sales.order_items oi ON oi.order_id = o.order_id",
+   "fan_out": false,
+   "why": "COUNT(*) never counts."
+  },
+  {
+   "id": "n05-max",
+   "sql": "SELECT max(o.shipping_fee) FROM sales.orders o JOIN sales.order_items oi ON oi.order_id = o.order_id",
+   "fan_out": false,
+   "why": "MAX is not affected by repetition."
+  },
+  {
+   "id": "n06-min-max-dates",
+   "sql": "SELECT min(i.issued_on), max(i.issued_on) FROM finance.invoices i JOIN finance.payments p ON p.invoice_id = i.invoice_id",
+   "fan_out": false,
+   "why": "MIN/MAX never count."
+  },
+  {
+   "id": "n07-count-distinct",
+   "sql": "SELECT count(DISTINCT o.order_id) FROM sales.orders o JOIN sales.order_items oi ON oi.order_id = o.order_id WHERE oi.quantity > 2",
+   "fan_out": false,
+   "why": "COUNT(DISTINCT) is immune to repetition."
+  },
+  {
+   "id": "n08-sum-distinct",
+   "sql": "SELECT sum(DISTINCT o.shipping_fee) FROM sales.orders o JOIN sales.order_items oi ON oi.order_id = o.order_id",
+   "fan_out": false,
+   "why": "DISTINCT aggregates are excluded by the definition (semantically dubious, but not a fan-out)."
+  },
+  {
+   "id": "n09-preagg-subquery",
+   "sql": "SELECT sum(o.shipping_fee) FROM sales.orders o JOIN (SELECT order_id, sum(quantity) AS qty FROM sales.order_items GROUP BY order_id) x ON x.order_id = o.order_id",
+   "fan_out": false,
+   "why": "Join target grouped by order_id, so unique."
+  },
+  {
+   "id": "n10-preagg-cte",
+   "sql": "WITH q AS (SELECT order_id, sum(quantity) AS qty FROM sales.order_items GROUP BY order_id) SELECT sum(o.shipping_fee) FROM sales.orders o JOIN q ON q.order_id = o.order_id WHERE q.qty > 5",
+   "fan_out": false,
+   "why": "Pre-aggregated CTE is unique on order_id."
+  },
+  {
+   "id": "n11-in-filter",
+   "sql": "SELECT sum(shipping_fee) FROM sales.orders WHERE order_id IN (SELECT order_id FROM sales.order_items WHERE quantity > 2)",
+   "fan_out": false,
+   "why": "IN semi-join."
+  },
+  {
+   "id": "n12-chain-n-to-1",
+   "sql": "SELECT c.region, sum(oi.quantity) FROM sales.order_items oi JOIN sales.orders o ON o.order_id = oi.order_id JOIN sales.customers c ON c.customer_id = o.customer_id GROUP BY c.region",
+   "fan_out": false,
+   "why": "Chain of N:1 joins to primary keys."
+  },
+  {
+   "id": "n13-subs-to-accounts",
+   "sql": "SELECT sum(s.mrr) FROM crm.subscriptions s JOIN crm.accounts a ON a.account_id = s.account_id WHERE a.tier = 'gold'",
+   "fan_out": false,
+   "why": "N:1 to accounts primary key."
+  },
+  {
+   "id": "n14-invoices-to-customers",
+   "sql": "SELECT c.region, sum(i.amount) FROM finance.invoices i JOIN sales.customers c ON c.customer_id = i.customer_id GROUP BY c.region",
+   "fan_out": false,
+   "why": "N:1 to customers primary key."
+  },
+  {
+   "id": "n15-unique-pk-child",
+   "sql": "SELECT sum(o.shipping_fee) FROM sales.orders o JOIN sales.order_status_history h ON h.order_id = o.order_id",
+   "fan_out": false,
+   "why": "order_status_history.order_id is its primary key."
+  },
+  {
+   "id": "n16-account-segments",
+   "sql": "SELECT seg.segment, count(a.account_id) FROM crm.accounts a JOIN crm.account_segments seg ON seg.account_id = a.account_id GROUP BY seg.segment",
+   "fan_out": false,
+   "why": "account_segments.account_id is its primary key (1:1)."
+  },
+  {
+   "id": "n17-accounts-unique-customer",
+   "sql": "SELECT count(c.customer_id) FROM sales.customers c JOIN crm.accounts a ON a.customer_id = c.customer_id",
+   "fan_out": false,
+   "why": "accounts.customer_id carries a UNIQUE constraint, so customers are not repeated."
+  },
+  {
+   "id": "n18-sum-key-unique-target",
+   "sql": "SELECT sum(c.customer_id) FROM sales.customers c JOIN crm.accounts a ON a.customer_id = c.customer_id",
+   "fan_out": false,
+   "why": "Sum of a key-side column where the join column on the other side is unique."
+  },
+  {
+   "id": "n19-opps-to-accounts",
+   "sql": "SELECT a.tier, sum(op.amount) FROM crm.opportunities op JOIN crm.accounts a ON a.account_id = op.account_id GROUP BY a.tier",
+   "fan_out": false,
+   "why": "Aggregating the many side."
+  },
+  {
+   "id": "n20-two-preagg-ctes",
+   "sql": "WITH f AS (SELECT customer_id, sum(shipping_fee) AS fee FROM sales.orders GROUP BY customer_id), v AS (SELECT customer_id, sum(amount) AS amt FROM finance.invoices GROUP BY customer_id) SELECT sum(f.fee), sum(v.amt) FROM f JOIN v ON v.customer_id = f.customer_id",
+   "fan_out": false,
+   "why": "Both sides pre-aggregated to one row per customer."
+  },
+  {
+   "id": "n21-many-side-left-join",
+   "sql": "SELECT o.status, sum(oi.quantity) FROM sales.orders o LEFT JOIN sales.order_items oi ON oi.order_id = o.order_id GROUP BY o.status",
+   "fan_out": false,
+   "why": "Aggregated column is on the many side; items are not repeated."
+  },
+  {
+   "id": "n22-payments-chain",
+   "sql": "SELECT c.region, sum(p.paid_amount) FROM finance.payments p JOIN finance.invoices i ON i.invoice_id = p.invoice_id JOIN sales.customers c ON c.customer_id = i.customer_id GROUP BY c.region",
+   "fan_out": false,
+   "why": "N:1 chain from payments."
+  },
+  {
+   "id": "n23-returns-chain",
+   "sql": "SELECT count(r.return_id) FROM sales.returns r JOIN sales.order_items oi ON oi.order_item_id = r.order_item_id JOIN sales.orders o ON o.order_id = oi.order_id",
+   "fan_out": false,
+   "why": "N:1 chain from returns."
+  },
+  {
+   "id": "n24-no-join",
+   "sql": "SELECT sum(shipping_fee) FROM sales.orders WHERE status = 'paid'",
+   "fan_out": false,
+   "why": "No join."
+  },
+  {
+   "id": "n25-no-join-grouped",
+   "sql": "SELECT customer_id, avg(amount) FROM finance.invoices GROUP BY customer_id",
+   "fan_out": false,
+   "why": "No join."
+  },
+  {
+   "id": "n26-correlated-exists",
+   "sql": "SELECT sum(i.amount) FROM finance.invoices i WHERE EXISTS (SELECT 1 FROM finance.payments p WHERE p.invoice_id = i.invoice_id)",
+   "fan_out": false,
+   "why": "EXISTS semi-join."
+  },
+  {
+   "id": "n27-scalar-subquery",
+   "sql": "SELECT o.order_id, (SELECT sum(oi.quantity) FROM sales.order_items oi WHERE oi.order_id = o.order_id) AS qty FROM sales.orders o",
+   "fan_out": false,
+   "why": "Correlated scalar subquery, no join."
+  },
+  {
+   "id": "n28-lateral-preagg",
+   "sql": "SELECT sum(o.shipping_fee) FROM sales.orders o JOIN LATERAL (SELECT sum(oi.quantity) AS qty FROM sales.order_items oi WHERE oi.order_id = o.order_id) x ON true",
+   "fan_out": false,
+   "why": "Lateral aggregate returns exactly one row per order (and the join is not on columns)."
+  },
+  {
+   "id": "n29-fx-rates",
+   "sql": "SELECT sum(fx.rate) FROM finance.fx_rates fx JOIN finance.currencies c ON c.code = fx.currency",
+   "fan_out": false,
+   "why": "N:1 to currencies primary key."
+  },
+  {
+   "id": "n30-four-way-n-to-1",
+   "sql": "SELECT c.region, sum(oi.unit_price * oi.quantity) FROM sales.order_items oi JOIN sales.products p ON p.product_id = oi.product_id JOIN sales.orders o ON o.order_id = oi.order_id JOIN sales.customers c ON c.customer_id = o.customer_id GROUP BY c.region",
+   "fan_out": false,
+   "why": "Every join lands on a primary key."
+  },
+  {
+   "id": "n31-clicks-to-sessions",
+   "sql": "SELECT count(k.click_id) FROM events.clicks k JOIN events.sessions s ON s.session_id = k.session_id",
+   "fan_out": false,
+   "why": "N:1 to sessions primary key."
+  },
+  {
+   "id": "n32-referrals-to-signups",
+   "sql": "SELECT count(ref.referral_id) FROM events.signup_referrals ref JOIN events.signups s ON s.signup_id = ref.signup_id",
+   "fan_out": false,
+   "why": "N:1 to signups primary key."
+  },
+  {
+   "id": "n33-union-all",
+   "sql": "SELECT sum(shipping_fee) FROM sales.orders UNION ALL SELECT sum(amount) FROM finance.invoices",
+   "fan_out": false,
+   "why": "No joins."
+  },
+  {
+   "id": "n34-in-with-many-side",
+   "sql": "SELECT sum(oi.quantity) FROM sales.order_items oi WHERE oi.order_id IN (SELECT order_id FROM sales.orders WHERE status = 'paid')",
+   "fan_out": false,
+   "why": "IN semi-join on the aggregated table."
+  },
+  {
+   "id": "n35-distinct-cte",
+   "sql": "WITH d AS (SELECT DISTINCT order_id FROM sales.order_items WHERE quantity > 2) SELECT sum(o.shipping_fee) FROM sales.orders o JOIN d ON d.order_id = o.order_id",
+   "fan_out": false,
+   "why": "SELECT DISTINCT order_id makes the CTE unique on order_id."
+  },
+  {
+   "id": "n36-groupby-cte-keys",
+   "sql": "WITH big AS (SELECT order_id FROM sales.order_items GROUP BY order_id HAVING sum(quantity) > 5) SELECT sum(o.shipping_fee) FROM sales.orders o JOIN big ON big.order_id = o.order_id",
+   "fan_out": false,
+   "why": "GROUP BY order_id CTE is unique on order_id."
+  },
+  {
+   "id": "n37-avg-distinct",
+   "sql": "SELECT avg(DISTINCT i.amount) FROM finance.invoices i JOIN finance.payments p ON p.invoice_id = i.invoice_id",
+   "fan_out": false,
+   "why": "DISTINCT aggregate."
+  },
+  {
+   "id": "n38-max-text-many",
+   "sql": "SELECT c.region, max(o.ordered_at) FROM sales.customers c JOIN sales.orders o ON o.customer_id = c.customer_id GROUP BY c.region",
+   "fan_out": false,
+   "why": "MAX."
+  },
+  {
+   "id": "n39-subs-segments",
+   "sql": "SELECT seg.segment, sum(s.mrr) FROM crm.subscriptions s JOIN crm.account_segments seg ON seg.account_id = s.account_id GROUP BY seg.segment",
+   "fan_out": false,
+   "why": "account_segments.account_id is a primary key, so subscriptions are not repeated."
+  },
+  {
+   "id": "n40-opps-chain-segments",
+   "sql": "SELECT sum(op.amount) FROM crm.opportunities op JOIN crm.accounts a ON a.account_id = op.account_id JOIN crm.account_segments seg ON seg.account_id = a.account_id",
+   "fan_out": false,
+   "why": "Chain of N:1 and 1:1 joins."
+  },
+  {
+   "id": "n41-items-history",
+   "sql": "SELECT sum(oi.quantity) FROM sales.order_items oi JOIN sales.order_status_history h ON h.order_id = oi.order_id",
+   "fan_out": false,
+   "why": "history.order_id is its primary key; aggregating the many side."
+  },
+  {
+   "id": "n42-customers-accounts-left-seg",
+   "sql": "SELECT count(c.customer_id) FROM sales.customers c JOIN crm.accounts a ON a.customer_id = c.customer_id LEFT JOIN crm.account_segments seg ON seg.account_id = a.account_id",
+   "fan_out": false,
+   "why": "Unique customer_id on accounts, primary key on segments."
+  },
+  {
+   "id": "n43-count-star-group",
+   "sql": "SELECT a.tier, count(*) FROM crm.accounts a JOIN crm.contacts c ON c.account_id = a.account_id GROUP BY a.tier",
+   "fan_out": false,
+   "why": "COUNT(*) never counts."
+  },
+  {
+   "id": "n44-count-many-side",
+   "sql": "SELECT a.tier, count(c.contact_id) FROM crm.accounts a JOIN crm.contacts c ON c.account_id = a.account_id GROUP BY a.tier",
+   "fan_out": false,
+   "why": "Counts the many-side key; contacts not repeated."
+  }
+ ]
+}

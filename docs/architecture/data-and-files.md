@@ -56,6 +56,19 @@ at 100. A cached description answers only when the source cannot be reached, and
 so; a table the live source no longer has is unknown even if the catalog remembers
 it. A failing catalog leaves both tools answering from the source.
 
+Both tools label look-alike tables (`catalog/labels.py`): within one source, tables whose
+core name tokens are similar and whose columns overlap get an advisory `status`
+(`canonical`, `likely_stale`, `deprecated` or `unknown`), short `evidence` and
+`look_alikes`. Evidence is row estimates, inbound foreign keys, and a table comment or a
+current single-table note that matches a deprecation phrase, which marks the table
+`deprecated`; the last analyze is shown but never decisive. Facts come live from
+`adapters/postgresql_query.py`, so tables past a truncated catalog are labelled too.
+`catalog_describe` runs one extra live name search to find look-alikes and answers
+unchanged if it fails. Nothing is hidden or reordered, no record shape stores a label,
+query history is not used, and labels appear only in tool results, never in the prompt.
+For live PostgreSQL foreign keys, `catalog_describe` relationships also carry
+`cardinality` (`one_to_one` or `many_to_one`) from the unique indexes.
+
 PostgreSQL discovery lists every relation kind from `pg_class`: tables, partitioned
 tables and foreign tables as `TABLE`, views and materialized views as `VIEW`. A
 partition folds under its parent when the role can read an ancestor in the source's
@@ -191,6 +204,17 @@ if `name` takes a row and is outside `pg_catalog` or volatile, even when a real
 column has that name. SQLite keeps its `mode=ro` connection and authorizer, which
 also refuses `load_extension`. Do not duplicate any of this in a generic policy
 layer.
+
+A single-statement `data_query` read may return advisory `warnings`
+(`sql/query_checks.py`): a fan-out (`SUM`, `AVG` or `COUNT(col)` over a one-to-many
+join, with keys from a live describe of the joined tables, at most 4), duplicate
+primary-key values in a joined, non-aggregated result, and an explanation of an empty
+result from one bounded probe (min and max of a range-filtered column, or up to 10
+distinct values of an equality-filtered column) that runs through the normal read
+policy. Checks run only when triggered, share a 1-second budget inside the read's
+deadline, and any failure is dropped; they never change or block a result.
+Multi-statement, combined and folder reads are unchanged. The fan-out check shares
+`select_equalities` in `sql/duckdb_read.py` with the combined-query join checks below.
 
 `data_query` with `inputs` routes to `data.query_combined`, a foreground-only
 read that joins two to sixteen sources. The model names each source by display

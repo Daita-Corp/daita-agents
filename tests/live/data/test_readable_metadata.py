@@ -311,3 +311,42 @@ async def test_describe_after_ddl_shows_the_current_columns(server: Any) -> None
     assert await described() == ["id", "old_name", "added"]
     await server.execute(f"ALTER TABLE {_SCHEMA}.shifting DROP COLUMN old_name")
     assert await described() == ["id", "added"]
+
+
+async def test_search_and_describe_carry_comment_references_and_join_cardinality(
+    server: Any,
+) -> None:
+    await server.execute(
+        f"CREATE TABLE {_SCHEMA}.customers (id int PRIMARY KEY);"
+        f"COMMENT ON TABLE {_SCHEMA}.customers IS 'Deprecated, see accounts';"
+        f"CREATE TABLE {_SCHEMA}.orders (id int PRIMARY KEY, customer_id int "
+        f"REFERENCES {_SCHEMA}.customers (id));"
+        f"CREATE TABLE {_SCHEMA}.profiles (customer_id int UNIQUE "
+        f"REFERENCES {_SCHEMA}.customers (id));"
+        # A foreign key from a schema the source does not list is not counted.
+        f"CREATE TABLE {_OTHER_SCHEMA}.elsewhere (customer_id int "
+        f"REFERENCES {_SCHEMA}.customers (id));"
+        f"GRANT SELECT ON ALL TABLES IN SCHEMA {_SCHEMA} TO {_ROLE}"
+    )
+    await server.execute(f"ANALYZE {_SCHEMA}.customers")
+    await server.execute(f"SET LOCAL ROLE {_ROLE}")
+
+    (hit,) = await server.fetch(
+        _LIVE_SEARCH, [_SCHEMA], ["customers"], ["%customers%"], 10
+    )
+    assert hit["comment"] == "Deprecated, see accounts"
+    assert hit["inbound_foreign_keys"] == 2
+    assert hit["last_analyzed"] is not None
+
+    (relation,) = await server.fetch(
+        _LIVE_RELATIONS, [_SCHEMA], ["customers"], "customers"
+    )
+    described = await _describe_relation(server, relation, (_SCHEMA,))
+    cardinality = {
+        item["from"]: item["cardinality"]
+        for item in cast(list[Mapping[str, str]], described["relationships"])
+    }
+    assert cardinality == {
+        f"{_SCHEMA}.orders": "many_to_one",
+        f"{_SCHEMA}.profiles": "one_to_one",
+    }

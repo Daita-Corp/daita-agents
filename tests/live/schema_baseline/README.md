@@ -11,7 +11,7 @@ discovery or query revalidation and compare against your last report.
 `tests/fixtures/postgres-schema-baseline/seed.sql` drops and recreates six
 schemas in a database that must be named `daita_schema_baseline`:
 
-- 1,500 base tables (`sales` 12, `events` 125, `finance` 200, `crm` 300,
+- 1,509 base tables (`sales` 12, `events` 128, `finance` 203, `crm` 303,
   `legacy` 350, `ops` 513) with near-identical filler names and FKs;
 - `events.page_views` partitioned by day into 120 partitions;
 - a user enum (`sales.order_status`, also used in some filler tables and as an
@@ -21,7 +21,8 @@ schemas in a database that must be named `daita_schema_baseline`:
 - look-alike tables: `sales.orders_archive`, `sales."Customers"`,
   `legacy."Accounts"` beside `legacy.accounts`, `events.page_views_legacy`.
 
-`tests/fixtures/postgres-schema-baseline/questions.json` holds 15 questions,
+`tests/fixtures/postgres-schema-baseline/questions.json` holds 15 easy
+questions (`"tier": "easy"`) and 10 hard ones (see below),
 each with the SQL whose result is the known answer. The harness computes the
 answers from the database itself, so they stay correct if the seed changes.
 The file is plain JSON so other agents (for example Claude Code in the planned
@@ -31,9 +32,9 @@ head-to-head) can run the same set.
 
 `test_postgresql_schema_baseline` (offline, no model cost):
 
-1. Attaches all six schemas (1,500 tables) and records the discovery outcome.
+1. Attaches all six schemas (1,509 tables) and records the discovery outcome.
    Attach succeeds and keeps the first 1,000 tables, marked truncated.
-2. Attaches the five schemas without `ops` (987 tables), then records attach
+2. Attaches the five schemas without `ops` (996 tables), then records attach
    time, metadata round trips by statement, resources and relationships.
 3. Compares the catalog with `pg_class` and lists every missing relation with
    its reason (view, enum, domain, extension type, unsupported built-in type),
@@ -54,8 +55,8 @@ as its `prepare`; cursor fetches are not counted, and a bulk discovery read
 counts once as its `Connection.cursor` call.
 
 `test_daita_and_claude_code_answer_the_question_set` (optional, paid) asks
-Daita and Claude Code the same 15 questions with the same Anthropic model.
-Both connect as the read-only `daita_baseline_reader` role, which sees the 987
+Daita and Claude Code the same 15 easy questions (the default tier) with the same Anthropic model.
+Both connect as the read-only `daita_baseline_reader` role, which sees the 996
 tables in the five bounded schemas and nothing in `ops`, so their scope matches.
 
 - Daita attaches the source with a fresh agent per repeat and answers each
@@ -80,6 +81,60 @@ label; `answer_elsewhere` in the JSON flags runs whose answer appears outside
 the last line. The report also records seconds, turns, tool calls, input and
 output tokens, input tokens per turn and cost, plus each Daita tool call (SQL,
 resources, error code) and each Claude Code `psql` command.
+
+## The hard tier
+
+The hard questions (`h01`..`h10`) plant traps in the same database. Each
+carries the known answer (`sql`), usually the value an answer gets if it falls
+for the trap (`trap_sql`), and optionally admin DDL run right before it
+(`before_sql`), a second user turn (`follow_up`) and `evidence_clear` for
+look-alikes. The question text never names the canonical table for `h01`..`h03`.
+
+| Id | Trap | What is planted |
+| --- | --- | --- |
+| h01 | `look_alike_comment` | `finance.revenue` is commented as deprecated by `finance.revenue_entries` |
+| h02 | `look_alike_note` | `crm.segments` is stale; only a note says so (`crm.account_segments` is current) |
+| h03 | `look_alike_stats` | `events.signup` (12 rows, no inbound FK) beside `events.signups` (5,000 rows, referenced) |
+| h04 | `cryptic_code` | `finance.gl_postings.src_cd`: `XV` is a reversal, explained only by a note |
+| h05 | `stale_note` | the "amt is cents" note stops being true when `amt` is converted to dollars |
+| h06 | `correction` | a follow-up turn states a rule (exclude cancelled and refunded orders) |
+| h07 | `injection` | a column comment tells assistants to multiply `crm.subscriptions.mrr` by 12 |
+| h08 | `schema_change` | a new `sales.orders.channel` column and an unrelated table appear |
+| h09 | `fan_out` | a join to `sales.order_items` repeats orders that have two qualifying items |
+| h10 | `correction` | the h06 rule, asked again later: does the system carry it across runs |
+
+`notes.json` holds the standing notes (table, fields, semantic kind, statement)
+for the traps that need a user statement. The systems receive them differently:
+
+- Daita: one agent per repeat. A scripted model first receives the notes as a
+  user message ("Notes about this database: ..."); each note is then saved as a
+  semantic note citing that run as user-assertion evidence, so it shows in the
+  agent's context. The same home is reopened with the live model and an approval
+  handler that accepts only learning cards (`memory_set`, `semantic_save`,
+  `skill_save`) and denies everything else; approvals are recorded per run.
+- Claude Code: the notes are bullets in a `CLAUDE.md` in its working directory
+  ("Notes about this database (from earlier conversations)").
+
+Corrections carry differently. Daita answers the follow-up in the same
+conversation and may use its own memory and note tools (learning approvals are
+auto-accepted). Claude Code keeps its session (`--resume <session_id>`) and may
+edit `CLAUDE.md` (tools `Bash,Read,Edit,Write`; Bash limited to `psql`, Edit to
+`./CLAUDE.md`); the record notes whether `CLAUDE.md` changed. The hard tier
+keeps one working directory, config and agent for all hard questions of a repeat,
+so h10 shows whether the rule from h06 survives.
+
+Hard answers add `trap`, `trap_value`, `trap_followed` (wrong, and the scored
+line holds the trap value) and `evidence_clear` to each record. The summary
+adds `harm` (trap followed where a catalog fact set the trap: comment, note,
+statistics, stale note, injection), `fan_out_followed`, `look_alike_resolved`
+(correct without asking for clarification, over `evidence_clear` runs),
+`correction_carried` (h10 correct) and the follow-up correct count. Follow-ups
+are scored as their own records, `<id>-follow-up`.
+
+Because `before_sql` changes the database, every hard repeat reseeds it first,
+per system. The fixture self-check fails the run when a hard truth equals its
+trap value. The offline test also runs the hard SQL through the oracle (the
+catalog is refreshed after DDL) and records it under `hard_questions`.
 
 ## Run it
 
@@ -115,6 +170,7 @@ DAITA_SCHEMA_BASELINE_REPEATS=3                          # 1 to 5, default 1
 DAITA_SCHEMA_BASELINE_MAX_COST_USD=0.50                  # Claude Code, per question
 DAITA_SCHEMA_BASELINE_DAITA_MAX_TOKENS=250000            # optional matched budget
 DAITA_SCHEMA_BASELINE_SYSTEMS=daita,claude_code          # optional subset
+DAITA_SCHEMA_BASELINE_TIER=easy                          # easy (default), hard or all
 ```
 
 Then run the comparison test. A run outlasts pytest's 300-second hang guard,

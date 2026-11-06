@@ -30,7 +30,11 @@ from ...catalog.models import (
 from ...catalog.protocols import CatalogStore, CatalogStoreError
 from ...catalog.service import CatalogService, CatalogTabularResource
 from ...llm.models import ModelSensitivity
-from ...semantics import SemanticResourceFact
+from ...semantics import (
+    SemanticResourceFact,
+    SemanticStore,
+    inspect_semantic_annotations,
+)
 from ...storage.sqlite_records import (
     RelationalWriteScope,
     SourcePermissionStateError,
@@ -972,6 +976,36 @@ class CatalogDataView:
             )
             for resource in sorted(resources.values(), key=lambda item: item.id)
         )
+
+    async def table_notes(
+        self, agent_id: str, source_id: str
+    ) -> Mapping[str, tuple[str, ...]]:
+        """Statements of current notes about one table of a source, by table name."""
+
+        # The composed state store is also the semantic store.
+        stored = await cast(SemanticStore, self._store).list_semantic_annotations(
+            agent_id
+        )
+        annotations = tuple(
+            item
+            for item in stored
+            if item.subject.source_ids == (source_id,)
+            and len(item.subject.resource_ids) == 1
+            and not item.subject.fields
+        )
+        if not annotations:
+            return {}
+        resource_ids = tuple(
+            sorted({item.subject.resource_ids[0] for item in annotations})
+        )
+        facts = await self.semantic_resource_facts(agent_id, resource_ids)
+        names = await self.resource_names(agent_id, (source_id,))
+        notes: dict[str, list[str]] = {}
+        for view in inspect_semantic_annotations(annotations, facts):
+            name = names.get(view.annotation.subject.resource_ids[0])
+            if name is not None and view.usable_as_current_meaning:
+                notes.setdefault(name, []).append(view.annotation.statement)
+        return {name: tuple(statements) for name, statements in notes.items()}
 
     async def relational_write_scopes(
         self, agent_id: str, source_id: str

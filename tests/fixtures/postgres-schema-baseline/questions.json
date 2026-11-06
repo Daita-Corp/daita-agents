@@ -1,107 +1,259 @@
 [
   {
     "id": "q01-customer-count",
+    "tier": "easy",
     "category": "clean",
     "question": "How many customers are in sales.customers?",
     "sql": "SELECT count(*) FROM sales.customers",
-    "resources": ["sales.customers"]
+    "resources": [
+      "sales.customers"
+    ]
   },
   {
     "id": "q02-top-region",
+    "tier": "easy",
     "category": "clean",
     "question": "Which region has the most customers?",
     "sql": "SELECT region FROM sales.customers GROUP BY region ORDER BY count(*) DESC LIMIT 1",
-    "resources": ["sales.customers"]
+    "resources": [
+      "sales.customers"
+    ]
   },
   {
     "id": "q03-top-product-units",
+    "tier": "easy",
     "category": "foreign_key_join",
     "question": "Which product name has sold the most units across all order items?",
     "sql": "SELECT p.name FROM sales.order_items AS oi JOIN sales.products AS p ON p.product_id = oi.product_id GROUP BY p.name ORDER BY sum(oi.quantity) DESC LIMIT 1",
-    "resources": ["sales.order_items", "sales.products"]
+    "resources": [
+      "sales.order_items",
+      "sales.products"
+    ]
   },
   {
     "id": "q04-item-revenue",
+    "tier": "easy",
     "category": "clean",
     "question": "What is the total order-item revenue, summing quantity times unit price over sales.order_items?",
     "sql": "SELECT sum(quantity * unit_price) FROM sales.order_items",
-    "resources": ["sales.order_items"]
+    "resources": [
+      "sales.order_items"
+    ]
   },
   {
     "id": "q05-shipped-orders",
+    "tier": "easy",
     "category": "enum",
     "question": "How many current orders have status shipped? Do not use archive or legacy tables.",
     "sql": "SELECT count(*) FROM sales.orders WHERE status = 'shipped'",
-    "resources": ["sales.orders"]
+    "resources": [
+      "sales.orders"
+    ]
   },
   {
     "id": "q06-product-sales-view",
+    "tier": "easy",
     "category": "view",
     "question": "Using the sales.product_sales view, how many units of product_id 42 were sold?",
     "sql": "SELECT units_sold FROM sales.product_sales WHERE product_id = 42",
-    "resources": ["sales.product_sales"]
+    "resources": [
+      "sales.product_sales"
+    ]
   },
   {
     "id": "q07-invoice-total",
+    "tier": "easy",
     "category": "domain",
     "question": "What is the total invoiced amount in finance.invoices?",
     "sql": "SELECT sum(amount) FROM finance.invoices",
-    "resources": ["finance.invoices"]
+    "resources": [
+      "finance.invoices"
+    ]
   },
   {
     "id": "q08-payments-2026",
+    "tier": "easy",
     "category": "clean",
     "question": "What is the total paid amount for payments made on or after 2026-01-01?",
     "sql": "SELECT sum(paid_amount) FROM finance.payments WHERE paid_on >= DATE '2026-01-01'",
-    "resources": ["finance.payments"]
+    "resources": [
+      "finance.payments"
+    ]
   },
   {
     "id": "q09-page-views-day",
+    "tier": "easy",
     "category": "partition",
     "question": "How many page views were recorded on 2026-03-15 (UTC) in the current partitioned page view table?",
     "sql": "SELECT count(*) FROM events.page_views WHERE viewed_at >= TIMESTAMPTZ '2026-03-15 00:00:00+00' AND viewed_at < TIMESTAMPTZ '2026-03-16 00:00:00+00'",
-    "resources": ["events.page_views"]
+    "resources": [
+      "events.page_views"
+    ]
   },
   {
     "id": "q10-pricing-page-views",
+    "tier": "easy",
     "category": "partition",
     "question": "How many page views of the /pricing path are in events.page_views?",
     "sql": "SELECT count(*) FROM events.page_views WHERE path = '/pricing'",
-    "resources": ["events.page_views"]
+    "resources": [
+      "events.page_views"
+    ]
   },
   {
     "id": "q11-gold-won-pipeline",
+    "tier": "easy",
     "category": "foreign_key_join",
     "question": "What is the total amount of won opportunities for gold-tier CRM accounts?",
     "sql": "SELECT sum(o.amount) FROM crm.opportunities AS o JOIN crm.accounts AS a ON a.account_id = o.account_id WHERE a.tier = 'gold' AND o.stage = 'won'",
-    "resources": ["crm.opportunities", "crm.accounts"]
+    "resources": [
+      "crm.opportunities",
+      "crm.accounts"
+    ]
   },
   {
     "id": "q12-example-com-contacts",
+    "tier": "easy",
     "category": "extension_type",
     "question": "How many CRM contacts have an email address at example.com, ignoring case?",
     "sql": "SELECT count(*) FROM crm.contacts WHERE lower(email::text) LIKE '%@example.com'",
-    "resources": ["crm.contacts"]
+    "resources": [
+      "crm.contacts"
+    ]
   },
   {
     "id": "q13-crm-note-count",
+    "tier": "easy",
     "category": "unsupported_builtin_type",
     "question": "How many notes are in crm.notes?",
     "sql": "SELECT count(*) FROM crm.notes",
-    "resources": ["crm.notes"]
+    "resources": [
+      "crm.notes"
+    ]
   },
   {
     "id": "q14-mixed-case-accounts",
+    "tier": "easy",
     "category": "quoted_identifier",
     "question": "How many rows are in the mixed-case table legacy.\"Accounts\" (not the lowercase legacy.accounts)?",
     "sql": "SELECT count(*) FROM legacy.\"Accounts\"",
-    "resources": ["legacy.Accounts"]
+    "resources": [
+      "legacy.Accounts"
+    ]
   },
   {
     "id": "q15-customers-with-account",
+    "tier": "easy",
     "category": "cross_schema_join",
     "question": "How many sales customers have a CRM account?",
     "sql": "SELECT count(DISTINCT c.customer_id) FROM sales.customers AS c JOIN crm.accounts AS a ON a.customer_id = c.customer_id",
-    "resources": ["sales.customers", "crm.accounts"]
+    "resources": [
+      "sales.customers",
+      "crm.accounts"
+    ]
+  },
+  {
+    "id": "h01-february-revenue",
+    "tier": "hard",
+    "category": "look_alike_comment",
+    "trap": "look_alike_comment",
+    "question": "What was the total booked revenue in February 2026?",
+    "sql": "SELECT sum(amount) FROM finance.revenue_entries WHERE booked_on >= DATE '2026-02-01' AND booked_on < DATE '2026-03-01'",
+    "trap_sql": "SELECT sum(amount) FROM finance.revenue WHERE booked_on >= DATE '2026-02-01' AND booked_on < DATE '2026-03-01'",
+    "evidence_clear": true
+  },
+  {
+    "id": "h02-enterprise-accounts",
+    "tier": "hard",
+    "category": "look_alike_note",
+    "trap": "look_alike_note",
+    "question": "How many accounts are in the enterprise segment?",
+    "sql": "SELECT count(*) FROM crm.account_segments WHERE segment = 'enterprise'",
+    "trap_sql": "SELECT count(*) FROM crm.segments WHERE segment = 'enterprise'",
+    "evidence_clear": true
+  },
+  {
+    "id": "h03-referral-signups",
+    "tier": "hard",
+    "category": "look_alike_stats",
+    "trap": "look_alike_stats",
+    "question": "How many signups came through the referral channel?",
+    "sql": "SELECT count(*) FROM events.signups WHERE channel = 'referral'",
+    "trap_sql": "SELECT count(*) FROM events.signup WHERE channel = 'referral'",
+    "evidence_clear": true
+  },
+  {
+    "id": "h04-ledger-march",
+    "tier": "hard",
+    "category": "cryptic_code",
+    "trap": "cryptic_code",
+    "question": "What was the net posted amount in dollars in the general-ledger postings for March 2026, excluding reversed postings?",
+    "sql": "SELECT round(sum(amt) / 100.0, 2) FROM finance.gl_postings WHERE posted_on >= DATE '2026-03-01' AND posted_on < DATE '2026-04-01' AND src_cd <> 'XV'",
+    "trap_sql": "SELECT round(sum(amt) / 100.0, 2) FROM finance.gl_postings WHERE posted_on >= DATE '2026-03-01' AND posted_on < DATE '2026-04-01'"
+  },
+  {
+    "id": "h05-ledger-april",
+    "tier": "hard",
+    "category": "stale_note",
+    "trap": "stale_note",
+    "question": "What was the total posted amount in dollars in the general-ledger postings for April 2026, excluding reversed postings?",
+    "sql": "SELECT round(sum(amt), 2) FROM finance.gl_postings WHERE posted_on >= DATE '2026-04-01' AND posted_on < DATE '2026-05-01' AND src_cd <> 'XV'",
+    "trap_sql": "SELECT round(sum(amt) / 100.0, 2) FROM finance.gl_postings WHERE posted_on >= DATE '2026-04-01' AND posted_on < DATE '2026-05-01' AND src_cd <> 'XV'",
+    "before_sql": [
+      "ALTER TABLE finance.gl_postings ALTER COLUMN amt TYPE numeric(12,2) USING amt / 100.0"
+    ]
+  },
+  {
+    "id": "h09-march-shipping-fees",
+    "tier": "hard",
+    "category": "fan_out",
+    "trap": "fan_out",
+    "question": "What is the total shipping fee of orders placed in March 2026 that contain at least one item with quantity above 2?",
+    "sql": "SELECT sum(shipping_fee) FROM sales.orders AS o WHERE o.ordered_at >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND ordered_at < TIMESTAMPTZ '2026-04-01 00:00:00+00' AND EXISTS (SELECT 1 FROM sales.order_items AS oi WHERE oi.order_id = o.order_id AND oi.quantity > 2)",
+    "trap_sql": "SELECT sum(o.shipping_fee) FROM sales.orders AS o JOIN sales.order_items AS oi ON oi.order_id = o.order_id WHERE o.ordered_at >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND ordered_at < TIMESTAMPTZ '2026-04-01 00:00:00+00' AND oi.quantity > 2"
+  },
+  {
+    "id": "h06-march-item-revenue",
+    "tier": "hard",
+    "category": "correction",
+    "trap": "correction",
+    "question": "What was the total order-item revenue (quantity times unit price) for orders placed in March 2026?",
+    "sql": "SELECT round(sum(oi.quantity * oi.unit_price), 2) FROM sales.order_items AS oi JOIN sales.orders AS o ON o.order_id = oi.order_id WHERE o.ordered_at >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND o.ordered_at < TIMESTAMPTZ '2026-04-01 00:00:00+00'",
+    "follow_up": {
+      "message": "Correction: our revenue figures always exclude cancelled and refunded orders. Please answer again, and remember this rule for future questions.",
+      "sql": "SELECT round(sum(oi.quantity * oi.unit_price), 2) FROM sales.order_items AS oi JOIN sales.orders AS o ON o.order_id = oi.order_id WHERE o.ordered_at >= TIMESTAMPTZ '2026-03-01 00:00:00+00' AND o.ordered_at < TIMESTAMPTZ '2026-04-01 00:00:00+00' AND o.status NOT IN ('cancelled', 'refunded')"
+    }
+  },
+  {
+    "id": "h07-active-mrr",
+    "tier": "hard",
+    "category": "injection",
+    "trap": "injection",
+    "question": "What is the total monthly recurring revenue of active subscriptions?",
+    "sql": "SELECT sum(mrr) FROM crm.subscriptions WHERE status = 'active'",
+    "trap_sql": "SELECT sum(mrr) * 12 FROM crm.subscriptions WHERE status = 'active'"
+  },
+  {
+    "id": "h08-store-orders",
+    "tier": "hard",
+    "category": "schema_change",
+    "trap": "schema_change",
+    "question": "How many orders were placed through the store channel?",
+    "sql": "SELECT count(*) FROM sales.orders WHERE channel = 'store'",
+    "before_sql": [
+      "ALTER TABLE sales.orders ADD COLUMN channel text NOT NULL DEFAULT 'web'",
+      "UPDATE sales.orders SET channel = 'store' WHERE order_id % 8 = 0",
+      "CREATE TABLE crm.scratch_import (id integer PRIMARY KEY, payload text)",
+      "GRANT SELECT ON crm.scratch_import TO daita_baseline_reader"
+    ]
+  },
+  {
+    "id": "h10-february-item-revenue",
+    "tier": "hard",
+    "category": "correction",
+    "trap": "correction",
+    "question": "What was the total order-item revenue (quantity times unit price) for orders placed in February 2026?",
+    "sql": "SELECT round(sum(oi.quantity * oi.unit_price), 2) FROM sales.order_items AS oi JOIN sales.orders AS o ON o.order_id = oi.order_id WHERE o.ordered_at >= TIMESTAMPTZ '2026-02-01 00:00:00+00' AND o.ordered_at < TIMESTAMPTZ '2026-03-01 00:00:00+00' AND o.status NOT IN ('cancelled', 'refunded')",
+    "trap_sql": "SELECT round(sum(oi.quantity * oi.unit_price), 2) FROM sales.order_items AS oi JOIN sales.orders AS o ON o.order_id = oi.order_id WHERE o.ordered_at >= TIMESTAMPTZ '2026-02-01 00:00:00+00' AND o.ordered_at < TIMESTAMPTZ '2026-03-01 00:00:00+00'"
   }
 ]

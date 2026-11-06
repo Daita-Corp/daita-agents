@@ -26,6 +26,7 @@ from ..capabilities import (
 )
 from ..errors import DaitaError
 from ..scope import EffectiveSourceScope
+from .labels import TableFacts, TableLabel, column_names, core_tokens, label_tables
 from .models import (
     CATALOG_MAX_LIMIT,
     CATALOG_TOOL_DEFAULT_LIMIT,
@@ -50,6 +51,10 @@ _COMMON_WORDS = frozenset(
 _LOOKUP_FAILURES = (DaitaError, ImportError, OSError, TimeoutError)
 _TRUST = "untrusted_external_data"
 _MAX_LINK_CANDIDATES = 8
+_MAX_LOOK_ALIKE_HITS = 8
+_MAX_LOOK_ALIKES = 2
+# What a label's extra reads may raise; the answer then goes out unlabelled.
+_LABEL_FAILURES = (*_LOOKUP_FAILURES, CatalogStoreError, ValueError)
 
 RefreshRequest = Callable[[str, tuple[str, ...]], None]
 
@@ -89,6 +94,10 @@ class CatalogProjection(Protocol):
         self, agent_id: str, source_id: str, name: str
     ) -> Mapping[str, object] | None: ...
 
+    async def table_notes(
+        self, agent_id: str, source_id: str
+    ) -> Mapping[str, tuple[str, ...]]: ...
+
     async def link_candidates(
         self,
         agent_id: str,
@@ -121,6 +130,21 @@ def _visible(
         return True
     return catalog_resource_id(source_id, ResourceKind(str(kind)), name) in (
         scope.resource_ids
+    )
+
+
+def _facts(
+    hit: Mapping[str, object], notes: Mapping[str, tuple[str, ...]]
+) -> TableFacts:
+    name = cast(str, hit["name"])
+    return TableFacts(
+        name=name,
+        columns=column_names(hit.get("columns")),
+        row_estimate=cast("int | None", hit.get("row_estimate")),
+        inbound_foreign_keys=cast("int | None", hit.get("inbound_foreign_keys")),
+        comment=cast("str | None", hit.get("comment")),
+        notes=notes.get(name, ()),
+        last_analyzed=cast("str | None", hit.get("last_analyzed")),
     )
 
 
@@ -235,6 +259,7 @@ class CatalogSearchExecutor:
         for source_id, names in missed.items():
             if source_id != session:
                 self._request_refresh(source_id, tuple(names))
+        await self._label(merged)
         hits = list(merged.values())
         return ToolOutput(
             kind=CATALOG_SEARCH_EVIDENCE_KIND,
@@ -248,6 +273,33 @@ class CatalogSearchExecutor:
                 "trust_classification": _TRUST,
             },
         )
+
+    async def _label(self, merged: Mapping[tuple[str, str], dict[str, object]]) -> None:
+        """Add look-alike status to the hits of each source; no hit is dropped."""
+
+        sources = {source_id for source_id, _ in merged}
+        for source_id in sorted(sources):
+            tables = [
+                hit
+                for (hit_source, _), hit in merged.items()
+                if hit_source == source_id and hit["kind"] == "table"
+            ]
+            try:
+                notes = await self._service.table_notes(self._agent_id, source_id)
+            except _LABEL_FAILURES:
+                notes = {}
+            labels = label_tables([_facts(hit, notes) for hit in tables])
+            for hit in tables:
+                if (label := labels.get(cast(str, hit["name"]))) is not None:
+                    hit.update(_label_fields(label))
+
+
+def _label_fields(label: TableLabel) -> dict[str, object]:
+    return {
+        "status": label.status,
+        **({"evidence": list(label.evidence)} if label.evidence else {}),
+        "look_alikes": list(label.look_alikes[:_MAX_LOOK_ALIKES]),
+    }
 
 
 class CatalogDescribeExecutor:
@@ -355,6 +407,17 @@ class CatalogDescribeExecutor:
                     "Use catalog_search to find the name, or qualify it with its schema.",
                 ),
             )
+        if (
+            backend is not None
+            and visible.get("answered_from") == "live"
+            and visible.get("kind") == "table"
+        ):
+            visible = {
+                **visible,
+                **await self._labelled(
+                    backend, source_id, request.source_scope, visible
+                ),
+            }
         return ToolOutput(
             kind=CATALOG_DESCRIBE_EVIDENCE_KIND,
             data={
@@ -364,6 +427,69 @@ class CatalogDescribeExecutor:
                 "trust_classification": _TRUST,
             },
         )
+
+    async def _labelled(
+        self,
+        backend: LiveLookup,
+        source_id: str,
+        scope: EffectiveSourceScope | None,
+        answer: Mapping[str, object],
+    ) -> dict[str, object]:
+        """The table's look-alike status, or nothing if the extra reads fail."""
+
+        name = cast(str, answer["name"])
+        session = self._service.session_source_id
+        try:
+            tokens = tuple(sorted(core_tokens(name)))
+            found = (
+                await backend.search_names(
+                    agent_id=self._agent_id,
+                    source_id=source_id,
+                    words=tokens,
+                    limit=_MAX_LOOK_ALIKE_HITS,
+                )
+                if tokens
+                else ()
+            )
+            notes = await self._service.table_notes(self._agent_id, source_id)
+        except _LABEL_FAILURES:
+            return {}
+        own = next((hit for hit in found if hit["name"] == name), {})
+        table = {
+            **own,
+            "name": name,
+            "columns": ", ".join(
+                f"{column['name']} {column['type']}"
+                for column in cast(
+                    Sequence[Mapping[str, str]], answer.get("columns", ())
+                )
+            ),
+            "row_estimate": answer.get("row_estimate"),
+            "comment": answer.get("comment"),
+        }
+        others = [
+            hit
+            for hit in found
+            if hit["kind"] == "table"
+            and hit["name"] != name
+            and _visible(scope, session, source_id, hit["kind"], cast(str, hit["name"]))
+        ]
+        labels = label_tables([_facts(item, notes) for item in (table, *others)])
+        label = labels.get(name)
+        if label is None:
+            return {}
+        by_name = {cast(str, hit["name"]): hit for hit in others}
+        return {
+            **_label_fields(label),
+            "look_alikes": [
+                {
+                    "name": other,
+                    "status": labels[other].status,
+                    "row_estimate": by_name[other].get("row_estimate"),
+                }
+                for other in label.look_alikes
+            ],
+        }
 
     def _scoped(
         self,
@@ -521,7 +647,9 @@ def catalog_declarations(
             "Find tables, views and files by words in their table or column names. "
             "Every search checks the live source as well as the catalog. Returns "
             "compact hits: full name, kind, leading columns, row estimate, dialect "
-            "and whether it was seen live. A hit is a candidate, not a choice. "
+            "and whether it was seen live. Look-alike tables carry a status "
+            "(canonical, likely_stale, deprecated, unknown) with evidence; advice, "
+            "not a rule. A hit is a candidate, not a choice. "
             'Limits: no rows; up to 50 hits. Example: {"query": "customer invoices"}. '
             "Mistakes: searching again for a name you already have."
         ),
@@ -564,8 +692,10 @@ def catalog_declarations(
         description=(
             "Describe one table, view or file from the live source: columns with "
             "native types, enum values, keys, partitions as one table with a child "
-            "count, comments, row estimate and relationships. A schema or folder "
-            "name lists what it holds, capped at 100. answered_from says live or "
+            "count, comments, row estimate and relationships with join cardinality "
+            "(one_to_one or many_to_one). A table with look-alikes carries a status "
+            "and them. A schema or folder name lists what it holds, capped at 100. "
+            "answered_from says live or "
             'cache. Example: {"source": "Shop", "name": "sales.orders"}. '
             "Mistakes: describing many tables when one query answers; reading "
             "estimates as exact counts."
@@ -673,8 +803,10 @@ def _describe_output_schema() -> dict[str, object]:
         "columns_truncated": "boolean",
         "comment": "string",
         "dialect": "string",
+        "evidence": "array",
         "kind": "string",
         "link_candidates": "array",
+        "look_alikes": "array",
         "name": "string",
         "note": "string",
         "partitions": "integer",
@@ -683,6 +815,7 @@ def _describe_output_schema() -> dict[str, object]:
         "revision": "string",
         "row_estimate": "integer",
         "source_id": "string",
+        "status": "string",
         "tables": "array",
         "total_tables": "integer",
         "trust_classification": "string",
