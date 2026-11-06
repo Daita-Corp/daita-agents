@@ -2,8 +2,8 @@
 
 Daita keeps provider discovery declarative while retaining explicit native
 protocol adapters. Built-in provider identity, display name, authentication
-mode, endpoint behavior, construction binding, request-policy support, and
-unreviewed-profile defaults have one owner:
+mode, endpoint behavior, construction binding, request-policy support,
+accepted reasoning levels, and unreviewed-profile defaults have one owner:
 `src/daita/llm/provider_definitions.py`.
 
 The consumers are deliberately separate:
@@ -20,6 +20,15 @@ not add provider lists or vendor branches to the factory, embedded host, TUI, or
 model loop. Unknown provider names already use the custom OpenAI-compatible path
 and must supply an HTTP(S) base URL; that path does not confer built-in identity
 or privileges.
+
+## Reasoning effort
+
+A provider that accepts a reasoning level lists its native values in
+`ProviderDefinition.reasoning_efforts`, and its constructor takes
+`reasoning_effort: str | None`. The adapter keeps that value for its lifetime and
+adds it to every generation and input-count request; with `None` it sends nothing.
+Do not read the level from `ModelRequest`, which would let it change in the
+middle of a run.
 
 ## Host request capacity
 

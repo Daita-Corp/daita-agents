@@ -382,11 +382,14 @@ class Agent:
         base_url: str | None = None,
         context_window_tokens: int | None = None,
         max_output_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> ModelRoute:
         """Validate and persist one model route for the next open.
 
         Omit subscription_credential to reuse the current primary subscription
         login for the same provider. Supply a new credential to replace it.
+        reasoning_effort pins a provider-native reasoning level for every run;
+        None keeps the provider's default.
         """
 
         credential = api_key
@@ -402,6 +405,7 @@ class Agent:
                 base_url=base_url,
                 context_window_tokens=context_window_tokens,
                 max_output_tokens=max_output_tokens,
+                reasoning_effort=reasoning_effort,
             )
         finally:
             credential = None

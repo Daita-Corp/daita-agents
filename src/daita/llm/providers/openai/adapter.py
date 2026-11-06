@@ -192,9 +192,14 @@ class OpenAIResponsesProvider:
         region: str = "global",
         pricing_schedules: Iterable[PricingSchedule] | None = None,
         clock: Callable[[], datetime] = _utc_now,
+        reasoning_effort: str | None = None,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a non-empty string")
+        if reasoning_effort is not None and (
+            not isinstance(reasoning_effort, str) or not reasoning_effort
+        ):
+            raise ValueError("reasoning_effort must be non-empty text when provided")
         if api_key is not None and (
             not isinstance(api_key, str) or not api_key.strip()
         ):
@@ -221,6 +226,7 @@ class OpenAIResponsesProvider:
         self._id_factory = _new_id if id_factory is None else id_factory
         self._service_tier = service_tier
         self._region = region
+        self._reasoning_effort = reasoning_effort
         self._pricing_schedules = (
             load_bundled_pricing_schedules()
             if pricing_schedules is None
@@ -561,6 +567,8 @@ class OpenAIResponsesProvider:
             arguments["prompt_cache_key"] = cache_key
         if self._max_output_tokens is not None:
             arguments["max_output_tokens"] = self._max_output_tokens
+        if self._reasoning_effort is not None:
+            arguments["reasoning"] = {"effort": self._reasoning_effort}
         if request.allow_parallel_tool_calls is not None:
             arguments["parallel_tool_calls"] = request.allow_parallel_tool_calls
         if request.tools:

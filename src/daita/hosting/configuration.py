@@ -167,6 +167,12 @@ def _encode_model_route_contract(route: ModelRoute) -> dict[str, object]:
                     if candidate.secret_reference is None
                     else candidate.secret_reference.to_uri()
                 ),
+                # Omitted when unset so routes without one keep their digests.
+                **(
+                    {}
+                    if candidate.reasoning_effort is None
+                    else {"reasoning_effort": candidate.reasoning_effort}
+                ),
             }
             for candidate in route.candidates
         ],
@@ -360,6 +366,7 @@ def _model_route(
     secret_reference: SecretReference | None,
     context_window_tokens: int | None,
     max_output_tokens: int | None,
+    reasoning_effort: str | None = None,
 ) -> ModelRoute:
     profile = _model_profile(
         provider,
@@ -374,6 +381,7 @@ def _model_route(
                 profile=profile,
                 base_url=base_url,
                 secret_reference=secret_reference,
+                reasoning_effort=reasoning_effort,
             ),
         )
     )
@@ -784,6 +792,7 @@ def _encode_agent_config(config: AgentConfig) -> dict[str, object]:
                     "base_url": candidate.base_url,
                     "profile_limits": _persisted_profile_limits(candidate),
                     "provider_id": candidate.provider_id,
+                    "reasoning_effort": candidate.reasoning_effort,
                     "secret_reference": (
                         None
                         if candidate.secret_reference is None
@@ -866,6 +875,7 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
                 "base_url",
                 "profile_limits",
                 "provider_id",
+                "reasoning_effort",
                 "secret_reference",
             },
         )
@@ -881,6 +891,9 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
         provider_id = candidate["provider_id"]
         if not isinstance(provider_id, str):
             raise TypeError("provider ID must be text")
+        reasoning_effort = candidate["reasoning_effort"]
+        if reasoning_effort is not None and not isinstance(reasoning_effort, str):
+            raise TypeError("reasoning effort must be text or null")
         provider_name, separator, model_name = provider_id.partition(":")
         if not separator:
             raise ValueError("provider ID is incomplete")
@@ -950,6 +963,7 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
                 base_url=admitted_url,
                 secret_reference=reference,
                 allowed_sensitivities=frozenset(allowed),
+                reasoning_effort=reasoning_effort,
             )
         )
     raw_retry = _strict_mapping(

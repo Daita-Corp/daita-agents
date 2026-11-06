@@ -66,6 +66,8 @@ An existing home migrates automatically to home revision 4 the first time it ope
   - A stored routine, job or MCP tool is converted as described in its section below.
   - Old records keep decoding; a record that no longer needs a catalog revision simply
     stops requiring it.
+  - Each saved model route candidate in `config.json` gains `reasoning_effort: null`,
+    which keeps the provider's default.
 
 ### The model works with names, not IDs
 
@@ -304,6 +306,27 @@ the limits and continues it. This replaces the task-graph job system.
   by an older version of Daita; start it again.", result deliveries and
   receipts keep their job, graph attention notices are dropped, and the graph
   tables are removed.
+
+### Choose a model's reasoning level
+
+Each agent can pin how hard its model thinks. Until now every run used the provider's
+default: `medium` on Claude Opus 5.5 and `high` on Claude Fable 5.1, Sonnet 5 and
+Opus 4.8.
+
+- **Where.** `/model` in the TUI asks for a level after the model, with "Provider
+  default" first. `Agent.configure_model(..., reasoning_effort="high")` does the same
+  from Python, and `daita run --no-host --model ... --reasoning-effort high` sets it
+  for one run.
+- **Levels** are the provider's own: Anthropic `low`, `medium`, `high`, `xhigh`,
+  `max` (`output_config.effort`); OpenAI `none`, `minimal`, `low`, `medium`,
+  `high`, `xhigh`, `max` (`reasoning.effort`); Gemini `minimal`, `low`, `medium`,
+  `high` (`thinking_config.thinking_level`). Subscription and custom providers don't
+  accept one. Saving checks the level with the model, so a level the model rejects
+  is refused before it is saved.
+- **Fixed for a run.** The level is set when the provider is built, so every request
+  in a run uses it and Anthropic's cached messages stay valid. A change applies when
+  the agent next reopens. It is part of the route's machine-run binding; routes with
+  no level keep the binding they had.
 
 ### Smoother interactive tools
 

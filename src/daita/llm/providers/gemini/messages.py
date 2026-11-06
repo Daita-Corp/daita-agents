@@ -70,9 +70,11 @@ def _count_request(arguments: Mapping[str, object]) -> dict[str, object]:
         "contents": contents,
     }
     config = cast(dict[str, object], arguments["config"])
+    # thinking_config sets output reasoning only; it never changes input tokens.
     if set(config) - {
         "http_options",
         "max_output_tokens",
+        "thinking_config",
         "system_instruction",
         "tools",
         "response_mime_type",

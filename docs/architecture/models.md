@@ -131,4 +131,17 @@ decoding in the package's Claude or Grok adapters. Preserve dispatch-time
 revalidation even when it uses the same definition fact as lazy route preflight:
 those checks protect different boundaries.
 
+A route candidate may pin a provider-native `reasoning_effort`. The levels a
+provider accepts are a `ProviderDefinition` fact (`reasoning_efforts`); an empty
+list means none, and unknown providers accept none. `None` sends nothing and keeps
+the provider's default. The factory passes the level to the adapter's
+constructor, so it is fixed for the provider's lifetime and every request of a
+run uses it: changing it between requests would invalidate Anthropic's cached
+messages. Adapters add it to both generation and input counting (Anthropic
+`output_config.effort`, OpenAI `reasoning.effort`, Gemini
+`thinking_config.thinking_level`). It is persisted per candidate in
+`config.json` and enters the route's contract digest only when set, so routes
+without one keep their digests. It is not a `ModelProfile` field and never
+reaches `ModelRequest`.
+
 Do not add provider branches to `AgentLoop`.

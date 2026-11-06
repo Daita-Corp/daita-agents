@@ -62,6 +62,7 @@ from .protocols import (
     provider_has_complete_pricing,
     provider_supports_request_policy,
 )
+from .provider_definitions import reasoning_efforts
 
 ProviderAdmission = Callable[
     [str, float | None],
@@ -143,10 +144,19 @@ class ModelRouteCandidate:
     allowed_sensitivities: frozenset[ModelSensitivity] = frozenset(
         {ModelSensitivity.PUBLIC, ModelSensitivity.INTERNAL}
     )
+    # None keeps the provider's default; a level is fixed for the provider's life.
+    reasoning_effort: str | None = None
 
     def __post_init__(self) -> None:
         if self.provider_id != self.profile.id:
             raise ValueError("route candidate provider_id must match its profile")
+        if self.reasoning_effort is not None and self.reasoning_effort not in (
+            reasoning_efforts(self.provider_id.partition(":")[0])
+        ):
+            raise ValueError(
+                f"{self.provider_id} does not accept reasoning effort "
+                f"{self.reasoning_effort!r}"
+            )
         if self.base_url is not None and (
             not isinstance(self.base_url, str) or not self.base_url.strip()
         ):

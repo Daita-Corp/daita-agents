@@ -372,6 +372,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--base-url")
     run.add_argument("--context-window", type=int)
     run.add_argument("--max-output", type=int)
+    run.add_argument(
+        "--reasoning-effort",
+        help="provider-native reasoning level for this run, such as high",
+    )
     run.add_argument("--conversation-id")
     run.add_argument("--files-only", action="store_true")
     run.add_argument("--events-jsonl", action="store_true")
@@ -676,6 +680,7 @@ def _model_configuration(
     base_url: str | None = None,
     context_window: int | None = None,
     max_output: int | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[ManagedModelProvider, ModelProfile]:
     if (context_window is None) != (max_output is None):
         raise ValueError("--context-window and --max-output must be supplied together")
@@ -693,6 +698,7 @@ def _model_configuration(
         model_id,
         base_url=base_url,
         max_output_tokens=provider_max_output,
+        reasoning_effort=reasoning_effort,
     )
     profile = _provider_profile(provider)
     if context_window is None:
@@ -1116,10 +1122,16 @@ async def _execute(args: argparse.Namespace) -> object:
     if args.command == "run":
         if args.model is None and any(
             value is not None
-            for value in (args.base_url, args.context_window, args.max_output)
+            for value in (
+                args.base_url,
+                args.context_window,
+                args.max_output,
+                args.reasoning_effort,
+            )
         ):
             raise ValueError(
-                "--base-url, --context-window, and --max-output require --model"
+                "--base-url, --context-window, --max-output, and "
+                "--reasoning-effort require --model"
             )
         local = tuple(
             flag
@@ -1163,6 +1175,7 @@ async def _execute(args: argparse.Namespace) -> object:
                         base_url=args.base_url,
                         context_window=args.context_window,
                         max_output=args.max_output,
+                        reasoning_effort=args.reasoning_effort,
                     )
                     library.update(model=provider, model_profile=profile)
                 run_agent = await _open_agent(args, workspace, library)

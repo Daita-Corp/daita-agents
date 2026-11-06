@@ -346,6 +346,7 @@ class PresentationController:
         base_url: str | None = None,
         context_window_tokens: int | None = None,
         max_output_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         agent = self.require_agent()
         try:
@@ -357,6 +358,7 @@ class PresentationController:
                 base_url=base_url,
                 context_window_tokens=context_window_tokens,
                 max_output_tokens=max_output_tokens,
+                reasoning_effort=reasoning_effort,
             )
         except AgentModelConfigurationError as error:
             raise UserInputError(

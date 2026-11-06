@@ -268,6 +268,7 @@ def _make_preproduction_home(home: Path, shape: str) -> None:
     ):
         raw["profile"] = _encode_model_profile(candidate.profile)
         del raw["profile_limits"]
+        del raw["reasoning_effort"]
     retry = config["model_route"]["retry_policy"]
     config["model_route"]["retry_policy"] = {
         "attempts": retry["max_attempts_per_candidate"],
@@ -483,6 +484,42 @@ async def test_populated_prior_mcp_home_preserves_binding_routine_and_receipt(
                 tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
                 == rows
             )
+    assert _journal(home / "state.db")[-1] == (
+        4,
+        REVISION_4.migration_id,
+        REVISION_4.checksum,
+    )
+
+
+async def test_revision_3_model_configuration_gains_the_provider_default_effort(
+    tmp_path: Path,
+) -> None:
+    home, _ = await _create_rich_home(tmp_path)
+    config_path = home / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    for candidate in config["model_route"]["candidates"]:
+        del candidate["reasoning_effort"]
+    config_path.write_text(
+        json.dumps(config, separators=(",", ":"), sort_keys=True), encoding="utf-8"
+    )
+    with sqlite3.connect(home / "state.db") as connection:
+        undo_revision_4_schema(connection)
+        connection.execute("DELETE FROM agent_home_migrations WHERE revision = 4")
+    connection.close()
+
+    reopened = await Agent.open(
+        "atlas", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        route = reopened.model_route
+        assert route is not None
+        assert [item.reasoning_effort for item in route.candidates] == [None]
+    finally:
+        await reopened.close()
+    upgraded = json.loads(config_path.read_text(encoding="utf-8"))
+    for candidate in upgraded["model_route"]["candidates"]:
+        assert candidate.pop("reasoning_effort") is None
+    assert upgraded == config
     assert _journal(home / "state.db")[-1] == (
         4,
         REVISION_4.migration_id,

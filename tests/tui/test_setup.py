@@ -779,10 +779,20 @@ async def test_model_setup_provider_and_model_pickers_do_not_block_each_other():
         assert await pilot.click(model_options, offset=(2, 0)) is True
 
         await asyncio.wait_for(pilot.pause(), timeout=5)
+        effort_picker = app.screen
+        assert isinstance(effort_picker, SelectionScreen)
+        await pilot.press(*"xhigh")
+        await asyncio.wait_for(pilot.pause(), timeout=5)
+        effort_options = effort_picker.query_one("#picker-options", OptionList)
+        assert effort_options.option_count == 1
+        assert await pilot.click(effort_options, offset=(2, 0)) is True
+
+        await asyncio.wait_for(pilot.pause(), timeout=5)
         assert app.screen is setup
         assert isinstance(setup, ModelSetupScreen)
         assert setup._provider == "openai"
         assert setup._model == "gpt-6-astra"
+        assert setup._reasoning_effort == "xhigh"
         assert setup.query_one("#model-id", Input).value == "gpt-6-astra"
         assert "OpenAI API" in str(setup.query_one("#choose-provider", Button).label)
         assert setup.query_one("#model-provider-id", Input).display is False
