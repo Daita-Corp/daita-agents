@@ -22,6 +22,7 @@ from tests.support.conversations import (
     ToolDefinition,
     ToolResultBlock,
     _analytical_conversation_record,
+    _carries_messages,
     _conversation_record,
     _neutral_message,
     _prepared_request,
@@ -318,7 +319,7 @@ async def test_discovery_pressure_preserves_newest_continuity_and_tool_exchange(
     request = await _prepared_request(builder, run, (*prior, *current), tools, step=2)
     assert "history user 7" in repr(request.messages)
     assert answer in repr(request.messages)
-    assert request.messages[-3:] == current
+    assert _carries_messages(request, current)
     assert _estimate_input_tokens(request) <= profile.maximum_input_tokens
 
 
@@ -416,4 +417,4 @@ async def test_dataset_hint_cannot_invent_capture_contract_or_elide_results():
     system = request.messages[0].content[0]
     assert isinstance(system, TextBlock)
     assert "tools.capture(" not in system.text
-    assert request.messages[-len(messages) :] == messages
+    assert _carries_messages(request, messages)

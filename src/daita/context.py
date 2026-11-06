@@ -41,7 +41,6 @@ from .domains.data.controller import (
     DATA_QUERY_EVIDENCE_KIND,
     FILE_SEARCH_CAPABILITY_ID,
     PATH_QUERY_CAPABILITY_ID,
-    PATH_QUERY_OUTPUT_KIND,
     RELATIONAL_WRITE_CAPABILITY_ID,
     RELATIONAL_WRITE_EVIDENCE_KIND,
     RELATIONAL_WRITE_PREVIEW_EVIDENCE_KIND,
@@ -252,6 +251,9 @@ class RunContextSnapshot:
     # Source display names and resource native names by ID for this run's
     # frozen scope; every rendered tool result shows these instead of IDs.
     scope_names: Mapping[str, str] = field(default_factory=dict)
+    # Run-start time, effect state and question-specific procedures. Rendered
+    # after the question on the start message only, so the system text stays identical across runs.
+    start_context: str = ""
 
     def __post_init__(self) -> None:
         if self.local_file_context is not None and not isinstance(
@@ -712,6 +714,28 @@ class AgentContextBuilder:
                 one_time_grants=session_options.one_time_artifact_destinations,
             )
         )
+        start_context = "\n\n".join(
+            item
+            for item in (
+                effect_context,
+                _question_guidance(
+                    capability_ids,
+                    artifact_destinations,
+                    tool_context.capability_ids,
+                    current_start,
+                    local_file_context=local_file_context,
+                    arrow_export_callable=_arrow_export_admitted(
+                        tuple(
+                            entry
+                            for entry in tool_context.entries
+                            if entry.load_mode is ToolLoadMode.PINNED
+                        )
+                    ),
+                    arrow_export_candidate=_arrow_export_admitted(tool_context.entries),
+                ),
+            )
+            if item
+        )
         directory = _connector_directory(
             (
                 await self._catalog.source_directory(
@@ -772,7 +796,7 @@ class AgentContextBuilder:
                 skill_index=skill_index,
                 semantic_views=semantic_views,
                 explicit_learning=explicit_learning,
-                effect_context=effect_context,
+                start_context=start_context,
                 scope_names=scope_names,
                 artifact_destinations=artifact_destinations,
                 local_file_context=local_file_context,
@@ -813,7 +837,7 @@ class AgentContextBuilder:
                 skill_index=skill_index,
                 semantic_text=semantic_text,
                 explicit_learning=explicit_learning,
-                effect_context=effect_context,
+                start_context=start_context,
                 scope_names=scope_names,
                 artifact_destinations=artifact_destinations,
                 local_file_context=local_file_context,
@@ -855,7 +879,7 @@ class AgentContextBuilder:
                 skill_index=skill_index,
                 semantic_text=semantic_text,
                 explicit_learning=explicit_learning,
-                effect_context=effect_context,
+                start_context=start_context,
                 scope_names=scope_names,
                 artifact_destinations=artifact_destinations,
                 local_file_context=local_file_context,
@@ -892,7 +916,7 @@ class AgentContextBuilder:
             skill_index=skill_index,
             semantic_text=semantic_text,
             explicit_learning=explicit_learning,
-            effect_context=effect_context,
+            start_context=start_context,
             scope_names=scope_names,
             artifact_destinations=artifact_destinations,
             local_file_context=local_file_context,
@@ -913,7 +937,6 @@ class AgentContextBuilder:
             skill_index=skill_index,
             semantic_text=semantic_text,
             explicit_learning=explicit_learning,
-            effect_context=effect_context,
             scope_names=scope_names,
         )
         static_messages = (
@@ -931,6 +954,7 @@ class AgentContextBuilder:
             "tool_catalog_digest": tool_context.catalog_digest,
             "toolbox_manifest": manifest_payload,
             "messages": [_neutral_message(item) for item in static_messages],
+            "start_context": start_context,
             "artifact_destinations": [
                 artifact_destination_to_mapping(item) for item in artifact_destinations
             ],
@@ -955,6 +979,7 @@ class AgentContextBuilder:
             artifact_destinations=artifact_destinations,
             local_file_context=local_file_context,
             scope_names=scope_names,
+            start_context=start_context,
         )
 
     def project(
@@ -1062,7 +1087,6 @@ class AgentContextBuilder:
                 for capability in entry.capabilities
             ),
             local_file_context=snapshot.local_file_context,
-            messages=messages,
             arrow_export_callable=_arrow_export_admitted(tool_context.callable_entries),
             arrow_export_candidate=_arrow_export_admitted(tool_context.catalog_entries),
             external_actions_callable=any(
@@ -1105,7 +1129,12 @@ class AgentContextBuilder:
             }
         )
         request = ModelRequest(
-            messages=(*static_messages, *messages, *step_status),
+            messages=(
+                *static_messages,
+                _with_start_context(messages[0], snapshot.start_context),
+                *messages[1:],
+                *step_status,
+            ),
             tools=tools,
             sensitivity=sensitivity,
             sensitivity_provenance=provenance,
@@ -1136,7 +1165,7 @@ class AgentContextBuilder:
         skill_index: str | None,
         semantic_views: tuple[SemanticAnnotationView, ...],
         explicit_learning: bool,
-        effect_context: str,
+        start_context: str,
         scope_names: Mapping[str, str],
         artifact_destinations: tuple[ArtifactDestination, ...],
         local_file_context: FrozenJsonObject | None,
@@ -1161,7 +1190,7 @@ class AgentContextBuilder:
                 skill_index=skill_index,
                 semantic_text=semantics,
                 explicit_learning=explicit_learning,
-                effect_context=effect_context,
+                start_context=start_context,
                 scope_names=scope_names,
                 artifact_destinations=artifact_destinations,
                 local_file_context=local_file_context,
@@ -1178,7 +1207,8 @@ class AgentContextBuilder:
                     built.messages[0],
                     _history_omission_message(),
                     *history,
-                    *current_messages,
+                    # The start message carries the start context.
+                    built.messages[-1],
                 ),
             )
 
@@ -1267,7 +1297,9 @@ def _connector_directory(
                 "type": source.get("type"),
                 "dialect": source.get("dialect"),
                 "schemas": source.get("schemas", ()),
-                "approximate_objects": source.get("approximate_objects"),
+                "approximate_objects": _two_significant(
+                    source.get("approximate_objects")
+                ),
                 **(
                     {"catalog_partial": source["catalog_partial"]}
                     if "catalog_partial" in source
@@ -2147,6 +2179,49 @@ def _split_working_messages(
     )
 
 
+def _two_significant(count: object) -> object:
+    # A count that drifts by a few objects must not change the cached prefix.
+    if type(count) is not int or count < 100:
+        return count
+    step = 10 ** (len(str(count)) - 2)
+    return round(count / step) * step
+
+
+def _with_start_context(
+    message: CanonicalMessage, start_context: str
+) -> CanonicalMessage:
+    if not start_context:
+        return message
+    return replace(message, content=(*message.content, TextBlock(start_context)))
+
+
+def _question_guidance(
+    capability_ids: frozenset[str],
+    artifact_destinations: tuple[ArtifactDestination, ...],
+    candidate_ids: frozenset[str],
+    start: CanonicalMessage,
+    *,
+    local_file_context: FrozenJsonObject | None,
+    arrow_export_callable: bool,
+    arrow_export_candidate: bool,
+) -> str:
+    """Procedures that exist only because of this run's question."""
+
+    def guidance(messages: tuple[CanonicalMessage, ...]) -> list[str]:
+        return _tool_guidance(
+            capability_ids,
+            artifact_destinations,
+            candidate_ids,
+            local_file_context=local_file_context,
+            arrow_export_callable=arrow_export_callable,
+            arrow_export_candidate=arrow_export_candidate,
+            messages=messages,
+        ).split("\n\n")
+
+    static = guidance(())
+    return "\n\n".join(item for item in guidance((start,)) if item not in static)
+
+
 def _request(
     directory: dict[str, object],
     messages: tuple[CanonicalMessage, ...],
@@ -2161,7 +2236,7 @@ def _request(
     skill_index: str | None,
     semantic_text: str,
     explicit_learning: bool,
-    effect_context: str,
+    start_context: str,
     scope_names: Mapping[str, str],
     artifact_destinations: tuple[ArtifactDestination, ...],
     local_file_context: FrozenJsonObject | None,
@@ -2183,7 +2258,6 @@ def _request(
                     skill_index=skill_index,
                     semantic_text=semantic_text,
                     explicit_learning=explicit_learning,
-                    effect_context=effect_context,
                     scope_names=scope_names,
                 )
             ),
@@ -2194,7 +2268,6 @@ def _request(
         artifact_destinations,
         candidate_ids,
         local_file_context=local_file_context,
-        messages=messages,
     )
     if guidance:
         system = CanonicalMessage(
@@ -2214,7 +2287,12 @@ def _request(
         else ()
     )
     return ModelRequest(
-        messages=(system, *omission, *messages),
+        messages=(
+            system,
+            *omission,
+            *messages[:-1],
+            _with_start_context(messages[-1], start_context),
+        ),
         tools=tools,
         sensitivity=sensitivity,
         sensitivity_provenance={
@@ -2241,12 +2319,10 @@ def _system_prompt(
     skill_index: str | None,
     semantic_text: str,
     explicit_learning: bool = False,
-    effect_context: str = "",
     scope_names: Mapping[str, str] | None = None,
 ) -> str:
     instructions = [
         "You are Daita, a data agent.",
-        *([effect_context] if effect_context else []),
         (
             "Successful completion requires a bounded, non-empty final assistant "
             "response with no tool calls. After required work or tools, report the "
@@ -2570,39 +2646,7 @@ def _tool_guidance(
             "no authority or exemption from validation. Apply specialized procedures only "
             "to the corresponding requested work; they require no unrelated reads or outputs."
         )
-        # Select fixed procedures from current-task hints and successful typed
-        # result metadata only. Never interpolate untrusted contents into guidance
-        # or let previous conversation tasks impose a checklist on this task.
-        results = tuple(
-            block
-            for message in current
-            if message.role is MessageRole.TOOL
-            for block in message.content
-            if isinstance(block, ToolResultBlock) and not block.is_error
-        )
-        query_results = tuple(
-            block
-            for block in results
-            if (block.capability_id, block.output.get("kind"))
-            in {
-                ("data.query", DATA_QUERY_EVIDENCE_KIND),
-                (PATH_QUERY_CAPABILITY_ID, PATH_QUERY_OUTPUT_KIND),
-            }
-        )
-        dataset_requested = (
-            re.search(
-                r"\b(datasets?|statistics|statistical|percentiles?|medians?|averages?|aggregates?|complete query|(?:all|every) rows?)\b",
-                query,
-            )
-            is not None
-            or capture_requested
-            or any(
-                isinstance(data := block.output.get("data"), Mapping)
-                and (data.get("truncated") is True or data.get("complete") is False)
-                for block in query_results
-            )
-        )
-        if dataset_requested and DATA_EXPORT_TABULAR_CAPABILITY_ID in candidates:
+        if DATA_EXPORT_TABULAR_CAPABILITY_ID in candidates:
             instructions.append(
                 "Python datasets: use a complete exact query export before dataset-wide statistics when existing authenticated inputs are insufficient. Query predicates and explicit limits define its coverage; preview rows are bounded evidence. Preserve projected aliases, types, order and duplicates; validate and calculate together."
             )
@@ -2614,36 +2658,13 @@ def _tool_guidance(
                 instructions.append(
                     "The exact Arrow export is discoverable but not loaded. Use toolbox_load with data_query and python_execute together before capture; known names need no search. Loading grants no source authority."
                 )
-        csv_result = any(
-            isinstance(data := block.output.get("data"), Mapping)
-            and (
-                (
-                    block.capability_id == TEXT_READ_CAPABILITY_ID
-                    and block.output.get("kind") == TEXT_READ_EVIDENCE_KIND
-                    and str(data.get("path", "")).lower().endswith(".csv")
-                )
-                or (block in query_results and data.get("format") == "csv")
-            )
-            for block in results
+        instructions.append(
+            "Python CSV: parse actual headers from the admitted content (csv or pandas), "
+            "validate required fields and explicit types before computing, preferably "
+            "in the same cell. Reuse a sufficient captured read; avoid a separate "
+            "inspection-only cell. Clarify ambiguous field mappings."
         )
-        if re.search(r"\bcsv\b", query) or csv_result:
-            instructions.append(
-                "Python CSV: parse actual headers from the admitted content (csv or pandas), "
-                "validate required fields and explicit types before computing, preferably "
-                "in the same cell. Reuse a sufficient captured read; avoid a separate "
-                "inspection-only cell. Clarify ambiguous field mappings."
-            )
-        database = any(
-            block.capability_id == "data.query" for block in query_results
-        ) or (
-            "data.query" in candidates
-            and re.search(
-                r"\b(databases?|sql|sqlite|postgres(?:ql)?|schemas?|joins?|relationships?)\b",
-                query,
-            )
-            is not None
-        )
-        if database:
+        if "data.query" in candidates:
             instructions.append(
                 "Python database: reuse sufficient current catalog evidence for schemas "
                 "and relationships; obtain only missing structure before a query. Matching "
@@ -2657,14 +2678,7 @@ def _tool_guidance(
                     "missing database schemas and resolved relationship paths",
                 )
             )
-        if (
-            query_results
-            or database
-            or (
-                candidates & {"data.query", PATH_QUERY_CAPABILITY_ID}
-                and re.search(r"\bquer(?:y|ies)\b", query)
-            )
-        ):
+        if candidates & {"data.query", PATH_QUERY_CAPABILITY_ID}:
             instructions.append(
                 "Python query results: build computations from the returned columns and "
                 "rows, including aliases and projections; base-table fields may be absent. "
@@ -2672,16 +2686,12 @@ def _tool_guidance(
                 "coverage. Reuse sufficient results unless the task requires a fresh "
                 "programmatic read."
             )
-        if re.search(
-            r"\b(charts?|charting|plots?|plotting|histograms?|scatter|matplotlib|visuali[sz]ations?)\b",
-            query,
-        ):
-            instructions.append(
-                "Python charts: use installed Matplotlib "
-                "with retained data; save a supported PNG inside scratch, register it with "
-                "outputs.add and explicitly select save_output for artifact publication. "
-                "Reuse an existing candidate when only saving is needed."
-            )
+        instructions.append(
+            "Python charts: use installed Matplotlib "
+            "with retained data; save a supported PNG inside scratch, register it with "
+            "outputs.add and explicitly select save_output for artifact publication. "
+            "Reuse an existing candidate when only saving is needed."
+        )
     discoverable_native = (
         ["data_write"]
         if RELATIONAL_WRITE_CAPABILITY_ID in candidates

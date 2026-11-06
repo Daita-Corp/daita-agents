@@ -24,7 +24,7 @@ from daita.llm.providers.openai import OpenAIResponsesProvider
 
 
 @asynccontextmanager
-async def provider_at(kind, transport, *, max_output=2048):
+async def provider_at(kind, transport, *, max_output=2048, model="fixture-model"):
     client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
     sdk: Any
     provider: OpenAIResponsesProvider | AnthropicMessagesProvider | GeminiProvider
@@ -39,7 +39,7 @@ async def provider_at(kind, transport, *, max_output=2048):
     elif kind == "anthropic":
         sdk = anthropic.AsyncAnthropic(api_key="offline", http_client=client)
         provider = AnthropicMessagesProvider(
-            "fixture-model", client=cast(Any, sdk), max_tokens=max_output
+            model, client=cast(Any, sdk), max_tokens=max_output
         )
     else:
         sdk = genai.Client(

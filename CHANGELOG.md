@@ -305,6 +305,34 @@ the limits and continues it. This replaces the task-graph job system.
   receipts keep their job, graph attention notices are dropped, and the graph
   tables are removed.
 
+### Anthropic prompt caching
+
+Repeated steps and repeated questions on Anthropic models now reuse the provider's
+prompt cache, which lowers cost and latency. Each request's prefix (tools, system
+text, then messages) is identical across the steps of a run and across runs of one
+agent, except the current run's first user turn.
+
+- **Start context moves to the question.** The run-start time, the unresolved-effect
+  notice and question-specific procedures (SQL dates, Python requested reads, export
+  requests) are computed once per run and shown as a block after the question on the start
+  message, in the request only. The transcript and stored message are unchanged.
+- **Python guidance is steady.** It shows whenever `python_execute` is callable, not
+  chosen from the question's words or earlier results.
+- **Rounded object count.** The source directory's approximate object count is
+  rounded to two significant figures.
+- **Provider cache.** The Anthropic adapter marks the system block and the
+  conversation tail for caching, whatever the model profile's
+  `supports_prompt_caching` says. OpenAI and Gemini are unchanged.
+- **A tool load no longer fails the run.** On the preserved-thinking Claude models
+  (claude-fable-5-1, claude-mythos-5-1, claude-opus-5-5, claude-sonnet-5-5,
+  claude-haiku-5-5) the adapter asks the provider to drop a thinking block that no longer
+  matches the longer tool list, so every account loses one step's reasoning instead of
+  newer accounts failing the run with a 400.
+- **Limits.** `toolbox_load` changes the system text and rewrites the cache. Once
+  history is full, the sliding window drops the oldest turn and shifts the cached
+  history. Changes to memory, the user profile, the skill index or the directory also
+  change the system text.
+
 ### Smoother interactive tools
 
 Tools no longer make the model copy back values Daita already holds, and a call
