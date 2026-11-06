@@ -626,13 +626,31 @@ def test_run_without_model_opens_the_persisted_route_without_injection():
     agent.close.assert_awaited_once()
 
 
-def test_run_override_options_require_an_explicit_invocation_local_model():
-    arguments = cli.build_parser().parse_args(
-        ["run", "runner", "question", "--base-url", "https://models.invalid"]
-    )
+@pytest.mark.parametrize(
+    "override",
+    (("--base-url", "https://models.invalid"), ("--reasoning-effort", "high")),
+)
+def test_run_override_options_require_an_explicit_invocation_local_model(override):
+    arguments = cli.build_parser().parse_args(["run", "runner", "question", *override])
 
     with pytest.raises(ValueError, match="require --model"):
         asyncio.run(cli._execute(arguments))
+
+
+def test_direct_cli_pins_the_reasoning_effort_on_its_provider():
+    provider, _profile = cli._model_configuration(
+        "anthropic:claude-opus-5-5", reasoning_effort="max"
+    )
+    from daita.llm.models import CanonicalMessage, MessageRole, ModelRequest, TextBlock
+
+    arguments = provider._request_arguments(  # type: ignore[attr-defined]
+        ModelRequest(
+            messages=(
+                CanonicalMessage(role=MessageRole.USER, content=(TextBlock("Hi."),)),
+            )
+        )
+    )
+    assert arguments["output_config"] == {"effort": "max"}
 
 
 def test_run_without_model_reports_missing_persisted_configuration():
@@ -756,6 +774,7 @@ def test_future_cli_1_parser_adds_only_explicit_run_continuation_flags():
                 "--base-url",
                 "--context-window",
                 "--max-output",
+                "--reasoning-effort",
                 "--conversation-id",
                 "--max-cost-usd",
                 "--events-jsonl",

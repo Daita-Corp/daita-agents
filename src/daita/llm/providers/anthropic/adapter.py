@@ -131,9 +131,14 @@ class AnthropicMessagesProvider:
         id_factory: Callable[[str], str] | None = None,
         pricing_schedules: Iterable[PricingSchedule] | None = None,
         clock: Callable[[], datetime] = _utc_now,
+        reasoning_effort: str | None = None,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a non-empty string")
+        if reasoning_effort is not None and (
+            not isinstance(reasoning_effort, str) or not reasoning_effort
+        ):
+            raise ValueError("reasoning_effort must be non-empty text when provided")
         if (
             not isinstance(max_tokens, int)
             or isinstance(max_tokens, bool)
@@ -150,6 +155,7 @@ class AnthropicMessagesProvider:
             raise TypeError("clock must be callable")
         self.model = model.strip()
         self.max_tokens = max_tokens
+        self._reasoning_effort = reasoning_effort
         self._api_key = api_key
         self._client = client
         self._owns_client = client is None
@@ -489,15 +495,18 @@ class AnthropicMessagesProvider:
                 }
                 for tool in request.tools
             ]
+        output_config: dict[str, object] = {}
+        if self._reasoning_effort is not None:
+            output_config["effort"] = self._reasoning_effort
         if request.response_schema is not None:
-            arguments["output_config"] = {
-                "format": {
-                    "type": "json_schema",
-                    "schema": FrozenJsonObject.from_mapping(
-                        request.response_schema
-                    ).to_dict(),
-                }
+            output_config["format"] = {
+                "type": "json_schema",
+                "schema": FrozenJsonObject.from_mapping(
+                    request.response_schema
+                ).to_dict(),
             }
+        if output_config:
+            arguments["output_config"] = output_config
         return arguments
 
     async def _admit_request(

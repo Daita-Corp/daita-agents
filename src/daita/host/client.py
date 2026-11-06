@@ -533,6 +533,7 @@ class RemoteAgent:
         base_url: str | None = None,
         context_window_tokens: int | None = None,
         max_output_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> ModelRoute:
         route = await self._call("configure_model", locals())
         await self._refresh()

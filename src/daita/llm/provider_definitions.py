@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 
@@ -51,6 +51,7 @@ class ProviderConstruction:
     credential_updater: Callable[[str], Awaitable[None]] | None
     base_url: str | None
     max_output_tokens: int
+    reasoning_effort: str | None = None
 
 
 ProviderConstructor = Callable[[ProviderConstruction], ManagedModelProvider]
@@ -74,6 +75,17 @@ class ProviderDefinition:
     subscription_login_command: str | None = None
     tool_schema_keywords: frozenset[str] = _PORTABLE_TOOL_KEYWORDS
     tool_schema_nullable_types: bool = False
+    # Provider-native reasoning levels a route may pin; empty means none.
+    reasoning_efforts: tuple[str, ...] = ()
+    # Reviewed models whose accepted levels differ from the provider's list.
+    model_reasoning_efforts: Mapping[str, tuple[str, ...]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def reasoning_efforts_for(self, model: str | None) -> tuple[str, ...]:
+        if model is None:
+            return self.reasoning_efforts
+        return self.model_reasoning_efforts.get(model, self.reasoning_efforts)
 
     @property
     def requires_saved_credential(self) -> bool:
@@ -102,6 +114,14 @@ class ProviderDefinition:
                 raise ValueError(
                     f"{self.id} uses the official client's subscription login"
                 )
+        if (
+            values.reasoning_effort is not None
+            and values.reasoning_effort not in self.reasoning_efforts_for(values.model)
+        ):
+            raise ValueError(
+                f"{self.id} does not accept reasoning effort "
+                f"{values.reasoning_effort!r}"
+            )
         base_url = values.base_url
         if base_url is None:
             base_url = self.default_endpoint
@@ -113,6 +133,7 @@ class ProviderDefinition:
                 credential_updater=values.credential_updater,
                 base_url=base_url,
                 max_output_tokens=values.max_output_tokens,
+                reasoning_effort=values.reasoning_effort,
             )
         )
 
@@ -136,6 +157,7 @@ def _openai(values: ProviderConstruction) -> ManagedModelProvider:
         values.model,
         api_key=values.api_key,
         max_output_tokens=values.max_output_tokens,
+        reasoning_effort=values.reasoning_effort,
     )
 
 
@@ -146,6 +168,7 @@ def _anthropic(values: ProviderConstruction) -> ManagedModelProvider:
         values.model,
         api_key=values.api_key,
         max_tokens=values.max_output_tokens,
+        reasoning_effort=values.reasoning_effort,
     )
 
 
@@ -156,6 +179,7 @@ def _gemini(values: ProviderConstruction) -> ManagedModelProvider:
         values.model,
         api_key=values.api_key,
         max_output_tokens=values.max_output_tokens,
+        reasoning_effort=values.reasoning_effort,
     )
 
 
@@ -225,6 +249,12 @@ PROVIDER_DEFINITIONS = (
         False,
         tool_schema_keywords=PROJECTED_SCHEMA_KEYWORDS,
         tool_schema_nullable_types=True,
+        # Levels the Responses API names as supported for each reviewed model,
+        # checked live on 2026-11-05; none accepts "minimal".
+        reasoning_efforts=("none", "low", "medium", "high", "xhigh", "max"),
+        model_reasoning_efforts=MappingProxyType(
+            {"gpt-6-astra": ("low", "medium", "high", "xhigh", "max")}
+        ),
     ),
     ProviderDefinition(
         "anthropic",
@@ -239,6 +269,9 @@ PROVIDER_DEFINITIONS = (
         False,
         tool_schema_keywords=PROJECTED_SCHEMA_KEYWORDS,
         tool_schema_nullable_types=True,
+        reasoning_efforts=("low", "medium", "high", "xhigh", "max"),
+        # Checked live on 2026-11-05: Haiku 4.5 rejects the effort parameter.
+        model_reasoning_efforts=MappingProxyType({"claude-haiku-4-5-20251001": ()}),
     ),
     ProviderDefinition(
         "gemini",
@@ -251,6 +284,7 @@ PROVIDER_DEFINITIONS = (
         False,
         True,
         False,
+        reasoning_efforts=("minimal", "low", "medium", "high"),
     ),
     ProviderDefinition(
         "grok",
@@ -408,6 +442,13 @@ def provider_definition(provider_id: str) -> ProviderDefinition | None:
     return _BY_ID.get(provider_id)
 
 
+def reasoning_efforts(provider_name: str, model: str | None = None) -> tuple[str, ...]:
+    """Return the reasoning levels a route may pin for one built-in model."""
+
+    definition = _BY_ID.get(provider_name)
+    return () if definition is None else definition.reasoning_efforts_for(model)
+
+
 def split_provider_model_id(model_id: str) -> tuple[str, str]:
     if not isinstance(model_id, str):
         raise TypeError("model_id must be a string")
@@ -489,6 +530,7 @@ __all__ = [
     "SUBSCRIPTION_CREDENTIAL_PROVIDER_IDS",
     "SUBSCRIPTION_PROVIDER_IDS",
     "provider_definition",
+    "reasoning_efforts",
     "split_provider_model_id",
     "supports_builtin_request_policy",
 ]

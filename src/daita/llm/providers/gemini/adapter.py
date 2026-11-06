@@ -108,9 +108,14 @@ class GeminiProvider:
         id_factory: Callable[[str], str] | None = None,
         pricing_schedules: Iterable[PricingSchedule] | None = None,
         clock: Callable[[], datetime] = _utc_now,
+        reasoning_effort: str | None = None,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise ValueError("model must be a non-empty string")
+        if reasoning_effort is not None and (
+            not isinstance(reasoning_effort, str) or not reasoning_effort
+        ):
+            raise ValueError("reasoning_effort must be non-empty text when provided")
         if api_key is not None and (
             not isinstance(api_key, str) or not api_key.strip()
         ):
@@ -128,6 +133,7 @@ class GeminiProvider:
         self.model = model.strip()
         self._api_key = api_key
         self._max_output_tokens = max_output_tokens
+        self._reasoning_effort = reasoning_effort
         self._client = client
         self._owns_client = client is None
         self._native_owner = NativeOwner()
@@ -369,6 +375,8 @@ class GeminiProvider:
             }
             if system_instruction is not None:
                 config["system_instruction"] = system_instruction
+            if self._reasoning_effort is not None:
+                config["thinking_config"] = {"thinking_level": self._reasoning_effort}
             if request.tools:
                 config["tools"] = [
                     {

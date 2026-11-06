@@ -16,6 +16,7 @@ from ...llm.provider_definitions import (
     AuthenticationMode,
     EndpointMode,
     provider_definition,
+    reasoning_efforts,
 )
 from ..commands import parse_postgresql_connection_url
 from ..models import (
@@ -84,6 +85,7 @@ class ModelSetupScreen(Screen[bool]):
         self._initial_help = initial_help or "Choose a provider, then a model."
         self._provider: str | None = None
         self._model: str | None = None
+        self._reasoning_effort: str | None = None
         self._subscription_prompt: tuple[str, str] | None = None
         self._busy = False
 
@@ -225,6 +227,7 @@ class ModelSetupScreen(Screen[bool]):
                 base_url=base_url,
                 context_window_tokens=context,
                 max_output_tokens=output,
+                reasoning_effort=self._reasoning_effort,
             )
         except Exception as error:
             self.query_one("#model-help", Static).update(
@@ -322,6 +325,7 @@ class ModelSetupScreen(Screen[bool]):
             self.query_one("#model-output", Input).clear()
         self._provider = provider
         self._model = model
+        self._reasoning_effort = None
         self.query_one("#model-id", Input).value = model or ""
         self.query_one("#onboard-error", Label).update("")
         self._refresh_provider_fields()
@@ -395,9 +399,27 @@ class ModelSetupScreen(Screen[bool]):
             self._apply_provider_selection(provider, model)
         else:
             self._apply_provider_selection(provider, None)
+        levels = reasoning_efforts(provider, self._model)
+        if levels:
+            effort = await self.app._await_modal(  # type: ignore[attr-defined]
+                SelectionScreen(
+                    title="Select a reasoning level",
+                    options=(
+                        PickerOption(
+                            "default", "Provider default", "The provider chooses"
+                        ),
+                        *(PickerOption(level, level) for level in levels),
+                    ),
+                )
+            )
+            if effort is not None and effort[0] in levels:
+                self._reasoning_effort = effort[0]
+        reasoning = (
+            "" if self._reasoning_effort is None else f" · {self._reasoning_effort}"
+        )
         self.query_one("#model-help", Static).update(
             sanitize_terminal_text(
-                f"{self._provider}:{self._model or 'enter a model ID'}",
+                f"{self._provider}:{self._model or 'enter a model ID'}{reasoning}",
                 maximum=240,
                 preserve_lines=False,
                 fallback="model",

@@ -135,6 +135,7 @@ async def _configure(
     base_url: str | None = None,
     context_window_tokens: int | None = 8_192,
     max_output_tokens: int | None = 1_024,
+    reasoning_effort: str | None = None,
 ) -> ModelRoute:
     agent = await Agent.open(
         "atlas",
@@ -152,6 +153,7 @@ async def _configure(
             subscription_credential=subscription_credential,
             context_window_tokens=context_window_tokens,
             max_output_tokens=max_output_tokens,
+            reasoning_effort=reasoning_effort,
         )
     finally:
         await agent.close()
@@ -172,6 +174,7 @@ async def test_model_configuration_round_trips_without_persisting_the_key(tmp_pa
         "max_output_tokens": 1024,
     }
     assert "profile" not in stored_candidate
+    assert stored_candidate["reasoning_effort"] is None
     assert route.candidates[0].secret_reference is not None
     assert route.candidates[0].secret_reference.to_uri() in persisted
 
@@ -183,6 +186,33 @@ async def test_model_configuration_round_trips_without_persisting_the_key(tmp_pa
         assert reopened.model_profile == route.model_profile
     finally:
         await reopened.close()
+
+
+async def test_reasoning_effort_survives_reopen_and_is_checked_before_saving(tmp_path):
+    await _create_unconfigured(tmp_path)
+    keychain = _FakeKeychain()
+    route = await _configure(
+        tmp_path, keychain, _provider("openai:test-model"), reasoning_effort="xhigh"
+    )
+    assert route.candidates[0].reasoning_effort == "xhigh"
+    config_path = tmp_path / "agents" / "atlas" / "config.json"
+    document = json.loads(config_path.read_text(encoding="utf-8"))
+    assert document["model_route"]["candidates"][0]["reasoning_effort"] == "xhigh"
+
+    reopened = await Agent.open(
+        "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+    )
+    try:
+        assert reopened.model_route == route
+    finally:
+        await reopened.close()
+
+    before = config_path.read_bytes()
+    with pytest.raises(ValueError, match="reasoning effort"):
+        await _configure(
+            tmp_path, keychain, _provider("openai:test-model"), reasoning_effort="ultra"
+        )
+    assert config_path.read_bytes() == before
 
 
 def _offline_validation_reply(request: httpx.Request) -> httpx.Response:

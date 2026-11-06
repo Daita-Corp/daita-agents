@@ -2264,6 +2264,7 @@ class EmbeddedAgent:
         base_url: str | None = None,
         context_window_tokens: int | None = None,
         max_output_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> ModelRoute:
         """Validate and atomically persist one non-secret model route.
 
@@ -2357,6 +2358,7 @@ class EmbeddedAgent:
                 secret_reference=reference,
                 context_window_tokens=context_window_tokens,
                 max_output_tokens=max_output_tokens,
+                reasoning_effort=reasoning_effort,
             )
             validate_mcp_model_compatibility(
                 await self._store.list_mcp_bindings(self.identity.id),

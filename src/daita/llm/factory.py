@@ -59,6 +59,7 @@ def create_llm_provider(
     credential_updater: Callable[[str], Awaitable[None]] | None = None,
     base_url: str | None = None,
     max_output_tokens: int = 1_024,
+    reasoning_effort: str | None = None,
 ) -> ManagedModelProvider:
     provider_name, model = split_provider_model_id(model_id)
     if (
@@ -74,10 +75,13 @@ def create_llm_provider(
         credential_updater=credential_updater,
         base_url=base_url,
         max_output_tokens=max_output_tokens,
+        reasoning_effort=reasoning_effort,
     )
     definition = provider_definition(provider_name)
     if definition is not None:
         return definition.construct(values)
+    if reasoning_effort is not None:
+        raise ValueError("custom providers do not accept a reasoning effort")
     if subscription_credential is not None:
         raise ValueError(
             "subscription_credential is only accepted by subscription providers"
@@ -261,6 +265,7 @@ class _LazyProvider:
                     credential_updater=credential_updater,
                     base_url=self._candidate.base_url,
                     max_output_tokens=self._candidate.profile.max_output_tokens,
+                    reasoning_effort=self._candidate.reasoning_effort,
                 )
         return self._provider
 

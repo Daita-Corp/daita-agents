@@ -1,11 +1,13 @@
 """Add foreground analytical evidence, declared catalog links and sync truncation."""
 
 import json
+import os
 import re
 import sqlite3
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ..sqlite_schema import (
     ANALYSIS_EVIDENCE_SQL,
@@ -549,6 +551,58 @@ def _convert_write_scopes(connection: sqlite3.Connection) -> None:
         )
 
 
+_REVISION_3_CANDIDATE_FIELDS = {
+    "allowed_sensitivities",
+    "base_url",
+    "profile_limits",
+    "provider_id",
+    "secret_reference",
+}
+
+
+def _default_reasoning_effort(path: Path) -> None:
+    """Give every saved route candidate the provider-default reasoning effort."""
+
+    if not path.exists():
+        return
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Historical model configuration path is invalid")
+    value = json.loads(path.read_bytes().decode("utf-8"))
+    route = value.get("model_route") if isinstance(value, dict) else None
+    candidates = route.get("candidates") if isinstance(route, dict) else None
+    if not isinstance(candidates, list):
+        raise ValueError("Historical model configuration is invalid")
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or set(candidate) != (
+            _REVISION_3_CANDIDATE_FIELDS
+        ):
+            raise ValueError("Historical model route candidate is invalid")
+        candidate["reasoning_effort"] = None
+    encoded = json.dumps(
+        value, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        try:
+            remaining = memoryview(encoded)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("model configuration write made no progress")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _apply_revision_4(home: Path, source_shape: str | None) -> None:
     if source_shape is not None:
         raise ValueError("Unknown analysis migration source")
@@ -619,6 +673,7 @@ def _apply_revision_4(home: Path, source_shape: str | None) -> None:
         _fold_sqlite_identities(connection)
         _convert_write_scopes(connection)
         connection.commit()
+    _default_reasoning_effort(home / "config.json")
 
 
 REVISION_4 = HomeMigration(
@@ -643,9 +698,11 @@ REVISION_4 = HomeMigration(
         "receipts keep their job id, graph attention notices are dropped, and the graph tables go. "
         "Stored write scopes bind to table and column names, not catalog revisions: update stays "
         "update, upsert becomes insert and update, delete is never granted, conflict keys and "
-        "identity columns go, and a scope whose table left the catalog is dropped."
+        "identity columns go, and a scope whose table left the catalog is dropped. "
+        "Each saved model route candidate gains a null reasoning effort, which keeps the "
+        "provider's default."
     ),
-    affected_paths=("state.db",),
+    affected_paths=("state.db", "config.json"),
     target_schema=SCHEMA_REVISION_4,
     apply=_apply_revision_4,
 )
