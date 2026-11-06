@@ -814,6 +814,8 @@ def _normalize_error(error: Exception) -> ModelProviderError:
         normalized = ProviderErrorCode.CONTEXT_OVERFLOW
     elif status is not None and status >= 500:
         normalized = ProviderErrorCode.PROVIDER_UNAVAILABLE
+    elif status == 402:
+        normalized = ProviderErrorCode.BILLING_ERROR
     elif status is not None and 400 <= status < 500:
         normalized = ProviderErrorCode.INVALID_REQUEST
     elif isinstance(error, ConnectionError):

@@ -6,7 +6,10 @@ from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
+import anthropic
+import httpx
 import pytest
+from google import genai
 
 import daita.hosting.embedded as embedded
 from daita import Agent, LoopLimits, MCPToolSelection
@@ -180,6 +183,111 @@ async def test_model_configuration_round_trips_without_persisting_the_key(tmp_pa
         assert reopened.model_profile == route.model_profile
     finally:
         await reopened.close()
+
+
+def _offline_validation_reply(request: httpx.Request) -> httpx.Response:
+    path = request.url.path
+    if path.endswith("/count_tokens"):
+        return httpx.Response(200, json={"input_tokens": 10})
+    if path.endswith(":countTokens"):
+        return httpx.Response(200, json={"totalTokens": 10})
+    if path.endswith("/messages"):
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg-offline",
+                "type": "message",
+                "role": "assistant",
+                "model": "offline",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu-offline",
+                        "name": "daita_validate_tool_support",
+                        "input": {},
+                    }
+                ],
+                "stop_reason": "tool_use",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+        )
+    return httpx.Response(
+        200,
+        json={
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "daita_validate_tool_support",
+                                    "args": {},
+                                }
+                            }
+                        ],
+                    },
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "model"),
+    (("anthropic", "claude-sonnet-5"), ("gemini", "gemini-3.8-flash")),
+)
+async def test_anthropic_and_gemini_routes_save_through_their_sdk_adapters(
+    tmp_path, monkeypatch, provider_name, model
+):
+    sent: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return _offline_validation_reply(request)
+
+    real_anthropic, real_gemini = anthropic.AsyncAnthropic, genai.Client
+    monkeypatch.setattr(
+        anthropic,
+        "AsyncAnthropic",
+        lambda **kwargs: real_anthropic(
+            **kwargs,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(respond)),
+        ),
+    )
+    monkeypatch.setattr(
+        genai,
+        "Client",
+        lambda **kwargs: real_gemini(
+            **kwargs,
+            http_options=genai.types.HttpOptions(
+                httpx_async_client=httpx.AsyncClient(
+                    transport=httpx.MockTransport(respond)
+                )
+            ),
+        ),
+    )
+    await _create_unconfigured(tmp_path)
+    agent = await Agent.open(
+        "atlas",
+        root=tmp_path,
+        keychain=_FakeKeychain(),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        route = await agent.configure_model(
+            provider=provider_name, model=model, api_key="offline-not-a-real-key"
+        )
+    finally:
+        await agent.close()
+
+    assert route.candidates[0].provider_id == f"{provider_name}:{model}"
+    assert any(
+        request.url.path.endswith(("/messages", ":generateContent")) for request in sent
+    )
 
 
 async def test_nondefault_call_policy_survives_reopen_and_model_replacement(tmp_path):
@@ -369,7 +477,7 @@ async def test_validation_requires_one_exact_tool_call_without_retries(tmp_path)
         "daita_validate_tool_support",
     )
     assert request.response_schema is None
-    assert request.allow_parallel_tool_calls is False
+    assert request.allow_parallel_tool_calls is None
     assert len(request.messages) == 1
     assert len(request.messages[0].content) == 1
     validation_prompt = request.messages[0].content[0]
