@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from daita.domains.data.sql.query_checks import fan_out_warnings
 
 pytestmark = pytest.mark.contract
