@@ -22,7 +22,8 @@ directory of each source's name, type, dialect, schemas and approximate object c
 (rounded to two significant figures, so small drift in a source does not change the
 prompt), the same for every question. `catalog_search` and `catalog_describe` find tables when
 the model needs them, asking the live source as well as the catalog, and show only
-what the run may read.
+what the run may read. Look-alike tables carry an advisory `status` and `evidence` in
+those results only; nothing is hidden or reordered.
 
 For a read, the model chooses the best-supported table from the evidence available
 (schema, row estimates, keys, comments, a quick query), says which it used, and

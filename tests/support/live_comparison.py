@@ -133,6 +133,78 @@ def system_summary(runs: Sequence[Mapping[str, Any]]) -> dict[str, object]:
     }
 
 
+# Traps where a catalog fact (comment, note, statistic, stale note, injected
+# instruction) can make an answer worse than having no fact at all.
+HARM_TRAPS = frozenset(
+    {
+        "look_alike_comment",
+        "look_alike_note",
+        "look_alike_stats",
+        "stale_note",
+        "injection",
+    }
+)
+
+
+def hard_record(
+    question: Mapping[str, Any],
+    expected: str,
+    trap_value: str | None,
+    text: str,
+    completed: bool,
+) -> dict[str, object]:
+    """Score a hard-tier answer and note whether it fell for the trap."""
+
+    record = answer_record(expected, text, completed)
+    return record | {
+        "trap": question["trap"],
+        "trap_value": trap_value,
+        "trap_followed": (
+            trap_value is not None
+            and record["outcome"] != "correct"
+            and answer_in_text(trap_value, last_line(text))
+        ),
+        "evidence_clear": bool(question.get("evidence_clear")),
+    }
+
+
+def hard_summary(runs: Sequence[Mapping[str, Any]]) -> dict[str, object]:
+    """Hard-tier totals; ``harm`` counts answers a catalog fact made worse."""
+
+    def tally(chosen: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+        return {
+            "correct": sum(1 for run in chosen if run["outcome"] == "correct"),
+            "runs": len(chosen),
+        }
+
+    clear = [run for run in runs if run["evidence_clear"]]
+    return {
+        "outcomes": {
+            name: sum(1 for run in runs if run["outcome"] == name) for name in OUTCOMES
+        },
+        "harm": sum(
+            1 for run in runs if run["trap_followed"] and run["trap"] in HARM_TRAPS
+        ),
+        "fan_out_followed": sum(
+            1 for run in runs if run["trap_followed"] and run["trap"] == "fan_out"
+        ),
+        "look_alike_resolved": {
+            "resolved": sum(
+                1
+                for run in clear
+                if run["outcome"] == "correct" and not run["asked_clarification"]
+            ),
+            "runs": len(clear),
+        },
+        "correction_carried": tally(
+            [run for run in runs if str(run["id"]).startswith("h10")]
+        ),
+        "follow_up_correct": tally(
+            [run for run in runs if str(run["id"]).endswith("-follow-up")]
+        ),
+    }
+
+
 async def ask_claude_code(
     executable: str,
     model: str,
@@ -143,8 +215,15 @@ async def ask_claude_code(
     max_cost: str,
     workdir: Path,
     config: Path,
+    tools: str = "Bash",
+    persist_session: bool = False,
+    resume: str | None = None,
 ) -> dict[str, Any]:
-    """Run ``claude -p`` once with Bash limited to ``allowed_tools``."""
+    """Run ``claude -p`` once with ``tools`` limited by ``allowed_tools``.
+
+    ``persist_session`` keeps the session so a later call can ``resume`` it; the
+    run record then carries its ``session_id``.
+    """
 
     env = {
         key: value
@@ -165,19 +244,20 @@ async def ask_claude_code(
         executable,
         "-p",
         prompt,
+        *(("--resume", resume) if resume else ()),
         "--output-format",
         "stream-json",
         "--verbose",
         "--model",
         model,
         "--tools",
-        "Bash",
+        tools,
         "--allowedTools",
         allowed_tools,
         "--permission-mode",
         "dontAsk",
         "--strict-mcp-config",
-        "--no-session-persistence",
+        *(() if persist_session else ("--no-session-persistence",)),
         "--max-budget-usd",
         max_cost,
         cwd=workdir,
@@ -261,6 +341,7 @@ async def ask_claude_code(
         "cache_read_tokens": int(usage.get("cache_read_input_tokens") or 0),
         "total_tokens": input_tokens + int(usage.get("output_tokens") or 0),
         "cost_usd": result.get("total_cost_usd"),
+        "session_id": result.get("session_id"),
         "exit": result.get("subtype") or f"exit {process.returncode}",
         "api_error_status": result.get("api_error_status"),
         "error": (
@@ -273,6 +354,25 @@ async def ask_claude_code(
 
 def claude_executable(executable_env: str) -> str | None:
     return os.environ.get(executable_env) or shutil.which("claude")
+
+
+def require_claude(executable_env: str) -> str:
+    executable = claude_executable(executable_env)
+    if executable is None:
+        pytest.fail(f"claude is not on PATH; set {executable_env}")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        pytest.fail(
+            "Claude Code runs with an empty config, so it needs ANTHROPIC_API_KEY"
+        )
+    return executable
+
+
+def fail_on_api_rejection(run: Mapping[str, Any]) -> None:
+    # Auth, billing and other API rejections are setup failures, not answers.
+    if run["api_error_status"] or (
+        run["error"] and "authenticate" in run["error"].lower()
+    ):
+        pytest.fail(f"Claude Code could not call the model: {run['error']}")
 
 
 async def run_claude_code(
@@ -291,13 +391,7 @@ async def run_claude_code(
 ) -> None:
     """Ask every question once; append scored runs to ``entry["questions"]``."""
 
-    executable = claude_executable(executable_env)
-    if executable is None:
-        pytest.fail(f"claude is not on PATH; set {executable_env}")
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        pytest.fail(
-            "Claude Code runs with an empty config, so it needs ANTHROPIC_API_KEY"
-        )
+    executable = require_claude(executable_env)
     for question in questions:
         workdir = root / question["id"]
         config = root / f"{question['id']}-config"
@@ -313,11 +407,8 @@ async def run_claude_code(
             workdir=workdir,
             config=config,
         )
-        # Auth, billing and other API rejections are setup failures, not answers.
-        if run["api_error_status"] or (
-            run["error"] and "authenticate" in run["error"].lower()
-        ):
-            pytest.fail(f"Claude Code could not call the model: {run['error']}")
+        fail_on_api_rejection(run)
+        run.pop("session_id")
         completed = run.pop("completed")
         text = run.pop("final_text")
         entry["questions"].append(

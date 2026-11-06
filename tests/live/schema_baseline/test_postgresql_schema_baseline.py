@@ -19,7 +19,8 @@ import sqlite3
 import subprocess
 import time
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -33,9 +34,18 @@ from daita import (
     Agent,
     AgentConfig,
     AgentEvent,
+    ApprovalDecision,
+    ApprovalRequest,
     LoopExitKind,
     LoopLimits,
     PostgreSQLReadLimits,
+    ResourceRevisionBinding,
+    SemanticAnnotation,
+    SemanticEvidence,
+    SemanticEvidenceKind,
+    SemanticFieldReference,
+    SemanticKind,
+    SemanticSubject,
 )
 from daita.evaluation import BenchmarkJudgment, measure_observer_events
 from daita.llm.models import FinishReason, ModelResponse, ToolCall
@@ -45,8 +55,13 @@ from tests.support.live_comparison import (
     ANSWER_FORMAT,
     OUTCOMES,
     answer_record,
+    ask_claude_code,
     claude_code_version,
+    fail_on_api_rejection,
+    hard_record,
+    hard_summary,
     normalize,
+    require_claude,
     run_claude_code,
     system_summary,
 )
@@ -64,12 +79,13 @@ _MAX_COST = "DAITA_SCHEMA_BASELINE_MAX_COST_USD"
 _CLAUDE = "DAITA_SCHEMA_BASELINE_CLAUDE_EXECUTABLE"
 _REPEATS = "DAITA_SCHEMA_BASELINE_REPEATS"
 _DAITA_MAX_TOKENS = "DAITA_SCHEMA_BASELINE_DAITA_MAX_TOKENS"
+_TIER = "DAITA_SCHEMA_BASELINE_TIER"
 _READER = ("daita_baseline_reader", "daita_baseline_reader_password")
 _DATABASE = "daita_schema_baseline"
 _FIXTURE = FIXTURES_ROOT / "postgres-schema-baseline"
 _CREDENTIAL = SecretReference.keychain("fixture:postgres-schema-baseline")
 _ALL_SCHEMAS = ("crm", "events", "finance", "legacy", "ops", "sales")
-# 987 base tables: under the 1,000-resource discovery limit.
+# 996 base tables: under the 1,000-resource discovery limit.
 _BOUNDED_SCHEMAS = ("crm", "events", "finance", "legacy", "sales")
 _USER_QUERY_MARKERS = frozenset({"bounded_result", "exact_tabular"})
 _MARKER = re.compile(r"/\* daita:postgresql\.([a-z_]+) \*/")
@@ -98,6 +114,11 @@ _PLAIN_TYPES = frozenset(
         "varchar",
     }
 )
+# The learning cards a person accepts after telling the agent something.
+_LEARNING_TOOLS = frozenset({"memory_set", "semantic_save", "skill_save"})
+_CLAUDE_TOOLS = "Bash,Read,Edit,Write"
+# Claude Code's Edit rules cover Write too.
+_CLAUDE_HARD_ALLOWED = "Bash(psql:*),Read(./**),Edit(./CLAUDE.md)"
 _STALE_STEPS = (
     (
         "add_partition",
@@ -249,8 +270,54 @@ class _OracleModel(MockModelProvider):
         self._cursor = 0
 
 
-def _questions() -> list[dict[str, Any]]:
-    return json.loads((_FIXTURE / "questions.json").read_text())
+def _questions(tier: str = "easy") -> list[dict[str, Any]]:
+    return [
+        item
+        for item in json.loads((_FIXTURE / "questions.json").read_text())
+        if item["tier"] == tier
+    ]
+
+
+def _notes() -> list[dict[str, Any]]:
+    return json.loads((_FIXTURE / "notes.json").read_text())
+
+
+@asynccontextmanager
+async def _fresh_database(target: _Target) -> AsyncIterator[Any]:
+    """An admin connection to a freshly seeded database, closed afterwards."""
+
+    admin = await _connect_admin(target)
+    try:
+        await _seed(admin)
+        yield admin
+    finally:
+        await admin.close()
+
+
+@dataclass(frozen=True)
+class _Expected:
+    truth: str
+    trap_value: str | None
+    follow_up_truth: str | None
+
+
+async def _expectations(admin: Any, question: Mapping[str, Any]) -> _Expected:
+    """Apply the question's DDL, then compute its answers on that state."""
+
+    for statement in question.get("before_sql", ()):
+        await admin.execute(statement)
+    truth = normalize(await admin.fetchval(question["sql"]))
+    trap_sql = question.get("trap_sql")
+    trap_value = normalize(await admin.fetchval(trap_sql)) if trap_sql else None
+    follow_up = question.get("follow_up")
+    follow_truth = (
+        normalize(await admin.fetchval(follow_up["sql"])) if follow_up else None
+    )
+    if truth == trap_value:
+        pytest.fail(f"{question['id']}: the true answer equals the trap value")
+    if follow_truth is not None and follow_truth == truth:
+        pytest.fail(f"{question['id']}: the follow-up answer equals the first answer")
+    return _Expected(truth, trap_value, follow_truth)
 
 
 async def _connect_admin(target: _Target) -> Any:
@@ -496,6 +563,7 @@ async def _measured_run(
     source_id: str,
     events: list[AgentEvent],
     trips: _RoundTrips,
+    conversation_id: str | None = None,
 ) -> tuple[Any, dict[str, object]]:
     diagnostics = agent.postgresql_read_diagnostics()
     before_trips = trips.snapshot()
@@ -503,7 +571,9 @@ async def _measured_run(
     started = time.perf_counter()
     # Daita enforces its own 300 s wall limit; this only catches a broken one.
     async with asyncio.timeout(360):
-        result = await agent.run(message, source_scope_ids=(source_id,))
+        result = await agent.run(
+            message, conversation_id=conversation_id, source_scope_ids=(source_id,)
+        )
     seconds = time.perf_counter() - started
     after = agent.postgresql_read_diagnostics()
     run_measurement = measure_observer_events(tuple(events[before_events:]))
@@ -595,6 +665,57 @@ async def _stale_scenario(
             }
         )
     return steps
+
+
+async def _hard_oracle_scenario(
+    admin: Any,
+    agent: Agent,
+    model: _OracleModel,
+    source_id: str,
+    events: list[AgentEvent],
+    trips: _RoundTrips,
+) -> list[dict[str, object]]:
+    """Answer each hard question's SQL through Daita's read path.
+
+    DDL changes the source, so the catalog is refreshed after it; the stale
+    scenario above already records the unrefreshed behavior.
+    """
+
+    runs: list[dict[str, object]] = []
+    for question in _questions("hard"):
+        expected = await _expectations(admin, question)
+        if question.get("before_sql"):
+            await agent.refresh_source(source_id)
+        asked = [
+            (question, expected.truth),
+            *(
+                [
+                    (
+                        {
+                            "id": f"{question['id']}-follow-up",
+                            "category": question["category"],
+                            "question": question["follow_up"]["message"],
+                            "sql": question["follow_up"]["sql"],
+                        },
+                        expected.follow_up_truth,
+                    )
+                ]
+                if "follow_up" in question
+                else []
+            ),
+        ]
+        for item, truth in asked:
+            run = await _ask_oracle(
+                agent,
+                model,
+                {"resources": [], **item},
+                source_id,
+                str(truth),
+                events,
+                trips,
+            )
+            runs.append(run | {"trap": question["trap"]})
+    return runs
 
 
 def _brief(run: Mapping[str, object]) -> dict[str, object]:
@@ -742,6 +863,19 @@ def _markdown(report: Mapping[str, Any]) -> str:
                 f"{', '.join(before['refusal_codes'])} | {step['refresh']['seconds']} "
                 f"| {after['outcome']} {', '.join(after['refusal_codes'])} |"
             )
+    if report.get("hard_questions"):
+        lines += [
+            "",
+            "## Hard-tier SQL through the read path (oracle)",
+            "",
+            "| Question | Trap | Outcome | Codes |",
+            "| --- | --- | --- | --- |",
+            *(
+                f"| {run['id']} | {run['trap']} | {run['outcome']} | "
+                f"{', '.join(run['refusal_codes']) or '—'} |"
+                for run in report["hard_questions"]
+            ),
+        ]
     return "\n".join(lines) + "\n"
 
 
@@ -835,12 +969,18 @@ async def test_postgresql_schema_baseline(
                     events,
                     trips,
                 )
+                report["hard_questions"] = await _hard_oracle_scenario(
+                    admin, agent, model, source_id, events, trips
+                )
     finally:
         await admin.close()
     path = _write(report, "postgresql-schema-baseline")
     print(f"\nschema baseline written to {path}")
     assert report["attach"]["bounded"]["status"] == "attached", report["attach"]
     assert len(report["questions"]) == len(questions)
+    assert len(report["hard_questions"]) == sum(
+        1 + ("follow_up" in item) for item in _questions("hard")
+    )
 
 
 async def test_the_question_set_answers_from_the_source_with_an_empty_catalog(
@@ -993,12 +1133,7 @@ async def _run_daita(
                     events,
                     trips,
                 )
-                # A run refused before its first step (rejected key, unpriced cap)
-                # is a setup failure; budget exhaustion later is a real outcome.
-                if result.steps == 0 and result.kind is not LoopExitKind.COMPLETED:
-                    pytest.fail(f"Daita could not run: {result.reason}")
-                measured.pop("query_seconds")  # Recorded only with the pool enabled.
-                estimate = result.usage.cost_estimate
+                _require_started(result)
                 entry["questions"].append(
                     {
                         "id": question["id"],
@@ -1009,24 +1144,362 @@ async def _run_daita(
                             result.final_text or "",
                             result.kind is LoopExitKind.COMPLETED,
                         ),
-                        "input_tokens": result.usage.input_tokens,
-                        "output_tokens": result.usage.output_tokens,
-                        "cache_read_tokens": result.usage.cache_read_tokens,
-                        "cost_usd": (
-                            None
-                            if estimate.amount_usd is None
-                            or estimate.status.value != "complete"
-                            else str(estimate.amount_usd)
-                        ),
-                        "cost_status": estimate.status.value,
-                        "calls": _daita_calls(
-                            await agent.tool_evidence(result.run_id), names
-                        ),
-                        **measured,
+                        **await _daita_usage(agent, result, measured, names),
                     }
                 )
     finally:
         await provider.close()
+
+
+async def _daita_usage(
+    agent: Agent,
+    result: Any,
+    measured: dict[str, object],
+    names: Mapping[str, str],
+) -> dict[str, object]:
+    measured.pop("query_seconds")  # Recorded only with the pool enabled.
+    estimate = result.usage.cost_estimate
+    return {
+        "input_tokens": result.usage.input_tokens,
+        "output_tokens": result.usage.output_tokens,
+        "cache_read_tokens": result.usage.cache_read_tokens,
+        "cost_usd": (
+            None
+            if estimate.amount_usd is None or estimate.status.value != "complete"
+            else str(estimate.amount_usd)
+        ),
+        "cost_status": estimate.status.value,
+        "calls": _daita_calls(await agent.tool_evidence(result.run_id), names),
+        **measured,
+    }
+
+
+def _require_started(result: Any) -> None:
+    # A run refused before its first step (rejected key, unpriced cap)
+    # is a setup failure; budget exhaustion later is a real outcome.
+    if result.steps == 0 and result.kind is not LoopExitKind.COMPLETED:
+        pytest.fail(f"Daita could not run: {result.reason}")
+
+
+def _statements(notes: Sequence[Mapping[str, Any]]) -> str:
+    return " ".join(str(item["statement"]) for item in notes)
+
+
+async def _teach_notes(
+    agent: Agent,
+    source_id: str,
+    notes: Sequence[Mapping[str, Any]],
+    events: list[AgentEvent],
+    trips: _RoundTrips,
+) -> None:
+    """Tell the agent the notes in a real message, then save them as semantic
+    notes citing it, as a person accepting each learning card would."""
+
+    result, _ = await _measured_run(
+        agent,
+        "Notes about this database: " + _statements(notes),
+        source_id,
+        events,
+        trips,
+    )
+    _require_started(result)
+    resources = {
+        item.native_identity: item
+        for item in await agent.list_catalog_resources(source_id=source_id)
+    }
+    now = datetime.now(UTC)
+    for index, note in enumerate(notes):
+        resource = resources[note["table"]]
+        saved = await agent.save_semantic_annotation(
+            SemanticAnnotation(
+                id=f"baseline-note-{index}",
+                agent_id=agent.id,
+                subject=SemanticSubject(
+                    source_ids=(source_id,),
+                    resource_ids=(resource.id,),
+                    fields=tuple(
+                        SemanticFieldReference(resource.id, field)
+                        for field in note["fields"]
+                    ),
+                ),
+                kind=SemanticKind(note["kind"]),
+                statement=note["statement"],
+                evidence=(
+                    SemanticEvidence(
+                        SemanticEvidenceKind.USER_ASSERTION,
+                        result.run_id,
+                        message_position=0,
+                    ),
+                ),
+                catalog_revisions=(
+                    ResourceRevisionBinding(resource.id, resource.current_revision),
+                ),
+                created_at=now,
+                confirmed_at=now,
+            )
+        )
+        if saved is not True:
+            pytest.fail(f"could not save the note for {note['table']}")
+
+
+async def _run_daita_hard(
+    target: _Target,
+    model_id: str,
+    notes: Sequence[Mapping[str, Any]],
+    trips: _RoundTrips,
+    root: Path,
+    entry: dict[str, Any],
+    repeat: int,
+) -> None:
+    """One agent for the hard tier: notes first, then the questions in order."""
+
+    from tests.support.live_billing import live_provider
+
+    def api_key() -> str:
+        value = os.environ.get(_MODEL_KEY)
+        if not value:
+            pytest.fail(f"{_MODEL_KEY} must be set for API billing")
+        return value
+
+    profile, provider = live_provider(
+        model_id, api_key=api_key, max_output_tokens=4_096
+    )
+    events: list[AgentEvent] = []
+    approvals: list[dict[str, str]] = []
+
+    async def approve_learning(request: ApprovalRequest) -> ApprovalDecision:
+        decision = (
+            ApprovalDecision.APPROVE
+            if request.tool_name in _LEARNING_TOOLS
+            else ApprovalDecision.DENY
+        )
+        approvals.append({"tool": request.tool_name, "decision": decision.value})
+        return decision
+
+    shared: dict[str, Any] = {
+        "root": root,
+        "secret_provider": _Secrets(_READER[1]),
+        "workspace": workspace_for(root),
+        "observer": events.append,
+    }
+    name = "schema-baseline-hard"
+    try:
+        # Hard questions run DDL, so every repeat starts from a fresh seed.
+        async with _fresh_database(target) as admin:
+            scripted = MockModelProvider(
+                (ModelResponse(finish_reason=FinishReason.STOP, text="Noted."),),
+                provider_id="mock:schema-baseline-notes",
+            )
+            async with await Agent.create(
+                name,
+                model=scripted,
+                model_profile=scripted.model_profile,
+                **shared,
+            ) as teacher:
+                source_id, attach = await _attach(
+                    teacher, target, _BOUNDED_SCHEMAS, trips, username=_READER[0]
+                )
+                entry["attach"].append(attach)
+                if source_id is None:
+                    pytest.fail(f"Daita could not attach: {attach}")
+                await _teach_notes(teacher, source_id, notes, events, trips)
+            # The same home, now with the live model; only learning cards pass.
+            async with await Agent.open(
+                name,
+                model=provider,
+                model_profile=profile,
+                limits=_daita_limits(),
+                approval_handler=approve_learning,
+                **shared,
+            ) as agent:
+                names = {
+                    resource_id: table
+                    for table, resource_id in (
+                        await _resource_ids(agent, source_id)
+                    ).items()
+                }
+                for question in _questions("hard"):
+                    expected = await _expectations(admin, question)
+                    turns = _turns(question, expected)
+                    conversation_id: str | None = None
+                    for record_id, text, truth, trap_value in turns:
+                        first_approval = len(approvals)
+                        result, measured = await _measured_run(
+                            agent,
+                            text + ANSWER_FORMAT,
+                            source_id,
+                            events,
+                            trips,
+                            conversation_id,
+                        )
+                        _require_started(result)
+                        conversation_id = result.conversation_id
+                        entry["hard_questions"].append(
+                            {
+                                "id": record_id,
+                                "category": question["category"],
+                                "repeat": repeat,
+                                **hard_record(
+                                    question,
+                                    truth,
+                                    trap_value,
+                                    result.final_text or "",
+                                    result.kind is LoopExitKind.COMPLETED,
+                                ),
+                                "approvals": approvals[first_approval:],
+                                **await _daita_usage(agent, result, measured, names),
+                            }
+                        )
+    finally:
+        await provider.close()
+
+
+async def _run_claude_code_hard(
+    target: _Target,
+    model: str,
+    root: Path,
+    entry: dict[str, Any],
+    repeat: int,
+    notes: Sequence[Mapping[str, Any]],
+) -> None:
+    """One working directory and config for the hard tier, notes in CLAUDE.md."""
+
+    executable = require_claude(_CLAUDE)
+    workdir, config = root / "work", root / "config"
+    workdir.mkdir(parents=True)
+    config.mkdir()
+    memory = workdir / "CLAUDE.md"
+    memory.write_text(
+        "# Notes about this database (from earlier conversations)\n\n"
+        + "".join(f"- {item['statement']}\n" for item in notes)
+    )
+    environment = {
+        "PGHOST": target.host,
+        "PGPORT": str(target.port),
+        "PGDATABASE": _DATABASE,
+        "PGUSER": _READER[0],
+        "PGPASSWORD": _READER[1],
+        "PGSSLMODE": target.ssl_mode,
+    }
+    preamble = (
+        "A PostgreSQL database is reachable with psql; its connection settings "
+        "are already in the environment. Answer from that database: "
+    )
+
+    async def ask(prompt: str, resume: str | None) -> dict[str, Any]:
+        run = await ask_claude_code(
+            executable,
+            model,
+            prompt + ANSWER_FORMAT,
+            environment=environment,
+            allowed_tools=_CLAUDE_HARD_ALLOWED,
+            max_cost=os.environ.get(_MAX_COST, "0.50"),
+            workdir=workdir,
+            config=config,
+            tools=_CLAUDE_TOOLS,
+            persist_session=True,
+            resume=resume,
+        )
+        fail_on_api_rejection(run)
+        return run
+
+    # Hard runs reseed per system: the DDL below changes the database.
+    async with _fresh_database(target) as admin:
+        for question in _questions("hard"):
+            expected = await _expectations(admin, question)
+            session_id: str | None = None
+            for index, (record_id, text, truth, trap_value) in enumerate(
+                _turns(question, expected)
+            ):
+                before = memory.read_text()
+                run = await ask(
+                    (preamble if index == 0 else "") + text, resume=session_id
+                )
+                completed = run.pop("completed")
+                answer = run.pop("final_text")
+                session_id = run.pop("session_id")
+                entry["hard_questions"].append(
+                    {
+                        "id": record_id,
+                        "category": question["category"],
+                        "repeat": repeat,
+                        **hard_record(question, truth, trap_value, answer, completed),
+                        "claude_md_changed": memory.read_text() != before,
+                        **run,
+                    }
+                )
+
+
+def _turns(
+    question: Mapping[str, Any], expected: _Expected
+) -> list[tuple[str, str, str, str | None]]:
+    """The user turns of one hard question: (id, text, truth, trap value)."""
+
+    turns = [
+        (question["id"], question["question"], expected.truth, expected.trap_value)
+    ]
+    if "follow_up" in question:
+        turns.append(
+            (
+                f"{question['id']}-follow-up",
+                question["follow_up"]["message"],
+                str(expected.follow_up_truth),
+                expected.truth,  # Ignoring the correction.
+            )
+        )
+    return turns
+
+
+def _hard_markdown(report: Mapping[str, Any]) -> list[str]:
+    systems = report["systems"]
+    lines = [
+        "",
+        "## Hard tier",
+        "",
+        "Harm counts answers that followed a trap a catalog fact set "
+        "(look-alike comment, note or statistics, stale note, injection).",
+        "",
+        "| System | Runs | Correct | Confident-wrong | No answer | Incomplete | "
+        "Harm | Fan-out followed | Look-alikes resolved | Correction carried | "
+        "Follow-ups correct |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for name, system in systems.items():
+        summary = system["hard_summary"]
+        resolved = summary["look_alike_resolved"]
+        carried = summary["correction_carried"]
+        follow = summary["follow_up_correct"]
+        lines.append(
+            f"| {name} | {len(system['hard_questions'])} | "
+            + " | ".join(str(summary["outcomes"][item]) for item in OUTCOMES)
+            + f" | {summary['harm']} | {summary['fan_out_followed']} | "
+            f"{resolved['resolved']}/{resolved['runs']} | "
+            f"{carried['correct']}/{carried['runs']} | "
+            f"{follow['correct']}/{follow['runs']} |"
+        )
+    names = list(systems)
+    lines += [
+        "",
+        "| Question | Trap | "
+        + " | ".join(f"{name} correct | {name} followed trap" for name in names)
+        + " |",
+        "| --- | --- | " + " | ".join("---: | ---:" for _ in names) + " |",
+    ]
+    for question in report["hard_question_ids"]:
+        cells = []
+        for name in names:
+            runs = [
+                run for run in systems[name]["hard_questions"] if run["id"] == question
+            ]
+            correct = sum(1 for run in runs if run["outcome"] == "correct")
+            followed = sum(1 for run in runs if run["trap_followed"])
+            cells.append(f"{correct}/{len(runs)} | {followed}")
+        lines.append(
+            f"| {question} | {report['hard_traps'][question]} | "
+            + " | ".join(cells)
+            + " |"
+        )
+    return lines
 
 
 def _comparison_markdown(report: Mapping[str, Any]) -> str:
@@ -1038,8 +1511,9 @@ def _comparison_markdown(report: Mapping[str, Any]) -> str:
         "",
         f"Commit `{meta['commit']}` ({meta['branch']}) · PostgreSQL "
         f"{meta['server_version']} · Claude Code {report.get('claude_code_version')} · "
-        f"{meta['generated_at']} · 987 tables in scope for both, read-only role · "
-        f"{report['repeats']} repeat(s)",
+        f"{meta['generated_at']} · "
+        f"{_base_tables(meta, _BOUNDED_SCHEMAS)} tables in scope for both, "
+        f"read-only role · tier {report['tier']} · {report['repeats']} repeat(s)",
         "",
         f"Limits per question: Daita {limits['daita']['max_steps']} steps, "
         f"{limits['daita']['max_total_tokens']} tokens, "
@@ -1052,7 +1526,7 @@ def _comparison_markdown(report: Mapping[str, Any]) -> str:
         "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
         "---: | ---: |",
     ]
-    for name, system in systems.items():
+    for name, system in systems.items() if report["question_ids"] else ():
         summary = system["summary"]
         outcomes = summary["outcomes"]
         lines.append(
@@ -1085,6 +1559,8 @@ def _comparison_markdown(report: Mapping[str, Any]) -> str:
             + " | ".join(cells)
             + " |"
         )
+    if report["hard_question_ids"]:
+        lines += _hard_markdown(report)
     lines += [
         "",
         "Scoring reads the requested last line: correct when it holds the known "
@@ -1125,8 +1601,14 @@ async def test_daita_and_claude_code_answer_the_question_set(
     repeats = int(os.environ.get(_REPEATS, "1"))
     if not 1 <= repeats <= 5:
         pytest.fail(f"{_REPEATS} must be from 1 through 5")
+    tier = os.environ.get(_TIER, "easy")
+    if tier not in {"easy", "hard", "all"}:
+        pytest.fail(f"{_TIER} must be easy, hard or all")
     target, admin, trips, environment, questions, truth = await _prepare(monkeypatch)
     await admin.close()
+    questions = questions if tier in {"easy", "all"} else []
+    hard = _questions("hard") if tier in {"hard", "all"} else []
+    notes = _notes()
     limits = _daita_limits()
     report: dict[str, Any] = {
         "environment": environment,
@@ -1134,6 +1616,7 @@ async def test_daita_and_claude_code_answer_the_question_set(
             claude_code_version(_CLAUDE) if "claude_code" in systems else None
         ),
         "repeats": repeats,
+        "tier": tier,
         "limits": {
             "daita": {
                 "max_steps": limits.max_steps,
@@ -1144,21 +1627,42 @@ async def test_daita_and_claude_code_answer_the_question_set(
         },
         "question_ids": [item["id"] for item in questions],
         "categories": {item["id"]: item["category"] for item in questions},
+        "hard_question_ids": [
+            record_id
+            for item in hard
+            for record_id in (
+                item["id"],
+                *([f"{item['id']}-follow-up"] if "follow_up" in item else []),
+            )
+        ],
+        "hard_traps": {
+            record_id: item["trap"]
+            for item in hard
+            for record_id in (
+                item["id"],
+                *([f"{item['id']}-follow-up"] if "follow_up" in item else []),
+            )
+        },
         "systems": {
             name: {
                 "model": model_id if name == "daita" else model,
                 "attach": [],
                 "questions": [],
+                "hard_questions": [],
             }
             for name in systems
         },
     }
     directory = _report_directory()
-    stem = f"postgresql-schema-comparison-{environment['commit']}-{model}"
+    stem = f"postgresql-schema-comparison-{environment['commit']}-{model}-{tier}"
     try:
         # Repeats outermost so a mid-run failure leaves both systems comparable.
         for repeat in range(repeats):
-            for name in systems:
+            if repeat and hard and questions:
+                # The previous repeat's hard tier changed the database.
+                async with _fresh_database(target):
+                    pass
+            for name in systems if questions else ():
                 entry = report["systems"][name]
                 root = tmp_path / name / f"repeat-{repeat}"
                 if name == "daita":
@@ -1190,14 +1694,29 @@ async def test_daita_and_claude_code_answer_the_question_set(
                         allowed_tools="Bash(psql:*)",
                         max_cost=os.environ.get(_MAX_COST, "0.50"),
                     )
+            for name in systems if hard else ():
+                entry = report["systems"][name]
+                root = tmp_path / name / f"hard-repeat-{repeat}"
+                if name == "daita":
+                    await _run_daita_hard(
+                        target, model_id, notes, trips, root, entry, repeat
+                    )
+                else:
+                    await _run_claude_code_hard(
+                        target, model, root, entry, repeat, notes
+                    )
     finally:
         # Paid results survive a later failure.
         for entry in report["systems"].values():
             entry["summary"] = system_summary(entry["questions"])
+            entry["hard_summary"] = hard_summary(entry["hard_questions"])
+            entry["hard_usage"] = system_summary(entry["hard_questions"])
         (directory / f"{stem}.json").write_text(
             json.dumps(report, indent=2, sort_keys=True, default=str) + "\n"
         )
         (directory / f"{stem}.md").write_text(_comparison_markdown(report))
         print(f"\ncomparison written to {directory / stem}.md")
+    hard_runs = sum(1 + ("follow_up" in item) for item in hard)
     for name, system in report["systems"].items():
         assert len(system["questions"]) == len(questions) * repeats, name
+        assert len(system["hard_questions"]) == hard_runs * repeats, name

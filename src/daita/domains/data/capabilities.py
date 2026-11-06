@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+import re
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -62,11 +63,19 @@ from .source_files import (
 from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
+    SQL_READ_DIALECTS,
     CheckedRead,
     WriteFacts,
     WritePreview,
     checked_reads,
+    validate_read,
     write_facts,
+)
+from .sql.query_checks import (
+    duplicate_key_warnings,
+    empty_result_probe,
+    empty_result_warning,
+    fan_out_warnings,
 )
 
 DATA_QUERY_EXECUTOR_ID = "data.query.executor"
@@ -445,6 +454,12 @@ DATA_QUERY_MAX_ROWS = 100
 DATA_QUERY_MAX_BYTES = 16_384
 DATA_QUERY_STATEMENT_TIMEOUT_SECONDS = 5.0
 DATA_QUERY_TOTAL_TIMEOUT_SECONDS = 15.0
+# Advisory checks after a read share this budget and never delay it further.
+DATA_QUERY_ADVICE_SECONDS = 1.0
+_ADVICE_MAX_TABLES = 4
+_ADVICE_PROBE_BYTES = 2_048
+_PROBE_ROWS = 10
+_AGGREGATE_CALL = re.compile(r"\b(?:sum|avg|count)\s*\(", re.IGNORECASE)
 
 
 class DataQueryError(DaitaError):
@@ -545,6 +560,11 @@ class DataQueryExecutor:
             data["adapter_id"] = adapter_id
             data["read_at"] = results[0][2]
             data["timing"] = timing
+            advice = await self._advise(
+                backend, adapter_id, source_id, reads[0], executed[0], deadline
+            )
+            if advice:
+                data["warnings"] = list(advice)
             return ToolOutput(kind=DATA_QUERY_EVIDENCE_KIND, data=data)
         return ToolOutput(
             kind=DATA_QUERY_EVIDENCE_KIND,
@@ -557,6 +577,143 @@ class DataQueryExecutor:
                 byte_limit=self._max_bytes,
             ),
         )
+
+    async def _advise(
+        self,
+        backend: SqlReadBackend,
+        adapter_id: str,
+        source_id: str,
+        read: CheckedRead,
+        result: SqlReadResult,
+        deadline: float,
+    ) -> tuple[str, ...]:
+        """Advisory warnings for one successful read; never raises, never blocks it."""
+
+        if adapter_id not in SQL_READ_DIALECTS:
+            return ()
+        advice_deadline = min(self._clock() + DATA_QUERY_ADVICE_SECONDS, deadline)
+        warnings: list[str] = []
+        for check in (self._join_advice, self._empty_advice):
+            remaining = advice_deadline - self._clock()
+            if remaining <= 0:
+                break
+            try:
+                async with asyncio.timeout(remaining):
+                    warnings.extend(
+                        await check(
+                            backend,
+                            adapter_id,
+                            source_id,
+                            read,
+                            result,
+                            advice_deadline,
+                        )
+                    )
+            except Exception:  # noqa: BLE001 - advice must never change a read
+                continue
+        return tuple(dict.fromkeys(warnings))
+
+    async def _join_advice(
+        self,
+        backend: SqlReadBackend,
+        adapter_id: str,
+        source_id: str,
+        read: CheckedRead,
+        result: SqlReadResult,
+        deadline: float,
+    ) -> tuple[str, ...]:
+        sql = read.canonical_sql
+        rows = [row.to_dict() for row in result.projection.rows]
+        plain = len(rows) > 1 and not re.search(
+            r"\b(?:group\s+by|distinct)\b", sql, re.IGNORECASE
+        )
+        names = [name for _, name in read.resource_names]
+        describe = getattr(backend, "describe_name", None)
+        if (
+            describe is None
+            or not re.search(r"\bjoin\b", sql, re.IGNORECASE)
+            or not (_AGGREGATE_CALL.search(sql) or plain)
+            or not 1 < len(names) <= _ADVICE_MAX_TABLES
+        ):
+            return ()
+        described = await asyncio.gather(
+            *(
+                describe(agent_id=self._agent_id, source_id=source_id, name=name)
+                for name in names
+            )
+        )
+        keys: dict[str, list[list[str]]] = {}
+        for name, description in zip(names, described, strict=True):
+            if description:
+                found = [
+                    description.get("primary_key"),
+                    *description.get("unique_keys", ()),
+                ]
+                keys[name] = [list(key) for key in found if key]
+        return (
+            *fan_out_warnings(sql, adapter_id, keys),
+            *duplicate_key_warnings(sql, adapter_id, keys, result.columns, rows),
+        )
+
+    async def _empty_advice(
+        self,
+        backend: SqlReadBackend,
+        adapter_id: str,
+        source_id: str,
+        read: CheckedRead,
+        result: SqlReadResult,
+        deadline: float,
+    ) -> tuple[str, ...]:
+        rows = result.projection.rows
+        if len(rows) > 1 or (
+            rows
+            and not all(
+                value is None or (value == 0 and value is not False)
+                for value in rows[0].to_dict().values()
+            )
+        ):
+            return ()
+        probe = empty_result_probe(read.canonical_sql, adapter_id)
+        if probe is None:
+            return ()
+        kind, derived = probe
+        schemas = tuple(
+            sorted(
+                {name.split(".")[0] for _, name in read.resource_names if "." in name}
+            )
+        )
+        allowed = read.allowed_resource_ids
+        checked = validate_read(
+            derived,
+            dialect=cast(Any, adapter_id),
+            source_id=source_id,
+            allowed_resource_ids=None if allowed is None else frozenset(allowed),
+            schemas=schemas,
+        )
+        if not checked.valid or checked.analysis is None:
+            return ()
+        explained = await backend.execute_read(
+            agent_id=self._agent_id,
+            source_id=source_id,
+            read=CheckedRead(
+                canonical_sql=checked.analysis.canonical_sql,
+                sql_fingerprint=checked.analysis.sql_fingerprint,
+                function_lookups=checked.function_lookups,
+                attribute_lookups=checked.attribute_lookups,
+                written_calls=checked.written_calls,
+                unqualified_relations=checked.unqualified_relations,
+                resource_ids=checked.resource_ids,
+                resource_names=checked.resource_names,
+                allowed_resource_ids=allowed,
+            ),
+            max_rows=_PROBE_ROWS,
+            max_bytes=_ADVICE_PROBE_BYTES,
+            timeout_seconds=max(min(deadline - self._clock(), 1.0), 0.01),
+        )
+        warning = empty_result_warning(
+            kind, derived, [row.to_dict() for row in explained.projection.rows]
+        )
+        return () if warning is None else (warning,)
 
 
 class CombinedQueryEngine(Protocol):
@@ -1627,6 +1784,8 @@ def _query_output_schema() -> dict[str, object]:
         "type": "object",
         "properties": {
             **{name: {"type": kind} for name, kind in sorted(types.items())},
+            # Advisory, and present only when a check had something to say.
+            "warnings": {"type": "array", "items": {"type": "string"}},
             **_STORED_READ_RESULT_KEYS,
         },
         "required": sorted(set(types) - per_statement),

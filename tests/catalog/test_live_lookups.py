@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -30,6 +31,14 @@ from daita.llm.models import (
     model_tool_result,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.semantics import (
+    ResourceRevisionBinding,
+    SemanticAnnotation,
+    SemanticEvidence,
+    SemanticEvidenceKind,
+    SemanticKind,
+    SemanticSubject,
+)
 from tests.support.source_refresh import settled, sync_count
 from tests.support.workspace import workspace_for
 
@@ -669,5 +678,101 @@ async def test_describe_suggests_nothing_from_unreadable_sources_or_a_failing_ca
         (result,) = await _results(agent)
         assert _data(result)["answered_from"] == "live"
         assert _candidates(result) == []
+    finally:
+        await agent.close()
+
+
+def _with_archive(path: Path) -> Path:
+    with sqlite3.connect(_database(path)) as connection:
+        connection.executescript("""
+            CREATE TABLE orders_archive (
+              id INTEGER, customer_id INTEGER, status TEXT NOT NULL
+            );
+            CREATE TABLE order_items (id INTEGER, order_id INTEGER, sku TEXT);
+            """)
+    return path
+
+
+async def test_search_labels_look_alike_tables_and_hides_nothing(
+    tmp_path: Path,
+) -> None:
+    database = _with_archive(tmp_path / "shop.sqlite")
+    agent, _provider = await _agent(tmp_path, _search("order"))
+    try:
+        await agent.attach(SQLiteSource(database, name="Shop"))
+        (result,) = await _results(agent)
+        hits = _hits(result)
+        assert {"main.orders", "main.orders_archive", "main.order_items"} <= set(hits)
+        assert hits["main.orders"]["status"] == "unknown"
+        assert hits["main.orders"]["look_alikes"] == ("main.orders_archive",)
+        assert "status" not in hits["main.order_items"]
+    finally:
+        await agent.close()
+
+
+async def test_describe_names_the_look_alikes_of_one_table(tmp_path: Path) -> None:
+    database = _with_archive(tmp_path / "shop.sqlite")
+    agent, _provider = await _agent(tmp_path, _describe("orders"))
+    try:
+        await agent.attach(SQLiteSource(database, name="Shop"))
+        (result,) = await _results(agent)
+        data = _data(result)
+        assert data["status"] == "unknown"
+        (other,) = cast(Sequence[Mapping[str, object]], data["look_alikes"])
+        assert other["name"] == "main.orders_archive"
+        assert other["status"] == "unknown"
+    finally:
+        await agent.close()
+
+
+async def test_a_failing_label_lookup_leaves_describe_unlabelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = _with_archive(tmp_path / "shop.sqlite")
+    agent, _provider = await _agent(tmp_path, _describe("orders"))
+    try:
+        await agent.attach(SQLiteSource(database, name="Shop"))
+        monkeypatch.setattr(agent._embedded._data_view, "_store", _BrokenCatalogStore())
+        (result,) = await _results(agent)
+        data = _data(result)
+        assert data["answered_from"] == "live"
+        assert "status" not in data and "look_alikes" not in data
+    finally:
+        await agent.close()
+
+
+async def test_a_current_note_marks_a_look_alike_deprecated(tmp_path: Path) -> None:
+    database = _with_archive(tmp_path / "shop.sqlite")
+    agent, _provider = await _agent(tmp_path, _search("order"))
+    try:
+        source = await agent.attach(SQLiteSource(database, name="Shop"))
+        resource = next(
+            item
+            for item in await agent.list_catalog_resources(source_id=source.id)
+            if item.name == "orders_archive"
+        )
+        now = datetime(2026, 11, 6, tzinfo=UTC)
+        await agent._embedded._store.save_semantic_annotation(
+            agent.id,
+            SemanticAnnotation(
+                id="archive-note",
+                agent_id=agent.id,
+                subject=SemanticSubject((source.id,), (resource.id,)),
+                kind=SemanticKind.GLOSSARY,
+                statement="Deprecated: orders live in orders now.",
+                evidence=(
+                    SemanticEvidence(SemanticEvidenceKind.USER_ASSERTION, "run", 0),
+                ),
+                catalog_revisions=(
+                    ResourceRevisionBinding(resource.id, resource.current_revision),
+                ),
+                created_at=now,
+                confirmed_at=now,
+            ),
+        )
+        (result,) = await _results(agent)
+        hits = _hits(result)
+        assert hits["main.orders_archive"]["status"] == "deprecated"
+        assert hits["main.orders"]["status"] == "canonical"
     finally:
         await agent.close()

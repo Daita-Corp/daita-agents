@@ -114,7 +114,15 @@ SELECT m.nspname, m.relname, m.relkind, m.estimate,
          WHERE a.attrelid = m.oid AND {READABLE_COLUMN_SQL}
          ORDER BY a.attnum LIMIT 12) AS a) AS columns,
   (SELECT count(*) FROM pg_attribute AS a
-   WHERE a.attrelid = m.oid AND {READABLE_COLUMN_SQL}) AS column_count
+   WHERE a.attrelid = m.oid AND {READABLE_COLUMN_SQL}) AS column_count,
+  obj_description(m.oid, 'pg_class') AS comment,
+  (SELECT count(*) FROM pg_constraint AS fk
+   JOIN pg_class AS fk_src ON fk_src.oid = fk.conrelid
+   JOIN pg_namespace AS fk_ns ON fk_ns.oid = fk_src.relnamespace
+   WHERE fk.contype = 'f' AND fk.conparentid = 0 AND fk.confrelid = m.oid
+     AND fk_ns.nspname = ANY($1::text[])) AS inbound_foreign_keys,
+  (SELECT greatest(s.last_analyze, s.last_autoanalyze)
+   FROM pg_stat_all_tables AS s WHERE s.relid = m.oid) AS last_analyzed
 FROM matched AS m
 WHERE m.named + m.columned > 0
 ORDER BY m.exact DESC, m.named DESC, m.columned DESC, m.estimate DESC NULLS LAST,
@@ -140,12 +148,19 @@ LIMIT $3"""
 _LIVE_RELATIONSHIPS = f"""/* daita:postgresql.live_relationships */
 SELECT src_ns.nspname || '.' || src.relname, dst_ns.nspname || '.' || dst.relname,
   array_agg(src_att.attname::text ORDER BY keys.ordinality),
-  array_agg(dst_att.attname::text ORDER BY keys.ordinality)
+  array_agg(dst_att.attname::text ORDER BY keys.ordinality),
+  EXISTS (
+    SELECT 1 FROM pg_index AS ix
+    WHERE ix.indrelid = con.conrelid AND ix.indisunique
+      AND ix.indpred IS NULL AND ix.indexprs IS NULL
+      AND ix.indkey::int2[] <@ con.conkey
+  ) AS referencing_unique
 {FOREIGN_KEYS_FROM_SQL}
   AND con.conparentid = 0
   AND (con.conrelid = $1 OR con.confrelid = $1)
   AND src_ns.nspname = ANY($2::text[]) AND dst_ns.nspname = ANY($2::text[])
-GROUP BY con.oid, src_ns.nspname, src.relname, dst_ns.nspname, dst.relname
+GROUP BY con.oid, con.conrelid, con.conkey, src_ns.nspname, src.relname,
+  dst_ns.nspname, dst.relname
 {READABLE_FOREIGN_KEY_SQL}
 ORDER BY 1, 2
 LIMIT 32"""
@@ -991,6 +1006,9 @@ class PostgreSQLQueryBackend:
                     "kind": _relation_kind(row[2]),
                     "columns": column_summary(row[4], int(row[5])),
                     "row_estimate": _row_estimate(row[3]),
+                    **({"comment": row[6]} if row[6] else {}),
+                    "inbound_foreign_keys": int(row[7]),
+                    **({"last_analyzed": row[8].isoformat()} if row[8] else {}),
                 }
                 for row in rows
             )
@@ -1312,6 +1330,7 @@ async def _describe_relation(
                 "from": item[0],
                 "to": item[1],
                 "columns": [list(pair) for pair in zip(item[2], item[3], strict=True)],
+                "cardinality": "one_to_one" if item[4] else "many_to_one",
             }
             for item in foreign_keys
         ],

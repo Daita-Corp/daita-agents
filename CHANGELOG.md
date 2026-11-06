@@ -133,6 +133,28 @@ longer fail a read.
   `catalog_describe` reports `answered_from` (live or cache).
 - **SQLite resource IDs fold case.** `Orders` and `orders` are one table, as SQLite
   treats them.
+- **Look-alike tables get an advisory label.** When `catalog_search` or
+  `catalog_describe` shows tables in one source with similar names and overlapping
+  columns, each carries a `status` (`canonical`, `likely_stale`, `deprecated` or
+  `unknown`), short `evidence` (row estimates, inbound foreign keys, a comment or
+  current note that says deprecated; the last analyze is shown but never decisive) and
+  its `look_alikes`. Nothing is hidden or reordered, and labels appear only in tool
+  results, never in the prompt. PostgreSQL facts are read live, so tables past a
+  truncated catalog get them too. `catalog_describe` makes one extra name search for
+  this; if it fails the answer is unchanged.
+- **Relationships carry `cardinality`.** For live PostgreSQL foreign keys,
+  `catalog_describe` marks each `one_to_one` or `many_to_one` from the unique indexes.
+- **`data_query` warns about wrong-looking results.** A single-statement read may return
+  advisory `warnings`: a fan-out (`SUM`, `AVG` or `COUNT(col)` over a one-to-many join,
+  at most 4), duplicate primary-key values in a joined, non-aggregated result, and, for
+  an empty result, what the filtered column actually holds (min and max of a range
+  filter, or up to 10 distinct values of an equality filter) from one bounded probe
+  through the normal read policy. Checks run only when triggered, share 1 second within
+  the read's deadline, and a failed check is dropped; a result is never changed or
+  blocked. Multi-statement, combined and folder reads are unchanged.
+- **Benchmarks.** The live schema baseline has a hard tier with planted traps
+  (`DAITA_SCHEMA_BASELINE_TIER`), and a labelled corpus measures fan-out detection
+  (37 of 40 caught, 0 of 44 false alarms).
 
 ### One write tool: `data_write`
 

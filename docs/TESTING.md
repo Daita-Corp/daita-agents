@@ -738,7 +738,7 @@ drive the app to its own exit.
 
 `tests/live/schema_baseline` measures PostgreSQL discovery limits, catalog
 coverage, per-query structural cost, staleness and question outcomes on a
-1,500-table messy schema. It runs only when `DAITA_SCHEMA_BASELINE_POSTGRES_URL`
+1,509-table messy schema. It runs only when `DAITA_SCHEMA_BASELINE_POSTGRES_URL`
 names a disposable `daita_schema_baseline` database. Its paid Daita-versus-Claude
 Code comparison also needs `DAITA_RUN_LIVE_SCHEMA_BASELINE_COMPARISON=1`. Reports go to the
 ignored `live-evidence/schema-baseline/` and stay out of git. See its `README.md`.

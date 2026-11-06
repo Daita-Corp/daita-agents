@@ -339,6 +339,97 @@ def _conjuncts(node: Any, exp: Any) -> Iterator[Any]:
         yield node
 
 
+def _side_item(
+    side: Any,
+    items: list[Any],
+    names: list[str],
+    known: Mapping[str, set[str]],
+    exp: Any,
+) -> int | None:
+    if side.find(exp.Subquery, exp.Select) is not None:
+        return None
+    owners: set[int] = set()
+    for column in side.find_all(exp.Column):
+        if column.table:
+            matches = [
+                i
+                for i, n in enumerate(names)
+                if n.casefold() == column.table.casefold()
+            ]
+        else:
+            # Unqualified names resolve only when every from-item is a
+            # known input relation and exactly one has the column.
+            if any(
+                not isinstance(i, exp.Table) or i.name.casefold() not in known
+                for i in items
+            ):
+                return None
+            matches = [
+                i
+                for i, item in enumerate(items)
+                if column.name.casefold() in known[item.name.casefold()]
+            ]
+        if len(matches) != 1:
+            return None
+        owners.add(matches[0])
+    return next(iter(owners)) if len(owners) == 1 else None
+
+
+def select_equalities(
+    root: Any, exp: Any, known: Mapping[str, set[str]]
+) -> Iterator[tuple[Any, list[Any], list[str], Any, int, int]]:
+    """Yield each equality between two different from-items of every SELECT.
+
+    Each item is (select, from-items, their aliases, the EQ node, left item
+    index, right item index). ``known`` maps lower-cased relation names to
+    lower-cased column names; an empty map resolves only qualified columns.
+    """
+
+    for select in root.find_all(exp.Select):
+        source = select.args.get("from_") or select.args.get("from")
+        joins = select.args.get("joins") or []
+        if source is None:
+            continue
+        items = [source.this, *(j.this for j in joins)]
+        names = [i.alias_or_name for i in items]
+        if not all(names):
+            continue
+        candidates: list[Any] = []
+        for position, join in enumerate(joins, start=1):
+            candidates.extend(_conjuncts(join.args.get("on"), exp))
+            for using in join.args.get("using") or []:
+                name = using.name.casefold()
+                holders = [
+                    i
+                    for i in range(position + 1)
+                    if isinstance(items[i], exp.Table)
+                    and name in known.get(items[i].name.casefold(), ())
+                ]
+                if not known and position == 1:
+                    # Without column facts, a two-item USING join is unambiguous.
+                    holders = [0, 1]
+                if position in holders and len(holders) == 2:
+                    other = next(i for i in holders if i != position)
+                    candidates.append(
+                        exp.EQ(
+                            this=exp.column(using.name, names[other]),
+                            expression=exp.column(using.name, names[position]),
+                        )
+                    )
+        candidates.extend(
+            _conjuncts(
+                select.args["where"].this if select.args.get("where") else None, exp
+            )
+        )
+        for eq in candidates:
+            if not isinstance(eq, exp.EQ):
+                continue
+            li = _side_item(eq.this, items, names, known, exp)
+            ri = _side_item(eq.expression, items, names, known, exp)
+            if li is not None and ri is not None and li != ri:
+                yield select, items, names, eq, li, ri
+
+
 def _equality_joins(
     canonical_sql: str, columns: Mapping[str, frozenset[str]]
 ) -> tuple[EqualityJoin, ...]:
@@ -351,40 +442,8 @@ def _equality_joins(
     prefix = with_clause.sql(dialect="duckdb") + " " if with_clause else ""
     found: dict[tuple[str, str], EqualityJoin] = {}
 
-    def side_item(side: Any, items: list[Any], names: list[str]) -> int | None:
-        if side.find(exp.Subquery, exp.Select) is not None:
-            return None
-        owners: set[int] = set()
-        for column in side.find_all(exp.Column):
-            if column.table:
-                matches = [
-                    i
-                    for i, n in enumerate(names)
-                    if n.casefold() == column.table.casefold()
-                ]
-            else:
-                # Unqualified names resolve only when every from-item is a
-                # known input relation and exactly one has the column.
-                if any(
-                    not isinstance(i, exp.Table) or i.name.casefold() not in known
-                    for i in items
-                ):
-                    return None
-                matches = [
-                    i
-                    for i, item in enumerate(items)
-                    if column.name.casefold() in known[item.name.casefold()]
-                ]
-            if len(matches) != 1:
-                return None
-            owners.add(matches[0])
-        return next(iter(owners)) if len(owners) == 1 else None
-
-    def add(eq: Any, items: list[Any], names: list[str]) -> None:
+    for _select, items, names, eq, li, ri in select_equalities(root, exp, known):
         left, right = eq.this, eq.expression
-        li, ri = side_item(left, items, names), side_item(right, items, names)
-        if li is None or ri is None or li == ri:
-            return
         label = (left.sql(dialect="duckdb"), right.sql(dialect="duckdb"))
         sides = []
         for side, index in ((left, li), (right, ri)):
@@ -430,42 +489,6 @@ def _equality_joins(
             ),
         )
         found.setdefault((join.left_unmatched_sql, join.right_unmatched_sql), join)
-
-    for select in root.find_all(exp.Select):
-        source = select.args.get("from_") or select.args.get("from")
-        joins = select.args.get("joins") or []
-        if source is None:
-            continue
-        items = [source.this, *(j.this for j in joins)]
-        names = [i.alias_or_name for i in items]
-        if not all(names):
-            continue
-        for position, join in enumerate(joins, start=1):
-            candidates = list(_conjuncts(join.args.get("on"), exp))
-            for using in join.args.get("using") or []:
-                name = using.name.casefold()
-                holders = [
-                    i
-                    for i in range(position + 1)
-                    if isinstance(items[i], exp.Table)
-                    and name in known.get(items[i].name.casefold(), ())
-                ]
-                if position in holders and len(holders) == 2:
-                    other = next(i for i in holders if i != position)
-                    candidates.append(
-                        exp.EQ(
-                            this=exp.column(using.name, names[other]),
-                            expression=exp.column(using.name, names[position]),
-                        )
-                    )
-            for candidate in candidates:
-                if isinstance(candidate, exp.EQ):
-                    add(candidate, items, names)
-        for candidate in _conjuncts(
-            select.args["where"].this if select.args.get("where") else None, exp
-        ):
-            if isinstance(candidate, exp.EQ):
-                add(candidate, items, names)
     return tuple(found.values())[:_MAX_JOIN_CHECKS]
 
 

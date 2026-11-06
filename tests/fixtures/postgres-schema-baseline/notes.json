@@ -1,0 +1,24 @@
+[
+  {
+    "table": "crm.segments",
+    "fields": [],
+    "kind": "exclusion_rule",
+    "statement": "crm.segments is deprecated since 2025-10 and no longer updated; current segment assignments are in crm.account_segments."
+  },
+  {
+    "table": "finance.gl_postings",
+    "fields": [
+      "src_cd"
+    ],
+    "kind": "code_mapping",
+    "statement": "src_cd codes: R1 and R2 are regular postings, XV marks a reversed posting and must be excluded from posted totals, ZZ is intercompany."
+  },
+  {
+    "table": "finance.gl_postings",
+    "fields": [
+      "amt"
+    ],
+    "kind": "glossary",
+    "statement": "amt is stored in integer cents; divide by 100 for dollars."
+  }
+]
