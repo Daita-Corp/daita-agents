@@ -621,6 +621,8 @@ def _normalize_error(error: Exception, provider: str) -> ModelProviderError:
         normalized = ProviderErrorCode.CONTENT_BLOCKED
     elif isinstance(error, ConnectionError) or status is not None and status >= 500:
         normalized = ProviderErrorCode.PROVIDER_UNAVAILABLE
+    elif status == 402:
+        normalized = ProviderErrorCode.BILLING_ERROR
     elif status is not None and 400 <= status < 500:
         normalized = ProviderErrorCode.INVALID_REQUEST
     else:

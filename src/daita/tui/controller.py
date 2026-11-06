@@ -84,6 +84,7 @@ _LEARNING_WRITE_TOOLS = frozenset(
 )
 VALIDATION_ERRORS = {
     "authentication_error": "The API key was rejected. Replace it and retry.",
+    "billing_error": "The provider account has no credits or billing is not set up.",
     "model_not_found": "This account cannot access {model}.",
     "rate_limit_error": "The provider rate-limited the validation request.",
     "provider_unavailable": "The provider could not be reached.",

@@ -120,6 +120,7 @@ class ProviderErrorCode(str, Enum):
     """Canonical failures that every model adapter may expose to the runtime."""
 
     AUTHENTICATION_ERROR = "authentication_error"
+    BILLING_ERROR = "billing_error"
     RATE_LIMIT_ERROR = "rate_limit_error"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
     MODEL_NOT_FOUND = "model_not_found"
