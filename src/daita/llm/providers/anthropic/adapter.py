@@ -790,6 +790,8 @@ def _code_from_error_type(error_type: str) -> ProviderErrorCode:
         "safety_error",
     }:
         return ProviderErrorCode.CONTENT_BLOCKED
+    if error_type == "billing_error":
+        return ProviderErrorCode.BILLING_ERROR
     if error_type == "invalid_request_error":
         return ProviderErrorCode.INVALID_REQUEST
     return ProviderErrorCode.PROVIDER_UNAVAILABLE
@@ -845,6 +847,8 @@ def _normalize_error(error: Exception) -> ModelProviderError:
         "safety_error",
     }:
         normalized = ProviderErrorCode.CONTENT_BLOCKED
+    elif status == 402 or error_type == "billing_error":
+        normalized = ProviderErrorCode.BILLING_ERROR
     elif (
         status is not None and 400 <= status < 500
     ) or error_type == "invalid_request_error":

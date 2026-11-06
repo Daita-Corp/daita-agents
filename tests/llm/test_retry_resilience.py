@@ -8,6 +8,7 @@ from decimal import Decimal
 import httpx
 import pytest
 
+from daita import Agent
 from daita._json import FrozenJsonObject
 from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import (
@@ -51,6 +52,7 @@ from tests.llm._token_counting_support import (
     is_count,
     provider_at,
 )
+from tests.support.workspace import workspace_for
 
 
 def usage(tokens=30, cost="0.01"):
@@ -284,6 +286,7 @@ async def test_dollar_cap_replays_only_a_failure_with_proven_zero_usage(
         (503, ProviderErrorCode.PROVIDER_UNAVAILABLE),
         (429, ProviderErrorCode.RATE_LIMIT_ERROR),
         (401, ProviderErrorCode.AUTHENTICATION_ERROR),
+        (402, ProviderErrorCode.BILLING_ERROR),
     ],
 )
 async def test_count_failure_preserves_actionable_classification(
@@ -306,6 +309,36 @@ async def test_count_failure_preserves_actionable_classification(
     assert caught.value.usage.total_tokens == 0
     assert caught.value.usage.cost_estimate.status.value == "complete"
     assert caught.value.code is expected
+
+
+async def test_agent_run_reports_exhausted_provider_credits_as_billing(tmp_path):
+    paths = []
+
+    def respond(req):
+        paths.append(req.url.path)
+        return httpx.Response(
+            402, json={"error": {"code": 402, "message": "credits are depleted"}}
+        )
+
+    async with provider_at("gemini", respond) as provider:
+        agent = await Agent.create(
+            "atlas",
+            root=tmp_path,
+            workspace=workspace_for(tmp_path),
+            model=provider,
+            model_profile=ModelProfile(
+                id=provider.provider_id,
+                context_window_tokens=100_000,
+                max_output_tokens=2048,
+                supports_tools=True,
+            ),
+        )
+        try:
+            result = await agent.run("hello")
+        finally:
+            await agent.close()
+    assert result.reason == ProviderErrorCode.BILLING_ERROR.value
+    assert paths and all(is_count(path) for path in paths)
 
 
 @pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
