@@ -8,6 +8,7 @@ from daita.domains.analysis.domain import AnalysisCapabilityDomain
 from daita.hosting.execution_governor import RunAdmissionCoordinator
 from daita.llm.errors import ContextWindowExceeded
 from daita.loop.models import build_run_note
+from tests.support.conversations import _carries_messages
 from tests.support.kernel import (
     NOW,
     AgentContextBuilder,
@@ -153,13 +154,14 @@ async def test_a_request_carries_no_per_step_status():
         )
         for step, remaining in ((1, 10_000), (2, 7_500))
     )
-    assert first.messages == second.messages == (first.messages[0], user)
+    assert first.messages == second.messages
+    assert _carries_messages(first, (user,))
     assert "This run has a token budget" in repr(first.messages[0])
 
     unbounded = builder.project(
         snapshot, (user,), step=1, tool_context=projection.project(tools, (user,))
     )
-    assert unbounded.messages[1:] == (user,)
+    assert _carries_messages(unbounded, (user,)) and len(unbounded.messages) == 2
     assert "This run has a token budget" not in repr(unbounded.messages[0])
 
     # A one-step run has no tool result to carry its last-request status.
@@ -170,7 +172,7 @@ async def test_a_request_carries_no_per_step_status():
         tool_context=projection.project(tools, (user,)),
         remaining_steps=1,
     )
-    assert only.messages[:2] == (only.messages[0], user)
+    assert _carries_messages(ModelRequest(messages=only.messages[:-1]), (user,))
     assert only.messages[-1].role is MessageRole.SYSTEM
     assert "last model request" in repr(only.messages[-1])
 
@@ -226,7 +228,7 @@ async def test_optional_context_uses_run_allowance_without_rejecting_mandatory_i
         tool_context=projection.project(tools, (user,)),
         remaining_tokens=1,
     )
-    assert narrow_request.messages[-1] == user
+    assert _carries_messages(narrow_request, (user,))
     assert wide.initial_sensitivity == narrow.initial_sensitivity
     assert (
         wide.initial_sensitivity_provenance["source_ids"]
@@ -275,7 +277,12 @@ async def test_python_guidance_follows_applicable_loaded_projection(
         "Python workspace:" not in cast(TextBlock, before.messages[0].content[0]).text
     )
     assert (
-        "Python requested reads:" in cast(TextBlock, before.messages[0].content[0]).text
+        "Python requested reads:"
+        not in cast(TextBlock, before.messages[0].content[0]).text
+    )
+    assert (
+        "Python requested reads:"
+        in cast(TextBlock, before.messages[-1].content[-1]).text
     ) is (available and requested_reads)
 
     call = ToolCall(
@@ -307,83 +314,21 @@ async def test_python_guidance_follows_applicable_loaded_projection(
     assert callable_python is available
     system = cast(TextBlock, request.messages[0].content[0]).text
     assert ("Python workspace:" in system) is callable_python
-    assert ("Python requested reads:" in system) is (available and requested_reads)
-    assert not any(
-        f"Python {procedure}:" in system
-        for procedure in ("CSV", "database", "query results", "charts")
-    )
-    assert request.messages[-len(messages) :] == messages
+    start = cast(TextBlock, request.messages[-len(messages)].content[-1]).text
+    assert "Python requested reads:" not in system
+    assert ("Python requested reads:" in start) is (available and requested_reads)
+    assert _carries_messages(request, messages)
     assert _estimate_input_tokens(request) <= snapshot.profile.maximum_input_tokens
 
 
 @pytest.mark.parametrize(
-    "message,capability_id,kind,data,is_error,expected",
+    "message,with_result",
     (
-        ("Normalize text and validate JSON records.", None, None, {}, False, set()),
-        ("Compute from sales.csv.", None, None, {}, False, {"CSV"}),
-        (
-            "Compute from a SQLite database join.",
-            None,
-            None,
-            {},
-            False,
-            {"database", "query results"},
-        ),
-        ("Transform query results.", None, None, {}, False, {"query results"}),
-        ("Plot a histogram from retained values.", None, None, {}, False, {"charts"}),
-        (
-            "Compute from this input.",
-            "data.query",
-            "data.query_result",
-            {"columns": ["aliased_total"]},
-            False,
-            {"database", "query results"},
-        ),
-        (
-            "Compute from this input.",
-            "data.query_files",
-            "data.query_files_result",
-            {"format": "csv", "columns": ["aliased_total"]},
-            False,
-            {"CSV", "query results"},
-        ),
-        (
-            "Compute from this input.",
-            "data.read_text",
-            "data.read_text_result",
-            {"path": "sales.CSV"},
-            False,
-            {"CSV"},
-        ),
-        (
-            "Compute from this input.",
-            "data.read_text",
-            "data.read_text_result",
-            {"path": "notes.txt", "content": "CSV database query chart"},
-            False,
-            set(),
-        ),
-        (
-            "Compute from this input.",
-            "mcp.tool",
-            "data.query_result",
-            {"format": "csv", "columns": ["chart"]},
-            False,
-            set(),
-        ),
-        (
-            "Compute from this input.",
-            "data.query",
-            "data.query_result",
-            {},
-            True,
-            set(),
-        ),
+        ("Normalize text and validate JSON records.", False),
+        ("Compute from sales.csv.", True),
     ),
 )
-async def test_python_procedures_use_current_task_and_typed_metadata(
-    message, capability_id, kind, data, is_error, expected
-):
+async def test_python_procedures_follow_the_tool_set_not_the_task(message, with_result):
     builder = AgentContextBuilder(
         _SnapshotCatalog(),
         profile=ModelProfile(
@@ -422,7 +367,7 @@ async def test_python_procedures_use_current_task_and_typed_metadata(
     )
     snapshot = await builder.prepare(run, (*history, user), catalog)
     messages: tuple[CanonicalMessage, ...] = (user,)
-    if capability_id is not None:
+    if with_result:
         call = ToolCall(id="captured-input", name="lookup")
         messages = (
             user,
@@ -432,10 +377,9 @@ async def test_python_procedures_use_current_task_and_typed_metadata(
                 content=(
                     ToolResultBlock(
                         call_id=call.id,
-                        capability_id=capability_id,
-                        executor_id=f"{capability_id}.executor",
-                        output={"kind": kind, "data": data},
-                        is_error=is_error,
+                        capability_id="data.query",
+                        executor_id="data.query.executor",
+                        output={"kind": "data.query_result", "data": {}},
                     ),
                 ),
             ),
@@ -448,20 +392,20 @@ async def test_python_procedures_use_current_task_and_typed_metadata(
     )
     system = cast(TextBlock, request.messages[0].content[0]).text
     assert "Python requested reads:" not in system
-    # Check selected procedure categories, not their exact prose or a scripted
-    # model's reasoning. Selection cannot add callable tools or alter evidence.
+    # The same procedures appear whatever was asked or returned, so the system
+    # text cannot drift within or across runs.
     assert {
         procedure
         for procedure in ("CSV", "database", "query results", "charts")
         if f"Python {procedure}:" in system
-    } == expected
+    } == {"CSV", "database", "query results", "charts"}
     assert {tool.name for tool in request.tools} == {
         "python_execute",
         "data_query",
         "file_read",
         "toolbox_inspect",
     }
-    assert request.messages[-len(messages) :] == messages
+    assert _carries_messages(request, messages)
 
 
 async def test_python_guidance_is_counted_at_preparation_and_projection():
@@ -639,17 +583,8 @@ def test_token_estimate_prices_rendered_names_rather_than_stored_ids():
 
 
 @pytest.mark.parametrize("arrow", (False, True))
-@pytest.mark.parametrize(
-    "message,dataset_requested",
-    (
-        ("Compute statistics from a complete dataset.", True),
-        ("Use Python to compute over every row of the connected table.", True),
-        ("Use tools.capture('data_query', args, name='numbers').", True),
-        ("Normalize retained JSON records.", False),
-    ),
-)
 async def test_dataset_guidance_requires_exact_loaded_export_metadata(
-    monkeypatch, arrow, message, dataset_requested
+    monkeypatch, arrow
 ):
     from daita.capabilities import (
         CapabilityDeclarations,
@@ -708,7 +643,7 @@ async def test_dataset_guidance_requires_exact_loaded_export_metadata(
             supports_tools=True,
         ),
     )
-    run = replace(_run("typed-dataset"), message=message, start=None)
+    run = replace(_run("typed-dataset"), message="Compute from the table.", start=None)
     messages: tuple[CanonicalMessage, ...] = (run.start_message(),)
     catalog = await runtime.prepare_run(run)
     snapshot = await builder.prepare(run, messages, catalog)
@@ -742,6 +677,6 @@ async def test_dataset_guidance_requires_exact_loaded_export_metadata(
         )
         text = cast(TextBlock, request.messages[0].content[0]).text
         assert "tools.batch" in text and "in submission order" in text
-        assert ("tools.capture(" in text) is (arrow and dataset_requested)
-        assert request.messages[-len(messages) :] == messages
+        assert ("tools.capture(" in text) is arrow
+        assert _carries_messages(request, messages)
         assert _estimate_input_tokens(request) <= snapshot.profile.maximum_input_tokens

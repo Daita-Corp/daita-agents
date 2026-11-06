@@ -71,6 +71,17 @@ from .usage import (
 
 _NONCONTENT_STREAM_BLOCK_TYPES = frozenset({"fallback"})
 _STREAM_MISSING = object()
+# These models sign thinking blocks against the tools, system and earlier messages, so a
+# changed tool list (toolbox_load) breaks the signature; ask to drop the block, not 400.
+_PRESERVED_THINKING_MODELS = frozenset(
+    {
+        "claude-fable-5-1",
+        "claude-mythos-5-1",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+    }
+)
 
 
 class _MessagesResource(Protocol):
@@ -454,9 +465,25 @@ class AnthropicMessagesProvider:
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": messages,
+            # Automatic caching moves a breakpoint to the end of the growing tail.
+            "cache_control": {"type": "ephemeral"},
         }
+        if self.model in _PRESERVED_THINKING_MODELS:
+            arguments["thinking"] = {
+                "type": "adaptive",
+                "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+            }
+            arguments["extra_headers"] = {
+                "anthropic-beta": "thinking-binding-controls-2026-08-01"
+            }
         if system is not None:
-            arguments["system"] = system
+            arguments["system"] = [
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
         if request.tools:
             arguments["tools"] = [
                 {
@@ -799,6 +826,8 @@ def _code_from_error_type(error_type: str) -> ProviderErrorCode:
         "safety_error",
     }:
         return ProviderErrorCode.CONTENT_BLOCKED
+    if error_type == "billing_error":
+        return ProviderErrorCode.BILLING_ERROR
     if error_type == "invalid_request_error":
         return ProviderErrorCode.INVALID_REQUEST
     return ProviderErrorCode.PROVIDER_UNAVAILABLE
@@ -854,6 +883,8 @@ def _normalize_error(error: Exception) -> ModelProviderError:
         "safety_error",
     }:
         normalized = ProviderErrorCode.CONTENT_BLOCKED
+    elif status == 402 or error_type == "billing_error":
+        normalized = ProviderErrorCode.BILLING_ERROR
     elif (
         status is not None and 400 <= status < 500
     ) or error_type == "invalid_request_error":

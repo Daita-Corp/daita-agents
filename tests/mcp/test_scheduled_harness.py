@@ -26,6 +26,7 @@ from daita.llm.models import (
 )
 from daita.llm.pricing import CostEstimate
 from daita.loop.models import LoopExitKind
+from tests.support.conversations import _carries_messages
 from tests.support.job_benchmarks import RecordingProvider
 from tests.support.mcp_actions import ActionModel, response
 from tests.support.mcp_routine_harness import (
@@ -201,8 +202,9 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
         assert model.provider_id not in texts[0] + texts[1]
         assert model.provider_id not in transcript.run.message
         for request in requests:
-            assert (
-                request.messages[1:] == transcript.messages[: len(request.messages) - 1]
+            assert _carries_messages(
+                ModelRequest(messages=request.messages[1:]),
+                transcript.messages[: len(request.messages) - 1],
             )
             assert request.sensitivity is scenario.binding.maximum_outbound_sensitivity
         # Plenty of budget left: no status, and nothing edits earlier requests.
