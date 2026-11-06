@@ -52,7 +52,12 @@ normal cancellation/deadline behavior; dispatched generation can remain unmeasur
 The Anthropic adapter marks the system block with an ephemeral cache breakpoint and
 turns on top-level automatic caching for the conversation tail. The count call sends
 the same arguments, so counting shares the markers. They are sent regardless of the
-model profile's `supports_prompt_caching` flag. Cache read and write tokens are
+model profile's `supports_prompt_caching` flag. On the preserved-thinking models
+(claude-fable-5-1, claude-mythos-5-1, claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5)
+it also sends adaptive `thinking` with `block_binding.prefix_mismatch_behavior` set to
+`drop_block` and the `thinking-binding-controls-2026-08-01` beta header, because a
+`toolbox_load` mid-run changes the tool list and the signed thinking blocks would otherwise
+fail the request on newer accounts; one step's reasoning is dropped instead. Cache read and write tokens are
 accounted and priced, and count in full toward input tokens. OpenAI and Gemini are
 unchanged and render the start message's trailing context block joined by a newline.
 

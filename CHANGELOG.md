@@ -323,6 +323,11 @@ agent, except the current run's first user turn.
 - **Provider cache.** The Anthropic adapter marks the system block and the
   conversation tail for caching, whatever the model profile's
   `supports_prompt_caching` says. OpenAI and Gemini are unchanged.
+- **A tool load no longer fails the run.** On the preserved-thinking Claude models
+  (claude-fable-5-1, claude-mythos-5-1, claude-opus-5-5, claude-sonnet-5-5,
+  claude-haiku-5-5) the adapter asks the provider to drop a thinking block that no longer
+  matches the longer tool list, so every account loses one step's reasoning instead of
+  newer accounts failing the run with a 400.
 - **Limits.** `toolbox_load` changes the system text and rewrites the cache. Once
   history is full, the sliding window drops the oldest turn and shifts the cached
   history. Changes to memory, the user profile, the skill index or the directory also

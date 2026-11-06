@@ -394,20 +394,25 @@ async def test_invalid_counts_never_admit_generation(kind, count):
     assert len(paths) == 1 and is_count(paths[0])
 
 
+@pytest.mark.parametrize(
+    "model", ["fixture-model", "claude-sonnet-5-5", "claude-sonnet-5"]
+)
 @pytest.mark.parametrize("stream", [False, True])
 async def test_anthropic_requests_mark_the_cacheable_prefix_and_count_the_same_request(
-    stream,
+    stream, model
 ):
-    bodies = {}
+    bodies, betas = {}, {}
 
     def respond(request):
         counting = is_count(request.url.path)
-        bodies["count" if counting else "generate"] = json.loads(request.content)
+        key = "count" if counting else "generate"
+        bodies[key] = json.loads(request.content)
+        betas[key] = request.headers.get("anthropic-beta")
         if counting:
             return httpx.Response(200, json=count_response("anthropic", 10))
         return httpx.Response(503, json={"error": {"message": "offline"}})
 
-    async with provider_at("anthropic", respond) as provider:
+    async with provider_at("anthropic", respond, model=model) as provider:
         with pytest.raises(ModelProviderError):
             await invoke(provider, input_request(remaining=7000), stream)
     generate, count = bodies["generate"], bodies["count"]
@@ -417,6 +422,15 @@ async def test_anthropic_requests_mark_the_cacheable_prefix_and_count_the_same_r
     assert count == {
         k: v for k, v in generate.items() if k not in {"max_tokens", "stream"}
     }
+    # Preserved-thinking models drop a mismatched thinking block instead of failing.
+    for body, beta in ((generate, betas["generate"]), (count, betas["count"])):
+        if model == "claude-sonnet-5-5":
+            binding = body["thinking"]["block_binding"]
+            assert binding["prefix_mismatch_behavior"] == "drop_block"
+            assert "thinking-binding-controls-2026-08-01" in beta
+        else:
+            assert "thinking" not in body
+            assert "thinking-binding-controls" not in (beta or "")
 
 
 @pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
