@@ -631,7 +631,8 @@ async def _require_validated_model_provider(
                 ),
             ),
             sensitivity=ModelSensitivity.PUBLIC,
-            allow_parallel_tool_calls=False,
+            # allow_parallel_tool_calls stays unset like ordinary runs: Anthropic and
+            # Gemini refuse any override, and the check below rejects extra calls.
         )
     )
     if response.finish_reason is FinishReason.LENGTH:
