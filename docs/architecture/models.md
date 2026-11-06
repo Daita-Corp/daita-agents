@@ -132,8 +132,9 @@ revalidation even when it uses the same definition fact as lazy route preflight:
 those checks protect different boundaries.
 
 A route candidate may pin a provider-native `reasoning_effort`. The levels a
-provider accepts are a `ProviderDefinition` fact (`reasoning_efforts`); an empty
-list means none, and unknown providers accept none. `None` sends nothing and keeps
+provider accepts are a `ProviderDefinition` fact (`reasoning_efforts`, with
+`model_reasoning_efforts` for reviewed models that accept fewer); an empty list
+means none, and unknown providers accept none. `None` sends nothing and keeps
 the provider's default. The factory passes the level to the adapter's
 constructor, so it is fixed for the provider's lifetime and every request of a
 run uses it: changing it between requests would invalidate Anthropic's cached

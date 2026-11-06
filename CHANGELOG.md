@@ -318,11 +318,11 @@ Opus 4.8.
   from Python, and `daita run --no-host --model ... --reasoning-effort high` sets it
   for one run.
 - **Levels** are the provider's own: Anthropic `low`, `medium`, `high`, `xhigh`,
-  `max` (`output_config.effort`); OpenAI `none`, `minimal`, `low`, `medium`,
-  `high`, `xhigh`, `max` (`reasoning.effort`); Gemini `minimal`, `low`, `medium`,
-  `high` (`thinking_config.thinking_level`). Subscription and custom providers don't
-  accept one. Saving checks the level with the model, so a level the model rejects
-  is refused before it is saved.
+  `max` (`output_config.effort`), none on Claude Haiku 4.5; OpenAI `none`, `low`,
+  `medium`, `high`, `xhigh`, `max` (`reasoning.effort`), without `none` on GPT-6
+  Astra; Gemini `minimal`, `low`, `medium`, `high` (`thinking_config.thinking_level`).
+  Subscription and custom providers don't accept one. Saving checks the level with
+  the model, so a level the model rejects is refused before it is saved.
 - **Fixed for a run.** The level is set when the provider is built, so every request
   in a run uses it and Anthropic's cached messages stay valid. A change applies when
   the agent next reopens. It is part of the route's machine-run binding; routes with

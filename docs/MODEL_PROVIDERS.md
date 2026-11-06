@@ -24,7 +24,9 @@ or privileges.
 ## Reasoning effort
 
 A provider that accepts a reasoning level lists its native values in
-`ProviderDefinition.reasoning_efforts`, and its constructor takes
+`ProviderDefinition.reasoning_efforts`. A reviewed model that accepts fewer gets
+its own list in `model_reasoning_efforts`; check each against the live API before
+listing it. The provider's constructor takes
 `reasoning_effort: str | None`. The adapter keeps that value for its lifetime and
 adds it to every generation and input-count request; with `None` it sends nothing.
 Do not read the level from `ModelRequest`, which would let it change in the

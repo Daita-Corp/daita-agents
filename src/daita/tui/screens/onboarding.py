@@ -399,7 +399,7 @@ class ModelSetupScreen(Screen[bool]):
             self._apply_provider_selection(provider, model)
         else:
             self._apply_provider_selection(provider, None)
-        levels = reasoning_efforts(provider)
+        levels = reasoning_efforts(provider, self._model)
         if levels:
             effort = await self.app._await_modal(  # type: ignore[attr-defined]
                 SelectionScreen(

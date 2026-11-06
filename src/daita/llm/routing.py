@@ -151,7 +151,7 @@ class ModelRouteCandidate:
         if self.provider_id != self.profile.id:
             raise ValueError("route candidate provider_id must match its profile")
         if self.reasoning_effort is not None and self.reasoning_effort not in (
-            reasoning_efforts(self.provider_id.partition(":")[0])
+            reasoning_efforts(*self.provider_id.split(":", 1))
         ):
             raise ValueError(
                 f"{self.provider_id} does not accept reasoning effort "

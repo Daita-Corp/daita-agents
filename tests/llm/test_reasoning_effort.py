@@ -10,6 +10,7 @@ from daita.hosting.configuration import (
 from daita.llm.factory import create_llm_provider
 from daita.llm.models import CanonicalMessage, MessageRole, ModelRequest, TextBlock
 from daita.llm.profiles import reviewed_model_profile
+from daita.llm.provider_definitions import reasoning_efforts
 from daita.llm.providers.gemini.messages import _count_request
 from daita.llm.routing import ModelRouteCandidate
 
@@ -79,6 +80,10 @@ def test_gemini_counts_a_request_that_pins_a_thinking_level():
         ("gemini:gemini-3.8-flash", "max"),
         ("anthropic:claude-opus-5-5", "minimal"),
         ("claude-code:claude-opus-5-5", "high"),
+        # Per-model gaps found against the live APIs.
+        ("anthropic:claude-haiku-4-5-20251001", "low"),
+        ("openai:gpt-6-sol", "minimal"),
+        ("openai:gpt-6-astra", "none"),
     ),
 )
 def test_a_level_the_provider_does_not_accept_is_refused(model_id, effort):
@@ -122,3 +127,10 @@ def test_machine_run_binding_changes_with_the_effort_and_not_without_one():
     assert contracts("high") != contracts(None)
     assert contracts("high") != contracts("low")
     assert contracts("high") == contracts("high")
+
+
+def test_a_per_model_gap_leaves_the_rest_of_the_provider_untouched():
+    assert reasoning_efforts("openai", "gpt-6-sol")[0] == "none"
+    assert "none" not in reasoning_efforts("openai", "gpt-6-astra")
+    assert reasoning_efforts("anthropic", "claude-haiku-4-5-20251001") == ()
+    assert "max" in reasoning_efforts("anthropic", "claude-sonnet-5")
