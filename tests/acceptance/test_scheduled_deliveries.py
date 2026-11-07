@@ -9,7 +9,6 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
 
 import httpx2 as httpx
@@ -30,7 +29,6 @@ from daita.adapters import (
 from daita.adapters.mcp import SDKMCPClientFactory
 from daita.adapters.models import (
     DiscoveryRequest,
-    DiscoveryResult,
     ResourceRef,
     ResourceSnapshot,
     SourceHealth,
@@ -44,14 +42,14 @@ from daita.artifacts.renderers import (
     render_exact_xlsx,
 )
 from daita.catalog.models import (
+    CatalogEntry,
     CatalogFacet,
     CatalogResource,
     CatalogResourceRevision,
-    CatalogSync,
-    CatalogSyncStatus,
+    CatalogTier,
+    ResourceBatch,
     ResourceKind,
     Sensitivity,
-    SourceCatalogSnapshot,
     TabularColumn,
     TabularFacet,
     catalog_resource_id,
@@ -261,23 +259,15 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
     # its full registry record from the owned manifest before upgrading to current.
     with sqlite3.connect(reopened.home / "state.db") as connection:
         # Historical catalog syncs predate the truncation flag.
-        for table, key, nested in (
-            ("syncs", "id", False),
-            ("snapshots", "source_id", True),
-        ):
-            for row_key, encoded in connection.execute(
-                f"SELECT {key}, data FROM {table}"  # noqa: S608
-            ).fetchall():
-                record = json.loads(encoded)
-                sync = record["fields"]["sync"] if nested else record
-                del sync["fields"]["truncated"]
-                connection.execute(
-                    f"UPDATE {table} SET data = ? WHERE {key} = ?",  # noqa: S608
-                    (
-                        json.dumps(record, sort_keys=True, separators=(",", ":")),
-                        row_key,
-                    ),
-                )
+        for row_key, encoded in connection.execute(
+            "SELECT id, data FROM syncs"
+        ).fetchall():
+            record = json.loads(encoded)
+            del record["fields"]["truncated"]
+            connection.execute(
+                "UPDATE syncs SET data = ? WHERE id = ?",
+                (json.dumps(record, sort_keys=True, separators=(",", ":")), row_key),
+            )
         # Restore the released routine fields the revision-4 rewrite reads.
         for table, key, restore in (
             ("scheduled_routines", "routine_id", _released_routine),
@@ -571,7 +561,7 @@ class _OfflinePostgreSQLSource:
             def registration(self) -> SourceRegistration:
                 return registration
 
-            async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
+            async def reconcile(self, request: DiscoveryRequest):
                 resource_id = catalog_resource_id(
                     request.source_id,
                     ResourceKind.TABLE,
@@ -611,26 +601,17 @@ class _OfflinePostgreSQLSource:
                     first_observed_at=NOW,
                     last_observed_at=NOW,
                 )
-                sync = CatalogSync(
-                    id=request.sync_id,
-                    agent_id=request.agent_id,
-                    source_id=request.source_id,
-                    adapter_id="postgresql",
-                    status=CatalogSyncStatus.SUCCEEDED,
-                    started_at=request.requested_at,
-                    completed_at=NOW,
-                    source_revision="catalog:offline-postgresql-d2",
-                    resource_count=1,
-                )
-                return DiscoveryResult(
-                    request=request,
-                    snapshot=SourceCatalogSnapshot(
-                        sync=sync,
-                        resources=(resource,),
-                        revisions=(revision,),
-                        facets=(facet,),
+                yield ResourceBatch(
+                    tier=CatalogTier.DETAIL,
+                    entries=(
+                        CatalogEntry(
+                            resource=resource,
+                            revision=revision,
+                            facets=(facet,),
+                            detailed=True,
+                        ),
                     ),
-                    completed_at=NOW,
+                    source_revision="catalog:offline-postgresql-d2",
                 )
 
             async def inspect(self, resource: ResourceRef) -> ResourceSnapshot:

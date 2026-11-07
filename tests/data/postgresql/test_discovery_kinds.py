@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -19,8 +20,13 @@ from daita.adapters.models import (
 )
 from daita.adapters.postgresql import PostgreSQLResourceAdapter, _load_structure
 from daita.catalog.models import (
+    CatalogRelationship,
+    CatalogResource,
+    CatalogSync,
+    CatalogSyncStatus,
+    CatalogTier,
+    ResourceBatch,
     ResourceKind,
-    SourceCatalogSnapshot,
     TabularFacet,
 )
 from daita.storage.sqlite import SQLiteStateStore
@@ -162,8 +168,13 @@ class _Connection:
         rows: Sequence[Row]
         if tag == "resources":
             rows = [
-                {"schema_name": schema, "resource_name": name, "resource_kind": kind}
-                for schema, name, kind in sorted(self.tables)
+                {
+                    "schema_name": schema,
+                    "resource_name": name,
+                    "resource_kind": kind,
+                    "source_object_id": str(index),
+                }
+                for index, (schema, name, kind) in enumerate(sorted(self.tables))
             ]
         elif tag == "relationships":
             rows = self.relationships
@@ -217,32 +228,56 @@ class _Connection:
     async def execute(self, *_: object) -> None: ...
 
 
+@dataclass(frozen=True)
+class _Pass:
+    """One reconcile pass: the inventory batch, then the detail batch."""
+
+    inventory: ResourceBatch
+    detail: ResourceBatch
+
+    @property
+    def resources(self) -> list[CatalogResource]:
+        return [entry.resource for entry in self.detail.entries]
+
+    @property
+    def relationships(self) -> tuple[CatalogRelationship, ...]:
+        return self.detail.relationships
+
+    @property
+    def truncated(self) -> bool:
+        return self.inventory.truncated or self.detail.truncated
+
+
 async def _discover(
     connection: _Connection,
     *,
     registration: SourceRegistration | None = None,
     sync_id: str = "sync",
     **request: Any,
-) -> SourceCatalogSnapshot:
+) -> _Pass:
     registration = registration or _registration()
     adapter = PostgreSQLResourceAdapter(
         registration=registration, connection=connection, clock=lambda: _NOW
     )
-    result = await adapter.discover(
-        DiscoveryRequest(
-            agent_id=registration.agent_id,
-            source_id=registration.id,
-            sync_id=sync_id,
-            requested_at=_NOW,
-            **request,
+    inventory, detail = [
+        batch
+        async for batch in adapter.reconcile(
+            DiscoveryRequest(
+                agent_id=registration.agent_id,
+                source_id=registration.id,
+                sync_id=sync_id,
+                requested_at=_NOW,
+                **request,
+            )
         )
-    )
-    return result.snapshot
+    ]
+    assert inventory.tier is CatalogTier.INVENTORY
+    return _Pass(inventory, detail)
 
 
-def _tabular(snapshot: SourceCatalogSnapshot, name: str) -> TabularFacet:
-    (resource,) = [item for item in snapshot.resources if item.name == name]
-    (facet,) = [item for item in snapshot.facets if item.resource_id == resource.id]
+def _tabular(result: _Pass, name: str) -> TabularFacet:
+    (entry,) = [item for item in result.detail.entries if item.resource.name == name]
+    (facet,) = entry.facets
     return TabularFacet.from_payload(facet.payload)
 
 
@@ -291,7 +326,10 @@ async def test_attaching_beyond_the_resource_limit_keeps_the_first_thousand(
 
     snapshot = await _discover(connection, registration=registration)
 
-    assert snapshot.sync.truncated is truncated
+    assert snapshot.truncated is truncated
+    # Every listed table is named in the inventory; the first thousand are described.
+    assert len(snapshot.inventory.entries) == count
+    assert all(item.source_object_id for item in snapshot.inventory.entries)
     assert [item.name for item in snapshot.resources] == [
         f"t{index:04}" for index in range(1_000)
     ]
@@ -302,11 +340,28 @@ async def test_attaching_beyond_the_resource_limit_keeps_the_first_thousand(
         assert connection.round_trips * 0.05 < 5
     store = await SQLiteStateStore.open(tmp_path / "state.db")
     try:
-        await store.commit_snapshot(snapshot, registration=registration)
-        stored = await store.load_sync(registration.agent_id, snapshot.sync.id)
+        sync = CatalogSync(
+            id="sync",
+            agent_id=registration.agent_id,
+            source_id=registration.id,
+            adapter_id="postgresql",
+            status=CatalogSyncStatus.SUCCEEDED,
+            started_at=_NOW,
+            completed_at=_NOW,
+            resource_count=count,
+            truncated=snapshot.truncated,
+        )
+        await store.commit_catalog(
+            sync, (snapshot.inventory, snapshot.detail), registration=registration
+        )
+        stored = await store.load_sync(registration.agent_id, sync.id)
+        names = {
+            item.name for item in await store.list_resources(registration.agent_id)
+        }
     finally:
         await store.close()
     assert stored is not None and stored.truncated is truncated
+    assert len(names) == count
 
 
 @pytest.mark.parametrize(
@@ -342,7 +397,7 @@ async def test_a_wide_table_keeps_its_first_columns_and_a_whole_primary_key_or_n
     ] == list(key)
     # Neither the index nor the key on the cut column points outside the table.
     assert [index.name for index in orders.indexes] == ["by_a"]
-    assert snapshot.sync.truncated is True
+    assert snapshot.truncated is True
     assert [
         pair.source_field
         for relationship in snapshot.relationships
@@ -360,12 +415,12 @@ async def test_more_indexes_and_relationships_than_the_limits_keep_the_first() -
     )
 
     within = await _discover(connection, sync_id="within")
-    assert within.sync.truncated is False
+    assert within.truncated is False
 
     snapshot = await _discover(
         connection, max_indexes_per_resource=2, max_relationships=2
     )
-    assert snapshot.sync.truncated is True
+    assert snapshot.truncated is True
     assert [index.name for index in _tabular(snapshot, "orders").indexes] == ["a", "b"]
     names = {item.id: item.name for item in snapshot.resources}
     assert {names[item.from_resource_id] for item in snapshot.relationships} == {
@@ -400,7 +455,7 @@ async def test_a_source_slower_than_the_budget_keeps_the_tables_it_read(
 
     snapshot = await _discover(connection)
 
-    assert snapshot.sync.truncated is True
+    assert snapshot.truncated is True
     assert [item.name for item in snapshot.resources] == names[:kept]
     for name in names[:kept]:
         facet = _tabular(snapshot, name)
@@ -447,7 +502,7 @@ async def test_tables_without_columns_or_indexes_stay_listed_beside_the_others(
     indexed = _tabular(snapshot, "c_indexed")
     assert [column.name for column in indexed.columns] == ["id", "owner"]
     assert [index.name for index in indexed.indexes] == ["by_owner"]
-    assert snapshot.sync.truncated is False
+    assert snapshot.truncated is False
 
 
 async def test_refreshing_one_schema_rereads_only_that_schema() -> None:
@@ -477,12 +532,12 @@ async def test_refreshing_one_schema_rereads_only_that_schema() -> None:
         connection,
         registration=registration,
         sync_id="second",
-        refresh_schemas=("sales",),
-        previous=first,
+        scopes=("sales",),
+        previous=first.detail.entries,
     )
 
     assert sorted(connection.reads) == [("ops", "fresh"), ("sales", "orders")]
-    assert second.sync.truncated is False
+    assert second.truncated is False
     revisions = {item.name: item.current_revision for item in second.resources}
     before = {item.name: item.current_revision for item in first.resources}
     assert set(revisions) == {"orders", "jobs", "fresh"}
@@ -501,19 +556,19 @@ async def test_a_reused_table_at_the_limit_keeps_the_snapshot_truncated() -> Non
     first = await _discover(
         connection, registration=registration, max_columns_per_resource=2
     )
-    assert first.sync.truncated is False
+    assert first.truncated is False
 
     connection.statements.clear()
     second = await _discover(
         connection,
         registration=registration,
         sync_id="second",
-        refresh_schemas=("sales",),
-        previous=first,
+        scopes=("sales",),
+        previous=first.detail.entries,
         max_columns_per_resource=2,
     )
 
-    assert second.sync.truncated is True
+    assert second.truncated is True
     assert connection.reads == [("ops", "jobs")]
     # Every listed table kept its facet, so nothing is read again.
     assert not {"bulk_columns", "bulk_indexes"} & set(connection.statements)

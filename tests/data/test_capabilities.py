@@ -247,8 +247,13 @@ class _Catalog:
             return None
         return schema.source_id, "table", schema.revision
 
+    async def close_table_names(
+        self, agent_id, source_id, relations, *, count, cutoff
+    ) -> tuple[str, ...]:
+        return ()
+
     async def resource_schemas(
-        self, agent_id: str, source_id: str
+        self, agent_id: str, source_id: str, resource_ids=None
     ) -> tuple[ResourceSchema, ...]:
         del agent_id
         schema = self.schemas.get(source_id)
@@ -268,6 +273,7 @@ class _Catalog:
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
+        resource_ids=None,
         *,
         operation: str = "update",
     ) -> frozenset[str]:
@@ -378,11 +384,14 @@ class _FolderCatalog(_Catalog):
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
+        resource_ids=None,
         *,
         operation: str = "update",
     ) -> frozenset[str]:
         return await super().readable_resource_ids(
-            agent_id, tuple(item for item in source_ids if item != _SESSION_SOURCE)
+            agent_id,
+            tuple(item for item in source_ids if item != _SESSION_SOURCE),
+            resource_ids,
         )
 
 

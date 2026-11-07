@@ -7,7 +7,7 @@ CREATE TABLE agent_home_migrations (
 INSERT INTO "agent_home_migrations" VALUES(1,'agent_home_revision_1','a08bdc56e3cb7c3dbe77dc0d8b8ed9aac1299a6a701902dba8e11a5ebe70f25e');
 INSERT INTO "agent_home_migrations" VALUES(2,'0002_durable_adaptive_task_graph','cb98e978fcb6db71cc1cb3ee5532d92ce99117db7359a008a98a4651df1c20e2');
 INSERT INTO "agent_home_migrations" VALUES(3,'0003_framework_caller_authority','3357ee7ad8153e5160d06133082be89dca1e868f1529029f5b63988fae5dca42');
-INSERT INTO "agent_home_migrations" VALUES(4,'0004_foreground_analysis_evidence','616b3b33398146437668d9441c5089952d1d93d6545025a1e8c76981e1a1dfde');
+INSERT INTO "agent_home_migrations" VALUES(4,'0004_foreground_analysis_evidence','4e9acff7f225ed89a6ce7826c78f87997a3de988e6f9e606cbd0afbc1c0b9217');
 CREATE TABLE analysis_evidence (
     agent_id TEXT NOT NULL,
     run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -164,12 +164,59 @@ CREATE TABLE semantic_annotations (
     data TEXT NOT NULL,
     PRIMARY KEY(agent_id, id)
 );
-CREATE TABLE snapshots (
+CREATE TABLE catalog_resources (
     agent_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
-    sync_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    native_identity TEXT NOT NULL,
+    name TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    source_object_id TEXT,
+    detail TEXT NOT NULL CHECK (detail IN ('inventory', 'complete')),
+    last_seen_sync TEXT NOT NULL,
+    first_observed_at TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
     data TEXT NOT NULL,
-    PRIMARY KEY(agent_id, source_id)
+    PRIMARY KEY (agent_id, id)
+);
+CREATE TABLE catalog_relationships (
+    agent_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    from_resource_id TEXT NOT NULL,
+    to_resource_id TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, id)
+);
+CREATE TABLE catalog_changes (
+    agent_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    sync_id TEXT NOT NULL,
+    changed_at TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('added', 'changed', 'removed')),
+    resource_id TEXT NOT NULL,
+    native_identity TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, source_id, sequence)
+);
+CREATE TABLE catalog_source_state (
+    agent_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, source_id)
+);
+CREATE TABLE catalog_search (
+    agent_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    identity_key TEXT NOT NULL,
+    words TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, resource_id)
 );
 CREATE TABLE source_read_scopes (
     agent_id TEXT NOT NULL,
@@ -214,4 +261,15 @@ CREATE INDEX effect_receipts_unresolved
 CREATE INDEX effect_receipts_grant_reservations
     ON effect_receipts(agent_id, occurrence_id, grant_digest);
 CREATE INDEX effect_receipts_by_job ON effect_receipts(agent_id, job_id, unresolved);
+CREATE INDEX catalog_resources_by_source
+    ON catalog_resources(agent_id, source_id, native_identity);
+CREATE INDEX catalog_relationships_by_source
+    ON catalog_relationships(agent_id, source_id);
+CREATE INDEX catalog_relationships_from
+    ON catalog_relationships(agent_id, from_resource_id);
+CREATE INDEX catalog_relationships_to
+    ON catalog_relationships(agent_id, to_resource_id);
+CREATE INDEX catalog_search_by_source ON catalog_search(agent_id, source_id);
+CREATE INDEX catalog_search_by_name ON catalog_search(agent_id, name_key);
+CREATE INDEX catalog_search_by_identity ON catalog_search(agent_id, identity_key);
 COMMIT;

@@ -8,24 +8,24 @@ import re
 import sqlite3
 import stat
 import threading
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from ..catalog.models import (
+    CatalogEntry,
     CatalogFacet,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
-    CatalogSync,
-    CatalogSyncStatus,
+    CatalogTier,
     RelationshipFieldPair,
     RelationshipKind,
     RelationshipProvenance,
+    ResourceBatch,
     ResourceKind,
     Sensitivity,
-    SourceCatalogSnapshot,
     TabularColumn,
     TabularFacet,
     TabularIndex,
@@ -33,7 +33,6 @@ from ..catalog.models import (
 )
 from .models import (
     DiscoveryRequest,
-    DiscoveryResult,
     ResourceRef,
     ResourceSnapshot,
     SourceHealth,
@@ -43,7 +42,7 @@ from .protocols import (
     ResourceAdapterError,
     ResourceNotFoundError,
     SourceClosedError,
-    StaleResourceError,
+    latest_snapshot,
 )
 
 
@@ -128,13 +127,15 @@ class SQLiteResourceAdapter:
         self._clock = clock
         self._lock = asyncio.Lock()
         self._closed = False
-        self._latest: SourceCatalogSnapshot | None = None
+        self._latest: ResourceBatch | None = None
 
     @property
     def registration(self) -> SourceRegistration:
         return self._registration
 
-    async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
+    async def reconcile(
+        self, request: DiscoveryRequest
+    ) -> AsyncIterator[ResourceBatch]:
         self._require_request(request)
         async with self._lock:
             self._require_open()
@@ -145,12 +146,11 @@ class SQLiteResourceAdapter:
                     self._connection,
                     self._registration,
                     request,
-                    self._clock(),
                     cancellation,
                 )
             )
             try:
-                snapshot = await asyncio.shield(worker)
+                batches = await asyncio.shield(worker)
             except asyncio.CancelledError:
                 cancellation.set()
                 while not worker.done():
@@ -161,13 +161,9 @@ class SQLiteResourceAdapter:
                     except BaseException:
                         break
                 raise
-            self._latest = snapshot
-            assert snapshot.sync.completed_at is not None
-            return DiscoveryResult(
-                request=request,
-                snapshot=snapshot,
-                completed_at=snapshot.sync.completed_at,
-            )
+            self._latest = batches[1]
+        for batch in batches:
+            yield batch
 
     async def inspect(self, resource: ResourceRef) -> ResourceSnapshot:
         if not isinstance(resource, ResourceRef):
@@ -182,56 +178,7 @@ class SQLiteResourceAdapter:
                     self._registration.id,
                     resource.resource_id,
                 )
-            snapshot = self._latest
-            if snapshot is None:
-                raise ResourceNotFoundError(
-                    self._registration.id,
-                    resource.resource_id,
-                )
-            current = next(
-                (
-                    item
-                    for item in snapshot.resources
-                    if item.id == resource.resource_id
-                ),
-                None,
-            )
-            if current is None:
-                raise ResourceNotFoundError(
-                    self._registration.id,
-                    resource.resource_id,
-                )
-            if resource.revision is not None and (
-                resource.revision != current.current_revision
-            ):
-                raise StaleResourceError(
-                    self._registration.id,
-                    resource.resource_id,
-                )
-            revision = next(
-                item for item in snapshot.revisions if item.resource_id == current.id
-            )
-            return ResourceSnapshot(
-                reference=resource,
-                resource=current,
-                revision=revision,
-                facets=tuple(
-                    facet
-                    for facet in snapshot.facets
-                    if facet.resource_id == current.id
-                ),
-                relationships=tuple(
-                    relationship
-                    for relationship in snapshot.relationships
-                    if current.id
-                    in {
-                        relationship.from_resource_id,
-                        relationship.to_resource_id,
-                    }
-                ),
-                inspected_at=self._clock(),
-                source_revision=revision.source_revision,
-            )
+            return latest_snapshot(self._latest, resource, self._clock())
 
     async def health(self) -> SourceHealth:
         async with self._lock:
@@ -355,11 +302,8 @@ def _discover(
     connection: sqlite3.Connection,
     registration: SourceRegistration,
     request: DiscoveryRequest,
-    completed_at: datetime,
     cancellation: threading.Event,
-) -> SourceCatalogSnapshot:
-    if completed_at < request.requested_at:
-        completed_at = request.requested_at
+) -> tuple[ResourceBatch, ResourceBatch]:
     connection.set_progress_handler(lambda: int(cancellation.is_set()), 500)
     try:
         connection.execute("BEGIN")
@@ -376,6 +320,23 @@ def _discover(
                 ),
                 key=lambda row: (str(row["name"]), str(row["type"])),
             )
+        )
+        inventory = ResourceBatch(
+            tier=CatalogTier.INVENTORY,
+            entries=tuple(
+                request.inventory_entry(
+                    kind=(
+                        ResourceKind.TABLE
+                        if row["type"] == "table"
+                        else ResourceKind.VIEW
+                    ),
+                    native_identity=_native_identity(str(row["name"])),
+                    name=str(row["name"]),
+                    external_uri=f"sqlite://{request.source_id}/main/{row['name']}",
+                )
+                for row in visible[: request.max_inventory]
+            ),
+            truncated=len(visible) > request.max_inventory,
         )
         truncated = len(visible) > request.max_resources
         visible = visible[: request.max_resources]
@@ -421,61 +382,47 @@ def _discover(
         )
         truncated |= relationships_cut
         source_revision = f"schema_version:{schema_version}"
-        revisions: list[CatalogResourceRevision] = []
-        resources: list[CatalogResource] = []
+        entries: list[CatalogEntry] = []
         for fact in facts:
             resource_id = fact.facet.resource_id
-            linked_relationships = tuple(
-                relationship.revision
-                for relationship in relationships
-                if resource_id
-                in {
-                    relationship.from_resource_id,
-                    relationship.to_resource_id,
-                }
-            )
             revision = CatalogResourceRevision.build(
                 resource_id=resource_id,
                 sync_id=request.sync_id,
                 observed_at=request.requested_at,
                 facet_revisions=(fact.facet.revision,),
-                relationship_revisions=linked_relationships,
+                relationship_revisions=tuple(
+                    relationship.revision
+                    for relationship in relationships
+                    if resource_id
+                    in {relationship.from_resource_id, relationship.to_resource_id}
+                ),
                 source_revision=source_revision,
             )
-            revisions.append(revision)
-            resources.append(
-                CatalogResource.build(
-                    agent_id=request.agent_id,
-                    source_id=request.source_id,
-                    native_identity=_native_identity(fact.name),
-                    external_uri=f"sqlite://{request.source_id}/main/{fact.name}",
-                    kind=fact.kind,
-                    name=fact.name,
-                    sensitivity=Sensitivity.INTERNAL,
+            entries.append(
+                CatalogEntry(
+                    resource=CatalogResource.build(
+                        agent_id=request.agent_id,
+                        source_id=request.source_id,
+                        native_identity=_native_identity(fact.name),
+                        external_uri=f"sqlite://{request.source_id}/main/{fact.name}",
+                        kind=fact.kind,
+                        name=fact.name,
+                        sensitivity=Sensitivity.INTERNAL,
+                        revision=revision,
+                        first_observed_at=request.requested_at,
+                        last_observed_at=request.requested_at,
+                    ),
                     revision=revision,
-                    first_observed_at=request.requested_at,
-                    last_observed_at=request.requested_at,
+                    facets=(fact.facet,),
+                    detailed=True,
                 )
             )
-        sync = CatalogSync(
-            id=request.sync_id,
-            agent_id=request.agent_id,
-            source_id=request.source_id,
-            adapter_id="sqlite",
-            status=CatalogSyncStatus.SUCCEEDED,
-            started_at=request.requested_at,
-            completed_at=completed_at,
-            source_revision=source_revision,
-            resource_count=len(resources),
-            relationship_count=len(relationships),
-            truncated=truncated,
-        )
-        return SourceCatalogSnapshot(
-            sync=sync,
-            resources=tuple(resources),
-            revisions=tuple(revisions),
-            facets=tuple(fact.facet for fact in facts),
+        return inventory, ResourceBatch(
+            tier=CatalogTier.DETAIL,
+            entries=tuple(entries),
             relationships=relationships,
+            truncated=truncated,
+            source_revision=source_revision,
         )
     finally:
         connection.set_progress_handler(None, 0)

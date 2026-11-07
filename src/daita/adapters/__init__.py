@@ -5,7 +5,6 @@
 # isort: off
 from .models import (
     DiscoveryRequest,
-    DiscoveryResult,
     ResourceRef,
     ResourceSnapshot,
     LinkCheck,
@@ -54,7 +53,6 @@ from .postgresql_query import PostgreSQLQueryBackend, PostgreSQLQueryError
 
 __all__ = [
     "DiscoveryRequest",
-    "DiscoveryResult",
     "MCPAdmissionError",
     "MCPAuthentication",
     "MCPAuthenticationMode",

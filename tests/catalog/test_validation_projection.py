@@ -10,7 +10,6 @@ from tests.catalog._schema_support import (
     SQLiteSource,
     TabularFacet,
     _commit_schema_graph,
-    catalog_service,
     pytest,
     sqlite3,
     workspace_for,
@@ -41,42 +40,19 @@ async def test_validation_schemas_use_one_bulk_current_generation(
         data_view = agent._embedded._data_view
         store = agent._embedded._store
         original_bulk = service.tabular_resources
-        original_refs = store.list_current_snapshot_refs
-        original_snapshot = store.load_current_snapshot
-        original_compile = catalog_service._compile_source_index
-        counts = {
-            "bulk": 0,
-            "refs": 0,
-            "snapshot": 0,
-            "compile": 0,
-        }
+        counts = {"bulk": 0}
         projected = []
 
-        async def counting_bulk(agent_id: str, source_id: str):
+        async def counting_bulk(agent_id: str, source_id: str, **lookup):
             counts["bulk"] += 1
-            result = await original_bulk(agent_id, source_id)
+            result = await original_bulk(agent_id, source_id, **lookup)
             projected.append(result)
             return result
-
-        async def counting_refs(agent_id: str, source_ids: tuple[str, ...]):
-            counts["refs"] += 1
-            return await original_refs(agent_id, source_ids)
-
-        async def counting_snapshot(ref):
-            counts["snapshot"] += 1
-            return await original_snapshot(ref)
-
-        def counting_compile(snapshot):
-            counts["compile"] += 1
-            return original_compile(snapshot)
 
         async def legacy_read(*args, **kwargs):
             pytest.fail("validation schemas performed a superseded store read")
 
         monkeypatch.setattr(service, "tabular_resources", counting_bulk)
-        monkeypatch.setattr(store, "list_current_snapshot_refs", counting_refs)
-        monkeypatch.setattr(store, "load_current_snapshot", counting_snapshot)
-        monkeypatch.setattr(catalog_service, "_compile_source_index", counting_compile)
         for method_name in (
             "list_resources",
             "load_resource",
@@ -90,12 +66,7 @@ async def test_validation_schemas_use_one_bulk_current_generation(
         second = await data_view.resource_schemas(agent.id, source.id)
 
         assert first == second
-        assert counts == {
-            "bulk": 2,
-            "refs": 4,
-            "snapshot": 1,
-            "compile": 1,
-        }
+        assert counts == {"bulk": 2}
         assert tuple(item.name for item in first) == ("account_lookup", "accounts")
         by_name = {item.name: item for item in first}
         assert by_name["accounts"].columns == ("account_id", "email", "status")
@@ -122,12 +93,9 @@ async def test_validation_schemas_use_one_bulk_current_generation(
             assert item.sync.source_id == source.id
             assert item.resource.agent_id == agent.id
             assert item.resource.source_id == source.id
-            assert item.resource.current_sync_id == item.sync.id
             assert item.revision.resource_id == item.resource.id
             assert item.revision.revision == item.resource.current_revision
-            assert item.revision.sync_id == item.sync.id
             assert item.facet.resource_id == item.resource.id
-            assert item.facet.sync_id == item.sync.id
             assert item.facet.revision in item.revision.facet_revisions
             assert item.facet.kind.value == "tabular"
             assert item.tabular == TabularFacet.from_payload(item.facet.payload)
@@ -177,10 +145,6 @@ async def test_validation_projection_enforces_active_source_and_agent_isolation(
         await first.detach(first_source.id)
         with pytest.raises(CatalogStoreError, match="unknown active catalog source"):
             await first_service.tabular_resources(first.id, first_source.id)
-        assert all(
-            key[:2] != (first.id, first_source.id)
-            for key in first_service._source_indexes
-        )
     finally:
         await first.close()
         await second.close()

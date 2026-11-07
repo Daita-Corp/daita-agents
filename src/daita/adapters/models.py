@@ -12,12 +12,13 @@ from typing import TypeVar
 
 from .._json import FrozenJsonObject, canonical_json
 from ..catalog.models import (
+    CatalogEntry,
     CatalogFacet,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
     ResourceKind,
-    SourceCatalogSnapshot,
+    Sensitivity,
     catalog_resource_id,
 )
 from ..llm.models import ModelSensitivity
@@ -179,6 +180,7 @@ class DiscoveryRequest:
     source_id: str
     sync_id: str
     requested_at: datetime
+    # Detailed resources per pass; the inventory is bounded by max_inventory.
     max_resources: int = 1_000
     max_columns_per_resource: int = 512
     max_indexes_per_resource: int = 256
@@ -187,20 +189,22 @@ class DiscoveryRequest:
     # read or catalog; None for hosts without a local agent home.
     agent_root: Path | None = None
     agent_home: Path | None = None
-    # PostgreSQL only; SQLite and folder sources ignore both. With a previous
-    # snapshot, tables outside these schemas keep their columns and indexes
-    # from it instead of being read again. Empty means every schema is read.
-    refresh_schemas: tuple[str, ...] = ()
-    previous: SourceCatalogSnapshot | None = field(
+    # With previous entries, resources outside these scopes (a PostgreSQL
+    # schema; SQLite and folder sources ignore both) keep their detail from
+    # them instead of being read again. Empty means every scope is read.
+    scopes: tuple[str, ...] = ()
+    previous: tuple[CatalogEntry, ...] | None = field(
         default=None, repr=False, compare=False
     )
+    max_inventory: int = 1_000_000
 
     def __post_init__(self) -> None:
         _text(self.agent_id, "discovery agent_id")
         _text(self.source_id, "discovery source_id")
         _text(self.sync_id, "discovery sync_id")
         _aware(self.requested_at, "discovery requested_at")
-        _bounded_int(self.max_resources, "discovery max_resources", 10_000)
+        _bounded_int(self.max_resources, "discovery max_resources", 100_000)
+        _bounded_int(self.max_inventory, "discovery max_inventory", 1_000_000)
         _bounded_int(
             self.max_columns_per_resource,
             "discovery max_columns_per_resource",
@@ -221,47 +225,56 @@ class DiscoveryRequest:
             for item in (self.agent_root, self.agent_home)
         ):
             raise ValueError("discovery agent state paths must be absolute together")
-        if not isinstance(self.refresh_schemas, tuple):
-            raise TypeError("discovery refresh_schemas must be a tuple")
-        for schema in self.refresh_schemas:
-            _text(schema, "discovery refresh schema")
+        if not isinstance(self.scopes, tuple):
+            raise TypeError("discovery scopes must be a tuple")
+        for scope in self.scopes:
+            _text(scope, "discovery scope")
         if self.previous is not None and (
-            not isinstance(self.previous, SourceCatalogSnapshot)
-            or self.previous.sync.agent_id != self.agent_id
-            or self.previous.sync.source_id != self.source_id
+            not isinstance(self.previous, tuple)
+            or any(
+                not isinstance(entry, CatalogEntry)
+                or entry.resource.agent_id != self.agent_id
+                or entry.resource.source_id != self.source_id
+                for entry in self.previous
+            )
         ):
-            raise ValueError("discovery previous snapshot belongs to another source")
+            raise ValueError("discovery previous entries belong to another source")
 
+    def inventory_entry(
+        self,
+        *,
+        kind: ResourceKind,
+        native_identity: str,
+        name: str,
+        external_uri: str,
+        sensitivity: Sensitivity = Sensitivity.INTERNAL,
+        source_object_id: str | None = None,
+    ) -> CatalogEntry:
+        """A listed resource with a name and no detail."""
 
-@dataclass(frozen=True, slots=True)
-class DiscoveryResult:
-    request: DiscoveryRequest
-    snapshot: SourceCatalogSnapshot
-    completed_at: datetime
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.request, DiscoveryRequest):
-            raise TypeError("discovery result request must be DiscoveryRequest")
-        if not isinstance(self.snapshot, SourceCatalogSnapshot):
-            raise TypeError("discovery result snapshot must be SourceCatalogSnapshot")
-        _aware(self.completed_at, "discovery completed_at")
-        if self.completed_at < self.request.requested_at:
-            raise ValueError("discovery cannot complete before it was requested")
-        sync = self.snapshot.sync
-        if sync.agent_id != self.request.agent_id:
-            raise ValueError("discovery snapshot belongs to another agent")
-        if sync.source_id != self.request.source_id:
-            raise ValueError("discovery snapshot belongs to another source")
-        if sync.id != self.request.sync_id:
-            raise ValueError("discovery snapshot belongs to another sync")
-        if sync.started_at != self.request.requested_at:
-            raise ValueError("discovery sync start does not match the request")
-        if sync.completed_at != self.completed_at:
-            raise ValueError("discovery completion does not match the snapshot")
-        if len(self.snapshot.resources) > self.request.max_resources:
-            raise ValueError("discovery result exceeds max_resources")
-        if len(self.snapshot.relationships) > self.request.max_relationships:
-            raise ValueError("discovery result exceeds max_relationships")
+        revision = CatalogResourceRevision.build(
+            resource_id=catalog_resource_id(self.source_id, kind, native_identity),
+            sync_id=self.sync_id,
+            observed_at=self.requested_at,
+        )
+        return CatalogEntry(
+            resource=CatalogResource.build(
+                agent_id=self.agent_id,
+                source_id=self.source_id,
+                native_identity=native_identity,
+                external_uri=external_uri,
+                kind=kind,
+                name=name,
+                sensitivity=sensitivity,
+                revision=revision,
+                first_observed_at=self.requested_at,
+                last_observed_at=self.requested_at,
+            ),
+            revision=revision,
+            facets=(),
+            detailed=False,
+            source_object_id=source_object_id,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,7 +481,6 @@ class LinkCheck:
 
 __all__ = [
     "DiscoveryRequest",
-    "DiscoveryResult",
     "LinkCheck",
     "ResourceRef",
     "ResourceSnapshot",

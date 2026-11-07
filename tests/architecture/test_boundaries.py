@@ -4,8 +4,6 @@ from collections.abc import Iterable, Mapping
 from functools import cache
 from pathlib import Path
 
-import pytest
-
 import daita
 from daita.capabilities import AccessMode, CallTargetLane, OperationalEffect
 from daita.host.protocol import CLIENT_ONLY_MEMBERS
@@ -1215,8 +1213,7 @@ def test_durable_state_contract_composes_domain_owned_interfaces():
         )
     )
     declared = _class_methods(PACKAGE / "storage/protocols.py", "StateStore")
-    # The composition extends snapshot publication with atomic registration.
-    assert declared & inherited == {"commit_snapshot"}
+    assert declared & inherited == set()
     for path in ("jobs/supervisor.py", "routines/supervisor.py"):
         assert "storage.sqlite" not in _imports(PACKAGE / path)
         assert "storage.protocols" not in _imports(PACKAGE / path)
@@ -2070,20 +2067,22 @@ def test_catalog_describe_extends_existing_catalog_and_capability_owners():
         assert prohibited not in _python_text(PACKAGE)
 
 
-def test_catalog_snapshot_reuse_is_private_derived_storage_state():
-    assert _class_owners("CatalogSnapshotRef") == {"catalog/models.py"}
-    assert "CatalogSnapshotRef" not in daita.__all__
+def test_catalog_is_stored_per_resource_without_a_decoded_cache():
     protocol_methods = _class_methods(
         PACKAGE / "catalog" / "protocols.py",
         "CatalogStore",
     )
-    assert {
-        "list_current_snapshot_refs",
-        "load_current_snapshot",
-    } <= protocol_methods
-    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
-    assert "_decoded_catalog_snapshots" in storage
-    assert "CREATE TABLE IF NOT EXISTS decoded_catalog_snapshots" not in storage
+    assert {"commit_catalog", "search_catalog", "current_syncs"} <= protocol_methods
+    assert (
+        not {
+            "commit_snapshot",
+            "list_current_snapshot_refs",
+            "load_current_snapshot",
+        }
+        & protocol_methods
+    )
+    storage = _python_text(PACKAGE / "storage")
+    assert "_decoded_catalog_snapshots" not in storage
     for prohibited in (
         "CatalogSchemaCache",
         "CatalogSearchService",
@@ -2102,19 +2101,26 @@ def test_catalog_indexed_retrieval_is_private_and_catalog_owned():
         PACKAGE / "storage" / "sqlite.py",
         "SQLiteStateStore",
     )
-    service = (PACKAGE / "catalog" / "service.py").read_text(encoding="utf-8")
     storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
     loop = _python_text(PACKAGE / "loop")
 
     assert "search" not in protocol_methods
     assert "search" not in storage_methods
-    assert "_SourceCatalogIndex" in service
-    assert "_source_indexes" in service
-    assert "_compile_source_index" in service
+    service_class = next(
+        node
+        for node in _tree(PACKAGE / "catalog" / "service.py").body
+        if isinstance(node, ast.ClassDef) and node.name == "CatalogService"
+    )
+    init = next(
+        node
+        for node in service_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    kept = [node.value for node in ast.walk(init) if isinstance(node, ast.Assign)]
+    # The service reads the store on every call and keeps no per-source cache.
+    assert not any(isinstance(value, (ast.Dict, ast.List, ast.Set)) for value in kept)
     assert "_catalog_search_reason" not in storage
-    assert "_SourceCatalogIndex" not in storage
     assert "CatalogSearchHit" not in storage
-    assert "_SourceCatalogIndex" not in loop
     assert "CatalogMatchOutcome" not in loop
     assert "TargetPosture" not in _python_text(PACKAGE)
     assert "target_posture" not in _python_text(PACKAGE)
@@ -2147,7 +2153,6 @@ def test_catalog_bounded_traversal_is_catalog_owned_and_not_storage_owned():
     assert "traverse" not in storage_methods
     assert "load_relationships" not in protocol_methods
     assert "load_relationships" not in storage_methods
-    assert "_traverse_indexes" in service
     assert "distance_by_resource" in service
     assert "parents_by_resource" in service
     assert "deque(admitted_sources)" in service

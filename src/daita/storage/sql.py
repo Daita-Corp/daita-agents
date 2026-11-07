@@ -42,16 +42,21 @@ from ..capabilities import (
 )
 from ..catalog.models import (
     CATALOG_MAX_LINKS,
+    CatalogChange,
+    CatalogCommitSummary,
+    CatalogEntry,
     CatalogFacet,
     CatalogLink,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
-    CatalogSnapshotRef,
+    CatalogSearchRow,
+    CatalogSourceState,
     CatalogSummary,
     CatalogSync,
     RelationshipKind,
-    SourceCatalogSnapshot,
+    ResourceBatch,
+    ResourceKind,
 )
 from ..catalog.protocols import CatalogStoreError
 from ..distribution.models import (
@@ -103,7 +108,7 @@ from ..semantics import (
     SemanticValidationError,
     semantic_annotation_sha256,
 )
-from . import sql_jobs as _job_store, sql_routines as _routine_store
+from . import catalog_rows, sql_jobs as _job_store, sql_routines as _routine_store
 from .sql_connection import (
     SQLConnection,
     SQLDatabase,
@@ -119,7 +124,6 @@ from .sql_routines import (
 )
 from .sqlite_codecs import (
     decode_catalog_link,
-    decode_catalog_snapshot,
     decode_catalog_sync,
     decode_delivery,
     decode_identity,
@@ -136,7 +140,6 @@ from .sqlite_codecs import (
     decode_source_configuration_for_deletion,
     decode_source_read_scope,
     encode_catalog_link,
-    encode_catalog_snapshot,
     encode_catalog_sync,
     encode_delivery,
     encode_identity,
@@ -174,7 +177,6 @@ from .sqlite_records import (
     validate_effect_receipt_id,
 )
 
-_CATALOG_SNAPSHOT_SOURCE_FILTER_BATCH = 64
 _T = TypeVar("_T")
 
 
@@ -249,24 +251,28 @@ def _require_nonforeign_read_resources(
     connection: SQLConnection,
     scope: SourceReadScope,
 ) -> None:
-    requested = set(scope.resource_ids)
-    if not requested:
-        return
-    for (data,) in connection.execute(
-        "SELECT data FROM snapshots WHERE agent_id = ?",
-        (scope.agent_id,),
-    ):
-        try:
-            snapshot = decode_catalog_snapshot(data)
-        except (TypeError, ValueError):
-            # A resource ID hashes its source, so a row the catalog cannot read
-            # cannot make this source's reads foreign; the catalog only advises.
-            continue
-        for resource in snapshot.resources:
-            if resource.id in requested and resource.source_id != scope.source_id:
-                raise SourcePermissionStateError(
-                    "active source read scope contains a foreign resource"
-                )
+    requested = sorted(set(scope.resource_ids))
+    foreign = _fetch_foreign(connection, scope, requested)
+    if foreign:
+        raise SourcePermissionStateError(
+            "active source read scope contains a foreign resource"
+        )
+
+
+def _fetch_foreign(
+    connection: SQLConnection, scope: SourceReadScope, requested: list[str]
+) -> bool:
+    # A resource ID hashes its source, so a damaged row cannot make reads foreign.
+    for start in range(0, len(requested), 400):
+        chunk = requested[start : start + 400]
+        marks = ", ".join("?" * len(chunk))
+        if connection.execute(
+            "SELECT 1 FROM catalog_resources WHERE agent_id = ? "
+            f"AND id IN ({marks}) AND source_id <> ?",
+            (scope.agent_id, *chunk, scope.source_id),
+        ).fetchone():
+            return True
+    return False
 
 
 def _decode_source_state(
@@ -318,6 +324,85 @@ def _source_state_row(
     ).fetchone()
 
 
+def _attach_registration(
+    connection: SQLConnection, registration: SourceRegistration
+) -> None:
+    """First attach inserts the source and an allow-all scope; re-attach follows the rules."""
+
+    stored_registration = registration
+    row = _source_state_row(
+        connection,
+        stored_registration.agent_id,
+        stored_registration.id,
+    )
+    if row is None:
+        connection.execute(
+            "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
+            (
+                stored_registration.agent_id,
+                stored_registration.id,
+                encode_source(stored_registration),
+            ),
+        )
+        if stored_registration.active:
+            attach_scope = SourceReadScope.allow_all(
+                agent_id=stored_registration.agent_id,
+                source_id=stored_registration.id,
+            )
+            connection.execute(
+                """INSERT INTO source_read_scopes(
+                       agent_id, source_id, data
+                   ) VALUES (?, ?, ?)""",
+                (
+                    stored_registration.agent_id,
+                    stored_registration.id,
+                    encode_source_read_scope(attach_scope),
+                ),
+            )
+    else:
+        current = _decode_source_state(
+            connection,
+            row_agent_id=row[0],
+            row_source_id=row[1],
+            source_data=row[2],
+            read_scope_data=row[3],
+            update_scope_count=row[4],
+        )
+        if current != stored_registration:
+            if (
+                current.active
+                or not stored_registration.active
+                or current.adapter_id != stored_registration.adapter_id
+                or current.native_identity != stored_registration.native_identity
+            ):
+                raise ValueError(
+                    "source registration already exists: " f"{stored_registration.id}"
+                )
+            connection.execute(
+                """UPDATE sources SET data = ?
+                   WHERE agent_id = ? AND id = ?""",
+                (
+                    encode_source(stored_registration),
+                    stored_registration.agent_id,
+                    stored_registration.id,
+                ),
+            )
+            attach_scope = SourceReadScope.allow_all(
+                agent_id=stored_registration.agent_id,
+                source_id=stored_registration.id,
+            )
+            connection.execute(
+                """INSERT INTO source_read_scopes(
+                       agent_id, source_id, data
+                   ) VALUES (?, ?, ?)""",
+                (
+                    stored_registration.agent_id,
+                    stored_registration.id,
+                    encode_source_read_scope(attach_scope),
+                ),
+            )
+
+
 class _CatalogCommitGate:
     """Linearize task cancellation against one state mutation transaction."""
 
@@ -359,14 +444,13 @@ class SQLStateStore:
     ) -> None:
         self._database = database
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._decoded_catalog_snapshots: dict[
-            tuple[str, str, str], SourceCatalogSnapshot
-        ] = {}
-        self._decoded_catalog_snapshot_lock = asyncio.Lock()
+        self._unreadable: set[tuple[str, str]] = set()
+        self._damaged: set[tuple[str, str]] = set()  # (agent_id, row id)
+        self._unreadable_lock = threading.Lock()
 
     async def close(self) -> None:
-        async with self._decoded_catalog_snapshot_lock:
-            self._decoded_catalog_snapshots.clear()
+        with self._unreadable_lock:
+            self._unreadable.clear()
 
     async def recover_started_effect_receipts(
         self, agent_id: str, *, recovered_at: datetime
@@ -1912,10 +1996,7 @@ class SQLStateStore:
             )
             return detached
 
-        detached = await run_sql_transaction(self._database, write)
-        async with self._decoded_catalog_snapshot_lock:
-            self._evict_decoded_catalog_source(agent_id, source_id)
-        return detached
+        return await run_sql_transaction(self._database, write)
 
     async def record_sync(self, sync: CatalogSync) -> CatalogSync:
         def write(connection: SQLConnection) -> CatalogSync:
@@ -1934,157 +2015,74 @@ class SQLStateStore:
 
         return await run_sql_transaction(self._database, write)
 
-    async def commit_snapshot(
+    async def commit_catalog(
         self,
-        snapshot: SourceCatalogSnapshot,
+        sync: CatalogSync,
+        batches: tuple[ResourceBatch, ...],
         *,
         registration: SourceRegistration | None = None,
-    ) -> SourceCatalogSnapshot:
-        sync = snapshot.sync
+        full: bool = True,
+    ) -> CatalogCommitSummary:
         if registration is not None and (
             registration.agent_id != sync.agent_id or registration.id != sync.source_id
         ):
-            raise ValueError("catalog snapshot and source registration disagree")
+            raise ValueError("catalog sync and source registration disagree")
 
-        def write(connection: SQLConnection) -> SourceCatalogSnapshot:
+        repair = self._damaged_rows(sync.agent_id)
+
+        def write(connection: SQLConnection) -> CatalogCommitSummary:
             if registration is not None:
-                stored_registration = registration
-                row = _source_state_row(
-                    connection,
-                    stored_registration.agent_id,
-                    stored_registration.id,
-                )
-                if row is None:
-                    connection.execute(
-                        "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
-                        (
-                            stored_registration.agent_id,
-                            stored_registration.id,
-                            encode_source(stored_registration),
-                        ),
-                    )
-                    if stored_registration.active:
-                        attach_scope = SourceReadScope.allow_all(
-                            agent_id=stored_registration.agent_id,
-                            source_id=stored_registration.id,
-                        )
-                        connection.execute(
-                            """INSERT INTO source_read_scopes(
-                                   agent_id, source_id, data
-                               ) VALUES (?, ?, ?)""",
-                            (
-                                stored_registration.agent_id,
-                                stored_registration.id,
-                                encode_source_read_scope(attach_scope),
-                            ),
-                        )
-                else:
-                    current = _decode_source_state(
-                        connection,
-                        row_agent_id=row[0],
-                        row_source_id=row[1],
-                        source_data=row[2],
-                        read_scope_data=row[3],
-                        update_scope_count=row[4],
-                    )
-                    if current != stored_registration:
-                        if (
-                            current.active
-                            or not stored_registration.active
-                            or current.adapter_id != stored_registration.adapter_id
-                            or current.native_identity
-                            != stored_registration.native_identity
-                        ):
-                            raise ValueError(
-                                "source registration already exists: "
-                                f"{stored_registration.id}"
-                            )
-                        connection.execute(
-                            """UPDATE sources SET data = ?
-                               WHERE agent_id = ? AND id = ?""",
-                            (
-                                encode_source(stored_registration),
-                                stored_registration.agent_id,
-                                stored_registration.id,
-                            ),
-                        )
-                        attach_scope = SourceReadScope.allow_all(
-                            agent_id=stored_registration.agent_id,
-                            source_id=stored_registration.id,
-                        )
-                        connection.execute(
-                            """INSERT INTO source_read_scopes(
-                                   agent_id, source_id, data
-                               ) VALUES (?, ?, ?)""",
-                            (
-                                stored_registration.agent_id,
-                                stored_registration.id,
-                                encode_source_read_scope(attach_scope),
-                            ),
-                        )
-            connection.execute(
-                f"""INSERT INTO syncs(agent_id, id, source_id, data)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT({connection.conflict('agent_id, id')}) DO UPDATE SET data = excluded.data""",
-                (
-                    sync.agent_id,
-                    sync.id,
-                    sync.source_id,
-                    encode_catalog_sync(sync),
-                ),
+                _attach_registration(connection, registration)
+            return catalog_rows.commit_pass(
+                connection,
+                sync,
+                batches,
+                full=full,
+                note=self._note_for(sync.agent_id),
+                repair=repair,
             )
-            connection.execute(
-                f"""INSERT INTO snapshots(agent_id, source_id, sync_id, data)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT({connection.conflict('agent_id, source_id')}) DO UPDATE SET
-                     sync_id = excluded.sync_id, data = excluded.data""",
-                (
-                    sync.agent_id,
-                    sync.source_id,
-                    sync.id,
-                    encode_catalog_snapshot(snapshot),
-                ),
-            )
-            return snapshot
 
-        committed = await run_sql_transaction(
+        summary = await run_sql_transaction(
             self._database, write, commit=_commit_catalog_transaction
         )
-        async with self._decoded_catalog_snapshot_lock:
-            self._publish_decoded_catalog_snapshot(committed)
-        return committed
+        self._repaired(sync.agent_id, repair)
+        return summary
 
     async def commit_source_edit(
         self,
-        snapshot: SourceCatalogSnapshot,
+        sync: CatalogSync,
+        batches: tuple[ResourceBatch, ...],
         *,
         registration: SourceRegistration,
         replaced_source_id: str,
         replaced_at: datetime,
         read_scope: SourceReadScope,
-    ) -> SourceCatalogSnapshot:
+    ) -> CatalogCommitSummary:
         """Atomically hand one active source connection to discovered truth."""
 
         if not isinstance(registration, SourceRegistration) or not registration.active:
             raise ValueError("source edit requires an active replacement registration")
         if not isinstance(replaced_source_id, str) or not replaced_source_id:
             raise ValueError("replaced_source_id must be a non-empty string")
-        sync = snapshot.sync
         if registration.agent_id != sync.agent_id or registration.id != sync.source_id:
-            raise ValueError("catalog snapshot and replacement registration disagree")
+            raise ValueError("catalog sync and replacement registration disagree")
         if (
             read_scope.agent_id != registration.agent_id
             or read_scope.source_id != registration.id
         ):
             raise ValueError("replacement read scope belongs to another source")
-        snapshot_resource_ids = {resource.id for resource in snapshot.resources}
+        pass_resource_ids = {
+            entry.resource.id for batch in batches for entry in batch.entries
+        }
         if (
             read_scope.mode is SourceReadMode.SELECTED
-            and not set(read_scope.resource_ids) <= snapshot_resource_ids
+            and not set(read_scope.resource_ids) <= pass_resource_ids
         ):
             raise ValueError("replacement read scope is outside discovered catalog")
 
-        def write(connection: SQLConnection) -> SourceCatalogSnapshot:
+        repair = self._damaged_rows(sync.agent_id)
+
+        def write(connection: SQLConnection) -> CatalogCommitSummary:
             replaced_row = _source_state_row(
                 connection,
                 registration.agent_id,
@@ -2187,173 +2185,83 @@ class SQLStateStore:
                     encode_source_read_scope(read_scope),
                 ),
             )
-            connection.execute(
-                f"""INSERT INTO syncs(agent_id, id, source_id, data)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT({connection.conflict('agent_id, id')}) DO UPDATE SET data = excluded.data""",
-                (
-                    sync.agent_id,
-                    sync.id,
-                    sync.source_id,
-                    encode_catalog_sync(sync),
-                ),
+            return catalog_rows.commit_pass(
+                connection,
+                sync,
+                batches,
+                full=True,
+                note=self._note_for(sync.agent_id),
+                repair=repair,
             )
-            connection.execute(
-                f"""INSERT INTO snapshots(agent_id, source_id, sync_id, data)
-                   VALUES (?, ?, ?, ?)
-                   ON CONFLICT({connection.conflict('agent_id, source_id')}) DO UPDATE SET
-                     sync_id = excluded.sync_id, data = excluded.data""",
-                (
-                    sync.agent_id,
-                    sync.source_id,
-                    sync.id,
-                    encode_catalog_snapshot(snapshot),
-                ),
-            )
-            return snapshot
 
-        committed = await run_sql_transaction(
+        summary = await run_sql_transaction(
             self._database, write, commit=_commit_catalog_transaction
         )
-        async with self._decoded_catalog_snapshot_lock:
-            self._evict_decoded_catalog_source(
-                registration.agent_id,
-                replaced_source_id,
-            )
-            self._publish_decoded_catalog_snapshot(committed)
-        return committed
+        self._repaired(sync.agent_id, repair)
+        return summary
 
-    async def list_current_snapshot_refs(
-        self,
-        agent_id: str,
-        source_ids: tuple[str, ...],
-    ) -> tuple[CatalogSnapshotRef, ...]:
-        _catalog_identifier(agent_id, "catalog snapshot agent_id")
-        selected_source_ids = _catalog_snapshot_source_ids(source_ids)
+    async def take_unreadable_catalog_sources(self, agent_id: str) -> tuple[str, ...]:
+        with self._unreadable_lock:
+            taken = sorted(s for a, s in self._unreadable if a == agent_id)
+            self._unreadable -= {(agent_id, s) for s in taken}
+        return tuple(taken)
 
-        def read() -> tuple[CatalogSnapshotRef, ...]:
+    async def _catalog_read(
+        self, agent_id: str, read: Callable[[SQLConnection, catalog_rows.Note], _T]
+    ) -> _T:
+        _catalog_identifier(agent_id, "catalog agent_id")
+
+        def run() -> _T:
             with _connect_read_only(self._database) as connection:
-                if not selected_source_ids:
-                    rows = connection.execute(
-                        "SELECT agent_id, source_id, sync_id FROM snapshots "
-                        "WHERE agent_id = ? ORDER BY source_id, sync_id",
-                        (agent_id,),
-                    ).fetchall()
-                else:
-                    rows = []
-                    for offset in range(
-                        0,
-                        len(selected_source_ids),
-                        _CATALOG_SNAPSHOT_SOURCE_FILTER_BATCH,
-                    ):
-                        batch = selected_source_ids[
-                            offset : offset + _CATALOG_SNAPSHOT_SOURCE_FILTER_BATCH
-                        ]
-                        placeholders = ", ".join("?" for _ in batch)
-                        rows.extend(
-                            connection.execute(
-                                "SELECT agent_id, source_id, sync_id FROM snapshots "
-                                f"WHERE agent_id = ? AND source_id IN ({placeholders})",
-                                (agent_id, *batch),
-                            ).fetchall()
-                        )
-            return tuple(
-                CatalogSnapshotRef(
-                    agent_id=row_agent_id,
-                    source_id=source_id,
-                    sync_id=sync_id,
-                )
-                for row_agent_id, source_id, sync_id in sorted(
-                    rows,
-                    key=lambda item: (item[1], item[2]),
-                )
-            )
+                return read(connection, self._note_for(agent_id))
 
-        return await settled_thread(read)
+        return await settled_thread(run)
 
-    async def list_unreadable_snapshot_source_ids(
-        self, agent_id: str
-    ) -> tuple[str, ...]:
-        """Sources whose stored snapshot cannot be read, so a refresh can replace it."""
+    def _note_for(self, agent_id: str) -> catalog_rows.Note:
+        return lambda source_id, row_id: self._note(agent_id, source_id, row_id)
 
-        def read() -> tuple[str, ...]:
-            with _connect_read_only(self._database) as connection:
-                rows = connection.execute(
-                    "SELECT source_id, sync_id, data FROM snapshots "
-                    "WHERE agent_id = ? ORDER BY source_id",
-                    (agent_id,),
-                ).fetchall()
-            unreadable: list[str] = []
-            for source_id, sync_id, data in rows:
-                try:
-                    sync = decode_catalog_snapshot(data).sync
-                except (TypeError, ValueError):
-                    unreadable.append(source_id)
-                    continue
-                if (sync.agent_id, sync.source_id, sync.id) != (
-                    agent_id,
-                    source_id,
-                    sync_id,
-                ):
-                    unreadable.append(source_id)
-            return tuple(unreadable)
+    def _note(self, agent_id: str, source_id: str, row_id: str = "") -> None:
+        with self._unreadable_lock:
+            self._unreadable.add((agent_id, source_id))
+            if row_id:
+                self._damaged.add((agent_id, row_id))
 
-        return await settled_thread(read)
+    def _damaged_rows(self, agent_id: str) -> frozenset[str]:
+        with self._unreadable_lock:
+            return frozenset(row for agent, row in self._damaged if agent == agent_id)
 
-    async def load_current_snapshot(
-        self,
-        ref: CatalogSnapshotRef,
-    ) -> SourceCatalogSnapshot | None:
-        if not isinstance(ref, CatalogSnapshotRef):
-            raise TypeError("ref must be a CatalogSnapshotRef")
-        key = (ref.agent_id, ref.source_id, ref.sync_id)
+    def _repaired(self, agent_id: str, rows: frozenset[str]) -> None:
+        with self._unreadable_lock:
+            self._damaged -= {(agent_id, row) for row in rows}
 
-        async with self._decoded_catalog_snapshot_lock:
-            cached = self._decoded_catalog_snapshots.get(key)
-            if cached is not None:
-                current_sync_id = await settled_thread(
-                    _current_snapshot_sync_id,
-                    self._database,
-                    ref.agent_id,
-                    ref.source_id,
-                )
-                if current_sync_id != ref.sync_id:
-                    self._decoded_catalog_snapshots.pop(key, None)
-                    return None
-                return cached
+    async def current_syncs(
+        self, agent_id: str, source_ids: tuple[str, ...]
+    ) -> tuple[CatalogSync, ...]:
+        selected = _catalog_source_ids(source_ids)
+        return await self._catalog_read(
+            agent_id,
+            lambda c, note: catalog_rows.current_syncs(c, agent_id, selected, note),
+        )
 
-            row = await settled_thread(
-                _current_snapshot_row,
-                self._database,
-                ref.agent_id,
-                ref.source_id,
-            )
-            if row is None or row[0] != ref.sync_id:
-                return None
-            try:
-                snapshot = await settled_thread(_decode_catalog_snapshot, row[1])
-            except (TypeError, ValueError):
-                raise CatalogStoreError(
-                    "stored catalog snapshot is undecodable"
-                ) from None
-            if (
-                snapshot.sync.agent_id != ref.agent_id
-                or snapshot.sync.source_id != ref.source_id
-                or snapshot.sync.id != ref.sync_id
-            ):
-                raise CatalogStoreError(
-                    "stored catalog snapshot does not match its exact reference"
-                )
-            current_sync_id = await settled_thread(
-                _current_snapshot_sync_id,
-                self._database,
-                ref.agent_id,
-                ref.source_id,
-            )
-            if current_sync_id != ref.sync_id:
-                return None
-            self._publish_decoded_catalog_snapshot(snapshot)
-            return snapshot
+    async def load_source_state(
+        self, agent_id: str, source_id: str
+    ) -> CatalogSourceState | None:
+        return await self._catalog_read(
+            agent_id,
+            lambda c, note: catalog_rows.source_state(c, agent_id, source_id, note),
+        )
+
+    async def list_catalog_changes(
+        self, agent_id: str, source_id: str, *, limit: int = 50
+    ) -> tuple[CatalogChange, ...]:
+        if not isinstance(limit, int) or not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        return await self._catalog_read(
+            agent_id,
+            lambda c, note: catalog_rows.list_changes(
+                c, agent_id, source_id, limit, note
+            ),
+        )
 
     async def load_sync(self, agent_id: str, sync_id: str) -> CatalogSync | None:
         def read() -> CatalogSync | None:
@@ -2376,73 +2284,114 @@ class SQLStateStore:
         agent_id: str,
         active_source_ids: tuple[str, ...],
     ) -> CatalogSummary:
-        """Count only current committed snapshots for the supplied active sources."""
+        """Count the catalog of the active sources that have a readable current sync.
 
-        if not isinstance(active_source_ids, tuple) or any(
-            not isinstance(source_id, str) or not source_id
-            for source_id in active_source_ids
-        ):
-            raise TypeError("active_source_ids must be a tuple of non-empty strings")
-        if len(active_source_ids) != len(set(active_source_ids)):
-            raise ValueError("active_source_ids cannot contain duplicates")
-        if not active_source_ids:
-            return CatalogSummary(
-                active_source_count=0,
-                resource_count=0,
-                relationship_count=0,
-                latest_successful_sync_completed_at=None,
-                is_empty=True,
+        A source whose current sync was not truncated stored exactly the pass it
+        counted (every older row was removed), so its sync supplies the counts.
+        A truncated sync kept rows it did not restate, so those sources are
+        counted in SQL.
+        """
+
+        selected = _catalog_source_ids(active_source_ids)
+        syncs = await self.current_syncs(agent_id, selected) if selected else ()
+        resource_count = sum(s.resource_count for s in syncs if not s.truncated)
+        relationship_count = sum(s.relationship_count for s in syncs if not s.truncated)
+        counted = [s.source_id for s in syncs if s.truncated]
+        if counted:
+            more = await self._catalog_read(
+                agent_id, lambda c, _: catalog_rows.counts(c, agent_id, counted)
             )
-        snapshots = await self._snapshots(agent_id, active_source_ids)
-        completion_times = tuple(
-            snapshot.sync.completed_at
-            for snapshot in snapshots
-            if snapshot.sync.completed_at is not None
-        )
-        resource_count = sum(len(snapshot.resources) for snapshot in snapshots)
+            resource_count += more[0]
+            relationship_count += more[1]
+        completions = [s.completed_at for s in syncs if s.completed_at is not None]
         return CatalogSummary(
-            active_source_count=len(active_source_ids),
+            active_source_count=len(selected),
             resource_count=resource_count,
-            relationship_count=sum(
-                len(snapshot.relationships) for snapshot in snapshots
-            ),
+            relationship_count=relationship_count,
             latest_successful_sync_completed_at=(
-                max(completion_times) if completion_times else None
+                max(completions) if completions else None
             ),
             is_empty=resource_count == 0,
+        )
+
+    async def load_entries(
+        self, agent_id: str, resource_ids: tuple[str, ...]
+    ) -> tuple[CatalogEntry, ...]:
+        found = await self._catalog_read(
+            agent_id,
+            lambda c, note: catalog_rows.load_entries(c, agent_id, resource_ids, note),
+        )
+        return tuple(sorted(found, key=lambda item: item.resource.id))
+
+    async def load_entries_by_identity(
+        self, agent_id: str, source_id: str, native_identities: tuple[str, ...]
+    ) -> tuple[CatalogEntry, ...]:
+        found = await self._catalog_read(
+            agent_id,
+            lambda c, note: catalog_rows.load_entries_by_identity(
+                c, agent_id, source_id, native_identities, note
+            ),
+        )
+        return tuple(sorted(found, key=lambda item: item.resource.id))
+
+    async def list_resource_names(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...],
+        *,
+        other_than: ResourceKind | None = None,
+        limit: int | None = None,
+    ) -> tuple[tuple[str, str, str], ...]:
+        selected = _catalog_source_ids(source_ids)
+        return tuple(
+            await self._catalog_read(
+                agent_id,
+                lambda c, note: catalog_rows.resource_names(
+                    c,
+                    agent_id,
+                    selected,
+                    None if other_than is None else other_than.value,
+                    limit,
+                ),
+            )
+        )
+
+    async def load_entry(self, agent_id: str, resource_id: str) -> CatalogEntry | None:
+        found = await self.load_entries(agent_id, (resource_id,))
+        return found[0] if found else None
+
+    async def list_entries(
+        self, agent_id: str, source_id: str
+    ) -> tuple[CatalogEntry, ...]:
+        return tuple(
+            await self._catalog_read(
+                agent_id,
+                lambda c, note: catalog_rows.list_entries(c, agent_id, source_id, note),
+            )
         )
 
     async def load_resource(
         self, agent_id: str, resource_id: str
     ) -> CatalogResource | None:
-        for snapshot in await self._snapshots(agent_id):
-            for resource in snapshot.resources:
-                if resource.id == resource_id:
-                    return resource
-        return None
+        entry = await self.load_entry(agent_id, resource_id)
+        return None if entry is None else entry.resource
 
     async def load_revision(
         self, agent_id: str, resource_id: str, revision: str
     ) -> CatalogResourceRevision | None:
-        for snapshot in await self._snapshots(agent_id):
-            for item in snapshot.revisions:
-                if item.resource_id == resource_id and item.revision == revision:
-                    return item
-        return None
+        entry = await self.load_entry(agent_id, resource_id)
+        if entry is None or entry.revision.revision != revision:
+            return None
+        return entry.revision
 
     async def list_resources(
         self, agent_id: str, source_id: str | None = None
     ) -> tuple[CatalogResource, ...]:
-        resources = [
-            resource
-            for snapshot in await self._snapshots(
-                agent_id,
-                () if source_id is None else (source_id,),
-            )
-            if source_id is None or snapshot.sync.source_id == source_id
-            for resource in snapshot.resources
-        ]
-        return tuple(sorted(resources, key=lambda item: (item.name, item.id)))
+        entries = await self._catalog_read(
+            agent_id,
+            lambda c, note: catalog_rows.list_entries(c, agent_id, source_id, note),
+        )
+        return tuple(item.resource for item in entries)
 
     async def load_facets(
         self,
@@ -2450,34 +2399,43 @@ class SQLStateStore:
         resource_id: str,
         revision: str | None = None,
     ) -> tuple[CatalogFacet, ...]:
-        for snapshot in await self._snapshots(agent_id):
-            resource = next(
-                (item for item in snapshot.resources if item.id == resource_id), None
-            )
-            if resource is None or (
-                revision is not None and resource.current_revision != revision
-            ):
-                continue
-            return tuple(
-                facet for facet in snapshot.facets if facet.resource_id == resource_id
-            )
-        return ()
+        entry = await self.load_entry(agent_id, resource_id)
+        if entry is None or (
+            revision is not None and entry.resource.current_revision != revision
+        ):
+            return ()
+        return entry.facets
 
     async def load_incident_relationships(
         self,
         agent_id: str,
-        resource_id: str,
+        resource_ids: tuple[str, ...],
         *,
         relationship_kinds: tuple[RelationshipKind, ...] = (),
         limit: int = 50,
-    ) -> tuple[CatalogRelationship, ...]:
-        relationships = [
-            item
-            for item in await self._relationships(agent_id)
-            if resource_id in (item.from_resource_id, item.to_resource_id)
-            and (not relationship_kinds or item.kind in relationship_kinds)
-        ]
-        return tuple(sorted(relationships, key=lambda item: item.id)[:limit])
+    ) -> Mapping[str, tuple[CatalogRelationship, ...]]:
+        return await self._catalog_read(
+            agent_id,
+            lambda c, note: catalog_rows.incident_relationships(
+                c, agent_id, resource_ids, relationship_kinds, limit, note
+            ),
+        )
+
+    async def search_catalog(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...],
+        *,
+        terms: tuple[str, ...] | None,
+        anchor_keys: tuple[str, ...] = (),
+    ) -> tuple[CatalogSearchRow, ...]:
+        selected = _catalog_source_ids(source_ids)
+        return await self._catalog_read(
+            agent_id,
+            lambda c, note: catalog_rows.search(
+                c, agent_id, selected, terms, anchor_keys, note
+            ),
+        )
 
     async def save_catalog_link(self, link: CatalogLink) -> None:
         """Create or replace one declared link within the per-agent bound."""
@@ -3764,63 +3722,6 @@ class SQLStateStore:
 
         return await settled_thread(read)
 
-    async def _snapshots(
-        self,
-        agent_id: str,
-        source_ids: tuple[str, ...] = (),
-    ) -> tuple[SourceCatalogSnapshot, ...]:
-        for attempt in range(2):
-            refs = await self.list_current_snapshot_refs(agent_id, source_ids)
-            snapshots: list[SourceCatalogSnapshot] = []
-            generation_changed = False
-            for ref in refs:
-                try:
-                    snapshot = await self.load_current_snapshot(ref)
-                except CatalogStoreError:
-                    # A damaged row reads as missing; the next refresh replaces it.
-                    continue
-                if snapshot is None:
-                    generation_changed = True
-                    break
-                snapshots.append(snapshot)
-            if (
-                not generation_changed
-                and refs
-                == await self.list_current_snapshot_refs(
-                    agent_id,
-                    source_ids,
-                )
-            ):
-                return tuple(snapshots)
-            if attempt == 1:
-                break
-        raise CatalogStoreError("catalog snapshot generation changed repeatedly")
-
-    async def _relationships(self, agent_id: str) -> tuple[CatalogRelationship, ...]:
-        return tuple(
-            relationship
-            for snapshot in await self._snapshots(agent_id)
-            for relationship in snapshot.relationships
-        )
-
-    def _publish_decoded_catalog_snapshot(
-        self,
-        snapshot: SourceCatalogSnapshot,
-    ) -> None:
-        sync = snapshot.sync
-        key = (sync.agent_id, sync.source_id, sync.id)
-        existing = self._decoded_catalog_snapshots.get(key)
-        for cached_key in tuple(self._decoded_catalog_snapshots):
-            if cached_key[:2] == key[:2] and cached_key != key:
-                del self._decoded_catalog_snapshots[cached_key]
-        if existing is None:
-            self._decoded_catalog_snapshots[key] = snapshot
-
-    def _evict_decoded_catalog_source(self, agent_id: str, source_id: str) -> None:
-        for key in tuple(self._decoded_catalog_snapshots):
-            if key[:2] == (agent_id, source_id):
-                del self._decoded_catalog_snapshots[key]
-
 
 def _catalog_identifier(value: str, field_name: str) -> None:
     if not isinstance(value, str) or not value.strip():
@@ -3831,63 +3732,14 @@ def _catalog_identifier(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} exceeds 512 characters")
 
 
-def _catalog_snapshot_source_ids(source_ids: tuple[str, ...]) -> tuple[str, ...]:
+def _catalog_source_ids(source_ids: tuple[str, ...]) -> tuple[str, ...]:
     if not isinstance(source_ids, tuple):
-        raise TypeError("catalog snapshot source_ids must be a tuple")
+        raise TypeError("catalog source_ids must be a tuple")
     for source_id in source_ids:
-        _catalog_identifier(source_id, "catalog snapshot source_id")
+        _catalog_identifier(source_id, "catalog source_id")
     if len(source_ids) != len(set(source_ids)):
-        raise ValueError("catalog snapshot source_ids cannot contain duplicates")
+        raise ValueError("catalog source_ids cannot contain duplicates")
     return source_ids
-
-
-def _current_snapshot_sync_id(
-    path: SQLDatabase,
-    agent_id: str,
-    source_id: str,
-) -> str | None:
-    with _connect_read_only(path) as connection:
-        row = connection.execute(
-            "SELECT sync_id FROM snapshots WHERE agent_id = ? AND source_id = ?",
-            (agent_id, source_id),
-        ).fetchone()
-    return None if row is None else str(row[0])
-
-
-def _current_snapshot_row(
-    path: SQLDatabase,
-    agent_id: str,
-    source_id: str,
-) -> tuple[str, str] | None:
-    with _connect_read_only(path) as connection:
-        row = connection.execute(
-            "SELECT sync_id, data FROM snapshots WHERE agent_id = ? AND source_id = ?",
-            (agent_id, source_id),
-        ).fetchone()
-    if row is None:
-        return None
-    return str(row[0]), str(row[1])
-
-
-def _current_source_snapshot(
-    connection: SQLConnection,
-    agent_id: str,
-    source_id: str,
-) -> SourceCatalogSnapshot | None:
-    row = connection.execute(
-        "SELECT data FROM snapshots WHERE agent_id = ? AND source_id = ?",
-        (agent_id, source_id),
-    ).fetchone()
-    if row is None:
-        return None
-    snapshot = decode_catalog_snapshot(row[0])
-    if snapshot.sync.agent_id != agent_id or snapshot.sync.source_id != source_id:
-        raise SourcePermissionStateError("stored catalog snapshot ownership is invalid")
-    return snapshot
-
-
-def _decode_catalog_snapshot(value: str) -> SourceCatalogSnapshot:
-    return decode_catalog_snapshot(value)
 
 
 def _validate_semantic_owner(
@@ -4368,7 +4220,7 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
             authorization_fingerprint=fingerprint,
         )
 
-    # `syncs` and `snapshots` are not read here: a damaged catalog row is rebuilt
+    # Catalog rows are not read here: a damaged row is refreshed
     # from its source, so it must not stop the home opening.
 
     run_ids: set[str] = set()

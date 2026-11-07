@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +16,7 @@ from daita.catalog.protocols import CatalogStoreError
 from daita.hosting import embedded as embedded_module
 from daita.llm.models import FinishReason, ModelResponse, ToolCall, ToolResultBlock
 from daita.llm.providers.mock import MockModelProvider
-from daita.storage.sqlite import SQLiteStateStore
-from daita.storage.sqlite_codecs import decode_catalog_snapshot
+from daita.storage.sqlite_codecs import decode_catalog_entry
 from tests.support.source_refresh import settled, sync_count
 from tests.support.workspace import workspace_for
 
@@ -228,27 +227,39 @@ async def test_a_damaged_catalog_row_does_not_stop_a_run(
         else:
             await agent.attach(source)
         with sqlite3.connect(agent.home / "state.db") as connection:
-            connection.execute("UPDATE snapshots SET data = ?", (stored,))
-        assert isinstance(agent._embedded._store, SQLiteStateStore)
-        agent._embedded._store._decoded_catalog_snapshots.clear()
+            connection.execute("UPDATE catalog_resources SET data = ?", (stored,))
         run = await agent.run("How many companies are there?")
         assert run.reason == "completed"
         counted, searched, described = (
             _data(result) for _, result in await agent.tool_evidence(run.run_id)
         )
         assert [dict(row) for row in counted["rows"]] == [{"total": 2}]
-        assert searched["catalog_available"] is False
-        assert [hit["name"] for hit in searched["hits"]] == ["main.companies"]
+        # The damaged table is absent from the catalog, so search finds it only
+        # by reading the source live, and describing it does the same.
+        assert [(hit["name"], hit["seen_live"]) for hit in searched["hits"]] == [
+            ("main.companies", True)
+        ]
         assert described["answered_from"] == "live"
+        # The run skipped the damaged row; the source is refreshed afterwards.
+        await settled(agent)
+        assert _rows_decode(agent)
+        listed = await agent.list_catalog_resources()
+        assert [item.name for item in listed] == ["companies"]
     finally:
         await agent.close()
-    # Damaged again at rest: opening rebuilds the row instead of refusing the home.
-    _damage(agent, "snapshots", stored)
-    reopened = await _open_agent(tmp_path, _read_call("count", "companies"))
+    # Damaged again at rest: opening reads nothing, and the next read that
+    # reaches the row skips it and refreshes the source.
+    _damage(agent, "catalog_resources", stored)
+    reopened = await _open_agent(
+        tmp_path,
+        ToolCall(
+            "describe", "catalog_describe", {"source": "CRM", "name": "companies"}
+        ),
+    )
     try:
-        await _assert_read_answers(reopened)
+        assert (await reopened.run("What is companies?")).reason == "completed"
         await settled(reopened)
-        assert _snapshot_decodes(reopened)
+        assert _rows_decode(reopened)
         listed = await reopened.list_catalog_resources()
         assert [item.name for item in listed] == ["companies"]
     finally:
@@ -260,10 +271,10 @@ def _damage(agent: Agent, table: str, stored: str) -> None:
         connection.execute(f"UPDATE {table} SET data = ?", (stored,))
 
 
-def _snapshot_decodes(agent: Agent) -> bool:
+def _rows_decode(agent: Agent) -> bool:
     with sqlite3.connect(agent.home / "state.db") as connection:
-        ((data,),) = connection.execute("SELECT data FROM snapshots")
-    return decode_catalog_snapshot(data) is not None
+        rows = connection.execute("SELECT data FROM catalog_resources").fetchall()
+    return bool(rows) and all(decode_catalog_entry(data) for (data,) in rows)
 
 
 async def _open_agent(tmp_path: Path, *calls: ToolCall) -> Agent:
@@ -308,7 +319,7 @@ async def test_an_unreachable_source_leaves_a_damaged_catalog_usable_and_honest(
     _create_companies(database)
     agent = await _create_agent(tmp_path)
     await agent.attach(SQLiteSource(database, name="CRM"))
-    _damage(agent, "snapshots", "{not json")
+    _damage(agent, "catalog_resources", "{not json")
     await agent.close()
     database.unlink()
     reopened = await _open_agent(tmp_path, _read_call("count", "companies"))
@@ -456,12 +467,13 @@ async def test_a_refresh_that_fails_changes_nothing_for_the_user(
         tmp_path, (_read_call("kept", "companies"), _read_call("gone", "leads"))
     )
 
-    async def failing(self: object, request: object) -> object:
+    async def failing(self: object, request: object) -> AsyncIterator[object]:
         raise RuntimeError("password=private-diagnostic")
+        yield  # pragma: no cover - makes this an async generator
 
     try:
         source = await agent.attach(SQLiteSource(database, name="CRM"))
-        monkeypatch.setattr(SQLiteResourceAdapter, "discover", failing)
+        monkeypatch.setattr(SQLiteResourceAdapter, "reconcile", failing)
         run = await agent.run("Count companies and leads.")
         kept, gone = [result for _, result in await agent.tool_evidence(run.run_id)]
         assert [dict(row) for row in _data(kept)["rows"]] == [{"total": 2}]

@@ -134,8 +134,8 @@
           "state.db",
           "config.json"
         ],
-        "checksum": "616b3b33398146437668d9441c5089952d1d93d6545025a1e8c76981e1a1dfde",
-        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete. Retire inactive learning candidates and their review stamps; approved knowledge is unaffected. Routines keep their title, prompt, schedule, named sources, counters and state; their frozen access, grants, routes, sensitivity, budgets, expiry, outcome, precheck, skills and provenance are dropped, and their runs ask before writes. Occurrences drop prechecks, reservations and their copy of the run's scope. MCP tool bindings drop unattended eligibility; every MCP action asks at the time. The task graph is replaced by one checklist-job record per job: finished jobs keep their accepted result, unfinished jobs fail with an upgrade message, result deliveries and receipts keep their job id, graph attention notices are dropped, and the graph tables go. Stored write scopes bind to table and column names, not catalog revisions: update stays update, upsert becomes insert and update, delete is never granted, conflict keys and identity columns go, and a scope whose table left the catalog is dropped. Each saved model route candidate gains a null reasoning effort, which keeps the provider's default.",
+        "checksum": "4e9acff7f225ed89a6ce7826c78f87997a3de988e6f9e606cbd0afbc1c0b9217",
+        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete. Retire inactive learning candidates and their review stamps; approved knowledge is unaffected. Routines keep their title, prompt, schedule, named sources, counters and state; their frozen access, grants, routes, sensitivity, budgets, expiry, outcome, precheck, skills and provenance are dropped, and their runs ask before writes. Occurrences drop prechecks, reservations and their copy of the run's scope. MCP tool bindings drop unattended eligibility; every MCP action asks at the time. The task graph is replaced by one checklist-job record per job: finished jobs keep their accepted result, unfinished jobs fail with an upgrade message, result deliveries and receipts keep their job id, graph attention notices are dropped, and the graph tables go. Stored write scopes bind to table and column names, not catalog revisions: update stays update, upsert becomes insert and update, delete is never granted, conflict keys and identity columns go, and a scope whose table left the catalog is dropped. Each saved model route candidate gains a null reasoning effort, which keeps the provider's default. Each source's catalog snapshot becomes one row per resource, relationship and search entry plus a source state row; resource ids and revisions are unchanged, every resource counts as fully described, and the snapshot table goes.",
         "migration_id": "0004_foreground_analysis_evidence",
         "revision": 4
       }
@@ -287,6 +287,23 @@
         "max_calls_per_occurrence",
         "grant_digest"
       ],
+      "CatalogChangeData": [
+        "before",
+        "after"
+      ],
+      "CatalogChangeSide": [
+        "name",
+        "kind",
+        "revision",
+        "columns"
+      ],
+      "CatalogEntry": [
+        "resource",
+        "revision",
+        "facets",
+        "detailed",
+        "source_object_id"
+      ],
       "CatalogFacet": [
         "resource_id",
         "sync_id",
@@ -343,6 +360,19 @@
         "facet_revisions",
         "relationship_revisions",
         "source_revision"
+      ],
+      "CatalogSourceState": [
+        "agent_id",
+        "source_id",
+        "current_sync_id",
+        "probe_tokens",
+        "probe_cursor",
+        "last_probe_at",
+        "last_change_at",
+        "last_full_check_at",
+        "last_missed",
+        "last_error_code",
+        "keep_current"
       ],
       "CatalogSync": [
         "id",
@@ -1195,6 +1225,63 @@
             "state"
           ]
         ],
+        "catalog_relationships_by_source": [
+          "catalog_relationships",
+          false,
+          [
+            "agent_id",
+            "source_id"
+          ]
+        ],
+        "catalog_relationships_from": [
+          "catalog_relationships",
+          false,
+          [
+            "agent_id",
+            "from_resource_id"
+          ]
+        ],
+        "catalog_relationships_to": [
+          "catalog_relationships",
+          false,
+          [
+            "agent_id",
+            "to_resource_id"
+          ]
+        ],
+        "catalog_resources_by_source": [
+          "catalog_resources",
+          false,
+          [
+            "agent_id",
+            "source_id",
+            "native_identity"
+          ]
+        ],
+        "catalog_search_by_identity": [
+          "catalog_search",
+          false,
+          [
+            "agent_id",
+            "identity_key"
+          ]
+        ],
+        "catalog_search_by_name": [
+          "catalog_search",
+          false,
+          [
+            "agent_id",
+            "name_key"
+          ]
+        ],
+        "catalog_search_by_source": [
+          "catalog_search",
+          false,
+          [
+            "agent_id",
+            "source_id"
+          ]
+        ],
         "deliveries_conversation_history": [
           "deliveries",
           false,
@@ -1280,6 +1367,12 @@
         "artifacts": [
           "CHECK (state IN ('creating', 'ready', 'deleting'))",
           "CHECK (byte_size >= 0)"
+        ],
+        "catalog_changes": [
+          "CHECK (kind IN ('added', 'changed', 'removed'))"
+        ],
+        "catalog_resources": [
+          "CHECK (detail IN ('inventory', 'complete'))"
         ],
         "deliveries": [
           "CHECK (json_valid(data))"
@@ -1432,6 +1525,71 @@
             0
           ]
         ],
+        "catalog_changes": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "source_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "sequence",
+            "INTEGER",
+            1,
+            null,
+            3
+          ],
+          [
+            "sync_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "changed_at",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "kind",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "resource_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "native_identity",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
         "catalog_links": [
           [
             "agent_id",
@@ -1442,6 +1600,224 @@
           ],
           [
             "id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "catalog_relationships": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "source_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "from_resource_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "to_resource_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "revision",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "catalog_resources": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "source_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "kind",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "native_identity",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "name",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "revision",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "source_object_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "detail",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "last_seen_sync",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "first_observed_at",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "last_observed_at",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "catalog_search": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "source_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "resource_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "name_key",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "identity_key",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "words",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "catalog_source_state": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "source_id",
             "TEXT",
             1,
             null,
@@ -1946,36 +2322,6 @@
             0
           ]
         ],
-        "snapshots": [
-          [
-            "agent_id",
-            "TEXT",
-            1,
-            null,
-            1
-          ],
-          [
-            "source_id",
-            "TEXT",
-            1,
-            null,
-            2
-          ],
-          [
-            "sync_id",
-            "TEXT",
-            1,
-            null,
-            0
-          ],
-          [
-            "data",
-            "TEXT",
-            1,
-            null,
-            0
-          ]
-        ],
         "source_read_scopes": [
           [
             "agent_id",
@@ -2097,7 +2443,7 @@
       }
     }
   },
-  "contract_sha256": "dbaf67695aac196ab3cbf91b34bcd9324b30a69ab69f307bf6a30a2351dd98ba",
+  "contract_sha256": "886ed0aaa67ef32eacc045869618c597ddd4d23438f91319f5c7c2fa9a4c44b0",
   "home_revision": 4,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1

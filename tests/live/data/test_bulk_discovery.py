@@ -45,6 +45,7 @@ from daita.adapters.postgresql import (
     columns_from_rows,
 )
 from daita.catalog.models import ResourceKind, TabularFacet
+from tests.support.source_contract import reconcile_pass
 
 pytestmark = [
     pytest.mark.requires_db,
@@ -541,11 +542,10 @@ async def test_a_structure_read_takes_a_handful_of_statements(
 
 
 def _tables(result: Any) -> dict[str, TabularFacet]:
-    snapshot = result.snapshot
-    names = {item.id: item.name for item in snapshot.resources}
+    names = {item.id: item.name for item in result.resources}
     return {
         names[facet.resource_id]: TabularFacet.from_payload(facet.payload)
-        for facet in snapshot.facets
+        for facet in result.facets
     }
 
 
@@ -569,7 +569,7 @@ async def _attach(
         connected = time.perf_counter()
         await counting.fetchrow(_HEALTH_SQL, [_WIDE])
         checked = time.perf_counter()
-        result = await adapter.discover(_request(registration, max_resources))
+        result = await reconcile_pass(adapter, _request(registration, max_resources))
         finished = time.perf_counter()
     finally:
         proxy.delay = 0.0
@@ -600,8 +600,8 @@ async def test_attaching_a_thousand_tables_takes_under_five_seconds_at_50ms(
     _show("1,000 tables", timings, chunks, len(counting.tags))
     tables = _tables(result)
     assert timings["total"] < _ACCEPT_SECONDS
-    assert result.snapshot.sync.truncated is False
-    assert len(result.snapshot.resources) == 1_000
+    assert result.truncated is False
+    assert len(result.resources) == 1_000
     assert {len(facet.columns) for facet in tables.values()} == {30}
     assert len([t for t in counting.tags if t != "daita:postgresql.health"]) <= 6
 
@@ -614,9 +614,13 @@ async def test_a_larger_source_is_cut_by_the_table_budget_not_by_time(
     result, counting, timings, chunks = await _attach(server, proxy, 1_000)
     _show("1,500 tables, default budget", timings, chunks, len(counting.tags))
 
-    names = [item.name for item in result.snapshot.resources]
+    names = [item.name for item in result.resources]
     assert names == [f"wide_{i:04}" for i in range(1, 1_001)]
-    assert result.snapshot.sync.truncated is True
+    assert result.truncated is True
+    # The inventory names every table, though only the first thousand are described.
+    assert [item.resource.name for item in result.inventory.entries] == [
+        f"wide_{i:04}" for i in range(1, 1_501)
+    ]
     tables = _tables(result)
     assert {len(facet.columns) for facet in tables.values()} == {30}
     assert {len(facet.indexes) for facet in tables.values()} == {2}
@@ -624,8 +628,8 @@ async def test_a_larger_source_is_cut_by_the_table_budget_not_by_time(
 
     full, _, full_timings, full_chunks = await _attach(server, proxy, 1_500)
     _show("1,500 tables, budget 1,500", full_timings, full_chunks, 0)
-    assert len(full.snapshot.resources) == 1_500
-    assert full.snapshot.sync.truncated is False
+    assert len(full.resources) == 1_500
+    assert full.truncated is False
 
 
 async def test_a_discovery_cut_by_time_leaves_the_transaction_usable(

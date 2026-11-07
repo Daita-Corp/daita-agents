@@ -28,7 +28,13 @@ from daita.semantics import (
     SemanticSubject,
 )
 from daita.storage.home_migrations import revision_0004
+from daita.storage.sqlite_codecs import (
+    decode_catalog_relationship,
+    encode_catalog_snapshot,
+)
 from tests.support.capability_runtime import execute_projected
+from tests.support.catalog_records import Table, entries, snapshot
+from tests.support.home_revisions import restore_catalog_snapshots
 from tests.support.workspace import workspace_for
 
 _NOW = datetime(2026, 11, 2, tzinfo=UTC)
@@ -117,7 +123,10 @@ async def _old_home(
 def _fold(root: Path) -> None:
     home = next(root.rglob("state.db"))
     with sqlite3.connect(home) as connection:
+        # The fold reads the snapshots table an older home still has.
+        restore_catalog_snapshots(connection, truncated_flag=True)
         revision_0004._fold_sqlite_identities(connection)
+        revision_0004._convert_catalog_snapshots(connection)
         connection.commit()
 
 
@@ -199,13 +208,15 @@ async def test_a_lower_case_catalog_is_left_exactly_as_it_was(tmp_path: Path) ->
     finally:
         await agent.close()
     home = next(tmp_path.rglob("state.db"))
+    query = "SELECT id, revision, native_identity FROM catalog_resources ORDER BY id"
     with sqlite3.connect(home) as connection:
-        before = connection.execute("SELECT data FROM snapshots").fetchall()
+        before = connection.execute(query).fetchall()
+    assert before
 
     _fold(tmp_path)
 
     with sqlite3.connect(home) as connection:
-        assert connection.execute("SELECT data FROM snapshots").fetchall() == before
+        assert connection.execute(query).fetchall() == before
 
 
 def test_tables_differing_only_by_case_fail_closed() -> None:
@@ -227,3 +238,80 @@ def test_tables_differing_only_by_case_fail_closed() -> None:
 
     with pytest.raises(ValueError, match="differing only by case"):
         revision_0004._folded_snapshot("source", json.loads(json.dumps(fields)))
+
+
+def test_folded_identities_land_in_the_per_resource_rows() -> None:
+    mixed = snapshot(
+        "agent",
+        "source:shop",
+        "sync-1",
+        (
+            Table("main.Customers", ("id", "Name")),
+            Table("main.Orders", ("id", "customer_id")),
+        ),
+        (("main.Orders", "customer_id", "main.Customers", "id"),),
+        folder=None,
+    )
+    lower = snapshot(
+        "agent",
+        "source:shop",
+        "sync-1",
+        (
+            Table("main.customers", ("id", "Name")),
+            Table("main.orders", ("id", "customer_id")),
+        ),
+        (("main.orders", "customer_id", "main.customers", "id"),),
+        folder=None,
+    )
+    stored = json.loads(encode_catalog_snapshot(mixed))
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(
+        "CREATE TABLE snapshots (agent_id TEXT, source_id TEXT, sync_id TEXT, data TEXT);"
+        "CREATE TABLE sources (agent_id TEXT, id TEXT, data TEXT);"
+        "CREATE TABLE source_read_scopes (agent_id TEXT, source_id TEXT, data TEXT);"
+        "CREATE TABLE semantic_annotations (agent_id TEXT, id TEXT, data TEXT);"
+    )
+    connection.execute(
+        "INSERT INTO snapshots VALUES ('agent', 'source:shop', 'sync-1', ?)",
+        (json.dumps(stored),),
+    )
+    connection.execute(
+        "INSERT INTO sources VALUES ('agent', 'source:shop', ?)",
+        ('{"fields":{"adapter_id":"sqlite"}}',),
+    )
+
+    revision_0004._fold_sqlite_identities(connection)
+    revision_0004._convert_catalog_snapshots(connection)
+
+    assert {
+        row[0]: (row[1], row[2])
+        for row in connection.execute(
+            "SELECT id, revision, native_identity FROM catalog_resources"
+        )
+    } == {
+        item.resource.id: (
+            item.resource.current_revision,
+            item.resource.native_identity,
+        )
+        for item in entries(lower)
+    }
+    assert {
+        row[0]: decode_catalog_relationship(row[1])
+        for row in connection.execute("SELECT id, data FROM catalog_relationships")
+    } == {item.id: item for item in lower.relationships}
+    assert {
+        row[0] for row in connection.execute("SELECT name_key FROM catalog_search")
+    } == {"customers", "orders"}
+
+
+def test_a_snapshot_that_does_not_decode_stops_the_upgrade() -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE snapshots (agent_id TEXT, source_id TEXT, sync_id TEXT, data TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO snapshots VALUES ('agent', 'source:shop', 'sync-1', '{}')"
+    )
+
+    with pytest.raises(ValueError):
+        revision_0004._convert_catalog_snapshots(connection)

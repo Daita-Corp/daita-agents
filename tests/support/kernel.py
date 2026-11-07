@@ -185,7 +185,9 @@ class _SnapshotCatalog:
             for source_id in source_ids
         }
 
-    async def readable_resource_ids(self, agent_id, source_ids=()):
+    async def readable_resource_ids(
+        self, agent_id, source_ids=(), resource_ids=None, first=None
+    ):
         return frozenset(("resource-snapshot",))
 
     async def resource_names(self, agent_id, source_ids=()):

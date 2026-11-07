@@ -29,6 +29,7 @@ from daita.semantics import (
 )
 from daita.storage.sqlite_codecs.mcp_bindings import decode_mcp_binding
 from daita.storage.sqlite_records import SourceReadScope
+from tests.support import catalog_records
 from tests.support.graph import GRAPH_NOW
 from tests.support.paths import REPO_ROOT
 
@@ -80,10 +81,11 @@ async def test_catalog_reopen_edit_and_detach_preserve_permission_authority(
         sync=sync, resources=(resource,), revisions=(revision,)
     )
     async with state_store_factory() as store:
-        assert await store.commit_snapshot(snapshot, registration=source) == snapshot
-        refs = await store.list_current_snapshot_refs("agent-1", ())
-        assert len(refs) == 1
-        assert await store.load_current_snapshot(refs[0]) == snapshot
+        summary = await store.commit_catalog(
+            sync, catalog_records.batches(snapshot), registration=source
+        )
+        assert summary.added == 1
+        assert await store.current_syncs("agent-1", ()) == (sync,)
         assert await store.load_resource("agent-1", resource.id) == resource
         scope = SourceReadScope.allow_all(agent_id="agent-1", source_id=source.id)
         assert await store.load_source_read_scope("agent-1", source.id) == scope
@@ -98,7 +100,7 @@ async def test_catalog_reopen_edit_and_detach_preserve_permission_authority(
         assert await reopened.load_source_read_scope("agent-1", source.id) is None
         detached = await reopened.load_source("agent-1", source.id)
         assert detached is not None and not detached.active
-        assert await reopened.list_current_snapshot_refs("agent-1", ()) == refs
+        assert await reopened.current_syncs("agent-1", ()) == (sync,)
 
 
 async def test_advisory_cas_survives_reopen(state_store_factory):

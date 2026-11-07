@@ -3,30 +3,29 @@ tabular reads. It stands in for third-party source types in tests."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
 
 from daita.adapters.models import (
     DiscoveryRequest,
-    DiscoveryResult,
     ResourceRef,
     ResourceSnapshot,
     SourceHealth,
     SourceRegistration,
 )
-from daita.adapters.protocols import SourceClosedError, StaleResourceError
+from daita.adapters.protocols import SourceClosedError, latest_snapshot
 from daita.adapters.registry import SourceBackendContext, SourceOperation, SourceType
 from daita.catalog.models import (
+    CatalogEntry,
     CatalogFacet,
     CatalogResource,
     CatalogResourceRevision,
-    CatalogSync,
-    CatalogSyncStatus,
+    CatalogTier,
+    ResourceBatch,
     ResourceKind,
     Sensitivity,
-    SourceCatalogSnapshot,
     TabularColumn,
     TabularFacet,
     catalog_resource_id,
@@ -42,7 +41,7 @@ MEMORY_NOW = datetime(2026, 10, 19, 12, 0, tzinfo=UTC)
 MEMORY_ADAPTER_ID = "memory-table"
 
 
-def _snapshot(registration: SourceRegistration, sync_id: str) -> SourceCatalogSnapshot:
+def _detail(registration: SourceRegistration, sync_id: str) -> ResourceBatch:
     resource_id = catalog_resource_id(registration.id, ResourceKind.TABLE, "regions")
     facet = CatalogFacet.from_tabular(
         resource_id=resource_id,
@@ -78,21 +77,14 @@ def _snapshot(registration: SourceRegistration, sync_id: str) -> SourceCatalogSn
         first_observed_at=MEMORY_NOW,
         last_observed_at=MEMORY_NOW,
     )
-    return SourceCatalogSnapshot(
-        sync=CatalogSync(
-            id=sync_id,
-            agent_id=registration.agent_id,
-            source_id=registration.id,
-            adapter_id=MEMORY_ADAPTER_ID,
-            status=CatalogSyncStatus.SUCCEEDED,
-            started_at=MEMORY_NOW,
-            completed_at=MEMORY_NOW,
-            source_revision="memory:v1",
-            resource_count=1,
+    return ResourceBatch(
+        tier=CatalogTier.DETAIL,
+        entries=(
+            CatalogEntry(
+                resource=resource, revision=revision, facets=(facet,), detailed=True
+            ),
         ),
-        resources=(resource,),
-        revisions=(revision,),
-        facets=(facet,),
+        source_revision="memory:v1",
     )
 
 
@@ -101,40 +93,37 @@ class _MemoryAdapter:
 
     def __init__(self, registration: SourceRegistration) -> None:
         self._registration = registration
-        self._latest: SourceCatalogSnapshot | None = None
+        self._latest: ResourceBatch | None = None
         self._closed = False
 
     @property
     def registration(self) -> SourceRegistration:
         return self._registration
 
-    async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
+    async def reconcile(
+        self, request: DiscoveryRequest
+    ) -> AsyncIterator[ResourceBatch]:
         if self._closed:
             raise SourceClosedError(self._registration.id)
-        self._latest = _snapshot(self._registration, request.sync_id)
-        return DiscoveryResult(
-            request=request, snapshot=self._latest, completed_at=MEMORY_NOW
+        detail = _detail(self._registration, request.sync_id)
+        self._latest = detail
+        yield ResourceBatch(
+            tier=CatalogTier.INVENTORY,
+            entries=(
+                request.inventory_entry(
+                    kind=ResourceKind.TABLE,
+                    native_identity="regions",
+                    name="regions",
+                    external_uri="memory://regions",
+                ),
+            ),
         )
+        yield detail
 
     async def inspect(self, resource: ResourceRef) -> ResourceSnapshot:
         if self._closed:
             raise SourceClosedError(self._registration.id)
-        assert self._latest is not None
-        current = self._latest.resources[0]
-        if (
-            resource.revision is not None
-            and resource.revision != current.current_revision
-        ):
-            raise StaleResourceError(self._registration.id, resource.resource_id)
-        return ResourceSnapshot(
-            reference=resource,
-            resource=current,
-            revision=self._latest.revisions[0],
-            facets=self._latest.facets,
-            relationships=(),
-            inspected_at=MEMORY_NOW,
-            source_revision="memory:v1",
-        )
+        return latest_snapshot(self._latest, resource, MEMORY_NOW)
 
     async def health(self) -> SourceHealth:
         return SourceHealth(

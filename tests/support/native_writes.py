@@ -17,7 +17,14 @@ from daita.adapters.models import DiscoveryRequest, SourceRegistration
 from daita.capabilities import (
     ApprovalDecision,
 )
-from daita.catalog.models import ResourceKind, Sensitivity, TabularColumn, TabularIndex
+from daita.catalog.models import (
+    CatalogSync,
+    CatalogSyncStatus,
+    ResourceKind,
+    Sensitivity,
+    TabularColumn,
+    TabularIndex,
+)
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -124,7 +131,12 @@ def companies_structure(db: Database) -> pg.PostgreSQLStructure:
             ),
         ),
     )
-    return pg.PostgreSQLStructure((table,), (), db.structure_revision)
+    return pg.PostgreSQLStructure(
+        (table,),
+        (),
+        db.structure_revision,
+        inventory=((table.schema, table.name, table.kind, None),),
+    )
 
 
 def patch_fake_postgresql(monkeypatch, db: Database) -> None:
@@ -216,8 +228,7 @@ async def create_fixture(
         attached_at=NOW,
     )
     structure = companies_structure(db)
-    snapshot = pg._catalog_snapshot(
-        registration,
+    inventory, detail = pg._batches(
         DiscoveryRequest(
             agent_id=agent.id,
             source_id=registration.id,
@@ -225,16 +236,30 @@ async def create_fixture(
             requested_at=NOW,
         ),
         structure,
-        NOW,
     )
-    snapshot = replace(
-        snapshot,
-        resources=tuple(
-            replace(item, sensitivity=sensitivity) for item in snapshot.resources
+    detail = replace(
+        detail,
+        entries=tuple(
+            replace(entry, resource=replace(entry.resource, sensitivity=sensitivity))
+            for entry in detail.entries
         ),
     )
-    await agent._embedded._store.commit_snapshot(snapshot, registration=registration)
-    resource = snapshot.resources[0]
+    await agent._embedded._store.commit_catalog(
+        CatalogSync(
+            id="native-admission",
+            agent_id=agent.id,
+            source_id=registration.id,
+            adapter_id="postgresql",
+            status=CatalogSyncStatus.SUCCEEDED,
+            started_at=NOW,
+            completed_at=NOW,
+            source_revision=structure.source_revision,
+            resource_count=len(detail.entries),
+        ),
+        (inventory, detail),
+        registration=registration,
+    )
+    resource = detail.entries[0].resource
     constraints = {
         "allowed_operations": ("insert", "update"),
         "allowed_insert_columns": ("domain", "name", "evidence_url"),

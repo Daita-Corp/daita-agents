@@ -269,6 +269,11 @@ with `DAITA_RUN_POSTGRES_LARGE_FIXTURE=1` and
 runs in one transaction on that server's `postgres` database and always rolls back,
 so it leaves no schemas, tables or roles behind.
 
+`tests/live/storage/test_postgresql_state_store.py` runs the shared store SQL
+(`SQLStateStore`, through the test-only backend in
+`tests/support/postgresql_state.py`) on the `postgres-large` fixture inside one
+rolled-back transaction, under the same gate.
+
 `tests/live/data/test_bulk_discovery.py` runs under the same gate and the same
 rollback. It checks that PostgreSQL's bulk discovery statements say exactly what the
 per-table statements say, and times attaching 1,000 and 1,500 tables through a local

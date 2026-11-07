@@ -20,7 +20,6 @@ from daita import (
 from daita._json import canonical_json
 from daita.adapters.models import (
     DiscoveryRequest,
-    DiscoveryResult,
     ResourceRef,
     ResourceSnapshot,
     SourceHealth,
@@ -40,7 +39,7 @@ from daita.capabilities import (
     ToolView,
 )
 from daita.capability_runtime import CapabilityRuntime
-from daita.catalog.models import CatalogSync, CatalogSyncStatus, SourceCatalogSnapshot
+from daita.catalog.models import CatalogTier, ResourceBatch
 from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
@@ -424,25 +423,11 @@ class _OfflinePostgresSource:
             def registration(self) -> SourceRegistration:
                 return registration
 
-            async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
-                sync = CatalogSync(
-                    id=request.sync_id,
-                    agent_id=request.agent_id,
-                    source_id=request.source_id,
-                    adapter_id="postgresql",
-                    status=CatalogSyncStatus.SUCCEEDED,
-                    started_at=request.requested_at,
-                    completed_at=NOW,
+            async def reconcile(self, request: DiscoveryRequest):
+                yield ResourceBatch(
+                    tier=CatalogTier.DETAIL,
+                    entries=(),
                     source_revision="catalog:phase5-offline",
-                )
-                return DiscoveryResult(
-                    request=request,
-                    snapshot=SourceCatalogSnapshot(
-                        sync=sync,
-                        resources=(),
-                        revisions=(),
-                    ),
-                    completed_at=NOW,
                 )
 
             async def inspect(self, resource: ResourceRef) -> ResourceSnapshot:

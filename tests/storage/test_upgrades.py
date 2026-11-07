@@ -47,7 +47,10 @@ from daita.storage.schema_contract import require_healthy, require_schema
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_schema import CURRENT_SCHEMA
 from tests.storage._routine_history import restore_released_routines
-from tests.support.home_revisions import undo_revision_4_schema
+from tests.support.home_revisions import (
+    catalog_snapshot_rows,
+    undo_revision_4_schema,
+)
 from tests.support.host import StartHost, host_workspace
 from tests.support.mcp_actions import ActionFixture
 from tests.support.paths import REPO_ROOT
@@ -195,12 +198,26 @@ async def _create_rich_home(tmp_path: Path, name: str = "atlas") -> tuple[Path, 
     return home, agent_id
 
 
+def _snapshot_resources(connection: sqlite3.Connection) -> list[tuple[str, ...]]:
+    return sorted(
+        (
+            source_id,
+            item["fields"]["id"],
+            item["fields"]["current_revision"],
+            item["fields"]["native_identity"],
+        )
+        for source_id, data in connection.execute(
+            "SELECT source_id, data FROM snapshots"
+        )
+        for item in json.loads(data)["fields"]["resources"]
+    )
+
+
 def _durable_snapshot(home: Path) -> dict[str, object]:
     tables = (
         "messages",
         "metadata",
         "runs",
-        "snapshots",
         "source_read_scopes",
         "sources",
         "syncs",
@@ -210,6 +227,17 @@ def _durable_snapshot(home: Path) -> dict[str, object]:
             table: tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
             for table in tables
         }
+        # A catalog is the same catalog whichever shape stores it.
+        rows["catalog"] = tuple(
+            connection.execute(
+                "SELECT source_id, id, revision, native_identity "
+                "FROM catalog_resources ORDER BY id"
+            )
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'catalog_resources'"
+            ).fetchone()
+            else _snapshot_resources(connection)
+        )
     return {
         "config": json.loads((home / "config.json").read_text(encoding="utf-8")),
         "memory": (home / "MEMORY.md").read_bytes(),
@@ -246,6 +274,11 @@ def _make_preproduction_home(home: Path, shape: str) -> None:
                     f'INSERT INTO "{table}" ({projection}) VALUES ({placeholders})',
                     rows,
                 )
+        target.executemany(
+            "INSERT INTO snapshots (agent_id, source_id, sync_id, data) "
+            "VALUES (?, ?, ?, ?)",
+            catalog_snapshot_rows(source),
+        )
         target.execute(
             "INSERT INTO agent_home_migrations VALUES (?, ?, ?)",
             (REVISION_1.revision, REVISION_1.migration_id, REVISION_1.checksum),

@@ -13,8 +13,8 @@ import asyncio
 import os
 import stat
 import time
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
@@ -22,18 +22,18 @@ from typing import TYPE_CHECKING, cast
 
 from .._json import FrozenJsonObject, canonical_json
 from ..catalog.models import (
+    CatalogEntry,
     CatalogFacet,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
-    CatalogSync,
-    CatalogSyncStatus,
+    CatalogTier,
     FileFacet,
     RelationshipKind,
     RelationshipProvenance,
+    ResourceBatch,
     ResourceKind,
     Sensitivity,
-    SourceCatalogSnapshot,
     TabularColumn,
     TabularFacet,
     catalog_resource_id,
@@ -56,7 +56,6 @@ from .local_workspace import (
 )
 from .models import (
     DiscoveryRequest,
-    DiscoveryResult,
     ResourceRef,
     ResourceSnapshot,
     SourceHealth,
@@ -68,7 +67,7 @@ from .protocols import (
     ResourceAdapterError,
     ResourceNotFoundError,
     SourceClosedError,
-    StaleResourceError,
+    latest_snapshot,
 )
 
 if TYPE_CHECKING:
@@ -249,13 +248,15 @@ class FolderResourceAdapter:
         self._clock = clock
         self._lock = asyncio.Lock()
         self._closed = False
-        self._latest: SourceCatalogSnapshot | None = None
+        self._latest: ResourceBatch | None = None
 
     @property
     def registration(self) -> SourceRegistration:
         return self._registration
 
-    async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
+    async def reconcile(
+        self, request: DiscoveryRequest
+    ) -> AsyncIterator[ResourceBatch]:
         if not isinstance(request, DiscoveryRequest):
             raise TypeError("request must be a DiscoveryRequest")
         if (
@@ -281,7 +282,8 @@ class FolderResourceAdapter:
                     agent_root=request.agent_root,
                     agent_home=request.agent_home,
                     limits=LocalWorkspaceLimits(
-                        max_search_results=request.max_resources,
+                        max_search_results=request.max_inventory,
+                        max_search_entries=1_000_000,
                         max_search_seconds=_DISCOVERY_SECONDS,
                     ),
                     clock=self._clock,
@@ -291,7 +293,7 @@ class FolderResourceAdapter:
                     self._registration.id, error.code, error.message
                 ) from error
             try:
-                snapshot = await _discover(
+                batches = await _discover(
                     backend, self._registration, self._subpaths, request
                 )
             except LocalWorkspaceError as error:
@@ -300,60 +302,21 @@ class FolderResourceAdapter:
                 ) from error
             finally:
                 await backend.close()
-            completed_at = max(self._clock(), request.requested_at)
-            snapshot = _complete(snapshot, completed_at)
-            self._latest = snapshot
-            return DiscoveryResult(
-                request=request, snapshot=snapshot, completed_at=completed_at
-            )
+            self._latest = batches[1]
+        for batch in batches:
+            yield batch
 
     async def inspect(self, resource: ResourceRef) -> ResourceSnapshot:
         if not isinstance(resource, ResourceRef):
             raise TypeError("resource must be a ResourceRef")
         async with self._lock:
             self._require_open()
-            snapshot = self._latest
-            current = (
-                None
-                if snapshot is None
-                or resource.agent_id != self._registration.agent_id
-                or resource.source_id != self._registration.id
-                else next(
-                    (
-                        item
-                        for item in snapshot.resources
-                        if item.id == resource.resource_id
-                    ),
-                    None,
-                )
-            )
-            if snapshot is None or current is None:
-                raise ResourceNotFoundError(self._registration.id, resource.resource_id)
             if (
-                resource.revision is not None
-                and resource.revision != current.current_revision
+                resource.agent_id != self._registration.agent_id
+                or resource.source_id != self._registration.id
             ):
-                raise StaleResourceError(self._registration.id, resource.resource_id)
-            revision = next(
-                item for item in snapshot.revisions if item.resource_id == current.id
-            )
-            return ResourceSnapshot(
-                reference=resource,
-                resource=current,
-                revision=revision,
-                facets=tuple(
-                    facet
-                    for facet in snapshot.facets
-                    if facet.resource_id == current.id
-                ),
-                relationships=tuple(
-                    item
-                    for item in snapshot.relationships
-                    if current.id in {item.from_resource_id, item.to_resource_id}
-                ),
-                inspected_at=self._clock(),
-                source_revision=revision.source_revision,
-            )
+                raise ResourceNotFoundError(self._registration.id, resource.resource_id)
+            return latest_snapshot(self._latest, resource, self._clock())
 
     async def health(self) -> SourceHealth:
         async with self._lock:
@@ -408,9 +371,10 @@ async def _discover(
     registration: SourceRegistration,
     subpaths: tuple[str, ...],
     request: DiscoveryRequest,
-) -> SourceCatalogSnapshot:
+) -> tuple[ResourceBatch, ResourceBatch]:
     """Catalog the data files and the folders that hold them, bounded by the
-    request, through the scanner. Other files stay reachable live."""
+    request, through the scanner: every one as inventory, the first
+    ``max_resources`` described. Other files stay reachable live."""
 
     root_revision = _root_revision(backend.working_directory)
     if root_revision is None:
@@ -425,10 +389,13 @@ async def _discover(
         order_by="path",
         structured_only=True,
     )
-    truncated = result.truncated
+    inventory_truncated = result.truncated
     folders: list[str] = ["."]
     seen_folders = {"."}
     files: list[tuple[str, str, int, datetime]] = []
+    # Detail covers a prefix of the walk; the inventory continues past it.
+    detail_folders, detail_files = 1, 0
+    detail_cut = False
     for match in result.matches:
         parents = [
             parent.as_posix()
@@ -436,11 +403,18 @@ async def _discover(
             if parent.as_posix() != "."
         ]
         missing = [item for item in parents if item not in seen_folders]
-        # One resource per file and missing folder; one CONTAINS edge each.
-        needed = len(folders) + len(files) + len(missing) + 1
-        if needed > request.max_resources or needed - 1 > request.max_relationships:
-            truncated = True
+        if len(folders) + len(files) + len(missing) + 1 > request.max_inventory:
+            inventory_truncated = True
             break
+        # One resource per file and missing folder; one CONTAINS edge each.
+        needed = detail_folders + detail_files + len(missing) + 1
+        if not detail_cut and (
+            needed > request.max_resources or needed - 1 > request.max_relationships
+        ):
+            detail_cut = True
+        if not detail_cut:
+            detail_folders += len(missing)
+            detail_files += 1
         folders.extend(missing)
         seen_folders.update(missing)
         files.append(
@@ -451,6 +425,27 @@ async def _discover(
                 datetime.fromisoformat(match.modified_at),
             )
         )
+    inventory_entries = tuple(
+        request.inventory_entry(
+            kind=kind,
+            native_identity=path,
+            name=registration.display_name if path == "." else path,
+            external_uri=(backend.working_directory / path).as_uri(),
+            sensitivity=Sensitivity(registration.presentation_sensitivity.value),
+        )
+        for kind, path in (
+            *((ResourceKind.FOLDER, item) for item in folders),
+            *((ResourceKind.FILE, item[0]) for item in files),
+        )
+    )
+    inventory = ResourceBatch(
+        tier=CatalogTier.INVENTORY,
+        entries=inventory_entries,
+        truncated=inventory_truncated,
+    )
+    folders = folders[:detail_folders]
+    files = files[:detail_files]
+    truncated = detail_cut
     schemas, described_all = await _describe(backend, tuple(path for path, *_ in files))
     # A data file left without its schema is an incomplete catalog.
     truncated = truncated or not described_all
@@ -536,8 +531,10 @@ async def _discover(
     for item in relationships:
         for endpoint in (item.from_resource_id, item.to_resource_id):
             relationship_revisions.setdefault(endpoint, []).append(item.revision)
-    resources: list[CatalogResource] = []
-    revisions: list[CatalogResourceRevision] = []
+    facets_by_resource: dict[str, list[CatalogFacet]] = {}
+    for facet in facets:
+        facets_by_resource.setdefault(facet.resource_id, []).append(facet)
+    detailed: list[CatalogEntry] = []
     for kind, path, facet_revisions, revision_source in entries:
         identifier = resource_id(kind, path)
         revision = CatalogResourceRevision.build(
@@ -548,47 +545,33 @@ async def _discover(
             relationship_revisions=tuple(relationship_revisions.get(identifier, ())),
             source_revision=revision_source or root_revision,
         )
-        revisions.append(revision)
-        resources.append(
-            CatalogResource.build(
-                agent_id=request.agent_id,
-                source_id=source_id,
-                native_identity=path,
-                external_uri=(backend.working_directory / path).as_uri(),
-                kind=kind,
-                name=registration.display_name if path == "." else path,
-                sensitivity=sensitivity,
+        detailed.append(
+            CatalogEntry(
+                resource=CatalogResource.build(
+                    agent_id=request.agent_id,
+                    source_id=source_id,
+                    native_identity=path,
+                    external_uri=(backend.working_directory / path).as_uri(),
+                    kind=kind,
+                    name=registration.display_name if path == "." else path,
+                    sensitivity=sensitivity,
+                    revision=revision,
+                    first_observed_at=observed_at,
+                    last_observed_at=observed_at,
+                ),
                 revision=revision,
-                first_observed_at=observed_at,
-                last_observed_at=observed_at,
+                facets=tuple(facets_by_resource.get(identifier, ())),
+                detailed=True,
             )
         )
-    sync = CatalogSync(
-        id=sync_id,
-        agent_id=request.agent_id,
-        source_id=source_id,
-        adapter_id=FOLDER_ADAPTER_ID,
-        status=CatalogSyncStatus.SUCCEEDED,
-        started_at=observed_at,
-        completed_at=observed_at,
-        source_revision=root_revision,
-        resource_count=len(resources),
-        relationship_count=len(relationships),
-        truncated=truncated,
-    )
-    return SourceCatalogSnapshot(
-        sync=sync,
-        resources=tuple(resources),
-        revisions=tuple(revisions),
-        facets=tuple(facets),
+    detail = ResourceBatch(
+        tier=CatalogTier.DETAIL,
+        entries=tuple(detailed),
         relationships=relationships,
+        truncated=truncated,
+        source_revision=root_revision,
     )
-
-
-def _complete(
-    snapshot: SourceCatalogSnapshot, completed_at: datetime
-) -> SourceCatalogSnapshot:
-    return replace(snapshot, sync=replace(snapshot.sync, completed_at=completed_at))
+    return inventory, detail
 
 
 async def _describe(

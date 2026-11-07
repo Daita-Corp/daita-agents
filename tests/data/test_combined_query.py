@@ -17,7 +17,6 @@ from daita import Agent, AgentConfig, SQLiteSource
 from daita._json import FrozenJsonObject, canonical_json
 from daita.adapters.models import (
     DiscoveryRequest,
-    DiscoveryResult,
     ResourceRef,
     ResourceSnapshot,
     SourceHealth,
@@ -33,14 +32,14 @@ from daita.capabilities import (
 )
 from daita.capability_runtime import CapabilityRuntime
 from daita.catalog.models import (
+    CatalogEntry,
     CatalogFacet,
     CatalogResource,
     CatalogResourceRevision,
-    CatalogSync,
-    CatalogSyncStatus,
+    CatalogTier,
+    ResourceBatch,
     ResourceKind,
     Sensitivity,
-    SourceCatalogSnapshot,
     TabularColumn,
     TabularFacet,
     catalog_resource_id,
@@ -838,7 +837,7 @@ class _TargetsAdapter:
     def __init__(self, registration: SourceRegistration) -> None:
         self.registration = registration
 
-    async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
+    async def reconcile(self, request: DiscoveryRequest):
         registration = self.registration
         now = request.requested_at
         resource_id = catalog_resource_id(
@@ -878,23 +877,18 @@ class _TargetsAdapter:
             first_observed_at=now,
             last_observed_at=now,
         )
-        snapshot = SourceCatalogSnapshot(
-            sync=CatalogSync(
-                id=request.sync_id,
-                agent_id=registration.agent_id,
-                source_id=registration.id,
-                adapter_id=CONFIDENTIAL_ADAPTER_ID,
-                status=CatalogSyncStatus.SUCCEEDED,
-                started_at=now,
-                completed_at=now,
-                source_revision="targets:v1",
-                resource_count=1,
+        yield ResourceBatch(
+            tier=CatalogTier.DETAIL,
+            entries=(
+                CatalogEntry(
+                    resource=resource,
+                    revision=revision,
+                    facets=(facet,),
+                    detailed=True,
+                ),
             ),
-            resources=(resource,),
-            revisions=(revision,),
-            facets=(facet,),
+            source_revision="targets:v1",
         )
-        return DiscoveryResult(request=request, snapshot=snapshot, completed_at=now)
 
     async def inspect(self, resource: ResourceRef) -> ResourceSnapshot:
         raise StaleResourceError(self.registration.id, resource.resource_id)

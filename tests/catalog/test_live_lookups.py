@@ -507,7 +507,9 @@ def _with_estimates(agent: Agent) -> None:
     service = agent._embedded._catalog_service
     real = service.tabular_resources
 
-    async def estimated(agent_id: str, source_id: str) -> tuple[object, ...]:
+    async def estimated(
+        agent_id: str, source_id: str, **lookup: object
+    ) -> tuple[object, ...]:
         return tuple(
             replace(
                 item,
@@ -516,7 +518,7 @@ def _with_estimates(agent: Agent) -> None:
                     row_count_estimate=_ESTIMATES.get(item.resource.native_identity),
                 ),
             )
-            for item in await real(agent_id, source_id)
+            for item in await real(agent_id, source_id, **lookup)  # type: ignore[arg-type]
         )
 
     service.tabular_resources = estimated  # type: ignore[method-assign,assignment]

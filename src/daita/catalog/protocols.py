@@ -2,20 +2,29 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from .models import (
+    CatalogChange,
+    CatalogCommitSummary,
+    CatalogEntry,
     CatalogFacet,
     CatalogLink,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
-    CatalogSnapshotRef,
+    CatalogSearchRow,
+    CatalogSourceState,
     CatalogSummary,
     CatalogSync,
     RelationshipKind,
-    SourceCatalogSnapshot,
+    ResourceBatch,
+    ResourceKind,
 )
+
+if TYPE_CHECKING:
+    from ..adapters.models import SourceRegistration
 
 
 def _required_text(value: str, field_name: str) -> None:
@@ -66,25 +75,67 @@ class CatalogStore(Protocol):
 
     async def record_sync(self, sync: CatalogSync) -> CatalogSync: ...
 
-    async def commit_snapshot(
+    async def commit_catalog(
         self,
-        snapshot: SourceCatalogSnapshot,
-    ) -> SourceCatalogSnapshot: ...
+        sync: CatalogSync,
+        batches: tuple[ResourceBatch, ...],
+        *,
+        registration: SourceRegistration | None = None,
+        full: bool = True,
+    ) -> CatalogCommitSummary: ...
 
-    async def list_current_snapshot_refs(
-        self,
-        agent_id: str,
-        source_ids: tuple[str, ...],
-    ) -> tuple[CatalogSnapshotRef, ...]: ...
+    async def current_syncs(
+        self, agent_id: str, source_ids: tuple[str, ...]
+    ) -> tuple[CatalogSync, ...]: ...
 
-    async def list_unreadable_snapshot_source_ids(
+    async def load_source_state(
+        self, agent_id: str, source_id: str
+    ) -> CatalogSourceState | None: ...
+
+    async def list_catalog_changes(
+        self, agent_id: str, source_id: str, *, limit: int = 50
+    ) -> tuple[CatalogChange, ...]: ...
+
+    async def take_unreadable_catalog_sources(
         self, agent_id: str
     ) -> tuple[str, ...]: ...
 
-    async def load_current_snapshot(
+    async def load_entry(
+        self, agent_id: str, resource_id: str
+    ) -> CatalogEntry | None: ...
+
+    async def load_entries(
+        self, agent_id: str, resource_ids: tuple[str, ...]
+    ) -> tuple[CatalogEntry, ...]: ...
+
+    async def load_entries_by_identity(
+        self, agent_id: str, source_id: str, native_identities: tuple[str, ...]
+    ) -> tuple[CatalogEntry, ...]: ...
+
+    async def list_resource_names(
         self,
-        ref: CatalogSnapshotRef,
-    ) -> SourceCatalogSnapshot | None: ...
+        agent_id: str,
+        source_ids: tuple[str, ...],
+        *,
+        other_than: ResourceKind | None = None,
+        limit: int | None = None,
+    ) -> tuple[tuple[str, str, str], ...]:
+        """(ID, source ID, native name) of the resources of these sources (empty
+        means every source), or the ``limit`` smallest IDs, reading columns alone."""
+        ...
+
+    async def list_entries(
+        self, agent_id: str, source_id: str
+    ) -> tuple[CatalogEntry, ...]: ...
+
+    async def search_catalog(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...],
+        *,
+        terms: tuple[str, ...] | None,
+        anchor_keys: tuple[str, ...] = (),
+    ) -> tuple[CatalogSearchRow, ...]: ...
 
     async def load_sync(self, agent_id: str, sync_id: str) -> CatalogSync | None: ...
 
@@ -123,11 +174,11 @@ class CatalogStore(Protocol):
     async def load_incident_relationships(
         self,
         agent_id: str,
-        resource_id: str,
+        resource_ids: tuple[str, ...],
         *,
         relationship_kinds: tuple[RelationshipKind, ...] = (),
         limit: int = 50,
-    ) -> tuple[CatalogRelationship, ...]: ...
+    ) -> Mapping[str, tuple[CatalogRelationship, ...]]: ...
 
     async def save_catalog_link(self, link: CatalogLink) -> None: ...
 

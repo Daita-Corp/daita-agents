@@ -49,7 +49,7 @@ policy before source I/O, which needs no catalog lookup. Local file reads are
 descriptor-contained, and a read cursor stays bound to the bytes it started on. MCP calls
 revalidate the exact binding revision, remote identity, and schemas.
 
-Agent identity, source registrations, current catalog snapshots, declared
+Agent identity, source registrations, catalog entries, declared
 catalog links, exact run transcripts, terminal results, jobs, routines,
 deliveries, permissions, and receipts are stored in one SQLite database inside
 the agent home.

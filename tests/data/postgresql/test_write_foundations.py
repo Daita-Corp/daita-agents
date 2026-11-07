@@ -8,14 +8,15 @@ import pytest
 
 from daita import Agent, PostgreSQLSource
 from daita.adapters import postgresql as postgresql_module
-from daita.adapters.models import DiscoveryRequest, DiscoveryResult, SourceRegistration
+from daita.adapters.models import DiscoveryRequest, SourceRegistration
 from daita.adapters.registry import SourceTypeRegistry
 from daita.catalog.models import (
     CatalogFacet,
     CatalogSync,
     CatalogSyncStatus,
+    CatalogTier,
+    ResourceBatch,
     ResourceKind,
-    SourceCatalogSnapshot,
     TabularColumn,
     TabularFacet,
 )
@@ -179,10 +180,7 @@ async def test_detach_revokes_scopes_and_storage_reattachment_starts_read_only(
         completed_at=NOW,
         source_revision="catalog:sha256:" + "a" * 64,
     )
-    await agent._embedded._store.commit_snapshot(
-        SourceCatalogSnapshot(sync=sync, resources=(), revisions=()),
-        registration=registered,
-    )
+    await agent._embedded._store.commit_catalog(sync, (), registration=registered)
     reattached = await agent._embedded._store.load_source(agent.id, registration.id)
     try:
         assert reattached is not None
@@ -227,25 +225,11 @@ async def test_postgresql_refresh_preserves_read_scope_outside_connection_identi
         def registration(self) -> SourceRegistration:
             return connection_registration
 
-        async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
-            sync = CatalogSync(
-                id=request.sync_id,
-                agent_id=request.agent_id,
-                source_id=request.source_id,
-                adapter_id="postgresql",
-                status=CatalogSyncStatus.SUCCEEDED,
-                started_at=request.requested_at,
-                completed_at=NOW,
+        async def reconcile(self, request: DiscoveryRequest):
+            yield ResourceBatch(
+                tier=CatalogTier.DETAIL,
+                entries=(),
                 source_revision="catalog:sha256:" + "a" * 64,
-            )
-            return DiscoveryResult(
-                request=request,
-                snapshot=SourceCatalogSnapshot(
-                    sync=sync,
-                    resources=(),
-                    revisions=(),
-                ),
-                completed_at=NOW,
             )
 
         async def inspect(self, resource):
@@ -324,14 +308,7 @@ async def test_committed_source_edit_deletes_only_the_previous_owned_credential(
         completed_at=NOW,
         source_revision="catalog:initial",
     )
-    await agent._embedded._store.commit_snapshot(
-        SourceCatalogSnapshot(
-            sync=initial_sync,
-            resources=(),
-            revisions=(),
-        ),
-        registration=current,
-    )
+    await agent._embedded._store.commit_catalog(initial_sync, (), registration=current)
     edited = replace(
         _registration(agent.id, native_identity="postgresql:writer"),
         configuration={
@@ -347,25 +324,11 @@ async def test_committed_source_edit_deletes_only_the_previous_owned_credential(
         def registration(self) -> SourceRegistration:
             return edited
 
-        async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
-            sync = CatalogSync(
-                id=request.sync_id,
-                agent_id=request.agent_id,
-                source_id=request.source_id,
-                adapter_id="postgresql",
-                status=CatalogSyncStatus.SUCCEEDED,
-                started_at=request.requested_at,
-                completed_at=NOW,
+        async def reconcile(self, request: DiscoveryRequest):
+            yield ResourceBatch(
+                tier=CatalogTier.DETAIL,
+                entries=(),
                 source_revision="catalog:edited",
-            )
-            return DiscoveryResult(
-                request=request,
-                snapshot=SourceCatalogSnapshot(
-                    sync=sync,
-                    resources=(),
-                    revisions=(),
-                ),
-                completed_at=NOW,
             )
 
         async def inspect(self, resource):
@@ -530,6 +493,7 @@ async def test_catalog_projection_round_trips_ordered_keys_and_column_write_fact
         ),
         relationships=(),
         source_revision="catalog:sha256:" + "5" * 64,
+        inventory=(("public", "accounts", ResourceKind.TABLE, None),),
     )
     request = DiscoveryRequest(
         agent_id=agent.id,
@@ -537,10 +501,21 @@ async def test_catalog_projection_round_trips_ordered_keys_and_column_write_fact
         sync_id="catalog-sync-write-facts",
         requested_at=NOW,
     )
-    snapshot = postgresql_module._catalog_snapshot(
-        registration, request, structure, NOW
+    batches = postgresql_module._batches(request, structure)
+    await agent._embedded._store.commit_catalog(
+        CatalogSync(
+            id=request.sync_id,
+            agent_id=agent.id,
+            source_id=registration.id,
+            adapter_id="postgresql",
+            status=CatalogSyncStatus.SUCCEEDED,
+            started_at=NOW,
+            completed_at=NOW,
+            source_revision=structure.source_revision,
+            resource_count=len(batches[1].entries),
+        ),
+        batches,
     )
-    await agent._embedded._store.commit_snapshot(snapshot)
 
     try:
         tabular_resource = (

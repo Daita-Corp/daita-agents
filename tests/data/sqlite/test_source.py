@@ -10,7 +10,7 @@ from daita import Agent, SQLiteSource
 from daita.adapters import sqlite_query as sqlite_query_module
 from daita.adapters.models import DiscoveryRequest
 from daita.adapters.registry import SourceTypeRegistry
-from daita.catalog.models import SourceCatalogSnapshot, TabularFacet
+from daita.catalog.models import TabularFacet
 from daita.domains.data.results import project_result_rows
 from daita.llm.models import (
     FinishReason,
@@ -23,7 +23,9 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.loop import LoopExitKind
 from daita.security import EmptySecretProvider
 from tests.support.source_contract import (
+    ReconcilePass,
     assert_source_type_contract,
+    reconcile_pass,
 )
 from tests.support.workspace import workspace_for
 
@@ -409,29 +411,29 @@ async def test_sqlite_source_type_satisfies_the_source_contract(tmp_path) -> Non
     )
 
 
-async def _discover_sqlite(database: Path, **limits: Any) -> SourceCatalogSnapshot:
+async def _discover_sqlite(database: Path, **limits: Any) -> ReconcilePass:
     now = datetime(2026, 11, 2, tzinfo=UTC)
     adapter = await SQLiteSource(database).open(
         agent_id="agent", attached_at=now, clock=lambda: now
     )
     try:
-        result = await adapter.discover(
+        return await reconcile_pass(
+            adapter,
             DiscoveryRequest(
                 agent_id="agent",
                 source_id=adapter.registration.id,
                 sync_id="sync",
                 requested_at=now,
                 **limits,
-            )
+            ),
         )
     finally:
         await adapter.close()
-    return result.snapshot
 
 
-def _tabular(snapshot: SourceCatalogSnapshot, name: str) -> TabularFacet:
-    (resource,) = [item for item in snapshot.resources if item.name == name]
-    (facet,) = [item for item in snapshot.facets if item.resource_id == resource.id]
+def _tabular(result: ReconcilePass, name: str) -> TabularFacet:
+    (entry,) = [item for item in result.detail.entries if item.resource.name == name]
+    (facet,) = entry.facets
     return TabularFacet.from_payload(facet.payload)
 
 
@@ -446,9 +448,24 @@ async def test_sqlite_discovery_beyond_the_resource_limit_keeps_the_first_tables
     whole = await _discover_sqlite(database, max_resources=8)
     cut = await _discover_sqlite(database, max_resources=5)
 
-    assert whole.sync.truncated is False
-    assert cut.sync.truncated is True
+    assert whole.truncated is False
+    assert cut.truncated is True
     assert [item.name for item in cut.resources] == [f"t{index}" for index in range(5)]
+
+
+async def test_sqlite_inventory_names_every_table_beyond_the_detail_limit(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "large.sqlite"
+    with sqlite3.connect(database) as connection:
+        for index in range(1_500):
+            connection.execute(f"CREATE TABLE t{index:04} (id INTEGER)")
+
+    result = await _discover_sqlite(database, max_resources=1_000)
+
+    assert len(result.inventory.entries) == 1_500
+    assert len(result.resources) == 1_000
+    assert result.truncated is True
 
 
 async def test_sqlite_wide_table_keeps_its_first_columns_and_a_whole_key_or_none(
@@ -468,7 +485,7 @@ async def test_sqlite_wide_table_keeps_its_first_columns_and_a_whole_key_or_none
 
     snapshot = await _discover_sqlite(database, max_columns_per_resource=3)
 
-    assert snapshot.sync.truncated is True
+    assert snapshot.truncated is True
     keys = {
         name: [
             column.name
@@ -509,8 +526,8 @@ async def test_sqlite_more_indexes_and_relationships_than_the_limits_keep_the_fi
         database, max_indexes_per_resource=2, max_relationships=2
     )
 
-    assert whole.sync.truncated is False
-    assert cut.sync.truncated is True
+    assert whole.truncated is False
+    assert cut.truncated is True
     assert [index.name for index in _tabular(cut, "parent").indexes] == ["by_a", "by_b"]
     assert len(cut.relationships) == 2
 

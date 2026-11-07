@@ -9,12 +9,25 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+# shortcut: imports current catalog codecs and search text, so revision 4's output follows them; freeze copies here before any later revision changes them.
+from ...catalog.models import CatalogEntry, CatalogSourceState
+from ...catalog.search_text import search_key, search_postings, search_words
+from ..sqlite_codecs import (
+    decode_catalog_snapshot,
+    encode_catalog_entry,
+    encode_catalog_relationship,
+    encode_catalog_source_state,
+    encode_search_postings,
+)
+from ..sqlite_codecs.common import datetime_encode
 from ..sqlite_schema import (
     ANALYSIS_EVIDENCE_SQL,
+    CATALOG_ENTRIES_SQL,
     CATALOG_LINKS_SQL,
     JOBS_SQL,
     RETIRE_GRAPH_SQL,
     RETIRE_LEARNING_CANDIDATES_SQL,
+    RETIRE_SNAPSHOTS_SQL,
     SCHEMA_REVISION_4,
 )
 from .models import HomeMigration
@@ -603,6 +616,152 @@ def _default_reasoning_effort(path: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+_MAX_PARAMETERS = 900
+
+
+def _insert_rows(
+    connection: sqlite3.Connection,
+    table: str,
+    columns: str,
+    rows: list[tuple[str | None, ...]],
+) -> None:
+    """Insert rows in multi-row statements that stay under the parameter limit."""
+
+    if not rows:
+        return
+    width = len(rows[0])
+    per_statement = _MAX_PARAMETERS // width
+    group = "(" + ", ".join("?" * width) + ")"
+    for start in range(0, len(rows), per_statement):
+        chunk = rows[start : start + per_statement]
+        connection.execute(
+            f"INSERT INTO {table} ({columns}) VALUES "
+            + ", ".join([group] * len(chunk)),
+            [value for row in chunk for value in row],
+        )
+
+
+def _timestamp(value: object) -> str:
+    stored = datetime_encode(value)["__datetime__"]  # type: ignore[arg-type]
+    assert isinstance(stored, str)
+    return stored
+
+
+def _convert_catalog_snapshots(connection: sqlite3.Connection) -> None:
+    """Turn each stored source snapshot into per-resource rows, then drop it.
+
+    Every resource keeps its ID, revision and facets and counts as fully
+    described; the source's one state row names the snapshot's sync as current.
+    A snapshot that does not decode stops the upgrade.
+    """
+
+    connection.executescript(CATALOG_ENTRIES_SQL)
+    for agent_id, source_id, encoded in connection.execute(
+        "SELECT agent_id, source_id, data FROM snapshots"
+    ).fetchall():
+        snapshot = decode_catalog_snapshot(encoded)
+        sync_id = snapshot.sync.id
+        revisions = {item.resource_id: item for item in snapshot.revisions}
+        facets: dict[str, list] = {}
+        for facet in snapshot.facets:
+            facets.setdefault(facet.resource_id, []).append(facet)
+        incident: dict[str, list] = {item.id: [] for item in snapshot.resources}
+        for relationship in snapshot.relationships:
+            incident[relationship.from_resource_id].append(relationship)
+            if relationship.to_resource_id != relationship.from_resource_id:
+                incident[relationship.to_resource_id].append(relationship)
+        resource_rows: list[tuple[str | None, ...]] = []
+        search_rows: list[tuple[str | None, ...]] = []
+        for resource in snapshot.resources:
+            entry = CatalogEntry(
+                resource=resource,
+                revision=revisions[resource.id],
+                facets=tuple(
+                    sorted(
+                        facets.get(resource.id, ()),
+                        key=lambda item: (item.kind.value, item.revision),
+                    )
+                ),
+                detailed=True,
+            )
+            resource_rows.append(
+                (
+                    agent_id,
+                    source_id,
+                    resource.id,
+                    resource.kind.value,
+                    resource.native_identity,
+                    resource.name,
+                    resource.current_revision,
+                    None,
+                    "complete",
+                    sync_id,
+                    _timestamp(resource.first_observed_at),
+                    _timestamp(resource.last_observed_at),
+                    encode_catalog_entry(entry),
+                )
+            )
+            postings = search_postings(entry, incident[resource.id])
+            search_rows.append(
+                (
+                    agent_id,
+                    source_id,
+                    resource.id,
+                    search_key(resource.name),
+                    search_key(resource.native_identity),
+                    search_words(postings),
+                    encode_search_postings(postings),
+                )
+            )
+        _insert_rows(
+            connection,
+            "catalog_resources",
+            "agent_id, source_id, id, kind, native_identity, name, revision, "
+            "source_object_id, detail, last_seen_sync, first_observed_at, "
+            "last_observed_at, data",
+            resource_rows,
+        )
+        _insert_rows(
+            connection,
+            "catalog_relationships",
+            "agent_id, source_id, id, from_resource_id, to_resource_id, revision, data",
+            [
+                (
+                    agent_id,
+                    source_id,
+                    item.id,
+                    item.from_resource_id,
+                    item.to_resource_id,
+                    item.revision,
+                    encode_catalog_relationship(item),
+                )
+                for item in snapshot.relationships
+            ],
+        )
+        _insert_rows(
+            connection,
+            "catalog_search",
+            "agent_id, source_id, resource_id, name_key, identity_key, words, data",
+            search_rows,
+        )
+        connection.execute(
+            "INSERT INTO catalog_source_state (agent_id, source_id, data) "
+            "VALUES (?, ?, ?)",
+            (
+                agent_id,
+                source_id,
+                encode_catalog_source_state(
+                    CatalogSourceState(
+                        agent_id=agent_id,
+                        source_id=source_id,
+                        current_sync_id=sync_id,
+                    )
+                ),
+            ),
+        )
+    connection.executescript(RETIRE_SNAPSHOTS_SQL)
+
+
 def _apply_revision_4(home: Path, source_shape: str | None) -> None:
     if source_shape is not None:
         raise ValueError("Unknown analysis migration source")
@@ -672,6 +831,7 @@ def _apply_revision_4(home: Path, source_shape: str | None) -> None:
         _convert_graph_jobs(connection)
         _fold_sqlite_identities(connection)
         _convert_write_scopes(connection)
+        _convert_catalog_snapshots(connection)
         connection.commit()
     _default_reasoning_effort(home / "config.json")
 
@@ -700,7 +860,10 @@ REVISION_4 = HomeMigration(
         "update, upsert becomes insert and update, delete is never granted, conflict keys and "
         "identity columns go, and a scope whose table left the catalog is dropped. "
         "Each saved model route candidate gains a null reasoning effort, which keeps the "
-        "provider's default."
+        "provider's default. "
+        "Each source's catalog snapshot becomes one row per resource, relationship and search "
+        "entry plus a source state row; resource ids and revisions are unchanged, every "
+        "resource counts as fully described, and the snapshot table goes."
     ),
     affected_paths=("state.db", "config.json"),
     target_schema=SCHEMA_REVISION_4,

@@ -13,6 +13,18 @@ from daita import (
     SemanticEvidenceKind,
 )
 from daita.capabilities import CallTargetLane, OperationalEffect
+from daita.catalog.models import (
+    CatalogEntry,
+    CatalogResource,
+    CatalogResourceRevision,
+    CatalogSync,
+    CatalogSyncStatus,
+    CatalogTier,
+    ResourceBatch,
+    ResourceKind,
+    Sensitivity,
+    catalog_resource_id,
+)
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -823,8 +835,47 @@ async def test_a_note_on_a_view_in_a_source_read_in_full_binds_its_catalog_entry
         await agent.close()
 
 
+async def _list_without_detail(agent, source, native_identity: str) -> None:
+    """Record a table in the catalog by name only, as an inventory pass does."""
+
+    revision = CatalogResourceRevision.build(
+        resource_id=catalog_resource_id(source.id, ResourceKind.TABLE, native_identity),
+        sync_id="inventory-sync",
+        observed_at=NOW,
+    )
+    resource = CatalogResource.build(
+        agent_id=agent.id,
+        source_id=source.id,
+        native_identity=native_identity,
+        external_uri=f"sqlite:///{native_identity}",
+        kind=ResourceKind.TABLE,
+        name=native_identity.split(".")[-1],
+        sensitivity=Sensitivity.UNKNOWN,
+        revision=revision,
+        first_observed_at=NOW,
+        last_observed_at=NOW,
+    )
+    sync = CatalogSync(
+        id="inventory-sync",
+        agent_id=agent.id,
+        source_id=source.id,
+        adapter_id="sqlite",
+        status=CatalogSyncStatus.SUCCEEDED,
+        started_at=NOW,
+        completed_at=NOW,
+        resource_count=1,
+        relationship_count=0,
+    )
+    entry = CatalogEntry(resource, revision, (), detailed=False)
+    await agent._embedded._store.commit_catalog(
+        sync, (ResourceBatch(CatalogTier.INVENTORY, (entry,)),)
+    )
+
+
+@pytest.mark.parametrize("listed", (False, True), ids=("unseen", "listed-only"))
 async def test_a_note_on_a_table_the_catalog_has_not_seen_is_refused_by_name(
     tmp_path,
+    listed,
 ):
     database = tmp_path / "fresh.db"
     sqlite3.connect(database).close()
@@ -860,10 +911,13 @@ async def test_a_note_on_a_table_the_catalog_has_not_seen_is_refused_by_name(
         model_profile=_profile(provider),
     )
     try:
-        await agent.attach_sqlite(database, name="Fresh")
-        # Created after attach and never refreshed: the catalog has no entry.
+        source = await agent.attach_sqlite(database, name="Fresh")
+        # Created after attach and never refreshed: the catalog has no entry,
+        # or only a name with no described structure.
         with sqlite3.connect(database) as connection:
             connection.execute("CREATE TABLE fresh(id INTEGER PRIMARY KEY)")
+        if listed:
+            await _list_without_detail(agent, source, "main.fresh")
         await agent.learn("Fresh holds new rows.")
         (refusal,) = (item for item in _tool_results(provider) if item.is_error)
         assert _error_code(refusal) == "semantic_unknown_resource"

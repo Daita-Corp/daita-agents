@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
+from types import MappingProxyType
 from typing import ClassVar, TypeVar, cast
 
 from .._json import FrozenJsonObject, canonical_json
@@ -214,20 +215,6 @@ class CatalogSyncStatus(str, Enum):
     SUCCEEDED = "succeeded"
     PARTIAL = "partial"
     FAILED = "failed"
-
-
-@dataclass(frozen=True, slots=True)
-class CatalogSnapshotRef:
-    """Lightweight identity for one exact current source snapshot generation."""
-
-    agent_id: str
-    source_id: str
-    sync_id: str
-
-    def __post_init__(self) -> None:
-        _required_text(self.agent_id, "catalog snapshot ref agent_id")
-        _required_text(self.source_id, "catalog snapshot ref source_id")
-        _required_text(self.sync_id, "catalog snapshot ref sync_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1387,6 +1374,253 @@ class SourceCatalogSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class CatalogEntry:
+    """One resource with its current revision and facets, stored as one row."""
+
+    resource: CatalogResource
+    revision: CatalogResourceRevision
+    facets: tuple[CatalogFacet, ...]
+    detailed: bool
+    source_object_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.resource, CatalogResource):
+            raise TypeError("catalog entry resource must be a CatalogResource")
+        if not isinstance(self.revision, CatalogResourceRevision):
+            raise TypeError("catalog entry revision must be a CatalogResourceRevision")
+        facets = _record_tuple(self.facets, CatalogFacet, "catalog entry facets")
+        if not isinstance(self.detailed, bool):
+            raise TypeError("catalog entry detailed must be a boolean")
+        _optional_text(self.source_object_id, "catalog entry source_object_id")
+        if self.revision.resource_id != self.resource.id:
+            raise ValueError("catalog entry revision belongs to another resource")
+        if self.revision.revision != self.resource.current_revision:
+            raise ValueError("catalog entry revision is not the current revision")
+        if any(facet.resource_id != self.resource.id for facet in facets):
+            raise ValueError("catalog entry facet belongs to another resource")
+        if tuple(sorted(facet.revision for facet in facets)) != (
+            self.revision.facet_revisions
+        ):
+            raise ValueError("catalog entry facets do not match its revision")
+        if facets and not self.detailed:
+            raise ValueError("an inventory-only catalog entry cannot carry facets")
+        object.__setattr__(self, "facets", facets)
+
+
+class CatalogTier(str, Enum):
+    INVENTORY = "inventory"
+    DETAIL = "detail"
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceBatch:
+    """One tier of one discovery pass over a single source."""
+
+    tier: CatalogTier
+    entries: tuple[CatalogEntry, ...]
+    relationships: tuple[CatalogRelationship, ...] = ()
+    truncated: bool = False
+    source_revision: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tier, CatalogTier):
+            raise TypeError("resource batch tier must be a CatalogTier")
+        entries = _record_tuple(self.entries, CatalogEntry, "resource batch entries")
+        relationships = _record_tuple(
+            self.relationships, CatalogRelationship, "resource batch relationships"
+        )
+        if not isinstance(self.truncated, bool):
+            raise TypeError("resource batch truncated must be a boolean")
+        _optional_text(self.source_revision, "batch source_revision", maximum=1_024)
+        if len({entry.resource.id for entry in entries}) != len(entries):
+            raise ValueError("resource batch has duplicate resource ids")
+        if len({(e.resource.agent_id, e.resource.source_id) for e in entries}) > 1:
+            raise ValueError("resource batch spans more than one agent or source")
+        sources = {entry.resource.source_id for entry in entries} | {
+            relationship.source_id for relationship in relationships
+        }
+        if len(sources) > 1:
+            raise ValueError("resource batch spans more than one source")
+        if self.tier is CatalogTier.INVENTORY:
+            if any(entry.detailed for entry in entries):
+                raise ValueError("an inventory batch cannot carry detailed entries")
+            if relationships:
+                raise ValueError("an inventory batch cannot carry relationships")
+        elif any(not entry.detailed for entry in entries):
+            raise ValueError("a detail batch can carry only detailed entries")
+        object.__setattr__(self, "entries", entries)
+        object.__setattr__(self, "relationships", relationships)
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogSourceState:
+    agent_id: str
+    source_id: str
+    current_sync_id: str
+    probe_tokens: Mapping[str, str] = field(default_factory=dict)
+    probe_cursor: str | None = None
+    last_probe_at: datetime | None = None
+    last_change_at: datetime | None = None
+    last_full_check_at: datetime | None = None
+    last_missed: int | None = None
+    last_error_code: str | None = None
+    keep_current: bool = True
+
+    def __post_init__(self) -> None:
+        _required_text(self.agent_id, "source state agent_id")
+        _required_text(self.source_id, "source state source_id")
+        _required_text(self.current_sync_id, "source state current_sync_id")
+        if not isinstance(self.probe_tokens, Mapping):
+            raise TypeError("source state probe_tokens must be a mapping")
+        for key, value in self.probe_tokens.items():
+            _required_text(key, "source state probe token name", maximum=256)
+            _required_text(value, "source state probe token", maximum=1_024)
+        _optional_text(self.probe_cursor, "source state probe_cursor", maximum=1_024)
+        for moment, name in (
+            (self.last_probe_at, "last_probe_at"),
+            (self.last_change_at, "last_change_at"),
+            (self.last_full_check_at, "last_full_check_at"),
+        ):
+            if moment is not None:
+                _aware(moment, f"source state {name}")
+        if self.last_missed is not None:
+            _non_negative_int(self.last_missed, "source state last_missed")
+        _optional_text(
+            self.last_error_code, "source state last_error_code", maximum=128
+        )
+        if not isinstance(self.keep_current, bool):
+            raise TypeError("source state keep_current must be a boolean")
+        object.__setattr__(
+            self,
+            "probe_tokens",
+            MappingProxyType(dict(sorted(self.probe_tokens.items()))),
+        )
+
+
+class CatalogChangeKind(str, Enum):
+    ADDED = "added"
+    CHANGED = "changed"
+    REMOVED = "removed"
+
+
+CATALOG_CHANGE_MAX_COLUMNS = 4_096
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogChangeSide:
+    name: str
+    kind: ResourceKind
+    revision: str
+    columns: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        _required_text(self.name, "change side name")
+        if not isinstance(self.kind, ResourceKind):
+            raise TypeError("change side kind must be a ResourceKind")
+        _require_hash(self.revision, "change side revision")
+        columns = tuple(tuple(column) for column in self.columns)
+        if len(columns) > CATALOG_CHANGE_MAX_COLUMNS:
+            raise ValueError(
+                f"change side exceeds {CATALOG_CHANGE_MAX_COLUMNS} columns"
+            )
+        for column in columns:
+            if len(column) != 2:
+                raise ValueError("change side columns must be name and type pairs")
+            _required_text(column[0], "change side column name", maximum=256)
+            _required_text(column[1], "change side column type", maximum=256)
+        object.__setattr__(
+            self, "columns", cast("tuple[tuple[str, str], ...]", columns)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogChange:
+    agent_id: str
+    source_id: str
+    sequence: int
+    sync_id: str
+    changed_at: datetime
+    kind: CatalogChangeKind
+    resource_id: str
+    native_identity: str
+    before: CatalogChangeSide | None
+    after: CatalogChangeSide | None
+
+    def __post_init__(self) -> None:
+        _required_text(self.agent_id, "change agent_id")
+        _required_text(self.source_id, "change source_id")
+        _non_negative_int(self.sequence, "change sequence")
+        _required_text(self.sync_id, "change sync_id")
+        _aware(self.changed_at, "change changed_at")
+        if not isinstance(self.kind, CatalogChangeKind):
+            raise TypeError("change kind must be a CatalogChangeKind")
+        _required_text(self.resource_id, "change resource_id")
+        _required_text(self.native_identity, "change native_identity")
+        for side in (self.before, self.after):
+            if side is not None and not isinstance(side, CatalogChangeSide):
+                raise TypeError("change sides must be CatalogChangeSide records")
+        expected = {
+            CatalogChangeKind.ADDED: (False, True),
+            CatalogChangeKind.CHANGED: (True, True),
+            CatalogChangeKind.REMOVED: (True, False),
+        }[self.kind]
+        if (self.before is not None, self.after is not None) != expected:
+            raise ValueError("change sides do not match the change kind")
+
+
+@dataclass(frozen=True, slots=True)
+class SearchPosting:
+    field_kind: str
+    field_name: str
+    value: str
+
+    def __post_init__(self) -> None:
+        _required_text(self.field_kind, "posting field_kind", maximum=64)
+        _required_text(self.field_name, "posting field_name", maximum=2_048)
+        _required_text(self.value, "posting value", maximum=2_048)
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogSearchRow:
+    resource_id: str
+    source_id: str
+    name: str
+    native_identity: str
+    kind: ResourceKind
+    revision: str
+    detailed: bool
+    postings: tuple[SearchPosting, ...]
+
+    def __post_init__(self) -> None:
+        _required_text(self.resource_id, "search row resource_id")
+        _required_text(self.source_id, "search row source_id")
+        _required_text(self.name, "search row name")
+        _required_text(self.native_identity, "search row native_identity")
+        if not isinstance(self.kind, ResourceKind):
+            raise TypeError("search row kind must be a ResourceKind")
+        _require_hash(self.revision, "search row revision")
+        if not isinstance(self.detailed, bool):
+            raise TypeError("search row detailed must be a boolean")
+        object.__setattr__(
+            self,
+            "postings",
+            _record_tuple(self.postings, SearchPosting, "search row postings"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogCommitSummary:
+    added: int
+    changed: int
+    removed: int
+
+    def __post_init__(self) -> None:
+        _non_negative_int(self.added, "commit summary added")
+        _non_negative_int(self.changed, "commit summary changed")
+        _non_negative_int(self.removed, "commit summary removed")
+
+
+@dataclass(frozen=True, slots=True)
 class CatalogSchemaRequest:
     """Bounded selection criteria for one current structural schema projection."""
 
@@ -1762,7 +1996,6 @@ __all__ = [
     "CatalogResource",
     "CatalogResourceRevision",
     "CatalogSchemaRequest",
-    "CatalogSnapshotRef",
     "CatalogSearchHit",
     "CatalogSearchRequest",
     "CatalogSearchResult",

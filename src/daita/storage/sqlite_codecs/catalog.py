@@ -1,13 +1,21 @@
-"""Encode and decode catalog synchronizations, snapshots, facets, revisions and links."""
+"""Encode and decode catalog entries, relationships, source state, changes and links."""
 
 from __future__ import annotations
 
+import json
+from functools import lru_cache
+from typing import Any, cast
+
+from ..._json import FrozenJsonObject, thaw_json
 from ...catalog.models import (
+    CatalogChangeSide,
+    CatalogEntry,
     CatalogFacet,
     CatalogLink,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
+    CatalogSourceState,
     CatalogSync,
     CatalogSyncStatus,
     FacetKind,
@@ -15,9 +23,11 @@ from ...catalog.models import (
     RelationshipKind,
     RelationshipProvenance,
     ResourceKind,
+    SearchPosting,
     Sensitivity,
     SourceCatalogSnapshot,
 )
+from ...catalog.search_text import posting_field_name
 from .common import (
     JsonValue,
     boolean,
@@ -32,6 +42,7 @@ from .common import (
     number,
     optional_datetime_decode,
     optional_datetime_encode,
+    optional_integer,
     optional_text,
     plain_decode,
     plain_encode,
@@ -60,6 +71,211 @@ def encode_catalog_snapshot(value: SourceCatalogSnapshot) -> str:
 
 def decode_catalog_snapshot(value: str) -> SourceCatalogSnapshot:
     return _decode_catalog_snapshot(load_payload(value))
+
+
+def encode_catalog_entry(value: CatalogEntry) -> str:
+    if not isinstance(value, CatalogEntry):
+        raise TypeError("catalog entry codec requires CatalogEntry")
+    return dump_payload(
+        record(
+            "CatalogEntry",
+            {
+                "resource": _encode_resource(value.resource),
+                "revision": _encode_revision(value.revision),
+                "facets": [_encode_catalog_facet(item) for item in value.facets],
+                "detailed": value.detailed,
+                "source_object_id": value.source_object_id,
+            },
+        )
+    )
+
+
+def decode_catalog_entry(value: str) -> CatalogEntry:
+    fields = record_fields(
+        load_payload(value),
+        "CatalogEntry",
+        ("resource", "revision", "facets", "detailed", "source_object_id"),
+    )
+    return CatalogEntry(
+        resource=_decode_resource(fields["resource"]),
+        revision=_decode_revision(fields["revision"]),
+        facets=tuple(
+            _decode_catalog_facet(item)
+            for item in sequence(fields["facets"], "catalog entry facets")
+        ),
+        detailed=boolean(fields["detailed"], "catalog entry detailed"),
+        source_object_id=optional_text(
+            fields["source_object_id"], "catalog entry source_object_id"
+        ),
+    )
+
+
+def encode_catalog_relationship(value: CatalogRelationship) -> str:
+    if not isinstance(value, CatalogRelationship):
+        raise TypeError("catalog relationship codec requires CatalogRelationship")
+    return dump_payload(_encode_relationship(value))
+
+
+def decode_catalog_relationship(value: str) -> CatalogRelationship:
+    return _decode_relationship(load_payload(value))
+
+
+def encode_catalog_source_state(value: CatalogSourceState) -> str:
+    if not isinstance(value, CatalogSourceState):
+        raise TypeError("catalog source state codec requires CatalogSourceState")
+    return dump_payload(
+        record(
+            "CatalogSourceState",
+            {
+                "agent_id": value.agent_id,
+                "source_id": value.source_id,
+                "current_sync_id": value.current_sync_id,
+                "probe_tokens": dict(value.probe_tokens),
+                "probe_cursor": value.probe_cursor,
+                "last_probe_at": optional_datetime_encode(value.last_probe_at),
+                "last_change_at": optional_datetime_encode(value.last_change_at),
+                "last_full_check_at": optional_datetime_encode(
+                    value.last_full_check_at
+                ),
+                "last_missed": value.last_missed,
+                "last_error_code": value.last_error_code,
+                "keep_current": value.keep_current,
+            },
+        )
+    )
+
+
+def decode_catalog_source_state(value: str) -> CatalogSourceState:
+    fields = record_fields(
+        load_payload(value),
+        "CatalogSourceState",
+        (
+            "agent_id",
+            "source_id",
+            "current_sync_id",
+            "probe_tokens",
+            "probe_cursor",
+            "last_probe_at",
+            "last_change_at",
+            "last_full_check_at",
+            "last_missed",
+            "last_error_code",
+            "keep_current",
+        ),
+    )
+    return CatalogSourceState(
+        agent_id=text(fields["agent_id"], "source state agent_id"),
+        source_id=text(fields["source_id"], "source state source_id"),
+        current_sync_id=text(fields["current_sync_id"], "source state sync id"),
+        probe_tokens={
+            key: text(item, "source state probe token")
+            for key, item in mapping(
+                fields["probe_tokens"], "source state probe tokens"
+            ).items()
+        },
+        probe_cursor=optional_text(fields["probe_cursor"], "source state cursor"),
+        last_probe_at=optional_datetime_decode(fields["last_probe_at"]),
+        last_change_at=optional_datetime_decode(fields["last_change_at"]),
+        last_full_check_at=optional_datetime_decode(fields["last_full_check_at"]),
+        last_missed=optional_integer(fields["last_missed"], "source state missed"),
+        last_error_code=optional_text(
+            fields["last_error_code"], "source state error code"
+        ),
+        keep_current=boolean(fields["keep_current"], "source state keep_current"),
+    )
+
+
+def encode_catalog_change_data(
+    before: CatalogChangeSide | None, after: CatalogChangeSide | None
+) -> str:
+    for side in (before, after):
+        if side is not None and not isinstance(side, CatalogChangeSide):
+            raise TypeError("catalog change codec requires CatalogChangeSide")
+    return dump_payload(
+        record(
+            "CatalogChangeData",
+            {
+                "before": None if before is None else _encode_change_side(before),
+                "after": None if after is None else _encode_change_side(after),
+            },
+        )
+    )
+
+
+def decode_catalog_change_data(
+    value: str,
+) -> tuple[CatalogChangeSide | None, CatalogChangeSide | None]:
+    fields = record_fields(
+        load_payload(value), "CatalogChangeData", ("before", "after")
+    )
+    return (
+        None if fields["before"] is None else _decode_change_side(fields["before"]),
+        None if fields["after"] is None else _decode_change_side(fields["after"]),
+    )
+
+
+def encode_search_postings(value: tuple[SearchPosting, ...]) -> str:
+    if any(not isinstance(item, SearchPosting) for item in value):
+        raise TypeError("search posting codec requires SearchPosting records")
+    # The field name is derivable from kind and value, so it is not stored.
+    return dump_payload([[item.field_kind, item.value] for item in value])
+
+
+@lru_cache(maxsize=262_144)  # column names repeat across every table
+def _posting(kind: str, value: str) -> SearchPosting:
+    return SearchPosting(kind, posting_field_name(kind, value), value)
+
+
+def decode_search_postings(value: str) -> tuple[SearchPosting, ...]:
+    parsed = json.loads(value)
+    if not isinstance(parsed, list):
+        raise ValueError("stored search postings are invalid")
+    result: list[SearchPosting] = []
+    for item in parsed:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not isinstance(item[1], str)
+        ):
+            raise ValueError("stored search posting is invalid")
+        result.append(_posting(item[0], item[1]))
+    return tuple(result)
+
+
+def _encode_change_side(value: CatalogChangeSide) -> dict[str, JsonValue]:
+    return record(
+        "CatalogChangeSide",
+        {
+            "name": value.name,
+            "kind": enum_encode(value.kind, "ResourceKind"),
+            "revision": value.revision,
+            "columns": [[name, native_type] for name, native_type in value.columns],
+        },
+    )
+
+
+def _decode_change_side(value: JsonValue) -> CatalogChangeSide:
+    fields = record_fields(
+        value, "CatalogChangeSide", ("name", "kind", "revision", "columns")
+    )
+    columns: list[tuple[str, str]] = []
+    for item in sequence(fields["columns"], "change side columns"):
+        pair = sequence(item, "change side column")
+        if len(pair) != 2:
+            raise ValueError("stored change side column is invalid")
+        columns.append(
+            (
+                text(pair[0], "change side column name"),
+                text(pair[1], "change side column type"),
+            )
+        )
+    return CatalogChangeSide(
+        name=text(fields["name"], "change side name"),
+        kind=enum_decode(fields["kind"], ResourceKind, "ResourceKind"),
+        revision=text(fields["revision"], "change side revision"),
+        columns=tuple(columns),
+    )
 
 
 def encode_catalog_link(value: CatalogLink) -> str:
@@ -126,6 +342,90 @@ def decode_catalog_link(value: str) -> CatalogLink:
     )
 
 
+def _frozen_plain(value: object) -> JsonValue:
+    # plain_encode on a frozen object re-scans its items per key (quadratic).
+    if isinstance(value, FrozenJsonObject):
+        return cast(JsonValue, thaw_json(value))
+    return plain_encode(value)
+
+
+# A tabular column payload repeats the same twelve keys, most of them at their
+# default. Columns with exactly that shape are stored as [name, native_type,
+# ordinal, nullable, {non-default extras}?]; anything else is stored as it is.
+_COLUMN_CORE = ("name", "native_type", "ordinal", "nullable")
+_COLUMN_DEFAULTS: dict[str, JsonValue] = {
+    "collation": None,
+    "default_expression": None,
+    "generated": False,
+    "identity": False,
+    "native_type_name": None,
+    "native_type_namespace": None,
+    "primary_key_ordinal": None,
+    "updatable": False,
+}
+_PACKED = "__packed_columns__"
+
+
+def _pack_payload(kind: FacetKind, payload: object) -> JsonValue:
+    if kind is FacetKind.TABULAR and isinstance(payload, FrozenJsonObject):
+        items = dict(payload._items)
+        packed = _pack_columns(items.get("columns"))
+        if packed is not None:
+            return cast(
+                JsonValue,
+                {
+                    key: {_PACKED: packed} if key == "columns" else thaw_json(item)
+                    for key, item in items.items()
+                },
+            )
+    return _frozen_plain(payload)
+
+
+def _pack_columns(columns: object) -> list[Any] | None:
+    if not isinstance(columns, tuple):
+        return None
+    expected = {*_COLUMN_CORE, *_COLUMN_DEFAULTS}
+    packed: list[Any] = []
+    for column in columns:
+        if not isinstance(column, FrozenJsonObject):
+            return None
+        fields = dict(column._items)
+        if not expected <= set(fields) <= {*expected, "comment"}:
+            return None
+        extras = {
+            key: thaw_json(item)
+            for key, item in fields.items()
+            if key not in _COLUMN_CORE and item is not _COLUMN_DEFAULTS.get(key, ...)
+        }
+        row = [thaw_json(fields[key]) for key in _COLUMN_CORE]
+        packed.append([*row, extras] if extras else row)
+    return packed
+
+
+def _unpack_payload(kind: FacetKind, payload: JsonValue) -> JsonValue:
+    if kind is not FacetKind.TABULAR or not isinstance(payload, dict):
+        return payload
+    columns = payload.get("columns")
+    if not isinstance(columns, dict) or set(columns) != {_PACKED}:
+        return payload
+    unpacked: list[JsonValue] = []
+    for row in sequence(columns[_PACKED], "packed columns"):
+        parts = sequence(row, "packed column")
+        if len(parts) not in (4, 5) or (
+            len(parts) == 5 and not isinstance(parts[4], dict)
+        ):
+            raise ValueError("stored packed column is invalid")
+        extras = cast(dict[str, JsonValue], parts[4] if len(parts) == 5 else {})
+        unpacked.append(
+            {
+                **_COLUMN_DEFAULTS,
+                **dict(zip(_COLUMN_CORE, parts[:4], strict=True)),
+                **extras,
+            }
+        )
+    return {**payload, "columns": unpacked}
+
+
 def _encode_catalog_facet(value: CatalogFacet) -> dict[str, JsonValue]:
     return record(
         "CatalogFacet",
@@ -134,7 +434,7 @@ def _encode_catalog_facet(value: CatalogFacet) -> dict[str, JsonValue]:
             "sync_id": value.sync_id,
             "kind": enum_encode(value.kind, "FacetKind"),
             "revision": value.revision,
-            "payload": plain_encode(value.payload),
+            "payload": _pack_payload(value.kind, value.payload),
             "observed_at": datetime_encode(value.observed_at),
         },
     )
@@ -146,13 +446,16 @@ def _decode_catalog_facet(value: JsonValue) -> CatalogFacet:
         "CatalogFacet",
         ("resource_id", "sync_id", "kind", "revision", "payload", "observed_at"),
     )
-    payload = plain_decode(mapping(fields["payload"], "catalog facet payload"))
+    kind = enum_decode(fields["kind"], FacetKind, "FacetKind")
+    payload = plain_decode(
+        _unpack_payload(kind, mapping(fields["payload"], "catalog facet payload"))
+    )
     if not isinstance(payload, dict):
         raise ValueError("stored catalog facet payload is invalid")
     return CatalogFacet(
         resource_id=text(fields["resource_id"], "catalog facet resource_id"),
         sync_id=text(fields["sync_id"], "catalog facet sync_id"),
-        kind=enum_decode(fields["kind"], FacetKind, "FacetKind"),
+        kind=kind,
         revision=text(fields["revision"], "catalog facet revision"),
         payload=payload,
         observed_at=datetime_decode(fields["observed_at"]),
@@ -198,7 +501,7 @@ def _encode_relationship(value: CatalogRelationship) -> dict[str, JsonValue]:
             "sync_id": value.sync_id,
             "observed_at": datetime_encode(value.observed_at),
             "field_pairs": [_encode_field_pair(item) for item in value.field_pairs],
-            "attributes": plain_encode(value.attributes),
+            "attributes": _frozen_plain(value.attributes),
         },
     )
 

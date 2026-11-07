@@ -16,7 +16,6 @@ from ..adapters.registry import SourceOperation, SourceTypeRegistry
 from ..catalog.models import (
     CatalogResource,
     ResourceKind,
-    SourceCatalogSnapshot,
     catalog_resource_id,
 )
 from ..catalog.protocols import CatalogStoreError
@@ -130,23 +129,25 @@ def _source_edit_read_scope(
     *,
     current_read_scope: SourceReadScope,
     current_resources: tuple[CatalogResource, ...],
-    replacement: SourceCatalogSnapshot,
+    agent_id: str,
+    source_id: str,
+    replacement_resources: tuple[CatalogResource, ...],
 ) -> tuple[SourceReadScope, tuple[str, ...]]:
     """Carry read intent only across exact kind/native-identity matches."""
 
     if current_read_scope.mode is SourceReadMode.ALL:
         return (
             SourceReadScope.allow_all(
-                agent_id=replacement.sync.agent_id,
-                source_id=replacement.sync.source_id,
+                agent_id=agent_id,
+                source_id=source_id,
             ),
             (),
         )
     if current_read_scope.mode is SourceReadMode.NONE:
         return (
             SourceReadScope(
-                agent_id=replacement.sync.agent_id,
-                source_id=replacement.sync.source_id,
+                agent_id=agent_id,
+                source_id=source_id,
                 mode=SourceReadMode.NONE,
             ),
             (),
@@ -154,7 +155,7 @@ def _source_edit_read_scope(
 
     current_by_id = {resource.id: resource for resource in current_resources}
     replacement_by_identity: dict[tuple[ResourceKind, str], list[CatalogResource]] = {}
-    for resource in replacement.resources:
+    for resource in replacement_resources:
         replacement_by_identity.setdefault(
             (resource.kind, resource.native_identity),
             [],
@@ -179,16 +180,16 @@ def _source_edit_read_scope(
     if not preserved:
         return (
             SourceReadScope(
-                agent_id=replacement.sync.agent_id,
-                source_id=replacement.sync.source_id,
+                agent_id=agent_id,
+                source_id=source_id,
                 mode=SourceReadMode.NONE,
             ),
             tuple(sorted(omitted)),
         )
     return (
         SourceReadScope(
-            agent_id=replacement.sync.agent_id,
-            source_id=replacement.sync.source_id,
+            agent_id=agent_id,
+            source_id=source_id,
             mode=SourceReadMode.SELECTED,
             resource_ids=tuple(preserved),
         ),

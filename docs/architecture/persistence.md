@@ -11,7 +11,12 @@ Where durable state lives, how its format is versioned, and the release contract
 
 The current agent-home format is **revision 4**, extending released revision 3
 with bounded foreground analytical evidence, retained artifact computation
-provenance and agent-owned declared catalog links. Released revisions 1 through 3 and their migrations remain immutable. Revision 4 is the
+provenance, agent-owned declared catalog links and per-resource catalog storage.
+Revision 4's migration converts each stored source snapshot into rows of
+`catalog_resources`, `catalog_relationships` and `catalog_search`, one state row
+naming the snapshot's sync as current, and drops `snapshots`; every resource keeps its
+ID and revision. The catalog also keeps `catalog_changes`, pruned to 90 days or
+10,000 rows per source, and syncs pruned to the newest 20 per source. Released revisions 1 through 3 and their migrations remain immutable. Revision 4 is the
 sole current runnable format; legacy decoders remain migration-only.
 
 ## State boundary, migrations and releases
@@ -59,10 +64,11 @@ known suffix in order, validate the complete staged home, and publish `state.db`
 last. Hash-bound journals recover staging, partial commit, and rollback states.
 Publication failure restores the prior home, and one rollback bundle is retained.
 Newer, unsupported, reordered, checksum-edited, or damaged homes fail closed
-without a state rewrite. The exception is a damaged catalog row (`syncs` or
-`snapshots`): it can be rebuilt from the source, so the home opens and a
-background refresh replaces the row. Upgrading a home from before revision 4 still reads
-those rows and fails closed on a damaged one.
+without a state rewrite. The exception is a damaged catalog row (`syncs`, `catalog_resources`,
+`catalog_relationships`, `catalog_search` or `catalog_source_state`): it can be
+rebuilt from the source, so the home opens, a read skips the row as absent, and a
+background refresh replaces it. Upgrading a home from before revision 4 still reads
+the old `snapshots` rows and fails closed on a damaged one.
 
 Every supported production revision has one immutable whole-home golden fixture.
 Tests cover every supported-to-current path, durable-data preservation, failure

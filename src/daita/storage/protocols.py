@@ -37,9 +37,7 @@ if TYPE_CHECKING:
     from ..adapters.mcp import MCPServerBinding
     from ..adapters.models import SourceRegistration
     from ..capabilities import ExecutionScope
-    from ..catalog.models import (
-        SourceCatalogSnapshot,
-    )
+    from ..catalog.models import CatalogCommitSummary, CatalogSync, ResourceBatch
     from ..identity import AgentIdentity
     from ..loop.analysis import AnalysisEvidence
     from ..loop.models import ConversationRun, LoopExit
@@ -158,22 +156,16 @@ class StateStore(
         self, agent_id: str, resolution: EffectResolution
     ) -> EffectReceipt: ...
 
-    async def commit_snapshot(
-        self,
-        snapshot: SourceCatalogSnapshot,
-        *,
-        registration: SourceRegistration | None = ...,
-    ) -> SourceCatalogSnapshot: ...
-
     async def commit_source_edit(
         self,
-        snapshot: SourceCatalogSnapshot,
+        sync: CatalogSync,
+        batches: tuple[ResourceBatch, ...],
         *,
         registration: SourceRegistration,
         replaced_source_id: str,
         replaced_at: datetime,
         read_scope: SourceReadScope,
-    ) -> SourceCatalogSnapshot: ...
+    ) -> CatalogCommitSummary: ...
 
     async def recover_unfinished_runs(
         self, agent_id: str, *, created_at: datetime

@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import duckdb
 import pytest
@@ -40,6 +40,7 @@ from daita.security import EmptySecretProvider
 from tests.support.source_contract import (
     assert_live_source_contract,
     assert_source_type_contract,
+    reconcile_pass,
 )
 from tests.support.workspace import workspace_for
 
@@ -137,11 +138,13 @@ async def test_attached_folder_catalogs_folders_files_and_tabular_schemas(
         contains = {
             (relationship.from_resource_id, relationship.to_resource_id)
             for path in ("sales", "sales/2026")
-            for relationship in await store.load_incident_relationships(
-                agent.id,
-                resources[path].id,
-                relationship_kinds=(RelationshipKind.CONTAINS,),
-            )
+            for relationship in (
+                await store.load_incident_relationships(
+                    agent.id,
+                    (resources[path].id,),
+                    relationship_kinds=(RelationshipKind.CONTAINS,),
+                )
+            )[resources[path].id]
         }
         assert (
             resources["sales/2026"].id,
@@ -463,7 +466,8 @@ async def test_discovery_beyond_max_resources_is_bounded_and_marked_truncated(
             agent_id=agent.id, attached_at=_NOW, clock=lambda: _NOW
         )
         try:
-            result = await adapter.discover(
+            snapshot = await reconcile_pass(
+                adapter,
                 DiscoveryRequest(
                     agent_id=agent.id,
                     source_id=adapter.registration.id,
@@ -472,14 +476,13 @@ async def test_discovery_beyond_max_resources_is_bounded_and_marked_truncated(
                     max_resources=5,
                     agent_root=agent.home.parent.parent,
                     agent_home=agent.home,
-                )
+                ),
             )
         finally:
             await adapter.close()
     finally:
         await agent.close()
-    snapshot = result.snapshot
-    assert snapshot.sync.truncated is True
+    assert snapshot.truncated is True
     assert len(snapshot.resources) == 5
     assert [item.native_identity for item in snapshot.resources] == [
         ".",
@@ -507,7 +510,8 @@ async def test_discovery_out_of_schema_budget_is_marked_truncated(
             agent_id=agent.id, attached_at=_NOW, clock=lambda: _NOW
         )
         try:
-            result = await adapter.discover(
+            snapshot = await reconcile_pass(
+                adapter,
                 DiscoveryRequest(
                     agent_id=agent.id,
                     source_id=adapter.registration.id,
@@ -515,14 +519,13 @@ async def test_discovery_out_of_schema_budget_is_marked_truncated(
                     requested_at=_NOW,
                     agent_root=agent.home.parent.parent,
                     agent_home=agent.home,
-                )
+                ),
             )
         finally:
             await adapter.close()
     finally:
         await agent.close()
-    snapshot = result.snapshot
-    assert snapshot.sync.truncated is True
+    assert snapshot.truncated is True
     assert {item.native_identity for item in snapshot.resources} == {".", "orders.csv"}
     assert {facet.kind for facet in snapshot.facets} == {FacetKind.FILE}
 
@@ -691,3 +694,28 @@ async def test_session_folder_access_follows_the_workspace_boundary(
             assert refused.value.code == code
     finally:
         await contained.close()
+
+
+async def test_a_folder_source_can_be_edited_to_another_folder(tmp_path: Path) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    for folder, count in ((first, 1), (second, 3)):
+        folder.mkdir()
+        for index in range(count):
+            (folder / f"part-{index}.csv").write_text(f"id\n{index}\n")
+    agent = await _agent(tmp_path, "folder-edit")
+    try:
+        source = await agent.attach(FolderSource(first))
+        previews = []
+
+        async def confirm(preview: Any) -> bool:
+            previews.append(preview)
+            return True
+
+        result = await agent.edit_source(
+            source.id, FolderSource(second), confirmation_handler=confirm
+        )
+        assert result is not None and result.identity_changed
+        # The root folder plus three files, found with the agent's own paths.
+        assert previews[0].resource_count == 4
+    finally:
+        await agent.close()
