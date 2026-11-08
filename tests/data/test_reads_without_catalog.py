@@ -13,11 +13,10 @@ from daita import Agent, SQLiteSource
 from daita._json import canonical_json
 from daita.adapters.sqlite import SQLiteResourceAdapter
 from daita.catalog.protocols import CatalogStoreError
-from daita.hosting import embedded as embedded_module
 from daita.llm.models import FinishReason, ModelResponse, ToolCall, ToolResultBlock
 from daita.llm.providers.mock import MockModelProvider
 from daita.storage.sqlite_codecs import decode_catalog_entry
-from tests.support.source_refresh import settled, sync_count
+from tests.support.source_refresh import settled, stale_probes, sync_count
 from tests.support.workspace import workspace_for
 
 _QUERY = {"source": "CRM", "sql": "SELECT count(*) AS total FROM companies"}
@@ -136,6 +135,7 @@ async def test_describing_an_uncataloged_table_answers_from_the_source(
     )
     try:
         source = await agent.attach(SQLiteSource(database, name="companies"))
+        stale_probes(agent)
         _create_companies(database)
         run = await agent.run("What columns does companies have?")
         ((_, result),) = await agent.tool_evidence(run.run_id)
@@ -441,6 +441,7 @@ async def test_reading_a_dropped_table_returns_the_source_error_and_refreshes(
     agent = await _agent_running(tmp_path, (_read_call("gone", "companies"),))
     try:
         source = await agent.attach(SQLiteSource(database, name="CRM"))
+        stale_probes(agent)
         with sqlite3.connect(database) as connection:
             connection.execute("DROP TABLE companies")
         run = await agent.run("Count companies.")
@@ -473,6 +474,9 @@ async def test_a_refresh_that_fails_changes_nothing_for_the_user(
 
     try:
         source = await agent.attach(SQLiteSource(database, name="CRM"))
+        stale_probes(agent)
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE leads_archive (name TEXT)")
         monkeypatch.setattr(SQLiteResourceAdapter, "reconcile", failing)
         run = await agent.run("Count companies and leads.")
         kept, gone = [result for _, result in await agent.tool_evidence(run.run_id)]
@@ -487,21 +491,19 @@ async def test_a_refresh_that_fails_changes_nothing_for_the_user(
         await agent.close()
 
 
-async def test_a_mistyped_query_repeated_starts_one_refresh_until_the_interval_passes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_mistyped_queries_never_reread_a_source_that_has_not_changed(
+    tmp_path: Path,
 ) -> None:
     database = tmp_path / "crm.sqlite"
     _create_companies(database)
     typos = [(_read_call(f"typo-{index}", f"compnies{index}"),) for index in range(4)]
-    agent = await _agent_running(tmp_path, *typos, (), (_read_call("later", "typo9"),))
+    agent = await _agent_running(tmp_path, *typos)
     try:
         await agent.attach(SQLiteSource(database, name="CRM"))
-        await agent.run("Count companies.")
-        await settled(agent)
-        assert sync_count(agent) == 2
-        monkeypatch.setattr(embedded_module, "_SOURCE_REFRESH_MIN_SECONDS", 0)
-        await agent.run("Count companies again.")
-        await settled(agent)
-        assert sync_count(agent) == 3
+        for _ in range(3):
+            stale_probes(agent)
+            await agent.run("Count companies.")
+            await settled(agent)
+        assert sync_count(agent) == 1
     finally:
         await agent.close()

@@ -59,7 +59,17 @@ from ..capabilities import (
     ApprovalRequest,
     OperationalEffect,
 )
-from ..catalog.models import CatalogResource, CatalogSummary, ResourceKind, Sensitivity
+from ..catalog.models import (
+    CatalogChange,
+    CatalogChangeKind,
+    CatalogChangeSide,
+    CatalogFreshness,
+    CatalogResource,
+    CatalogStatus,
+    CatalogSummary,
+    ResourceKind,
+    Sensitivity,
+)
 from ..distribution.models import (
     Delivery,
     DeliveryInspection,
@@ -509,6 +519,8 @@ for _enum in (
     AgentEventKind,
     AmbiguousTimePolicy,
     ArtifactAuthorship,
+    CatalogChangeKind,
+    CatalogFreshness,
     ArtifactDestinationKind,
     CalendarDaySelector,
     DeliveryState,
@@ -593,7 +605,10 @@ for _record in (
     ArtifactDestination,
     ArtifactPayload,
     CalendarSchedule,
+    CatalogChange,
+    CatalogChangeSide,
     CatalogResource,
+    CatalogStatus,
     CatalogSummary,
     CodexDevicePrompt,
     ConversationRun,

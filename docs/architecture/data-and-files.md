@@ -83,7 +83,9 @@ one INVENTORY batch listing every object, up to `DiscoveryRequest.max_inventory`
 tables, 512 columns and 256 indexes per table, and 2,000 relationships; PostgreSQL
 stops reading table detail after 60 seconds. A listed table without detail is
 cataloged by name only, still readable and describable through the live tools, and
-`CatalogSync.truncated` means detail is incomplete (or the inventory hit its cap).
+`CatalogSync.truncated` means the source's catalog lacks some detail (or the
+inventory hit its cap): after a commit it is also true while any row of the source
+still has only a name, so a fill pass that has not finished leaves it set.
 A primary key shows whole or not at all, and an index or foreign key that names a
 cut column is dropped. `source_directory` adds `catalog_partial` for a truncated
 source: the catalog lists every object but describes only some, so the model reads
@@ -113,18 +115,36 @@ get their indexes. When the budget ends a read, the table in progress is dropped
 the tables before it are kept with both their columns and indexes, so a kept table
 never shows a falsely empty index list.
 
-The catalog refreshes on attach, on an explicit `Agent.refresh_source`, when
-`catalog_describe` or `catalog_search` finds a table the catalog lacks or
-describes differently, and when a query fails with an undefined table, column,
-object or schema (SQLSTATE `42P01`, `42703`, `42704`, `3F000`; SQLite "no such
-table" or "no such column"). The automatic ones run in the background through
-`EmbeddedAgent.request_source_refresh`. They take no execution lease, never block
-a read, run at most once per source per 300 seconds, and are cancelled on close.
-There is no scheduler. A miss on a schema-qualified name re-reads only that
-schema's tables on PostgreSQL (`DiscoveryRequest.scopes`) and keeps the rest from
-the source's stored entries (`previous`); the table listing, relationships and row
-estimates are always current. When the
-catalog itself failed, a lookup does not refresh.
+The catalog is kept current by the keeper (`hosting/keeper.py`), one task per open
+agent. The catalog is read on attach and on an explicit `Agent.refresh_source`; after
+that the keeper probes each source cheaply (`SourceOperation.CHANGE_PROBE`: a token per
+scope) and reads only the scopes whose token moved, committing the new tokens in the
+same transaction as the read, so an interrupted read is simply read again. The probe
+interval starts at the type's `min_probe_seconds`, doubles after each unchanged probe
+up to `max_probe_seconds` and resets on a change or a use; two failed probes mark the
+source unreachable and one success recovers it. Due times are wall-clock times, so
+sleep and restart catch up. A run start (every origin), `Agent.catalog_status(check=True)`,
+a lookup miss or a missing-object error, damaged catalog rows and the permissions
+screen (which waits at most 2 s) are triggers; a type with no probe is only fully
+rechecked on its `full_check_seconds`. While a source has resources without detail the
+keeper describes more of them in passes of 1,000, and the daily full check records
+`missed`, the changes no probe flagged. `Agent.set_keep_current(source_id, False)`
+stops all of it for a source; an explicit `Agent.refresh_source` still works.
+
+Keeper reads take no execution lease and run under the source management lock, with
+`_source_commit_lock` for the commit only. A person's attach, edit, detach, refresh
+or permission change first cancels a keeper read in flight. Upkeep is never background
+work for the host's idle policy and never sets a wake time. An unchanged probe
+rewrites the stored source state at most every 10 minutes. The probe is one bounded
+read-only statement or stat walk that reports names and hashes only, ignores the read
+scope and fails with a stable error code. PostgreSQL has one token per configured
+schema the role can use, covering what a revision stores and what the role may read,
+so a grant or revoke moves it but row counts and statistics do not. SQLite has one
+token from `PRAGMA schema_version` and the file's identity. A folder has one token from
+a stat walk over the files discovery would catalog. `Agent.catalog_status` reports
+`current`, `updating`, `unreachable`, `paused` or `not_checked`, with the described and
+total counts; `Agent.catalog_changes` lists recent changes; `daita sources` and the
+TUI sources screen show them, with a Keep current switch and Check now.
 
 A refresh runs under the source management lock. `_source_commit_lock` covers
 only the commit, so a revoke does not wait for discovery. Permission apply
@@ -159,18 +179,19 @@ on demand, not a model tool, and the host serves it at `POST /links/check` and
 
 Opening a home decodes no catalog rows. A read skips a catalog row that cannot be
 decoded as if it were absent, so reads and approved writes continue; when a
-foreground run finishes, `EmbeddedAgent` refreshes each source whose row was skipped
-in the background, and the refresh rewrites the row. A lookup that finds the catalog
-unreadable requests the same refresh. A `semantic_save` on a table with no catalog
+the keeper reads each source whose row was skipped in full on its next pass, and
+that read rewrites the row. A lookup that finds the catalog unreadable asks the keeper
+the same way. A `semantic_save` on a table with no catalog
 entry, or with only a name, is refused with `semantic_unknown_resource`, which says
 reads are unaffected.
 
 `daita.adapters` implements source admission, containment, discovery,
 freshness checks, and I/O. One composed `SourceTypeRegistry` per agent maps each
 `adapter_id` to its factory, credential fields, read capacity, SQL dialect and
-operation backends. `SourceOperation` names those backends: `SQL_READ`,
-`TABULAR_READ`, `TABULAR_EXPORT`, `PROFILE`, `RELATIONAL_WRITE`, `FILE_SEARCH`, `TEXT_READ`, `PATH_QUERY` and `LIVE_LOOKUP`;
-every operation except `TABULAR_READ`, `FILE_SEARCH`, `TEXT_READ` and `LIVE_LOOKUP`
+operation backends, and its `SourceFreshness` (probe interval bounds and the full-check period). `SourceOperation` names those backends: `SQL_READ`,
+`TABULAR_READ`, `TABULAR_EXPORT`, `PROFILE`, `RELATIONAL_WRITE`, `FILE_SEARCH`, `TEXT_READ`, `PATH_QUERY`, `LIVE_LOOKUP` and `CHANGE_PROBE`;
+every operation except `TABULAR_READ`, `FILE_SEARCH`, `TEXT_READ`, `LIVE_LOOKUP` and
+`CHANGE_PROBE`
 requires an SQL dialect the read policy in `domains/data/sql` supports, checked at registration.
 A stored source whose type is not registered stays listed
 but unavailable: it gets no tools or source capacity, and refresh or edit fails.

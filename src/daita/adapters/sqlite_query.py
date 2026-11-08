@@ -11,7 +11,8 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import TypeVar
 
@@ -38,7 +39,7 @@ from ..storage.sqlite_records import (
     SourceReadMode,
     SourceReadScope,
 )
-from .models import SourceRegistration
+from .models import SourceProbe, SourceRegistration
 from .protocols import (
     DESCRIBE_MAX_COLUMNS,
     DESCRIBE_MAX_LISTED_TABLES,
@@ -46,6 +47,7 @@ from .protocols import (
     SourceReadScopeStore,
     column_summary,
 )
+from .sqlite import SQLiteSourceError
 
 _T = TypeVar("_T")
 _LOOKUP_SECONDS = 5.0
@@ -157,6 +159,47 @@ class SQLiteQueryBackend:
         path = _regular_unaliased_path(configured_path)
         return await asyncio.wait_for(
             asyncio.to_thread(_lookup_sync, path, work), _LOOKUP_SECONDS + 1
+        )
+
+    async def probe(
+        self, *, agent_id: str, source_id: str, cursor: str | None
+    ) -> SourceProbe:
+        """The file's schema version and identity, read fresh and read-only.
+
+        Data writes leave both alone; a schema change bumps the version and a
+        file replaced by rename changes the identity. Not bound by the read scope.
+        """
+
+        del cursor
+        try:
+            registration = await self._sources.load_source(agent_id, source_id)
+            path = registration.configuration.get("path") if registration else None
+            if (
+                registration is None
+                or not registration.active
+                or not isinstance(path, str)
+            ):
+                raise SQLiteQueryError(
+                    "source_not_available",
+                    "The SQLite source is not attached to this agent.",
+                )
+            admitted = _regular_unaliased_path(path)
+            version = await asyncio.wait_for(
+                asyncio.to_thread(_schema_version, admitted), _LOOKUP_SECONDS + 1
+            )
+        except asyncio.CancelledError:
+            raise
+        except SQLiteQueryError as error:
+            code = error.code
+        except (sqlite3.Error, TimeoutError):
+            code = "sqlite_probe_failed"
+        else:
+            token = sha256(
+                f"{version}:{admitted.device}:{admitted.inode}".encode()
+            ).hexdigest()
+            return SourceProbe(checked_at=datetime.now(UTC), tokens={"main": token})
+        raise SQLiteSourceError(
+            code, "The SQLite source could not be probed.", source_id=source_id
         )
 
     async def search_names(
@@ -291,6 +334,16 @@ def _lookup_sync(
         raise SQLiteQueryError(
             "source_unreachable", "The SQLite source could not be inspected."
         ) from None
+    finally:
+        connection.close()
+        os.close(descriptor)
+
+
+def _schema_version(admitted: _AdmittedSQLiteFile) -> int:
+    connection, descriptor = _connect_admitted_read_only(admitted)
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        return int(connection.execute("PRAGMA schema_version").fetchone()[0])
     finally:
         connection.close()
         os.close(descriptor)

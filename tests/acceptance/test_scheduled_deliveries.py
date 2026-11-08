@@ -700,6 +700,9 @@ async def test_scheduled_postgresql_xlsx_uses_the_same_inbox_path(
     )
     try:
         source = await agent.attach(_OfflinePostgreSQLSource(agent.id))
+        # The test counts the delivery's own I/O, not the keeper's probes.
+        await agent.set_keep_current(source.id, False)
+        source_io = 0
         (resource,) = await agent.list_catalog_resources(source_id=source.id)
         origin = await agent.run("Authorize the scheduled XLSX outcome.")
         assert origin.conversation_id is not None

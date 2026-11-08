@@ -41,11 +41,13 @@ from .artifacts.models import (
 )
 from .capabilities import ApprovalHandler
 from .catalog.models import (
+    CatalogChange,
     CatalogLink,
     CatalogLinkStatus,
     CatalogResource,
     CatalogSearchRequest,
     CatalogSearchResult,
+    CatalogStatus,
     CatalogSummary,
 )
 from .config import AgentConfig
@@ -1247,6 +1249,27 @@ class Agent:
         """Refresh one registered source through its persisted admitted config."""
 
         return await self._embedded.refresh_source(source_id)
+
+    async def catalog_status(
+        self, source_id: str, *, check: bool = False
+    ) -> CatalogStatus:
+        """How current one source's catalog is; ``check`` also asks for a look now."""
+
+        return await self._embedded.catalog_status(source_id, check=check)
+
+    async def catalog_changes(
+        self, source_id: str, *, limit: int = 50
+    ) -> tuple[CatalogChange, ...]:
+        """The latest recorded catalog changes of one source, newest first."""
+
+        return await self._embedded.catalog_changes(source_id, limit=limit)
+
+    async def set_keep_current(
+        self, source_id: str, keep_current: bool
+    ) -> CatalogStatus:
+        """Turn automatic catalog upkeep on or off for one source."""
+
+        return await self._embedded.set_keep_current(source_id, keep_current)
 
     async def check_source(self, source_id: str) -> SourceHealth:
         """Check the live source: reachability, role and whether it is read-only.

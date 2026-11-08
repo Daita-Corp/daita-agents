@@ -106,6 +106,8 @@ async def _commit_graph(
     edges: tuple[_EdgeSpec, ...],
     sync_id: str,
 ) -> _CommittedGraph:
+    # Rows written straight to the store must not be read away by the keeper.
+    await agent.set_keep_current(source_id, False)
     resource_ids = {
         name: catalog_resource_id(source_id, ResourceKind.TABLE, f"main.{name}")
         for name in nodes

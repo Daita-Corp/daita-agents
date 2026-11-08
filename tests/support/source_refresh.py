@@ -1,4 +1,4 @@
-"""Observe the catalog's background refreshes without reaching into a task."""
+"""Drive the catalog keeper from a test without sleeping."""
 
 from __future__ import annotations
 
@@ -9,11 +9,21 @@ from daita import Agent
 
 
 async def settled(agent: Agent) -> None:
-    """Wait until every background refresh the agent has started is over."""
+    """Let the keeper finish everything that is due, then return."""
 
-    await asyncio.wait_for(
-        asyncio.gather(*agent._embedded._source_refreshes.values()), timeout=10
-    )
+    async def finish() -> None:
+        for _ in range(200):
+            if not await agent._embedded.keeper.tick():
+                return
+
+    await asyncio.wait_for(finish(), timeout=10)
+
+
+def stale_probes(agent: Agent) -> None:
+    """Make every source look unprobed for long, so the next trigger probes."""
+
+    for mem in agent._embedded.keeper._mems.values():
+        mem.last_probe = None
 
 
 def sync_count(agent: Agent) -> int:
@@ -23,4 +33,4 @@ def sync_count(agent: Agent) -> int:
         return int(connection.execute("SELECT count(*) FROM syncs").fetchone()[0])
 
 
-__all__ = ["settled", "sync_count"]
+__all__ = ["settled", "stale_probes", "sync_count"]

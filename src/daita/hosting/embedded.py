@@ -99,12 +99,17 @@ from ..catalog.capabilities import (
     catalog_declarations,
 )
 from ..catalog.models import (
+    CatalogChange,
+    CatalogCommitSummary,
     CatalogEntry,
+    CatalogFreshness,
     CatalogLink,
     CatalogLinkStatus,
     CatalogResource,
     CatalogSearchRequest,
     CatalogSearchResult,
+    CatalogSourceState,
+    CatalogStatus,
     CatalogSummary,
     CatalogSync,
     CatalogSyncStatus,
@@ -358,6 +363,7 @@ from .execution_governor import (
     WorkloadClass,
 )
 from .home_upgrade import AgentHomeStatus, inspect_agent_home, upgrade_agent_home
+from .keeper import FILL_RESOURCES, CatalogKeeper, KeeperRead, KeptSource
 from .sources import (
     SourceEditConfirmationHandler,
     SourceEditPreview,
@@ -403,8 +409,6 @@ def machine_run_excluded_owners(origin: RunOrigin) -> frozenset[str]:
 
 _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
 _RUN_ADMISSION_DRAIN_SECONDS = 30.0
-# A model typo must not cost a discovery per query.
-_SOURCE_REFRESH_MIN_SECONDS = 300.0
 LINK_CHECK_MAX_KEYS = 50_000
 LINK_CHECK_MAX_BYTES = 16 * 1_024 * 1_024
 LINK_CHECK_TIMEOUT_SECONDS = 10.0
@@ -656,8 +660,18 @@ class EmbeddedAgent:
         self._mcp_commit_lock = asyncio.Lock()
         self._source_management_lock = asyncio.Lock()
         self._source_commit_lock = asyncio.Lock()
-        self._source_refreshes: dict[str, asyncio.Task[None]] = {}
-        self._source_refresh_started: dict[str, float] = {}
+        self._keeper = CatalogKeeper(
+            agent_id=identity.id,
+            store=store,
+            commit_lock=self._source_commit_lock,
+            clock=clock,
+            sources=self._kept_sources,
+            probe_backend=lambda adapter_id: source_backends[
+                SourceOperation.CHANGE_PROBE
+            ].get(adapter_id),
+            freshness=lambda adapter_id: source_types.require(adapter_id).freshness,
+            read=self._keeper_read,
+        )
         self._source_permission_lock = asyncio.Lock()
         self._source_permission_confirmation_key = secrets.token_bytes(32)
         self._source_permission_previews: dict[str, SourcePermissionsPreview] = {}
@@ -1390,7 +1404,7 @@ class EmbeddedAgent:
                 source_backends[operation][source_type.adapter_id] = backend
 
         def request_refresh(source_id: str, names: tuple[str, ...]) -> None:
-            embedded.request_source_refresh(source_id, names)
+            embedded.keeper.miss(source_id)
 
         catalog = catalog_declarations(
             identity.id,
@@ -1779,7 +1793,10 @@ class EmbeddedAgent:
             artifact_domain.bind_capability_registry(capabilities)
 
         async def resolve_run_sources(run: RunInput):
-            return await resolve_effective_source_scope(run, data_view)
+            scope = await resolve_effective_source_scope(run, data_view)
+            # Every origin: a run is a use, so its sources are checked soon.
+            embedded.keeper.use(tuple(scope.source_ids))
+            return scope
 
         # The one loop and runtime serve foreground, routine and job runs,
         # so the host diagnostic sink sees every origin beside the caller observer.
@@ -2243,6 +2260,7 @@ class EmbeddedAgent:
         try:
             await job_supervisor.start()
             await routine_supervisor.start()
+            embedded.keeper.start()
         except BaseException:
             await embedded.close()
             raise
@@ -2459,16 +2477,13 @@ class EmbeddedAgent:
         files_only: bool = False,
         caller_principal_id: str | None = None,
     ) -> LoopExit:
-        try:
-            return await self._run(
-                message,
-                conversation_id=conversation_id,
-                source_scope_ids=source_scope_ids,
-                files_only=files_only,
-                caller_principal_id=caller_principal_id,
-            )
-        finally:
-            await self._refresh_unreadable_catalogs()
+        return await self._run(
+            message,
+            conversation_id=conversation_id,
+            source_scope_ids=source_scope_ids,
+            files_only=files_only,
+            caller_principal_id=caller_principal_id,
+        )
 
     async def learn(
         self,
@@ -2480,16 +2495,13 @@ class EmbeddedAgent:
     ) -> LoopExit:
         """Run one explicit user-authorized foreground learning action."""
 
-        try:
-            return await self._run(
-                message,
-                conversation_id=conversation_id,
-                source_scope_ids=source_scope_ids,
-                explicit_learning=True,
-                caller_principal_id=caller_principal_id,
-            )
-        finally:
-            await self._refresh_unreadable_catalogs()
+        return await self._run(
+            message,
+            conversation_id=conversation_id,
+            source_scope_ids=source_scope_ids,
+            explicit_learning=True,
+            caller_principal_id=caller_principal_id,
+        )
 
     async def _run(
         self,
@@ -3974,10 +3986,27 @@ class EmbeddedAgent:
         *,
         attached_at: datetime,
         persisted_registration: SourceRegistration | None = None,
-        scopes: tuple[str, ...] = (),
-        previous: tuple[CatalogEntry, ...] | None = None,
     ) -> SourceRegistration:
-        """Discover under the management lock; only the commit takes the commit lock."""
+        registration, _ = await self._discover_locked(
+            source,
+            attached_at=attached_at,
+            persisted_registration=persisted_registration,
+        )
+        return registration
+
+    async def _discover_locked(
+        self,
+        source: ResourceSource,
+        *,
+        attached_at: datetime,
+        persisted_registration: SourceRegistration | None = None,
+        plan: KeeperRead | None = None,
+        previous: tuple[CatalogEntry, ...] | None = None,
+    ) -> tuple[SourceRegistration, CatalogCommitSummary]:
+        """Discover under the management lock; only the commit takes the commit lock.
+
+        A keeper ``plan`` narrows the pass and commits the probe tokens it matched.
+        """
 
         adapter = await source.open(
             agent_id=self.identity.id,
@@ -4013,6 +4042,17 @@ class EmbeddedAgent:
                 started_at=self._clock(),
             )
             await self._store.record_sync(sync)
+            plan = plan or KeeperRead(max_resources=FILL_RESOURCES)
+            tokens, probed_at = plan.probe_tokens, plan.probed_at
+            if tokens is None and persisted_registration is not None:
+                # An explicit refresh stores the tokens it read at, so the next
+                # probe does not read again. The probe goes first: a change
+                # during the read only costs one more read.
+                probe = await self._keeper.probe_once(
+                    registration.id, registration.adapter_id
+                )
+                if probe is not None:
+                    tokens, probed_at = probe.tokens, probe.checked_at
             succeeded, batches = await _reconcile_pass(
                 adapter,
                 DiscoveryRequest(
@@ -4022,18 +4062,22 @@ class EmbeddedAgent:
                     requested_at=sync.started_at,
                     agent_root=None if self._home is None else self._home.parent.parent,
                     agent_home=self._home,
-                    scopes=scopes,
+                    scopes=plan.scopes,
                     previous=previous,
+                    fill=plan.fill,
+                    max_resources=plan.max_resources,
                 ),
                 self._clock,
             )
             async with self._source_commit_lock:
                 self._require_open()
-                await self._store.commit_catalog(
+                summary = await self._store.commit_catalog(
                     succeeded,
                     batches,
                     registration=registration,
-                    full=not scopes,
+                    full=plan.full,
+                    probe_tokens=tokens,
+                    probed_at=probed_at,
                 )
                 self._admission_coordinator.configure_source_resource_capacity(
                     f"source:{registration.id}",
@@ -4041,7 +4085,10 @@ class EmbeddedAgent:
                         registration.adapter_id, self._host_capacity
                     ),
                 )
-            return registration
+            if persisted_registration is None:
+                # The first probe is stored now so the keeper never rereads this pass.
+                await self._keeper.baseline(registration.id, registration.adapter_id)
+            return registration, summary
         except BaseException as error:
             if isinstance(error, ResourceAdapterError):
                 code = error.code
@@ -4401,6 +4448,9 @@ class EmbeddedAgent:
     ) -> SourcePermissionsInspection:
         """Inspect exact scopes against complete trusted current catalog truth."""
 
+        # The picker should be current: let the keeper look first, but never
+        # for long and never while holding a lock.
+        await self._keeper.check(source_id, wait=2.0)
         async with self._source_commit_lock:
             self._require_open()
             return await self._inspect_source_permissions_locked(source_id)
@@ -4441,7 +4491,7 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "source-permission-apply", self._source_permission_lock
         ):
-            async with self._source_commit_lock:
+            async with self._keeper.person_work(), self._source_commit_lock:
                 self._require_open()
                 preview = self._source_permission_previews.get(source_id)
                 if preview is None or not hmac.compare_digest(
@@ -4555,6 +4605,7 @@ class EmbeddedAgent:
                     agent_id=self.identity.id,
                     source_types=self._source_types,
                 )
+            self._keeper.forget(source_id)
             await self._retire_source_backends(source_id)
             for reference in references:
                 try:
@@ -4576,7 +4627,8 @@ class EmbeddedAgent:
             refreshed = await self._refresh_source_locked(source_id)
             if refreshed is None:
                 raise ValueError("unknown active source for this agent")
-            return refreshed
+            self._keeper.wake()
+            return refreshed[0]
 
     async def check_source(self, source_id: str) -> SourceHealth:
         """Ask the live source who Daita connects as and what that can change.
@@ -4839,9 +4891,13 @@ class EmbeddedAgent:
         )
 
     async def _refresh_source_locked(
-        self, source_id: str, names: tuple[str, ...] = ()
-    ) -> SourceRegistration | None:
-        """Refresh under the management lock; None when the source is gone."""
+        self, source_id: str, plan: KeeperRead | None = None
+    ) -> tuple[SourceRegistration, CatalogCommitSummary] | None:
+        """Refresh under the management lock; None when the source is gone.
+
+        A keeper ``plan`` reads against the stored entries; an explicit refresh
+        reads everything.
+        """
 
         async with self._source_commit_lock:
             self._require_open()
@@ -4859,89 +4915,138 @@ class EmbeddedAgent:
             )
         except (TypeError, ValueError) as error:
             raise AgentHomeError(str(error)) from error
-        scopes, previous = await self._refresh_scope(registration, names)
-        return await self._attach_source_locked(
+        previous = (
+            None
+            if plan is None
+            else await self._store.list_entries(self.identity.id, source_id)
+        )
+        return await self._discover_locked(
             source,
             attached_at=registration.attached_at,
             persisted_registration=registration,
-            scopes=scopes,
+            plan=plan,
             previous=previous,
         )
 
-    async def _refresh_scope(
-        self, registration: SourceRegistration, names: tuple[str, ...]
-    ) -> tuple[tuple[str, ...], tuple[CatalogEntry, ...] | None]:
-        """The schemas the names sit in, with the entries to keep the others from.
+    @property
+    def keeper(self) -> CatalogKeeper:
+        return self._keeper
 
-        A name outside the configured schemas, or an unqualified one, refreshes all.
-        """
-
-        configured = registration.configuration.get("schemas")
-        parts = [name.partition(".") for name in names]
-        if not names or not isinstance(configured, tuple):
-            return (), None
-        if not all(dot and schema in configured for schema, dot, _ in parts):
-            return (), None
-        schemas = tuple(dict.fromkeys(schema for schema, _, _ in parts))
-        return schemas, await self._store.list_entries(
-            self.identity.id, registration.id
+    async def _kept_sources(self) -> tuple[KeptSource, ...]:
+        return tuple(
+            KeptSource(item.id, item.adapter_id)
+            for item in await self._store.list_sources(self.identity.id)
+            if item.active and self._source_types.get(item.adapter_id) is not None
         )
 
-    async def _refresh_unreadable_catalogs(self) -> None:
-        """Refresh, in the background, sources whose catalog rows a read skipped."""
-
-        try:
-            unreadable = await self._store.take_unreadable_catalog_sources(
-                self.identity.id
-            )
-            if not unreadable:
-                return
-            active = {
-                source.id
-                for source in await self._store.list_sources(self.identity.id)
-                if source.active
-            }
-        except Exception:
-            return  # The catalog only advises; a failed check never fails a run.
-        for source_id in unreadable:
-            if source_id in active:
-                self.request_source_refresh(source_id)
-
-    def request_source_refresh(
-        self, source_id: str, names: tuple[str, ...] = ()
-    ) -> None:
-        """Refresh one source's catalog in the background; never waits, never raises."""
-
-        loop = asyncio.get_running_loop()
-        started = self._source_refresh_started.get(source_id)
-        if (
-            self._closed
-            or source_id in self._source_refreshes
-            or (
-                started is not None
-                and loop.time() - started < _SOURCE_REFRESH_MIN_SECONDS
-            )
-        ):
-            return
-        self._source_refresh_started[source_id] = loop.time()
-        task = loop.create_task(self._refresh_source_in_background(source_id, names))
-        self._source_refreshes[source_id] = task
-        task.add_done_callback(lambda _: self._source_refreshes.pop(source_id, None))
-
-    async def _refresh_source_in_background(
-        self, source_id: str, names: tuple[str, ...]
-    ) -> None:
+    async def _keeper_read(
+        self, source_id: str, plan: KeeperRead
+    ) -> CatalogCommitSummary | None:
         # No admission lease: one queued on the lock would hold slots that
         # foreground runs, routines and jobs share.
-        try:
-            async with self._source_management_lock:
-                await self._refresh_source_locked(source_id, names)
-        except Exception as error:
-            # Error text can hold secrets; a failed sync is already recorded and
-            # the current snapshot stays.
-            _LOGGER.warning(
-                "background catalog refresh failed: %s", type(error).__name__
+        async with self._source_management_lock:
+            outcome = await self._refresh_source_locked(source_id, plan)
+        return None if outcome is None else outcome[1]
+
+    async def catalog_status(
+        self, source_id: str, *, check: bool = False
+    ) -> CatalogStatus:
+        """How current one source's catalog is; ``check`` asks the keeper to look."""
+
+        self._require_open()
+        registration = await self._active_source(source_id)
+        if check:
+            self._keeper.use((source_id,))
+        state = await self._store.load_source_state(self.identity.id, source_id)
+        resources, described = await self._store.catalog_detail_counts(
+            self.identity.id, source_id
+        )
+        syncs = await self._store.current_syncs(self.identity.id, (source_id,))
+        facts = self._keeper.facts(source_id)
+        keep_current = True if state is None else state.keep_current
+        checked = [
+            moment
+            for moment in (
+                facts.last_probe,
+                *(
+                    ()
+                    if state is None
+                    else (
+                        state.last_probe_at,
+                        state.last_full_check_at,
+                        state.last_change_at,
+                    )
+                ),
             )
+            if moment is not None
+        ]
+        if state is None:
+            freshness = CatalogFreshness.NOT_CHECKED
+        elif not keep_current:
+            freshness = CatalogFreshness.PAUSED
+        elif facts.updating:
+            freshness = CatalogFreshness.UPDATING
+        elif facts.unreachable:
+            freshness = CatalogFreshness.UNREACHABLE
+        else:
+            freshness = CatalogFreshness.CURRENT
+        return CatalogStatus(
+            source_id=registration.id,
+            state=freshness,
+            keep_current=keep_current,
+            checked_at=max(checked, default=None),
+            changed_at=None if state is None else state.last_change_at,
+            full_check_at=None if state is None else state.last_full_check_at,
+            resources=resources,
+            described=described,
+            inventory_truncated=bool(syncs) and syncs[0].truncated,
+            error_code=facts.error_code
+            or (None if state is None else state.last_error_code),
+        )
+
+    async def catalog_changes(
+        self, source_id: str, *, limit: int = 50
+    ) -> tuple[CatalogChange, ...]:
+        self._require_open()
+        await self._active_source(source_id)
+        return await self._store.list_catalog_changes(
+            self.identity.id, source_id, limit=limit
+        )
+
+    async def set_keep_current(
+        self, source_id: str, keep_current: bool
+    ) -> CatalogStatus:
+        """Switch the keeper on or off for one source; an explicit refresh still works."""
+
+        if not isinstance(keep_current, bool):
+            raise TypeError("keep_current must be a boolean")
+        self._require_open()
+        await self._active_source(source_id)
+        async with self._source_commit_lock:
+            state = await self._store.load_source_state(self.identity.id, source_id)
+            if state is None:
+                syncs = await self._store.current_syncs(self.identity.id, (source_id,))
+                if not syncs:
+                    raise ValueError("source has not been read yet")
+                state = CatalogSourceState(
+                    agent_id=self.identity.id,
+                    source_id=source_id,
+                    current_sync_id=syncs[0].id,
+                )
+            if state.keep_current != keep_current:
+                await self._store.save_source_state(
+                    replace(state, keep_current=keep_current)
+                )
+        self._keeper.wake()
+        return await self.catalog_status(source_id)
+
+    async def _active_source(self, source_id: str) -> SourceRegistration:
+        if not isinstance(source_id, str) or not source_id:
+            raise ValueError("source_id must be a non-empty string")
+        registration = await self._store.load_source(self.identity.id, source_id)
+        if registration is None or not registration.active:
+            raise ValueError("unknown active source for this agent")
+        return registration
 
     async def list_sources(self) -> tuple[SourceRegistration, ...]:
         self._require_open()
@@ -5060,8 +5165,14 @@ class EmbeddedAgent:
         owner_lock: asyncio.Lock,
     ):
         async with self._admit_system_work(label) as lease:
-            async with owner_lock:
-                yield lease
+            if owner_lock is not self._source_management_lock:
+                async with owner_lock:
+                    yield lease
+                return
+            # A person's source action first stops a background keeper read.
+            async with self._keeper.person_work():
+                async with owner_lock:
+                    yield lease
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -5080,10 +5191,7 @@ class EmbeddedAgent:
 
     async def _finish_close(self) -> None:
         first_error: BaseException | None = None
-        refreshes = tuple(self._source_refreshes.values())
-        for refresh in refreshes:
-            refresh.cancel()
-        await asyncio.gather(*refreshes, return_exceptions=True)
+        await self._keeper.close()
         await self._admission_coordinator.begin_draining()
         try:
             await self._routine_supervisor.close()

@@ -2022,7 +2022,11 @@ class SQLStateStore:
         *,
         registration: SourceRegistration | None = None,
         full: bool = True,
+        probe_tokens: Mapping[str, str] | None = None,
+        probed_at: datetime | None = None,
     ) -> CatalogCommitSummary:
+        if (probe_tokens is None) != (probed_at is None):
+            raise ValueError("probe tokens and probe time come together")
         if registration is not None and (
             registration.agent_id != sync.agent_id or registration.id != sync.source_id
         ):
@@ -2040,6 +2044,8 @@ class SQLStateStore:
                 full=full,
                 note=self._note_for(sync.agent_id),
                 repair=repair,
+                probe_tokens=probe_tokens,
+                probed_at=probed_at,
             )
 
         summary = await run_sql_transaction(
@@ -2047,6 +2053,19 @@ class SQLStateStore:
         )
         self._repaired(sync.agent_id, repair)
         return summary
+
+    async def save_source_state(self, state: CatalogSourceState) -> None:
+        await run_sql_transaction(
+            self._database, lambda c: catalog_rows.save_state(c, state)
+        )
+
+    async def catalog_detail_counts(
+        self, agent_id: str, source_id: str
+    ) -> tuple[int, int]:
+        return await self._catalog_read(
+            agent_id,
+            lambda c, _: catalog_rows.detail_counts(c, agent_id, source_id),
+        )
 
     async def commit_source_edit(
         self,

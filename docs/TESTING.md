@@ -279,6 +279,17 @@ rollback. It checks that PostgreSQL's bulk discovery statements say exactly what
 per-table statements say, and times attaching 1,000 and 1,500 tables through a local
 proxy that adds 50 ms to every round trip.
 
+`tests/live/data/test_change_probe.py` runs under the same gate and the same rollback
+(`DAITA_RUN_POSTGRES_LARGE_FIXTURE=1` and `DAITA_LARGE_POSTGRES_ADMIN_PASSWORD`). It
+checks that the PostgreSQL change probe moves for every structural change a revision
+stores and for grants, revokes and role membership as the probing role, stays still for
+rows and statistics, and times the probe at 1,500 tables. Run it with
+`pytest tests/live/data/test_change_probe.py -s`. A new source type that declares
+`CHANGE_PROBE` uses `assert_change_detection_contract` in `tests/support/source_contract.py`:
+it takes the probe, a list of scripted mutations (each says which scopes must move) and a
+function that reads the catalog's revisions per scope, and fails if tokens differ on an
+unchanged source or if the catalog changed where the probe stayed still.
+
 The scheduled-write case (`tests/live/routines/test_scheduled_write.py`) runs a
 real model's one-time routine in a real host while no client watches: the run
 asks to upsert one row into the real `postgres-large` fixture with

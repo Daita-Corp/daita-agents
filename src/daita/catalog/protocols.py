@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from .models import (
@@ -82,7 +83,13 @@ class CatalogStore(Protocol):
         *,
         registration: SourceRegistration | None = None,
         full: bool = True,
-    ) -> CatalogCommitSummary: ...
+        probe_tokens: Mapping[str, str] | None = None,
+        probed_at: datetime | None = None,
+    ) -> CatalogCommitSummary:
+        """Commit one pass. ``probe_tokens`` and ``probed_at`` come together: they are
+        stored in the same transaction and clear the last error; otherwise the
+        stored tokens stay."""
+        ...
 
     async def current_syncs(
         self, agent_id: str, source_ids: tuple[str, ...]
@@ -91,6 +98,16 @@ class CatalogStore(Protocol):
     async def load_source_state(
         self, agent_id: str, source_id: str
     ) -> CatalogSourceState | None: ...
+
+    async def save_source_state(self, state: CatalogSourceState) -> None:
+        """Upsert one state row of a known source; no catalog rows change."""
+        ...
+
+    async def catalog_detail_counts(
+        self, agent_id: str, source_id: str
+    ) -> tuple[int, int]:
+        """(resources, described) of one source."""
+        ...
 
     async def list_catalog_changes(
         self, agent_id: str, source_id: str, *, limit: int = 50

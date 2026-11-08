@@ -104,6 +104,9 @@ REMOTE_AGENT_SURFACE: Final = frozenset(
         "catalog_summary",
         "list_catalog_resources",
         "inspect_catalog_resource",
+        "catalog_status",
+        "catalog_changes",
+        "set_keep_current",
         # Artifacts, deliveries and work
         "list_artifacts",
         "read_artifact",

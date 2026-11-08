@@ -39,6 +39,8 @@ class SourceOperation(str, Enum):
     PATH_QUERY = "path_query"
     # Bounded name search and description straight from the source.
     LIVE_LOOKUP = "live_lookup"
+    # A cheap read that says whether the catalog may be out of date.
+    CHANGE_PROBE = "change_probe"
 
 
 # Operations whose validation and execution depend on the type's SQL dialect.
@@ -47,6 +49,7 @@ _SQL_OPERATIONS = frozenset(SourceOperation) - {
     SourceOperation.FILE_SEARCH,
     SourceOperation.TEXT_READ,
     SourceOperation.LIVE_LOOKUP,
+    SourceOperation.CHANGE_PROBE,
 }
 
 
@@ -85,6 +88,24 @@ def _no_backends(_: SourceBackendContext) -> Mapping[SourceOperation, object]:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceFreshness:
+    """How often a source's catalog is probed and fully rechecked, in seconds."""
+
+    min_probe_seconds: float
+    max_probe_seconds: float
+    full_check_seconds: float | None
+
+    def __post_init__(self) -> None:
+        if not 0 < self.min_probe_seconds <= self.max_probe_seconds:
+            raise ValueError("probe seconds must satisfy 0 < min <= max")
+        if self.full_check_seconds is not None and self.full_check_seconds <= 0:
+            raise ValueError("full_check_seconds must be positive or None")
+
+
+_DAY = 86_400.0
+
+
+@dataclass(frozen=True, slots=True)
 class SourceType:
     """One source adapter's identity, factory and declared operations."""
 
@@ -98,6 +119,8 @@ class SourceType:
     create_backends: Callable[
         [SourceBackendContext], Mapping[SourceOperation, object]
     ] = _no_backends
+    # Only meaningful with CHANGE_PROBE; a type without one is just fully rechecked.
+    freshness: SourceFreshness = SourceFreshness(300.0, 3_600.0, None)
 
     def __post_init__(self) -> None:
         for text, name in ((self.adapter_id, "adapter_id"), (self.label, "label")):
@@ -212,6 +235,7 @@ def _sqlite_operations(
         SourceOperation.TABULAR_EXPORT: backend,
         SourceOperation.PROFILE: backend,
         SourceOperation.LIVE_LOOKUP: backend,
+        SourceOperation.CHANGE_PROBE: backend,
     }
 
 
@@ -239,6 +263,7 @@ def _postgresql_operations(
         SourceOperation.TABULAR_EXPORT: reads,
         SourceOperation.PROFILE: reads,
         SourceOperation.LIVE_LOOKUP: reads,
+        SourceOperation.CHANGE_PROBE: reads,
         SourceOperation.RELATIONAL_WRITE: writes,
     }
 
@@ -255,6 +280,7 @@ def _folder_operations(
         SourceOperation.FILE_SEARCH: backend,
         SourceOperation.TEXT_READ: backend,
         SourceOperation.LIVE_LOOKUP: backend,
+        SourceOperation.CHANGE_PROBE: backend,
     }
 
 
@@ -286,9 +312,11 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
                     SourceOperation.TABULAR_EXPORT,
                     SourceOperation.PROFILE,
                     SourceOperation.LIVE_LOOKUP,
+                    SourceOperation.CHANGE_PROBE,
                 }
             ),
             create_backends=_sqlite_operations,
+            freshness=SourceFreshness(5.0, 300.0, _DAY),
         ),
         SourceType(
             adapter_id="postgresql",
@@ -303,10 +331,12 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
                     SourceOperation.TABULAR_EXPORT,
                     SourceOperation.PROFILE,
                     SourceOperation.LIVE_LOOKUP,
+                    SourceOperation.CHANGE_PROBE,
                     SourceOperation.RELATIONAL_WRITE,
                 }
             ),
             create_backends=_postgresql_operations,
+            freshness=SourceFreshness(20.0, 900.0, _DAY),
         ),
         *(
             (
@@ -323,9 +353,11 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
                             SourceOperation.FILE_SEARCH,
                             SourceOperation.TEXT_READ,
                             SourceOperation.LIVE_LOOKUP,
+                            SourceOperation.CHANGE_PROBE,
                         }
                     ),
                     create_backends=_folder_operations,
+                    freshness=SourceFreshness(5.0, 300.0, _DAY),
                 ),
             )
             if local_files
@@ -336,6 +368,7 @@ def _builtin_source_types(local_files: bool) -> tuple[SourceType, ...]:
 
 __all__ = [
     "SourceBackendContext",
+    "SourceFreshness",
     "SourceOperation",
     "SourceReconstructor",
     "SourceType",

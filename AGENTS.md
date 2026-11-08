@@ -274,7 +274,8 @@ Check the scheduled-run limits in `docs/architecture/jobs-and-routines.md`.
    outside the type's own modules.
 2. Run the shared contract checks in `tests/support/source_contract.py`:
    `assert_source_type_contract`, plus `assert_tabular_read_contract` when it
-   declares `TABULAR_READ`, and `assert_live_source_contract` for a live,
+   declares `TABULAR_READ`, `assert_change_detection_contract` when it
+   declares `CHANGE_PROBE`, and `assert_live_source_contract` for a live,
    uncataloged source. A source without SQL needs only `reconcile` and a
    `TABULAR_READ` backend to join combined queries.
 3. Implement `reconcile`: yield one INVENTORY batch listing every resource up to
@@ -282,6 +283,16 @@ Check the scheduled-run limits in `docs/architecture/jobs-and-routines.md`.
    marking what a budget cuts `truncated` rather than failing on size. Implement
    `health()` (`SourceHealth`); `Agent.check_source` calls it. The catalog only
    records what `reconcile` found.
+   `DiscoveryRequest.fill` keeps every detailed `previous` entry that is still
+   listed and describes up to `max_resources` that lack detail.
+   Implement `CHANGE_PROBE` (`ChangeProbeBackend`) and declare the type's
+   `SourceFreshness` so the keeper can tell cheaply when the catalog is out of
+   date. A probe is one bounded read-only statement (or one stat walk), reports
+   names and hashes only, ignores the read scope, and fails with a
+   `ResourceAdapterError` code, never driver text. Its tokens must move exactly
+   with what a `reconcile` would record (a change it misses is never re-read),
+   and not with rows or statistics. A type without a probe is only fully
+   rechecked on its schedule.
 4. Declare stable `Capability`, `Executor` and optional `ToolView` identities and
    compose them through `CapabilityRegistry` in `EmbeddedAgent`.
 5. Reads go through the one read policy, `validate_read` in

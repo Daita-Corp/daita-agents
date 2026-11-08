@@ -17,6 +17,7 @@ from .models import (
     ResourceRef,
     ResourceSnapshot,
     SourceHealth,
+    SourceProbe,
     SourceRegistration,
 )
 
@@ -195,8 +196,24 @@ class SourcePermissionStore(SourceReadScopeStore, Protocol):
     ) -> tuple[RelationalWriteScope, ...]: ...
 
 
+@runtime_checkable
+class ChangeProbeBackend(Protocol):
+    """Cheaply say whether a source's catalog may be out of date.
+
+    One probe is one bounded read-only statement (or one stat walk) with a short
+    timeout. It reports names and hashes only, is not bound by the read scope,
+    and fails with a ``ResourceAdapterError`` carrying a stable code, never raw
+    driver text.
+    """
+
+    async def probe(
+        self, *, agent_id: str, source_id: str, cursor: str | None
+    ) -> SourceProbe: ...
+
+
 __all__ = [
     "DESCRIBE_MAX_COLUMNS",
+    "ChangeProbeBackend",
     "DESCRIBE_MAX_LISTED_TABLES",
     "SUMMARY_MAX_COLUMNS",
     "column_summary",

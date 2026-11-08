@@ -1497,6 +1497,53 @@ class CatalogSourceState:
         )
 
 
+class CatalogFreshness(str, Enum):
+    CURRENT = "current"
+    UPDATING = "updating"
+    UNREACHABLE = "unreachable"
+    PAUSED = "paused"
+    NOT_CHECKED = "not_checked"
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogStatus:
+    """How current one source's catalog is; derived from stored state, never stored."""
+
+    source_id: str
+    state: CatalogFreshness
+    keep_current: bool
+    checked_at: datetime | None
+    changed_at: datetime | None
+    full_check_at: datetime | None
+    resources: int
+    described: int
+    inventory_truncated: bool
+    error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        _required_text(self.source_id, "catalog status source_id")
+        if not isinstance(self.state, CatalogFreshness):
+            raise TypeError("catalog status state must be a CatalogFreshness")
+        for flag, name in (
+            (self.keep_current, "keep_current"),
+            (self.inventory_truncated, "inventory_truncated"),
+        ):
+            if not isinstance(flag, bool):
+                raise TypeError(f"catalog status {name} must be a boolean")
+        for moment, name in (
+            (self.checked_at, "checked_at"),
+            (self.changed_at, "changed_at"),
+            (self.full_check_at, "full_check_at"),
+        ):
+            if moment is not None:
+                _aware(moment, f"catalog status {name}")
+        _non_negative_int(self.resources, "catalog status resources")
+        _non_negative_int(self.described, "catalog status described")
+        if self.described > self.resources:
+            raise ValueError("catalog status described exceeds resources")
+        _optional_text(self.error_code, "catalog status error_code", maximum=128)
+
+
 class CatalogChangeKind(str, Enum):
     ADDED = "added"
     CHANGED = "changed"
@@ -1987,6 +2034,7 @@ class CatalogTraversalResult:
 
 __all__ = [
     "CatalogFacet",
+    "CatalogFreshness",
     "CatalogLink",
     "CatalogLinkStaleReason",
     "CatalogLinkStatus",
@@ -1999,6 +2047,7 @@ __all__ = [
     "CatalogSearchHit",
     "CatalogSearchRequest",
     "CatalogSearchResult",
+    "CatalogStatus",
     "CatalogSync",
     "CatalogSyncStatus",
     "CatalogTraversalRequest",

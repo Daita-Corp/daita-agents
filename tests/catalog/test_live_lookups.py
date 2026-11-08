@@ -39,7 +39,7 @@ from daita.semantics import (
     SemanticKind,
     SemanticSubject,
 )
-from tests.support.source_refresh import settled, sync_count
+from tests.support.source_refresh import settled, stale_probes, sync_count
 from tests.support.workspace import workspace_for
 
 
@@ -112,6 +112,7 @@ async def test_search_finds_a_table_the_catalog_has_never_seen(tmp_path: Path) -
     agent, _provider = await _agent(tmp_path, _search("invoice"))
     try:
         source = await agent.attach(SQLiteSource(database, name="Shop"))
+        stale_probes(agent)
         with sqlite3.connect(database) as connection:
             connection.execute("CREATE TABLE invoices (id INTEGER, total REAL)")
         (result,) = await _results(agent)
@@ -211,6 +212,7 @@ async def test_describe_reads_the_live_table_with_keys_and_relationships(
     )
     try:
         source = await agent.attach(SQLiteSource(database, name="Shop"))
+        stale_probes(agent)
         # A column added after attach shows: a cached answer never overrides.
         with sqlite3.connect(database) as connection:
             connection.execute("ALTER TABLE orders ADD COLUMN placed_at TEXT")
@@ -253,6 +255,7 @@ async def test_a_table_the_source_no_longer_has_is_unknown_even_if_cached(
     agent, _provider = await _agent(tmp_path, _describe("secrets"))
     try:
         source = await agent.attach(SQLiteSource(database, name="Shop"))
+        stale_probes(agent)
         with sqlite3.connect(database) as connection:
             connection.execute("DROP TABLE secrets")
         (result,) = await _results(agent)

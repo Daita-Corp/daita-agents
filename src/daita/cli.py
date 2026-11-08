@@ -1518,15 +1518,26 @@ async def _execute(args: argparse.Namespace) -> object:
                     expected_revision=args.expected_revision,
                 )
             )
-        return [
-            {
-                "source_id": item.id,
-                "adapter": item.adapter_id,
-                "name": item.display_name,
-                "active": item.active,
-            }
-            for item in await agent.list_sources()
-        ]
+        listing = []
+        for item in await agent.list_sources():
+            catalog = await agent.catalog_status(item.id) if item.active else None
+            listing.append(
+                {
+                    "source_id": item.id,
+                    "adapter": item.adapter_id,
+                    "name": item.display_name,
+                    "active": item.active,
+                    "status": None if catalog is None else catalog.state.value,
+                    "checked_at": (
+                        None
+                        if catalog is None or catalog.checked_at is None
+                        else catalog.checked_at.isoformat()
+                    ),
+                    "described": None if catalog is None else catalog.described,
+                    "total": None if catalog is None else catalog.resources,
+                }
+            )
+        return listing
     finally:
         try:
             if owned_mcp_credential is not None and not any(

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, ClassVar
 
 from rich.text import Text
@@ -14,6 +15,7 @@ from textual.containers import Horizontal, ItemGrid, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Label, Static, Tree
 
+from ..catalog_status import status_line, today_line
 from ..models import source_type_label
 from ..projection import connection_lines
 from ..sanitization import safe_display, sanitize_terminal_text
@@ -88,6 +90,8 @@ class CatalogScreen(ModalScreen[SourceManagerAction | None]):
         # Live checks answer once per source for the life of this screen.
         self._connections: dict[str, dict[str, object]] = {}
         self._checking: set[str] = set()
+        self._catalog_lines: dict[str, str] = {}
+        self._catalog_loading: set[str] = set()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="catalog-browser"):
@@ -129,9 +133,11 @@ class CatalogScreen(ModalScreen[SourceManagerAction | None]):
                 markup=False,
             )
             yield Static("", id="source-connection", markup=False)
+            yield Static("", id="source-catalog-status", markup=False)
             with ItemGrid(id="source-actions", min_column_width=14):
                 yield Button("Add source", id="source-add", variant="primary")
-                yield Button("Refresh", id="source-refresh")
+                yield Button("Check now", id="source-refresh")
+                yield Button("Keep current", id="source-keep-current")
                 yield Button("Edit", id="source-edit")
                 yield Button("Permissions", id="source-permissions")
                 yield Button("Detach", id="source-detach", variant="error")
@@ -225,6 +231,7 @@ class CatalogScreen(ModalScreen[SourceManagerAction | None]):
             return
         actions = {
             "source-refresh": "refresh",
+            "source-keep-current": "keep_current",
             "source-edit": "edit",
             "source-permissions": "permissions",
             "source-detach": "detach",
@@ -686,6 +693,7 @@ class CatalogScreen(ModalScreen[SourceManagerAction | None]):
         source_id = self._selected_source_id()
         for button_id in (
             "source-refresh",
+            "source-keep-current",
             "source-edit",
             "source-permissions",
             "source-detach",
@@ -705,6 +713,42 @@ class CatalogScreen(ModalScreen[SourceManagerAction | None]):
             )
         self.query_one("#catalog-help", Static).update(message)
         self._show_connection(source_id)
+        self._show_catalog_status(source_id)
+
+    def _show_catalog_status(self, source_id: str | None) -> None:
+        block = self.query_one("#source-catalog-status", Static)
+        if source_id is None:
+            block.update("")
+        elif source_id in self._catalog_lines:
+            block.update(self._catalog_lines[source_id])
+        else:
+            block.update("")
+            if source_id not in self._catalog_loading:
+                self._catalog_loading.add(source_id)
+                self.run_worker(
+                    self._load_catalog_status(source_id),
+                    name="catalog-status-load",
+                    group="catalog-status",
+                    exit_on_error=False,
+                )
+
+    async def _load_catalog_status(self, source_id: str) -> None:
+        controller = self.app.controller  # type: ignore[attr-defined]
+        try:
+            status = await controller.catalog_status(source_id, check=True)
+            changes = await controller.catalog_changes(source_id)
+            now = datetime.now().astimezone()
+            lines = [status_line(status, now), today_line(changes, now)]
+            self._catalog_lines[source_id] = "\n".join(line for line in lines if line)
+        except Exception:
+            self._catalog_lines[source_id] = ""
+        self._catalog_loading.discard(source_id)
+        if (
+            self.is_mounted
+            and self.query("#catalog-tree")
+            and self._selected_source_id() == source_id
+        ):
+            self._show_catalog_status(source_id)
 
     def _show_connection(self, source_id: str | None) -> None:
         block = self.query_one("#source-connection", Static)

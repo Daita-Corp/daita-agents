@@ -6,7 +6,7 @@ parameters, so they run unchanged on SQLite and PostgreSQL.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar
@@ -433,6 +433,35 @@ def source_state(
         return None
 
 
+def detail_counts(
+    connection: SQLConnection, agent_id: str, source_id: str
+) -> tuple[int, int]:
+    row = connection.execute(
+        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN detail = 'complete' THEN 1 ELSE 0 END), 0) "
+        "FROM catalog_resources WHERE agent_id = ? AND source_id = ?",
+        (agent_id, source_id),
+    ).fetchone()
+    assert row is not None  # an aggregate always returns a row
+    return int(row[0]), int(row[1])
+
+
+def save_state(connection: SQLConnection, state: CatalogSourceState) -> None:
+    known = connection.execute(
+        "SELECT 1 FROM sources WHERE agent_id = ? AND id = ?",
+        (state.agent_id, state.source_id),
+    ).fetchone()
+    if known is None:
+        raise ValueError("catalog source is unknown")
+    _write_rows(
+        connection,
+        "catalog_source_state",
+        ("agent_id", "source_id", "data"),
+        [(state.agent_id, state.source_id, encode_catalog_source_state(state))],
+        key="agent_id, source_id",
+        update=("data",),
+    )
+
+
 def list_changes(
     connection: SQLConnection, agent_id: str, source_id: str, limit: int, note: Note
 ) -> tuple[CatalogChange, ...]:
@@ -606,6 +635,8 @@ def commit_pass(
     full: bool,
     note: Note,
     repair: frozenset[str] = frozenset(),
+    probe_tokens: Mapping[str, str] | None = None,
+    probed_at: datetime | None = None,
 ) -> CatalogCommitSummary:
     """Write one succeeded pass inside the caller's transaction.
 
@@ -615,6 +646,8 @@ def commit_pass(
 
     if sync.status is not CatalogSyncStatus.SUCCEEDED:
         raise ValueError("only a succeeded sync can commit catalog rows")
+    if (probe_tokens is None) != (probed_at is None):
+        raise ValueError("probe tokens and probe time come together")
     agent_id, source_id = sync.agent_id, sync.source_id
     entries: dict[str, CatalogEntry] = {}
     relationships: dict[str, CatalogRelationship] = {}
@@ -923,7 +956,16 @@ def commit_pass(
         change_rows,
     )
 
-    # Sync, state and bounds.
+    # Sync, state and bounds. The catalog lacks detail while any row is a bare listing.
+    if (
+        not sync.truncated
+        and connection.execute(
+            "SELECT 1 FROM catalog_resources WHERE agent_id = ? AND source_id = ? "
+            "AND detail = 'inventory' LIMIT 1",
+            (agent_id, source_id),
+        ).fetchone()
+    ):
+        sync = replace(sync, truncated=True)
     _write_rows(
         connection,
         "syncs",
@@ -941,6 +983,13 @@ def commit_pass(
         last_change_at=completed if anything else state.last_change_at,
         last_full_check_at=completed if full else state.last_full_check_at,
     )
+    if probe_tokens is not None:
+        state = replace(
+            state,
+            probe_tokens=probe_tokens,
+            last_probe_at=probed_at,
+            last_error_code=None,
+        )
     _write_rows(
         connection,
         "catalog_source_state",

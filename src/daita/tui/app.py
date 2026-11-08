@@ -1211,6 +1211,26 @@ class DaitaApp(App[int]):
                     notice_warning = True
                 continue
 
+            if action.kind == "keep_current":
+                try:
+                    current = await self.controller.catalog_status(selected_source_id)
+                    updated = await self.controller.set_keep_current(
+                        selected_source_id, not current.keep_current
+                    )
+                except (UserInputError, ValueError, RuntimeError, OSError) as error:
+                    notice = sanitize_terminal_text(
+                        str(error),
+                        maximum=512,
+                        preserve_lines=False,
+                        fallback="Could not change Keep current.",
+                    )
+                    notice_warning = True
+                    continue
+                notice = "Keep current is " + (
+                    "on." if updated.keep_current else "off."
+                )
+                continue
+
             if action.kind == "edit":
                 changed = await self._await_modal(
                     SourceEditScreen(source_id=selected_source_id)
