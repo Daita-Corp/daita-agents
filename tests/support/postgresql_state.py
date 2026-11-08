@@ -28,11 +28,13 @@ from contextlib import contextmanager
 from types import TracebackType
 from typing import Any
 
-import psycopg2  # type: ignore[import-untyped]
+import pytest
 
 from daita.storage.sql import SQLStateStore
 from daita.storage.sql_connection import SQLConnection, SQLCursor, StateIntegrityError
 from daita.storage.sqlite_schema import CURRENT_DATABASE_SQL
+
+psycopg2 = pytest.importorskip("psycopg2", exc_type=ImportError)
 
 _TRANSLATIONS = (
     (r"CHECK \(json_valid\((\w+)\)\)", r"CHECK (\1::jsonb IS NOT NULL)"),

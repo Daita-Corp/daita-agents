@@ -14,7 +14,6 @@ from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
-import psycopg2  # type: ignore[import-untyped]
 import pytest
 
 from daita.adapters.models import SourceRegistration, source_registration_id
@@ -42,6 +41,8 @@ from tests.support.postgresql_state import (
     postgresql_state,
     postgresql_state_store,
 )
+
+psycopg2 = pytest.importorskip("psycopg2", exc_type=ImportError)
 
 pytestmark = [
     pytest.mark.requires_db,
