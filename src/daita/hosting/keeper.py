@@ -536,6 +536,8 @@ class CatalogKeeper:
         if self._people:
             return None
         task = asyncio.ensure_future(self._read(source_id, plan))
+        # A read that outlives a cancelled waiter must not leave its error unretrieved.
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
         self._inflight = (source_id, task)
         try:
             await asyncio.wait({task})

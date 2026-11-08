@@ -13,6 +13,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -245,6 +246,15 @@ def _durable_snapshot(home: Path) -> dict[str, object]:
         "skill": (home / "skills/preserved-skill/SKILL.md").read_bytes(),
         "user": (home / "USER.md").read_bytes(),
     }
+
+
+def _assert_preserved(actual: dict[str, Any], expected: dict[str, Any]) -> None:
+    # The keeper may add upkeep sync rows after a reopen; the old rows must survive.
+    actual_rows, expected_rows = dict(actual["rows"]), dict(expected["rows"])
+    syncs = expected_rows.pop("syncs")
+    assert actual_rows.pop("syncs")[: len(syncs)] == syncs
+    assert actual_rows == expected_rows
+    assert {**actual, "rows": 0} == {**expected, "rows": 0}
 
 
 def _make_preproduction_home(home: Path, shape: str) -> None:
@@ -936,7 +946,7 @@ async def test_revision_1_bridge_preserves_complete_observed_preproduction_homes
     finally:
         await reopened.close()
 
-    assert _durable_snapshot(home) == expected
+    _assert_preserved(_durable_snapshot(home), expected)
     assert _journal(home / "state.db") == (
         (1, REVISION_1.migration_id, REVISION_1.checksum),
         (2, REVISION_2.migration_id, REVISION_2.checksum),
