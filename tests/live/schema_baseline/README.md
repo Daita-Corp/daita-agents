@@ -11,8 +11,10 @@ discovery or query revalidation and compare against your last report.
 `tests/fixtures/postgres-schema-baseline/seed.sql` drops and recreates six
 schemas in a database that must be named `daita_schema_baseline`:
 
-- 1,509 base tables (`sales` 12, `events` 128, `finance` 203, `crm` 303,
+- 1,510 base tables (`sales` 12, `events` 128, `finance` 204, `crm` 303,
   `legacy` 350, `ops` 513) with near-identical filler names and FKs;
+- `finance.budgets`, which the read-only reader cannot read at attach (its
+  `SELECT` is revoked), so the admin sees 997 bounded tables and the reader 996;
 - `events.page_views` partitioned by day into 120 partitions;
 - a user enum (`sales.order_status`, also used in some filler tables and as an
   array), a domain (`finance.positive_amount`), `money` and `tsvector` columns,
@@ -22,7 +24,7 @@ schemas in a database that must be named `daita_schema_baseline`:
   `legacy."Accounts"` beside `legacy.accounts`, `events.page_views_legacy`.
 
 `tests/fixtures/postgres-schema-baseline/questions.json` holds 15 easy
-questions (`"tier": "easy"`) and 10 hard ones (see below),
+questions (`"tier": "easy"`) and 16 hard ones (see below),
 each with the SQL whose result is the known answer. The harness computes the
 answers from the database itself, so they stay correct if the seed changes.
 The file is plain JSON so other agents (for example Claude Code in the planned
@@ -32,9 +34,9 @@ head-to-head) can run the same set.
 
 `test_postgresql_schema_baseline` (offline, no model cost):
 
-1. Attaches all six schemas (1,509 tables) and records the discovery outcome.
+1. Attaches all six schemas (1,510 tables) and records the discovery outcome.
    Attach succeeds and keeps the first 1,000 tables, marked truncated.
-2. Attaches the five schemas without `ops` (996 tables), then records attach
+2. Attaches the five schemas without `ops` (997 tables as admin), then records attach
    time, metadata round trips by statement, resources and relationships.
 3. Compares the catalog with `pg_class` and lists every missing relation with
    its reason (view, enum, domain, extension type, unsupported built-in type),
@@ -84,7 +86,7 @@ resources, error code) and each Claude Code `psql` command.
 
 ## The hard tier
 
-The hard questions (`h01`..`h10`) plant traps in the same database. Each
+The hard questions (`h01`..`h16`) plant traps in the same database. Each
 carries the known answer (`sql`), usually the value an answer gets if it falls
 for the trap (`trap_sql`), and optionally admin DDL run right before it
 (`before_sql`), a second user turn (`follow_up`) and `evidence_clear` for
@@ -102,6 +104,28 @@ look-alikes. The question text never names the canonical table for `h01`..`h03`.
 | h08 | `schema_change` | a new `sales.orders.channel` column and an unrelated table appear |
 | h09 | `fan_out` | a join to `sales.order_items` repeats orders that have two qualifying items |
 | h10 | `correction` | the h06 rule, asked again later: does the system carry it across runs |
+| h11 | `renamed_column` | `sales.customers.region` becomes `sales_region` |
+| h12 | `new_table` | `sales.gift_cards` appears (600 rows) |
+| h13 | `replaced_table` | `finance.invoices` is dropped for `finance.billing_documents` (more rows) |
+| h14 | `granted_access` | the reader is granted `finance.budgets`, unreadable at attach |
+| h15 | `revoked_access` | the reader loses `sales.promotions`; the right answer is to decline |
+| h16 | `dropped_column` | `sales.orders.shipping_fee` is dropped; the right answer is to decline |
+
+h11..h16 (with h08) are the `schema_change` category: each runs admin DDL
+(`before_sql`) right before the question, so an answer is right only if the
+agent notices the change. Two optional fields describe them:
+
+- `catalog_expect`: facts the catalog should show once it has caught the
+  change: `{"resource": "schema.table"}` (present), `{"resource": ...,
+  "absent": true}`, `{"resource": ..., "column": "name"}` (column present),
+  `{"resource": ..., "column": ..., "absent": true}`.
+- `decline_expected: true` (no `sql`): the truth is None and the right answer
+  is to say it cannot be answered. Scoring: `correct` when the answer is
+  scored `no_answer`, `confident_wrong` when it gives a value, `incomplete`
+  as usual. The oracle scenario skips these questions.
+
+The summary adds a `schema_change` block: correct count per question over the
+repeats, plus total `failed_sql_calls` and `turns` over those records.
 
 `notes.json` holds the standing notes (table, fields, semantic kind, statement)
 for the traps that need a user statement. The systems receive them differently:
@@ -135,6 +159,41 @@ Because `before_sql` changes the database, every hard repeat reseeds it first,
 per system. The fixture self-check fails the run when a hard truth equals its
 trap value. The offline test also runs the hard SQL through the oracle (the
 catalog is refreshed after DDL) and records it under `hard_questions`.
+
+## The schema-change check (scripted, free)
+
+`test_schema_changes_reach_the_catalog` attaches one agent as the reader to
+the five bounded schemas, then for each `schema_change` question applies its
+`before_sql` as admin and polls the catalog once a second, up to 45 s
+(`_CATALOG_WAIT_SECONDS`), until every `catalog_expect` fact holds. It never
+calls `refresh_source`: it measures whether the catalog catches a change by
+itself. Per question it records `seconds_to_catalog` (None if it never did),
+the facts that never held and, for answerable questions, the oracle outcome
+(refusal codes, failed SQL calls, round trips). It asserts only that each
+truth was computed and each oracle answer is `correct`, never the timing: a
+build without a keeper is expected to report None. Report:
+`postgresql-schema-change-check-<commit>.json` and `.md`.
+
+```bash
+.venv/bin/python -m pytest tests/live/schema_baseline -k schema_changes -o addopts="--tb=short -q --strict-markers" -s
+```
+
+## Paired keeper comparison
+
+To see whether keeping the catalog current changes answers, run the scripted
+check and the hard tier on `main` (1fe877f1, before the keeper) and on the
+keeper branch, with the same model and repeats, Daita only:
+
+```bash
+DAITA_RUN_LIVE_SCHEMA_BASELINE_COMPARISON=1 DAITA_SCHEMA_BASELINE_SYSTEMS=daita \
+DAITA_SCHEMA_BASELINE_TIER=hard DAITA_SCHEMA_BASELINE_REPEATS=3 \
+.venv/bin/python -m pytest tests/live/schema_baseline -k "schema_changes or claude_code" -o addopts="--tb=short -q --strict-markers" -o faulthandler_timeout=0 -s
+```
+
+Compare `schema_changes` (`seconds_to_catalog`), the `schema_change` block of
+each side's hard summary (correct per question, failed SQL calls, turns), and
+check h01..h10 did not regress. The harness uses only Agent APIs present on
+`main`, so the same files run on both.
 
 ## Run it
 
