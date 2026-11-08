@@ -363,7 +363,13 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         assert approvals[1].arguments["expected_sha256"] == original_digest
         assert canonical_json(approvals[1].arguments["catalog_revisions"]) == (
             canonical_json(
-                ({"resource_id": resource.id, "revision": resource.current_revision},)
+                (
+                    {
+                        "resource_id": resource.id,
+                        "revision": resource.current_revision,
+                        "field_types": [["booked_at", "TEXT"]],
+                    },
+                )
             )
         )
         viewed_skill = next(

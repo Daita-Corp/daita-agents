@@ -195,6 +195,12 @@ each side's hard summary (correct per question, failed SQL calls, turns), and
 check h01..h10 did not regress. The harness uses only Agent APIs present on
 `main`, so the same files run on both.
 
+To see what notes contribute, run the hard tier twice on the same code, once
+with `DAITA_SCHEMA_BASELINE_NOTES=on` and once with `off`. Off teaches nothing,
+denies `memory_set`, `semantic_save` and `skill_save` (Claude Code gets an empty
+`CLAUDE.md` and no Edit tool), and its report has `"notes": "off"` and a
+`-notes-off` filename suffix.
+
 ## Run it
 
 Start the disposable server (tmpfs, discarded on `down`):
@@ -230,6 +236,7 @@ DAITA_SCHEMA_BASELINE_MAX_COST_USD=0.50                  # Claude Code, per ques
 DAITA_SCHEMA_BASELINE_DAITA_MAX_TOKENS=250000            # optional matched budget
 DAITA_SCHEMA_BASELINE_SYSTEMS=daita,claude_code          # optional subset
 DAITA_SCHEMA_BASELINE_TIER=easy                          # easy (default), hard or all
+DAITA_SCHEMA_BASELINE_NOTES=on                           # on (default) or off: hard tier without standing notes or any learning
 ```
 
 Then run the comparison test. A run outlasts pytest's 300-second hang guard,

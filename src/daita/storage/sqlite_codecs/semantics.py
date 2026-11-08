@@ -61,19 +61,55 @@ def decode_field_reference(value: JsonValue) -> SemanticFieldReference:
 def encode_revision_binding(value: ResourceRevisionBinding) -> dict[str, JsonValue]:
     return record(
         "ResourceRevisionBinding",
-        {"resource_id": value.resource_id, "revision": value.revision},
+        {
+            "resource_id": value.resource_id,
+            "revision": value.revision,
+            # Omitted when None so older records re-encode byte-identically.
+            **(
+                {"field_types": [list(pair) for pair in value.field_types]}
+                if value.field_types is not None
+                else {}
+            ),
+        },
     )
 
 
+def _pair(value: JsonValue) -> list[JsonValue]:
+    items = sequence(value, "semantic revision field type")
+    if len(items) != 2:
+        raise ValueError("stored semantic revision field type must be a pair")
+    return items
+
+
 def decode_revision_binding(value: JsonValue) -> ResourceRevisionBinding:
+    # Older records omit field_types; fill it in so one contract covers both.
+    stored = value.get("fields") if isinstance(value, dict) else None
+    if isinstance(value, dict) and isinstance(stored, dict):
+        value = {**value, "fields": {"field_types": None, **stored}}
     fields = record_fields(
         value,
         "ResourceRevisionBinding",
-        ("resource_id", "revision"),
+        ("resource_id", "revision", "field_types"),
     )
     return ResourceRevisionBinding(
         resource_id=text(fields["resource_id"], "semantic revision resource_id"),
         revision=text(fields["revision"], "semantic revision"),
+        field_types=(
+            tuple(
+                (
+                    text(pair[0], "semantic revision field name"),
+                    text(pair[1], "semantic revision field type"),
+                )
+                for pair in (
+                    _pair(item)
+                    for item in sequence(
+                        fields["field_types"], "semantic revision field_types"
+                    )
+                )
+            )
+            if fields["field_types"] is not None
+            else None
+        ),
     )
 
 

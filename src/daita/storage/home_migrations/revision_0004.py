@@ -10,9 +10,15 @@ from typing import Any
 from uuid import uuid4
 
 # shortcut: imports current catalog codecs and search text, so revision 4's output follows them; freeze copies here before any later revision changes them.
-from ...catalog.models import CatalogEntry, CatalogSourceState
+from ...catalog.models import (
+    CatalogEntry,
+    CatalogSourceState,
+    FacetKind,
+    TabularFacet,
+)
 from ...catalog.search_text import search_key, search_postings, search_words
 from ..sqlite_codecs import (
+    decode_catalog_entry,
     decode_catalog_snapshot,
     encode_catalog_entry,
     encode_catalog_relationship,
@@ -762,6 +768,59 @@ def _convert_catalog_snapshots(connection: sqlite3.Connection) -> None:
     connection.executescript(RETIRE_SNAPSHOTS_SQL)
 
 
+def _backfill_note_field_types(connection: sqlite3.Connection) -> None:
+    """Save the field types a note was written against, where they are still known.
+
+    A binding whose resource is still at its bound revision gets the native types
+    of the fields the note names. Any other binding keeps comparing revisions.
+    """
+
+    for agent_id, annotation_id, encoded in connection.execute(
+        "SELECT agent_id, id, data FROM semantic_annotations"
+    ).fetchall():
+        annotation = json.loads(encoded)
+        fields = annotation["fields"]
+        named: dict[str, set[str]] = {}
+        for item in fields["subject"]["fields"]["fields"]:
+            named.setdefault(item["fields"]["resource_id"], set()).add(
+                item["fields"]["field_name"]
+            )
+        changed = False
+        for binding in fields["catalog_revisions"]:
+            bound = binding["fields"]
+            row = connection.execute(
+                "SELECT revision, data FROM catalog_resources "
+                "WHERE agent_id = ? AND id = ?",
+                (agent_id, bound["resource_id"]),
+            ).fetchone()
+            if row is None or row[0] != bound["revision"]:
+                continue
+            tabular = next(
+                (
+                    facet
+                    for facet in decode_catalog_entry(row[1]).facets
+                    if facet.kind is FacetKind.TABULAR
+                ),
+                None,
+            )
+            columns = (
+                TabularFacet.from_payload(tabular.payload).columns if tabular else ()
+            )
+            wanted = named.get(bound["resource_id"], set())
+            bound["field_types"] = sorted(
+                [column.name, column.native_type]
+                for column in columns
+                if column.name in wanted
+            )
+            changed = True
+        if changed:
+            connection.execute(
+                "UPDATE semantic_annotations SET data = ? "
+                "WHERE agent_id = ? AND id = ?",
+                (_dump(annotation), agent_id, annotation_id),
+            )
+
+
 def _apply_revision_4(home: Path, source_shape: str | None) -> None:
     if source_shape is not None:
         raise ValueError("Unknown analysis migration source")
@@ -832,6 +891,7 @@ def _apply_revision_4(home: Path, source_shape: str | None) -> None:
         _fold_sqlite_identities(connection)
         _convert_write_scopes(connection)
         _convert_catalog_snapshots(connection)
+        _backfill_note_field_types(connection)
         connection.commit()
     _default_reasoning_effort(home / "config.json")
 
@@ -863,7 +923,9 @@ REVISION_4 = HomeMigration(
         "provider's default. "
         "Each source's catalog snapshot becomes one row per resource, relationship and search "
         "entry plus a source state row; resource ids and revisions are unchanged, every "
-        "resource counts as fully described, and the snapshot table goes."
+        "resource counts as fully described, and the snapshot table goes. "
+        "Each semantic note whose resource is still at the revision it was saved against "
+        "gains the native types of the fields it names; other notes keep comparing revisions."
     ),
     affected_paths=("state.db", "config.json"),
     target_schema=SCHEMA_REVISION_4,
