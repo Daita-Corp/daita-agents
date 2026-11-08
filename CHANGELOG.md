@@ -294,6 +294,11 @@ the host's idle policy, and sets no wake time.
 - **Stored sync `truncated`** now means the source's catalog lacks some detail: the
   pass was cut short, or any table still has only a name after the commit.
 - **No stored shape changes.** The keeper uses the existing source state row.
+- **A saved note goes stale only when what it names changes.** A note that names fields
+  stays current until one of them is dropped or retyped (`field_type_changed`); a note
+  that names no field stays current while its table exists. A new column or a new
+  catalog revision no longer discards it. Notes saved before this keep the old revision
+  check.
 - **For integrators.** `SourceOperation.CHANGE_PROBE` and `ChangeProbeBackend` (one
   `probe(agent_id, source_id, cursor)` returning a `SourceProbe` of tokens per scope);
   `SourceType.freshness` is a `SourceFreshness` (minimum and maximum probe interval, and

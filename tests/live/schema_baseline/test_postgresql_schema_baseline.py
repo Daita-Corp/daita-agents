@@ -80,6 +80,7 @@ _CLAUDE = "DAITA_SCHEMA_BASELINE_CLAUDE_EXECUTABLE"
 _REPEATS = "DAITA_SCHEMA_BASELINE_REPEATS"
 _DAITA_MAX_TOKENS = "DAITA_SCHEMA_BASELINE_DAITA_MAX_TOKENS"
 _TIER = "DAITA_SCHEMA_BASELINE_TIER"
+_NOTES = "DAITA_SCHEMA_BASELINE_NOTES"
 _CATALOG_WAIT_SECONDS = 45
 _READER = ("daita_baseline_reader", "daita_baseline_reader_password")
 _DATABASE = "daita_schema_baseline"
@@ -120,6 +121,9 @@ _LEARNING_TOOLS = frozenset({"memory_set", "semantic_save", "skill_save"})
 _CLAUDE_TOOLS = "Bash,Read,Edit,Write"
 # Claude Code's Edit rules cover Write too.
 _CLAUDE_HARD_ALLOWED = "Bash(psql:*),Read(./**),Edit(./CLAUDE.md)"
+# Notes off: nothing to remember into, so no edit tool at all.
+_CLAUDE_NO_NOTES_TOOLS = "Bash,Read"
+_CLAUDE_NO_NOTES_ALLOWED = "Bash(psql:*),Read(./**)"
 _STALE_STEPS = (
     (
         "add_partition",
@@ -1277,8 +1281,10 @@ async def _run_daita_hard(
     root: Path,
     entry: dict[str, Any],
     repeat: int,
+    notes_on: bool = True,
 ) -> None:
-    """One agent for the hard tier: notes first, then the questions in order."""
+    """One agent for the hard tier: notes first, then the questions in order.
+    With notes off nothing is taught or remembered, and learning is denied."""
 
     from tests.support.live_billing import live_provider
 
@@ -1297,7 +1303,7 @@ async def _run_daita_hard(
     async def approve_learning(request: ApprovalRequest) -> ApprovalDecision:
         decision = (
             ApprovalDecision.APPROVE
-            if request.tool_name in _LEARNING_TOOLS
+            if notes_on and request.tool_name in _LEARNING_TOOLS
             else ApprovalDecision.DENY
         )
         approvals.append({"tool": request.tool_name, "decision": decision.value})
@@ -1329,7 +1335,8 @@ async def _run_daita_hard(
                 entry["attach"].append(attach)
                 if source_id is None:
                     pytest.fail(f"Daita could not attach: {attach}")
-                await _teach_notes(teacher, source_id, notes, events, trips)
+                if notes_on:
+                    await _teach_notes(teacher, source_id, notes, events, trips)
             # The same home, now with the live model; only learning cards pass.
             async with await Agent.open(
                 name,
@@ -1388,8 +1395,10 @@ async def _run_claude_code_hard(
     entry: dict[str, Any],
     repeat: int,
     notes: Sequence[Mapping[str, Any]],
+    notes_on: bool = True,
 ) -> None:
-    """One working directory and config for the hard tier, notes in CLAUDE.md."""
+    """One working directory and config for the hard tier, notes in CLAUDE.md
+    (off: an empty CLAUDE.md and no Edit tool, so nothing carries over)."""
 
     executable = require_claude(_CLAUDE)
     workdir, config = root / "work", root / "config"
@@ -1399,6 +1408,8 @@ async def _run_claude_code_hard(
     memory.write_text(
         "# Notes about this database (from earlier conversations)\n\n"
         + "".join(f"- {item['statement']}\n" for item in notes)
+        if notes_on
+        else ""
     )
     environment = {
         "PGHOST": target.host,
@@ -1419,11 +1430,13 @@ async def _run_claude_code_hard(
             model,
             prompt + ANSWER_FORMAT,
             environment=environment,
-            allowed_tools=_CLAUDE_HARD_ALLOWED,
+            allowed_tools=(
+                _CLAUDE_HARD_ALLOWED if notes_on else _CLAUDE_NO_NOTES_ALLOWED
+            ),
             max_cost=os.environ.get(_MAX_COST, "0.50"),
             workdir=workdir,
             config=config,
-            tools=_CLAUDE_TOOLS,
+            tools=_CLAUDE_TOOLS if notes_on else _CLAUDE_NO_NOTES_TOOLS,
             persist_session=True,
             resume=resume,
         )
@@ -1556,7 +1569,8 @@ def _comparison_markdown(report: Mapping[str, Any]) -> str:
         f"{meta['server_version']} · Claude Code {report.get('claude_code_version')} · "
         f"{meta['generated_at']} · "
         f"{_base_tables(meta, _BOUNDED_SCHEMAS)} tables in scope for both, "
-        f"read-only role · tier {report['tier']} · {report['repeats']} repeat(s)",
+        f"read-only role · tier {report['tier']} · notes {report['notes']} · "
+        f"{report['repeats']} repeat(s)",
         "",
         f"Limits per question: Daita {limits['daita']['max_steps']} steps, "
         f"{limits['daita']['max_total_tokens']} tokens, "
@@ -1647,6 +1661,9 @@ async def test_daita_and_claude_code_answer_the_question_set(
     tier = os.environ.get(_TIER, "easy")
     if tier not in {"easy", "hard", "all"}:
         pytest.fail(f"{_TIER} must be easy, hard or all")
+    notes_mode = os.environ.get(_NOTES, "on")
+    if notes_mode not in {"on", "off"}:
+        pytest.fail(f"{_NOTES} must be on or off")
     target, admin, trips, environment, questions, truth = await _prepare(monkeypatch)
     await admin.close()
     questions = questions if tier in {"easy", "all"} else []
@@ -1660,6 +1677,7 @@ async def test_daita_and_claude_code_answer_the_question_set(
         ),
         "repeats": repeats,
         "tier": tier,
+        "notes": notes_mode,
         "limits": {
             "daita": {
                 "max_steps": limits.max_steps,
@@ -1698,6 +1716,8 @@ async def test_daita_and_claude_code_answer_the_question_set(
     }
     directory = _report_directory()
     stem = f"postgresql-schema-comparison-{environment['commit']}-{model}-{tier}"
+    if notes_mode == "off":
+        stem += "-notes-off"
     try:
         # Repeats outermost so a mid-run failure leaves both systems comparable.
         for repeat in range(repeats):
@@ -1742,11 +1762,18 @@ async def test_daita_and_claude_code_answer_the_question_set(
                 root = tmp_path / name / f"hard-repeat-{repeat}"
                 if name == "daita":
                     await _run_daita_hard(
-                        target, model_id, notes, trips, root, entry, repeat
+                        target,
+                        model_id,
+                        notes,
+                        trips,
+                        root,
+                        entry,
+                        repeat,
+                        notes_mode == "on",
                     )
                 else:
                     await _run_claude_code_hard(
-                        target, model, root, entry, repeat, notes
+                        target, model, root, entry, repeat, notes, notes_mode == "on"
                     )
     finally:
         # Paid results survive a later failure.

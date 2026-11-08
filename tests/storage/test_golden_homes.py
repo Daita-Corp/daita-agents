@@ -34,6 +34,14 @@ from daita.routines.models import (
     text_digest,
 )
 from daita.routines.schedule import occurrence_id, scheduled_slot_key
+from daita.semantics import (
+    ResourceRevisionBinding,
+    SemanticAnnotation,
+    SemanticEvidence,
+    SemanticEvidenceKind,
+    SemanticKind,
+    SemanticSubject,
+)
 from daita.storage.home_migrations import (
     CURRENT_HOME_REVISION,
     HOME_MIGRATIONS,
@@ -46,6 +54,7 @@ from daita.storage.sqlite_codecs import (
     decode_catalog_source_state,
     decode_search_postings,
     encode_catalog_snapshot,
+    encode_semantic_annotation,
 )
 from daita.storage.sqlite_schema import CURRENT_SCHEMA
 from tests.storage._routine_history import released_occurrence, released_routine
@@ -228,6 +237,31 @@ async def test_released_revision_3_home_upgrades_and_keeps_declared_links(
     assert len(tuple((tmp_path / "agents/golden/.home-rollbacks").iterdir())) == 1
 
 
+def _note(resource_id: str) -> str:
+    """A real note bound to an older revision than the catalog's, which stays as is."""
+
+    return encode_semantic_annotation(
+        SemanticAnnotation(
+            id="annotation",
+            agent_id="agent-catalog",
+            subject=SemanticSubject(
+                source_ids=("source:shop",), resource_ids=(resource_id,)
+            ),
+            kind=SemanticKind.METRIC_DEFINITION,
+            statement="Totals are in cents.",
+            evidence=(
+                SemanticEvidence(
+                    SemanticEvidenceKind.USER_ASSERTION, "run-seed", message_position=0
+                ),
+            ),
+            catalog_revisions=(ResourceRevisionBinding(resource_id, "older"),),
+            created_at=datetime(2026, 11, 2, tzinfo=UTC),
+            confirmed_at=datetime(2026, 11, 2, tzinfo=UTC),
+            confirmed_by="local-user",
+        )
+    )
+
+
 @pytest.mark.parametrize("source_revision", (1, 2, 3))
 def test_an_upgrade_keeps_every_cataloged_resource_and_what_refers_to_it(
     tmp_path: Path,
@@ -261,7 +295,7 @@ def test_an_upgrade_keeps_every_cataloged_resource_and_what_refers_to_it(
         )
         connection.execute(
             "INSERT INTO semantic_annotations VALUES (?, ?, ?)",
-            (*references["semantic_annotations"][:2], json.dumps(references)),
+            (*references["semantic_annotations"][:2], _note(shop.resources[0].id)),
         )
         connection.execute(
             "INSERT INTO source_read_scopes VALUES (?, ?, ?)",

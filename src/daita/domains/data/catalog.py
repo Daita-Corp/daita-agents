@@ -1161,6 +1161,7 @@ class CatalogDataView:
             and entry.resource.source_id in registrations
         }
         fields_by_id: dict[str, tuple[str, ...]] = {}
+        types_by_id: dict[str, tuple[tuple[str, str], ...]] = {}
         for source_id in sorted({item.source_id for item in resources.values()}):
             for schema in await self.resource_schemas(
                 agent_id,
@@ -1172,12 +1173,14 @@ class CatalogDataView:
                 ),
             ):
                 fields_by_id[schema.resource_id] = schema.columns
+                types_by_id[schema.resource_id] = schema.column_declared_types
         return tuple(
             SemanticResourceFact(
                 resource_id=resource.id,
                 source_id=resource.source_id,
                 revision=resource.current_revision,
                 field_names=fields_by_id.get(resource.id, ()),
+                field_types=types_by_id.get(resource.id, ()),
             )
             for resource in sorted(resources.values(), key=lambda item: item.id)
         )
