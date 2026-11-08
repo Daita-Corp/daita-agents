@@ -1605,6 +1605,8 @@ class SemanticDomainCatalog(Protocol):
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
+        resource_ids: tuple[str, ...] | None = None,
+        first: int | None = None,
     ) -> frozenset[str]: ...
 
     @property
@@ -1666,7 +1668,9 @@ class SemanticCapabilityDomain:
         known = scope.resource_ids
         if scope.unrestricted_source_ids:
             known |= await self._catalog.readable_resource_ids(
-                run.agent_id, tuple(sorted(scope.unrestricted_source_ids))
+                run.agent_id,
+                tuple(sorted(scope.unrestricted_source_ids)),
+                first=2_048,
             )
         if not known:
             return
@@ -2340,6 +2344,7 @@ class SemanticCapabilityDomain:
             readable = await self._catalog.readable_resource_ids(
                 run.agent_id,
                 ((source_id,) if isinstance(source_id, str) else ()),
+                requested,
             )
         except SourcePermissionStateError as error:
             raise CapabilityInputError(

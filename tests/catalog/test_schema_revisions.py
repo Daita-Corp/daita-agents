@@ -13,12 +13,11 @@ from tests.catalog._schema_support import (
     _mapping_sequence,
     _path_name_signatures,
     _schema,
+    _shift_generation,
     canonical_json,
-    catalog_service,
     pytest,
     replace,
     sqlite3,
-    sqlite_store,
     workspace_for,
 )
 
@@ -114,42 +113,8 @@ async def test_connected_schema_refresh_removes_stale_join_paths(tmp_path: Path)
         await agent.close()
 
 
-async def test_connected_schema_reuses_one_compilation_per_exact_generation(
+async def test_schema_slice_reopens_with_an_identical_payload(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    database = tmp_path / "schema-compilation.sqlite"
-    _fixture_database(database)
-    agent = await Agent.create(
-        "catalog-schema-compilation", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
-    try:
-        source = await agent.attach(SQLiteSource(database))
-        resources = {
-            resource.name: resource
-            for resource in await agent.list_catalog_resources(source_id=source.id)
-        }
-        original_compile = catalog_service._compile_source_index
-        compile_count = 0
-
-        def counting_compile(snapshot):
-            nonlocal compile_count
-            compile_count += 1
-            return original_compile(snapshot)
-
-        monkeypatch.setattr(catalog_service, "_compile_source_index", counting_compile)
-        request_ids = (resources["customers"].id, resources["products"].id)
-        first = await _schema(agent, resource_ids=request_ids, limit=5)
-        second = await _schema(agent, resource_ids=request_ids, limit=5)
-        assert first == second
-        assert compile_count == 1
-    finally:
-        await agent.close()
-
-
-async def test_schema_slice_reopens_with_one_decode_and_identical_payload(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     database = tmp_path / "coherent-reopen.sqlite"
     _fixture_database(database)
@@ -164,33 +129,21 @@ async def test_schema_slice_reopens_with_one_decode_and_identical_payload(
     expected = canonical_json(await _schema(agent, resource_ids=resource_ids))
     await agent.close()
 
-    original_decode = sqlite_store.decode_catalog_snapshot
-    decode_count = 0
-
-    def counting_decode(value: str):
-        nonlocal decode_count
-        decode_count += 1
-        return original_decode(value)
-
-    monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", counting_decode)
     reopened = await Agent.open(
         "catalog-schema-coherent-reopen",
         root=tmp_path,
         workspace=workspace_for(tmp_path),
     )
     try:
-        assert decode_count == 1
-        decode_count = 0
         first = await _schema(reopened, resource_ids=resource_ids)
         second = await _schema(reopened, resource_ids=resource_ids)
         assert canonical_json(first) == expected
         assert canonical_json(second) == expected
-        assert decode_count == 1
     finally:
         await reopened.close()
 
 
-async def test_schema_slice_retries_a_generation_conflict_only_once(
+async def test_schema_slice_retries_a_generation_change_only_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -204,21 +157,16 @@ async def test_schema_slice_retries_a_generation_conflict_only_once(
     try:
         source = await agent.attach(SQLiteSource(database))
         resource = (await agent.list_catalog_resources(source_id=source.id))[0]
-        store = agent._embedded._store
-        load_count = 0
+        expected = await _schema(agent, resource_ids=(resource.id,))
+        _shift_generation(monkeypatch, agent._embedded._store, reads=1)
+        assert await _schema(agent, resource_ids=(resource.id,)) == expected
 
-        async def changing_generation(ref):
-            nonlocal load_count
-            load_count += 1
-            return None
-
-        monkeypatch.setattr(store, "load_current_snapshot", changing_generation)
+        _shift_generation(monkeypatch, agent._embedded._store)
         with pytest.raises(
             CatalogStoreError,
             match="generation changed repeatedly",
         ):
             await _schema(agent, resource_ids=(resource.id,))
-        assert load_count == 2
     finally:
         await agent.close()
 
@@ -239,11 +187,10 @@ async def test_catalog_boundary_rejects_tabular_facet_revision_mismatch(
         source = await agent.attach(SQLiteSource(database))
         store = agent._embedded._store
         service = agent._embedded._catalog_service
-        refs = await store.list_current_snapshot_refs(agent.id, (source.id,))
-        assert len(refs) == 1
-        snapshot = await store.load_current_snapshot(refs[0])
-        assert snapshot is not None
-        facet = next(item for item in snapshot.facets if item.kind.value == "tabular")
+        entries = await store.list_entries(agent.id, source.id)
+        assert len(entries) == 1
+        entry = entries[0]
+        facet = next(item for item in entry.facets if item.kind.value == "tabular")
         decoded = TabularFacet.from_payload(facet.payload)
         changed_column = replace(decoded.columns[0], native_type="changed_type")
         changed_facet = TabularFacet(
@@ -252,27 +199,25 @@ async def test_catalog_boundary_rejects_tabular_facet_revision_mismatch(
             row_count_estimate=decoded.row_count_estimate,
         )
         mismatched_facet = replace(facet, payload=changed_facet.to_payload())
-        mismatched_snapshot = replace(
-            snapshot,
+        mismatched = replace(
+            entry,
             facets=tuple(
-                mismatched_facet if item is facet else item for item in snapshot.facets
+                mismatched_facet if item is facet else item for item in entry.facets
             ),
         )
 
-        async def load_mismatched(_ref):
-            return mismatched_snapshot
+        async def list_mismatched(_agent_id, _source_id):
+            return (mismatched,)
 
-        service._source_indexes.clear()
-        monkeypatch.setattr(store, "load_current_snapshot", load_mismatched)
+        monkeypatch.setattr(store, "list_entries", list_mismatched)
         with pytest.raises(CatalogStoreError, match="revision does not match"):
             await service.tabular_resources(agent.id, source.id)
     finally:
         await agent.close()
 
 
-async def test_validation_schema_reopen_decodes_and_compiles_once(
+async def test_validation_schemas_survive_reopen(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ):
     database = tmp_path / "validation-reopen.sqlite"
     _fixture_database(database)
@@ -282,65 +227,18 @@ async def test_validation_schema_reopen_decodes_and_compiles_once(
     source = await agent.attach(SQLiteSource(database))
     agent_id = agent.id
     source_id = source.id
+    expected = await agent._embedded._data_view.resource_schemas(agent_id, source_id)
     await agent.close()
 
-    original_decode = sqlite_store.decode_catalog_snapshot
-    original_compile = catalog_service._compile_source_index
-    decode_count = 0
-    compile_count = 0
-
-    def counting_decode(value: str):
-        nonlocal decode_count
-        decode_count += 1
-        return original_decode(value)
-
-    def counting_compile(snapshot):
-        nonlocal compile_count
-        compile_count += 1
-        return original_compile(snapshot)
-
-    monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", counting_decode)
-    monkeypatch.setattr(catalog_service, "_compile_source_index", counting_compile)
     reopened = await Agent.open(
         "catalog-validation-reopen", root=tmp_path, workspace=workspace_for(tmp_path)
     )
     try:
-        assert decode_count == 1
-        decode_count = 0
-        store = reopened._embedded._store
-        snapshot_read_count = 0
-        original_snapshot = store.load_current_snapshot
-
-        async def counting_snapshot(ref):
-            nonlocal snapshot_read_count
-            snapshot_read_count += 1
-            return await original_snapshot(ref)
-
-        async def legacy_read(*args, **kwargs):
-            pytest.fail("validation schemas performed a superseded store read")
-
-        monkeypatch.setattr(store, "load_current_snapshot", counting_snapshot)
-        for method_name in (
-            "list_resources",
-            "load_resource",
-            "load_revision",
-            "load_facets",
-            "load_sync",
-        ):
-            monkeypatch.setattr(store, method_name, legacy_read)
-
-        first = await reopened._embedded._data_view.resource_schemas(
-            agent_id,
-            source_id,
+        assert expected
+        assert (
+            await reopened._embedded._data_view.resource_schemas(agent_id, source_id)
+            == expected
         )
-        second = await reopened._embedded._data_view.resource_schemas(
-            agent_id,
-            source_id,
-        )
-        assert first == second
-        assert decode_count == 1
-        assert compile_count == 1
-        assert snapshot_read_count == 1
     finally:
         await reopened.close()
 
@@ -423,15 +321,11 @@ async def test_validation_schema_refresh_replaces_all_current_structural_facts(
         assert new_schemas["current_table"].source_revision == (
             new_current.sync.source_revision
         )
-        assert all(
-            key != (agent.id, source.id, old_current.sync.id)
-            for key in service._source_indexes
-        )
     finally:
         await agent.close()
 
 
-async def test_validation_projection_retries_one_generation_conflict(
+async def test_validation_projection_retries_one_generation_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -444,29 +338,17 @@ async def test_validation_projection_retries_one_generation_conflict(
     )
     try:
         source = await agent.attach(SQLiteSource(database))
-        store = agent._embedded._store
-        original_snapshot = store.load_current_snapshot
-        load_count = 0
-
-        async def one_conflict(ref):
-            nonlocal load_count
-            load_count += 1
-            if load_count == 1:
-                return None
-            return await original_snapshot(ref)
-
-        monkeypatch.setattr(store, "load_current_snapshot", one_conflict)
+        _shift_generation(monkeypatch, agent._embedded._store, reads=1)
         facts = await agent._embedded._catalog_service.tabular_resources(
             agent.id,
             source.id,
         )
         assert facts
-        assert load_count == 2
     finally:
         await agent.close()
 
 
-async def test_validation_projection_reports_repeated_generation_conflict(
+async def test_validation_projection_reports_repeated_generation_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -479,15 +361,7 @@ async def test_validation_projection_reports_repeated_generation_conflict(
     )
     try:
         source = await agent.attach(SQLiteSource(database))
-        store = agent._embedded._store
-        load_count = 0
-
-        async def changing_generation(ref):
-            nonlocal load_count
-            load_count += 1
-            return None
-
-        monkeypatch.setattr(store, "load_current_snapshot", changing_generation)
+        _shift_generation(monkeypatch, agent._embedded._store)
         with pytest.raises(
             CatalogStoreError,
             match="generation changed repeatedly",
@@ -496,6 +370,5 @@ async def test_validation_projection_reports_repeated_generation_conflict(
                 agent.id,
                 source.id,
             )
-        assert load_count == 2
     finally:
         await agent.close()

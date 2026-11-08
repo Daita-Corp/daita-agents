@@ -1,6 +1,5 @@
 import asyncio
 import sqlite3
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +13,9 @@ from daita import (
     PostgreSQLSource,
     SQLiteSource,
 )
-from daita.adapters.models import DiscoveryResult, SourceRegistration
+from daita.adapters.models import SourceRegistration
 from daita.adapters.sqlite import SQLiteResourceAdapter
-from daita.catalog.models import CatalogSync, CatalogSyncStatus, SourceCatalogSnapshot
+from daita.catalog.models import CatalogTier, ResourceBatch
 from daita.hosting import embedded as embedded_module
 from daita.hosting.embedded import AgentHomeError, HostActiveError
 from daita.hosting.execution_governor import PermitKind, WorkloadClass
@@ -414,14 +413,15 @@ async def test_a_refresh_stuck_in_discovery_blocks_neither_work_nor_close(
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE invoices (id INTEGER)")
     entered = asyncio.Event()
-    original = SQLiteResourceAdapter.discover
+    original = SQLiteResourceAdapter.reconcile
 
     async def stuck(self, request):
         entered.set()
         await asyncio.Event().wait()
-        return await original(self, request)
+        async for batch in original(self, request):
+            yield batch
 
-    monkeypatch.setattr(SQLiteResourceAdapter, "discover", stuck)
+    monkeypatch.setattr(SQLiteResourceAdapter, "reconcile", stuck)
 
     run = await asyncio.wait_for(agent.run("Look at invoices."), timeout=5)
     (_, describe), (_, read) = await agent.tool_evidence(run.run_id)
@@ -471,8 +471,9 @@ async def test_a_connection_check_answers_while_a_discovery_is_stuck(
     async def stuck(self, request):
         entered.set()
         await asyncio.Event().wait()
+        yield  # pragma: no cover - makes this an async generator
 
-    monkeypatch.setattr(SQLiteResourceAdapter, "discover", stuck)
+    monkeypatch.setattr(SQLiteResourceAdapter, "reconcile", stuck)
     agent._embedded.request_source_refresh(source.id)
     await asyncio.wait_for(entered.wait(), timeout=5)
 
@@ -594,22 +595,11 @@ async def test_a_refresh_for_qualified_names_rereads_only_their_schemas(
         def __init__(self, registration):
             self.registration = registration
 
-        async def discover(self, request):
-            now = datetime.now(UTC)
-            sync = CatalogSync(
-                id=request.sync_id,
-                agent_id=request.agent_id,
-                source_id=request.source_id,
-                adapter_id="postgresql",
-                status=CatalogSyncStatus.SUCCEEDED,
-                started_at=request.requested_at,
-                completed_at=now,
+        async def reconcile(self, request):
+            yield ResourceBatch(
+                tier=CatalogTier.DETAIL,
+                entries=(),
                 source_revision="catalog:sha256:" + "3" * 64,
-            )
-            return DiscoveryResult(
-                request=request,
-                snapshot=SourceCatalogSnapshot(sync=sync, resources=(), revisions=()),
-                completed_at=now,
             )
 
         async def inspect(self, resource):
@@ -646,7 +636,7 @@ async def test_a_refresh_for_qualified_names_rereads_only_their_schemas(
         requested = []
 
         async def record(opened, **keywords):
-            requested.append((keywords["refresh_schemas"], keywords["previous"]))
+            requested.append((keywords["scopes"], keywords["previous"]))
             return keywords["persisted_registration"]
 
         monkeypatch.setattr(agent._embedded, "_attach_source_locked", record)
@@ -665,7 +655,7 @@ async def test_a_refresh_for_qualified_names_rereads_only_their_schemas(
         schemas = [item[0] for item in requested]
         assert schemas == [("sales",), ("sales", "public"), (), (), (), ()]
         previous = [item[1] for item in requested]
-        assert all(item.sync.source_id == source.id for item in previous[:2])
+        assert previous[:2] == [(), ()]
         assert previous[2:] == [None] * 4
     finally:
         await agent.close()
@@ -754,22 +744,11 @@ async def test_postgresql_capacity_policy_applies_on_attach_and_reopen(tmp_path)
         def __init__(self, registration):
             self.registration = registration
 
-        async def discover(self, request):
-            now = datetime.now(UTC)
-            sync = CatalogSync(
-                id=request.sync_id,
-                agent_id=request.agent_id,
-                source_id=request.source_id,
-                adapter_id="postgresql",
-                status=CatalogSyncStatus.SUCCEEDED,
-                started_at=request.requested_at,
-                completed_at=now,
+        async def reconcile(self, request):
+            yield ResourceBatch(
+                tier=CatalogTier.DETAIL,
+                entries=(),
                 source_revision="catalog:sha256:" + "3" * 64,
-            )
-            return DiscoveryResult(
-                request=request,
-                snapshot=SourceCatalogSnapshot(sync=sync, resources=(), revisions=()),
-                completed_at=now,
             )
 
         async def inspect(self, resource):
@@ -893,3 +872,34 @@ async def test_pool_backend_construction_owns_no_unclosed_resources(
         "recovered-pool", root=tmp_path, workspace=workspace_for(tmp_path)
     )
     await agent.close()
+
+
+async def test_a_pass_that_fails_after_its_inventory_removes_and_changes_nothing(
+    tmp_path, monkeypatch
+):
+    database = tmp_path / "shop.sqlite"
+    _sqlite_database(database)
+    agent = await Agent.create(
+        "failed-pass", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    source = await agent.attach(SQLiteSource(database, name="Shop"))
+    store = agent._embedded._store
+    before = await store.list_entries(agent.id, source.id)
+    assert before
+
+    original = SQLiteResourceAdapter.reconcile
+
+    async def fails_after_inventory(self, request):
+        async for batch in original(self, request):
+            yield batch
+            raise RuntimeError("the source went away")
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE records")
+    monkeypatch.setattr(SQLiteResourceAdapter, "reconcile", fails_after_inventory)
+    try:
+        with pytest.raises(RuntimeError):
+            await agent.refresh_source(source.id)
+        assert await store.list_entries(agent.id, source.id) == before
+    finally:
+        await agent.close()

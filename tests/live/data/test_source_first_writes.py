@@ -1034,7 +1034,13 @@ async def test_a_wiped_catalog_still_writes(
     writes: _Writes, admin: Any, tmp_path: Path
 ) -> None:
     with sqlite3.connect(next(tmp_path.rglob("state.db"))) as connection:
-        connection.execute("DELETE FROM snapshots")
+        for table in (
+            "catalog_search",
+            "catalog_relationships",
+            "catalog_resources",
+            "catalog_source_state",
+        ):
+            connection.execute(f"DELETE FROM {table}")
     data = _data(await writes.call("UPDATE shop.items SET name = 'z' WHERE id = 1"))
     assert data["outcome"] == "committed"
     assert await admin.fetchval("SELECT name FROM shop.items WHERE id = 1") == "z"
@@ -1049,8 +1055,8 @@ async def test_writes_succeed_with_the_catalog_store_failing(
     store = writes.agent._embedded._store
     for name in (
         "list_resources",
-        "load_current_snapshot",
-        "list_current_snapshot_refs",
+        "load_entries",
+        "search_catalog",
     ):
         if hasattr(type(store), name):
             monkeypatch.setattr(type(store), name, failing)

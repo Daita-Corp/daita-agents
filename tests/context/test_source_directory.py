@@ -16,10 +16,9 @@ from daita.llm.models import (
     ToolCall,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_codecs import (
-    decode_catalog_snapshot,
-    encode_catalog_snapshot,
+    decode_catalog_sync,
+    encode_catalog_sync,
 )
 from tests.support.workspace import workspace_for
 
@@ -101,14 +100,15 @@ async def test_a_truncated_catalog_says_the_directory_is_only_part_of_the_source
     agent, provider = await _agent(tmp_path, _stop())
     try:
         with sqlite3.connect(agent.home / "state.db") as connection:
-            ((data,),) = connection.execute("SELECT data FROM snapshots")
-            snapshot = decode_catalog_snapshot(data)
-            truncated = replace(snapshot, sync=replace(snapshot.sync, truncated=True))
-            connection.execute(
-                "UPDATE snapshots SET data = ?", (encode_catalog_snapshot(truncated),)
+            ((data,),) = connection.execute(
+                "SELECT y.data FROM syncs AS y JOIN catalog_source_state AS s "
+                "ON y.agent_id = s.agent_id AND y.source_id = s.source_id"
             )
-        assert isinstance(agent._embedded._store, SQLiteStateStore)
-        agent._embedded._store._decoded_catalog_snapshots.clear()
+            sync = decode_catalog_sync(data)
+            connection.execute(
+                "UPDATE syncs SET data = ? WHERE id = ?",
+                (encode_catalog_sync(replace(sync, truncated=True)), sync.id),
+            )
         await agent.run("Hello.")
     finally:
         await agent.close()

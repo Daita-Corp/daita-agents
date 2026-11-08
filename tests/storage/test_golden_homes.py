@@ -7,6 +7,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -15,8 +16,11 @@ import pytest
 
 from daita import Agent, SQLiteSource
 from daita.catalog import CatalogLinkStaleReason
+from daita.catalog.models import CatalogSourceState
+from daita.catalog.search_text import search_key, search_postings, search_words
 from daita.distribution import OutcomeState
 from daita.errors import StateCompatibilityError
+from daita.hosting.home_upgrade import upgrade_agent_home
 from daita.llm.models import FinishReason, ModelResponse, ModelUsage, TextBlock
 from daita.llm.pricing import CostEstimate
 from daita.llm.providers.mock import MockModelProvider
@@ -35,7 +39,22 @@ from daita.storage.home_migrations import (
     HOME_MIGRATIONS,
     MINIMUM_SUPPORTED_HOME_REVISION,
 )
+from daita.storage.schema_contract import require_healthy, require_schema
+from daita.storage.sqlite_codecs import (
+    decode_catalog_entry,
+    decode_catalog_relationship,
+    decode_catalog_source_state,
+    decode_search_postings,
+    encode_catalog_snapshot,
+)
+from daita.storage.sqlite_schema import CURRENT_SCHEMA
 from tests.storage._routine_history import released_occurrence, released_routine
+from tests.support.catalog_records import (
+    SHOP,
+    SHOP_REFERENCES,
+    entries,
+    snapshot as catalog_snapshot,
+)
 from tests.support.paths import REPO_ROOT
 from tests.support.workspace import workspace_for
 
@@ -207,6 +226,118 @@ async def test_released_revision_3_home_upgrades_and_keeps_declared_links(
     finally:
         await reopened.close()
     assert len(tuple((tmp_path / "agents/golden/.home-rollbacks").iterdir())) == 1
+
+
+@pytest.mark.parametrize("source_revision", (1, 2, 3))
+def test_an_upgrade_keeps_every_cataloged_resource_and_what_refers_to_it(
+    tmp_path: Path,
+    source_revision: int,
+) -> None:
+    home = tmp_path / "agents/golden"
+    _materialize_fixture(FIXTURES / f"revision-{source_revision}", home)
+    shop = catalog_snapshot(
+        "agent-catalog", "source:shop", "sync-shop", SHOP, SHOP_REFERENCES
+    )
+    stored = json.loads(encode_catalog_snapshot(shop))
+    # Released syncs predate the truncation flag.
+    del stored["fields"]["sync"]["fields"]["truncated"]
+    references = {
+        "semantic_annotations": ("agent-catalog", "annotation", shop.resources[0].id),
+        "source_read_scopes": ("agent-catalog", "source:shop", shop.resources[1].id),
+    }
+    with closing(sqlite3.connect(home / "state.db")) as connection:
+        connection.execute(
+            "INSERT INTO snapshots (agent_id, source_id, sync_id, data) "
+            "VALUES (?, ?, ?, ?)",
+            ("agent-catalog", "source:shop", "sync-shop", json.dumps(stored)),
+        )
+        connection.execute(
+            "INSERT INTO sources VALUES (?, ?, ?)",
+            (
+                "agent-catalog",
+                "source:shop",
+                '{"__record__":"SourceRegistration","fields":{"adapter_id":"memory"}}',
+            ),
+        )
+        connection.execute(
+            "INSERT INTO semantic_annotations VALUES (?, ?, ?)",
+            (*references["semantic_annotations"][:2], json.dumps(references)),
+        )
+        connection.execute(
+            "INSERT INTO source_read_scopes VALUES (?, ?, ?)",
+            (*references["source_read_scopes"][:2], json.dumps(references)),
+        )
+        connection.commit()
+        scopes_before = connection.execute(
+            "SELECT * FROM source_read_scopes UNION ALL "
+            "SELECT * FROM semantic_annotations"
+        ).fetchall()
+
+    def validate(source: Path, candidate: Path, affected: frozenset[str]) -> None:
+        with sqlite3.connect(candidate / "state.db") as connection:
+            require_schema(connection, CURRENT_SCHEMA)
+            require_healthy(connection)
+
+    upgrade_agent_home(home, validate_home=validate)
+
+    with closing(sqlite3.connect(home / "state.db")) as connection:
+        assert not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'snapshots'"
+        ).fetchone()
+        resources = {
+            row[0]: row[1:]
+            for row in connection.execute(
+                "SELECT id, revision, detail, source_object_id, last_seen_sync, data "
+                "FROM catalog_resources WHERE agent_id = 'agent-catalog'"
+            )
+        }
+        assert {key: value[0] for key, value in resources.items()} == {
+            item.resource.id: item.resource.current_revision for item in entries(shop)
+        }
+        for item in entries(shop):
+            revision, detail, object_id, seen, data = resources[item.resource.id]
+            assert (detail, object_id, seen) == ("complete", None, "sync-shop")
+            assert decode_catalog_entry(data) == item
+        assert {
+            row[0]: decode_catalog_relationship(row[1])
+            for row in connection.execute("SELECT id, data FROM catalog_relationships")
+        } == {item.id: item for item in shop.relationships}
+        (state,) = connection.execute(
+            "SELECT data FROM catalog_source_state WHERE source_id = 'source:shop'"
+        )
+        assert decode_catalog_source_state(state[0]) == CatalogSourceState(
+            agent_id="agent-catalog",
+            source_id="source:shop",
+            current_sync_id="sync-shop",
+        )
+        assert connection.execute(
+            "SELECT count(*) FROM catalog_changes"
+        ).fetchone() == (0,)
+        searchable = {
+            row[0]: (row[1], row[2], decode_search_postings(row[3]))
+            for row in connection.execute(
+                "SELECT resource_id, name_key, words, data FROM catalog_search"
+            )
+        }
+        for item in entries(shop):
+            incident = [
+                link
+                for link in shop.relationships
+                if item.resource.id in (link.from_resource_id, link.to_resource_id)
+            ]
+            postings = search_postings(item, incident)
+            assert searchable[item.resource.id] == (
+                search_key(item.resource.name),
+                search_words(postings),
+                postings,
+            )
+        assert (
+            connection.execute(
+                "SELECT * FROM source_read_scopes UNION ALL "
+                "SELECT * FROM semantic_annotations"
+            ).fetchall()
+            == scopes_before
+        )
 
 
 async def test_revision_4_golden_home_retains_its_declared_link(

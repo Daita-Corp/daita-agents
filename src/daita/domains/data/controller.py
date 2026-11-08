@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from difflib import get_close_matches
 from hashlib import sha256
 from typing import Protocol, cast
 
@@ -178,7 +177,18 @@ class CatalogSchemaReader(Protocol):
         self,
         agent_id: str,
         source_id: str,
+        resource_ids: tuple[str, ...] | None = None,
     ) -> tuple[ResourceSchema, ...]: ...
+
+    async def close_table_names(
+        self,
+        agent_id: str,
+        source_id: str,
+        relations: Sequence[str],
+        *,
+        count: int,
+        cutoff: float,
+    ) -> tuple[str, ...]: ...
 
 
 class ReadScopedCatalogReader(CatalogSchemaReader, Protocol):
@@ -186,6 +196,7 @@ class ReadScopedCatalogReader(CatalogSchemaReader, Protocol):
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
+        resource_ids: tuple[str, ...] | None = None,
     ) -> frozenset[str]: ...
 
 
@@ -284,6 +295,7 @@ class DataCapabilityDomain:
         for method_name in (
             "source_routing_facts",
             "resource_schemas",
+            "close_table_names",
             "readable_resource_ids",
             "source_adapter_id",
         ):
@@ -805,6 +817,7 @@ class DataCapabilityDomain:
             readable = await self._catalog.readable_resource_ids(
                 run.agent_id,
                 source_ids,
+                requested,
             )
         except SourcePermissionStateError as error:
             raise CapabilityInputError(
@@ -1023,31 +1036,17 @@ class DataCapabilityDomain:
 
         relations = [cast(str, item.details["relation"]) for item in issues]
         try:
-            resources = await self._catalog.resource_schemas(run.agent_id, source_id)
-            readable = await self._catalog.readable_resource_ids(
-                run.agent_id, (source_id,)
+            did_you_mean = await self._catalog.close_table_names(
+                run.agent_id, source_id, relations, count=4, cutoff=0.45
             )
         except (CatalogStoreError, SourcePermissionStateError):
-            resources, readable = (), frozenset()
-        names = [
-            next((alias for alias in item.aliases if "." in alias), item.name)
-            for item in resources
-            if item.resource_id in readable
-        ]
+            did_you_mean = ()
         return CapabilityInputError(
             "resource_read_not_allowed",
             " ".join(item.message for item in issues),
             {
                 "tables": tuple(relations),
-                "did_you_mean": tuple(
-                    dict.fromkeys(
-                        match
-                        for relation in relations
-                        for match in get_close_matches(
-                            relation, names, n=4, cutoff=0.45
-                        )
-                    )
-                ),
+                "did_you_mean": did_you_mean,
             },
             recovery=_COPY_CATALOG_IDS,
         )
@@ -1246,7 +1245,9 @@ class DataCapabilityDomain:
             ) from error
         name = sent_name
         try:
-            for schema in await self._catalog.resource_schemas(run.agent_id, source_id):
+            for schema in await self._catalog.resource_schemas(
+                run.agent_id, source_id, (resource_id,)
+            ):
                 if schema.resource_id == resource_id:
                     name = schema.name
         except CatalogStoreError:

@@ -39,6 +39,7 @@ from daita.storage.sqlite_records import (
     SourceReadScope,
     relational_write_authorization_fingerprint,
 )
+from tests.support.catalog_records import batches
 from tests.support.relational_writes import update_scope
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
@@ -207,7 +208,9 @@ async def test_model_sensitivity_follows_the_source_and_a_stale_scope_id_never_m
         sync_id="sync-labelled",
         sensitivity=resource_label,
     )
-    await store.commit_snapshot(snapshot, registration=registration)
+    await store.commit_catalog(
+        snapshot.sync, batches(snapshot), registration=registration
+    )
     view = CatalogDataView(
         store, CatalogService(store, store), store, SourceTypeRegistry()
     )
@@ -260,7 +263,7 @@ async def test_attach_refresh_detach_and_reopen_preserve_narrow_scopes(
     store = await SQLiteStateStore.open(path)
     registration = _registration()
     first, resource, facet = _snapshot(registration, sync_id="sync-first")
-    await store.commit_snapshot(first, registration=registration)
+    await store.commit_catalog(first.sync, batches(first), registration=registration)
 
     assert await store.load_source_read_scope(
         registration.agent_id, registration.id
@@ -283,7 +286,7 @@ async def test_attach_refresh_detach_and_reopen_preserve_narrow_scopes(
         row_count_estimate=999,
         sensitivity=Sensitivity.CONFIDENTIAL,
     )
-    await store.commit_snapshot(second, registration=registration)
+    await store.commit_catalog(second.sync, batches(second), registration=registration)
     assert (
         await store.load_source_read_scope(registration.agent_id, registration.id)
         == selected
@@ -337,7 +340,9 @@ async def test_source_edit_atomically_hands_off_catalog_and_scopes(
         current,
         sync_id="sync-current",
     )
-    await store.commit_snapshot(current_snapshot, registration=current)
+    await store.commit_catalog(
+        current_snapshot.sync, batches(current_snapshot), registration=current
+    )
     await store.replace_source_permission_scopes(
         SourceReadScope(
             agent_id=current.agent_id,
@@ -360,7 +365,8 @@ async def test_source_edit_atomically_hands_off_catalog_and_scopes(
     )
 
     await store.commit_source_edit(
-        edited_snapshot,
+        edited_snapshot.sync,
+        batches(edited_snapshot),
         registration=edited,
         replaced_source_id=current.id,
         replaced_at=NOW + timedelta(minutes=1),
@@ -376,8 +382,8 @@ async def test_source_edit_atomically_hands_off_catalog_and_scopes(
         edited_read_scope
     )
     assert await store.list_relational_write_scopes(edited.agent_id, edited.id) == ()
-    refs = await store.list_current_snapshot_refs(edited.agent_id, (edited.id,))
-    assert len(refs) == 1 and refs[0].sync_id == "sync-edited"
+    syncs = await store.current_syncs(edited.agent_id, (edited.id,))
+    assert len(syncs) == 1 and syncs[0].id == "sync-edited"
     await store.close()
 
 
@@ -390,7 +396,9 @@ async def test_same_identity_source_edit_updates_connection_and_clears_updates(
         current,
         sync_id="sync-current",
     )
-    await store.commit_snapshot(current_snapshot, registration=current)
+    await store.commit_catalog(
+        current_snapshot.sync, batches(current_snapshot), registration=current
+    )
     await store.replace_source_permission_scopes(
         SourceReadScope.allow_all(agent_id=current.agent_id, source_id=current.id),
         (_scope(current, resource, facet),),
@@ -411,7 +419,8 @@ async def test_same_identity_source_edit_updates_connection_and_clears_updates(
     )
 
     await store.commit_source_edit(
-        edited_snapshot,
+        edited_snapshot.sync,
+        batches(edited_snapshot),
         registration=edited,
         replaced_source_id=current.id,
         replaced_at=NOW + timedelta(minutes=2),
@@ -433,7 +442,9 @@ async def test_missing_corrupt_or_foreign_read_scope_fails_closed(
     store = await SQLiteStateStore.open(path)
     registration = _registration(f"agent-{damage}")
     snapshot, _, _ = _snapshot(registration, sync_id=f"sync-{damage}")
-    await store.commit_snapshot(snapshot, registration=registration)
+    await store.commit_catalog(
+        snapshot.sync, batches(snapshot), registration=registration
+    )
     foreign_resource_id = "catalog-resource:sha256:" + "f" * 64
     if damage == "foreign":
         foreign = _registration(
@@ -444,7 +455,9 @@ async def test_missing_corrupt_or_foreign_read_scope_fails_closed(
             foreign,
             sync_id="sync-foreign-source",
         )
-        await store.commit_snapshot(foreign_snapshot, registration=foreign)
+        await store.commit_catalog(
+            foreign_snapshot.sync, batches(foreign_snapshot), registration=foreign
+        )
         foreign_resource_id = foreign_resource.id
     with sqlite3.connect(path) as connection:
         if damage == "missing":
@@ -523,7 +536,9 @@ async def test_invalid_scope_replacement_rolls_back_both_families(
     store = await SQLiteStateStore.open(path)
     registration = _registration()
     snapshot, resource, facet = _snapshot(registration, sync_id="sync-rollback")
-    await store.commit_snapshot(snapshot, registration=registration)
+    await store.commit_catalog(
+        snapshot.sync, batches(snapshot), registration=registration
+    )
     selected = SourceReadScope(
         agent_id=registration.agent_id,
         source_id=registration.id,
@@ -560,7 +575,9 @@ async def test_cancel_before_scope_transaction_start_changes_nothing(
     store = await SQLiteStateStore.open(path)
     registration = _registration()
     snapshot, resource, facet = _snapshot(registration, sync_id="sync-cancel")
-    await store.commit_snapshot(snapshot, registration=registration)
+    await store.commit_catalog(
+        snapshot.sync, batches(snapshot), registration=registration
+    )
     original = await store.load_source_read_scope(
         registration.agent_id, registration.id
     )
@@ -609,7 +626,9 @@ async def test_cancel_before_source_edit_transaction_keeps_current_connection(
     store = await SQLiteStateStore.open(tmp_path / "state.db")
     current = _registration(native_identity="postgresql:current")
     current_snapshot, _, _ = _snapshot(current, sync_id="sync-current")
-    await store.commit_snapshot(current_snapshot, registration=current)
+    await store.commit_catalog(
+        current_snapshot.sync, batches(current_snapshot), registration=current
+    )
     edited = _registration(native_identity="postgresql:edited")
     edited_snapshot, _, _ = _snapshot(edited, sync_id="sync-edited")
     entered = threading.Event()
@@ -624,7 +643,8 @@ async def test_cancel_before_source_edit_transaction_keeps_current_connection(
     monkeypatch.setattr(sqlite_module, "_CatalogCommitGate", _ControlledGate)
     task = asyncio.create_task(
         store.commit_source_edit(
-            edited_snapshot,
+            edited_snapshot.sync,
+            batches(edited_snapshot),
             registration=edited,
             replaced_source_id=current.id,
             replaced_at=NOW + timedelta(minutes=1),

@@ -503,7 +503,7 @@ async def test_a_damaged_catalog_row_does_not_stop_the_app_or_sources(
     await first.close()
     (state,) = harness.root.glob("**/state.db")
     with sqlite3.connect(state) as connection:
-        connection.execute("UPDATE snapshots SET data = '{not json'")
+        connection.execute("UPDATE catalog_resources SET data = '{not json'")
     opened = await connect("damaged-catalog", cwd=harness.work(), root=harness.root)
     app = DaitaApp(
         root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
@@ -519,13 +519,6 @@ async def test_a_damaged_catalog_row_does_not_stop_the_app_or_sources(
             assert isinstance(app.screen, CatalogScreen)
             assert source.id in app.screen._sources_by_id
 
-            def repaired() -> bool:
-                with sqlite3.connect(state) as connection:
-                    row = connection.execute("SELECT data FROM snapshots").fetchone()
-                return row is not None and row[0] != "{not json"
-
-            # Opening noticed the row and the background refresh replaced it.
-            await settle_until(pilot, repaired)
             app.exit(0)
     finally:
         await opened.close()

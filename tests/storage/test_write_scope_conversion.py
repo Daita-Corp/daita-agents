@@ -18,6 +18,7 @@ from daita.storage.sqlite_records import (
     EffectResolutionDecision,
     relational_write_authorization_fingerprint,
 )
+from tests.support.home_revisions import restore_catalog_snapshots
 from tests.support.native_writes import (
     TABLE,
     ScriptedResearchModel,
@@ -55,11 +56,11 @@ def _state_db(root: Path) -> Path:
 def _current_revision(connection: sqlite3.Connection) -> str:
     """The revision the catalog holds for the one table these homes write."""
 
-    for (encoded,) in connection.execute("SELECT data FROM snapshots"):
-        for resource in json.loads(encoded)["fields"]["resources"]:
-            if resource["fields"]["native_identity"] == TABLE:
-                return resource["fields"]["current_revision"]
-    raise AssertionError(f"{TABLE} is not in the catalog")
+    row = connection.execute(
+        "SELECT revision FROM catalog_resources WHERE native_identity = ?", (TABLE,)
+    ).fetchone()
+    assert row is not None, f"{TABLE} is not in the catalog"
+    return row[0]
 
 
 async def _home_with_stored_scope(
@@ -84,7 +85,10 @@ async def _home_with_stored_scope(
 
 def _convert(root: Path) -> None:
     with sqlite3.connect(_state_db(root)) as connection:
+        # The conversion reads the snapshots table an older home still has.
+        restore_catalog_snapshots(connection, truncated_flag=True)
         revision_0004._convert_write_scopes(connection)
+        revision_0004._convert_catalog_snapshots(connection)
         connection.commit()
 
 

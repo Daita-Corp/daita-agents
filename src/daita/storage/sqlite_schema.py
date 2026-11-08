@@ -122,6 +122,77 @@ CREATE INDEX effect_receipts_grant_reservations
     ON effect_receipts(agent_id, occurrence_id, grant_digest);
 CREATE INDEX effect_receipts_by_job ON effect_receipts(agent_id, job_id, unresolved);
 """
+CATALOG_ENTRIES_SQL = """
+CREATE TABLE catalog_resources (
+    agent_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    native_identity TEXT NOT NULL,
+    name TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    source_object_id TEXT,
+    detail TEXT NOT NULL CHECK (detail IN ('inventory', 'complete')),
+    last_seen_sync TEXT NOT NULL,
+    first_observed_at TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, id)
+);
+CREATE INDEX catalog_resources_by_source
+    ON catalog_resources(agent_id, source_id, native_identity);
+CREATE TABLE catalog_relationships (
+    agent_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    from_resource_id TEXT NOT NULL,
+    to_resource_id TEXT NOT NULL,
+    revision TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, id)
+);
+CREATE INDEX catalog_relationships_by_source
+    ON catalog_relationships(agent_id, source_id);
+CREATE INDEX catalog_relationships_from
+    ON catalog_relationships(agent_id, from_resource_id);
+CREATE INDEX catalog_relationships_to
+    ON catalog_relationships(agent_id, to_resource_id);
+CREATE TABLE catalog_changes (
+    agent_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    sync_id TEXT NOT NULL,
+    changed_at TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('added', 'changed', 'removed')),
+    resource_id TEXT NOT NULL,
+    native_identity TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, source_id, sequence)
+);
+CREATE TABLE catalog_source_state (
+    agent_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, source_id)
+);
+CREATE TABLE catalog_search (
+    agent_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    identity_key TEXT NOT NULL,
+    words TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (agent_id, resource_id)
+);
+CREATE INDEX catalog_search_by_source ON catalog_search(agent_id, source_id);
+CREATE INDEX catalog_search_by_name ON catalog_search(agent_id, name_key);
+CREATE INDEX catalog_search_by_identity ON catalog_search(agent_id, identity_key);
+"""
+# Catalog snapshots become the per-resource tables above.
+RETIRE_SNAPSHOTS_SQL = """
+DROP TABLE snapshots;
+"""
 CURRENT_DATABASE_SQL = (
     REVISION_3_DATABASE_SQL
     + ANALYSIS_EVIDENCE_SQL
@@ -129,17 +200,21 @@ CURRENT_DATABASE_SQL = (
     + RETIRE_LEARNING_CANDIDATES_SQL
     + RETIRE_GRAPH_SQL
     + JOBS_SQL
+    + CATALOG_ENTRIES_SQL
+    + RETIRE_SNAPSHOTS_SQL
 )
 SCHEMA_REVISION_4 = schema_from_sql(CURRENT_DATABASE_SQL)
 CURRENT_SCHEMA = SCHEMA_REVISION_4
 
 __all__ = [
     "ARTIFACT_REGISTRY_SQL",
+    "CATALOG_ENTRIES_SQL",
     "CURRENT_DATABASE_SQL",
     "CURRENT_SCHEMA",
     "JOBS_SQL",
     "RETIRE_GRAPH_SQL",
     "RETIRE_LEARNING_CANDIDATES_SQL",
+    "RETIRE_SNAPSHOTS_SQL",
     "REVISION_2_DATABASE_SQL",
     "SCHEMA_REVISION_2",
     "SCHEMA_REVISION_3",

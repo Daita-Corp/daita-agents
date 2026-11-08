@@ -27,6 +27,7 @@ from daita.hosting.errors import AgentHomeError
 from daita.hosting.sources import _source_edit_read_scope
 from daita.storage.sqlite_codecs import encode_relational_write_scope
 from daita.storage.sqlite_records import RelationalWriteScope, SourceReadMode
+from tests.support.catalog_records import batches
 from tests.support.relational_writes import update_constraints
 from tests.support.workspace import workspace_for
 
@@ -165,9 +166,8 @@ async def _agent_with_catalog(tmp_path, tables=("orders", "customers")):
         sync_id="sync-one",
         tables=tuple((name, 2) for name in tables),
     )
-    await agent._embedded._store.commit_snapshot(
-        snapshot,
-        registration=registration,
+    await agent._embedded._store.commit_catalog(
+        snapshot.sync, batches(snapshot), registration=registration
     )
     return agent, registration, resources
 
@@ -299,9 +299,8 @@ async def test_write_selected_many_all_current_and_future_table_exclusion(
             sync_id="sync-two",
             tables=(("orders", 2), ("customers", 2), ("future", 2)),
         )
-        await agent._embedded._store.commit_snapshot(
-            refreshed,
-            registration=source,
+        await agent._embedded._store.commit_catalog(
+            refreshed.sync, batches(refreshed), registration=source
         )
         inspection = await agent.inspect_source_permissions(source.id)
         assert refreshed_resources["future"].id not in {
@@ -325,7 +324,9 @@ async def test_wide_column_choices_support_exact_binding(tmp_path, monkeypatch):
         sync_id="sync-wide",
         tables=(("wide", 33),),
     )
-    await agent._embedded._store.commit_snapshot(snapshot, registration=source)
+    await agent._embedded._store.commit_catalog(
+        snapshot.sync, batches(snapshot), registration=source
+    )
     wide = resources["wide"]
     all_columns = tuple(f"value_{index:02d}" for index in range(1, 34))
     try:
@@ -362,7 +363,9 @@ async def _sync_after_preview(
     refreshed, _ = _snapshot(
         source, sync_id="sync-two", tables=tuple((name, 2) for name in tables)
     )
-    await agent._embedded._store.commit_snapshot(refreshed, registration=source)
+    await agent._embedded._store.commit_catalog(
+        refreshed.sync, batches(refreshed), registration=source
+    )
     return preview
 
 
@@ -656,7 +659,7 @@ async def test_a_stored_scope_the_catalog_has_not_seen_is_offered_for_removal(
 
 
 @pytest.mark.parametrize(
-    "broken", ("list_current_snapshot_refs", "list_resources", "resource_schemas")
+    "broken", ("list_entries", "list_resources", "resource_schemas")
 )
 async def test_a_failing_catalog_read_does_not_stop_a_revoke(
     tmp_path, monkeypatch, broken
@@ -694,9 +697,11 @@ async def test_a_source_edit_names_no_read_permission_by_its_id(tmp_path, monkey
         _read, omitted = _source_edit_read_scope(
             current_read_scope=inspection.state.read_scope,
             current_resources=tuple(resources.values()),
-            replacement=_snapshot(
+            agent_id=agent.id,
+            source_id=source.id,
+            replacement_resources=_snapshot(
                 _registration(agent.id), sync_id="sync-two", tables=(("orders", 2),)
-            )[0],
+            )[0].resources,
         )
         assert omitted
         assert not any(scope.resource_id in item for item in omitted)

@@ -99,6 +99,7 @@ from ..catalog.capabilities import (
     catalog_declarations,
 )
 from ..catalog.models import (
+    CatalogEntry,
     CatalogLink,
     CatalogLinkStatus,
     CatalogResource,
@@ -107,10 +108,10 @@ from ..catalog.models import (
     CatalogSummary,
     CatalogSync,
     CatalogSyncStatus,
+    CatalogTier,
     RelationshipFieldPair,
-    SourceCatalogSnapshot,
+    ResourceBatch,
 )
-from ..catalog.protocols import CatalogStoreError
 from ..catalog.service import CatalogService
 from ..config import (
     AgentConfig,
@@ -505,6 +506,33 @@ def _domain_declarations(
         executor_ids=tuple(capability.executor_id for capability in capabilities),
         tool_views=tuple(view for item in present for view in item.tool_views),
     )
+
+
+async def _reconcile_pass(
+    adapter: ResourceAdapter,
+    request: DiscoveryRequest,
+    clock: Callable[[], datetime],
+) -> tuple[CatalogSync, tuple[ResourceBatch, ...]]:
+    """Run one reconcile pass to its end; a pass that raises yields nothing."""
+
+    batches = tuple([batch async for batch in adapter.reconcile(request)])
+    detail = [batch for batch in batches if batch.tier is CatalogTier.DETAIL]
+    sync = CatalogSync(
+        id=request.sync_id,
+        agent_id=request.agent_id,
+        source_id=request.source_id,
+        adapter_id=adapter.registration.adapter_id,
+        status=CatalogSyncStatus.SUCCEEDED,
+        started_at=request.requested_at,
+        completed_at=max(clock(), request.requested_at),
+        source_revision=detail[-1].source_revision if detail else None,
+        resource_count=len(
+            {entry.resource.id for batch in batches for entry in batch.entries}
+        ),
+        relationship_count=sum(len(batch.relationships) for batch in batches),
+        truncated=any(batch.truncated for batch in batches),
+    )
+    return sync, batches
 
 
 class EmbeddedAgent:
@@ -2215,7 +2243,6 @@ class EmbeddedAgent:
         try:
             await job_supervisor.start()
             await routine_supervisor.start()
-            await embedded._rebuild_unreadable_catalogs()
         except BaseException:
             await embedded.close()
             raise
@@ -2432,13 +2459,16 @@ class EmbeddedAgent:
         files_only: bool = False,
         caller_principal_id: str | None = None,
     ) -> LoopExit:
-        return await self._run(
-            message,
-            conversation_id=conversation_id,
-            source_scope_ids=source_scope_ids,
-            files_only=files_only,
-            caller_principal_id=caller_principal_id,
-        )
+        try:
+            return await self._run(
+                message,
+                conversation_id=conversation_id,
+                source_scope_ids=source_scope_ids,
+                files_only=files_only,
+                caller_principal_id=caller_principal_id,
+            )
+        finally:
+            await self._refresh_unreadable_catalogs()
 
     async def learn(
         self,
@@ -2450,13 +2480,16 @@ class EmbeddedAgent:
     ) -> LoopExit:
         """Run one explicit user-authorized foreground learning action."""
 
-        return await self._run(
-            message,
-            conversation_id=conversation_id,
-            source_scope_ids=source_scope_ids,
-            explicit_learning=True,
-            caller_principal_id=caller_principal_id,
-        )
+        try:
+            return await self._run(
+                message,
+                conversation_id=conversation_id,
+                source_scope_ids=source_scope_ids,
+                explicit_learning=True,
+                caller_principal_id=caller_principal_id,
+            )
+        finally:
+            await self._refresh_unreadable_catalogs()
 
     async def _run(
         self,
@@ -3941,8 +3974,8 @@ class EmbeddedAgent:
         *,
         attached_at: datetime,
         persisted_registration: SourceRegistration | None = None,
-        refresh_schemas: tuple[str, ...] = (),
-        previous: SourceCatalogSnapshot | None = None,
+        scopes: tuple[str, ...] = (),
+        previous: tuple[CatalogEntry, ...] | None = None,
     ) -> SourceRegistration:
         """Discover under the management lock; only the commit takes the commit lock."""
 
@@ -3980,7 +4013,8 @@ class EmbeddedAgent:
                 started_at=self._clock(),
             )
             await self._store.record_sync(sync)
-            discovery = await adapter.discover(
+            succeeded, batches = await _reconcile_pass(
+                adapter,
                 DiscoveryRequest(
                     agent_id=self.identity.id,
                     source_id=registration.id,
@@ -3988,15 +4022,18 @@ class EmbeddedAgent:
                     requested_at=sync.started_at,
                     agent_root=None if self._home is None else self._home.parent.parent,
                     agent_home=self._home,
-                    refresh_schemas=refresh_schemas,
+                    scopes=scopes,
                     previous=previous,
-                )
+                ),
+                self._clock,
             )
             async with self._source_commit_lock:
                 self._require_open()
-                await self._store.commit_snapshot(
-                    discovery.snapshot,
+                await self._store.commit_catalog(
+                    succeeded,
+                    batches,
                     registration=registration,
+                    full=not scopes,
                 )
                 self._admission_coordinator.configure_source_resource_capacity(
                     f"source:{registration.id}",
@@ -4102,29 +4139,42 @@ class EmbeddedAgent:
                         status=CatalogSyncStatus.RUNNING,
                         started_at=self._clock(),
                     )
-                    discovery = await adapter.discover(
+                    succeeded, batches = await _reconcile_pass(
+                        adapter,
                         DiscoveryRequest(
                             agent_id=self.identity.id,
                             source_id=registration.id,
                             sync_id=sync.id,
                             requested_at=sync.started_at,
-                        )
+                            agent_root=(
+                                None if self._home is None else self._home.parent.parent
+                            ),
+                            agent_home=self._home,
+                        ),
+                        self._clock,
                     )
+                    replacement = {
+                        entry.resource.id: entry.resource
+                        for batch in batches
+                        for entry in batch.entries
+                    }
                     read_scope, omitted = _source_edit_read_scope(
                         current_read_scope=current_read_scope,
                         current_resources=current_resources,
-                        replacement=discovery.snapshot,
+                        agent_id=succeeded.agent_id,
+                        source_id=succeeded.source_id,
+                        replacement_resources=tuple(replacement.values()),
                     )
                     preview = SourceEditPreview(
                         current_source_id=current.id,
                         replacement_source_id=registration.id,
                         display_name=registration.display_name,
                         adapter_id=registration.adapter_id,
-                        resource_count=len(discovery.snapshot.resources),
-                        relationship_count=len(discovery.snapshot.relationships),
+                        resource_count=succeeded.resource_count,
+                        relationship_count=succeeded.relationship_count,
                         read_mode=read_scope.mode,
                         preserved_read_resource_count=(
-                            len(discovery.snapshot.resources)
+                            len(replacement)
                             if read_scope.mode is SourceReadMode.ALL
                             else len(read_scope.resource_ids)
                         ),
@@ -4136,7 +4186,8 @@ class EmbeddedAgent:
                     if not confirmed:
                         return None
                     await self._store.commit_source_edit(
-                        discovery.snapshot,
+                        succeeded,
+                        batches,
                         registration=registration,
                         replaced_source_id=current.id,
                         replaced_at=max(self._clock(), current.attached_at),
@@ -4757,7 +4808,9 @@ class EmbeddedAgent:
         if error_code is None:
             try:
                 names = await self._data_view.resource_names(
-                    self.identity.id, (link.from_source_id, link.to_source_id)
+                    self.identity.id,
+                    (link.from_source_id, link.to_source_id),
+                    (link.from_resource_id, link.to_resource_id),
                 )
             except (DaitaError, OSError, ValueError):
                 error_code = "link_check_failed"
@@ -4806,19 +4859,19 @@ class EmbeddedAgent:
             )
         except (TypeError, ValueError) as error:
             raise AgentHomeError(str(error)) from error
-        refresh_schemas, previous = await self._refresh_scope(registration, names)
+        scopes, previous = await self._refresh_scope(registration, names)
         return await self._attach_source_locked(
             source,
             attached_at=registration.attached_at,
             persisted_registration=registration,
-            refresh_schemas=refresh_schemas,
+            scopes=scopes,
             previous=previous,
         )
 
     async def _refresh_scope(
         self, registration: SourceRegistration, names: tuple[str, ...]
-    ) -> tuple[tuple[str, ...], SourceCatalogSnapshot | None]:
-        """The schemas the names sit in, with the snapshot to keep the others from.
+    ) -> tuple[tuple[str, ...], tuple[CatalogEntry, ...] | None]:
+        """The schemas the names sit in, with the entries to keep the others from.
 
         A name outside the configured schemas, or an unqualified one, refreshes all.
         """
@@ -4830,27 +4883,27 @@ class EmbeddedAgent:
         if not all(dot and schema in configured for schema, dot, _ in parts):
             return (), None
         schemas = tuple(dict.fromkeys(schema for schema, _, _ in parts))
+        return schemas, await self._store.list_entries(
+            self.identity.id, registration.id
+        )
+
+    async def _refresh_unreadable_catalogs(self) -> None:
+        """Refresh, in the background, sources whose catalog rows a read skipped."""
+
         try:
-            refs = await self._store.list_current_snapshot_refs(
-                self.identity.id, (registration.id,)
+            unreadable = await self._store.take_unreadable_catalog_sources(
+                self.identity.id
             )
-            return schemas, (
-                await self._store.load_current_snapshot(refs[0]) if refs else None
-            )
-        except CatalogStoreError:
-            return schemas, None
-
-    async def _rebuild_unreadable_catalogs(self) -> None:
-        """Replace damaged catalog rows from their sources, in the background."""
-
-        active = {
-            source.id
-            for source in await self._store.list_sources(self.identity.id)
-            if source.active
-        }
-        for source_id in await self._store.list_unreadable_snapshot_source_ids(
-            self.identity.id
-        ):
+            if not unreadable:
+                return
+            active = {
+                source.id
+                for source in await self._store.list_sources(self.identity.id)
+                if source.active
+            }
+        except Exception:
+            return  # The catalog only advises; a failed check never fails a run.
+        for source_id in unreadable:
             if source_id in active:
                 self.request_source_refresh(source_id)
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -11,9 +11,9 @@ from ..errors import DaitaError, ErrorRetryability
 if TYPE_CHECKING:
     from ..storage.sqlite_records import RelationalWriteScope, SourceReadScope
 
+from ..catalog.models import ResourceBatch
 from .models import (
     DiscoveryRequest,
-    DiscoveryResult,
     ResourceRef,
     ResourceSnapshot,
     SourceHealth,
@@ -83,6 +83,41 @@ class StaleResourceError(ResourceAdapterError):
         )
 
 
+def latest_snapshot(
+    latest: ResourceBatch | None,
+    resource: ResourceRef,
+    inspected_at: datetime,
+) -> ResourceSnapshot:
+    """Serve an inspect from the detail an adapter last discovered."""
+
+    entry = next(
+        (
+            item
+            for item in (() if latest is None else latest.entries)
+            if item.resource.id == resource.resource_id
+        ),
+        None,
+    )
+    if latest is None or entry is None:
+        raise ResourceNotFoundError(resource.source_id, resource.resource_id)
+    if resource.revision is not None and resource.revision != entry.revision.revision:
+        raise StaleResourceError(resource.source_id, resource.resource_id)
+    return ResourceSnapshot(
+        reference=resource,
+        resource=entry.resource,
+        revision=entry.revision,
+        facets=entry.facets,
+        relationships=tuple(
+            relationship
+            for relationship in latest.relationships
+            if resource.resource_id
+            in {relationship.from_resource_id, relationship.to_resource_id}
+        ),
+        inspected_at=inspected_at,
+        source_revision=entry.revision.source_revision,
+    )
+
+
 @runtime_checkable
 class ResourceAdapter(Protocol):
     """Bounded control-plane access to one registered source."""
@@ -90,7 +125,9 @@ class ResourceAdapter(Protocol):
     @property
     def registration(self) -> SourceRegistration: ...
 
-    async def discover(self, request: DiscoveryRequest) -> DiscoveryResult: ...
+    def reconcile(self, request: DiscoveryRequest) -> AsyncIterator[ResourceBatch]:
+        """Yield one inventory batch, then the detail batches."""
+        ...
 
     async def inspect(self, resource: ResourceRef) -> ResourceSnapshot: ...
 
@@ -170,4 +207,5 @@ __all__ = [
     "SourceClosedError",
     "SourceStore",
     "StaleResourceError",
+    "latest_snapshot",
 ]

@@ -7,7 +7,6 @@ from typing import TypedDict, cast
 
 import pytest
 
-import daita.catalog.service as catalog_service
 from daita import Agent, SQLiteSource
 from daita.catalog import (
     CatalogResource,
@@ -25,6 +24,8 @@ from daita.catalog import (
 )
 from daita.catalog.models import CatalogRelationship
 from daita.catalog.protocols import CatalogResourceNotFoundError, CatalogStoreError
+from tests.catalog._schema_support import _shift_generation
+from tests.support.catalog_records import batches
 from tests.support.workspace import workspace_for
 
 _OBSERVED_AT = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
@@ -179,7 +180,7 @@ async def _commit_graph(
         revisions=revisions,
         relationships=relationships,
     )
-    await agent._embedded._store.commit_snapshot(snapshot)
+    await agent._embedded._store.commit_catalog(snapshot.sync, batches(snapshot))
     return _CommittedGraph(
         resource_ids=resource_ids,
         relationship_ids={
@@ -727,10 +728,6 @@ async def test_refresh_replaces_the_exact_generation_and_removes_stale_edges(
     assert projection["paths"][0]["steps"][0]["relationship_id"] == (
         new.relationship_ids["a-c"]
     )
-    assert all(
-        key != (agent.id, source.id, "refresh-1")
-        for key in agent._embedded._catalog_service._source_indexes
-    )
     with pytest.raises(CatalogResourceNotFoundError):
         await agent._embedded._catalog_service.traverse(
             CatalogTraversalRequest(
@@ -790,42 +787,12 @@ async def test_inactive_sources_and_other_agents_are_never_traversable(
                     to_resource_ids=(first_graph.resource_ids["b"],),
                 )
             )
-        assert first._embedded._catalog_service._source_indexes == {}
     finally:
         await first.close()
         await second.close()
 
 
-async def test_traversal_reuses_one_compiled_index_per_exact_generation(
-    graph_agent,
-    monkeypatch: pytest.MonkeyPatch,
-):
-    agent, source = graph_agent
-    graph = await _commit_graph(
-        agent,
-        source.id,
-        nodes=("a", "b"),
-        edges=(_EdgeSpec("a-b", "a", "b"),),
-        sync_id="compile-reuse-1",
-    )
-    original_compile = catalog_service._compile_source_index
-    compile_count = 0
-
-    def counting_compile(snapshot):
-        nonlocal compile_count
-        compile_count += 1
-        return original_compile(snapshot)
-
-    monkeypatch.setattr(catalog_service, "_compile_source_index", counting_compile)
-
-    first = await _traverse(agent, graph, ("a",), ("b",))
-    second = await _traverse(agent, graph, ("a",), ("b",))
-
-    assert first == second
-    assert compile_count == 1
-
-
-async def test_traversal_retries_one_generation_conflict_then_returns_catalog_error(
+async def test_traversal_retries_one_generation_change_then_returns_catalog_error(
     graph_agent,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -838,18 +805,14 @@ async def test_traversal_retries_one_generation_conflict_then_returns_catalog_er
         sync_id="generation-conflict-1",
     )
     store = agent._embedded._store
-    load_count = 0
+    expected = await _traverse(agent, graph, ("a",), ("b",))
 
-    async def changing_generation(ref):
-        nonlocal load_count
-        load_count += 1
-        return None
+    _shift_generation(monkeypatch, store, reads=1)
+    assert await _traverse(agent, graph, ("a",), ("b",)) == expected
 
-    monkeypatch.setattr(store, "load_current_snapshot", changing_generation)
-
+    _shift_generation(monkeypatch, store)
     with pytest.raises(
         CatalogStoreError,
         match="generation changed repeatedly",
     ):
         await _traverse(agent, graph, ("a",), ("b",))
-    assert load_count == 2

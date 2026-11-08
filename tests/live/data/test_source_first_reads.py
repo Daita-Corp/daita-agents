@@ -510,7 +510,13 @@ async def test_a_wiped_catalog_still_answers(database: None, tmp_path: Path) -> 
     try:
         store = next(tmp_path.rglob("state.db"))
         with sqlite3.connect(store) as connection:
-            connection.execute("DELETE FROM snapshots")
+            for table in (
+                "catalog_search",
+                "catalog_relationships",
+                "catalog_resources",
+                "catalog_source_state",
+            ):
+                connection.execute(f"DELETE FROM {table}")
         assert _rows(
             await reads.query("SELECT count(*) AS n FROM sales.customers")
         ) == ({"n": 3},)

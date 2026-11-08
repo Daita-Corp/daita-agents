@@ -10,8 +10,7 @@ from typing import cast
 import pytest
 
 from daita import Agent, FolderSource, SQLiteSource
-from daita.adapters.folder import FolderSourceError
-from daita.adapters.registry import SourceOperation, UnknownSourceTypeError
+from daita.adapters.registry import UnknownSourceTypeError
 from daita.catalog import CatalogTraversalRequest
 from daita.catalog.models import ResourceKind
 from daita.llm.models import (

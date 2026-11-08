@@ -22,11 +22,15 @@ from daita.artifacts.models import (
 )
 from daita.capabilities import EffectEvidenceBasis, EffectObservation, EffectOutcome
 from daita.catalog.models import (
+    CatalogChangeSide,
+    CatalogSourceState,
     CatalogSync,
     CatalogSyncStatus,
+    ResourceKind,
     Sensitivity,
     SourceCatalogSnapshot,
 )
+from daita.catalog.search_text import search_postings
 from daita.identity import AgentIdentity
 from daita.llm.errors import ProviderFailureDiagnostic, ProviderFailurePhase
 from daita.llm.models import (
@@ -49,7 +53,11 @@ from daita.semantics import (
     SemanticSubject,
 )
 from daita.storage.sqlite_codecs import (
+    decode_catalog_change_data,
+    decode_catalog_entry,
+    decode_catalog_relationship,
     decode_catalog_snapshot,
+    decode_catalog_source_state,
     decode_catalog_sync,
     decode_identifier,
     decode_identity,
@@ -58,10 +66,15 @@ from daita.storage.sqlite_codecs import (
     decode_receipt,
     decode_relational_write_scope,
     decode_run_input,
+    decode_search_postings,
     decode_semantic_annotation,
     decode_source,
     decode_source_read_scope,
+    encode_catalog_change_data,
+    encode_catalog_entry,
+    encode_catalog_relationship,
     encode_catalog_snapshot,
+    encode_catalog_source_state,
     encode_catalog_sync,
     encode_identifier,
     encode_identity,
@@ -70,6 +83,7 @@ from daita.storage.sqlite_codecs import (
     encode_receipt,
     encode_relational_write_scope,
     encode_run_input,
+    encode_search_postings,
     encode_semantic_annotation,
     encode_source,
     encode_source_read_scope,
@@ -80,6 +94,12 @@ from daita.storage.sqlite_records import (
     SourceReadMode,
     SourceReadScope,
     effect_receipt_id,
+)
+from tests.support.catalog_records import (
+    SHOP,
+    SHOP_REFERENCES,
+    entries,
+    snapshot as catalog_snapshot,
 )
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
@@ -348,6 +368,52 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
         == update_scope
     )
     assert encode_relational_write_scope(update_scope) == encoded_update_scope
+
+
+def test_per_resource_catalog_records_round_trip_and_reject_damage() -> None:
+    shop = catalog_snapshot(
+        "agent-codec", "source:codec", "sync-codec", SHOP, SHOP_REFERENCES
+    )
+    entry = next(item for item in entries(shop) if item.facets)
+    relationship, _ = shop.relationships
+    state = CatalogSourceState(
+        agent_id="agent-codec",
+        source_id="source:codec",
+        current_sync_id="sync-codec",
+        probe_tokens={"b": "2", "a": "1"},
+        last_change_at=NOW,
+        last_missed=3,
+    )
+    side = CatalogChangeSide(
+        "orders", ResourceKind.TABLE, entry.revision.revision, (("id", "INTEGER"),)
+    )
+    postings = search_postings(entry, ())
+
+    _assert_round_trip(entry, encode_catalog_entry, decode_catalog_entry)
+    _assert_round_trip(
+        relationship, encode_catalog_relationship, decode_catalog_relationship
+    )
+    _assert_round_trip(state, encode_catalog_source_state, decode_catalog_source_state)
+    _assert_round_trip(postings, encode_search_postings, decode_search_postings)
+    encoded = encode_catalog_change_data(side, None)
+    assert decode_catalog_change_data(encoded) == (side, None)
+    assert decode_catalog_change_data(encode_catalog_change_data(None, side)) == (
+        None,
+        side,
+    )
+
+    payload = json.loads(encode_catalog_entry(entry))
+    payload["fields"]["future"] = True
+    with pytest.raises(ValueError, match="unknown fields"):
+        decode_catalog_entry(json.dumps(payload))
+    payload = json.loads(encode_catalog_source_state(state))
+    del payload["fields"]["keep_current"]
+    with pytest.raises(ValueError, match="missing fields"):
+        decode_catalog_source_state(json.dumps(payload))
+    with pytest.raises(ValueError):
+        decode_search_postings('[["column","column:id","id"]]')
+    with pytest.raises(ValueError):
+        decode_catalog_change_data(encode_catalog_entry(entry))
 
 
 def test_bound_edit_provenance_and_exact_outcome_receipt_round_trip_in_codec_v1() -> (

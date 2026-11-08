@@ -133,7 +133,9 @@ async def test_empty_machine_source_ceiling_never_queries_all_current_sources():
         async def source_read_access(self, agent_id, source_ids):
             raise AssertionError("an empty machine ceiling cannot read scopes")
 
-        async def readable_resource_ids(self, agent_id, source_ids=()):
+        async def readable_resource_ids(
+            self, agent_id, source_ids=(), resource_ids=None, first=None
+        ):
             raise AssertionError("an empty machine ceiling cannot enumerate resources")
 
     run = _scheduled_run(_scheduled_scope(("catalog.search",)))

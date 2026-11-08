@@ -285,7 +285,9 @@ class CatalogSpy:
             for source_id in source_ids
         }
 
-    async def readable_resource_ids(self, agent_id, source_ids=()):
+    async def readable_resource_ids(
+        self, agent_id, source_ids=(), resource_ids=None, first=None
+    ):
         return frozenset(item["resource_id"] for item in self.resources) or frozenset(
             {"resource-unmatched"}
         )

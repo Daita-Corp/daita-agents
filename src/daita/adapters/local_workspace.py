@@ -127,7 +127,7 @@ class LocalWorkspaceLimits:
 
     def __post_init__(self) -> None:
         integer_limits = (
-            (self.max_search_results, "max_search_results", 1, 10_000),
+            (self.max_search_results, "max_search_results", 1, 1_000_000),
             (self.max_search_entries, "max_search_entries", 1, 1_000_000),
             (self.max_search_depth, "max_search_depth", 1, 128),
             (

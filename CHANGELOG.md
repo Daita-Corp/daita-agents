@@ -36,6 +36,18 @@ An existing home migrates automatically to home revision 4 the first time it ope
   - Old transcripts that hold results of the removed write tools still replay, and
     their receipts (`data.update_rows`, `data.upsert_rows`) still decode, list and
     resolve.
+- **Source type and catalog APIs.** For integrators:
+  - `ResourceAdapter.reconcile(request)` replaces `discover`. It yields one INVENTORY
+    `ResourceBatch` of every resource, then DETAIL batches, and `DiscoveryResult` is
+    removed.
+  - `DiscoveryRequest.scopes` replaces `refresh_schemas`, `previous` is the source's
+    stored `CatalogEntry` tuple, and `max_inventory` is new; `max_resources` counts
+    detailed resources and may be up to 100,000.
+  - `CatalogStore` drops `commit_snapshot`, `list_current_snapshot_refs`,
+    `load_current_snapshot` and `list_unreadable_snapshot_source_ids`. It gains
+    `commit_catalog`, `current_syncs`, `load_source_state`, `list_catalog_changes`,
+    `take_unreadable_catalog_sources`, `load_entry`, `load_entries`, `list_entries`
+    and `search_catalog`.
 - **Large sources attach truncated.** Attaching a source over the discovery limits no
   longer raises `DiscoveryLimitError`, which is removed. The source attaches with a
   truncated catalog. The model's source directory says the catalog holds only part of
@@ -44,8 +56,8 @@ An existing home migrates automatically to home revision 4 the first time it ope
   the limits cannot be granted there, and a granted table that falls past them can be
   dropped when someone re-picks the list.
 - **Limits.**
-  - *Discovery:* 1,000 tables, 512 columns and 256 indexes per table, and 2,000
-    relationships. PostgreSQL stops reading table structure after 60 seconds.
+  - *Discovery:* every table listed (up to 1,000,000); 1,000 described, with 512
+    columns and 256 indexes per table, and 2,000 relationships. PostgreSQL stops reading table structure after 60 seconds.
   - *`data_query`:* up to 8 statements per call; 64 tables per call (16 in a job run);
     5 seconds per statement and 15 seconds in total; 100 rows and 16 KB shared by all
     statements; SQL up to 65,536 characters; up to 128 parameters. `output=csv`,
@@ -183,11 +195,20 @@ shows the preview.
 
 ### Attach never fails on size, and the catalog keeps up
 
-A large source now attaches. Discovery reads up to 1,000 tables, 512 columns and 256
-indexes per table and 2,000 relationships, and on PostgreSQL stops reading table
-structure after 60 seconds. Whatever is cut stays reachable through `catalog_search`,
-`catalog_describe` and queries, and the source is marked truncated; the model is told
-the catalog holds only part of it. `DiscoveryLimitError` is gone.
+A large source now attaches and lists every table (up to 1,000,000), then describes
+up to 1,000 of them with 512 columns and 256 indexes per table and 2,000
+relationships; on PostgreSQL it stops reading table structure after 60 seconds. A table
+without a description is still found by name and stays reachable through
+`catalog_search`, `catalog_describe` and queries, and the source is marked truncated;
+the model is told the catalog lists every object but describes only some.
+`DiscoveryLimitError` is gone.
+
+- **The catalog refreshes without rewriting unchanged tables.** It stores one row per
+  table, so a refresh writes only what changed, readers see the whole old catalog or
+  the whole new one, and a failed refresh changes nothing. It keeps the last 20
+  syncs and 90 days of changes per source.
+- **Folder source edits work.** Editing an attached folder source no longer fails for
+  want of its agent paths.
 
 - **PostgreSQL discovery no longer slows with table count.** It takes five statements
   however many tables there are, instead of two per table, so a source over a slow
@@ -211,9 +232,10 @@ the catalog holds only part of it. `DiscoveryLimitError` is gone.
   if the role can read every column of it. A partition is listed on its own unless a
   readable parent in the configured schemas holds it, so a role granted only a child
   partition can find it.
-- **A damaged catalog row no longer stops work.** Reads and approved writes
-  continue, the home still opens, and the catalog is rebuilt from the source.
-- **`semantic_save` on a table with no catalog entry** is refused with
+- **A damaged catalog entry no longer stops anything.** Reads and approved writes
+  continue, the home still opens, and when a run finishes the entry is rebuilt from
+  the source.
+- **`semantic_save` on a table with no catalog entry, or only a name,** is refused with
   `semantic_unknown_resource` and says reads are unaffected, instead of
   `resource_read_not_allowed`.
 

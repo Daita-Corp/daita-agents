@@ -149,8 +149,8 @@ These protect users. Each comes with the reason it exists.
    fixture and a refreshed release contract. Released migrations, checksums,
    decoders and fixtures never change. Newer, damaged or unknown homes fail
    closed without rewriting state. The one exception is catalog rows: they can be
-   rebuilt from the source, so a damaged one is rebuilt rather than failing
-   closed. *Why: upgrades must never lose user data.*
+   rebuilt from the source, so a damaged one is skipped as absent and rebuilt
+   rather than failing closed. *Why: upgrades must never lose user data.*
 10. **State mutation is atomic and cancellation-safe.** *Why: interrupted
     processes must leave a consistent home.*
 11. **Optional and heavy dependencies are imported lazily.** Importing `daita` or
@@ -275,12 +275,13 @@ Check the scheduled-run limits in `docs/architecture/jobs-and-routines.md`.
 2. Run the shared contract checks in `tests/support/source_contract.py`:
    `assert_source_type_contract`, plus `assert_tabular_read_contract` when it
    declares `TABULAR_READ`, and `assert_live_source_contract` for a live,
-   uncataloged source. A source without SQL needs only discovery and a
+   uncataloged source. A source without SQL needs only `reconcile` and a
    `TABULAR_READ` backend to join combined queries.
-3. Make discovery honour the `DiscoveryRequest` limits as a budget and mark
-   what it cuts `truncated` rather than failing on size. Implement `health()`
-   (`SourceHealth`); `Agent.check_source` calls it. The catalog only records
-   what discovery found.
+3. Implement `reconcile`: yield one INVENTORY batch listing every resource up to
+   `max_inventory`, then DETAIL batches within the `DiscoveryRequest` budgets,
+   marking what a budget cuts `truncated` rather than failing on size. Implement
+   `health()` (`SourceHealth`); `Agent.check_source` calls it. The catalog only
+   records what `reconcile` found.
 4. Declare stable `Capability`, `Executor` and optional `ToolView` identities and
    compose them through `CapabilityRegistry` in `EmbeddedAgent`.
 5. Reads go through the one read policy, `validate_read` in

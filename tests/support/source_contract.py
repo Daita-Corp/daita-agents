@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import cast
@@ -21,7 +21,16 @@ from daita.adapters.protocols import (
     StaleResourceError,
 )
 from daita.adapters.registry import SourceOperation, SourceType
-from daita.catalog.models import FacetKind, SourceCatalogSnapshot, TabularFacet
+from daita.catalog.models import (
+    CatalogEntry,
+    CatalogFacet,
+    CatalogRelationship,
+    CatalogResource,
+    CatalogTier,
+    FacetKind,
+    ResourceBatch,
+    TabularFacet,
+)
 from daita.domains.data import ReadTabularRequest, TabularFilter, TabularReadBackend
 from daita.domains.data.results import BoundedResultProjection
 from daita.domains.data.source_files import (
@@ -33,7 +42,6 @@ from daita.domains.data.source_files import (
     TextReadRequest,
 )
 from daita.domains.data.sql import validate_duckdb_read
-from daita.errors import DaitaError
 from daita.security import SecretProvider
 
 CONTRACT_AGENT_ID = "agent-source-contract"
@@ -53,21 +61,77 @@ def _request(
     )
 
 
-def _assert_within_request(
-    snapshot: SourceCatalogSnapshot, request: DiscoveryRequest
-) -> None:
-    # Reconstruction reruns the snapshot's own structural validation.
-    assert replace(snapshot) == snapshot
-    assert snapshot.sync.agent_id == request.agent_id
-    assert snapshot.sync.source_id == request.source_id
-    assert snapshot.sync.id == request.sync_id
-    assert len(snapshot.resources) <= request.max_resources
-    assert len(snapshot.relationships) <= request.max_relationships
-    for facet in snapshot.facets:
-        if facet.kind is FacetKind.TABULAR:
-            tabular = TabularFacet.from_payload(facet.payload)
-            assert len(tabular.columns) <= request.max_columns_per_resource
-            assert len(tabular.indexes) <= request.max_indexes_per_resource
+@dataclass(frozen=True)
+class ReconcilePass:
+    """One reconcile pass: the inventory batch, then the single detail batch."""
+
+    inventory: ResourceBatch
+    detail: ResourceBatch
+
+    @property
+    def resources(self) -> list[CatalogResource]:
+        return [entry.resource for entry in self.detail.entries]
+
+    @property
+    def facets(self) -> list[CatalogFacet]:
+        return [facet for entry in self.detail.entries for facet in entry.facets]
+
+    @property
+    def relationships(self) -> tuple[CatalogRelationship, ...]:
+        return self.detail.relationships
+
+    @property
+    def truncated(self) -> bool:
+        return self.inventory.truncated or self.detail.truncated
+
+
+async def reconcile_pass(
+    adapter: ResourceAdapter, request: DiscoveryRequest
+) -> ReconcilePass:
+    inventory, detail = [batch async for batch in adapter.reconcile(request)]
+    assert inventory.tier is CatalogTier.INVENTORY
+    assert detail.tier is CatalogTier.DETAIL
+    return ReconcilePass(inventory, detail)
+
+
+async def _reconcile(
+    adapter: ResourceAdapter, request: DiscoveryRequest
+) -> tuple[CatalogEntry, ...]:
+    """Run one pass, check each batch against the request, return the detail."""
+
+    batches = [batch async for batch in adapter.reconcile(request)]
+    assert batches and batches[0].tier is CatalogTier.INVENTORY
+    assert [b.tier for b in batches].count(CatalogTier.INVENTORY) == 1
+    assert batches[-1].tier is CatalogTier.DETAIL
+    inventory, *details = batches
+    detailed: list[CatalogEntry] = []
+    for batch in batches:
+        # Reconstruction reruns the batch's own structural validation.
+        assert replace(batch) == batch
+        for entry in batch.entries:
+            assert entry.resource.agent_id == request.agent_id
+            assert entry.resource.source_id == request.source_id
+        assert len(batch.relationships) <= request.max_relationships
+        for entry in batch.entries:
+            for facet in entry.facets:
+                if facet.kind is FacetKind.TABULAR:
+                    tabular = TabularFacet.from_payload(facet.payload)
+                    assert len(tabular.columns) <= request.max_columns_per_resource
+                    assert len(tabular.indexes) <= request.max_indexes_per_resource
+    assert len(inventory.entries) <= request.max_inventory
+    for batch in details:
+        detailed.extend(batch.entries)
+    assert len(detailed) <= request.max_resources
+    assert {e.resource.id for e in detailed} <= {
+        e.resource.id for e in inventory.entries
+    }
+    return tuple(detailed)
+
+
+async def _resource_ids(
+    adapter: ResourceAdapter, request: DiscoveryRequest
+) -> set[str]:
+    return {entry.resource.id for entry in await _reconcile(adapter, request)}
 
 
 async def assert_source_type_contract(
@@ -77,7 +141,7 @@ async def assert_source_type_contract(
     secret_provider: SecretProvider,
     agent_home: Path | None = None,
 ) -> None:
-    """Open, discover, inspect, health-check, close and rebuild one source.
+    """Open, reconcile, inspect, health-check, close and rebuild one source.
 
     A filesystem source receives ``agent_home`` as the private state it must
     never catalog.
@@ -93,17 +157,14 @@ async def assert_source_type_contract(
         assert registration.adapter_id == source_type.adapter_id
 
         first_request = _request(adapter, "sync-contract-first", agent_home)
-        first = (await adapter.discover(first_request)).snapshot
-        _assert_within_request(first, first_request)
-        assert first.resources, "the contract needs at least one resource"
+        first = await _reconcile(adapter, first_request)
+        assert first, "the contract needs at least one resource"
         second_request = _request(adapter, "sync-contract-second", agent_home)
-        second = (await adapter.discover(second_request)).snapshot
-        _assert_within_request(second, second_request)
-        assert {item.id for item in second.resources} == {
-            item.id for item in first.resources
+        assert await _resource_ids(adapter, second_request) == {
+            item.resource.id for item in first
         }
 
-        resource = first.resources[0]
+        resource = first[0].resource
         with pytest.raises(StaleResourceError):
             await adapter.inspect(
                 ResourceRef(
@@ -144,7 +205,7 @@ async def assert_source_type_contract(
 
     await adapter.close()
     with pytest.raises(SourceClosedError):
-        await adapter.discover(_request(adapter, "sync-contract-closed", agent_home))
+        await _reconcile(adapter, _request(adapter, "sync-contract-closed", agent_home))
     with pytest.raises(SourceClosedError):
         await adapter.inspect(
             ResourceRef(
@@ -344,6 +405,8 @@ async def assert_live_source_contract(
 
 __all__ = [
     "CONTRACT_AGENT_ID",
+    "ReconcilePass",
+    "reconcile_pass",
     "CONTRACT_NOW",
     "assert_live_source_contract",
     "assert_source_type_contract",

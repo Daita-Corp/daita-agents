@@ -44,6 +44,7 @@ __all__ = (
     "_object_sequence",
     "_path_name_signatures",
     "_schema",
+    "_shift_generation",
     "_tabular_decoder_fixture",
     "canonical_json",
     "cast",
@@ -124,6 +125,7 @@ from daita.llm.models import (
 )
 from daita.loop.models import RunInput
 from tests.support.capability_runtime import execute_projected
+from tests.support.catalog_records import batches
 from tests.support.workspace import workspace_for
 
 _OBSERVED_AT = datetime(2026, 7, 31, 12, 0, tzinfo=UTC)
@@ -387,27 +389,48 @@ async def _commit_schema_graph(
         )
         for key, (native_identity, kind, _) in nodes.items()
     )
-    await agent._embedded._store.commit_snapshot(
-        SourceCatalogSnapshot(
-            sync=CatalogSync(
-                id=sync_id,
-                agent_id=agent.id,
-                source_id=source_id,
-                adapter_id="test-schema-graph",
-                status=CatalogSyncStatus.SUCCEEDED,
-                started_at=_OBSERVED_AT,
-                completed_at=_OBSERVED_AT,
-                source_revision=f"test:{sync_id}",
-                resource_count=len(resources),
-                relationship_count=len(relationships),
-            ),
-            resources=resources,
-            revisions=revisions,
-            facets=tuple(facets_by_node.values()),
-            relationships=relationships,
-        )
+    snapshot = SourceCatalogSnapshot(
+        sync=CatalogSync(
+            id=sync_id,
+            agent_id=agent.id,
+            source_id=source_id,
+            adapter_id="test-schema-graph",
+            status=CatalogSyncStatus.SUCCEEDED,
+            started_at=_OBSERVED_AT,
+            completed_at=_OBSERVED_AT,
+            source_revision=f"test:{sync_id}",
+            resource_count=len(resources),
+            relationship_count=len(relationships),
+        ),
+        resources=resources,
+        revisions=revisions,
+        facets=tuple(facets_by_node.values()),
+        relationships=relationships,
     )
+    await agent._embedded._store.commit_catalog(snapshot.sync, batches(snapshot))
     return resource_ids, relationships
+
+
+def _shift_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    store: object,
+    *,
+    reads: int | None = None,
+) -> None:
+    """Make the first `reads` current_syncs reads (all when None) report a new generation."""
+
+    real = store.current_syncs  # type: ignore[attr-defined]
+    calls = 0
+
+    async def shifted(agent_id: str, source_ids: tuple[str, ...]):
+        nonlocal calls
+        calls += 1
+        syncs = await real(agent_id, source_ids)
+        if reads is not None and calls > reads:
+            return syncs
+        return tuple(replace(sync, id=f"{sync.id}-moved-{calls}") for sync in syncs)
+
+    monkeypatch.setattr(store, "current_syncs", shifted)
 
 
 def _mapping_sequence(value: object) -> tuple[Mapping[str, object], ...]:

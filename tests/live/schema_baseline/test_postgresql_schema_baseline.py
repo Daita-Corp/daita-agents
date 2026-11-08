@@ -1002,7 +1002,21 @@ async def test_the_question_set_answers_from_the_source_with_an_empty_catalog(
             source_id, _attached = await _attach(agent, target, _BOUNDED_SCHEMAS, trips)
             assert source_id is not None
             with sqlite3.connect(next(tmp_path.rglob("state.db"))) as connection:
-                connection.execute("DELETE FROM snapshots")
+                # K2 split `snapshots` into per-resource tables; clear whichever layout exists.
+                tables = {
+                    name
+                    for (name,) in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                for table in (
+                    "snapshots",
+                    "catalog_search",
+                    "catalog_relationships",
+                    "catalog_resources",
+                ):
+                    if table in tables:
+                        connection.execute(f"DELETE FROM {table}")
             runs = [
                 await _ask_oracle(
                     agent,

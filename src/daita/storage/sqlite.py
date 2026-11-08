@@ -91,8 +91,7 @@ class SQLiteStateStore(SQLStateStore):
         return cls(resolved, clock=resolved_clock)
 
     async def close(self) -> None:
-        async with self._decoded_catalog_snapshot_lock:
-            self._decoded_catalog_snapshots.clear()
+        await super().close()
         await asyncio.to_thread(_checkpoint_wal_for_close, self.path)
 
 

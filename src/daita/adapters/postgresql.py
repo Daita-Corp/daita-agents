@@ -7,7 +7,14 @@ import ipaddress
 import math
 import re
 import socket
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from hashlib import sha256
@@ -19,18 +26,19 @@ from urllib.parse import quote
 from .._installation import repair_guidance
 from .._json import canonical_json
 from ..catalog.models import (
+    CatalogEntry,
     CatalogFacet,
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
-    CatalogSync,
-    CatalogSyncStatus,
+    CatalogTier,
+    FacetKind,
     RelationshipFieldPair,
     RelationshipKind,
     RelationshipProvenance,
+    ResourceBatch,
     ResourceKind,
     Sensitivity,
-    SourceCatalogSnapshot,
     TabularColumn,
     TabularFacet,
     TabularIndex,
@@ -43,7 +51,6 @@ from ..security import (
 )
 from .models import (
     DiscoveryRequest,
-    DiscoveryResult,
     ResourceRef,
     ResourceSnapshot,
     SourceHealth,
@@ -53,7 +60,7 @@ from .protocols import (
     ResourceAdapterError,
     ResourceNotFoundError,
     SourceClosedError,
-    StaleResourceError,
+    latest_snapshot,
 )
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_$]{0,62}\Z")
@@ -132,7 +139,8 @@ _RESOURCES_SQL = f"""
 SELECT
     n.nspname AS schema_name,
     c.relname AS resource_name,
-    CASE WHEN c.relkind IN ('v', 'm') THEN 'view' ELSE 'table' END AS resource_kind
+    CASE WHEN c.relkind IN ('v', 'm') THEN 'view' ELSE 'table' END AS resource_kind,
+    c.oid::text AS source_object_id
 FROM pg_class AS c
 JOIN pg_namespace AS n ON n.oid = c.relnamespace
 WHERE n.nspname = ANY($1::text[])
@@ -676,13 +684,17 @@ class PostgreSQLResourceAdapter:
         self._clock = clock
         self._lock = asyncio.Lock()
         self._closed = False
-        self._latest: SourceCatalogSnapshot | None = None
+        self._latest: ResourceBatch | None = None
 
     @property
     def registration(self) -> SourceRegistration:
         return self._registration
 
-    async def discover(self, request: DiscoveryRequest) -> DiscoveryResult:
+    async def reconcile(
+        self, request: DiscoveryRequest
+    ) -> AsyncIterator[ResourceBatch]:
+        """Yield the inventory, then the detail; all reads finish before the first yield."""
+
         self._require_request(request)
         async with self._lock:
             self._require_open()
@@ -690,8 +702,7 @@ class PostgreSQLResourceAdapter:
             transaction_started = False
             transaction_finished = False
             discovery_failed = False
-            snapshot: SourceCatalogSnapshot | None = None
-            completed_at: datetime | None = None
+            batches: tuple[ResourceBatch, ResourceBatch] | None = None
             try:
                 transaction = self._connection.transaction(
                     isolation="repeatable_read",
@@ -706,22 +717,16 @@ class PostgreSQLResourceAdapter:
                 structure = await _load_structure(
                     self._connection,
                     self._registration,
+                    max_inventory=request.max_inventory,
                     max_resources=request.max_resources,
                     max_columns=request.max_columns_per_resource,
                     max_indexes=request.max_indexes_per_resource,
                     max_relationships=request.max_relationships,
-                    refresh_schemas=request.refresh_schemas,
+                    scopes=request.scopes,
                     previous=request.previous,
                 )
                 estimates = await _load_estimates(self._connection, structure)
-                completed_at = max(self._clock(), request.requested_at)
-                snapshot = _catalog_snapshot(
-                    self._registration,
-                    request,
-                    structure,
-                    completed_at,
-                    estimates,
-                )
+                batches = _batches(request, structure, estimates)
                 await transaction.commit()
                 transaction_finished = True
             except asyncio.CancelledError:
@@ -756,16 +761,11 @@ class PostgreSQLResourceAdapter:
                     "PostgreSQL source discovery failed.",
                     source_id=self._registration.id,
                 )
-            if snapshot is None or completed_at is None:
-                raise AssertionError(
-                    "PostgreSQL discovery completed without a snapshot"
-                )
-            self._latest = snapshot
-            return DiscoveryResult(
-                request=request,
-                snapshot=snapshot,
-                completed_at=completed_at,
-            )
+            if batches is None:
+                raise AssertionError("PostgreSQL discovery completed without batches")
+            self._latest = batches[1]
+        for batch in batches:
+            yield batch
 
     async def inspect(self, resource: ResourceRef) -> ResourceSnapshot:
         if not isinstance(resource, ResourceRef):
@@ -780,56 +780,7 @@ class PostgreSQLResourceAdapter:
                     self._registration.id,
                     resource.resource_id,
                 )
-            snapshot = self._latest
-            if snapshot is None:
-                raise ResourceNotFoundError(
-                    self._registration.id,
-                    resource.resource_id,
-                )
-            current = next(
-                (
-                    item
-                    for item in snapshot.resources
-                    if item.id == resource.resource_id
-                ),
-                None,
-            )
-            if current is None:
-                raise ResourceNotFoundError(
-                    self._registration.id,
-                    resource.resource_id,
-                )
-            if resource.revision is not None and (
-                resource.revision != current.current_revision
-            ):
-                raise StaleResourceError(
-                    self._registration.id,
-                    resource.resource_id,
-                )
-            revision = next(
-                item for item in snapshot.revisions if item.resource_id == current.id
-            )
-            return ResourceSnapshot(
-                reference=resource,
-                resource=current,
-                revision=revision,
-                facets=tuple(
-                    facet
-                    for facet in snapshot.facets
-                    if facet.resource_id == current.id
-                ),
-                relationships=tuple(
-                    relationship
-                    for relationship in snapshot.relationships
-                    if current.id
-                    in {
-                        relationship.from_resource_id,
-                        relationship.to_resource_id,
-                    }
-                ),
-                inspected_at=self._clock(),
-                source_revision=revision.source_revision,
-            )
+            return latest_snapshot(self._latest, resource, self._clock())
 
     async def health(self) -> SourceHealth:
         async with self._lock:
@@ -940,6 +891,9 @@ class PostgreSQLStructure:
     tables: tuple[_TableStructure, ...]
     relationships: tuple[_RelationshipStructure, ...]
     source_revision: str
+    # Every listed relation (schema, name, kind, pg_class oid), detailed or not.
+    inventory: tuple[tuple[str, str, ResourceKind, str | None], ...] = ()
+    inventory_truncated: bool = False
     truncated: bool = False
 
 
@@ -1003,8 +957,9 @@ async def _load_structure(
     max_columns: int,
     max_indexes: int,
     max_relationships: int,
-    refresh_schemas: tuple[str, ...] = (),
-    previous: SourceCatalogSnapshot | None = None,
+    max_inventory: int = 1_000_000,
+    scopes: tuple[str, ...] = (),
+    previous: tuple[CatalogEntry, ...] | None = None,
 ) -> PostgreSQLStructure:
     """Read the structure the request allows; whatever a limit cuts is truncated."""
 
@@ -1012,30 +967,46 @@ async def _load_structure(
     resource_rows = await connection.fetch(
         _RESOURCES_SQL,
         list(schemas),
-        max_resources + 1,
+        max_inventory + 1,
     )
+    inventory_truncated = len(resource_rows) > max_inventory
+    resource_rows = resource_rows[:max_inventory]
     truncated = len(resource_rows) > max_resources
-    # A table outside the refreshed schemas keeps what the previous snapshot read.
+    # A table outside the refreshed schemas keeps what the previous pass read.
     kept = (
-        {facet.resource_id: facet for facet in previous.facets}
-        if refresh_schemas and previous is not None
+        {entry.resource.id: entry for entry in previous if entry.detailed}
+        if scopes and previous is not None
         else {}
     )
+    inventory: list[tuple[str, str, ResourceKind, str | None]] = []
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _DISCOVERY_SECONDS
     listed: list[tuple[str, str, ResourceKind, TabularFacet | None]] = []
     wanted: list[tuple[str, str]] = []
-    for row in resource_rows[:max_resources]:
+    for position, row in enumerate(resource_rows):
         schema = _row_text(row, "schema_name")
         name = _row_text(row, "resource_name")
         kind_value = _row_text(row, "resource_kind")
         kind = ResourceKind.VIEW if kind_value == "view" else ResourceKind.TABLE
-        facet = (
+        inventory.append(
+            (schema, name, kind, _optional_row_text(row, "source_object_id"))
+        )
+        if position >= max_resources:
+            continue
+        previous_entry = (
             None
-            if schema in refresh_schemas
+            if schema in scopes
             else kept.get(
                 catalog_resource_id(registration.id, kind, f"{schema}.{name}")
             )
+        )
+        facet = next(
+            (
+                item
+                for item in (() if previous_entry is None else previous_entry.facets)
+                if item.kind is FacetKind.TABULAR
+            ),
+            None,
         )
         tabular = (
             TabularFacet.from_payload(facet.payload) if facet is not None else None
@@ -1142,6 +1113,8 @@ async def _load_structure(
         tables=ordered_tables,
         relationships=ordered_relationships,
         source_revision="catalog:sha256:" + sha256(encoded).hexdigest(),
+        inventory=tuple(inventory),
+        inventory_truncated=inventory_truncated,
         truncated=truncated,
     )
 
@@ -1207,19 +1180,39 @@ def _table_estimates(row: Mapping[str, object]) -> _TableEstimates:
     return _TableEstimates(row_count, size_bytes, as_of)
 
 
-def _catalog_snapshot(
-    registration: SourceRegistration,
+def _external_uri(source_id: str, schema: str, name: str) -> str:
+    return f"postgresql://{source_id}/{quote(schema, safe='')}/{quote(name, safe='')}"
+
+
+def _batches(
     request: DiscoveryRequest,
     structure: PostgreSQLStructure,
-    completed_at: datetime,
     estimates: Mapping[tuple[str, str], _TableEstimates] | None = None,
-) -> SourceCatalogSnapshot:
+) -> tuple[ResourceBatch, ResourceBatch]:
+    """The inventory of every listed relation and the detail that was read."""
+
+    inventory = ResourceBatch(
+        tier=CatalogTier.INVENTORY,
+        entries=tuple(
+            request.inventory_entry(
+                kind=kind,
+                native_identity=f"{schema}.{name}",
+                name=name,
+                external_uri=_external_uri(request.source_id, schema, name),
+                source_object_id=oid,
+            )
+            for schema, name, kind, oid in structure.inventory
+        ),
+        truncated=structure.inventory_truncated,
+    )
+    registration_id = request.source_id
+    oids = {(schema, name): oid for schema, name, _, oid in structure.inventory}
     facets: dict[tuple[str, str], CatalogFacet] = {}
     resource_ids: dict[tuple[str, str], tuple[str, ResourceKind]] = {}
     for table in structure.tables:
         native_identity = f"{table.schema}.{table.name}"
         resource_id = catalog_resource_id(
-            registration.id,
+            registration_id,
             table.kind,
             native_identity,
         )
@@ -1247,7 +1240,7 @@ def _catalog_snapshot(
             continue
         relationships.append(
             CatalogRelationship.build(
-                source_id=registration.id,
+                source_id=registration_id,
                 from_resource_id=source[0],
                 to_resource_id=target[0],
                 kind=RelationshipKind.REFERENCES,
@@ -1265,8 +1258,7 @@ def _catalog_snapshot(
             )
         )
     ordered_relationships = tuple(sorted(relationships, key=lambda item: item.id))
-    revisions: list[CatalogResourceRevision] = []
-    resources: list[CatalogResource] = []
+    entries: list[CatalogEntry] = []
     for table in structure.tables:
         resource_id, kind = resource_ids[(table.schema, table.name)]
         facet = facets[(table.schema, table.name)]
@@ -1284,44 +1276,36 @@ def _catalog_snapshot(
             relationship_revisions=linked,
             source_revision=structure.source_revision,
         )
-        revisions.append(revision)
-        resources.append(
-            CatalogResource.build(
-                agent_id=request.agent_id,
-                source_id=request.source_id,
-                native_identity=f"{table.schema}.{table.name}",
-                external_uri=(
-                    f"postgresql://{request.source_id}/"
-                    f"{quote(table.schema, safe='')}/{quote(table.name, safe='')}"
+        entries.append(
+            CatalogEntry(
+                resource=CatalogResource.build(
+                    agent_id=request.agent_id,
+                    source_id=request.source_id,
+                    native_identity=f"{table.schema}.{table.name}",
+                    external_uri=_external_uri(
+                        request.source_id, table.schema, table.name
+                    ),
+                    kind=kind,
+                    name=table.name,
+                    sensitivity=Sensitivity.INTERNAL,
+                    revision=revision,
+                    first_observed_at=request.requested_at,
+                    last_observed_at=request.requested_at,
                 ),
-                kind=kind,
-                name=table.name,
-                sensitivity=Sensitivity.INTERNAL,
                 revision=revision,
-                first_observed_at=request.requested_at,
-                last_observed_at=request.requested_at,
+                facets=(facet,),
+                detailed=True,
+                source_object_id=oids.get((table.schema, table.name)),
             )
         )
-    sync = CatalogSync(
-        id=request.sync_id,
-        agent_id=request.agent_id,
-        source_id=request.source_id,
-        adapter_id="postgresql",
-        status=CatalogSyncStatus.SUCCEEDED,
-        started_at=request.requested_at,
-        completed_at=completed_at,
-        source_revision=structure.source_revision,
-        resource_count=len(resources),
-        relationship_count=len(ordered_relationships),
-        truncated=structure.truncated,
-    )
-    return SourceCatalogSnapshot(
-        sync=sync,
-        resources=tuple(resources),
-        revisions=tuple(revisions),
-        facets=tuple(facets[key] for key in sorted(facets)),
+    detail = ResourceBatch(
+        tier=CatalogTier.DETAIL,
+        entries=tuple(entries),
         relationships=ordered_relationships,
+        truncated=structure.truncated,
+        source_revision=structure.source_revision,
     )
+    return inventory, detail
 
 
 def columns_from_rows(

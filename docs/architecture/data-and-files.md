@@ -10,7 +10,7 @@ Source types, the catalog, data queries and writes, folders and artifacts.
 ## Data, catalog and adapters
 
 The source answers; the catalog advises. `daita.catalog` stores a normalized
-snapshot of each source's structure and implements catalog search and
+entry for each resource of each source and implements catalog search and
 inspection. Data code reads the source directly. No read, export or scope check
 waits on a catalog entry or revision, and a missing, stale or unreadable catalog
 never grants or denies access. The model sees source display names and table
@@ -18,7 +18,7 @@ names, never source, resource or relationship IDs: `CapabilityRegistry.resolve_c
 turns names into IDs where a call enters the runtime, and `model_tool_result`
 renames the IDs in a result or drops those the run's scope does not name.
 
-A `CatalogRelationship` belongs to one source snapshot. A `CatalogLink` is an
+A `CatalogRelationship` belongs to one source. A `CatalogLink` is an
 agent-owned declared reference between fields of two resources, possibly in
 different sources, managed only through `Agent.declare_catalog_link`,
 `remove_catalog_link` and `list_catalog_links`; no model tool declares links.
@@ -46,7 +46,7 @@ already linked, with `status: "unconfirmed"` and the far table's
 `to_row_estimate`. A candidate is a hint. It grants no read authority and is
 never declared or stored.
 
-`catalog_search` always asks both the catalog snapshot and the live source, through
+`catalog_search` always asks both the catalog and the live source, through
 one bounded lookup of table and column names (`pg_class` and `pg_attribute` in the
 configured schemas, `sqlite_schema`, a file listing), and merges compact hits marked
 `seen_live`. `catalog_describe` takes one name and reads the live source: native
@@ -77,13 +77,27 @@ child partition can still find it. It keeps every column whatever its type, with
 `format_type` and comment. A composite primary key shows only when the role can read
 every column of it; a readable unique key still appears.
 
-Attach never fails on size. Discovery reads at most `DiscoveryRequest`'s 1,000
-tables, 512 columns and 256 indexes per table, and 2,000 relationships, and
-PostgreSQL stops reading table detail after 60 seconds. What a limit cuts stays
-reachable through the live tools, and `CatalogSync.truncated` is set. A primary key
-shows whole or not at all, and an index or foreign key that names a cut column is
-dropped. `source_directory` adds `catalog_partial` for a truncated source, so the
-model knows the object count is a floor and looks live.
+Attach never fails on size. `ResourceAdapter.reconcile` is names first: it yields
+one INVENTORY batch listing every object, up to `DiscoveryRequest.max_inventory`
+(1,000,000), then DETAIL batches that describe at most `max_resources` (1,000)
+tables, 512 columns and 256 indexes per table, and 2,000 relationships; PostgreSQL
+stops reading table detail after 60 seconds. A listed table without detail is
+cataloged by name only, still readable and describable through the live tools, and
+`CatalogSync.truncated` means detail is incomplete (or the inventory hit its cap).
+A primary key shows whole or not at all, and an index or foreign key that names a
+cut column is dropped. `source_directory` adds `catalog_partial` for a truncated
+source: the catalog lists every object but describes only some, so the model reads
+the rest live. A table with only a name cannot take a note.
+
+The catalog stores one row per resource (`catalog_resources`, with `detail` marking
+inventory or complete), one per relationship, a `catalog_search` row per table
+(its normalized words in one column matched by `LIKE`; ranking stays in Python, so
+SQLite and PostgreSQL rank alike), a change log, and one state row per source. A
+pass commits in one transaction, so a reader sees the whole old catalog or the
+whole new one. An unchanged table is never rewritten: a re-read writes only its sync
+and state rows. A table missing from a complete inventory is removed; a truncated
+inventory removes nothing, and a failed pass commits nothing. Syncs are pruned to
+the newest 20 per source, the change log to 90 days or 10,000 rows per source.
 
 PostgreSQL discovery sends five tagged statements however many tables there are:
 resources, bulk columns, bulk indexes, relationships and estimates. The two bulk
@@ -107,11 +121,12 @@ table" or "no such column"). The automatic ones run in the background through
 `EmbeddedAgent.request_source_refresh`. They take no execution lease, never block
 a read, run at most once per source per 300 seconds, and are cancelled on close.
 There is no scheduler. A miss on a schema-qualified name re-reads only that
-schema's tables on PostgreSQL and keeps the rest from the previous snapshot; the
-table listing, relationships and row estimates are always current. When the
+schema's tables on PostgreSQL (`DiscoveryRequest.scopes`) and keeps the rest from
+the source's stored entries (`previous`); the table listing, relationships and row
+estimates are always current. When the
 catalog itself failed, a lookup does not refresh.
 
-Discovery runs under the source management lock. `_source_commit_lock` covers
+A refresh runs under the source management lock. `_source_commit_lock` covers
 only the commit, so a revoke does not wait for discovery. Permission apply
 revalidates current facts rather than a catalog generation, so a sync between
 preview and apply does not force a new preview.
@@ -142,13 +157,13 @@ unknown or detached source, or an unknown link id, raises `ValueError`. It is
 on demand, not a model tool, and the host serves it at `POST /links/check` and
 `POST /links/{link_id}/check`.
 
-A catalog row that cannot be decoded while the agent is open raises
-`CatalogStoreError`, which every run path treats as advisory, so reads and approved
-writes continue. Opening a home with a damaged row succeeds, and a background
-refresh of that source replaces the row; a lookup that finds the catalog unreadable
-requests the same refresh. A
-`semantic_save` on a table with no catalog entry is refused with
-`semantic_unknown_resource`, which says reads are unaffected.
+Opening a home decodes no catalog rows. A read skips a catalog row that cannot be
+decoded as if it were absent, so reads and approved writes continue; when a
+foreground run finishes, `EmbeddedAgent` refreshes each source whose row was skipped
+in the background, and the refresh rewrites the row. A lookup that finds the catalog
+unreadable requests the same refresh. A `semantic_save` on a table with no catalog
+entry, or with only a name, is refused with `semantic_unknown_resource`, which says
+reads are unaffected.
 
 `daita.adapters` implements source admission, containment, discovery,
 freshness checks, and I/O. One composed `SourceTypeRegistry` per agent maps each
@@ -337,14 +352,14 @@ Local files reach the agent only through the `folder` source type
 folder source:
 
 - An **attached folder** (`Agent.attach(FolderSource(root, subpaths=...))`) is a
-  durable, cataloged source like any other. Discovery catalogs only its data
+  durable, cataloged source like any other. `reconcile` catalogs only its data
   files (csv, tsv, json-records, ndjson and parquet) as FILE resources, the
   FOLDER resources that hold them with `CONTAINS` edges, a `FileFacet` (format,
   media type, size, stat-based physical revision) and a `TabularFacet` read
   through the worker. Other files stay reachable only live, through the session
-  folder. Discovery is bounded by the 1,000-resource limit and a fixed walk and schema
-  budget; a discovery that reaches either commits a bounded snapshot with
-  `CatalogSync.truncated`. Attached folders are always contained to their root;
+  folder. It lists every data file up to the inventory limit and describes up to
+  1,000 within a fixed walk and schema budget; a pass that reaches either commits
+  with `CatalogSync.truncated`. Attached folders are always contained to their root;
   hosted compositions do not register the folder type. Like any source, they
   are in scope for scheduled and job runs; the session folder never is.
 - The **session folder source** is built by the composition root from the

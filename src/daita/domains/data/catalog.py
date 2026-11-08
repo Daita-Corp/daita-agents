@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
+from difflib import get_close_matches
 from hashlib import sha256
 from typing import cast
 
@@ -28,7 +29,8 @@ from ...catalog.models import (
     catalog_resource_id,
 )
 from ...catalog.protocols import CatalogStore, CatalogStoreError
-from ...catalog.service import CatalogService, CatalogTabularResource
+from ...catalog.search_text import normalize_search_text, search_key
+from ...catalog.service import TABULAR_KINDS, CatalogService, ReadableScope
 from ...llm.models import ModelSensitivity
 from ...semantics import (
     SemanticResourceFact,
@@ -44,7 +46,7 @@ from ...storage.sqlite_records import (
 from .sql import ResourceSchema
 
 _CATALOG_PARTIAL = (
-    "The catalog holds only part of this source, so the object count is a floor. "
+    "The catalog lists this source's objects but describes only some of them. "
     "catalog_search and catalog_describe read the source live."
 )
 
@@ -185,21 +187,31 @@ class CatalogDataView:
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
+        resource_ids: tuple[str, ...] | None = None,
+        first: int | None = None,
     ) -> frozenset[str]:
-        """Resolve current readable IDs without changing complete catalog truth."""
+        """Resolve current readable IDs without changing complete catalog truth.
 
-        resources = await self._admitted_resources(agent_id, source_ids)
-        return frozenset(resource.id for resource in resources)
+        Every readable ID, only those of ``resource_ids`` that are readable, or
+        the ``first`` smallest readable IDs.
+        """
+
+        found = sorted(
+            item
+            for item, _ in await self._admitted(
+                agent_id, source_ids, resource_ids, first
+            )
+        )
+        return frozenset(found if first is None else found[:first])
 
     async def non_table_resource_ids(self, agent_id: str) -> Mapping[str, str]:
         """Each view or file's ID, keyed by the ID its name hashes to as a table."""
 
         return {
-            catalog_resource_id(
-                resource.source_id, ResourceKind.TABLE, resource.native_identity
-            ): resource.id
-            for resource in await self._store.list_resources(agent_id)
-            if resource.kind is not ResourceKind.TABLE
+            catalog_resource_id(source_id, ResourceKind.TABLE, name): resource_id
+            for resource_id, source_id, name in await self._store.list_resource_names(
+                agent_id, (), other_than=ResourceKind.TABLE
+            )
         }
 
     async def source_read_access(
@@ -233,11 +245,14 @@ class CatalogDataView:
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
+        resource_ids: tuple[str, ...] | None = None,
     ) -> Mapping[str, str]:
-        """Map each current readable resource ID to the native name the model uses."""
+        """Map current readable resource IDs to the native name the model uses.
 
-        resources = await self._admitted_resources(agent_id, source_ids)
-        return {resource.id: resource.native_identity for resource in resources}
+        Every readable resource, or only ``resource_ids`` when given.
+        """
+
+        return dict(await self._admitted(agent_id, source_ids, resource_ids))
 
     async def admitted_model_sensitivity(
         self,
@@ -267,40 +282,96 @@ class CatalogDataView:
             return ModelSensitivity.PUBLIC
         return max(sensitivities, key=lambda item: item.routing_rank)
 
-    async def _admitted_resources(
+    async def _admitted(
         self,
         agent_id: str,
         source_ids: tuple[str, ...],
-    ) -> tuple[CatalogResource, ...]:
-        """Resolve the cataloged resources catalog tools and routing may show."""
+        resource_ids: tuple[str, ...] | None = None,
+        first: int | None = None,
+    ) -> list[tuple[str, str]]:
+        """(ID, native name) of the readable resources, or of those of ``resource_ids``.
 
-        admitted: list[CatalogResource] = []
-        for registration in await self._active_registrations(agent_id, source_ids):
-            scope = await self._sources.load_source_read_scope(
-                agent_id,
-                registration.id,
+        A source read in full is listed by columns alone; a source with chosen
+        tables loads only those, and a stale chosen ID never matches.
+        """
+
+        access = await self.source_read_access(agent_id, source_ids)
+        admitted: list[tuple[str, str]] = []
+        chosen = resource_ids
+        if chosen is None:
+            open_sources = tuple(
+                sorted(item for item, ids in access.items() if ids is None)
             )
-            if scope is None:
-                raise SourcePermissionStateError(
-                    "active source is missing its read scope"
+            if open_sources:
+                admitted.extend(
+                    (resource_id, name)
+                    for resource_id, _, name in await self._store.list_resource_names(
+                        agent_id, open_sources, limit=first
+                    )
                 )
-            self._require_owned_read_scope(registration.id, agent_id, scope)
-            current = tuple(
-                resource
-                for resource in await self._store.list_resources(
-                    agent_id,
-                    registration.id,
-                )
-                if resource.agent_id == agent_id
-                and resource.source_id == registration.id
+            chosen = tuple(
+                sorted({item for ids in access.values() if ids for item in ids})
             )
-            if scope.mode is SourceReadMode.ALL:
-                admitted.extend(current)
-            else:
-                # A stored ID for a table that no longer exists simply never matches.
-                selected = frozenset(scope.resource_ids)
-                admitted.extend(item for item in current if item.id in selected)
-        return tuple(admitted)
+        for entry in await self._store.load_entries(agent_id, chosen) if chosen else ():
+            resource = entry.resource
+            if (
+                resource.agent_id == agent_id
+                and resource.source_id in access
+                and (
+                    (resource_ids is not None and access[resource.source_id] is None)
+                    or (
+                        access[resource.source_id] is not None
+                        and resource.id
+                        in cast(frozenset[str], access[resource.source_id])
+                    )
+                )
+            ):
+                admitted.append((resource.id, resource.native_identity))
+        return admitted
+
+    async def _service_readable(
+        self, agent_id: str, source_ids: tuple[str, ...]
+    ) -> frozenset[str] | None:
+        """The readable scope the catalog service filters by: None when nothing
+        is restricted, otherwise the chosen tables plus the sources read in full
+        (never a listing of those)."""
+
+        access = await self.source_read_access(agent_id, source_ids)
+        open_sources = frozenset(item for item, ids in access.items() if ids is None)
+        if (
+            access
+            and len(open_sources) == len(access)
+            and (
+                source_ids
+                or all(
+                    registration.id in access
+                    for registration in await self._sources.list_sources(agent_id)
+                    if registration.agent_id == agent_id and registration.active
+                )
+            )
+        ):
+            return None
+        chosen = tuple(sorted({item for ids in access.values() if ids for item in ids}))
+        return ReadableScope(
+            (
+                entry.resource.id
+                for entry in (
+                    await self._store.load_entries(agent_id, chosen) if chosen else ()
+                )
+                if entry.resource.agent_id == agent_id
+                and entry.resource.id in (access.get(entry.resource.source_id) or ())
+            ),
+            open_sources,
+        )
+
+    @staticmethod
+    def _admits(
+        access: Mapping[str, frozenset[str] | None], resource: CatalogResource
+    ) -> bool:
+        if resource.source_id not in access:
+            return False
+        ids = access[resource.source_id]
+        return ids is None or resource.id in ids
 
     async def _active_registrations(
         self, agent_id: str, source_ids: tuple[str, ...]
@@ -362,20 +433,12 @@ class CatalogDataView:
     ) -> tuple[int | None, bool]:
         """(object count, whether the catalog holds only part of the source)."""
 
-        count = 0
-        partial = False
         try:
-            for ref in await self._store.list_current_snapshot_refs(
-                agent_id, (source_id,)
-            ):
-                snapshot = await self._store.load_current_snapshot(ref)
-                if snapshot is None:  # a sync replaced it while reading
-                    return None, False
-                count += len(snapshot.resources)
-                partial = partial or snapshot.sync.truncated
+            syncs = await self._store.current_syncs(agent_id, (source_id,))
+            summary = await self._store.summarize_catalog(agent_id, (source_id,))
         except CatalogStoreError:
             return None, False
-        return count, partial
+        return summary.resource_count, any(sync.truncated for sync in syncs)
 
     async def source_directory(
         self, agent_id: str, source_ids: tuple[str, ...]
@@ -412,19 +475,25 @@ class CatalogDataView:
     ) -> tuple[Mapping[str, object], ...]:
         """Ranked matches from the catalog snapshot, with their column summaries."""
 
-        readable = await self.readable_resource_ids(
-            request.agent_id, request.source_ids
-        )
+        readable = await self._service_readable(request.agent_id, request.source_ids)
         result = await self._service.search(request, readable_resource_ids=readable)
-        names = await self.resource_names(request.agent_id, request.source_ids)
         matched = [
             hit for hit in result.hits if "unmatched_fallback" not in hit.match_reasons
         ]
+        names = await self.resource_names(
+            request.agent_id,
+            request.source_ids,
+            tuple(hit.resource_id for hit in matched),
+        )
         tabular = {
             item.resource.id: item.tabular
             for source_id in {hit.source_id for hit in matched}
             for item in await self._service.tabular_resources(
-                request.agent_id, source_id
+                request.agent_id,
+                source_id,
+                resource_ids=tuple(
+                    hit.resource_id for hit in matched if hit.source_id == source_id
+                ),
             )
         }
         hits: list[Mapping[str, object]] = []
@@ -457,27 +526,45 @@ class CatalogDataView:
 
         if source_id == self.session_source_id:
             return None
-        readable = await self.readable_resource_ids(agent_id, (source_id,))
+        access = await self.source_read_access(agent_id, (source_id,))
         folded = name.lower()
+        spellings = (name, folded, f"main.{folded}")
         current = tuple(
             item
-            for item in await self._service.tabular_resources(agent_id, source_id)
-            if item.resource.id in readable
+            for item in await self._service.tabular_resources(
+                agent_id, source_id, identities=spellings
+            )
+            if self._admits(access, item.resource)
         )
         found = next(
             (
                 item
-                for spelling in (name, folded, f"main.{folded}")
+                for spelling in spellings
                 for item in current
                 if item.resource.native_identity == spelling
             ),
             None,
         )
         if found is None:
+            # An unqualified name sits in some schema: its resource is named so.
+            rows = await self._store.search_catalog(
+                agent_id, (source_id,), terms=(), anchor_keys=(search_key(name),)
+            )
+            ids = tuple(
+                row.resource_id
+                for row in rows
+                if row.detailed and row.native_identity.endswith(f".{name}")
+            )
             suffixed = [
                 item
-                for item in current
-                if item.resource.native_identity.endswith(f".{name}")
+                for item in (
+                    await self._service.tabular_resources(
+                        agent_id, source_id, resource_ids=ids
+                    )
+                    if ids
+                    else ()
+                )
+                if self._admits(access, item.resource)
             ]
             if len(suffixed) != 1:
                 return None
@@ -513,7 +600,7 @@ class CatalogDataView:
                 if index.unique and index.predicate is None
             ],
             "relationships": await self._cataloged_relationships(
-                agent_id, source_id, found.resource.id, current
+                agent_id, source_id, found.resource.id
             ),
         }
 
@@ -573,19 +660,49 @@ class CatalogDataView:
                             left,
                         )
                     )
-        readable = await self.readable_resource_ids(agent_id)
+        access = await self.source_read_access(agent_id, ())
+        # Where a match can be: a table named for the column's stem, or a column
+        # that starts the way the key column does (found by the search table).
+        stems = {own.removesuffix("_id") for own in key_like if own.endswith("_id")}
+        bare_names = {stem + plural for stem in stems for plural in ("", "s")}
+        anchors = tuple(dict.fromkeys(search_key(name) for name in bare_names))
+        terms = tuple(
+            dict.fromkeys(
+                "".join(normalize_search_text(own).tokens)[:3] for own in key_like
+            )
+        )
         found: dict[tuple[str, str, str, str], Mapping[str, object]] = {}
         for registration in await self._active_registrations(agent_id, ()):
             if registration.id == source_id:
                 continue
             try:
-                resources = await self._service.tabular_resources(
-                    agent_id, registration.id
+                rows = await self._store.search_catalog(
+                    agent_id, (registration.id,), terms=terms, anchor_keys=anchors
+                )
+                ids = tuple(
+                    row.resource_id
+                    for row in rows
+                    if row.detailed
+                    and (
+                        row.native_identity.rsplit(".", 1)[-1].lower() in bare_names
+                        or any(
+                            posting.field_kind == "column"
+                            and posting.value.lower() in key_like
+                            for posting in row.postings
+                        )
+                    )
+                )
+                resources = (
+                    await self._service.tabular_resources(
+                        agent_id, registration.id, resource_ids=ids
+                    )
+                    if ids
+                    else ()
                 )
             except CatalogStoreError:
                 continue
             for item in resources:
-                if item.resource.id not in readable:
+                if not self._admits(access, item.resource):
                     continue
                 target = item.resource.native_identity
                 bare = target.rsplit(".", 1)[-1].lower()
@@ -641,12 +758,11 @@ class CatalogDataView:
         agent_id: str,
         source_id: str,
         resource_id: str,
-        current: Sequence[CatalogTabularResource],
     ) -> list[Mapping[str, object]]:
         """Relationships by name, including links declared across sources."""
 
         # Every source's readable set: a declared link needs its far endpoint.
-        readable = await self.readable_resource_ids(agent_id)
+        readable = await self._service_readable(agent_id, ())
         projection = await self._service.schema_slice(
             CatalogSchemaRequest(
                 agent_id=agent_id,
@@ -659,34 +775,46 @@ class CatalogDataView:
             ),
             readable_resource_ids=readable,
         )
-        known = {
-            item.id: item
-            for item in await self._store.list_resources(agent_id)
-            if item.agent_id == agent_id
-        }
         relationships: list[Mapping[str, object]] = []
         raws = cast(
             tuple[Mapping[str, object], ...], projection.get("relationships", ())
         )
-        # One lookup per other source; a resource past its catalog budget has none.
-        estimates = {
-            item.resource.id: item.tabular.row_count_estimate for item in current
+        known = {
+            entry.resource.id: entry.resource
+            for entry in await self._store.load_entries(
+                agent_id,
+                tuple(
+                    {
+                        cast(str, raw.get(key))
+                        for raw in raws
+                        for key in ("from_resource_id", "to_resource_id")
+                    }
+                ),
+            )
+            if entry.resource.agent_id == agent_id
         }
-        for other in {
-            end.source_id
-            for raw in raws
-            for key in ("from_resource_id", "to_resource_id")
-            if (end := known.get(cast(str, raw.get(key)))) is not None
-            and end.source_id != source_id
-        }:
+        # One lookup per source holding an end; a resource past its catalog
+        # budget has none.
+        access = await self.source_read_access(agent_id, ())
+        estimates: dict[str, int | None] = {}
+        for end_source in {end.source_id for end in known.values()}:
             try:
                 estimates.update(
                     (item.resource.id, item.tabular.row_count_estimate)
-                    for item in await self._service.tabular_resources(agent_id, other)
-                    if item.resource.id in readable
+                    for item in await self._service.tabular_resources(
+                        agent_id,
+                        end_source,
+                        resource_ids=tuple(
+                            end.id
+                            for end in known.values()
+                            if end.source_id == end_source
+                        ),
+                    )
+                    if self._admits(access, item.resource)
                 )
             except CatalogStoreError:
-                pass
+                if end_source == source_id:
+                    raise
         for raw in raws:
             start = known.get(cast(str, raw.get("from_resource_id")))
             end = known.get(cast(str, raw.get("to_resource_id")))
@@ -768,8 +896,13 @@ class CatalogDataView:
         self,
         agent_id: str,
         source_id: str,
+        resource_ids: tuple[str, ...] | None = None,
     ) -> tuple[ResourceSchema, ...]:
-        tabular_resources = await self._service.tabular_resources(agent_id, source_id)
+        """One source's tabular schemas, or only those of ``resource_ids``."""
+
+        tabular_resources = await self._service.tabular_resources(
+            agent_id, source_id, resource_ids=resource_ids
+        )
         schemas: list[ResourceSchema] = []
         for item in tabular_resources:
             resource = item.resource
@@ -863,6 +996,69 @@ class CatalogDataView:
             )
         return tuple(sorted(schemas, key=lambda item: (item.name, item.resource_id)))
 
+    async def close_table_names(
+        self,
+        agent_id: str,
+        source_id: str,
+        relations: Sequence[str],
+        *,
+        count: int,
+        cutoff: float,
+    ) -> tuple[str, ...]:
+        """Readable table names close to each of ``relations``, best first.
+
+        For a refusal: the source's names are listed by columns alone, and only
+        the close ones are checked against their descriptions.
+        """
+
+        access = await self.source_read_access(agent_id, (source_id,))
+        if source_id not in access:
+            return ()
+        if (allowed := access[source_id]) is None:
+            rows = await self._store.search_catalog(agent_id, (source_id,), terms=None)
+            listed = [
+                (row.resource_id, row.name, row.native_identity)
+                for row in rows
+                if row.detailed and row.kind in TABULAR_KINDS
+            ]
+        else:
+            listed = [
+                (entry.resource.id, entry.resource.name, entry.resource.native_identity)
+                for entry in await self._store.load_entries(
+                    agent_id, tuple(sorted(allowed))
+                )
+                if entry.detailed
+                and entry.resource.source_id == source_id
+                and entry.resource.kind in TABULAR_KINDS
+            ]
+        # A name like "schema.table" shows in full, any other by its own name.
+        pool = {
+            resource_id: native if "." in native and native != name else name
+            for resource_id, name, native in listed
+        }
+        suggestions: dict[str, None] = {}
+        for relation in relations:
+            candidates = dict(pool)
+            while candidates:
+                close = get_close_matches(
+                    relation, list(candidates.values()), n=count, cutoff=cutoff
+                )
+                held = [i for i, name in candidates.items() if name in close]
+                described = {
+                    item.resource.id
+                    for item in await self._service.tabular_resources(
+                        agent_id, source_id, resource_ids=tuple(held)
+                    )
+                }
+                if all(i in described for i in held):
+                    suggestions.update(dict.fromkeys(close))
+                    break
+                # A name without a table description is no suggestion; look on.
+                for resource_id in held:
+                    if resource_id not in described:
+                        del candidates[resource_id]
+        return tuple(suggestions)
+
     async def source_adapter_id(
         self,
         agent_id: str,
@@ -921,14 +1117,13 @@ class CatalogDataView:
     ) -> tuple[str, str, ModelSensitivity] | None:
         """Return one exact current readable resource-revision observation fact."""
 
-        readable = await self.readable_resource_ids(agent_id, (source_id,))
-        if resource_id not in readable:
-            return None
         resource = await self._store.load_resource(agent_id, resource_id)
+        access = await self.source_read_access(agent_id, (source_id,))
         if (
             resource is None
             or resource.agent_id != agent_id
             or resource.source_id != source_id
+            or not self._admits(access, resource)
             or resource.sensitivity is Sensitivity.UNKNOWN
         ):
             return None
@@ -950,22 +1145,32 @@ class CatalogDataView:
             not isinstance(item, str) or not item for item in requested
         ):
             raise ValueError("semantic resource IDs must be bounded non-empty strings")
-        readable = await self.readable_resource_ids(agent_id)
+        access = await self.source_read_access(agent_id, ())
         registrations = {
             item.id: item
             for item in await self._sources.list_sources(agent_id)
             if item.agent_id == agent_id and item.active
         }
+        # A name-only entry has no fields to hold a note, so it is unknown here.
         resources = {
-            item.id: item
-            for item in await self._store.list_resources(agent_id)
-            if item.id in requested
-            and item.id in readable
-            and item.source_id in registrations
+            entry.resource.id: entry.resource
+            for entry in await self._store.load_entries(agent_id, requested)
+            if entry.detailed
+            and entry.resource.agent_id == agent_id
+            and self._admits(access, entry.resource)
+            and entry.resource.source_id in registrations
         }
         fields_by_id: dict[str, tuple[str, ...]] = {}
         for source_id in sorted({item.source_id for item in resources.values()}):
-            for schema in await self.resource_schemas(agent_id, source_id):
+            for schema in await self.resource_schemas(
+                agent_id,
+                source_id,
+                tuple(
+                    item.id
+                    for item in resources.values()
+                    if item.source_id == source_id
+                ),
+            ):
                 fields_by_id[schema.resource_id] = schema.columns
         return tuple(
             SemanticResourceFact(
@@ -999,7 +1204,7 @@ class CatalogDataView:
             sorted({item.subject.resource_ids[0] for item in annotations})
         )
         facts = await self.semantic_resource_facts(agent_id, resource_ids)
-        names = await self.resource_names(agent_id, (source_id,))
+        names = await self.resource_names(agent_id, (source_id,), resource_ids)
         notes: dict[str, list[str]] = {}
         for view in inspect_semantic_annotations(annotations, facts):
             name = names.get(view.annotation.subject.resource_ids[0])

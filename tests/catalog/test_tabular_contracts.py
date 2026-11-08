@@ -147,27 +147,25 @@ async def test_catalog_boundary_rejects_malformed_tabular_payload(
         source = await agent.attach(SQLiteSource(database))
         store = agent._embedded._store
         service = agent._embedded._catalog_service
-        refs = await store.list_current_snapshot_refs(agent.id, (source.id,))
-        assert len(refs) == 1
-        snapshot = await store.load_current_snapshot(refs[0])
-        assert snapshot is not None
-        facet = next(item for item in snapshot.facets if item.kind.value == "tabular")
+        entries = await store.list_entries(agent.id, source.id)
+        assert len(entries) == 1
+        entry = entries[0]
+        facet = next(item for item in entry.facets if item.kind.value == "tabular")
         malformed_facet = replace(
             facet,
             payload={**facet.payload, "unexpected": None},
         )
-        malformed_snapshot = replace(
-            snapshot,
+        malformed = replace(
+            entry,
             facets=tuple(
-                malformed_facet if item is facet else item for item in snapshot.facets
+                malformed_facet if item is facet else item for item in entry.facets
             ),
         )
 
-        async def load_malformed(_ref):
-            return malformed_snapshot
+        async def list_malformed(_agent_id, _source_id):
+            return (malformed,)
 
-        service._source_indexes.clear()
-        monkeypatch.setattr(store, "load_current_snapshot", load_malformed)
+        monkeypatch.setattr(store, "list_entries", list_malformed)
         with pytest.raises(CatalogStoreError, match="invalid structure"):
             await service.tabular_resources(agent.id, source.id)
     finally:
