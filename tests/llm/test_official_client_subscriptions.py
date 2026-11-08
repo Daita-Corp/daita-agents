@@ -661,9 +661,12 @@ def _process_exists(process_id: int) -> bool:
 
 async def _wait_for_file(path: Path) -> int:
     async with asyncio.timeout(2):
-        while not path.exists():
+        while True:
+            # The child creates the file before its write lands.
+            text = path.read_text(encoding="ascii") if path.exists() else ""
+            if text:
+                return int(text)
             await asyncio.sleep(0.01)
-    return int(path.read_text(encoding="ascii"))
 
 
 async def _wait_for_process_exit(process_id: int) -> None:
