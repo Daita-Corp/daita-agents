@@ -42,7 +42,7 @@ from ..storage.sqlite_records import (
     SourceReadMode,
     SourceReadScope,
 )
-from .models import SourceRegistration
+from .models import SourceProbe, SourceRegistration
 from .postgresql import (
     COLUMNS_SQL,
     FOREIGN_KEYS_FROM_SQL,
@@ -58,6 +58,7 @@ from .postgresql import (
     _connect,
     _rollback_postgresql_transaction,
     columns_from_rows,
+    probe_tokens,
 )
 from .protocols import (
     DESCRIBE_MAX_COLUMNS,
@@ -984,6 +985,52 @@ class PostgreSQLQueryBackend:
             await self._finish_read(
                 connection, pool_entry, transaction, finished, read_deadline
             )
+
+    async def probe(
+        self, *, agent_id: str, source_id: str, cursor: str | None
+    ) -> SourceProbe:
+        """One token per configured schema the role can use, on a pooled connection.
+
+        Not bound by the read scope: it reports hashes of names and structure only.
+        """
+
+        del cursor
+        connection = None
+        pool_entry = None
+        read_deadline = None
+        finished = False
+        try:
+            registration, read_scope = await self._current_source(agent_id, source_id)
+            async with self._operation(_LOOKUP_SECONDS) as read_deadline:
+                connection, pool_entry = await self._connection(
+                    registration, read_scope
+                )
+                tokens = await probe_tokens(
+                    connection,
+                    _configuration_schemas(registration.configuration),
+                    timeout=_LOOKUP_SECONDS,
+                )
+                finished = True
+            return SourceProbe(checked_at=datetime.now(UTC), tokens=tokens)
+        except asyncio.CancelledError:
+            raise
+        except PostgreSQLQueryError as error:
+            raise PostgreSQLSourceError(
+                error.code,
+                "The PostgreSQL source could not be probed.",
+                source_id=source_id,
+            ) from None
+        except TimeoutError:
+            code = "postgresql_probe_timeout"
+        except Exception:
+            code = "postgresql_probe_failed"
+        finally:
+            await self._finish_read(
+                connection, pool_entry, None, finished, read_deadline
+            )
+        raise PostgreSQLSourceError(
+            code, "The PostgreSQL source could not be probed.", source_id=source_id
+        )
 
     async def search_names(
         self, *, agent_id: str, source_id: str, words: tuple[str, ...], limit: int

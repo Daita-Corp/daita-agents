@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from daita.catalog.models import (
     CatalogEntry,
@@ -11,6 +13,7 @@ from daita.catalog.models import (
     CatalogRelationship,
     CatalogResource,
     CatalogResourceRevision,
+    CatalogSourceState,
     CatalogSync,
     CatalogSyncStatus,
     CatalogTier,
@@ -211,3 +214,104 @@ SHOP_REFERENCES = (
     ("main.orders", "customer_id", "main.customers", "id"),
     ("main.invoices", "order_id", "main.orders", "id"),
 )
+
+
+def _listed(entry: CatalogEntry, sync_id: str) -> CatalogEntry:
+    """The same resource as a bare listing: no facets, so no description."""
+
+    old = entry.resource
+    revision = CatalogResourceRevision.build(
+        resource_id=old.id, sync_id=sync_id, observed_at=OBSERVED_AT
+    )
+    resource = CatalogResource.build(
+        agent_id=old.agent_id,
+        source_id=old.source_id,
+        native_identity=old.native_identity,
+        external_uri=old.external_uri,
+        kind=old.kind,
+        name=old.name,
+        sensitivity=old.sensitivity,
+        revision=revision,
+        first_observed_at=old.first_observed_at,
+        last_observed_at=old.last_observed_at,
+    )
+    return CatalogEntry(resource, revision, (), detailed=False)
+
+
+async def exercise_keeper_state(store, agent_id: str, source_id: str, register) -> None:
+    """The keeper's storage contract, run against any ``SQLStateStore``.
+
+    ``register`` attaches the source (the store refuses state for unknown ones).
+    """
+
+    probed = OBSERVED_AT + timedelta(minutes=5)
+    with pytest.raises(ValueError):
+        await store.save_source_state(CatalogSourceState(agent_id, source_id, "s"))
+    await register()
+
+    def listed(value):
+        return ResourceBatch(
+            tier=CatalogTier.INVENTORY,
+            entries=tuple(_listed(e, value.sync.id) for e in entries(value)),
+        )
+
+    async def truncated() -> bool:
+        (sync,) = await store.current_syncs(agent_id, (source_id,))
+        return sync.truncated
+
+    value = snapshot(agent_id, source_id, "sync-1", SHOP, SHOP_REFERENCES)
+    total = len(value.resources)
+    detail = batches(value)[0]
+    # A listing alone leaves the catalog without detail, and says so.
+    await store.commit_catalog(value.sync, (listed(value),))
+    assert await store.catalog_detail_counts(agent_id, source_id) == (total, 0)
+    assert await truncated()
+    # Describing some rows keeps it true; the last description clears it.
+    some = replace(detail, entries=detail.entries[:2], relationships=())
+    await store.commit_catalog(replace(value.sync, id="sync-2"), (listed(value), some))
+    assert await store.catalog_detail_counts(agent_id, source_id) == (total, 2)
+    assert await truncated()
+    await store.commit_catalog(
+        replace(value.sync, id="sync-3"),
+        (listed(value), detail),
+        probe_tokens={"main": "a"},
+        probed_at=probed,
+    )
+    assert await store.catalog_detail_counts(agent_id, source_id) == (total, total)
+    assert not await truncated()
+
+    state = await store.load_source_state(agent_id, source_id)
+    assert state is not None
+    assert (dict(state.probe_tokens), state.last_probe_at) == ({"main": "a"}, probed)
+
+    # A commit without tokens keeps them (and the error); one with tokens clears it.
+    await store.save_source_state(replace(state, last_error_code="unreachable"))
+    await store.commit_catalog(replace(value.sync, id="sync-4"), batches(value))
+    kept = await store.load_source_state(agent_id, source_id)
+    assert kept is not None
+    assert (dict(kept.probe_tokens), kept.last_error_code) == (
+        {"main": "a"},
+        "unreachable",
+    )
+    await store.commit_catalog(
+        replace(value.sync, id="sync-5"),
+        batches(value),
+        probe_tokens={"main": "b"},
+        probed_at=probed,
+    )
+    moved = await store.load_source_state(agent_id, source_id)
+    assert moved is not None
+    assert (dict(moved.probe_tokens), moved.last_error_code) == ({"main": "b"}, None)
+    for options in ({"probe_tokens": {"main": "c"}}, {"probed_at": probed}):
+        with pytest.raises(ValueError):
+            await store.commit_catalog(
+                replace(value.sync, id="sync-6"), batches(value), **options
+            )
+    assert (await store.load_source_state(agent_id, source_id)) == moved
+
+    # save_source_state changes the state row alone.
+    await store.save_source_state(replace(moved, keep_current=False))
+    saved = await store.load_source_state(agent_id, source_id)
+    assert saved is not None and not saved.keep_current
+    assert await store.catalog_detail_counts(agent_id, source_id) == (total, total)
+    assert await store.catalog_detail_counts(agent_id, "source:none") == (0, 0)

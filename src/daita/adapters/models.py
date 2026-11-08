@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
+from types import MappingProxyType
 from typing import TypeVar
 
 from .._json import FrozenJsonObject, canonical_json
@@ -197,6 +198,9 @@ class DiscoveryRequest:
         default=None, repr=False, compare=False
     )
     max_inventory: int = 1_000_000
+    # With previous entries: keep every detailed one that is still listed and
+    # describe up to max_resources listed resources that lack detail.
+    fill: bool = False
 
     def __post_init__(self) -> None:
         _text(self.agent_id, "discovery agent_id")
@@ -239,6 +243,8 @@ class DiscoveryRequest:
             )
         ):
             raise ValueError("discovery previous entries belong to another source")
+        if not isinstance(self.fill, bool) or (self.fill and self.previous is None):
+            raise ValueError("discovery fill needs previous entries")
 
     def inventory_entry(
         self,
@@ -439,6 +445,40 @@ class SourceHealth:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceProbe:
+    """What one cheap change probe saw: names and hashes, never data.
+
+    ``tokens`` maps a scope name (a PostgreSQL schema; ``main`` for SQLite; ``.``
+    for a folder) to a bounded token that moves when anything the catalog stores
+    for that scope would change. A delta source also reports where its
+    ``cursor`` stands and which scopes ``changed`` since the cursor it was given.
+    """
+
+    checked_at: datetime
+    tokens: Mapping[str, str]
+    cursor: str | None = None
+    changed: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        _aware(self.checked_at, "probe checked_at")
+        if not isinstance(self.tokens, Mapping):
+            raise TypeError("probe tokens must be a mapping")
+        for scope, token in self.tokens.items():
+            _text(scope, "probe scope")
+            _text(token, "probe token", maximum=256)
+        object.__setattr__(
+            self, "tokens", MappingProxyType(dict(sorted(self.tokens.items())))
+        )
+        if self.cursor is not None:
+            _text(self.cursor, "probe cursor", maximum=1_024)
+        if self.changed is not None:
+            if not isinstance(self.changed, tuple):
+                raise TypeError("probe changed must be a tuple")
+            for scope in self.changed:
+                _text(scope, "probe changed scope")
+
+
+@dataclass(frozen=True, slots=True)
 class LinkCheck:
     """What a live read says about how well two columns join.
 
@@ -485,6 +525,7 @@ __all__ = [
     "ResourceRef",
     "ResourceSnapshot",
     "SourceHealth",
+    "SourceProbe",
     "SourceRegistration",
     "source_registration_id",
 ]

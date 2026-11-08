@@ -28,6 +28,7 @@ from ..catalog.models import (
     CatalogResource,
     CatalogResourceRevision,
     CatalogTier,
+    FacetKind,
     FileFacet,
     RelationshipKind,
     RelationshipProvenance,
@@ -59,6 +60,7 @@ from .models import (
     ResourceRef,
     ResourceSnapshot,
     SourceHealth,
+    SourceProbe,
     SourceRegistration,
 )
 from .protocols import (
@@ -96,6 +98,7 @@ _DESCRIBE_BATCH_FILES = 32
 # out of either commits a snapshot marked truncated.
 _DISCOVERY_SECONDS = 60.0
 _RUN_ID = "folder-source"
+_PROBE_SECONDS = 5.0
 
 
 class FolderSourceError(DaitaError):
@@ -381,40 +384,18 @@ async def _discover(
         raise LocalWorkspaceError(
             "folder_unavailable", "The folder root is unavailable."
         )
-    result = await backend.search(
-        run_id=_RUN_ID,
-        paths=subpaths or None,
-        mode="paths",
-        glob="*",
-        order_by="path",
-        structured_only=True,
-    )
+    result = await _scan(backend, subpaths)
     inventory_truncated = result.truncated
     folders: list[str] = ["."]
     seen_folders = {"."}
     files: list[tuple[str, str, int, datetime]] = []
-    # Detail covers a prefix of the walk; the inventory continues past it.
-    detail_folders, detail_files = 1, 0
-    detail_cut = False
     for match in result.matches:
-        parents = [
-            parent.as_posix()
-            for parent in reversed(PurePosixPath(match.path).parents)
-            if parent.as_posix() != "."
+        missing = [
+            item for item in _parent_folders(match.path) if item not in seen_folders
         ]
-        missing = [item for item in parents if item not in seen_folders]
         if len(folders) + len(files) + len(missing) + 1 > request.max_inventory:
             inventory_truncated = True
             break
-        # One resource per file and missing folder; one CONTAINS edge each.
-        needed = detail_folders + detail_files + len(missing) + 1
-        if not detail_cut and (
-            needed > request.max_resources or needed - 1 > request.max_relationships
-        ):
-            detail_cut = True
-        if not detail_cut:
-            detail_folders += len(missing)
-            detail_files += 1
         folders.extend(missing)
         seen_folders.update(missing)
         files.append(
@@ -443,10 +424,61 @@ async def _discover(
         entries=inventory_entries,
         truncated=inventory_truncated,
     )
-    folders = folders[:detail_folders]
-    files = files[:detail_files]
+    # A file whose revision the scanner proves unchanged keeps its previous schema.
+    kept: dict[str, tuple[object, TabularFacet]] = {}
+    for entry in request.previous or ():
+        if entry.detailed and entry.resource.kind is ResourceKind.FILE:
+            file_facet = next(
+                (item for item in entry.facets if item.kind is FacetKind.FILE), None
+            )
+            tabular = next(
+                (item for item in entry.facets if item.kind is FacetKind.TABULAR),
+                None,
+            )
+            if file_facet is not None and tabular is not None:
+                kept[entry.resource.native_identity] = (
+                    file_facet.payload.get("physical_revision"),
+                    TabularFacet.from_payload(tabular.payload),
+                )
+    # Detail covers a prefix of the walk, or with fill every kept file plus up to
+    # max_resources that lack detail; the inventory continues past it.
+    detail_folders: list[str] = ["."]
+    detail_seen = {"."}
+    detail_files: list[tuple[str, str, int, datetime]] = []
+    detail_cut = False
+    fresh = 0
+    for candidate in files:
+        new = [
+            folder
+            for folder in _parent_folders(candidate[0])
+            if folder not in detail_seen
+        ]
+        needed = len(detail_folders) + len(detail_files) + len(new) + 1
+        is_kept = kept.get(candidate[0], (None,))[0] == candidate[1]
+        if needed - 1 > request.max_relationships:
+            detail_cut = True
+            continue
+        if request.fill:
+            if not is_kept and fresh >= request.max_resources:
+                detail_cut = True
+                continue
+            fresh += not is_kept
+        elif detail_cut or needed > request.max_resources:
+            detail_cut = True
+            continue
+        detail_folders.extend(new)
+        detail_seen.update(new)
+        detail_files.append(candidate)
+    folders, files = detail_folders, detail_files
     truncated = detail_cut
-    schemas, described_all = await _describe(backend, tuple(path for path, *_ in files))
+    schemas, described_all = await _describe(
+        backend,
+        tuple(
+            path
+            for path, revision, *_ in files
+            if kept.get(path, (None,))[0] != revision
+        ),
+    )
     # A data file left without its schema is an incomplete catalog.
     truncated = truncated or not described_all
 
@@ -498,8 +530,20 @@ async def _discover(
             ),
         )
         own = [file_facet]
+        previous_tabular = (
+            kept[path][1] if kept.get(path, (None,))[0] == physical_revision else None
+        )
         columns = schemas.get(path)
-        if columns and len(columns) <= request.max_columns_per_resource:
+        if previous_tabular is not None:
+            own.append(
+                CatalogFacet.from_tabular(
+                    resource_id=identifier,
+                    sync_id=sync_id,
+                    observed_at=observed_at,
+                    facet=previous_tabular,
+                )
+            )
+        elif columns and len(columns) <= request.max_columns_per_resource:
             own.append(
                 CatalogFacet.from_tabular(
                     resource_id=identifier,
@@ -572,6 +616,27 @@ async def _discover(
         source_revision=root_revision,
     )
     return inventory, detail
+
+
+def _parent_folders(path: str) -> list[str]:
+    return [
+        parent.as_posix()
+        for parent in reversed(PurePosixPath(path).parents)
+        if parent.as_posix() != "."
+    ]
+
+
+async def _scan(backend: LocalWorkspaceBackend, subpaths: tuple[str, ...]):
+    """Every data file discovery would catalog, from the one scanner."""
+
+    return await backend.search(
+        run_id=_RUN_ID,
+        paths=subpaths or None,
+        mode="paths",
+        glob="*",
+        order_by="path",
+        structured_only=True,
+    )
 
 
 async def _describe(
@@ -1012,6 +1077,50 @@ class FolderBackend:
         finally:
             manifest.close()
         return result, paths, source
+
+    async def probe(
+        self, *, agent_id: str, source_id: str, cursor: str | None
+    ) -> SourceProbe:
+        """One stat walk over what discovery would catalog, hashed."""
+
+        del cursor
+        registration = await self._store.load_source(agent_id, source_id)
+        if (
+            registration is None
+            or not registration.active
+            or registration.adapter_id != FOLDER_ADAPTER_ID
+            or self._home is None
+        ):
+            raise ResourceAdapterError(
+                source_id, "folder_unavailable", "The folder source is unavailable."
+            )
+        source = folder_source_from_registration(registration)
+        try:
+            backend = await LocalWorkspaceBackend.open(
+                source.workspace(),
+                agent_root=self._home.parent.parent,
+                agent_home=self._home,
+                limits=LocalWorkspaceLimits(
+                    max_search_results=1_000_000,
+                    max_search_entries=1_000_000,
+                    max_search_seconds=_PROBE_SECONDS,
+                ),
+                clock=self._clock,
+            )
+            try:
+                result = await _scan(backend, source.subpaths)
+            finally:
+                await backend.close()
+        except LocalWorkspaceError as error:
+            raise ResourceAdapterError(source_id, error.code, error.message) from None
+        if "time_limit" in result.truncation_reasons:
+            raise ResourceAdapterError(
+                source_id, "folder_probe_timeout", "The folder walk ran out of time."
+            )
+        digest = sha256(str(result.truncated).encode())
+        for match in result.matches:
+            digest.update(f"\0{match.path}\0{match.physical_revision}".encode())
+        return SourceProbe(checked_at=self._clock(), tokens={".": digest.hexdigest()})
 
     async def retire_source(self, agent_id: str, source_id: str) -> None:
         del agent_id

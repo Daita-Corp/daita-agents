@@ -44,7 +44,12 @@ from ..artifacts.models import (
     ArtifactRef,
 )
 from ..capabilities import ApprovalDecision, ApprovalHandler
-from ..catalog.models import CatalogResource, CatalogSummary
+from ..catalog.models import (
+    CatalogChange,
+    CatalogResource,
+    CatalogStatus,
+    CatalogSummary,
+)
 from ..distribution import DeliveryInspection, DeliveryView
 from ..hosting.embedded import (
     EmbeddedAgent,
@@ -1284,6 +1289,21 @@ class RemoteAgent:
         self, *, source_id: str | None = None
     ) -> tuple[CatalogResource, ...]:
         return await self._call("list_catalog_resources", locals())
+
+    async def catalog_status(
+        self, source_id: str, *, check: bool = False
+    ) -> CatalogStatus:
+        return await self._call("catalog_status", locals())
+
+    async def catalog_changes(
+        self, source_id: str, *, limit: int = 50
+    ) -> tuple[CatalogChange, ...]:
+        return await self._call("catalog_changes", locals())
+
+    async def set_keep_current(
+        self, source_id: str, keep_current: bool
+    ) -> CatalogStatus:
+        return await self._call("set_keep_current", locals())
 
     async def catalog_summary(self) -> CatalogSummary:
         return await self._call("catalog_summary", locals())

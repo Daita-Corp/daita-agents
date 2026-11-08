@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from daita.adapters.models import SourceRegistration, source_registration_id
 from daita.catalog.models import (
     CatalogChangeKind,
     CatalogEntry,
@@ -32,6 +33,7 @@ from tests.support.catalog_records import (
     Table,
     batches,
     entries,
+    exercise_keeper_state,
     snapshot,
 )
 
@@ -502,3 +504,19 @@ async def test_a_relationship_to_a_missing_table_is_refused(store) -> None:
     with pytest.raises(ValueError):
         await store.commit_catalog(value.sync, (bad,))
     assert await store.list_entries(AGENT, SOURCE) == ()
+
+
+async def test_the_keeper_state_contract_holds_on_sqlite(store) -> None:
+    source = source_registration_id(AGENT, "sqlite", "db")
+    registration = SourceRegistration(
+        id=source,
+        agent_id=AGENT,
+        adapter_id="sqlite",
+        native_identity="db",
+        display_name="Shop",
+        configuration={},
+        attached_at=OBSERVED_AT,
+    )
+    await exercise_keeper_state(
+        store, AGENT, source, lambda: store.register_source(registration)
+    )

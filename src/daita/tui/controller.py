@@ -719,6 +719,15 @@ class PresentationController:
             )
         return facts
 
+    async def catalog_status(self, source_id: str, *, check: bool = False) -> Any:
+        return await self.require_agent().catalog_status(source_id, check=check)
+
+    async def catalog_changes(self, source_id: str) -> tuple[Any, ...]:
+        return await self.require_agent().catalog_changes(source_id)
+
+    async def set_keep_current(self, source_id: str, keep_current: bool) -> Any:
+        return await self.require_agent().set_keep_current(source_id, keep_current)
+
     async def detach_source(self, source_id: str) -> Any:
         return await self.require_agent().detach(source_id)
 

@@ -912,6 +912,8 @@ async def test_a_note_on_a_table_the_catalog_has_not_seen_is_refused_by_name(
     )
     try:
         source = await agent.attach_sqlite(database, name="Fresh")
+        # Keep the catalog lagging: the keeper must not describe the new table.
+        await agent.set_keep_current(source.id, False)
         # Created after attach and never refreshed: the catalog has no entry,
         # or only a name with no described structure.
         with sqlite3.connect(database) as connection:

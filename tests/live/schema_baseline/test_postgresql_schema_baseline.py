@@ -80,6 +80,7 @@ _CLAUDE = "DAITA_SCHEMA_BASELINE_CLAUDE_EXECUTABLE"
 _REPEATS = "DAITA_SCHEMA_BASELINE_REPEATS"
 _DAITA_MAX_TOKENS = "DAITA_SCHEMA_BASELINE_DAITA_MAX_TOKENS"
 _TIER = "DAITA_SCHEMA_BASELINE_TIER"
+_CATALOG_WAIT_SECONDS = 45
 _READER = ("daita_baseline_reader", "daita_baseline_reader_password")
 _DATABASE = "daita_schema_baseline"
 _FIXTURE = FIXTURES_ROOT / "postgres-schema-baseline"
@@ -296,7 +297,7 @@ async def _fresh_database(target: _Target) -> AsyncIterator[Any]:
 
 @dataclass(frozen=True)
 class _Expected:
-    truth: str
+    truth: str | None  # None when the right answer is to decline.
     trap_value: str | None
     follow_up_truth: str | None
 
@@ -306,6 +307,8 @@ async def _expectations(admin: Any, question: Mapping[str, Any]) -> _Expected:
 
     for statement in question.get("before_sql", ()):
         await admin.execute(statement)
+    if question.get("decline_expected"):
+        return _Expected(None, None, None)
     truth = normalize(await admin.fetchval(question["sql"]))
     trap_sql = question.get("trap_sql")
     trap_value = normalize(await admin.fetchval(trap_sql)) if trap_sql else None
@@ -686,6 +689,17 @@ async def _hard_oracle_scenario(
         expected = await _expectations(admin, question)
         if question.get("before_sql"):
             await agent.refresh_source(source_id)
+        if question.get("decline_expected"):
+            runs.append(
+                {
+                    "id": question["id"],
+                    "category": question["category"],
+                    "trap": question["trap"],
+                    "outcome": "skipped",
+                    "refusal_codes": [],
+                }
+            )
+            continue
         asked = [
             (question, expected.truth),
             *(
@@ -879,14 +893,14 @@ def _markdown(report: Mapping[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _write(report: dict[str, Any], stem: str) -> Path:
+def _write(report: dict[str, Any], stem: str, render: Any = None) -> Path:
     directory = _report_directory()
     name = f"{stem}-{report['environment']['commit']}"
     (directory / f"{name}.json").write_text(
         json.dumps(report, indent=2, sort_keys=True, default=str) + "\n"
     )
     path = directory / f"{name}.md"
-    path.write_text(_markdown(report))
+    path.write_text((render or _markdown)(report))
     return path
 
 
@@ -1036,11 +1050,10 @@ async def test_the_question_set_answers_from_the_source_with_an_empty_catalog(
     }
     for run in runs:
         round_trips = cast(Mapping[str, Any], run["round_trips"])
-        # A read may check the functions it calls; it never rediscovers the source.
-        assert round_trips["metadata_by_statement"] in (
-            {},
-            {"function_policy": 1},
-        ), run["id"]
+        # A read may check the functions it calls (or a keeper's change probe); it never rediscovers the source.
+        statements = dict(round_trips["metadata_by_statement"])
+        statements.pop("change_probe", None)
+        assert statements in ({}, {"function_policy": 1}), run["id"]
 
 
 def _daita_limits() -> LoopLimits:
@@ -1446,7 +1459,7 @@ async def _run_claude_code_hard(
 
 def _turns(
     question: Mapping[str, Any], expected: _Expected
-) -> list[tuple[str, str, str, str | None]]:
+) -> list[tuple[str, str, str | None, str | None]]:
     """The user turns of one hard question: (id, text, truth, trap value)."""
 
     turns = [
@@ -1512,6 +1525,22 @@ def _hard_markdown(report: Mapping[str, Any]) -> list[str]:
             f"| {question} | {report['hard_traps'][question]} | "
             + " | ".join(cells)
             + " |"
+        )
+    lines += [
+        "",
+        "Schema change (h11 and later, and h08): failed SQL calls and turns are "
+        "totals over those records.",
+        "",
+        "| System | Correct | Failed SQL calls | Turns |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for name, system in systems.items():
+        block = system["hard_summary"]["schema_change"]
+        correct = sum(item["correct"] for item in block["questions"].values())
+        runs = sum(item["runs"] for item in block["questions"].values())
+        lines.append(
+            f"| {name} | {correct}/{runs} | {block['failed_sql_calls']} "
+            f"| {block['turns']} |"
         )
     return lines
 
@@ -1734,3 +1763,133 @@ async def test_daita_and_claude_code_answer_the_question_set(
     for name, system in report["systems"].items():
         assert len(system["questions"]) == len(questions) * repeats, name
         assert len(system["hard_questions"]) == hard_runs * repeats, name
+
+
+async def _catalog_columns(agent: Agent, resource_id: str) -> set[str]:
+    described: Any = await agent.inspect_catalog_resource(resource_id)
+    return {
+        column["name"]
+        for facet in described["facets"]
+        for column in facet["payload"].get("columns", ())
+    }
+
+
+async def _unmet_facts(
+    agent: Agent, source_id: str, expect: Sequence[Mapping[str, Any]]
+) -> list[Mapping[str, Any]]:
+    """The ``catalog_expect`` facts the catalog does not show yet."""
+
+    ids = await _resource_ids(agent, source_id)
+    unmet = []
+    for fact in expect:
+        name, column = fact["resource"], fact.get("column")
+        shown = name in ids
+        if shown and column is not None:
+            shown = column in await _catalog_columns(agent, ids[name])
+        if shown == bool(fact.get("absent")):
+            unmet.append(fact)
+    return unmet
+
+
+def _schema_change_markdown(report: Mapping[str, Any]) -> str:
+    lines = [
+        "# PostgreSQL schema-change check",
+        "",
+        f"Commit {report['environment']['commit']}. The agent never calls "
+        f"`refresh_source`; it waits up to {_CATALOG_WAIT_SECONDS} s per change "
+        "for the catalog to show it.",
+        "",
+        "| Question | Seconds to catalog | Facts never held | Oracle |",
+        "| --- | ---: | --- | --- |",
+    ]
+    for run in report["schema_changes"]:
+        oracle = run["oracle"]
+        lines.append(
+            f"| {run['id']} | {run['seconds_to_catalog']} "
+            f"| {json.dumps(run['facts_never_held']) if run['facts_never_held'] else '—'} "
+            f"| {oracle['outcome'] if oracle else 'declines (not asked)'} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+async def test_schema_changes_reach_the_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Apply each schema change and time how long the catalog takes to show it.
+
+    No refresh is requested: the point is whether the catalog catches the
+    change on its own. The asserts hold on any correct build.
+    """
+
+    target, admin, trips, environment, _questions_, _truth = await _prepare(monkeypatch)
+    model = _OracleModel()
+    events: list[AgentEvent] = []
+    report: dict[str, Any] = {"environment": environment, "schema_changes": []}
+    truths: dict[str, str | None] = {}
+    try:
+        async with await Agent.create(
+            "schema-baseline-changes",
+            root=tmp_path,
+            model=model,
+            model_profile=model.model_profile,
+            config=AgentConfig(
+                postgresql_reads=PostgreSQLReadLimits(pool_enabled=True)
+            ),
+            secret_provider=_Secrets(_READER[1]),
+            workspace=workspace_for(tmp_path),
+            observer=events.append,
+        ) as agent:
+            source_id, attach = await _attach(
+                agent, target, _BOUNDED_SCHEMAS, trips, username=_READER[0]
+            )
+            assert source_id is not None, attach
+            for question in _questions("hard"):
+                if question["category"] != "schema_change":
+                    continue
+                for statement in question["before_sql"]:
+                    await admin.execute(statement)
+                started = time.perf_counter()
+                unmet = await _unmet_facts(agent, source_id, question["catalog_expect"])
+                while unmet and time.perf_counter() - started < _CATALOG_WAIT_SECONDS:
+                    await asyncio.sleep(1)
+                    unmet = await _unmet_facts(
+                        agent, source_id, question["catalog_expect"]
+                    )
+                seconds = None if unmet else round(time.perf_counter() - started, 2)
+                expected = await _expectations(admin, {**question, "before_sql": ()})
+                truths[question["id"]] = expected.truth
+                oracle = (
+                    None
+                    if expected.truth is None
+                    else await _ask_oracle(
+                        agent,
+                        model,
+                        {"resources": [], **question},
+                        source_id,
+                        expected.truth,
+                        events,
+                        trips,
+                    )
+                )
+                report["schema_changes"].append(
+                    {
+                        "id": question["id"],
+                        "trap": question["trap"],
+                        "seconds_to_catalog": seconds,
+                        "facts_never_held": unmet,
+                        "oracle": oracle,
+                    }
+                )
+    finally:
+        await admin.close()
+        path = _write(report, "postgresql-schema-change-check", _schema_change_markdown)
+        print(f"\nschema change check written to {path}")
+    for run in report["schema_changes"]:
+        question_id = run["id"]
+        declines = truths[question_id] is None
+        assert declines == (run["oracle"] is None), question_id
+        if not declines:
+            assert run["oracle"]["outcome"] == "correct", run
+    assert len(report["schema_changes"]) == sum(
+        1 for item in _questions("hard") if item["category"] == "schema_change"
+    )

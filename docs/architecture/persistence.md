@@ -16,7 +16,12 @@ Revision 4's migration converts each stored source snapshot into rows of
 `catalog_resources`, `catalog_relationships` and `catalog_search`, one state row
 naming the snapshot's sync as current, and drops `snapshots`; every resource keeps its
 ID and revision. The catalog also keeps `catalog_changes`, pruned to 90 days or
-10,000 rows per source, and syncs pruned to the newest 20 per source. Released revisions 1 through 3 and their migrations remain immutable. Revision 4 is the
+10,000 rows per source, and syncs pruned to the newest 20 per source. The source's state
+row also holds the keeper's saved progress (probe tokens, last probe, change and full
+check times, missed count, last error code and `keep_current`); the keeper commits new
+tokens in the same transaction as the read they matched, so a pass cut short is read
+again, and it rewrites an unchanged state row at most every 10 minutes. Its interval,
+failure count and next due time are memory only. Released revisions 1 through 3 and their migrations remain immutable. Revision 4 is the
 sole current runnable format; legacy decoders remain migration-only.
 
 ## State boundary, migrations and releases
@@ -66,8 +71,8 @@ Publication failure restores the prior home, and one rollback bundle is retained
 Newer, unsupported, reordered, checksum-edited, or damaged homes fail closed
 without a state rewrite. The exception is a damaged catalog row (`syncs`, `catalog_resources`,
 `catalog_relationships`, `catalog_search` or `catalog_source_state`): it can be
-rebuilt from the source, so the home opens, a read skips the row as absent, and a
-background refresh replaces it. Upgrading a home from before revision 4 still reads
+rebuilt from the source, so the home opens, a read skips the row as absent, and the
+catalog keeper reads the source again and replaces it. Upgrading a home from before revision 4 still reads
 the old `snapshots` rows and fails closed on a damaged one.
 
 Every supported production revision has one immutable whole-home golden fixture.

@@ -168,7 +168,7 @@ producer outcome and unique deliveries atomically before any UI wake.
 
 The Daita host (`daita host serve`, `src/daita/host/`) opens every agent that
 has background work (an active or due routine, an unfinished job, an
-unacknowledged delivery) as an ordinary `EmbeddedAgent`, so routines and jobs
+unacknowledged delivery; the catalog keeper's upkeep is neither) as an ordinary `EmbeddedAgent`, so routines and jobs
 progress while the host runs, whether or not a TUI is open. It reuses the
 existing runtime and state store and is each home's only writer while it holds
 the agent. Clients start it on demand; `daita host install` registers it as a

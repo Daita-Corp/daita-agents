@@ -16,7 +16,6 @@ from daita import (
 from daita.adapters.models import SourceRegistration
 from daita.adapters.sqlite import SQLiteResourceAdapter
 from daita.catalog.models import CatalogTier, ResourceBatch
-from daita.hosting import embedded as embedded_module
 from daita.hosting.embedded import AgentHomeError, HostActiveError
 from daita.hosting.execution_governor import PermitKind, WorkloadClass
 from daita.llm.models import (
@@ -30,7 +29,7 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import SecretReference
 from daita.storage.sqlite_records import SourceReadMode
-from tests.support.source_refresh import settled
+from tests.support.source_refresh import settled, stale_probes
 from tests.support.workspace import workspace_for
 
 
@@ -410,18 +409,26 @@ async def test_a_refresh_stuck_in_discovery_blocks_neither_work_nor_close(
         workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database, name="Shop"))
+    await settled(agent)
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE invoices (id INTEGER)")
     entered = asyncio.Event()
+    cancelled = asyncio.Event()
     original = SQLiteResourceAdapter.reconcile
 
     async def stuck(self, request):
         entered.set()
-        await asyncio.Event().wait()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
         async for batch in original(self, request):
             yield batch
 
     monkeypatch.setattr(SQLiteResourceAdapter, "reconcile", stuck)
+    stale_probes(agent)
+    agent._embedded.keeper.use((source.id,))
 
     run = await asyncio.wait_for(agent.run("Look at invoices."), timeout=5)
     (_, describe), (_, read) = await agent.tool_evidence(run.run_id)
@@ -430,8 +437,7 @@ async def test_a_refresh_stuck_in_discovery_blocks_neither_work_nor_close(
     data: Any = read.output["data"]
     assert [dict(row) for row in data["rows"]] == [{"n": 1}]
     await asyncio.wait_for(entered.wait(), timeout=5)
-    refresh = agent._embedded._source_refreshes[source.id]
-    assert not refresh.done()
+    assert agent._embedded.keeper.facts(source.id).updating
 
     preview = await asyncio.wait_for(
         agent.preview_source_permissions(
@@ -450,11 +456,10 @@ async def test_a_refresh_stuck_in_discovery_blocks_neither_work_nor_close(
         timeout=5,
     )
     await asyncio.wait_for(agent.catalog_summary(), timeout=5)
+    # A person's permission change cancels the background read first.
+    assert cancelled.is_set()
 
     await asyncio.wait_for(agent.close(), timeout=5)
-    assert refresh.cancelled()
-    agent._embedded.request_source_refresh(source.id)
-    assert not agent._embedded._source_refreshes
 
 
 async def test_a_connection_check_answers_while_a_discovery_is_stuck(
@@ -466,6 +471,9 @@ async def test_a_connection_check_answers_while_a_discovery_is_stuck(
         "check-while-stuck", root=tmp_path, workspace=workspace_for(tmp_path)
     )
     source = await agent.attach(SQLiteSource(database, name="Shop"))
+    await settled(agent)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE late (id INTEGER)")
     entered = asyncio.Event()
 
     async def stuck(self, request):
@@ -474,7 +482,8 @@ async def test_a_connection_check_answers_while_a_discovery_is_stuck(
         yield  # pragma: no cover - makes this an async generator
 
     monkeypatch.setattr(SQLiteResourceAdapter, "reconcile", stuck)
-    agent._embedded.request_source_refresh(source.id)
+    stale_probes(agent)
+    agent._embedded.keeper.use((source.id,))
     await asyncio.wait_for(entered.wait(), timeout=5)
 
     health = await asyncio.wait_for(agent.check_source(source.id), timeout=5)
@@ -580,83 +589,6 @@ async def test_a_failed_postgresql_check_gives_a_code_and_no_connection_text(
         assert health.error_code == "postgresql_connect_failed"
         assert dict(health.details) == {}
         assert password not in repr(health) and "db.example.test" not in repr(health)
-    finally:
-        await agent.close()
-
-
-async def test_a_refresh_for_qualified_names_rereads_only_their_schemas(
-    tmp_path, monkeypatch
-):
-    agent = await Agent.create(
-        "schema-refresh", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
-
-    class FixtureAdapter:
-        def __init__(self, registration):
-            self.registration = registration
-
-        async def reconcile(self, request):
-            yield ResourceBatch(
-                tier=CatalogTier.DETAIL,
-                entries=(),
-                source_revision="catalog:sha256:" + "3" * 64,
-            )
-
-        async def inspect(self, resource):
-            raise AssertionError("empty fixture has no resources")
-
-        async def health(self):
-            raise AssertionError("refresh must not require a health call")
-
-        async def close(self):
-            pass
-
-    class FixtureSource:
-        async def open(self, *, agent_id, attached_at, clock):
-            return FixtureAdapter(
-                SourceRegistration.build(
-                    agent_id=agent_id,
-                    adapter_id="postgresql",
-                    native_identity="offline-schema-refresh",
-                    display_name="Offline fixture",
-                    configuration={
-                        "database": "shop",
-                        "host": "localhost",
-                        "port": 5432,
-                        "schemas": ("public", "sales"),
-                        "ssl_mode": "require",
-                        "username": "reader",
-                    },
-                    attached_at=attached_at,
-                )
-            )
-
-    try:
-        source = await agent.attach(FixtureSource())
-        requested = []
-
-        async def record(opened, **keywords):
-            requested.append((keywords["scopes"], keywords["previous"]))
-            return keywords["persisted_registration"]
-
-        monkeypatch.setattr(agent._embedded, "_attach_source_locked", record)
-        monkeypatch.setattr(embedded_module, "_SOURCE_REFRESH_MIN_SECONDS", 0)
-        for names in (
-            ("sales.orders",),
-            ("sales.orders", "public.users", "sales.items"),
-            ("orders",),
-            ("archive.orders",),
-            ("sales.orders", "orders"),
-            (),
-        ):
-            agent._embedded.request_source_refresh(source.id, names)
-            await settled(agent)
-
-        schemas = [item[0] for item in requested]
-        assert schemas == [("sales",), ("sales", "public"), (), (), (), ()]
-        previous = [item[1] for item in requested]
-        assert previous[:2] == [(), ()]
-        assert previous[2:] == [None] * 4
     finally:
         await agent.close()
 

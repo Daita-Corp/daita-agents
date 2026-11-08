@@ -245,6 +245,12 @@
       "UPDATE sales.orders SET channel = 'store' WHERE order_id % 8 = 0",
       "CREATE TABLE crm.scratch_import (id integer PRIMARY KEY, payload text)",
       "GRANT SELECT ON crm.scratch_import TO daita_baseline_reader"
+    ],
+    "catalog_expect": [
+      {
+        "resource": "sales.orders",
+        "column": "channel"
+      }
     ]
   },
   {
@@ -255,5 +261,132 @@
     "question": "What was the total order-item revenue (quantity times unit price) for orders placed in February 2026?",
     "sql": "SELECT round(sum(oi.quantity * oi.unit_price), 2) FROM sales.order_items AS oi JOIN sales.orders AS o ON o.order_id = oi.order_id WHERE o.ordered_at >= TIMESTAMPTZ '2026-02-01 00:00:00+00' AND o.ordered_at < TIMESTAMPTZ '2026-03-01 00:00:00+00' AND o.status NOT IN ('cancelled', 'refunded')",
     "trap_sql": "SELECT round(sum(oi.quantity * oi.unit_price), 2) FROM sales.order_items AS oi JOIN sales.orders AS o ON o.order_id = oi.order_id WHERE o.ordered_at >= TIMESTAMPTZ '2026-02-01 00:00:00+00' AND o.ordered_at < TIMESTAMPTZ '2026-03-01 00:00:00+00'"
+  },
+  {
+    "id": "h11-customers-west",
+    "tier": "hard",
+    "category": "schema_change",
+    "trap": "renamed_column",
+    "question": "How many customers are in the west sales region?",
+    "sql": "SELECT count(*) FROM sales.customers WHERE sales_region = 'west'",
+    "before_sql": [
+      "ALTER TABLE sales.customers RENAME COLUMN region TO sales_region"
+    ],
+    "resources": [
+      "sales.customers"
+    ],
+    "catalog_expect": [
+      {
+        "resource": "sales.customers",
+        "column": "sales_region"
+      },
+      {
+        "resource": "sales.customers",
+        "column": "region",
+        "absent": true
+      }
+    ]
+  },
+  {
+    "id": "h12-gift-cards-march",
+    "tier": "hard",
+    "category": "schema_change",
+    "trap": "new_table",
+    "question": "How many gift cards were redeemed in March 2026?",
+    "sql": "SELECT count(*) FROM sales.gift_cards WHERE redeemed_on >= DATE '2026-03-01' AND redeemed_on < DATE '2026-04-01'",
+    "before_sql": [
+      "CREATE TABLE sales.gift_cards (card_id integer PRIMARY KEY, order_id integer NOT NULL REFERENCES sales.orders, amount numeric(8, 2) NOT NULL, redeemed_on date NOT NULL)",
+      "INSERT INTO sales.gift_cards SELECT g, g * 13, 25 + (g % 4) * 25, DATE '2026-02-10' + g % 70 FROM generate_series(1, 600) AS g",
+      "GRANT SELECT ON sales.gift_cards TO daita_baseline_reader"
+    ],
+    "resources": [
+      "sales.gift_cards"
+    ],
+    "catalog_expect": [
+      {
+        "resource": "sales.gift_cards"
+      }
+    ]
+  },
+  {
+    "id": "h13-invoiced-may",
+    "tier": "hard",
+    "category": "schema_change",
+    "trap": "replaced_table",
+    "question": "What was the total invoiced amount for invoices issued in May 2026?",
+    "sql": "SELECT round(sum(amount), 2) FROM finance.billing_documents WHERE issued_on >= DATE '2026-05-01' AND issued_on < DATE '2026-06-01'",
+    "before_sql": [
+      "CREATE TABLE finance.billing_documents (document_id integer PRIMARY KEY, customer_id integer NOT NULL REFERENCES sales.customers, amount numeric(12, 2) NOT NULL, issued_on date NOT NULL)",
+      "INSERT INTO finance.billing_documents SELECT invoice_id, customer_id, amount, issued_on FROM finance.invoices",
+      "INSERT INTO finance.billing_documents SELECT 4000 + g, 1 + g % 2000, 15 + (g % 60), DATE '2026-05-01' + g % 31 FROM generate_series(1, 500) AS g",
+      "GRANT SELECT ON finance.billing_documents TO daita_baseline_reader",
+      "DROP TABLE finance.invoices CASCADE"
+    ],
+    "resources": [
+      "finance.billing_documents"
+    ],
+    "catalog_expect": [
+      {
+        "resource": "finance.billing_documents"
+      },
+      {
+        "resource": "finance.invoices",
+        "absent": true
+      }
+    ]
+  },
+  {
+    "id": "h14-budget-2026",
+    "tier": "hard",
+    "category": "schema_change",
+    "trap": "granted_access",
+    "question": "What is the total 2026 budget across all cost centers?",
+    "sql": "SELECT sum(amount) FROM finance.budgets WHERE fiscal_year = 2026",
+    "before_sql": [
+      "GRANT SELECT ON finance.budgets TO daita_baseline_reader"
+    ],
+    "resources": [
+      "finance.budgets"
+    ],
+    "catalog_expect": [
+      {
+        "resource": "finance.budgets"
+      }
+    ]
+  },
+  {
+    "id": "h15-promotions-count",
+    "tier": "hard",
+    "category": "schema_change",
+    "trap": "revoked_access",
+    "question": "How many promotions are there?",
+    "decline_expected": true,
+    "before_sql": [
+      "REVOKE SELECT ON sales.promotions FROM daita_baseline_reader"
+    ],
+    "catalog_expect": [
+      {
+        "resource": "sales.promotions",
+        "absent": true
+      }
+    ]
+  },
+  {
+    "id": "h16-shipping-march",
+    "tier": "hard",
+    "category": "schema_change",
+    "trap": "dropped_column",
+    "question": "What was the total shipping fee charged on orders placed in March 2026?",
+    "decline_expected": true,
+    "before_sql": [
+      "ALTER TABLE sales.orders DROP COLUMN shipping_fee"
+    ],
+    "catalog_expect": [
+      {
+        "resource": "sales.orders",
+        "column": "shipping_fee",
+        "absent": true
+      }
+    ]
   }
 ]

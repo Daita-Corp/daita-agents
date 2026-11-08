@@ -6,7 +6,8 @@
 --
 -- Base-table counts (information_schema BASE TABLE, the discovery limit's unit):
 --   sales 12, events 128 (1 partitioned parent + 120 partitions + 7),
---   finance 203, crm 303, legacy 350  -> 996 (the bounded variant)
+--   finance 204, crm 303, legacy 350  -> 997 as admin (the bounded variant); the
+--   reader cannot read finance.budgets and sees 996
 --   ops 513                           -> 1,509 (the full variant)
 
 DO $$
@@ -264,6 +265,17 @@ CREATE TABLE finance.fx_rates (
 
 CREATE TABLE finance.cost_centers (code text PRIMARY KEY, owner text);
 
+-- Readable by admin only until h14 grants it to the reader.
+CREATE TABLE finance.budgets (
+    cost_center text NOT NULL,
+    fiscal_year integer NOT NULL,
+    amount numeric(12, 2) NOT NULL,
+    PRIMARY KEY (cost_center, fiscal_year)
+);
+INSERT INTO finance.budgets VALUES
+    ('OPS', 2025, 118000), ('ENG', 2025, 455000), ('SALES', 2025, 198000),
+    ('OPS', 2026, 125000), ('ENG', 2026, 480000), ('SALES', 2026, 210000);
+
 CREATE TABLE finance.ledger_entries (
     entry_id integer PRIMARY KEY,
     cost_center text REFERENCES finance.cost_centers,
@@ -483,3 +495,6 @@ GRANT USAGE ON SCHEMA sales, events, finance, crm, legacy TO daita_baseline_read
 
 GRANT SELECT ON ALL TABLES IN SCHEMA sales, events, finance, crm, legacy
     TO daita_baseline_reader;
+
+-- Granted later by h14 (access gained); invisible to the reader at attach.
+REVOKE SELECT ON finance.budgets FROM daita_baseline_reader;

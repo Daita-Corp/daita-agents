@@ -299,6 +299,8 @@ async def _commit_schema_graph(
     edges: tuple[_SchemaEdge, ...],
     sync_id: str,
 ) -> tuple[dict[str, str], tuple[CatalogRelationship, ...]]:
+    # The graph is hand-written; the keeper must not rewrite it from the file.
+    await agent.set_keep_current(source_id, False)
     resource_ids = {
         key: catalog_resource_id(source_id, kind, native_identity)
         for key, (native_identity, kind, _) in nodes.items()

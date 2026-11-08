@@ -43,7 +43,16 @@ from daita.artifacts.models import (
     ArtifactRef,
 )
 from daita.capabilities import EffectEvidenceBasis, EffectObservation, EffectOutcome
-from daita.catalog.models import CatalogResource, CatalogSummary
+from daita.catalog.models import (
+    CatalogChange,
+    CatalogChangeKind,
+    CatalogChangeSide,
+    CatalogFreshness,
+    CatalogResource,
+    CatalogStatus,
+    CatalogSummary,
+    ResourceKind,
+)
 from daita.distribution.models import (
     DeliveryInspection,
     DeliveryView,
@@ -378,6 +387,25 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
             tuple[SourceRegistration, ...]: (await agent.list_sources(),),
             tuple[CatalogResource, ...]: (resources,),
             CatalogSummary: (await agent.catalog_summary(),),
+            CatalogStatus: (
+                await agent.catalog_status(source.id),
+                CatalogStatus(
+                    source_id=source.id,
+                    state=CatalogFreshness.UNREACHABLE,
+                    keep_current=False,
+                    checked_at=NOW,
+                    changed_at=None,
+                    full_check_at=NOW,
+                    resources=3,
+                    described=2,
+                    inventory_truncated=True,
+                    error_code="connection_failed",
+                ),
+            ),
+            tuple[CatalogChange, ...]: (
+                await agent.catalog_changes(source.id),
+                _catalog_changes(agent.id, source.id),
+            ),
             FrozenJsonObject: (await agent.inspect_catalog_resource(resource.id),),
             SourcePermissionsInspection: (permissions,),
             SourcePermissionsPreview: (preview,),
@@ -585,3 +613,27 @@ async def start_host() -> AsyncIterator[StartHost]:
 
     async with hosts() as start:
         yield start
+
+
+def _catalog_changes(agent_id: str, source_id: str) -> tuple[CatalogChange, ...]:
+    side = CatalogChangeSide(
+        name="orders",
+        kind=ResourceKind.TABLE,
+        revision="sha256:" + "a" * 64,
+        columns=(("id", "integer"),),
+    )
+    return tuple(
+        CatalogChange(
+            agent_id=agent_id,
+            source_id=source_id,
+            sequence=index,
+            sync_id="sync-1",
+            changed_at=NOW,
+            kind=kind,
+            resource_id=f"resource-{index}",
+            native_identity="main.orders",
+            before=None if kind is CatalogChangeKind.ADDED else side,
+            after=None if kind is CatalogChangeKind.REMOVED else side,
+        )
+        for index, kind in enumerate(CatalogChangeKind)
+    )

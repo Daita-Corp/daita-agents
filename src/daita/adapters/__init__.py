@@ -9,10 +9,12 @@ from .models import (
     ResourceSnapshot,
     LinkCheck,
     SourceHealth,
+    SourceProbe,
     SourceRegistration,
     source_registration_id,
 )
 from .protocols import (
+    ChangeProbeBackend,
     ResourceAdapter,
     ResourceAdapterError,
     ResourceNotFoundError,
@@ -52,6 +54,7 @@ from .postgresql_query import PostgreSQLQueryBackend, PostgreSQLQueryError
 # isort: on
 
 __all__ = [
+    "ChangeProbeBackend",
     "DiscoveryRequest",
     "MCPAdmissionError",
     "MCPAuthentication",
@@ -89,6 +92,7 @@ __all__ = [
     "SourceClosedError",
     "LinkCheck",
     "SourceHealth",
+    "SourceProbe",
     "SourceRegistration",
     "SourceStore",
     "StaleResourceError",

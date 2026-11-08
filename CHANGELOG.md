@@ -215,11 +215,9 @@ the model is told the catalog lists every object but describes only some.
   network keeps all its tables rather than running out of time. Catalog contents and
   every limit are unchanged. Attaching 869 tables at 50 ms latency went from about 61 s,
   truncated at 540 tables, to about 2 s with all of them.
-- **The catalog refreshes itself.** It refreshes on attach, on `Agent.refresh_source`,
-  when a search or describe finds a table the catalog lacks or has wrong, and when a
-  query fails because a table or column does not exist. Automatic refreshes run in the
-  background, never delay a read, and run at most once per source every five minutes.
-  On PostgreSQL a miss on a schema-qualified name re-reads only that schema.
+- **The catalog keeps itself current.** After attach, a keeper (one task per open agent)
+  probes each source and re-reads only what changed; see "The catalog stays current
+  without being asked" below. The five-minute limit on automatic refreshes is gone.
 - **Revoking a source no longer waits for a refresh.**
 - **No re-preview after a sync.** A catalog sync between previewing and applying source
   permissions no longer forces a new preview.
@@ -233,11 +231,84 @@ the model is told the catalog lists every object but describes only some.
   readable parent in the configured schemas holds it, so a role granted only a child
   partition can find it.
 - **A damaged catalog entry no longer stops anything.** Reads and approved writes
-  continue, the home still opens, and when a run finishes the entry is rebuilt from
-  the source.
+  continue, the home still opens, and the keeper rebuilds the entry from the source.
 - **`semantic_save` on a table with no catalog entry, or only a name,** is refused with
   `semantic_unknown_resource` and says reads are unaffected, instead of
   `resource_read_not_allowed`.
+
+### The catalog stays current without being asked
+
+A keeper, one task per open agent, checks each source cheaply and reads again only
+what changed, so a new table or column shows up without a refresh. It never delays a
+run, read or revoke, takes no execution lease, does not count as background work for
+the host's idle policy, and sets no wake time.
+
+- **A probe per source type.** It is one bounded read-only statement (or one stat
+  walk) that reports names and hashes only and ignores the read scope. PostgreSQL gives
+  one token per configured schema the role can use; it moves with tables, columns
+  (including column comments), indexes, keys, and grants, roles or memberships that
+  change what the role can read, and not with rows, statistics, table comments or enum
+  labels. SQLite gives one token from
+  `PRAGMA schema_version` and the file's identity, so data writes do not move it.
+  A folder gives one token from a stat walk over the files that discovery would catalog.
+- **Adaptive intervals.** A probe starts at the type's minimum (PostgreSQL 20 s,
+  SQLite and folders 5 s), doubles after each unchanged probe up to its maximum
+  (PostgreSQL 15 minutes, SQLite and folders 5 minutes), and starts over after a change
+  or when the source is used. A type with no probe is only fully rechecked on its
+  schedule. Two failed probes in a row mark the source unreachable; the next success
+  recovers it. A probe times out after 5 seconds. Due times are wall-clock times, so
+  sleep and restart catch up.
+- **What starts a probe.** A run start (foreground, routine or job) if the last probe
+  is older than 30 seconds, `Agent.catalog_status(check=True)`, a lookup miss or a
+  missing-table or column error if the last probe is older than 5 seconds, and the
+  permissions screen, which waits at most 2 seconds. The 300-second limit on automatic
+  refreshes is removed.
+- **Scoped reads.** A change in some PostgreSQL schemas re-reads only those schemas.
+  A changed folder describes only its changed files. A pass still lists everything, so
+  removals stay correct.
+- **Resumable.** The new tokens are committed in the same transaction as the read that
+  matched them, so an interrupted pass is read again on the next probe.
+- **Background fill.** A catalog with tables that have only a name gets them described
+  in passes of 1,000 until none remain. Progress is the stored detail, so closing and
+  reopening resumes it.
+- **Daily full check.** Once a day a full read records `missed`, the changes no probe
+  flagged, and logs a warning naming only the source type and kinds of change.
+- **People come first.** A person's attach, edit, detach, refresh or permission change
+  cancels a keeper read in flight and runs first. Close stays prompt.
+- **An unchanged probe writes the source's state row at most every 10 minutes.**
+- **Keep current.** `Agent.set_keep_current(source_id, False)` stops all probes, fills
+  and checks for a source. An explicit `Agent.refresh_source` still works.
+- **Status.** New `Agent.catalog_status(source_id, check=False)` returns a
+  `CatalogStatus` (`current`, `updating`, `unreachable`, `paused` or `not_checked`, the
+  last check, change and full check times, resources, described, whether the inventory
+  is truncated, and a stable error code). `Agent.catalog_changes(source_id, limit=50)`
+  lists recent changes. `Agent.set_keep_current` returns the status. The host serves
+  them at `GET /sources/{source_id}/catalog/status`,
+  `GET /sources/{source_id}/catalog/changes` and
+  `POST /sources/{source_id}/catalog/keep-current`.
+- **`daita sources`** adds `status`, `checked_at`, `described` and `total` for each
+  active source.
+- **`/sources` in the TUI** shows a status line under each connection block (for example
+  "Up to date · checked 2 min ago · 1,500 tables"), a "Today:" line of recent changes,
+  a Keep current switch and Check now.
+- **Stored sync `truncated`** now means the source's catalog lacks some detail: the
+  pass was cut short, or any table still has only a name after the commit.
+- **No stored shape changes.** The keeper uses the existing source state row.
+- **For integrators.** `SourceOperation.CHANGE_PROBE` and `ChangeProbeBackend` (one
+  `probe(agent_id, source_id, cursor)` returning a `SourceProbe` of tokens per scope);
+  `SourceType.freshness` is a `SourceFreshness` (minimum and maximum probe interval, and
+  the full-check period); `DiscoveryRequest.fill` keeps every described `previous`
+  entry that is still listed and describes up to `max_resources` that lack detail.
+  `CatalogStore` gains `save_source_state`, `catalog_detail_counts`, and
+  `commit_catalog(probe_tokens=, probed_at=)`.
+- **Measured.** A probe at 1,500 tables takes about 150 ms on PostgreSQL (one statement,
+  best case on a quiet laptop; the 100 ms target was not met), about 1 ms on SQLite and
+  about 133 ms on a folder (median). A change reached the catalog in a median of 16 s
+  on PostgreSQL, 4 s on SQLite and 5 s on a folder. Over 108, 112 and 110 scripted
+  changes the probes missed none. Over a simulated 50 ms round trip the probe
+  statement costs one round trip, but with the default `pool_enabled=False` each
+  probe opens its own connection, so a probe of 36 tables took about 350 ms; with
+  `PostgreSQLReadLimits(pool_enabled=True)` probes reuse a pooled connection.
 
 ### Cross-source joins
 

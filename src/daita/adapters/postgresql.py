@@ -319,6 +319,114 @@ ORDER BY src_ns.nspname, src.relname, con.conname
 LIMIT $2
 """
 
+# One token per configured schema the role can use: a hash of what detail would
+# store for its listed, readable relations. It reuses the discovery fragments, so
+# a grant, revoke or role change that alters what is readable moves it, and
+# nothing it hashes (estimates, statistics, table comments, enum labels) is
+# something a revision does not store.
+_CHANGE_PROBE_SQL = f"""
+/* daita:postgresql.change_probe */
+WITH rels AS MATERIALIZED (
+    SELECT c.oid, n.nspname, c.relname, c.relkind,
+        pg_catalog.has_table_privilege(c.oid, 'SELECT') AS whole
+    FROM pg_catalog.pg_class AS c
+    JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+    WHERE n.nspname = ANY($1::text[])
+      AND {READABLE_RELATION_SQL}
+      AND {LISTED_RELATION_SQL}
+), cols AS MATERIALIZED (
+    -- Order-free: a sum of per-column hashes needs no sort. A table-level SELECT
+    -- grant makes every column readable, so has_column_privilege runs only for
+    -- tables without one (the same readable columns as READABLE_COLUMN_SQL).
+    SELECT a.attrelid AS oid,
+        sum(hashtextextended(ROW(
+            a.attnum, a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod),
+            a.attnotnull, t.typtype = 'd' AND t.typnotnull, a.attidentity,
+            a.attgenerated, a.attcollation, note.description,
+            CASE WHEN a.attgenerated = ''
+                 THEN pg_catalog.pg_get_expr(def.adbin, def.adrelid) END,
+            CASE WHEN rels.relkind IN ('v', 'f')
+                 THEN pg_catalog.pg_column_is_updatable(a.attrelid, a.attnum, false)
+            END)::text, 0)::numeric) AS d
+    FROM rels
+    JOIN pg_catalog.pg_attribute AS a ON a.attrelid = rels.oid
+    JOIN pg_catalog.pg_type AS t ON t.oid = a.atttypid
+    LEFT JOIN pg_catalog.pg_attrdef AS def
+      ON def.adrelid = a.attrelid AND def.adnum = a.attnum
+    LEFT JOIN pg_catalog.pg_description AS note
+      ON note.objoid = a.attrelid AND note.objsubid = a.attnum
+     AND note.classoid = 'pg_catalog.pg_class'::regclass
+    WHERE a.attnum > 0 AND NOT a.attisdropped
+      AND (rels.whole OR pg_catalog.has_column_privilege(a.attrelid, a.attnum, 'SELECT'))
+    GROUP BY a.attrelid
+), pks AS MATERIALIZED (
+    SELECT con.conrelid AS oid, con.conkey::text AS d
+    FROM pg_catalog.pg_constraint AS con
+    JOIN rels ON rels.oid = con.conrelid
+    WHERE con.contype = 'p'
+      AND (rels.whole OR NOT EXISTS (
+          SELECT 1 FROM unnest(con.conkey) AS part(attnum)
+          WHERE NOT pg_catalog.has_column_privilege(con.conrelid, part.attnum, 'SELECT')
+      ))
+), idxs AS MATERIALIZED (
+    SELECT oid, string_agg(ROW(index_name, index_kind, columns, is_unique,
+        write_conflict_supported, predicate)::text, ';' ORDER BY index_name) AS d
+    FROM (
+        SELECT rel.oid AS oid,
+{_INDEX_FIELDS_SQL}
+{_INDEX_SOURCES_SQL}
+        JOIN rels ON rels.oid = rel.oid
+        WHERE key.ordinality <= ind.indnkeyatts
+{_INDEX_GROUP_SQL}
+    ) AS listed_indexes
+    WHERE simple_columns
+    GROUP BY oid
+), fkeys AS MATERIALIZED (
+    SELECT src.oid AS src_oid, dst.oid AS dst_oid,
+        ROW(con.conname, src_ns.nspname, src.relname, dst_ns.nspname, dst.relname,
+            array_agg(src_att.attname ORDER BY keys.ordinality),
+            array_agg(dst_att.attname ORDER BY keys.ordinality),
+            con.confmatchtype, con.confupdtype, con.confdeltype)::text AS d
+    {FOREIGN_KEYS_FROM_SQL}
+      AND src.oid IN (SELECT oid FROM rels) AND dst.oid IN (SELECT oid FROM rels)
+    GROUP BY con.oid, con.conname, src.oid, src_ns.nspname, src.relname,
+             dst.oid, dst_ns.nspname, dst.relname, con.confmatchtype,
+             con.confupdtype, con.confdeltype
+    {READABLE_FOREIGN_KEY_SQL}
+), fks AS MATERIALIZED (
+    SELECT oid, string_agg(d, ';' ORDER BY d) AS d
+    FROM (
+        SELECT src_oid AS oid, d FROM fkeys
+        UNION ALL
+        SELECT dst_oid, d FROM fkeys WHERE dst_oid <> src_oid
+    ) AS ends
+    GROUP BY oid
+)
+SELECT n.nspname AS scope,
+    md5(coalesce(string_agg(
+        ROW(rels.oid, rels.relname, rels.relkind, cols.d, pks.d, idxs.d, fks.d)::text,
+        E'\\n' ORDER BY rels.relname) FILTER (WHERE rels.oid IS NOT NULL), ''))
+        AS token
+FROM pg_catalog.pg_namespace AS n
+LEFT JOIN rels ON rels.nspname = n.nspname
+LEFT JOIN cols ON cols.oid = rels.oid
+LEFT JOIN pks ON pks.oid = rels.oid
+LEFT JOIN idxs ON idxs.oid = rels.oid
+LEFT JOIN fks ON fks.oid = rels.oid
+WHERE n.nspname = ANY($1::text[]) AND pg_catalog.has_schema_privilege(n.oid, 'USAGE')
+GROUP BY n.nspname
+"""
+
+
+async def probe_tokens(
+    connection: Any, schemas: Sequence[str], *, timeout: float = 5.0
+) -> dict[str, str]:
+    """One statement: a token for each of ``schemas`` the connected role can use."""
+
+    rows = await connection.fetch(_CHANGE_PROBE_SQL, list(schemas), timeout=timeout)
+    return {_row_text(row, "scope"): _row_text(row, "token") for row in rows}
+
+
 # Planner statistics are approximate and nonstructural. They are read once at
 # discovery, never during query revalidation, and never change a revision.
 _ESTIMATES_SQL = f"""
@@ -724,6 +832,7 @@ class PostgreSQLResourceAdapter:
                     max_relationships=request.max_relationships,
                     scopes=request.scopes,
                     previous=request.previous,
+                    fill=request.fill,
                 )
                 estimates = await _load_estimates(self._connection, structure)
                 batches = _batches(request, structure, estimates)
@@ -960,6 +1069,7 @@ async def _load_structure(
     max_inventory: int = 1_000_000,
     scopes: tuple[str, ...] = (),
     previous: tuple[CatalogEntry, ...] | None = None,
+    fill: bool = False,
 ) -> PostgreSQLStructure:
     """Read the structure the request allows; whatever a limit cuts is truncated."""
 
@@ -971,13 +1081,16 @@ async def _load_structure(
     )
     inventory_truncated = len(resource_rows) > max_inventory
     resource_rows = resource_rows[:max_inventory]
-    truncated = len(resource_rows) > max_resources
+    # A fill describes what lacks detail, up to max_resources of it; any other
+    # pass describes a prefix of the listing.
+    truncated = not fill and len(resource_rows) > max_resources
     # A table outside the refreshed schemas keeps what the previous pass read.
     kept = (
         {entry.resource.id: entry for entry in previous if entry.detailed}
-        if scopes and previous is not None
+        if (scopes or fill) and previous is not None
         else {}
     )
+    fresh = 0
     inventory: list[tuple[str, str, ResourceKind, str | None]] = []
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _DISCOVERY_SECONDS
@@ -991,11 +1104,11 @@ async def _load_structure(
         inventory.append(
             (schema, name, kind, _optional_row_text(row, "source_object_id"))
         )
-        if position >= max_resources:
+        if not fill and position >= max_resources:
             continue
         previous_entry = (
             None
-            if schema in scopes
+            if schema in scopes and not fill
             else kept.get(
                 catalog_resource_id(registration.id, kind, f"{schema}.{name}")
             )
@@ -1018,6 +1131,10 @@ async def _load_structure(
                 or len(tabular.indexes) >= max_indexes
             )
         else:
+            if fill and fresh >= max_resources:
+                truncated = True
+                continue
+            fresh += 1
             wanted.append((schema, name))
         listed.append((schema, name, kind, tabular))
 

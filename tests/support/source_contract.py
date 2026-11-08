@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -13,7 +13,12 @@ import pytest
 from daita import Agent
 from daita._json import canonical_json
 from daita.adapters.local_workspace import LocalWorkspaceError
-from daita.adapters.models import DiscoveryRequest, ResourceRef
+from daita.adapters.models import (
+    DiscoveryRequest,
+    ResourceRef,
+    SourceProbe,
+    SourceRegistration,
+)
 from daita.adapters.protocols import (
     ResourceAdapter,
     ResourceSource,
@@ -403,8 +408,123 @@ async def assert_live_source_contract(
     assert rows.data["source_id"] == source_id
 
 
+class StaticSources:
+    """A source store holding one registration, enough to build a probe backend."""
+
+    def __init__(self, registration: SourceRegistration) -> None:
+        self._registration = registration
+
+    async def load_source(
+        self, agent_id: str, source_id: str
+    ) -> SourceRegistration | None:
+        registration = self._registration
+        return (
+            registration
+            if (agent_id, source_id)
+            == (
+                registration.agent_id,
+                registration.id,
+            )
+            else None
+        )
+
+    async def load_source_read_scope(self, agent_id: str, source_id: str) -> None:
+        return None
+
+    async def register_source(
+        self, registration: SourceRegistration
+    ) -> SourceRegistration:
+        raise NotImplementedError
+
+    async def list_sources(self, agent_id: str) -> tuple[SourceRegistration, ...]:
+        return (self._registration,)
+
+    async def detach_source(
+        self, agent_id: str, source_id: str, detached_at: datetime
+    ) -> SourceRegistration:
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class ProbeMutation:
+    """One scripted change to a source and the scopes whose token must move.
+
+    ``exact`` also requires the catalog to change in those scopes and nowhere
+    else; a mutation a probe may treat as a change the catalog never shows
+    (a file replaced by an identical one) sets it False.
+    """
+
+    name: str
+    apply: Callable[[], Awaitable[None]]
+    moves: frozenset[str] = frozenset()
+    exact: bool = True
+
+
+async def assert_change_detection_contract(
+    probe: Callable[[], Awaitable[SourceProbe]],
+    mutations: Sequence[ProbeMutation],
+    *,
+    revisions: Callable[[], Awaitable[Mapping[str, Mapping[str, str]]]],
+) -> None:
+    """A probe moves exactly with what a catalog read would record.
+
+    ``revisions`` reads the catalog now: scope -> resource -> revision. Before
+    each mutation an unchanged source must give the same tokens twice. After
+    it, the scopes whose token moved must be the ones expected, and the catalog
+    must change in no scope the probe left still (a miss); with ``exact`` it
+    must also change in every scope the probe moved.
+    """
+
+    for mutation in mutations:
+        before, again = await probe(), await probe()
+        assert before.tokens == again.tokens, mutation.name
+        catalog_before = await revisions()
+        await mutation.apply()
+        after = await probe()
+        moved = {
+            scope
+            for scope in {*before.tokens, *after.tokens}
+            if before.tokens.get(scope) != after.tokens.get(scope)
+        }
+        assert moved == mutation.moves, mutation.name
+        catalog_after = await revisions()
+        changed = {
+            scope
+            for scope in {*catalog_before, *catalog_after}
+            if catalog_before.get(scope) != catalog_after.get(scope)
+        }
+        assert changed <= moved, f"{mutation.name}: the probe missed {changed - moved}"
+        if mutation.exact:
+            assert changed == moved, f"{mutation.name}: moved without a change"
+
+
+async def scoped_revisions(
+    adapter: ResourceAdapter,
+    request: DiscoveryRequest,
+    scope_of: Callable[[CatalogEntry], str],
+) -> dict[str, dict[str, str]]:
+    """What a full read records now, per scope: resource -> revision."""
+
+    inventory, detail = [batch async for batch in adapter.reconcile(request)]
+    result: dict[str, dict[str, str]] = {}
+    for entry in (*inventory.entries, *detail.entries):
+        if entry.detailed:
+            result.setdefault(scope_of(entry), {})[
+                entry.resource.native_identity
+            ] = entry.revision.revision
+        else:
+            result.setdefault(scope_of(entry), {}).setdefault(
+                entry.resource.native_identity, "inventory"
+            )
+    return result
+
+
 __all__ = [
     "CONTRACT_AGENT_ID",
+    "ProbeMutation",
+    "StaticSources",
+    "assert_change_detection_contract",
+    "scoped_revisions",
     "ReconcilePass",
     "reconcile_pass",
     "CONTRACT_NOW",

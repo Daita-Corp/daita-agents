@@ -492,6 +492,26 @@ def test_attach_parser_builds_folder_source(tmp_path: Path):
     assert source.name == "Drop"
 
 
+def test_sources_lists_catalog_status_beside_the_existing_keys() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory).resolve() / "state"
+        folder = root.parent / "drop"
+        folder.mkdir()
+        (folder / "orders.csv").write_text("region\nnorth\n", encoding="utf-8")
+        asyncio.run(_create_agent(root, "atlas"))
+        base = ["--no-host", "--root", str(root)]
+        assert _invoke([*base, "attach", "atlas", "folder", str(folder)])[0] == 0
+
+        code, stdout, stderr = _invoke([*base, "sources", "atlas"])
+
+    assert (code, stderr) == (0, "")
+    (item,) = json.loads(stdout)
+    assert {"source_id", "adapter", "name", "active"} <= set(item)
+    assert item["status"] in {"current", "updating", "not_checked"}
+    assert item["total"] >= item["described"] >= 0
+    assert item["checked_at"] is None or isinstance(item["checked_at"], str)
+
+
 def test_attach_confirms_the_connection_from_the_live_source() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory).resolve() / "state"

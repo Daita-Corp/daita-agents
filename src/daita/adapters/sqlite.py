@@ -20,6 +20,7 @@ from ..catalog.models import (
     CatalogResource,
     CatalogResourceRevision,
     CatalogTier,
+    FacetKind,
     RelationshipFieldPair,
     RelationshipKind,
     RelationshipProvenance,
@@ -338,8 +339,33 @@ def _discover(
             ),
             truncated=len(visible) > request.max_inventory,
         )
-        truncated = len(visible) > request.max_resources
-        visible = visible[: request.max_resources]
+        # A fill keeps the detail it already has and describes what lacks it.
+        keep: dict[str, TabularFacet] = {}
+        if request.fill:
+            for entry in request.previous or ():
+                for item in entry.facets if entry.detailed else ():
+                    if item.kind is FacetKind.TABULAR:
+                        keep[entry.resource.id] = TabularFacet.from_payload(
+                            item.payload
+                        )
+            fresh = 0
+            chosen = []
+            for row in visible:
+                row_id = catalog_resource_id(
+                    registration.id,
+                    ResourceKind.TABLE if row["type"] == "table" else ResourceKind.VIEW,
+                    _native_identity(str(row["name"])),
+                )
+                if row_id not in keep:
+                    fresh += 1
+                    if fresh > request.max_resources:
+                        continue
+                chosen.append(row)
+            truncated = fresh > request.max_resources
+            visible = tuple(chosen)
+        else:
+            truncated = len(visible) > request.max_resources
+            visible = visible[: request.max_resources]
 
         facts: list[_TableFacts] = []
         for row in visible:
@@ -350,14 +376,18 @@ def _discover(
                 kind,
                 _native_identity(name),
             )
-            columns, columns_cut = _columns(connection, name, request)
-            indexes, indexes_cut = _indexes(
-                connection,
-                name,
-                {column.name for column in columns},
-                request,
-            )
-            truncated |= columns_cut or indexes_cut
+            previous_facet = keep.get(resource_id)
+            if previous_facet is not None:
+                columns, indexes = previous_facet.columns, previous_facet.indexes
+            else:
+                columns, columns_cut = _columns(connection, name, request)
+                indexes, indexes_cut = _indexes(
+                    connection,
+                    name,
+                    {column.name for column in columns},
+                    request,
+                )
+                truncated |= columns_cut or indexes_cut
             facet = CatalogFacet.from_tabular(
                 resource_id=resource_id,
                 sync_id=request.sync_id,

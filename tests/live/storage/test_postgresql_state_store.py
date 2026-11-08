@@ -33,6 +33,7 @@ from tests.support.catalog_records import (
     SHOP_REFERENCES,
     Table,
     batches,
+    exercise_keeper_state,
     snapshot,
 )
 from tests.support.postgresql_state import (
@@ -283,3 +284,21 @@ async def test_catalog_rows_are_pruned(
     assert row[0] <= 20
     assert await store.load_sync(_AGENT, "sync-22") is not None
     assert 0 < len(await store.list_catalog_changes(_AGENT, _SOURCE)) <= 3
+
+
+async def test_keeper_state_contract_holds_on_postgresql(
+    database: _PostgresDatabase,
+) -> None:
+    store = postgresql_state_store(database)
+    registration = SourceRegistration(
+        id=_SOURCE,
+        agent_id=_AGENT,
+        adapter_id="postgresql",
+        native_identity="db",
+        display_name="Orders",
+        configuration={},
+        attached_at=_NOW,
+    )
+    await exercise_keeper_state(
+        store, _AGENT, _SOURCE, lambda: store.register_source(registration)
+    )
