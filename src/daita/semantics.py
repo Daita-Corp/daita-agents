@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
@@ -217,10 +217,40 @@ class SemanticFieldReference:
         )
 
 
-@dataclass(frozen=True, slots=True, order=True)
+def _field_types(
+    value: tuple[tuple[str, str], ...], label: str
+) -> tuple[tuple[str, str], ...]:
+    pairs = tuple(sorted((name, native) for name, native in value))
+    if len({name for name, _ in pairs}) != len(pairs):
+        raise SemanticValidationError(f"{label} cannot repeat a field")
+    for name, native in pairs:
+        _bounded_text(
+            name,
+            f"{label} field_name",
+            max_characters=_FIELD_NAME_MAX_CHARACTERS,
+            max_utf8_bytes=_FIELD_NAME_MAX_UTF8_BYTES,
+        )
+        _bounded_text(
+            native,
+            f"{label} type",
+            max_characters=_FIELD_NAME_MAX_CHARACTERS,
+            max_utf8_bytes=_FIELD_NAME_MAX_UTF8_BYTES,
+        )
+    return pairs
+
+
+@dataclass(frozen=True, slots=True)
 class ResourceRevisionBinding:
+    """The catalog revision a note was saved against.
+
+    ``field_types`` holds (field name, native type) for each field of the
+    resource the note names. ``None`` is an older binding with no saved types;
+    ``()`` is a binding whose note names no field on this resource.
+    """
+
     resource_id: str
     revision: str
+    field_types: tuple[tuple[str, str], ...] | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.resource_id, "semantic revision resource_id")
@@ -230,6 +260,12 @@ class ResourceRevisionBinding:
             max_characters=_IDENTIFIER_MAX_CHARACTERS,
             max_utf8_bytes=_IDENTIFIER_MAX_UTF8_BYTES,
         )
+        if self.field_types is not None:
+            object.__setattr__(
+                self,
+                "field_types",
+                _field_types(self.field_types, "semantic revision field_types"),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,7 +399,12 @@ class SemanticAnnotation:
                 ),
             )
         )
-        revisions = tuple(sorted(self.catalog_revisions))
+        revisions = tuple(
+            sorted(
+                self.catalog_revisions,
+                key=lambda item: (item.resource_id, item.revision),
+            )
+        )
         if not evidence or len(evidence) > SEMANTIC_MAX_EVIDENCE:
             raise SemanticValidationError(
                 f"semantic annotations require 1 to {SEMANTIC_MAX_EVIDENCE} "
@@ -407,6 +448,7 @@ class SemanticResourceFact:
     source_id: str
     revision: str
     field_names: tuple[str, ...] = ()
+    field_types: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         _identifier(self.resource_id, "semantic resource fact resource_id")
@@ -430,6 +472,11 @@ class SemanticResourceFact:
                 max_utf8_bytes=_FIELD_NAME_MAX_UTF8_BYTES,
             )
         object.__setattr__(self, "field_names", fields)
+        object.__setattr__(
+            self,
+            "field_types",
+            _field_types(self.field_types, "semantic resource fact field_types"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,6 +619,7 @@ def semantic_annotation_from_mapping(
             ResourceRevisionBinding(
                 resource_id=_mapping_text(item, "resource_id"),
                 revision=_mapping_text(item, "revision"),
+                field_types=_mapping_field_types(item),
             )
             for item in raw_revisions
             if isinstance(item, Mapping)
@@ -603,6 +651,25 @@ def semantic_annotation_from_mapping(
         if isinstance(error, SemanticValidationError):
             raise
         raise SemanticValidationError("invalid semantic annotation mapping") from error
+
+
+def _mapping_field_types(
+    value: Mapping[str, object],
+) -> tuple[tuple[str, str], ...] | None:
+    raw = value.get("field_types")
+    if raw is None:
+        return None
+    if not isinstance(raw, (tuple, list)):
+        raise TypeError
+    pairs: list[tuple[str, str]] = []
+    for item in raw:
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise TypeError
+        name, native = item
+        if not isinstance(name, str) or not isinstance(native, str):
+            raise TypeError
+        pairs.append((name, native))
+    return tuple(pairs)
 
 
 def _mapping_text(value: Mapping[str, object], name: str) -> str:
@@ -733,9 +800,7 @@ def inspect_semantic_annotations(
     facts = {item.resource_id: item for item in resources}
     stale_by_id: dict[str, tuple[str, ...]] = {}
     for annotation in annotations:
-        revisions = {
-            item.resource_id: item.revision for item in annotation.catalog_revisions
-        }
+        bindings = {item.resource_id: item for item in annotation.catalog_revisions}
         reasons: set[str] = set()
         actual_sources: set[str] = set()
         for resource_id in annotation.subject.resource_ids:
@@ -744,8 +809,15 @@ def inspect_semantic_annotations(
                 reasons.add(f"missing_resource:{resource_id}")
                 continue
             actual_sources.add(fact.source_id)
-            if revisions[resource_id] != fact.revision:
-                reasons.add(f"revision_mismatch:{resource_id}")
+            binding = bindings[resource_id]
+            if binding.field_types is None:
+                if binding.revision != fact.revision:
+                    reasons.add(f"revision_mismatch:{resource_id}")
+                continue
+            now_types = dict(fact.field_types)
+            for name, native in binding.field_types:
+                if name in now_types and now_types[name] != native:
+                    reasons.add(f"field_type_changed:{resource_id}.{name}")
         if actual_sources and actual_sources != set(annotation.subject.source_ids):
             reasons.add("source_scope_mismatch")
         for field in annotation.subject.fields:
@@ -1817,7 +1889,7 @@ class SemanticCapabilityDomain:
         subject = cast(Mapping[str, object], arguments["subject"])
         resource_ids = cast(tuple[str, ...], subject["resource_ids"])
         facts = {
-            item.resource_id: item.revision
+            item.resource_id: item
             for item in await self._catalog.semantic_resource_facts(
                 run.agent_id, resource_ids
             )
@@ -1828,8 +1900,20 @@ class SemanticCapabilityDomain:
                     "semantic_unknown_resource", _UNCATALOGED_TABLE
                 )
         bound = arguments.to_dict()
+        named = {
+            (item["resource_id"], item["field_name"])
+            for item in cast(Sequence[Mapping[str, str]], subject.get("fields", ()))
+        }
         bound["catalog_revisions"] = [
-            {"resource_id": resource_id, "revision": facts[resource_id]}
+            {
+                "resource_id": resource_id,
+                "revision": facts[resource_id].revision,
+                "field_types": [
+                    [name, native]
+                    for name, native in facts[resource_id].field_types
+                    if (resource_id, name) in named
+                ],
+            }
             for resource_id in resource_ids
         ]
         annotation_id = arguments.get("id")

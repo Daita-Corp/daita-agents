@@ -134,8 +134,8 @@
           "state.db",
           "config.json"
         ],
-        "checksum": "4e9acff7f225ed89a6ce7826c78f87997a3de988e6f9e606cbd0afbc1c0b9217",
-        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete. Retire inactive learning candidates and their review stamps; approved knowledge is unaffected. Routines keep their title, prompt, schedule, named sources, counters and state; their frozen access, grants, routes, sensitivity, budgets, expiry, outcome, precheck, skills and provenance are dropped, and their runs ask before writes. Occurrences drop prechecks, reservations and their copy of the run's scope. MCP tool bindings drop unattended eligibility; every MCP action asks at the time. The task graph is replaced by one checklist-job record per job: finished jobs keep their accepted result, unfinished jobs fail with an upgrade message, result deliveries and receipts keep their job id, graph attention notices are dropped, and the graph tables go. Stored write scopes bind to table and column names, not catalog revisions: update stays update, upsert becomes insert and update, delete is never granted, conflict keys and identity columns go, and a scope whose table left the catalog is dropped. Each saved model route candidate gains a null reasoning effort, which keeps the provider's default. Each source's catalog snapshot becomes one row per resource, relationship and search entry plus a source state row; resource ids and revisions are unchanged, every resource counts as fully described, and the snapshot table goes.",
+        "checksum": "462d5ad981152f9c7fb5f8d7253a7e692b87ffc33eb84ae67c079e8091a6957b",
+        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs. Add an empty agent-owned declared catalog link table; link currency is computed, never stored. Catalog syncs record whether a bounded discovery was truncated; every historical sync was complete. Retire inactive learning candidates and their review stamps; approved knowledge is unaffected. Routines keep their title, prompt, schedule, named sources, counters and state; their frozen access, grants, routes, sensitivity, budgets, expiry, outcome, precheck, skills and provenance are dropped, and their runs ask before writes. Occurrences drop prechecks, reservations and their copy of the run's scope. MCP tool bindings drop unattended eligibility; every MCP action asks at the time. The task graph is replaced by one checklist-job record per job: finished jobs keep their accepted result, unfinished jobs fail with an upgrade message, result deliveries and receipts keep their job id, graph attention notices are dropped, and the graph tables go. Stored write scopes bind to table and column names, not catalog revisions: update stays update, upsert becomes insert and update, delete is never granted, conflict keys and identity columns go, and a scope whose table left the catalog is dropped. Each saved model route candidate gains a null reasoning effort, which keeps the provider's default. Each source's catalog snapshot becomes one row per resource, relationship and search entry plus a source state row; resource ids and revisions are unchanged, every resource counts as fully described, and the snapshot table goes. Each semantic note whose resource is still at the revision it was saved against gains the native types of the fields it names; other notes keep comparing revisions.",
         "migration_id": "0004_foreground_analysis_evidence",
         "revision": 4
       }
@@ -847,7 +847,8 @@
       ],
       "ResourceRevisionBinding": [
         "resource_id",
-        "revision"
+        "revision",
+        "field_types"
       ],
       "RoutineOccurrence": [
         "routine_id",
@@ -2443,7 +2444,7 @@
       }
     }
   },
-  "contract_sha256": "886ed0aaa67ef32eacc045869618c597ddd4d23438f91319f5c7c2fa9a4c44b0",
+  "contract_sha256": "9bd1d06fabb3e19e2615d61bbf02d0ebbee5684e38cf3480ac1d657ac9d606bd",
   "home_revision": 4,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1

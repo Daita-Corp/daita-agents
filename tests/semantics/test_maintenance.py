@@ -684,3 +684,95 @@ async def test_identically_named_resources_remain_isolated_by_selected_source(
         assert first_resource.id not in prompt and second_resource.id not in prompt
     finally:
         await agent.close()
+
+
+def _typed_note(field_types, *, fields=("amt",)):
+    base = _annotation("typed", field_names=fields, statement="Same note.")
+    return replace(
+        base,
+        catalog_revisions=(
+            ResourceRevisionBinding("resource-1", "revision-1", field_types),
+        ),
+    )
+
+
+def _fact(*types: tuple[str, str], revision="revision-2"):
+    return SemanticResourceFact(
+        "resource-1", "source-1", revision, tuple(n for n, _ in types), types
+    )
+
+
+def _reasons(note, fact):
+    return inspect_semantic_annotations((note,), (fact,))[0].stale_reasons
+
+
+def test_field_level_staleness_ignores_unrelated_changes():
+    named = _typed_note((("amt", "numeric(12,2)"),))
+    nameless = replace(
+        _annotation("nameless"),
+        subject=SemanticSubject(("source-1",), ("resource-1",), ()),
+        catalog_revisions=(ResourceRevisionBinding("resource-1", "revision-1", ()),),
+    )
+    # A new revision and an added column leave both notes current.
+    fact = _fact(("amt", "numeric(12,2)"), ("added", "text"))
+    assert _reasons(named, fact) == ()
+    assert _reasons(nameless, fact) == ()
+    assert _reasons(nameless, _fact()) == ()
+
+
+def test_field_level_staleness_names_drops_retypes_and_missing_tables():
+    named = _typed_note((("amt", "numeric(12,2)"),))
+    assert _reasons(named, _fact(("other", "text"))) == (
+        "missing_field:resource-1.amt",
+    )
+    view = inspect_semantic_annotations((named,), (_fact(("amt", "text")),))[0]
+    assert view.stale_reasons == ("field_type_changed:resource-1.amt",)
+    assert view.state is SemanticAnnotationState.STALE
+    assert inspect_semantic_annotations((named,), ())[0].stale_reasons == (
+        "missing_resource:resource-1",
+    )
+
+
+def test_binding_without_types_keeps_the_revision_check():
+    old = _annotation("old", field_names=("amt",))
+    assert old.catalog_revisions[0].field_types is None
+    assert _reasons(old, _fact(("amt", "text"))) == ("revision_mismatch:resource-1",)
+    assert _reasons(old, _fact(("amt", "text"), revision="revision-1")) == ()
+    mixed = replace(
+        old,
+        subject=SemanticSubject(("source-1",), ("a", "b"), ()),
+        catalog_revisions=(
+            ResourceRevisionBinding("b", "r", ()),
+            ResourceRevisionBinding("a", "r"),
+        ),
+    )
+    assert [b.resource_id for b in mixed.catalog_revisions] == ["a", "b"]
+
+
+def test_binding_types_round_trip_and_do_not_change_the_digest():
+    from typing import cast
+
+    from daita.semantics import semantic_annotation_sha256
+    from daita.storage.sqlite_codecs.common import JsonValue
+    from daita.storage.sqlite_codecs.semantics import (
+        decode_revision_binding,
+        encode_revision_binding,
+    )
+
+    for types in (None, (), (("amt", "numeric(12,2)"), ("id", "int8"))):
+        binding = ResourceRevisionBinding("resource-1", "revision-1", types)
+        stored = encode_revision_binding(binding)
+        assert ("field_types" in cast(dict, stored["fields"])) is (types is not None)
+        assert decode_revision_binding(stored) == binding
+        assert encode_revision_binding(decode_revision_binding(stored)) == stored
+    old: JsonValue = {
+        "__record__": "ResourceRevisionBinding",
+        "fields": {"resource_id": "resource-1", "revision": "revision-1"},
+    }
+    assert decode_revision_binding(old).field_types is None
+
+    plain = _annotation("same", field_names=("amt",), statement="Same note.")
+    typed = _typed_note((("amt", "text"),))
+    assert semantic_annotation_sha256(replace(typed, id="same")) == (
+        semantic_annotation_sha256(plain)
+    )
