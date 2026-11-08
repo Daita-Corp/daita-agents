@@ -6,9 +6,10 @@ connecting role can read, and it must stay still for what a revision does not
 store (rows, statistics, table comments, enum labels).
 
 Needs the disposable postgres-large fixture server
-(tests/fixtures/postgres-large/compose.yaml). Every case runs inside one
-transaction on its ``postgres`` database that always rolls back, so it creates
-its schemas, tables and roles there and leaves nothing behind:
+(tests/fixtures/postgres-large/compose.yaml). Every case but the last runs
+inside one transaction on its ``postgres`` database that always rolls back, so
+it creates its schemas, tables and roles there and leaves nothing behind. The
+last case only reads: it attaches the fixture database through a real agent:
 
     DAITA_RUN_POSTGRES_LARGE_FIXTURE=1 DAITA_LARGE_POSTGRES_ADMIN_PASSWORD=... \
     pytest tests/live/data/test_change_probe.py -s
@@ -22,16 +23,23 @@ import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from daita import Agent
 from daita.adapters.models import DiscoveryRequest, SourceProbe, SourceRegistration
 from daita.adapters.postgresql import _batches, _load_structure, probe_tokens
+from daita.llm.models import ModelProfile
+from daita.llm.providers.mock import MockModelProvider
+from daita.security import SecretReference
+from tests.data.postgresql._large_fixture_support import ATTACHED_SCHEMAS, _Secrets
 from tests.support.source_contract import (
     ProbeMutation,
     assert_change_detection_contract,
 )
+from tests.support.workspace import workspace_for
 
 pytestmark = [
     pytest.mark.requires_db,
@@ -397,3 +405,59 @@ async def test_fill_describes_what_lacks_detail_and_keeps_the_rest(
     assert len(middle.tables) == 4 and middle.truncated
     last, kept = await read(max_resources=2, previous=kept, fill=True)
     assert len(last.tables) == 6 and not last.truncated
+
+
+async def test_attached_agent_stores_the_probe_tokens_the_role_reads(
+    tmp_path: Path,
+) -> None:
+    import asyncpg
+
+    password = os.environ.get(
+        "DAITA_LARGE_POSTGRES_PASSWORD", "daita_large_fixture_password"
+    )
+    port = int(os.environ.get("DAITA_LARGE_POSTGRES_PORT", "55433"))
+    provider = MockModelProvider(())
+    agent = await Agent.create(
+        "change-probe-attached",
+        root=tmp_path,
+        model=provider,
+        model_profile=ModelProfile(
+            id=provider.provider_id,
+            context_window_tokens=80_000,
+            max_output_tokens=2_000,
+            supports_tools=True,
+        ),
+        secret_provider=_Secrets(password),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        source = await agent.attach_postgresql(
+            host="127.0.0.1",
+            port=port,
+            database="daita_large_fixture",
+            username="daita_large_reader",
+            credential=SecretReference.keychain(
+                "fixture:postgres-large:daita_large_reader"
+            ),
+            schemas=ATTACHED_SCHEMAS,
+            ssl_mode="disable",
+        )
+        state = await agent._embedded._store.load_source_state(agent.id, source.id)
+        assert state is not None and state.probe_tokens
+        connection = await asyncpg.connect(
+            host="127.0.0.1",
+            port=port,
+            database="daita_large_fixture",
+            user="daita_large_reader",
+            password=password,
+            ssl=False,
+            timeout=5,
+        )
+        try:
+            direct = await probe_tokens(connection, ATTACHED_SCHEMAS)
+        finally:
+            await connection.close()
+        assert dict(state.probe_tokens) == direct
+        assert (await agent.catalog_status(source.id)).error_code is None
+    finally:
+        await agent.close()

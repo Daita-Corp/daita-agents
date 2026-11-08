@@ -305,7 +305,10 @@ the host's idle policy, and sets no wake time.
   best case on a quiet laptop; the 100 ms target was not met), about 1 ms on SQLite and
   about 133 ms on a folder (median). A change reached the catalog in a median of 16 s
   on PostgreSQL, 4 s on SQLite and 5 s on a folder. Over 108, 112 and 110 scripted
-  changes the probes missed none.
+  changes the probes missed none. Over a simulated 50 ms round trip the probe
+  statement costs one round trip, but with the default `pool_enabled=False` each
+  probe opens its own connection, so a probe of 36 tables took about 350 ms; with
+  `PostgreSQLReadLimits(pool_enabled=True)` probes reuse a pooled connection.
 
 ### Cross-source joins
 

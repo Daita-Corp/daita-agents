@@ -575,3 +575,86 @@ async def test_cancel_during_reset_retains_lease_until_cleanup_settles(
     assert backend.diagnostics().active == 0
     assert len(transport.queries) == 1
     await backend.close()
+
+
+async def _probe(backend, registration):
+    return await backend.probe(
+        agent_id=registration.agent_id, source_id=registration.id, cursor=None
+    )
+
+
+async def test_probes_share_one_pooled_connection(transport, monkeypatch):
+    backend, registration = _pooled()
+    seen = []
+
+    async def fake(connection, schemas, *, timeout):
+        seen.append((connection, schemas))
+        return {"public": "token"}
+
+    monkeypatch.setattr(module, "probe_tokens", fake)
+    first = await _probe(backend, registration)
+    second = await _probe(backend, registration)
+    assert first.tokens == second.tokens == {"public": "token"}
+    assert [schemas for _, schemas in seen] == [("public",), ("public",)]
+    assert len(transport.created) == 1 and seen[0][0] is seen[1][0]
+    assert not transport.pools[0].active
+    await backend.close()
+
+
+async def test_probe_failure_hides_secret_and_frees_the_slot(transport, monkeypatch):
+    backend, registration = _pooled(source_capacity=1)
+    secret = "postgresql://user:hunter2-secret@db/app"
+    calls = []
+
+    async def fake(connection, schemas, *, timeout):
+        calls.append(connection)
+        if len(calls) == 1:
+            raise RuntimeError(f"could not connect to {secret}")
+        return {"public": "token"}
+
+    monkeypatch.setattr(module, "probe_tokens", fake)
+    with pytest.raises(source_module.PostgreSQLSourceError) as caught:
+        await _probe(backend, registration)
+    assert caught.value.code == "postgresql_probe_failed"
+    assert "hunter2" not in str(caught.value)
+    assert "hunter2" not in "".join(traceback.format_exception(caught.value))
+    assert not transport.pools[0].active
+    assert (await _probe(backend, registration)).tokens == {"public": "token"}
+    assert not transport.pools[0].active
+    await backend.close()
+
+
+async def test_hung_probe_times_out_and_frees_the_slot(transport, monkeypatch):
+    backend, registration = _pooled(
+        source_capacity=1,
+        limits=PostgreSQLReadLimits(pool_enabled=True, acquire_timeout_seconds=0.05),
+    )
+    monkeypatch.setattr(module, "_LOOKUP_SECONDS", 0.05)
+
+    async def hang(connection, schemas, *, timeout):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(module, "probe_tokens", hang)
+    with pytest.raises(source_module.PostgreSQLSourceError) as caught:
+        await asyncio.wait_for(_probe(backend, registration), 5)
+    assert caught.value.code == "postgresql_probe_timeout"
+    assert not transport.pools[0].active
+    await backend.close()
+
+
+async def test_cancelled_probe_leaves_no_active_connection(transport, monkeypatch):
+    backend, registration = _pooled(source_capacity=1)
+    entered = asyncio.Event()
+
+    async def hang(connection, schemas, *, timeout):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(module, "probe_tokens", hang)
+    task = asyncio.create_task(_probe(backend, registration))
+    await asyncio.wait_for(entered.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5)
+    assert not transport.pools[0].active
+    await backend.close()
