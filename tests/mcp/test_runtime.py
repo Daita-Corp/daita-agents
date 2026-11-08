@@ -1210,6 +1210,9 @@ async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(
             picker = app.screen
             assert isinstance(picker, SelectionScreen)
             listing = picker.query_one("#picker-options", OptionList)
+            async with asyncio.timeout(5):
+                while not listing.option_count:
+                    await pilot.pause()
             prompt = str(listing.get_option_at_index(0).prompt)
             assert "MCP guided-mcp.fixture.test" in prompt
             assert "query-docs" in prompt
@@ -1231,7 +1234,11 @@ async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(
                     await pilot.pause()
             picker = app.screen
             assert isinstance(picker, SelectionScreen)
-            picker.query_one("#picker-options", OptionList).highlighted = 0
+            listing = picker.query_one("#picker-options", OptionList)
+            async with asyncio.timeout(5):
+                while not listing.option_count:
+                    await pilot.pause()
+            listing.highlighted = 0
             picker.action_confirm()
             await pilot.pause()
             confirmation = app.screen
