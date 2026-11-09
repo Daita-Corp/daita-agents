@@ -636,3 +636,54 @@ async def test_route_validation_keeps_an_injected_provider_borrowed() -> None:
     )
 
     assert provider.close_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("model_id", "base_url", "api_key"),
+    (
+        ("gateway:model", "https://example.test/v1", None),
+        ("gateway:model", "https://example.test/v1", "own-key"),
+        ("grok:grok-test", None, None),
+    ),
+    ids=("keyless-custom", "custom-with-key", "keyless-grok"),
+)
+async def test_openai_environment_values_never_reach_other_endpoints(
+    monkeypatch,
+    model_id: str,
+    base_url: str | None,
+    api_key: str | None,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-secret")
+    monkeypatch.setenv("OPENAI_ORG_ID", "environment-org")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "environment-project")
+    seen: list[httpx.Headers] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers)
+        return httpx.Response(401, json={"error": {"message": "unauthorized"}})
+
+    real_client = openai.AsyncOpenAI
+
+    def with_transport(**kwargs: Any) -> openai.AsyncOpenAI:
+        http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        return real_client(http_client=http, **kwargs)
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", with_transport)
+    provider = cast(
+        Any,
+        factory_module.create_llm_provider(
+            model_id, base_url=base_url, api_key=api_key
+        ),
+    )
+
+    with pytest.raises(openai.AuthenticationError):
+        await provider.client.chat.completions.create(
+            model="model", messages=[{"role": "user", "content": "hello"}]
+        )
+    await provider.close()
+
+    assert "environment-secret" not in seen[0]["authorization"]
+    if api_key is not None:
+        assert seen[0]["authorization"] == f"Bearer {api_key}"
+    assert "openai-organization" not in seen[0]
+    assert "openai-project" not in seen[0]

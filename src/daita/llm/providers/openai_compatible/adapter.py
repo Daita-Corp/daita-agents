@@ -195,16 +195,24 @@ class OpenAICompatibleProvider:
             raise RuntimeError(f"{self.provider} provider is closed")
         if self._client is None:
             try:
-                from openai import AsyncOpenAI
+                from openai import AsyncOpenAI, Omit
             except ImportError as error:
                 raise ImportError(
                     "Daita's OpenAI-compatible runtime dependency is unavailable. "
                     f"{repair_guidance()}"
                 ) from error
+            # This endpoint is not OpenAI: the SDK must not fill these from OPENAI_*.
             self._client = cast(
                 _OpenAICompatibleClient,
                 AsyncOpenAI(
-                    api_key=self._api_key, base_url=self.base_url, max_retries=0
+                    api_key=self._api_key or "no-key-configured",
+                    base_url=self.base_url,
+                    max_retries=0,
+                    # The SDK honours Omit here; its type hint only allows str.
+                    default_headers=cast(
+                        Mapping[str, str],
+                        {"OpenAI-Organization": Omit(), "OpenAI-Project": Omit()},
+                    ),
                 ),
             )
         if not self._owns_client:

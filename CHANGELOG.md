@@ -20,6 +20,10 @@ An existing home migrates automatically to home revision 4 the first time it ope
   and it is dropped rather than revived. `Agent.preview_source_permissions(
   relational_write_scopes=...)` is now keyed by full table name, and a scope no longer
   has `key_columns` or `generated_identity_columns`.
+- **Custom and Grok endpoints no longer see `OPENAI_*` variables.** A route with no key
+  used to send `OPENAI_API_KEY` to that endpoint, and the organization and project
+  variables went with every request. A keyless route now sends a placeholder. Pass the
+  endpoint's own key on the route if it needs one.
 - **Renamed or removed tools and APIs.** Update any caller, stored routine or prompt
   that names one:
   - `data_update_rows` and `data_upsert_rows` are replaced by `data_write`.
