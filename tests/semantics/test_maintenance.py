@@ -34,6 +34,7 @@ from daita.semantics import (
     SEMANTIC_RECALL_MAX_UTF8_BYTES,
     SemanticResourceFact,
     SemanticValidationError,
+    carry_renames,
     inspect_semantic_annotations,
     render_semantic_recall,
     semantic_duplicate_identity,
@@ -776,3 +777,65 @@ def test_binding_types_round_trip_and_do_not_change_the_digest():
     assert semantic_annotation_sha256(replace(typed, id="same")) == (
         semantic_annotation_sha256(plain)
     )
+
+
+def _carried(note, *, tables=None, columns=None, revisions=None):
+    return carry_renames(
+        note,
+        tables=tables or {},
+        columns=columns or {},
+        revisions=revisions or {},
+    )
+
+
+def test_a_table_rename_moves_a_note_and_leaves_its_words_alone():
+    note = _typed_note((("amt", "numeric(12,2)"),))
+    new = SemanticResourceFact(
+        "resource-2", "source-1", "revision-9", ("amt",), (("amt", "numeric(12,2)"),)
+    )
+    carried = _carried(
+        note,
+        tables={"resource-1": "resource-2"},
+        revisions={"resource-1": ("revision-1", "revision-9")},
+    )
+    assert carried.subject.resource_ids == ("resource-2",)
+    assert carried.subject.fields == (SemanticFieldReference("resource-2", "amt"),)
+    assert carried.catalog_revisions[0].revision == "revision-9"
+    for kept in ("statement", "evidence", "created_at", "id", "kind", "sensitivity"):
+        assert getattr(carried, kept) == getattr(note, kept)
+    assert inspect_semantic_annotations((carried,), (new,))[0].stale_reasons == ()
+    assert _carried(note) is note
+
+
+def test_a_swapped_pair_of_column_names_follows_each_note():
+    note = _typed_note((("a", "int"), ("b", "text")), fields=("a",))
+    carried = _carried(note, columns={"resource-1": {"a": "b", "b": "a"}})
+    assert carried.subject.fields == (SemanticFieldReference("resource-1", "b"),)
+    assert carried.catalog_revisions[0].field_types == (("a", "text"), ("b", "int"))
+
+
+def test_a_renamed_and_retyped_column_is_carried_but_stale():
+    note = _typed_note((("amt", "numeric(12,2)"),))
+    carried = _carried(note, columns={"resource-1": {"amt": "amount"}})
+    now = _fact(("amount", "text"))
+    assert _reasons(carried, now) == ("field_type_changed:resource-1.amount",)
+
+
+def test_an_older_binding_stays_stale_after_a_rename_and_a_collision_is_refused():
+    old = _annotation("old", field_names=("amt",))
+    carried = _carried(
+        old,
+        tables={"resource-1": "resource-2"},
+        revisions={"resource-1": ("revision-1", "revision-9")},
+    )
+    assert carried.subject.resource_ids == ("resource-2",)
+    assert carried.catalog_revisions[0].revision == "revision-1"
+    fact = SemanticResourceFact("resource-2", "source-1", "revision-9", ("amt",))
+    assert inspect_semantic_annotations((carried,), (fact,))[0].stale_reasons == (
+        "revision_mismatch:resource-2",
+    )
+    both = _annotation(
+        "both", resource_ids=("resource-1", "resource-2"), field_names=("a", "b")
+    )
+    with pytest.raises(SemanticValidationError):
+        _carried(both, tables={"resource-1": "resource-2"})

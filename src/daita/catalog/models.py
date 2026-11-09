@@ -1381,6 +1381,8 @@ class CatalogEntry:
     revision: CatalogResourceRevision
     facets: tuple[CatalogFacet, ...]
     detailed: bool
+    # Set only when the source's identifier survives a rename; column ordinals
+    # keep their identity (so a rename is provable) while it holds.
     source_object_id: str | None = None
 
     def __post_init__(self) -> None:

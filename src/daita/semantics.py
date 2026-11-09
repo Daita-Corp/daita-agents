@@ -786,6 +786,58 @@ def _normalized_statement(statement: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", statement).casefold().split())
 
 
+def carry_renames(
+    annotation: SemanticAnnotation,
+    *,
+    tables: Mapping[str, str],
+    columns: Mapping[str, Mapping[str, str]],
+    revisions: Mapping[str, tuple[str, str]],
+) -> SemanticAnnotation:
+    """Follow proven renames: old resource id to new, and old field to new.
+
+    ``columns`` is keyed by the old resource id and applies simultaneously, so
+    a swap works. Stored field types keep their types, so a rename that also
+    retypes a field still reads as a type change. A binding's revision moves
+    only when it saved field types; an older binding keeps the revision check.
+    Returns the same object when nothing changes; a collision raises
+    ``SemanticValidationError``.
+    """
+
+    def column(resource_id: str, name: str) -> str:
+        return columns.get(resource_id, {}).get(name, name)
+
+    subject = replace(
+        annotation.subject,
+        resource_ids=tuple(tables.get(i, i) for i in annotation.subject.resource_ids),
+        fields=tuple(
+            SemanticFieldReference(
+                tables.get(f.resource_id, f.resource_id),
+                column(f.resource_id, f.field_name),
+            )
+            for f in annotation.subject.fields
+        ),
+    )
+    bindings = []
+    for binding in annotation.catalog_revisions:
+        old_revision, new_revision = revisions.get(binding.resource_id, ("", ""))
+        types = binding.field_types
+        revision = binding.revision
+        if types is not None:
+            types = tuple((column(binding.resource_id, n), t) for n, t in types)
+            if revision == old_revision:
+                revision = new_revision
+        bindings.append(
+            replace(
+                binding,
+                resource_id=tables.get(binding.resource_id, binding.resource_id),
+                revision=revision,
+                field_types=types,
+            )
+        )
+    carried = replace(annotation, subject=subject, catalog_revisions=tuple(bindings))
+    return annotation if carried == annotation else carried
+
+
 def inspect_semantic_annotations(
     annotations: tuple[SemanticAnnotation, ...],
     resources: tuple[SemanticResourceFact, ...],
@@ -2717,6 +2769,7 @@ __all__ = [
     "SemanticResourceFact",
     "SemanticSubject",
     "SemanticValidationError",
+    "carry_renames",
     "inspect_semantic_annotations",
     "render_semantic_annotation",
     "render_semantic_recall",

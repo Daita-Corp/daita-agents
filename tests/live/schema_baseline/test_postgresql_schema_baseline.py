@@ -1366,7 +1366,9 @@ async def _run_daita_hard(
                             trips,
                             conversation_id,
                         )
-                        _require_started(result)
+                        # A timeout is a recorded outcome, not a setup failure.
+                        if result.reason != "timeout":
+                            _require_started(result)
                         conversation_id = result.conversation_id
                         entry["hard_questions"].append(
                             {

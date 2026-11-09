@@ -657,3 +657,44 @@ def test_result_rendering_withholds_blocked_reports_and_marks_bounded_previews()
     assert "Result run: No model run started" in escalation
     assert "Escalation" in escalation
     assert "failed before a model run could start" in escalation
+
+
+@pytest.mark.tui_driven
+async def test_a_review_card_opens_memory_not_routines(
+    start_host: StartHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    card = _card(
+        WorkKind.CATALOG_REVIEW,
+        "resource-1",
+        WorkColumn.NEEDS_YOU,
+        title="2 notes need review after changes to sales.orders",
+        status="needs_review",
+    )
+    app, agent = await _app_with_board(start_host, monkeypatch, [_board(card)])
+    opened: list[str] = []
+
+    async def handle_command(command: str) -> None:
+        opened.append(command)
+
+    monkeypatch.setattr(app, "_handle_command", handle_command)
+    try:
+        async with app.run_test(size=(140, 40)) as pilot:
+            await app._show_chat()
+            chat = app.chat()
+            assert chat is not None
+            chat.action_section("work")
+            await app.refresh_background_status(notify_new=False)
+            await pilot.pause()
+            listing = chat.query_one("#work-needs_you", OptionList)
+            assert "sales.orders" in str(listing.get_option_at_index(0).prompt)
+            listing.focus()
+            await pilot.press("enter")
+            for _ in range(100):
+                await pilot.pause(0.02)
+                if opened:
+                    break
+            assert opened == ["/memory"]
+            assert not isinstance(app.screen, RoutinesScreen)
+            app.exit(0)
+    finally:
+        await agent.close()

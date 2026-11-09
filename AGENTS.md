@@ -292,7 +292,9 @@ Check the scheduled-run limits in `docs/architecture/jobs-and-routines.md`.
    `ResourceAdapterError` code, never driver text. Its tokens must move exactly
    with what a `reconcile` would record (a change it misses is never re-read),
    and not with rows or statistics. A type without a probe is only fully
-   rechecked on its schedule.
+   rechecked on its schedule. Set `source_object_id` only when it survives a
+   rename and column ordinals keep their identity while it holds: saved notes
+   follow renames on that proof.
 4. Declare stable `Capability`, `Executor` and optional `ToolView` identities and
    compose them through `CapabilityRegistry` in `EmbeddedAgent`.
 5. Reads go through the one read policy, `validate_read` in

@@ -45,6 +45,11 @@ from ...storage.sqlite_records import (
 )
 from .sql import ResourceSchema
 
+_CHANGED_HINT = (
+    "A key or column type on this table changed after a saved note about it was "
+    "written; check that note against these columns."
+)
+
 _CATALOG_PARTIAL = (
     "The catalog lists this source's objects but describes only some of them. "
     "catalog_search and catalog_describe read the source live."
@@ -571,6 +576,11 @@ class CatalogDataView:
             found = suffixed[0]
         facet = found.tabular
         return {
+            **(
+                {"changed": _CHANGED_HINT}
+                if await self._note_may_be_outdated(agent_id, found.resource)
+                else {}
+            ),
             "name": found.resource.native_identity,
             "kind": found.resource.kind.value,
             "revision": found.resource.current_revision,
@@ -603,6 +613,49 @@ class CatalogDataView:
                 agent_id, source_id, found.resource.id
             ),
         }
+
+    async def _note_may_be_outdated(
+        self, agent_id: str, resource: CatalogResource
+    ) -> bool:
+        """A current note naming no field, saved before a key or type change."""
+
+        try:
+            stored = await cast(SemanticStore, self._store).list_semantic_annotations(
+                agent_id
+            )
+            notes = tuple(
+                item
+                for item in stored
+                if resource.id in item.subject.resource_ids
+                and any(
+                    b.resource_id == resource.id
+                    and b.field_types == ()
+                    and b.revision != resource.current_revision
+                    for b in item.catalog_revisions
+                )
+            )
+            if not notes:
+                return False
+            facts = await self.semantic_resource_facts(agent_id, (resource.id,))
+            for view in inspect_semantic_annotations(notes, facts):
+                if not view.usable_as_current_meaning:
+                    continue
+                for binding in view.annotation.catalog_revisions:
+                    if (
+                        binding.resource_id == resource.id
+                        and binding.field_types == ()
+                        and binding.revision != resource.current_revision
+                        and await self._store.catalog_structure_changed(
+                            agent_id,
+                            resource.source_id,
+                            resource.id,
+                            binding.revision,
+                        )
+                    ):
+                        return True
+        except (CatalogStoreError, TypeError, ValueError, KeyError, RuntimeError):
+            return False  # advice only: a failing read means no hint
+        return False
 
     async def link_candidates(
         self,

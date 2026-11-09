@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -95,7 +96,7 @@ from daita.storage.sqlite_records import (
     SourceReadMode,
     effect_receipt_id,
 )
-from daita.work_board import WorkBoard
+from daita.work_board import WorkBoard, WorkCard, WorkColumn, WorkKind
 from tests.support.host import StartHost, hosts
 from tests.support.jobs import stored_job
 from tests.support.mcp import MemoryKeychain, conformance_identities, mock_transport
@@ -417,7 +418,7 @@ async def _capture(tmp_path: Path) -> dict[object, tuple[object, ...]]:
             ArtifactDestination: (await agent.export_destination(),),
             DeliveryInspection | None: (delivery,),
             DeliveryView | None: (acknowledged,),
-            WorkBoard: (board,),
+            WorkBoard: (board, _review_board(board)),
             ScheduledRoutine: (routine, paused),
             tuple[ScheduledRoutineSummary, ...]: (await agent.list_routines(),),
             ScheduledRoutineInspection | None: (inspection,),
@@ -637,3 +638,22 @@ def _catalog_changes(agent_id: str, source_id: str) -> tuple[CatalogChange, ...]
         )
         for index, kind in enumerate(CatalogChangeKind)
     )
+
+
+def _review_board(board: WorkBoard) -> WorkBoard:
+    """The same board with one catalog review card in Needs you."""
+
+    card = WorkCard(
+        kind=WorkKind.CATALOG_REVIEW,
+        id="resource-1",
+        column=WorkColumn.NEEDS_YOU,
+        title="2 notes need review after changes to sales.orders",
+        status="needs_review",
+        summary="",
+        updated_at=NOW,
+        reads_30d=4,
+        reads_7d=1,
+    )
+    columns = dict(board.columns)
+    columns[WorkColumn.NEEDS_YOU] += (card,)
+    return WorkBoard(MappingProxyType(columns), board.truncated, board.generated_at)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -115,6 +116,10 @@ def test_today_groups_added_tables_and_skips_earlier_days() -> None:
         == "Today: 3 objects added in sales · orders.status changed type"
     )
     assert today_line(changes[-1:], NOW) == ""
+    renamed = _change(CatalogChangeKind.CHANGED, "sales.purchases")
+    assert renamed.before is not None
+    renamed = replace(renamed, before=replace(renamed.before, name="orders"))
+    assert today_line([renamed], NOW) == "Today: orders renamed to purchases"
 
 
 @pytest.mark.unit

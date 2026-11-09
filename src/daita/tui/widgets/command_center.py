@@ -162,6 +162,8 @@ def _work_target(card: WorkCard) -> tuple[str, str | None]:
         return "jobs", card.id
     if card.kind is WorkKind.ROUTINE:
         return "routines", card.id
+    if card.kind is WorkKind.CATALOG_REVIEW:
+        return "memory", None
     if card.delivery_id is not None:
         return "result", card.delivery_id
     return "routines", card.routine_id

@@ -24,6 +24,7 @@ from ..catalog.models import (
     CatalogSync,
     CatalogSyncStatus,
     CatalogTier,
+    FacetKind,
     ResourceBatch,
     ResourceKind,
 )
@@ -33,6 +34,7 @@ from ..catalog.search_text import (
     search_words,
     tabular_parts,
 )
+from ..semantics import SemanticAnnotation, carry_renames
 from .sql_connection import SQLConnection
 from .sqlite_codecs import (
     decode_catalog_change_data,
@@ -41,12 +43,14 @@ from .sqlite_codecs import (
     decode_catalog_source_state,
     decode_catalog_sync,
     decode_search_postings,
+    decode_semantic_annotation,
     encode_catalog_change_data,
     encode_catalog_entry,
     encode_catalog_relationship,
     encode_catalog_source_state,
     encode_catalog_sync,
     encode_search_postings,
+    encode_semantic_annotation,
 )
 from .sqlite_codecs.common import datetime_encode
 
@@ -490,6 +494,52 @@ def list_changes(
     return tuple(_decoded(rows, change, note, lambda row: source_id))
 
 
+def newest_changes(
+    connection: SQLConnection, agent_id: str, resource_ids: Sequence[str]
+) -> dict[str, tuple[str, datetime]]:
+    """Each resource's newest change as (native identity, changed_at)."""
+
+    newest: dict[str, tuple[str, datetime]] = {}
+    for resource_id, changed_at, identity in _fetch_in(
+        connection,
+        "SELECT resource_id, changed_at, native_identity FROM catalog_changes "
+        "WHERE agent_id = ? AND resource_id IN ({marks})",
+        (agent_id,),
+        resource_ids,
+    ):
+        moment = datetime.fromisoformat(changed_at)
+        if resource_id not in newest or moment > newest[resource_id][1]:
+            newest[resource_id] = (identity, moment)
+    return newest
+
+
+# shortcut: key history isn't stored, so any revision move that isn't a pure column addition counts; upgrade when change sides record keys.
+def structure_changed(
+    connection: SQLConnection,
+    agent_id: str,
+    source_id: str,
+    resource_id: str,
+    since_revision: str,
+) -> bool:
+    rows = connection.execute(
+        "SELECT data FROM catalog_changes WHERE agent_id = ? AND source_id = ? "
+        "AND resource_id = ? AND kind = 'changed' ORDER BY sequence DESC LIMIT 64",
+        (agent_id, source_id, resource_id),
+    ).fetchall()
+    for (data,) in rows:
+        try:
+            before, after = decode_catalog_change_data(data)
+        except _DECODE_ERRORS:
+            return True
+        if before is None or after is None or not before.columns:
+            return True
+        if not set(before.columns) < set(after.columns):
+            return True
+        if before.revision == since_revision:
+            return False
+    return True
+
+
 def counts(
     connection: SQLConnection, agent_id: str, source_ids: Sequence[str]
 ) -> tuple[int, int]:
@@ -627,6 +677,120 @@ def _stored_side(stored: _Stored, entry: CatalogEntry | None) -> CatalogChangeSi
     )
 
 
+def _table_renames(
+    stored: Mapping[str, _Stored],
+    added: Sequence[CatalogEntry],
+    removed: Sequence[str],
+) -> dict[str, CatalogEntry]:
+    """Old resource id to new entry, where one source object id moved alone.
+
+    ``removed`` is empty unless the listing was complete.
+    """
+
+    gone: dict[str, list[str]] = {}
+    for resource_id in removed:
+        if stored[resource_id].source_object_id is not None:
+            gone.setdefault(stored[resource_id].source_object_id or "", []).append(
+                resource_id
+            )
+    arrived: dict[str, list[CatalogEntry]] = {}
+    for item in added:
+        if item.source_object_id is not None:
+            arrived.setdefault(item.source_object_id, []).append(item)
+    return {
+        old[0]: new[0]
+        for object_id, old in gone.items()
+        if len(old) == 1
+        and len(new := arrived.get(object_id, [])) == 1
+        and stored[old[0]].kind == new[0].resource.kind.value
+    }
+
+
+def _ordinal_names(entry: CatalogEntry) -> dict[int, str] | None:
+    tabular = [f for f in entry.facets if f.kind is FacetKind.TABULAR]
+    if not entry.detailed or len(tabular) != 1:
+        return None
+    payload: Any = tabular[0].payload
+    return {c["ordinal"]: c["name"] for c in payload["columns"]}
+
+
+def _column_renames(old: CatalogEntry, new: CatalogEntry) -> dict[str, str]:
+    """Old column name to new, for ordinals that kept their place and changed name."""
+
+    before, after = _ordinal_names(old), _ordinal_names(new)
+    if before is None or after is None:
+        return {}
+    return {
+        name: after[ordinal]
+        for ordinal, name in before.items()
+        if ordinal in after and after[ordinal] != name
+    }
+
+
+def _carry_notes(
+    connection: SQLConnection,
+    agent_id: str,
+    pairs: Mapping[str, tuple[_Stored, CatalogEntry]],
+    old_entries: Mapping[str, CatalogEntry],
+    note: Note,
+) -> None:
+    """Rewrite notes that name a proven rename; a bad note is left alone.
+
+    ``pairs`` maps an old resource id to its stored row and its new entry, for
+    resources whose source object id is the same on both sides.
+    """
+
+    notes: list[tuple[str, SemanticAnnotation]] = []
+    named: set[str] = set()
+    for note_id, data in connection.execute(
+        "SELECT id, data FROM semantic_annotations WHERE agent_id = ? ORDER BY id",
+        (agent_id,),
+    ).fetchall():
+        try:
+            annotation = decode_semantic_annotation(data)
+        except _DECODE_ERRORS:
+            continue
+        if named_here := set(annotation.subject.resource_ids) & set(pairs):
+            notes.append((note_id, annotation))
+            named |= named_here
+    if not notes:
+        return
+    missing = sorted(named - set(old_entries))
+    old_entries = {
+        **old_entries,
+        **{e.resource.id: e for e in load_entries(connection, agent_id, missing, note)},
+    }
+    tables: dict[str, str] = {}
+    columns: dict[str, dict[str, str]] = {}
+    revisions: dict[str, tuple[str, str]] = {}
+    for old_id in named:
+        stored, new = pairs[old_id]
+        if old_id != new.resource.id:
+            tables[old_id] = new.resource.id
+        if old_id in old_entries:
+            renamed = _column_renames(old_entries[old_id], new)
+            if renamed:
+                columns[old_id] = renamed
+        if old_id in tables or old_id in columns:
+            revisions[old_id] = (stored.revision, new.resource.current_revision)
+    if not revisions:
+        return
+    for note_id, annotation in notes:
+        try:
+            carried = carry_renames(
+                annotation, tables=tables, columns=columns, revisions=revisions
+            )
+            if carried is annotation:
+                continue
+            data = encode_semantic_annotation(carried)
+        except _DECODE_ERRORS:
+            continue
+        connection.execute(
+            "UPDATE semantic_annotations SET data = ? WHERE agent_id = ? AND id = ?",
+            (data, agent_id, note_id),
+        )
+
+
 def commit_pass(
     connection: SQLConnection,
     sync: CatalogSync,
@@ -755,12 +919,16 @@ def commit_pass(
         gone_ids |= set(stored_relationships) - set(relationships)
     gone = sorted(gone_ids)
 
+    # A proven rename is one change, not an added plus a removed.
+    renames = _table_renames(stored, added, removed)
+    origin = {item.resource.id: old_id for old_id, item in renames.items()}
     # Change log rows, newest kept; the old side of a change needs its stored data.
-    plan = [("added", item.resource.id) for item in added]
+    plan = [("added", i.resource.id) for i in added if i.resource.id not in origin]
     plan += [("changed", item.resource.id) for item in changed]
-    plan += [("removed", i) for i in removed]
+    plan += [("changed", item.resource.id) for item in renames.values()]
+    plan += [("removed", i) for i in removed if i not in renames]
     plan = plan[-KEPT_CHANGES:]
-    need_old = [i for kind, i in plan if kind != "added"]
+    need_old = [origin.get(i, i) for kind, i in plan if kind != "added"]
     old_entries = {
         item.resource.id: item
         for item in load_entries(connection, agent_id, need_old, note)
@@ -775,10 +943,9 @@ def commit_pass(
     change_rows: list[tuple[Any, ...]] = []
     for kind, resource_id in plan:
         sequence += 1
-        old = stored.get(resource_id)
-        before = (
-            None if old is None else _stored_side(old, old_entries.get(resource_id))
-        )
+        old_id = origin.get(resource_id, resource_id)
+        old = stored.get(old_id)
+        before = None if old is None else _stored_side(old, old_entries.get(old_id))
         after = None if kind == "removed" else _side(by_id[resource_id])
         identity = (
             stored[resource_id].native_identity
@@ -798,6 +965,17 @@ def commit_pass(
                 encode_catalog_change_data(before, after),
             )
         )
+
+    # Notes follow a table or column whose source object id proves the rename.
+    pairs = {i: (stored[i], item) for i, item in renames.items()}
+    for item in changed:
+        old = stored[item.resource.id]
+        if old.source_object_id is not None and (
+            old.source_object_id == item.source_object_id
+        ):
+            pairs[item.resource.id] = (old, item)
+    if pairs:
+        _carry_notes(connection, agent_id, pairs, old_entries, note)
 
     # Resources and relationships.
     resource_rows = [
@@ -999,7 +1177,10 @@ def commit_pass(
         update=("data",),
     )
     _prune(connection, agent_id, source_id, sync, completed)
-    return CatalogCommitSummary(len(added), len(changed), len(removed))
+    moved = len(renames)
+    return CatalogCommitSummary(
+        len(added) - moved, len(changed) + moved, len(removed) - moved
+    )
 
 
 def _prune(

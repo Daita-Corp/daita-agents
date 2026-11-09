@@ -15,6 +15,8 @@ from textual.containers import Horizontal, ItemGrid, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Label, Static, Tree
 
+from daita import SemanticAnnotationState
+
 from ..catalog_status import status_line, today_line
 from ..models import source_type_label
 from ..projection import connection_lines
@@ -742,6 +744,20 @@ class CatalogScreen(ModalScreen[SourceManagerAction | None]):
             self._catalog_lines[source_id] = "\n".join(line for line in lines if line)
         except Exception:
             self._catalog_lines[source_id] = ""
+        else:
+            try:
+                stale = await controller.require_agent().list_semantic_annotations(
+                    source_id=source_id, state=SemanticAnnotationState.STALE
+                )
+            except Exception:
+                stale = ()
+            if stale:
+                noun = "note needs" if len(stale) == 1 else "notes need"
+                text = f"{len(stale)} {noun} review"
+                current = self._catalog_lines[source_id]
+                self._catalog_lines[source_id] = (
+                    f"{current}\n{text}" if current else text
+                )
         self._catalog_loading.discard(source_id)
         if (
             self.is_mounted
