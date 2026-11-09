@@ -8,8 +8,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 
-import pytest
-
 from daita.adapters.models import SourceProbe
 from daita.adapters.registry import SourceFreshness
 from daita.catalog.models import CatalogCommitSummary, CatalogSourceState
@@ -125,10 +123,16 @@ class _World:
     def mem(self):
         return self.keeper._mems[_SOURCE.source_id]
 
+    @property
+    def next_due(self) -> datetime:
+        due = self.mem.next_due
+        assert due is not None
+        return due
+
     async def due(self) -> None:
         """Move the clock to the source's next probe and let the keeper work."""
 
-        self.clock.now = max(self.clock.now, self.mem.next_due)
+        self.clock.now = max(self.clock.now, self.next_due)
         await self.keeper.tick()
 
 
@@ -137,12 +141,12 @@ async def test_the_probe_interval_doubles_when_nothing_changes_and_resets_on_a_c
     await world.keeper.tick()
     gaps = []
     for _ in range(5):
-        gaps.append((world.mem.next_due - world.clock.now).total_seconds())
+        gaps.append((world.next_due - world.clock.now).total_seconds())
         await world.due()
     assert gaps == [5, 10, 20, 40, 40]
     world.probe.tokens = {"main": "t2"}
     await world.due()
-    assert world.reads and (world.mem.next_due - world.clock.now).total_seconds() == 5
+    assert world.reads and (world.next_due - world.clock.now).total_seconds() == 5
 
 
 async def test_a_run_probes_only_when_the_last_probe_is_old():

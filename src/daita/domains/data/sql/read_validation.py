@@ -257,7 +257,7 @@ def _check_sqlite_relation(
     allowed: frozenset[str] | None,
 ) -> tuple[str, str] | SqlValidationIssue:
     parts = tuple(sqlite_identifier_key(name) for name, _ in table.qualified_parts)
-    if len(parts) > 2 or (len(parts) == 2 and parts[0] != "main"):
+    if len(parts) > 2 or not parts or (len(parts) == 2 and parts[0] != "main"):
         return _out_of_scope(table)
     name = parts[-1]
     # A pragma table reads connection state, such as file paths, not source data.

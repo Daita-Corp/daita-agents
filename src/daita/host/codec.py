@@ -239,11 +239,11 @@ def _from_wire(payload: JsonValue) -> object:
     if type(payload) is list:
         return tuple(_from_wire(item) for item in payload)
     if type(payload) is dict:
-        if set(payload) != {_TAG, _VALUE} or type(payload[_TAG]) is not str:
+        if set(payload) != {_TAG, _VALUE} or type(tag := payload[_TAG]) is not str:
             raise ValueError("a host wire object must be one tagged value")
-        codec = _BY_TAG.get(payload[_TAG])
+        codec = _BY_TAG.get(tag)
         if codec is None:
-            raise TypeError(f"unknown host wire type: {payload[_TAG]}")
+            raise TypeError(f"unknown host wire type: {tag}")
         return codec.decode(payload[_VALUE])
     raise TypeError(f"{type(payload).__name__} is not a JSON value")
 

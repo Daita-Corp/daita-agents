@@ -274,7 +274,7 @@ def _read_insert(shape: _Shape, exp: Any) -> None:
     conflict = root.args.get("conflict")
     if conflict is None:
         return
-    keys = tuple(conflict.args.get("conflict_keys") or ())
+    keys: tuple[Any, ...] = tuple(conflict.args.get("conflict_keys") or ())
     if (
         conflict.args.get("constraint") is not None
         or conflict.args.get("index_predicate") is not None

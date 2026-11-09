@@ -234,7 +234,9 @@ async def test_wide_query_without_durable_path_names_bound_and_no_tool():
 
     assert _error_code(result) == "durable_execution_required"
     assert _dispatches(executors) == 0
-    message = str(result.output["error"]["message"])
+    error = result.output["error"]
+    assert isinstance(error, Mapping)
+    message = str(error["message"])
     assert message.startswith("No query ran")
     assert "8 tables exceed the per-call bound of 4" in message
     details = _details(result)

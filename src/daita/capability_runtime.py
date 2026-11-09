@@ -12,7 +12,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import TYPE_CHECKING, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, cast
 
 from ._json import FrozenJsonObject, canonical_json
 from .artifacts.models import (
@@ -110,7 +110,7 @@ if TYPE_CHECKING:
 class AdmissionPermit(Protocol):
     async def __aenter__(self) -> object: ...
 
-    async def __aexit__(self, exc_type, exc, traceback) -> bool | None: ...
+    async def __aexit__(self, exc_type, exc, traceback, /) -> bool | None: ...
 
 
 class CapabilityAdmissionCoordinator(Protocol):
@@ -897,7 +897,10 @@ class CapabilityRuntime:
         for owner_id in sorted(self._domains):
             domain = self._domains[owner_id]
             # A domain may also withhold mode routes no current source can serve.
-            project_routes = getattr(domain, "project_routes", None)
+            project_routes = cast(
+                Callable[..., Awaitable[Any]] | None,
+                getattr(domain, "project_routes", None),
+            )
             names, withheld = (
                 await project_routes(run, session)
                 if callable(project_routes)
@@ -923,10 +926,11 @@ class CapabilityRuntime:
                         projected[name] = admitted
                     continue
                 routes = tuple(
-                    (mode, admitted)
+                    (mode, route_entry)
                     for mode, capability_id in view.mode_capability_ids
                     if capability_id not in withheld
-                    and (admitted := admitted_by_capability[capability_id]) is not None
+                    and (route_entry := admitted_by_capability[capability_id])
+                    is not None
                 )
                 if not routes:
                     continue
@@ -5640,7 +5644,10 @@ async def _domain_call_provenance(
 
     if not capability.derives_call_provenance:
         return CallProvenance()
-    derive = getattr(domain, "derive_call_provenance", None)
+    derive = cast(
+        Callable[..., Awaitable[Any]] | None,
+        getattr(domain, "derive_call_provenance", None),
+    )
     if not callable(derive):
         raise ValueError("capability derives provenance its domain cannot supply")
     provenance = await derive(run, call, capability, arguments, session=session)

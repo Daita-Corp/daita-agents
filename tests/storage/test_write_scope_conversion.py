@@ -131,6 +131,7 @@ async def test_stored_scopes_convert_and_never_gain_delete(
         assert scope.allowed_update_columns == ("name",)
         assert scope.max_rows == 25
         registration = await store.load_source(agent.id, source_id)
+        assert registration is not None
         assert (
             scope.authorization_fingerprint
             == relational_write_authorization_fingerprint(

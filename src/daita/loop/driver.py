@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Protocol, TypeVar, cast
+from typing import Any, Protocol, TypeVar, cast
 
 from .._json import FrozenJsonObject
 from ..artifacts.models import (
@@ -538,6 +538,23 @@ class AgentLoop:
             else prepared.limits
         )
 
+        async def finish(
+            kind: LoopExitKind, reason: str, steps: int, **details: Any
+        ) -> LoopExit:
+            return await self._finish(
+                run,
+                writer,
+                kind,
+                reason,
+                steps,
+                usage,
+                run_started,
+                artifacts=tuple(artifacts),
+                artifact_deliveries=tuple(artifact_deliveries),
+                sensitivity=sensitivity,
+                **details,
+            )
+
         try:
             start_message = run.start_message()
             await writer.append(start_message, position=writer.next_position)
@@ -572,30 +589,16 @@ class AgentLoop:
                     key=lambda value: value.routing_rank,
                 )
                 if limits.max_estimated_cost_usd == 0:
-                    return await self._finish(
-                        run,
-                        writer,
+                    return await finish(
                         LoopExitKind.FAILED,
                         "cost_limit_reached",
                         step - 1,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
                     )
                 if self._wall_time_exhausted(started, limits):
-                    return await self._finish(
-                        run,
-                        writer,
+                    return await finish(
                         LoopExitKind.FAILED,
                         "wall_time_exhausted",
                         step - 1,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
                     )
                 step_messages = messages[current_start:]
                 step_tool_projection = self._tools.project(
@@ -627,63 +630,35 @@ class AgentLoop:
                     ).remaining_after(usage)
                 except ModelProviderError as error:
                     # Admission consumed nothing; retained usage is already cumulative.
-                    return await self._finish(
-                        run,
-                        writer,
+                    return await finish(
                         LoopExitKind.FAILED,
                         error.code.value,
                         step - 1,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
                     )
                 if run_route is None:
                     try:
                         run_route = _begin_run_route(self._model, request)
                     except ModelProviderError:
-                        return await self._finish(
-                            run,
-                            writer,
+                        return await finish(
                             LoopExitKind.FAILED,
                             "model_route_ineligible",
                             step - 1,
-                            usage,
-                            run_started,
-                            artifacts=tuple(artifacts),
-                            artifact_deliveries=tuple(artifact_deliveries),
-                            sensitivity=sensitivity,
                         )
                 if not _provider_supports_run_request(
                     self._model,
                     run_route,
                     request,
                 ):
-                    return await self._finish(
-                        run,
-                        writer,
+                    return await finish(
                         LoopExitKind.FAILED,
                         "model_route_ineligible",
                         step - 1,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
                     )
                 if not self._cost_limit_allows_request(request, run_route, limits):
-                    return await self._finish(
-                        run,
-                        writer,
+                    return await finish(
                         LoopExitKind.FAILED,
                         "cost_limit_unpriced_route",
                         step - 1,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
                     )
                 model_started = (
                     asyncio.get_running_loop().time()
@@ -799,18 +774,11 @@ class AgentLoop:
                             position=writer.next_position,
                         )
                         messages = (*messages, result_message)
-                    return await self._finish(
-                        run,
-                        writer,
+                    return await finish(
                         LoopExitKind.FAILED,
                         budget_reason,
                         step,
-                        usage,
-                        run_started,
                         final_text=response.text,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
                     )
 
                 terminal_response = await self._finish_terminal_model_response(
@@ -941,30 +909,16 @@ class AgentLoop:
                 ):
                     # The context is full enough to start over: the job
                     # continues in a new run from its saved checklist.
-                    return await self._finish(
-                        run,
-                        writer,
+                    return await finish(
                         LoopExitKind.MACHINE_TERMINATED,
                         CONTEXT_THRESHOLD_REASON,
                         step,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
                     )
 
-            return await self._finish(
-                run,
-                writer,
+            return await finish(
                 LoopExitKind.FAILED,
                 "step_limit_reached",
                 limits.max_steps,
-                usage,
-                run_started,
-                artifacts=tuple(artifacts),
-                artifact_deliveries=tuple(artifact_deliveries),
-                sensitivity=sensitivity,
             )
         except asyncio.CancelledError:
             await self._finish_best_effort(
@@ -981,17 +935,10 @@ class AgentLoop:
             )
             raise
         except TimeoutError:
-            return await self._finish(
-                run,
-                writer,
+            return await finish(
                 LoopExitKind.FAILED,
                 "wall_time_exhausted",
                 _completed_steps(messages[current_start:]),
-                usage,
-                run_started,
-                artifacts=tuple(artifacts),
-                artifact_deliveries=tuple(artifact_deliveries),
-                sensitivity=sensitivity,
             )
         except (
             ContextWindowExceeded,
@@ -1001,35 +948,21 @@ class AgentLoop:
             ToolManifestLimitExceeded,
             RequestSensitivityUnavailable,
         ) as error:
-            return await self._finish(
-                run,
-                writer,
+            return await finish(
                 LoopExitKind.FAILED,
                 _expected_loop_failure_reason(error),
                 _completed_steps(messages[current_start:]),
-                usage,
-                run_started,
-                artifacts=tuple(artifacts),
-                artifact_deliveries=tuple(artifact_deliveries),
-                sensitivity=sensitivity,
             )
         except ModelProviderError as error:
             usage = _add_usage(usage, error.usage)
-            return await self._finish(
-                run,
-                writer,
+            return await finish(
                 LoopExitKind.FAILED,
                 error.code.value,
                 _completed_steps(messages[current_start:]),
-                usage,
-                run_started,
                 # A bare injected provider does not stamp its own identity, and
                 # a failure diagnostic is only valid with one.
                 provider_id=error.provider_id or self._model.provider_id,
                 provider_failure=error.diagnostic,
-                artifacts=tuple(artifacts),
-                artifact_deliveries=tuple(artifact_deliveries),
-                sensitivity=sensitivity,
             )
         except Exception:
             await self._finish_best_effort(

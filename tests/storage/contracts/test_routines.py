@@ -295,8 +295,8 @@ async def test_three_consecutive_failures_pause_a_recurring_routine(
         if failures < 3:
             # Fewer failures keep it running at its next slot.
             assert persisted.state is RoutineState.ACTIVE
-            assert persisted.next_due_at == due + timedelta(hours=1)
-            due = persisted.next_due_at
+            due += timedelta(hours=1)
+            assert persisted.next_due_at == due
         else:
             assert persisted.state is RoutineState.NEEDS_ATTENTION
             assert persisted.next_due_at is None

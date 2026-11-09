@@ -4849,13 +4849,14 @@ class EmbeddedAgent:
                     first = await reads[0]()
                     second = await reads[1]()
                 else:
-                    outcomes = await asyncio.gather(
+                    first_outcome, second_outcome = await asyncio.gather(
                         reads[0](), reads[1](), return_exceptions=True
                     )
-                    for outcome in outcomes:
-                        if isinstance(outcome, BaseException):
-                            raise outcome
-                    first, second = outcomes  # type: ignore[assignment]
+                    if isinstance(first_outcome, BaseException):
+                        raise first_outcome
+                    if isinstance(second_outcome, BaseException):
+                        raise second_outcome
+                    first, second = first_outcome, second_outcome
         except (
             DaitaError,
             AdmissionError,

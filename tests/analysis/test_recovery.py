@@ -721,7 +721,7 @@ async def test_multiple_parsers_and_replacement_preserve_cumulative_cpu(
             if call.name == "python_execute"
         ]
         assert len(cells) == 3
-        assert cells[1] is not None and cells[2] is not None
+        assert cells[0] is not None and cells[1] is not None and cells[2] is not None
         assert json.loads(canonical_json(cells[1].output))["data"]["state_lost"] is True
         replacement = json.loads(canonical_json(cells[2].output))["data"]
         assert replacement["stdout"] == "42\n"

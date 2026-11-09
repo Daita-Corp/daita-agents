@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
@@ -109,7 +110,7 @@ class _StaticContextCatalog:
     async def resource_names(self, agent_id, source_ids=()):
         return {}
 
-    async def source_directory(self, agent_id, source_ids):
+    async def source_directory(self, agent_id, source_ids) -> tuple[Any, ...]:
         return await self.source_routing_facts(agent_id, source_ids)
 
     def __init__(self, sensitivity: ModelSensitivity | None) -> None:

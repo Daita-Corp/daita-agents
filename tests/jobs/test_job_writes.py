@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -193,4 +193,4 @@ async def test_a_subrun_write_pending_at_restart_is_never_dispatched_without_app
 
 def _next(steps: list[Any], request: ModelRequest) -> ModelResponse:
     step = steps.pop(0)
-    return step(request) if callable(step) else step
+    return cast(ModelResponse, step(request) if callable(step) else step)
