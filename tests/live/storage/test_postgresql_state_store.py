@@ -23,9 +23,20 @@ from daita.catalog.models import (
     CatalogSync,
     CatalogSyncStatus,
     RelationshipFieldPair,
+    ResourceKind,
     catalog_link_id,
+    catalog_resource_id,
 )
-from daita.catalog.search_text import search_key
+from daita.catalog.search_text import search_key, tabular_parts
+from daita.semantics import (
+    ResourceRevisionBinding,
+    SemanticAnnotation,
+    SemanticEvidence,
+    SemanticEvidenceKind,
+    SemanticFieldReference,
+    SemanticKind,
+    SemanticSubject,
+)
 from daita.storage import catalog_rows
 from tests.support.catalog_records import (
     OBSERVED_AT,
@@ -220,6 +231,114 @@ async def test_catalog_rows_commit_change_and_search(
     assert removed.removed == 1
     counts = await store.summarize_catalog(_AGENT, (_SOURCE,))
     assert (counts.resource_count, counts.relationship_count) == (3, 1)
+
+
+async def test_a_renamed_table_keeps_its_note_on_postgresql(
+    database: _PostgresDatabase,
+) -> None:
+    store = postgresql_state_store(database)
+    await store.register_source(
+        SourceRegistration(
+            id=_SOURCE,
+            agent_id=_AGENT,
+            adapter_id="postgresql",
+            native_identity="db",
+            display_name="Shop",
+            configuration={},
+            attached_at=_NOW,
+        )
+    )
+    plain = SHOP[:2]
+    objects = {"main.customers": "100", "main.orders": "200", "main.purchases": "200"}
+
+    async def commit_pass(sync_id, tables):
+        value = snapshot(_AGENT, _SOURCE, sync_id, tables, ())
+        (batch,) = batches(value)
+        described = tuple(
+            replace(e, source_object_id=objects.get(e.resource.native_identity))
+            for e in batch.entries
+        )
+        return await store.commit_catalog(
+            value.sync, (replace(batch, entries=described),)
+        )
+
+    await commit_pass("sync-1", plain)
+    (orders,) = [
+        e
+        for e in await store.list_entries(_AGENT, _SOURCE)
+        if e.resource.native_identity == "main.orders"
+    ]
+    old = orders.resource.id
+    note = SemanticAnnotation(
+        id="gross",
+        agent_id=_AGENT,
+        subject=SemanticSubject(
+            (_SOURCE,), (old,), (SemanticFieldReference(old, "total"),)
+        ),
+        kind=SemanticKind.METRIC_DEFINITION,
+        statement="Gross.",
+        evidence=(
+            SemanticEvidence(
+                SemanticEvidenceKind.USER_ASSERTION, "run-1", message_position=0
+            ),
+        ),
+        catalog_revisions=(
+            ResourceRevisionBinding(
+                old,
+                orders.resource.current_revision,
+                tuple(t for t in tabular_parts(orders)[0] if t[0] == "total"),
+            ),
+        ),
+        created_at=OBSERVED_AT,
+        confirmed_at=OBSERVED_AT,
+    )
+    await store.save_semantic_annotation(_AGENT, note)
+    before = len(await store.list_catalog_changes(_AGENT, _SOURCE))
+
+    renamed = tuple(
+        (
+            replace(t, native_identity="main.purchases")
+            if t.native_identity == "main.orders"
+            else t
+        )
+        for t in plain
+    )
+    summary = await commit_pass("sync-2", renamed)
+
+    assert (summary.added, summary.changed, summary.removed) == (0, 1, 0)
+    new = catalog_resource_id(_SOURCE, ResourceKind.TABLE, "main.purchases")
+    (kept,) = await store.list_semantic_annotations(_AGENT)
+    assert kept.statement == note.statement
+    assert kept.subject.resource_ids == (new,)
+    assert kept.subject.fields == (SemanticFieldReference(new, "total"),)
+    newest = (await store.list_catalog_changes(_AGENT, _SOURCE))[
+        : len(await store.list_catalog_changes(_AGENT, _SOURCE)) - before
+    ]
+    (change,) = newest
+    assert change.before is not None and change.after is not None
+    assert (change.kind, change.before.name, change.after.name) == (
+        CatalogChangeKind.CHANGED,
+        "orders",
+        "purchases",
+    )
+
+    (purchases,) = [
+        e
+        for e in await store.list_entries(_AGENT, _SOURCE)
+        if e.resource.native_identity == "main.purchases"
+    ]
+    widened = tuple(
+        (
+            replace(t, columns=(*t.columns, "memo"))
+            if t.native_identity == "main.purchases"
+            else t
+        )
+        for t in renamed
+    )
+    await commit_pass("sync-3", widened)
+    changed = store.catalog_structure_changed
+    assert not await changed(_AGENT, _SOURCE, new, purchases.resource.current_revision)
+    assert await changed(_AGENT, _SOURCE, new, "sha256:" + "0" * 64)
 
 
 async def test_catalog_rows_inventory_truncation_and_damage(

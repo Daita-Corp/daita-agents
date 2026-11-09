@@ -22,7 +22,7 @@ import re
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,9 +31,28 @@ import pytest
 from daita import Agent
 from daita.adapters.models import DiscoveryRequest, SourceProbe, SourceRegistration
 from daita.adapters.postgresql import _batches, _load_structure, probe_tokens
+from daita.catalog.models import (
+    CatalogSync,
+    CatalogSyncStatus,
+    ResourceKind,
+    catalog_resource_id,
+)
+from daita.catalog.search_text import tabular_parts
 from daita.llm.models import ModelProfile
 from daita.llm.providers.mock import MockModelProvider
 from daita.security import SecretReference
+from daita.semantics import (
+    ResourceRevisionBinding,
+    SemanticAnnotation,
+    SemanticEvidence,
+    SemanticEvidenceKind,
+    SemanticFieldReference,
+    SemanticKind,
+    SemanticResourceFact,
+    SemanticSubject,
+    inspect_semantic_annotations,
+)
+from daita.storage.sqlite import SQLiteStateStore
 from tests.data.postgresql._large_fixture_support import ATTACHED_SCHEMAS, _Secrets
 from tests.support.source_contract import (
     ProbeMutation,
@@ -324,6 +343,243 @@ async def test_probe_moves_with_grants_revokes_and_role_membership(
         ],
         revisions=watched.revisions,
     )
+
+
+async def test_notes_follow_schema_changes_and_only_real_damage_makes_one_stale(
+    server: Any, tmp_path: Path
+) -> None:
+    """A note goes stale for a dropped or retyped field or table, never for noise."""
+
+    watched = _Watched(server, _ROLE, _MAIN, _AUX)
+    registration = watched.registration
+    await server.execute(f"""
+        CREATE TABLE {_MAIN}.dim (id int PRIMARY KEY);
+        CREATE TABLE {_MAIN}.nt0 (id int, fa int, fb text, pad int);
+        CREATE TABLE {_MAIN}.nt1 (id int, fa int, fb text, pad int);
+        CREATE TABLE {_MAIN}.nt2 (id int, fa int, fb text, pad int);
+        CREATE TABLE {_MAIN}.nt3 (id int, fa int, fb text, pad int);
+        GRANT SELECT ON ALL TABLES IN SCHEMA {_MAIN} TO {_ROLE}
+        """)
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    try:
+        await store.register_source(registration)
+        counter = {"sync": 0, "changes": 0, "false_stale": 0, "missed": 0}
+
+        async def commit() -> None:
+            counter["sync"] += 1
+            sync_id = f"sync-{counter['sync']}"
+            await server.execute(f"SET LOCAL ROLE {_ROLE}")
+            try:
+                structure = await _load_structure(
+                    server,
+                    registration,
+                    max_resources=1_000,
+                    max_columns=512,
+                    max_indexes=256,
+                    max_relationships=2_000,
+                )
+            finally:
+                await server.execute("RESET ROLE")
+            request = DiscoveryRequest(
+                agent_id="agent",
+                source_id=registration.id,
+                sync_id=sync_id,
+                requested_at=_NOW,
+            )
+            inventory, detail = _batches(request, structure)
+            moment = _NOW + timedelta(seconds=counter["sync"])
+            await store.commit_catalog(
+                CatalogSync(
+                    id=sync_id,
+                    agent_id="agent",
+                    source_id=registration.id,
+                    adapter_id="postgresql",
+                    status=CatalogSyncStatus.SUCCEEDED,
+                    started_at=moment,
+                    completed_at=moment,
+                    resource_count=len(inventory.entries),
+                    relationship_count=len(detail.relationships),
+                ),
+                (inventory, detail),
+            )
+
+        async def stale_notes() -> set[str]:
+            facts = []
+            for entry in await store.list_entries("agent", registration.id):
+                columns, _ = tabular_parts(entry)
+                facts.append(
+                    SemanticResourceFact(
+                        entry.resource.id,
+                        registration.id,
+                        entry.resource.current_revision,
+                        tuple(name for name, _ in columns),
+                        tuple(columns),
+                    )
+                )
+            return {
+                note.id
+                for note in await store.list_semantic_annotations("agent")
+                if inspect_semantic_annotations((note,), tuple(facts))[0].stale_reasons
+            }
+
+        expected: set[str] = set()
+
+        async def step(*statements: str) -> None:
+            for statement in statements:
+                await server.execute(statement)
+            await commit()
+            counter["changes"] += 1
+            stale = await stale_notes()
+            counter["false_stale"] += len(stale - expected)
+            counter["missed"] += len(expected - stale)
+
+        names = {
+            i: {"schema": _MAIN, "table": f"nt{i}", "fa": "fa", "fb": "fb"}
+            for i in range(4)
+        }
+
+        def rid(i: int) -> str:
+            where = f"{names[i]['schema']}.{names[i]['table']}"
+            return catalog_resource_id(registration.id, ResourceKind.TABLE, where)
+
+        await commit()
+        statements = {}
+        for entry in await store.list_entries("agent", registration.id):
+            where = entry.resource.native_identity
+            for i in range(4):
+                if where != f"{_MAIN}.nt{i}":
+                    continue
+                for suffix, field in (("none", None), ("a", "fa"), ("b", "fb")):
+                    note_id, resource_id = f"t{i}-{suffix}", entry.resource.id
+                    statements[note_id] = f"Note {note_id}."
+                    await store.save_semantic_annotation(
+                        "agent",
+                        SemanticAnnotation(
+                            id=note_id,
+                            agent_id="agent",
+                            subject=SemanticSubject(
+                                (registration.id,),
+                                (resource_id,),
+                                (
+                                    ()
+                                    if field is None
+                                    else (SemanticFieldReference(resource_id, field),)
+                                ),
+                            ),
+                            kind=SemanticKind.METRIC_DEFINITION,
+                            statement=statements[note_id],
+                            evidence=(
+                                SemanticEvidence(
+                                    SemanticEvidenceKind.USER_ASSERTION,
+                                    "run-1",
+                                    message_position=0,
+                                ),
+                            ),
+                            catalog_revisions=(
+                                ResourceRevisionBinding(
+                                    resource_id,
+                                    entry.resource.current_revision,
+                                    tuple(
+                                        t
+                                        for t in tabular_parts(entry)[0]
+                                        if t[0] == field
+                                    ),
+                                ),
+                            ),
+                            created_at=_NOW,
+                            confirmed_at=_NOW,
+                        ),
+                    )
+        assert len(statements) == 12 and not await stale_notes()
+
+        async def notes_follow_their_fields() -> None:
+            for note in await store.list_semantic_annotations("agent"):
+                i = int(note.id[1])
+                assert note.statement == statements[note.id]
+                assert note.subject.resource_ids == (rid(i),)
+                field = {"a": "fa", "b": "fb"}.get(note.id.split("-")[1])
+                assert note.subject.fields == (
+                    ()
+                    if field is None
+                    else (SemanticFieldReference(rid(i), names[i][field]),)
+                )
+
+        for k in range(5):
+            i = k % 4
+            t = names[i]
+
+            def q(t: dict[str, str] = t) -> str:
+                return f"{t['schema']}.{t['table']}"
+
+            dim = f"{_MAIN}.dim"
+            await step(f"ALTER TABLE {q()} ADD COLUMN x1 int")
+            await step(f"ALTER TABLE {q()} DROP COLUMN x1")
+            await step(f"ALTER TABLE {q()} ADD COLUMN x2 int")
+            await step(f"ALTER TABLE {q()} ALTER x2 TYPE bigint")
+            await step(f"ALTER TABLE {q()} ALTER x2 TYPE text")
+            await step(f"ALTER TABLE {q()} DROP COLUMN x2")
+            await step(f"COMMENT ON COLUMN {q()}.pad IS 'padding'")
+            await step(f"COMMENT ON COLUMN {q()}.pad IS NULL")
+            await step(f"CREATE INDEX idx{k} ON {q()} (pad)")
+            await step(f"DROP INDEX {t['schema']}.idx{k}")
+            await step(f"ALTER TABLE {q()} ADD CONSTRAINT pk{k} PRIMARY KEY (pad)")
+            await step(f"ALTER TABLE {q()} DROP CONSTRAINT pk{k}")
+            await step(
+                f"ALTER TABLE {q()} ADD CONSTRAINT fk{k} "
+                f"FOREIGN KEY (pad) REFERENCES {dim} (id)"
+            )
+            await step(f"ALTER TABLE {q()} DROP CONSTRAINT fk{k}")
+            await step(
+                f"CREATE TABLE {_MAIN}.tmp{k} (id int, v text)",
+                f"GRANT SELECT ON {_MAIN}.tmp{k} TO {_ROLE}",
+            )
+            await step(f"DROP TABLE {_MAIN}.tmp{k}")
+            await step(f"GRANT INSERT ON {dim} TO {_ROLE}")
+            await step(f"REVOKE INSERT ON {dim} FROM {_ROLE}")
+            await step(f"REVOKE SELECT ON {dim} FROM {_ROLE}")
+            await step(f"GRANT SELECT ON {dim} TO {_ROLE}")
+            renamed = f"{t['table']}_r{k}"
+            await step(f"ALTER TABLE {q()} RENAME TO {renamed}")
+            t["table"] = renamed
+            await notes_follow_their_fields()
+            field = "fa" if k % 2 == 0 else "fb"
+            await step(f"ALTER TABLE {q()} RENAME COLUMN {t[field]} TO {t[field]}_r{k}")
+            t[field] = f"{t[field]}_r{k}"
+            await notes_follow_their_fields()
+            await step(f"ALTER TABLE {q()} SET SCHEMA {_AUX}")
+            t["schema"] = _AUX
+            await notes_follow_their_fields()
+            await step(f"ALTER TABLE {q()} SET SCHEMA {_MAIN}")
+            t["schema"] = _MAIN
+            await notes_follow_their_fields()
+
+        quiet = counter["changes"]
+        assert quiet >= 100 and not await stale_notes()
+
+        # Real damage, one table at a time: only the notes that depend on it go stale.
+        t0, t1, t2 = (names[i] for i in range(3))
+        expected.add("t0-a")
+        await step(f"ALTER TABLE {t0['schema']}.{t0['table']} DROP COLUMN {t0['fa']}")
+        expected.add("t1-b")
+        await step(
+            f"ALTER TABLE {t1['schema']}.{t1['table']} ALTER {t1['fb']} TYPE varchar(5)"
+        )
+        expected.add("t2-b")
+        await step(
+            f"DROP TABLE {t2['schema']}.{t2['table']}",
+            f"CREATE TABLE {t2['schema']}.{t2['table']} (id int, {t2['fa']} int, pad int)",
+            f"GRANT SELECT ON {t2['schema']}.{t2['table']} TO {_ROLE}",
+        )
+        assert await stale_notes() == {"t0-a", "t1-b", "t2-b"}
+
+        print(
+            f"\nschema changes: {counter['changes']} "
+            f"(first {quiet} unrelated), false_stale: {counter['false_stale']}, "
+            f"missed: {counter['missed']}"
+        )
+        assert counter["false_stale"] == 0 and counter["missed"] == 0
+    finally:
+        await store.close()
 
 
 async def _build_wide_tables(server: Any, count: int) -> None:

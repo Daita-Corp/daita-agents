@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -36,6 +37,7 @@ from daita.semantics import (
     SemanticAnnotation,
     SemanticEvidence,
     SemanticEvidenceKind,
+    SemanticFieldReference,
     SemanticKind,
     SemanticSubject,
 )
@@ -46,6 +48,17 @@ from tests.support.workspace import workspace_for
 class _BrokenCatalogStore:
     def __getattr__(self, name: str) -> object:
         raise CatalogStoreError(f"catalog store is unavailable: {name}")
+
+
+class _NotesDownStore:
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+    async def list_semantic_annotations(self, *args: object) -> object:
+        raise CatalogStoreError("notes are unavailable")
 
 
 def _database(path: Path) -> Path:
@@ -779,5 +792,156 @@ async def test_a_current_note_marks_a_look_alike_deprecated(tmp_path: Path) -> N
         hits = _hits(result)
         assert hits["main.orders_archive"]["status"] == "deprecated"
         assert hits["main.orders"]["status"] == "canonical"
+    finally:
+        await agent.close()
+
+
+async def _keep_note(agent: Agent, source_id: str, field_types, *, field: bool = False):
+    """Save a note about orders against its current revision; return its table ID."""
+
+    resource = next(
+        item
+        for item in await agent.list_catalog_resources(source_id=source_id)
+        if item.name == "orders"
+    )
+    now = datetime(2026, 11, 6, tzinfo=UTC)
+    subject = SemanticSubject(
+        (source_id,),
+        (resource.id,),
+        (SemanticFieldReference(resource.id, "status"),) if field else (),
+    )
+    await agent._embedded._store.save_semantic_annotation(
+        agent.id,
+        SemanticAnnotation(
+            id="orders-note",
+            agent_id=agent.id,
+            subject=subject,
+            kind=SemanticKind.GLOSSARY,
+            statement="Orders are placed by customers.",
+            evidence=(SemanticEvidence(SemanticEvidenceKind.USER_ASSERTION, "run", 0),),
+            catalog_revisions=(
+                ResourceRevisionBinding(
+                    resource.id, resource.current_revision, field_types
+                ),
+            ),
+            created_at=now,
+            confirmed_at=now,
+        ),
+    )
+    return resource.id
+
+
+async def _caught_up(agent: Agent, database: Path, source_id: str, change: str) -> None:
+    """Apply a schema change at the source and let the catalog catch up."""
+
+    with sqlite3.connect(database) as connection:
+        connection.executescript(change)
+    stale_probes(agent)
+    agent._embedded.keeper.miss(source_id)
+    await settled(agent)
+
+
+async def _described_after(
+    agent: Agent, database: Path, source_id: str, change: str | None
+):
+    if change is not None:
+        await _caught_up(agent, database, source_id, change)
+    (result,) = await _results(agent)
+    return _data(result)
+
+
+_RETYPED = """
+    ALTER TABLE orders RENAME TO old_orders;
+    CREATE TABLE orders (
+      id INTEGER PRIMARY KEY,
+      customer_id INTEGER REFERENCES customers(id),
+      status INTEGER NOT NULL
+    );
+    DROP VIEW open_orders;
+    DROP TABLE old_orders;
+    CREATE VIEW open_orders AS SELECT id FROM orders;
+"""
+
+
+async def test_a_retyped_column_under_a_no_field_note_shows_a_hint_not_staleness(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path / "shop.sqlite")
+    agent, _provider = await _agent(tmp_path, _describe("orders"))
+    try:
+        source = await agent.attach(SQLiteSource(database, name="Shop"))
+        resource_id = await _keep_note(agent, source.id, ())
+        data = await _described_after(agent, database, source.id, _RETYPED)
+        hint = cast(str, data["changed"])
+        assert resource_id not in hint and source.id not in hint
+        assert not re.search(r"\d{4}-\d\d|sha256|[0-9a-f]{16}", hint)
+        notes = await agent._embedded._data_view.table_notes(agent.id, source.id)
+        assert notes == {"main.orders": ("Orders are placed by customers.",)}
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize(
+    "case", ["column_added", "unchanged", "names_a_field", "older_binding"]
+)
+async def test_describe_shows_no_hint_when_the_note_needs_none(
+    tmp_path: Path, case: str
+) -> None:
+    database = _database(tmp_path / "shop.sqlite")
+    agent, _provider = await _agent(tmp_path, _describe("orders"))
+    try:
+        source = await agent.attach(SQLiteSource(database, name="Shop"))
+        await _keep_note(
+            agent,
+            source.id,
+            (
+                None
+                if case == "older_binding"
+                else (("status", "TEXT"),) if case == "names_a_field" else ()
+            ),
+            field=case == "names_a_field",
+        )
+        change = {
+            "column_added": "ALTER TABLE orders ADD COLUMN total REAL;",
+            "unchanged": None,
+        }.get(case, _RETYPED)
+        data = await _described_after(agent, database, source.id, change)
+        assert "changed" not in data
+    finally:
+        await agent.close()
+
+
+async def test_a_change_log_that_no_longer_reaches_the_note_still_shows_the_hint(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path / "shop.sqlite")
+    agent, _provider = await _agent(tmp_path, _describe("orders"))
+    try:
+        source = await agent.attach(SQLiteSource(database, name="Shop"))
+        await _keep_note(agent, source.id, ())
+        await _caught_up(
+            agent, database, source.id, "ALTER TABLE orders ADD COLUMN total REAL;"
+        )
+        with sqlite3.connect(agent.home / "state.db") as connection:
+            connection.execute("DELETE FROM catalog_changes")
+        data = await _described_after(agent, database, source.id, None)
+        assert "changed" in data
+    finally:
+        await agent.close()
+
+
+async def test_a_failing_note_read_leaves_describe_without_the_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = _database(tmp_path / "shop.sqlite")
+    agent, _provider = await _agent(tmp_path, _describe("orders"))
+    try:
+        source = await agent.attach(SQLiteSource(database, name="Shop"))
+        await _keep_note(agent, source.id, ())
+
+        view = agent._embedded._data_view
+        monkeypatch.setattr(view, "_store", _NotesDownStore(view._store))
+        data = await _described_after(agent, database, source.id, _RETYPED)
+        assert data["answered_from"] == "live" and "changed" not in data
     finally:
         await agent.close()

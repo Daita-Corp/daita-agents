@@ -353,6 +353,8 @@ class CatalogDescribeExecutor:
             answer = {**live, "answered_from": "live"}
             if cached is not None and cached["name"] == live["name"]:
                 answer["revision"] = cached.get("revision")
+                if "changed" in cached:
+                    answer["changed"] = cached["changed"]
                 answer["relationships"] = _merged_relationships(
                     source_id,
                     cast(Sequence[Mapping[str, object]], live.get("relationships", ())),
@@ -799,6 +801,7 @@ def _search_output_schema() -> dict[str, object]:
 def _describe_output_schema() -> dict[str, object]:
     names = {
         "answered_from": "string",
+        "changed": "string",
         "columns": "array",
         "columns_truncated": "boolean",
         "comment": "string",

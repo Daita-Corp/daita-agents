@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -16,7 +16,14 @@ from daita import (
     DeliveryView,
     IntervalSchedule,
     OutcomeState,
+    ResourceRevisionBinding,
     RoutineIntent,
+    SemanticAnnotation,
+    SemanticEvidence,
+    SemanticEvidenceKind,
+    SemanticFieldReference,
+    SemanticKind,
+    SemanticSubject,
     SQLiteSource,
     WorkBoard,
     WorkColumn,
@@ -29,11 +36,14 @@ from daita.llm.models import (
     ModelProfile,
     ModelResponse,
     ModelUsage,
+    ToolCall,
 )
 from daita.llm.pricing import CostEstimate
+from daita.llm.protocols import ModelProvider
 from daita.llm.providers.mock import MockModelProvider
 from daita.storage.sqlite import SQLiteStateStore
 from tests.support.jobs import stored_job
+from tests.support.toolbox_model import ToolboxAwareMockModelProvider
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.acceptance
@@ -51,7 +61,7 @@ def _stop(text: str) -> ModelResponse:
     return ModelResponse(finish_reason=FinishReason.STOP, text=text, usage=USAGE)
 
 
-def _profile(provider: MockModelProvider) -> ModelProfile:
+def _profile(provider: ModelProvider) -> ModelProfile:
     return ModelProfile(
         id=provider.provider_id,
         context_window_tokens=128_000,
@@ -249,3 +259,217 @@ async def test_work_board_rejects_hosted_callers_and_out_of_range_windows(
             await hosted.work_board()
     finally:
         await hosted.close()
+
+
+def _dump(path: Path) -> list[str]:
+    with sqlite3.connect(path) as connection:
+        return list(connection.iterdump())
+
+
+async def test_stale_notes_become_ranked_review_cards_and_the_board_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "shop.sqlite"
+    with sqlite3.connect(database) as connection:
+        for table in ("orders", "items", "gone", "fine"):
+            connection.execute(f"CREATE TABLE {table} (id INTEGER, qty INTEGER)")
+    provider = ToolboxAwareMockModelProvider((), provider_id="mock:work-board-review")
+    clock = [NOW - timedelta(days=40)]
+    agent = await Agent.create(
+        "work-board-review",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=provider,
+        model_profile=_profile(provider),
+        clock=lambda: clock[0],
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        tables = {
+            item.name: item
+            for item in await agent.list_catalog_resources(source_id=source.id)
+        }
+
+        def query(name: str, call_id: str) -> ModelResponse:
+            call = ToolCall(
+                id=call_id,
+                name="data_query",
+                arguments={
+                    "source_id": source.id,
+                    "resource_ids": (tables[name].id,),
+                    "sql": f"SELECT qty FROM {name}",
+                },
+            )
+            return ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS, tool_calls=(call,)
+            )
+
+        provider.replace_script(
+            (
+                _stop("hello"),
+                query("orders", "q1"),
+                _stop("done"),
+                query("orders", "q2"),
+                _stop("done"),
+                query("items", "q3"),
+                _stop("done"),
+            )
+        )
+        first = await agent.run("hello")
+        for days, name in ((3, "orders"), (2, "orders"), (20, "items")):
+            clock[0] = NOW - timedelta(days=days)
+            await agent.run(f"count {name}")
+        provider.assert_consumed()
+
+        def note(note_id: str, name: str) -> SemanticAnnotation:
+            table = tables[name]
+            return SemanticAnnotation(
+                id=note_id,
+                agent_id=agent.id,
+                subject=SemanticSubject(
+                    source_ids=(source.id,),
+                    resource_ids=(table.id,),
+                    fields=(SemanticFieldReference(table.id, "qty"),),
+                ),
+                kind=SemanticKind.METRIC_DEFINITION,
+                statement=f"Meaning {note_id}.",
+                evidence=(
+                    SemanticEvidence(
+                        SemanticEvidenceKind.USER_ASSERTION,
+                        first.run_id,
+                        message_position=0,
+                    ),
+                ),
+                catalog_revisions=(
+                    ResourceRevisionBinding(table.id, table.current_revision),
+                ),
+                created_at=NOW - timedelta(days=30),
+                confirmed_at=NOW - timedelta(days=30),
+            )
+
+        for note_id, name in (
+            ("n1", "orders"),
+            ("n2", "orders"),
+            ("n3", "items"),
+            ("n4", "gone"),
+            ("n5", "fine"),
+        ):
+            await agent.save_semantic_annotation(note(note_id, name))
+        assert await agent.work_board() is not None
+
+        changed = NOW - timedelta(hours=1)
+        clock[0] = changed
+        with sqlite3.connect(database) as connection:
+            connection.execute("ALTER TABLE orders DROP COLUMN qty")
+            connection.execute("ALTER TABLE items DROP COLUMN qty")
+            connection.execute("DROP TABLE gone")
+        await agent.refresh_source(source.id)
+        clock[0] = NOW
+
+        state = tmp_path / "agents" / "work-board-review" / "state.db"
+        before = _dump(state)
+        board = await agent.work_board()
+        await agent.work_board()
+        assert _dump(state) == before
+
+        cards = board.columns[WorkColumn.NEEDS_YOU]
+        assert [card.kind for card in cards] == [WorkKind.CATALOG_REVIEW] * 3
+        assert [(c.reads_30d, c.reads_7d) for c in cards] == [(2, 2), (1, 0), (0, 0)]
+        assert all(card.updated_at == changed for card in cards)
+        orders, items, gone = cards
+        assert "orders" in orders.title and orders.title.startswith("2 ")
+        assert "items" in items.title and items.title.startswith("1 ")
+        assert "gone" in gone.title
+
+        # A damaged note row costs the review cards, never the rest of the board.
+        with sqlite3.connect(state) as connection:
+            connection.execute("UPDATE semantic_annotations SET data = 'not json'")
+        damaged = await agent.work_board()
+        assert damaged.columns[WorkColumn.NEEDS_YOU] == ()
+    finally:
+        await agent.close()
+
+
+async def test_review_cards_skip_replaced_notes_and_accept_non_utc_note_times(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "shop.sqlite"
+    with sqlite3.connect(database) as connection:
+        for table in ("orders", "items", "fine"):
+            connection.execute(f"CREATE TABLE {table} (id INTEGER, qty INTEGER)")
+    provider = ToolboxAwareMockModelProvider(
+        (), provider_id="mock:work-board-review-edges"
+    )
+    agent = await Agent.create(
+        "work-board-review-edges",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=provider,
+        model_profile=_profile(provider),
+        clock=lambda: NOW,
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        tables = {
+            item.name: item
+            for item in await agent.list_catalog_resources(source_id=source.id)
+        }
+        provider.replace_script((_stop("hello"),))
+        first = await agent.run("hello")
+        local = NOW - timedelta(days=3)
+        zone = local.astimezone(timezone(timedelta(hours=5)))
+
+        def note(
+            note_id: str, name: str, confirmed_at: datetime, replaces: str | None = None
+        ) -> SemanticAnnotation:
+            table = tables[name]
+            return SemanticAnnotation(
+                id=note_id,
+                agent_id=agent.id,
+                subject=SemanticSubject(
+                    source_ids=(source.id,),
+                    resource_ids=(table.id,),
+                    fields=(SemanticFieldReference(table.id, "qty"),),
+                ),
+                kind=SemanticKind.METRIC_DEFINITION,
+                statement=f"Meaning {note_id}.",
+                evidence=(
+                    SemanticEvidence(
+                        SemanticEvidenceKind.USER_ASSERTION,
+                        first.run_id,
+                        message_position=0,
+                    ),
+                ),
+                catalog_revisions=(
+                    ResourceRevisionBinding(table.id, table.current_revision),
+                ),
+                supersedes_id=replaces,
+                created_at=NOW - timedelta(days=30),
+                confirmed_at=confirmed_at,
+            )
+
+        await agent.save_semantic_annotation(note("n1", "orders", zone))
+        await agent.save_semantic_annotation(note("n2", "items", zone))
+        old = await agent.read_semantic_annotation("n2")
+        assert old is not None
+        await agent.save_semantic_annotation(
+            note("n3", "items", zone, replaces="n2"), expected_sha256=old.sha256
+        )
+        with sqlite3.connect(database) as connection:
+            connection.execute("ALTER TABLE orders DROP COLUMN qty")
+            connection.execute("ALTER TABLE items DROP COLUMN qty")
+        await agent.refresh_source(source.id)
+        state = tmp_path / "agents" / "work-board-review-edges" / "state.db"
+        with sqlite3.connect(state) as connection:
+            connection.execute("DELETE FROM catalog_changes")
+
+        cards = (await agent.work_board()).columns[WorkColumn.NEEDS_YOU]
+        by_table = {
+            name: card for card in cards for name in tables if name in card.title
+        }
+        assert set(by_table) == {"orders", "items"}
+        assert by_table["orders"].updated_at == local
+        # n2 is replaced by n3, so the items card counts one note, not two.
+        assert by_table["items"].title.startswith("1 ")
+    finally:
+        await agent.close()

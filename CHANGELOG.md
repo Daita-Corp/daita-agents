@@ -299,6 +299,25 @@ the host's idle policy, and sets no wake time.
   that names no field stays current while its table exists. A new column or a new
   catalog revision no longer discards it. Notes saved before this keep the old revision
   check.
+- **Notes follow a proven rename.** When PostgreSQL shows the same table object under a
+  new name, or the same column number under a new name, the note's table and field
+  references move with it in the catalog commit, and the change log records one change
+  with the old and new names. The note's text never changes, and neither do read or
+  write scopes. Without proof (other source types, or a dump and restore) the note goes
+  stale instead.
+- **`catalog_describe` says when a note may be out of date.** A note that names no field
+  stays current, and the result gains a `changed` sentence when the table's keys or
+  column types changed after the note was written. Added columns don't trigger it.
+- **Stale notes get a card.** The work board's Needs you column shows one computed card
+  per table, such as `3 notes need review after changes to sales.orders`, at most 5 per
+  agent, busiest tables first. Enter opens `/memory`, and `/sources` shows the count.
+  A desktop notification goes out only if the table was read in the last 7 days. Read
+  counts come from saved runs, scanned at most hourly and only while stale notes exist.
+- **For integrators.** `WorkKind.CATALOG_REVIEW`, `WorkCard.reads_30d` and `reads_7d`.
+  `project_work_board` takes `catalog_reviews`. `CatalogStore` gains
+  `catalog_structure_changed` and `newest_catalog_changes`; `StateStore` gains
+  `tool_sql_reads`. A source type sets `source_object_id` only when that identifier
+  survives a rename and its column ordinals keep their identity while it holds.
 - **For integrators.** `SourceOperation.CHANGE_PROBE` and `ChangeProbeBackend` (one
   `probe(agent_id, source_id, cursor)` returning a `SourceProbe` of tokens per scope);
   `SourceType.freshness` is a `SourceFreshness` (minimum and maximum probe interval, and

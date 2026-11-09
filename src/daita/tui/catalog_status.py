@@ -79,6 +79,9 @@ def status_line(status: Any, now: datetime, noun: str = "object") -> str:
 def _column_change(before: Any, after: Any) -> str:
     old, new = dict(before.columns), dict(after.columns)
     name = safe_display(after.name, fallback="table", maximum=80)
+    if before.name != after.name:
+        was = safe_display(before.name, fallback="table", maximum=80)
+        return f"{was} renamed to {name}"
     for column in new:
         if column not in old:
             return f"{name}.{safe_display(column, fallback='column', maximum=80)} added"

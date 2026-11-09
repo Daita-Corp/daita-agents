@@ -68,6 +68,12 @@ class StateStore(
 
     async def clear_conversations(self, agent_id: str) -> int: ...
 
+    async def tool_sql_reads(
+        self, agent_id: str, tool_name: str, since: datetime
+    ) -> tuple[tuple[datetime, str, str], ...]:
+        """(run time, source ID, SQL) of this tool's calls since ``since``, newest first."""
+        ...
+
     async def load_analysis_evidence(
         self, agent_id: str, run_id: str
     ) -> tuple[AnalysisEvidence, ...]: ...
