@@ -117,6 +117,7 @@ from ..catalog.models import (
     RelationshipFieldPair,
     ResourceBatch,
 )
+from ..catalog.protocols import CatalogStoreError
 from ..catalog.service import CatalogService
 from ..config import (
     AgentConfig,
@@ -143,6 +144,7 @@ from ..domains.data import (
     ARTIFACT_DOMAIN_OWNER_ID,
     DATA_QUERY_MAX_BYTES,
     DATA_QUERY_MAX_ROWS,
+    DATA_QUERY_TOOL_NAME,
     LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS,
     LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS,
     PATH_QUERY_CAPABILITY_ID,
@@ -302,7 +304,9 @@ from ..storage.sqlite_records import (
 from ..work_board import (
     DEFAULT_DONE_WINDOW,
     MAX_DONE_WINDOW,
+    CatalogReview,
     WorkBoard,
+    count_table_reads,
     project_work_board,
 )
 from ..workspace import LocalWorkspace
@@ -647,6 +651,10 @@ class EmbeddedAgent:
         self._source_backends = source_backends
         self._combined_query_engine = combined_query_engine
         self._model_management_lock = asyncio.Lock()
+        # (read at, wanted table -> (30-day, 7-day) reads); one scan an hour.
+        self._review_reads: (
+            tuple[datetime, dict[tuple[str, str], tuple[int, int]]] | None
+        ) = None
         self._effect_resolution_lock = asyncio.Lock()
         self._routine_management_lock = asyncio.Lock()
         self._artifact_publication_lock = (
@@ -2821,7 +2829,84 @@ class EmbeddedAgent:
             deliveries=deliveries,
             now=now,
             done_window=done_window,
+            catalog_reviews=await self._catalog_reviews(now),
         )
+
+    async def _catalog_reviews(self, now: datetime) -> tuple[CatalogReview, ...]:
+        """One review per table with stale notes; reads only, and advisory."""
+
+        try:
+            views = await self._semantic_views()
+            replaced = {v.annotation.supersedes_id for v in views}
+            stale = [
+                view
+                for view in views
+                if view.state is SemanticAnnotationState.STALE
+                and view.annotation.id not in replaced
+            ]
+            if not stale:
+                return ()
+            notes: dict[str, list[SemanticAnnotation]] = {}
+            for view in stale:
+                note = view.annotation
+                ids = note.subject.resource_ids
+                tables = set()
+                for reason in view.stale_reasons:
+                    tail = reason.partition(":")[2]
+                    matches = [i for i in ids if tail == i or tail.startswith(i + ".")]
+                    tables.add(max(matches, key=len, default=ids[0]))
+                for table in tables or {ids[0]}:
+                    notes.setdefault(table, []).append(note)
+            agent_id = self.identity.id
+            names = await self._data_view.resource_names(
+                agent_id, resource_ids=tuple(notes)
+            )
+            changes = await self._store.newest_catalog_changes(agent_id, tuple(notes))
+            label = {
+                table: names.get(table)
+                or (changes[table][0] if table in changes else "a removed table")
+                for table in notes
+            }
+            wanted = {
+                (source, label[table])
+                for table, found in notes.items()
+                for note in found
+                for source in note.subject.source_ids
+            }
+            cached = self._review_reads
+            if (
+                cached is None
+                or now - cached[0] >= timedelta(hours=1)
+                or not wanted <= cached[1].keys()
+            ):
+                statements = await self._store.tool_sql_reads(
+                    agent_id, DATA_QUERY_TOOL_NAME, now - timedelta(days=30)
+                )
+                cached = (now, count_table_reads(statements, wanted, now))
+                self._review_reads = cached
+            reviews = []
+            for table, found in notes.items():
+                sources = {s for note in found for s in note.subject.source_ids}
+                reads = [cached[1][(s, label[table])] for s in sources]
+                reviews.append(
+                    CatalogReview(
+                        resource_id=table,
+                        table=label[table],
+                        notes=len(found),
+                        changed_at=(
+                            changes[table][1]
+                            if table in changes
+                            else max(note.confirmed_at for note in found).astimezone(
+                                UTC
+                            )
+                        ),
+                        reads_30d=sum(r[0] for r in reads),
+                        reads_7d=sum(r[1] for r in reads),
+                    )
+                )
+            return tuple(reviews)
+        except (CatalogStoreError, TypeError, ValueError, KeyError, RuntimeError):
+            return ()
 
     def background_status(self) -> tuple[SupervisorStatus, ...]:
         """Return payload-free health of background job and routine execution."""

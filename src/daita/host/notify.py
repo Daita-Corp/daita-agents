@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from ..tui.sanitization import sanitize_terminal_text
-from ..work_board import WorkBoard, WorkColumn
+from ..work_board import WorkBoard, WorkColumn, WorkKind
 from .interactions import InteractionKind
 
 _LOGGER = logging.getLogger("daita.host")
@@ -82,6 +82,8 @@ class Notifier:
             (card.kind.value, card.id, column): card.updated_at
             for column in _WORK_TEXT
             for card in board.columns.get(column, ())
+            # A table nobody read this week is shown, never announced.
+            if card.kind is not WorkKind.CATALOG_REVIEW or card.reads_7d
         }
         since = state.since or self._started
         fresh = [

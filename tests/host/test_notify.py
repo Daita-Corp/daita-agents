@@ -224,3 +224,45 @@ def _board(*cards: WorkCard) -> WorkBoard:
         truncated={column: 0 for column in WorkColumn},
         generated_at=START,
     )
+
+
+def _review(updated_at: datetime, reads_7d: int) -> WorkCard:
+    return WorkCard(
+        kind=WorkKind.CATALOG_REVIEW,
+        id="resource-1",
+        column=WorkColumn.NEEDS_YOU,
+        title="1 note needs review after changes to sales.orders",
+        status="needs_review",
+        summary="",
+        updated_at=updated_at,
+        reads_30d=reads_7d,
+        reads_7d=reads_7d,
+    )
+
+
+async def test_a_review_notifies_once_and_only_when_the_table_was_read(
+    tmp_path: Path,
+) -> None:
+    sent = Sent()
+    notifier = _notifier(tmp_path, sent, interval=0.0)
+    changed = START + timedelta(minutes=1)
+
+    notifier.work("sales", _board(_review(changed, reads_7d=0)))
+    notifier.work("sales", _board(_review(changed, reads_7d=3)))
+    notifier.work("sales", _board(_review(changed, reads_7d=3)))
+    await bounded(lambda: sent.items)
+    await asyncio.sleep(0.1)
+    assert sent.texts() == ["sales: an item needs you"]
+
+    # A restarted host has seen nothing, but the change time is older than it.
+    restarted = Sent()
+    later = Notifier(
+        attached=lambda _agent: 0,
+        enabled=lambda: True,
+        send=restarted,
+        interval=0.0,
+        now=lambda: START + timedelta(hours=1),
+    )
+    later.work("sales", _board(_review(changed, reads_7d=3)))
+    await asyncio.sleep(0.1)
+    assert restarted.items == []

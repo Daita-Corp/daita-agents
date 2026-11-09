@@ -2282,6 +2282,74 @@ class SQLStateStore:
             ),
         )
 
+    async def catalog_structure_changed(
+        self, agent_id: str, source_id: str, resource_id: str, since_revision: str
+    ) -> bool:
+        return await self._catalog_read(
+            agent_id,
+            lambda c, note: catalog_rows.structure_changed(
+                c, agent_id, source_id, resource_id, since_revision
+            ),
+        )
+
+    async def newest_catalog_changes(
+        self, agent_id: str, resource_ids: tuple[str, ...]
+    ) -> dict[str, tuple[str, datetime]]:
+        """Each resource's newest change as (native identity, changed_at)."""
+
+        return await self._catalog_read(
+            agent_id,
+            lambda c, note: catalog_rows.newest_changes(c, agent_id, resource_ids),
+        )
+
+    async def tool_sql_reads(
+        self, agent_id: str, tool_name: str, since: datetime
+    ) -> tuple[tuple[datetime, str, str], ...]:
+        """(run time, source ID, SQL) of this tool's calls since ``since``, newest first."""
+
+        def read() -> tuple[tuple[datetime, str, str], ...]:
+            with _connect_read_only(self._database) as connection:
+                runs: list[tuple[datetime, str]] = []
+                for run_id, data in connection.execute(
+                    "SELECT id, input FROM runs WHERE agent_id = ?", (agent_id,)
+                ):
+                    try:
+                        created_at = decode_run_input(data).created_at
+                    except (TypeError, ValueError, KeyError):
+                        continue
+                    if created_at >= since:
+                        runs.append((created_at, run_id))
+                # shortcut: newest 2,000 runs bound the scan; raise it if counts prove too low.
+                runs = sorted(runs, reverse=True)[:2_000]
+                times = {run_id: created_at for created_at, run_id in runs}
+                ids = list(times)
+                reads: list[tuple[datetime, str, str]] = []
+                for start in range(0, len(ids), 500):
+                    chunk = ids[start : start + 500]
+                    for run_id, data in connection.execute(
+                        "SELECT run_id, data FROM messages WHERE run_id IN ("
+                        + ", ".join("?" * len(chunk))
+                        + ")",
+                        chunk,
+                    ):
+                        if tool_name not in data:
+                            continue
+                        try:
+                            calls = decode_message(data).tool_calls
+                        except (TypeError, ValueError, KeyError):
+                            continue
+                        for call in calls:
+                            if call.name == tool_name:
+                                reads.extend(
+                                    (times[run_id], source_id, sql)
+                                    for source_id, sql in _call_statements(
+                                        call.arguments
+                                    )
+                                )
+                return tuple(sorted(reads, key=lambda item: item[0], reverse=True))
+
+        return await settled_thread(read)
+
     async def load_sync(self, agent_id: str, sync_id: str) -> CatalogSync | None:
         def read() -> CatalogSync | None:
             with _connect_read_only(self._database) as connection:
@@ -4034,6 +4102,26 @@ def _conversation_records(
         )
         for run_id, turn_index, input_data, result_data in rows
     )
+
+
+def _call_statements(arguments: Mapping[str, object]) -> Iterable[tuple[str, str]]:
+    """(source ID, SQL text) of a query call; one entry per source it reads."""
+
+    inputs = arguments.get("inputs")
+    if isinstance(inputs, (list, tuple)):  # a combined read: SQL per input
+        for item in inputs:
+            if isinstance(item, Mapping) and isinstance(item.get("sql"), str):
+                yield str(item.get("source_id")), str(item["sql"])
+        return
+    statements = arguments.get("statements")
+    parts = (
+        [item.get("sql") for item in statements if isinstance(item, Mapping)]
+        if isinstance(statements, (list, tuple))
+        else [arguments.get("sql")]
+    )
+    text = "\n".join(part for part in parts if isinstance(part, str))
+    if text:
+        yield str(arguments.get("source_id")), text
 
 
 async def _run_read_transaction(

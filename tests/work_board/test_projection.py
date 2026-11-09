@@ -34,10 +34,12 @@ from daita.work_board import (
     DEFAULT_DONE_WINDOW,
     FAILED_JOB_WINDOW,
     MAX_WORK_CARDS_PER_COLUMN,
+    CatalogReview,
     WorkBoard,
     WorkCard,
     WorkColumn,
     WorkKind,
+    count_table_reads,
     project_work_board,
     work_board_projection,
 )
@@ -630,6 +632,8 @@ def test_projection_is_json_safe_with_every_column() -> None:
             "due_at": None,
             "routine_id": None,
             "delivery_id": None,
+            "reads_30d": 0,
+            "reads_7d": 0,
         }
     ]
     assert columns["scheduled"][0]["due_at"] == (NOW + timedelta(hours=1)).isoformat()
@@ -656,3 +660,56 @@ def test_projection_rejects_naive_time_and_non_positive_window(
             now=now,
             done_window=done_window,
         )
+
+
+def _review(table: str, reads: int = 0, days: int = 1, notes: int = 1) -> CatalogReview:
+    return CatalogReview(
+        f"res-{table}", table, notes, NOW - timedelta(days=days), reads, reads
+    )
+
+
+def test_review_cards_rank_by_reads_and_cap_with_a_count() -> None:
+    reviews = tuple(_review(f"t{n}", reads=n) for n in range(8))
+    board = project_work_board(
+        jobs=(),
+        routines=(),
+        active_occurrences=(),
+        result_occurrences=(),
+        deliveries=(),
+        now=NOW,
+        catalog_reviews=reviews,
+    )
+    cards = board.columns[WorkColumn.NEEDS_YOU]
+    assert [c.reads_30d for c in cards] == [7, 6, 5, 4, 3]
+    assert board.truncated[WorkColumn.NEEDS_YOU] == 3
+
+
+def test_review_card_names_the_table_and_the_note_count() -> None:
+    board = project_work_board(
+        jobs=(_job("job-1", JobState.WAITING_FOR_YOU),),
+        routines=(),
+        active_occurrences=(),
+        result_occurrences=(),
+        deliveries=(),
+        now=NOW,
+        catalog_reviews=(
+            replace(_review("sales.orders", notes=3), table="sales.orders\x00"),
+        ),
+    )
+    first, review = board.columns[WorkColumn.NEEDS_YOU]
+    assert first.kind is WorkKind.JOB
+    assert review.kind is WorkKind.CATALOG_REVIEW
+    assert "3 notes" in review.title and review.title.endswith("sales.orders")
+    assert review.updated_at == NOW - timedelta(days=1)
+
+
+def test_reads_honour_windows_and_source() -> None:
+    sql = "SELECT * FROM sales.Orders o JOIN other ON 1=1"
+    statements = [
+        (NOW - timedelta(days=2), "pg", sql),
+        (NOW - timedelta(days=20), "pg", sql),
+        (NOW - timedelta(days=40), "pg", sql),
+        (NOW - timedelta(days=1), "mysql", sql),
+    ]
+    counts = count_table_reads(statements, [("pg", "sales.orders")], NOW)
+    assert counts == {("pg", "sales.orders"): (2, 1)}

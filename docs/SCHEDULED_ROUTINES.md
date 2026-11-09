@@ -172,8 +172,10 @@ own decision.
 The TUI's Work tab (`Ctrl+3` or `/work`) is a board over jobs, routines and their
 results. A routine's successful result sits in Done for 24 hours, then
 ages off the board. A failed or withheld result stays in Needs you until you
-dismiss it. Press `Enter` on a result to read it, and `d` (or the result's
-Dismiss button) to dismiss it. Dismissing acknowledges the delivery; it never
+dismiss it. Saved notes that went stale show as one computed card per table in
+Needs you (at most 5, busiest tables first); `Enter` opens `/memory`. Press
+`Enter` on a result to read it, and `d` (or the result's Dismiss button) to
+dismiss it. Dismissing acknowledges the delivery; it never
 reruns the work. Notices about jobs are not listed separately: the job's own card
 moves to Needs you while it waits on you. The headless equivalents are:
 

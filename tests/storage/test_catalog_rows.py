@@ -23,9 +23,21 @@ from daita.catalog.models import (
     Sensitivity,
     catalog_resource_id,
 )
-from daita.catalog.search_text import search_key
+from daita.catalog.search_text import search_key, tabular_parts
+from daita.semantics import (
+    ResourceRevisionBinding,
+    SemanticAnnotation,
+    SemanticEvidence,
+    SemanticEvidenceKind,
+    SemanticFieldReference,
+    SemanticKind,
+    SemanticResourceFact,
+    SemanticSubject,
+    inspect_semantic_annotations,
+)
 from daita.storage import catalog_rows, sql
 from daita.storage.sqlite import SQLiteStateStore
+from daita.storage.sqlite_codecs import decode_semantic_annotation
 from tests.support.catalog_records import (
     OBSERVED_AT,
     SHOP,
@@ -520,3 +532,297 @@ async def test_the_keeper_state_contract_holds_on_sqlite(store) -> None:
     await exercise_keeper_state(
         store, AGENT, source, lambda: store.register_source(registration)
     )
+
+
+# ----------------------------------------------------------- proven renames
+
+HOME = source_registration_id(AGENT, "sqlite", "db")
+PLAIN = (
+    Table("main.customers", ("id", "CustomerName")),
+    Table("main.orders", ("id", "customer_id", "total")),
+)
+OBJECTS = {"main.customers": "100", "main.orders": "200"}
+
+
+def pass_of(sync_id: str, tables, objects, **batch_options):
+    """One detail pass whose entries carry the given source object ids."""
+
+    value = snapshot(AGENT, HOME, sync_id, tables, ())
+    (batch,) = batches(value)
+    described = tuple(
+        replace(e, source_object_id=objects.get(e.resource.native_identity))
+        for e in batch.entries
+    )
+    return value.sync, (replace(batch, entries=described, **batch_options),)
+
+
+def table_id(identity: str) -> str:
+    return catalog_resource_id(HOME, ResourceKind.TABLE, identity)
+
+
+def renamed_orders(tables=PLAIN, columns=None):
+    return tuple(
+        (
+            replace(
+                t,
+                native_identity=(
+                    "main.purchases" if columns is None else t.native_identity
+                ),
+                columns=columns or t.columns,
+            )
+            if t.native_identity == "main.orders"
+            else t
+        )
+        for t in tables
+    )
+
+
+@pytest.fixture
+async def shop_home(store):
+    await store.register_source(
+        SourceRegistration(
+            id=HOME,
+            agent_id=AGENT,
+            adapter_id="sqlite",
+            native_identity="db",
+            display_name="Shop",
+            configuration={},
+            attached_at=OBSERVED_AT,
+        )
+    )
+    sync, first = pass_of("sync-1", PLAIN, OBJECTS)
+    await store.commit_catalog(sync, first)
+    return store
+
+
+async def keep_note(store, note_id, identity, field, *, typed=True, statement="Gross."):
+    (entry,) = [
+        e
+        for e in await store.list_entries(AGENT, HOME)
+        if e.resource.native_identity == identity
+    ]
+    resource_id = entry.resource.id
+    types = tuple(t for t in tabular_parts(entry)[0] if t[0] == field)
+    note = SemanticAnnotation(
+        id=note_id,
+        agent_id=AGENT,
+        subject=SemanticSubject(
+            (HOME,), (resource_id,), (SemanticFieldReference(resource_id, field),)
+        ),
+        kind=SemanticKind.METRIC_DEFINITION,
+        statement=statement,
+        evidence=(
+            SemanticEvidence(
+                SemanticEvidenceKind.USER_ASSERTION, "run-1", message_position=0
+            ),
+        ),
+        catalog_revisions=(
+            ResourceRevisionBinding(
+                resource_id, entry.resource.current_revision, types if typed else None
+            ),
+        ),
+        created_at=OBSERVED_AT,
+        confirmed_at=OBSERVED_AT,
+    )
+    await store.save_semantic_annotation(AGENT, note)
+    return note
+
+
+async def standing(store, tmp_path: Path) -> dict[str, tuple]:
+    """Each readable note with the reasons it is stale against the catalog now."""
+
+    facts = []
+    for entry in await store.list_entries(AGENT, HOME):
+        columns, _ = tabular_parts(entry)
+        facts.append(
+            SemanticResourceFact(
+                entry.resource.id,
+                HOME,
+                entry.resource.current_revision,
+                tuple(n for n, _ in columns),
+                tuple(columns),
+            )
+        )
+    found = {}
+    for note_id, data in rows(tmp_path, "SELECT id, data FROM semantic_annotations"):
+        try:
+            note = decode_semantic_annotation(data)
+        except ValueError:
+            continue
+        (view,) = inspect_semantic_annotations((note,), tuple(facts))
+        found[note_id] = (note, view.stale_reasons)
+    return found
+
+
+async def test_a_renamed_table_keeps_its_notes_and_logs_one_change(
+    shop_home, tmp_path
+) -> None:
+    store = shop_home
+    typed = await keep_note(store, "typed", "main.orders", "total")
+    await keep_note(store, "older", "main.orders", "total", typed=False)
+    await keep_note(store, "other", "main.customers", "CustomerName")
+    note_rows = "SELECT id, data FROM semantic_annotations WHERE id = 'other'"
+    scopes = "SELECT * FROM source_read_scopes"
+    unrelated, granted = rows(tmp_path, note_rows), rows(tmp_path, scopes)
+    assert granted
+    logged = len(await store.list_catalog_changes(AGENT, HOME))
+
+    objects = {**OBJECTS, "main.purchases": OBJECTS["main.orders"]}
+    sync, second = pass_of("sync-2", renamed_orders(), objects)
+    summary = await store.commit_catalog(sync, second)
+
+    assert (summary.added, summary.changed, summary.removed) == (0, 1, 0)
+    everything = await store.list_catalog_changes(AGENT, HOME)
+    new = everything[: len(everything) - logged]  # newest first
+    assert [(c.kind, c.before.name, c.after.name) for c in new] == [
+        (CatalogChangeKind.CHANGED, "orders", "purchases")
+    ]
+    purchases = table_id("main.purchases")
+    notes = await standing(store, tmp_path)
+    assert notes["typed"][0].subject.resource_ids == (purchases,)
+    assert notes["typed"][0].subject.fields[0].resource_id == purchases
+    assert notes["typed"][0].statement == typed.statement
+    assert notes["typed"][1] == ()
+    assert notes["older"][0].subject.resource_ids == (purchases,)
+    assert notes["older"][1] == (f"revision_mismatch:{purchases}",)
+    assert rows(tmp_path, note_rows) == unrelated
+    assert rows(tmp_path, scopes) == granted
+
+
+async def test_renamed_columns_keep_their_notes_even_when_names_swap(
+    shop_home, tmp_path
+) -> None:
+    store = shop_home
+    await keep_note(store, "total", "main.orders", "total")
+    await keep_note(store, "customer", "main.orders", "customer_id")
+
+    swapped = renamed_orders(columns=("id", "total", "customer_id"))
+    sync, second = pass_of("sync-2", swapped, OBJECTS)
+    await store.commit_catalog(sync, second)
+
+    notes = await standing(store, tmp_path)
+    assert notes["total"][0].subject.fields[0].field_name == "customer_id"
+    assert notes["customer"][0].subject.fields[0].field_name == "total"
+    assert notes["total"][1] == notes["customer"][1] == ()
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        pytest.param({"main.purchases": "999"}, id="restored-with-a-new-object-id"),
+        pytest.param({"main.purchases": None}, id="no-object-id"),
+    ],
+)
+async def test_a_rename_without_a_matching_object_id_carries_nothing(
+    shop_home, tmp_path, after
+) -> None:
+    await keep_note(shop_home, "typed", "main.orders", "total")
+    old = table_id("main.orders")
+    objects = {**OBJECTS, **after}
+    objects.pop("main.orders")
+    sync, second = pass_of("sync-2", renamed_orders(), objects)
+    summary = await shop_home.commit_catalog(sync, second)
+
+    assert (summary.added, summary.removed) == (1, 1)
+    note, stale = (await standing(shop_home, tmp_path))["typed"]
+    assert note.subject.resource_ids == (old,)
+    assert stale == (f"missing_resource:{old}",)
+
+
+async def test_a_new_column_name_without_an_object_id_is_not_a_rename(
+    store, tmp_path
+) -> None:
+    await store.register_source(
+        SourceRegistration(
+            id=HOME,
+            agent_id=AGENT,
+            adapter_id="sqlite",
+            native_identity="db",
+            display_name="Shop",
+            configuration={},
+            attached_at=OBSERVED_AT,
+        )
+    )
+    sync, first = pass_of("sync-1", PLAIN, {})
+    await store.commit_catalog(sync, first)
+    await keep_note(store, "typed", "main.orders", "total")
+
+    sync, second = pass_of(
+        "sync-2", renamed_orders(columns=("id", "customer_id", "gross")), {}
+    )
+    await store.commit_catalog(sync, second)
+
+    note, stale = (await standing(store, tmp_path))["typed"]
+    assert note.subject.fields[0].field_name == "total"
+    assert stale == (f"missing_field:{table_id('main.orders')}.total",)
+
+
+async def test_an_incomplete_listing_removes_and_carries_nothing(
+    shop_home, tmp_path
+) -> None:
+    await keep_note(shop_home, "typed", "main.orders", "total")
+    objects = {**OBJECTS, "main.purchases": OBJECTS["main.orders"]}
+    sync, second = pass_of("sync-2", renamed_orders(), objects, truncated=True)
+    await shop_home.commit_catalog(sync, second)
+
+    names = identities(await shop_home.list_entries(AGENT, HOME))
+    assert "main.orders" in names
+    note, _ = (await standing(shop_home, tmp_path))["typed"]
+    assert note.subject.resource_ids == (table_id("main.orders"),)
+
+
+async def test_a_bad_note_never_fails_a_commit_or_blocks_the_others(
+    shop_home, tmp_path
+) -> None:
+    good = await keep_note(shop_home, "good", "main.orders", "total")
+    old, new = table_id("main.orders"), table_id("main.purchases")
+    clash = replace(
+        good,
+        id="clash",
+        subject=SemanticSubject((HOME,), (old, new)),
+        catalog_revisions=(
+            ResourceRevisionBinding(old, "r"),
+            ResourceRevisionBinding(new, "r"),
+        ),
+    )
+    await shop_home.save_semantic_annotation(AGENT, clash)
+    with sqlite3.connect(tmp_path / "state.db") as connection:
+        connection.execute(
+            "INSERT INTO semantic_annotations(agent_id, id, data) VALUES (?, 'bad', 'x')",
+            (AGENT,),
+        )
+
+    objects = {**OBJECTS, "main.purchases": OBJECTS["main.orders"]}
+    sync, second = pass_of("sync-2", renamed_orders(), objects)
+    await shop_home.commit_catalog(sync, second)
+
+    notes = await standing(shop_home, tmp_path)
+    assert notes["good"][0].subject.resource_ids == (new,)
+    assert notes["clash"][0] == clash
+
+
+async def test_only_added_columns_since_a_revision_are_not_a_structure_change(
+    store,
+) -> None:
+    await commit(store, shop("sync-1"))
+    (orders,) = [
+        e
+        for e in await store.list_entries(AGENT, SOURCE)
+        if e.resource.native_identity == "main.orders"
+    ]
+    first = orders.resource.current_revision
+
+    def orders_with(*columns):
+        return tuple(
+            replace(t, columns=columns) if t.native_identity == "main.orders" else t
+            for t in SHOP
+        )
+
+    names = next(t.columns for t in SHOP if t.native_identity == "main.orders")
+    await commit(store, shop("sync-2", orders_with(*names, "note")))
+    changed = store.catalog_structure_changed
+    assert not await changed(AGENT, SOURCE, orders.resource.id, first)
+    assert await changed(AGENT, SOURCE, orders.resource.id, "sha256:" + "0" * 64)
+
+    await commit(store, shop("sync-3", orders_with(*names[1:], "note")))
+    assert await changed(AGENT, SOURCE, orders.resource.id, first)

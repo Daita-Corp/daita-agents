@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -23,6 +24,7 @@ from .routines.models import (
 )
 
 MAX_WORK_CARDS_PER_COLUMN = 25
+MAX_CATALOG_REVIEW_CARDS = 5
 MAX_WORK_CARD_TITLE_CHARACTERS = 120
 MAX_WORK_CARD_SUMMARY_CHARACTERS = 240
 DEFAULT_DONE_WINDOW = timedelta(hours=24)
@@ -44,6 +46,7 @@ class WorkKind(str, Enum):
     JOB = "job"
     ROUTINE = "routine"
     ROUTINE_RUN = "routine_run"
+    CATALOG_REVIEW = "catalog_review"
 
 
 def _utc(value: datetime, name: str) -> None:
@@ -83,6 +86,8 @@ class WorkCard:
     due_at: datetime | None = None
     routine_id: str | None = None
     delivery_id: str | None = None
+    reads_30d: int = 0
+    reads_7d: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, WorkKind):
@@ -105,12 +110,30 @@ class WorkCard:
         ):
             if timestamp is not None:
                 _utc(timestamp, name)
+        for count, name in (
+            (self.reads_30d, "work card reads_30d"),
+            (self.reads_7d, "work card reads_7d"),
+        ):
+            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
         for identifier, name in (
             (self.routine_id, "work card routine_id"),
             (self.delivery_id, "work card delivery_id"),
         ):
             if identifier is not None:
                 _line(identifier, name, maximum=256)
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogReview:
+    """One table whose saved notes went stale; computed, never stored."""
+
+    resource_id: str
+    table: str
+    notes: int
+    changed_at: datetime
+    reads_30d: int = 0
+    reads_7d: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +260,47 @@ def _delivery_card(
     )
 
 
+def _review_card(review: CatalogReview) -> WorkCard:
+    # The name comes from the source; a NUL would make the whole board invalid.
+    table = review.table.replace("\x00", "")
+    title = "1 note needs" if review.notes == 1 else f"{review.notes} notes need"
+    return WorkCard(
+        kind=WorkKind.CATALOG_REVIEW,
+        id=review.resource_id,
+        column=WorkColumn.NEEDS_YOU,
+        title=_bounded(
+            f"{title} review after changes to {table}", MAX_WORK_CARD_TITLE_CHARACTERS
+        ),
+        status="needs_review",
+        summary="",
+        updated_at=review.changed_at,
+        reads_30d=review.reads_30d,
+        reads_7d=review.reads_7d,
+    )
+
+
+def count_table_reads(
+    statements: Iterable[tuple[datetime, str, str]],
+    wanted: Iterable[tuple[str, str]],
+    now: datetime,
+) -> dict[tuple[str, str], tuple[int, int]]:
+    """Reads per wanted (source_id, table_name) in the last 30 and 7 days."""
+
+    names = {key: key[1].rsplit(".", 1)[-1].casefold() for key in wanted}
+    counts = {key: [0, 0] for key in names}
+    for created_at, source_id, sql in statements:
+        age = now - created_at
+        if age > timedelta(days=30):
+            continue
+        # shortcut: matches table names in SQL text, so an alias or a column of the same name can count; upgrade if ranking proves wrong.
+        tokens = set(re.findall(r"[\w$]+", sql.casefold()))
+        for key, name in names.items():
+            if key[0] == source_id and name in tokens:
+                counts[key][0] += 1
+                counts[key][1] += age <= timedelta(days=7)
+    return {key: (month, week) for key, (month, week) in counts.items()}
+
+
 def _sort_key(card: WorkCard) -> tuple[object, ...]:
     tie = (card.id, card.kind.value)
     if card.column is WorkColumn.SCHEDULED:
@@ -244,7 +308,9 @@ def _sort_key(card: WorkCard) -> tuple[object, ...]:
         return (card.due_at is None, due, -card.updated_at.timestamp(), *tie)
     if card.column is WorkColumn.RUNNING:
         return (card.started_at or card.updated_at, *tie)
-    return (-card.updated_at.timestamp(), *tie)
+    if card.kind is WorkKind.CATALOG_REVIEW:
+        return (1, -card.reads_30d, -card.updated_at.timestamp(), *tie)
+    return (0, -card.updated_at.timestamp(), *tie)
 
 
 def project_work_board(
@@ -256,8 +322,9 @@ def project_work_board(
     deliveries: Iterable[DeliveryView],
     now: datetime,
     done_window: timedelta = DEFAULT_DONE_WINDOW,
+    catalog_reviews: Iterable[CatalogReview] = (),
 ) -> WorkBoard:
-    """Place each job, routine and routine run in exactly one column."""
+    """Place each job, routine, routine run and table review in one column."""
 
     _utc(now, "work board now")
     if not isinstance(done_window, timedelta) or done_window <= timedelta(0):
@@ -331,6 +398,12 @@ def project_work_board(
             carded_occurrences.add(delivery.subject_id)
             cards.append(delivery_card)
 
+    reviews = sorted(
+        catalog_reviews,
+        key=lambda r: (-r.reads_30d, -r.changed_at.timestamp(), r.table),
+    )
+    cards.extend(_review_card(r) for r in reviews[:MAX_CATALOG_REVIEW_CARDS])
+
     columns: dict[WorkColumn, tuple[WorkCard, ...]] = {}
     truncated: dict[WorkColumn, int] = {}
     for column in WorkColumn:
@@ -339,6 +412,7 @@ def project_work_board(
         )
         columns[column] = tuple(ordered[:MAX_WORK_CARDS_PER_COLUMN])
         truncated[column] = max(0, len(ordered) - MAX_WORK_CARDS_PER_COLUMN)
+    truncated[WorkColumn.NEEDS_YOU] += max(0, len(reviews) - MAX_CATALOG_REVIEW_CARDS)
     return WorkBoard(
         columns=MappingProxyType(columns),
         truncated=MappingProxyType(truncated),
@@ -371,6 +445,8 @@ def work_board_projection(board: WorkBoard) -> dict[str, object]:
                     "due_at": _optional_iso(card.due_at),
                     "routine_id": card.routine_id,
                     "delivery_id": card.delivery_id,
+                    "reads_30d": card.reads_30d,
+                    "reads_7d": card.reads_7d,
                 }
                 for card in board.columns[column]
             ]
@@ -383,12 +459,15 @@ def work_board_projection(board: WorkBoard) -> dict[str, object]:
 __all__ = [
     "DEFAULT_DONE_WINDOW",
     "FAILED_JOB_WINDOW",
+    "MAX_CATALOG_REVIEW_CARDS",
     "MAX_DONE_WINDOW",
     "MAX_WORK_CARDS_PER_COLUMN",
+    "CatalogReview",
     "WorkBoard",
     "WorkCard",
     "WorkColumn",
     "WorkKind",
+    "count_table_reads",
     "project_work_board",
     "work_board_projection",
 ]

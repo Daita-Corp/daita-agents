@@ -776,6 +776,8 @@ class DaitaApp(App[int]):
                 await self._await_modal(ResultScreen(delivery_id=item_id))
             elif section == "artifacts":
                 await self._await_modal(ArtifactsScreen(artifact_id=item_id))
+            elif section == "memory":
+                await self._handle_command("/memory")
             await self.refresh_background_status(notify_new=False)
         except (UserInputError, ValueError, RuntimeError, OSError) as error:
             chat.show_notice(safe_display(str(error), maximum=512))

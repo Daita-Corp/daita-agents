@@ -185,6 +185,24 @@ the same way. A `semantic_save` on a table with no catalog
 entry, or with only a name, is refused with `semantic_unknown_resource`, which says
 reads are unaffected.
 
+A note's currency is computed at read time from what it names, so nothing renews it.
+A catalog commit carries notes across a proven rename in its own transaction: the same
+non-null `source_object_id` under a new name on a complete listing, or, while that
+object ID holds, the same column ordinal under a new name. It rewrites only the note's
+subject and bindings, keeps stored field types (so a rename plus a retype still reads
+as stale), leaves an older binding's revision alone, skips a note it can't decode or
+rewrite, and never touches read or write scopes. The change log gets one `changed` row
+with both names. A current note naming no field adds a `changed` sentence to
+`catalog_describe` when the change log can't show that only columns were added since
+the note's revision; key history isn't stored, so any other structural change counts.
+
+`project_work_board` computes one Needs you card per table with stale notes, at most 5
+per agent, ranked by reads in the last 30 days; the rest count as truncated. Those
+counts come from a read-only scan of saved `data_query` calls, matched by table name in
+the SQL text, done at most hourly per open agent and only while stale notes exist. The
+host notifies only for a table read in the last 7 days. The card writes nothing and sets
+no wake time.
+
 `daita.adapters` implements source admission, containment, discovery,
 freshness checks, and I/O. One composed `SourceTypeRegistry` per agent maps each
 `adapter_id` to its factory, credential fields, read capacity, SQL dialect and

@@ -113,6 +113,18 @@ class CatalogStore(Protocol):
         self, agent_id: str, source_id: str, *, limit: int = 50
     ) -> tuple[CatalogChange, ...]: ...
 
+    async def catalog_structure_changed(
+        self, agent_id: str, source_id: str, resource_id: str, since_revision: str
+    ) -> bool:
+        """Whether more than added columns changed since that revision."""
+        ...
+
+    async def newest_catalog_changes(
+        self, agent_id: str, resource_ids: tuple[str, ...]
+    ) -> dict[str, tuple[str, datetime]]:
+        """Each resource's newest change as (native identity, changed_at)."""
+        ...
+
     async def take_unreadable_catalog_sources(
         self, agent_id: str
     ) -> tuple[str, ...]: ...
