@@ -708,7 +708,9 @@ class PresentationController:
         """Live connection facts for one source; a failed check is a result."""
 
         try:
-            facts = connection_facts(await self.require_agent().check_source(source_id))
+            facts: dict[str, object] = connection_facts(
+                await self.require_agent().check_source(source_id)
+            )
         except Exception:
             facts = {"reachable": False}
         if not facts["reachable"]:

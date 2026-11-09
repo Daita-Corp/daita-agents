@@ -1416,9 +1416,9 @@ def _readiness(
     rejections: tuple[str, ...],
     remediation: tuple[str, ...],
 ) -> RelationalWriteReadiness:
-    role: dict[str, object] = dict.fromkeys(_READINESS_ROLE_KEYS)
-    privileges: dict[str, object] = dict.fromkeys(_READINESS_PRIVILEGE_KEYS)
-    relation: dict[str, object] = dict.fromkeys(_READINESS_RELATION_KEYS)
+    role: dict[str, object] = {key: None for key in _READINESS_ROLE_KEYS}
+    privileges: dict[str, object] = {key: None for key in _READINESS_PRIVILEGE_KEYS}
+    relation: dict[str, object] = {key: None for key in _READINESS_RELATION_KEYS}
     relation["exists"] = False if facts is None else True
     if facts is not None:
         role.update(

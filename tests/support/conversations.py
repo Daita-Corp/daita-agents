@@ -52,6 +52,7 @@ import inspect
 from collections.abc import Mapping
 from dataclasses import fields
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
@@ -311,7 +312,7 @@ class CatalogSpy:
         del agent_id, source_ids
         return ModelSensitivity.PUBLIC
 
-    async def source_directory(self, agent_id, source_ids):
+    async def source_directory(self, agent_id, source_ids) -> tuple[Any, ...]:
         return await self.source_routing_facts(agent_id, source_ids)
 
 

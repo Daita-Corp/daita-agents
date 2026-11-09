@@ -169,6 +169,7 @@ def test_postgresql_subscription_route_uses_only_the_test_keychain(
     monkeypatch.delenv("DAITA_POSTGRES_LIVE_OPENAI_API_KEY", raising=False)
     monkeypatch.setenv(live_billing.BILLING_ENV, "subscription")
     config = postgres_harness.live_config("openai:gpt-5.6-terra")
+    assert config.model_route is not None
     candidate = config.model_route.candidates[0]
     assert candidate.provider_id == "codex:gpt-5.6-terra"
     assert candidate.secret_reference == SecretReference.keychain(

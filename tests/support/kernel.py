@@ -57,7 +57,7 @@ import asyncio
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -193,7 +193,7 @@ class _SnapshotCatalog:
     async def resource_names(self, agent_id, source_ids=()):
         return {}
 
-    async def source_directory(self, agent_id, source_ids):
+    async def source_directory(self, agent_id, source_ids) -> tuple[Any, ...]:
         self.context_reads += 1
         return await self.source_routing_facts(agent_id, source_ids)
 

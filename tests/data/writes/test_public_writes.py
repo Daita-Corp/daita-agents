@@ -132,7 +132,9 @@ async def test_search_finds_the_write_tool_apart_from_catalog_and_export_tools(
         result = await agent.run("Discover the tools without executing work.")
         transcript = await agent.transcript(result.run_id)
         block = dict((call.id, item) for call, item in transcript.tool_pairs)["search"]
-        names = [item["tool_name"] for item in block.output["data"]["matches"]]
+        assert block is not None
+        data = cast(dict[str, Any], block.output["data"])
+        names = [item["tool_name"] for item in data["matches"]]
         assert expected in names[:rank], (query, names)
         assert not db.rows and not await agent.list_effects()
     finally:

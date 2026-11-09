@@ -213,6 +213,7 @@ async def test_live_mixed_upsert_and_repeat(database, scenario_factory):
         )
         written = assert_exact_preview(scenario, transcript)
         receipt = await database.receipt(EffectOutcome.SUCCEEDED)
+        assert written is not None
         assert receipt.payload["affected_rows"] == written["affected_rows"]
         actual = await database.rows()
         assert [(item["domain"], item["name"]) for item in actual] == [
@@ -237,6 +238,7 @@ async def test_live_mixed_upsert_and_repeat(database, scenario_factory):
         )
         assert repeat.outcome is EffectOutcome.SUCCEEDED
         # Either way is right: rewriting the rows, or skipping them as unchanged.
+        assert written is not None
         assert repeat.payload["affected_rows"] == written["affected_rows"]
         assert await database.rows() == actual
         assert database.probe.mutations == 2 and database.probe.server_commits == 2

@@ -130,7 +130,7 @@ def _owner(column: Any, names: list[str]) -> int | None:
 def _base_table(item: Any, ctes: Mapping[str, Any], exp: Any) -> Any:
     """The base table behind a plain pass-through CTE or subquery, else the item."""
 
-    inner = item.this if isinstance(item, exp.Subquery) else None
+    inner: Any = item.this if isinstance(item, exp.Subquery) else None
     if isinstance(item, exp.Table) and not item.db:
         inner = ctes.get(item.name.casefold())
     if (
@@ -143,7 +143,7 @@ def _base_table(item: Any, ctes: Mapping[str, Any], exp: Any) -> Any:
     ):
         return item
     source = inner.args.get("from_") or inner.args.get("from")
-    table = source.this if source is not None else None
+    table: Any = source.this if source is not None else None
     return table if isinstance(table, exp.Table) and table.name else item
 
 

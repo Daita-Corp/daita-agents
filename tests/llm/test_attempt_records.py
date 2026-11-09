@@ -96,6 +96,7 @@ def _reconcile(steps: list[dict[str, Any]], usage: ModelUsage) -> None:
             assert isinstance(item["usage_unavailable_reason"], str)
         # Cache tokens are a subset of the attempt's input.
         if isinstance(item["cache_read_tokens"], int):
+            assert isinstance(item["input_tokens"], int)
             assert item["cache_read_tokens"] <= item["input_tokens"]
 
 

@@ -114,6 +114,8 @@ pythonVersion = "3.11"
 typeCheckingMode = "basic"
 reportMissingTypeStubs = false
 reportUnusedImport = "error"
+# Frozen and hash-checked, so it cannot carry an inline ignore; see the mypy override below.
+ignore = ["src/daita/storage/home_migrations/revision_0002_legacy_autonomy.py"]
 
 [tool.mypy]
 python_version = "3.11"

@@ -257,8 +257,6 @@ def _written_calls(sqlglot: Any, sql: str) -> tuple[str, ...]:
     that turn out not to be functions are harmless.
     """
 
-    from sqlglot.tokens import TokenType
-
     tokens = sqlglot.Dialect.get_or_raise("postgres").tokenize(
         _POSTGRESQL_TOKENS.sub(_space_parameter, sql)
     )
@@ -267,15 +265,16 @@ def _written_calls(sqlglot: Any, sql: str) -> tuple[str, ...]:
             {
                 (
                     token.text
-                    if token.token_type is TokenType.IDENTIFIER
+                    if token.token_type is sqlglot.TokenType.IDENTIFIER
                     else token.text.lower()
                 )[:256]
                 for before, token, after in zip(
                     (None, *tokens), tokens, tokens[1:], strict=False
                 )
-                if token.token_type in (TokenType.VAR, TokenType.IDENTIFIER)
-                and after.token_type is TokenType.L_PAREN
-                and (before is None or before.token_type is not TokenType.DOT)
+                if token.token_type
+                in (sqlglot.TokenType.VAR, sqlglot.TokenType.IDENTIFIER)
+                and after.token_type is sqlglot.TokenType.L_PAREN
+                and (before is None or before.token_type is not sqlglot.TokenType.DOT)
             }
         )
     )

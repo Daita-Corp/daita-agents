@@ -166,7 +166,6 @@ __all__ = [
     "PostgreSQLReadResult",
     "RelationalWriteScopeReader",
     "ReadScopedCatalogReader",
-    "ResourceRevisionObservationDeclarations",
     "ResourceSchema",
     "SQLiteReadResult",
     "SqlAnalysis",

@@ -194,7 +194,10 @@ async def test_projection_opens_exact_owner_item_and_restores_composer(
                 if not isinstance(screen, screen_type):
                     return False
                 if section == "sources":
-                    return screen._selected_source_id() == expected_id
+                    return (
+                        isinstance(screen, CatalogScreen)
+                        and screen._selected_source_id() == expected_id
+                    )
                 picked = screen.query_one(selector, OptionList)
                 return (
                     picked.highlighted is not None
@@ -204,6 +207,7 @@ async def test_projection_opens_exact_owner_item_and_restores_composer(
             await settle_until(pilot, opened_on_item)
             assert isinstance(app.screen, screen_type)
             if section == "sources":
+                assert isinstance(app.screen, CatalogScreen)
                 assert app.screen._selected_source_id() == expected_id
             else:
                 selected = app.screen.query_one(selector, OptionList)

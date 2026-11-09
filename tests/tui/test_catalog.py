@@ -147,7 +147,7 @@ def _permissions_app(stored_max_rows: int = 25):
         resources=(tickets,),
         supports_relational_writes=True,
     )
-    previews: list[dict[str, object]] = []
+    previews: list[dict[str, Any]] = []
 
     async def inspect(source_id: str):
         return inspection

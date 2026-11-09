@@ -134,7 +134,7 @@ class _Connection:
         stall: tuple[str, int] | None = None,
     ) -> None:
         self.tables = list(tables)
-        self.columns = dict(columns or {})
+        self.columns: dict[tuple[str, str], Sequence[Row]] = dict(columns or {})
         self.indexes = dict(indexes or {})
         self.relationships = list(relationships)
         self.latency = latency
