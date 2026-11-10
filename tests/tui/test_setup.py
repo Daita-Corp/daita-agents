@@ -77,8 +77,41 @@ def test_welcome_checklist_disappears_once_setup_is_complete():
 
 
 @pytest.mark.tui_driven
+async def test_suggestions_share_a_row_and_fill_the_composer(start_host: StartHost):
+    harness = await start_host()
+    opened = await remote_agent(harness, "welcome-suggestions")
+    app = DaitaApp(
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
+    )
+    app.controller.agent = opened
+    question = "What is in [orders]?"
+    try:
+        async with app.run_test(size=(140, 30)) as pilot:
+            await app._show_chat()
+            chat = app.screen
+            assert isinstance(chat, ChatScreen)
+            chat.set_welcome(
+                model=None,
+                sources=0,
+                catalog_empty=False,
+                suggestions=(question, "Second", "Third"),
+            )
+            await pilot.pause()
+
+            rows = {button.region.y for button in chat.query(".suggestion")}
+            assert len(rows) == 1
+
+            assert await pilot.click("#suggestion-0") is True
+            await pilot.pause()
+            assert chat.query_one(Composer).text == question
+            app.exit(0)
+    finally:
+        await opened.close()
+
+
+@pytest.mark.tui_driven
 async def test_closing_sources_updates_the_welcome_checklist(
-    tmp_path: Path, start_host: StartHost
+    tmp_path: Path, start_host: StartHost, monkeypatch: pytest.MonkeyPatch
 ):
     database = tmp_path / "records.sqlite"
     _create_sqlite_source(database, "records")
@@ -100,7 +133,7 @@ async def test_closing_sources_updates_the_welcome_checklist(
             assert "connect with /sources" in str(welcome.content)
 
             await opened.attach(SQLiteSource(database, name="Records"))
-            setattr(app, "_await_modal", close_sources)
+            monkeypatch.setattr(app, "_await_modal", close_sources)
             await app._manage_sources()
             await pilot.pause()
 

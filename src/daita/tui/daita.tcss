@@ -266,26 +266,39 @@ ChatScreen.-narrow #main-tabs Tab {
     color: $text-muted;
 }
 
-#suggestions-row {
-    height: auto;
-}
-
 #suggestions {
-    width: 64;
-    max-width: 100%;
+    width: 100%;
     height: auto;
-    max-height: 4;
-    border: none;
-    padding: 0 1;
+    align-horizontal: center;
 }
 
-#suggestions > .option-list--option-highlighted {
-    text-style: none;
+.suggestion {
+    display: none;
+    width: 1fr;
+    max-width: 36;
+    min-width: 0;
+    height: 5;
+    margin: 0 1;
+    border: round $border;
+    text-wrap: wrap;
+    content-align: center middle;
 }
 
-#suggestions:focus > .option-list--option-highlighted,
-#suggestions > .option-list--option-hover {
-    text-style: bold reverse;
+.suggestion:hover,
+.suggestion:focus {
+    border: round $border;
+}
+
+ChatScreen.-narrow #suggestions {
+    layout: vertical;
+}
+
+ChatScreen.-narrow .suggestion {
+    width: 100%;
+    max-width: 100%;
+    height: 3;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
 }
 
 #next-steps {
