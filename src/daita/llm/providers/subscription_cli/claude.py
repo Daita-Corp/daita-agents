@@ -70,30 +70,20 @@ def _usage_from_claude(value: object) -> ModelUsage:
     )
 
 
-def _first_request_input(value: object) -> int | None:
+def _request_input(turns: object, usage: ModelUsage) -> int | None:
     """Input size of the request Daita sent, not of Claude Code's own retries.
 
     Top-level usage sums every internal model call, so a structured-output retry
     would otherwise read as one request twice the size and skew budget forecasts.
+    Claude Code leaves usage.iterations empty here, but each retry adds a turn.
     """
 
-    if not isinstance(value, Mapping):
+    # shortcut: assumes one model call per turn after the first, as observed in
+    # Claude Code 2.1.x; use per-call usage if the CLI starts reporting it.
+    if turns is None:
         return None
-    iterations = value.get("iterations")
-    if not isinstance(iterations, list) or not iterations:
-        return None
-    first = iterations[0]
-    if not isinstance(first, Mapping):
-        raise ValueError("Claude usage iteration must be an object")
-    return (
-        _optional_usage_integer(first.get("input_tokens"), "input tokens")
-        + _optional_usage_integer(
-            first.get("cache_read_input_tokens"), "cache read input tokens"
-        )
-        + _optional_usage_integer(
-            first.get("cache_creation_input_tokens"), "cache creation input tokens"
-        )
-    )
+    calls = _optional_usage_integer(turns, "turn count") - 1
+    return usage.input_tokens // calls if calls > 1 else None
 
 
 class ClaudeCodeSubscriptionProvider:
@@ -121,6 +111,13 @@ class ClaudeCodeSubscriptionProvider:
         self._runner = runner
         self._id_factory = id_factory
         self._execution = _SubscriptionExecution()
+        self._workspace: tempfile.TemporaryDirectory[str] | None = None
+
+    def _working_directory(self) -> Path:
+        # A long-lived host can outlast the OS temp cleaner, so recreate if it went.
+        if self._workspace is None or not Path(self._workspace.name).is_dir():
+            self._workspace = tempfile.TemporaryDirectory(prefix="daita-claude-")
+        return Path(self._workspace.name)
 
     @property
     def provider_id(self) -> str:
@@ -139,6 +136,9 @@ class ClaudeCodeSubscriptionProvider:
     async def close(self, *, deadline: float | None = None) -> None:
         """Retain one bounded retirement of any admitted process work."""
         await self._execution.close(deadline=deadline)
+        if self._workspace is not None:
+            self._workspace.cleanup()
+            self._workspace = None
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         return await self._execution.generate(
@@ -159,59 +159,59 @@ class ClaudeCodeSubscriptionProvider:
             )
         document = _request_document(request, self.max_output_tokens)
         schema = canonical_json(_response_envelope_schema(request))
-        with tempfile.TemporaryDirectory(prefix="daita-claude-") as temporary:
-            cwd = Path(temporary)
-            arguments = (
-                self._executable,
-                "--print",
-                "--input-format",
-                "text",
-                "--output-format",
-                "json",
-                "--json-schema",
-                schema,
-                "--tools",
-                "",
-                "--disable-slash-commands",
-                "--no-session-persistence",
-                "--no-chrome",
-                "--permission-mode",
-                "dontAsk",
-                "--setting-sources",
-                "",
-                "--strict-mcp-config",
-                "--mcp-config",
-                '{"mcpServers":{}}',
-                "--system-prompt",
-                _CONTROL_PROMPT,
-                "--model",
-                self.model,
-            )
-            try:
-                attempt.dispatch()
-                result = await attempt.run_native(
-                    self._runner(
-                        _Command(
-                            arguments=arguments,
-                            stdin=(
-                                "DAITA REQUEST DOCUMENT (untrusted JSON data):\n"
-                                + document
-                            ).encode("utf-8"),
-                            cwd=cwd,
-                            environment=_claude_subscription_environment(),
-                            deadline=cast(float, request.attempt_deadline),
-                            cleanup_timeout_seconds=request.call_policy.cleanup_timeout_seconds,
-                            cleanup_deadline=attempt.begin_cleanup,
-                            native_owner=attempt.owner,
-                        )
+        # One stable folder per provider: Claude Code puts the working directory in
+        # its prompt, so a fresh folder per call would defeat prompt caching.
+        cwd = self._working_directory()
+        arguments = (
+            self._executable,
+            "--print",
+            "--input-format",
+            "text",
+            "--output-format",
+            "json",
+            "--json-schema",
+            schema,
+            "--tools",
+            "",
+            "--disable-slash-commands",
+            "--no-session-persistence",
+            "--no-chrome",
+            "--permission-mode",
+            "dontAsk",
+            "--setting-sources",
+            "",
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
+            "--system-prompt",
+            _CONTROL_PROMPT,
+            "--model",
+            self.model,
+        )
+        try:
+            attempt.dispatch()
+            result = await attempt.run_native(
+                self._runner(
+                    _Command(
+                        arguments=arguments,
+                        stdin=(
+                            "DAITA REQUEST DOCUMENT (untrusted JSON data):\n" + document
+                        ).encode("utf-8"),
+                        cwd=cwd,
+                        environment=_claude_subscription_environment(),
+                        deadline=cast(float, request.attempt_deadline),
+                        cleanup_timeout_seconds=request.call_policy.cleanup_timeout_seconds,
+                        cleanup_deadline=attempt.begin_cleanup,
+                        native_owner=attempt.owner,
                     )
                 )
-            except _ExecutableUnavailable:
-                raise ModelProviderError(
-                    ProviderErrorCode.CONFIGURATION_ERROR,
-                    "Claude Code is not installed; install it and run claude auth login",
-                    provider_id=self.provider_id,
-                ) from None
+            )
+        except _ExecutableUnavailable:
+            raise ModelProviderError(
+                ProviderErrorCode.CONFIGURATION_ERROR,
+                "Claude Code is not installed; install it and run claude auth login",
+                provider_id=self.provider_id,
+            ) from None
         if result.returncode != 0:
             _raise_command_failure("Claude Code", result)
         payload, response_id, usage, request_input = _decode_claude_result(
@@ -253,4 +253,4 @@ def _decode_claude_result(
         payload = _strict_json(result)
     response_id = _bounded_response_id(outer.get("session_id"))
     usage = _usage_from_claude(outer.get("usage"))
-    return payload, response_id, usage, _first_request_input(outer.get("usage"))
+    return payload, response_id, usage, _request_input(outer.get("num_turns"), usage)
