@@ -981,8 +981,7 @@ class DaitaApp(App[int]):
                             "Edit to correct its scope."
                         )
                     chat.show_notice(notice)
-            else:
-                await self._show_home_guidance()
+            await self._show_home_guidance()
             await self._reload_sources()
             await self._refresh_status()
             return
@@ -1075,6 +1074,7 @@ class DaitaApp(App[int]):
                 self._reset_context_usage()
                 await self._replace_conversation_transcript()
                 await self._reload_sources()
+                await self._show_home_guidance()
             await self._refresh_status()
             return
         if screen_name == "confirm_revoke_mcp":
@@ -1152,6 +1152,7 @@ class DaitaApp(App[int]):
             notice = ""
             notice_warning = False
             if action is None:
+                await self._show_home_guidance()
                 return
             if not isinstance(action, SourceManagerAction):
                 raise RuntimeError("invalid source manager action")

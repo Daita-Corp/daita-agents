@@ -11,6 +11,7 @@ from daita.adapters.models import SourceHealth
 from daita.host.client import RemoteAgent
 from daita.llm.models import FinishReason, ModelResponse, ToolCall
 from daita.llm.providers.mock import MockModelProvider
+from daita.tui.screens.chat import welcome_text
 from tests.support.host import StartHost, host_workspace, remote_agent, short_root
 from tests.support.mcp import MemoryKeychain, conformance_identities, mock_transport
 from tests.tui._support import (
@@ -34,6 +35,7 @@ from tests.tui._support import (
     SelectionScreen,
     SimpleNamespace,
     SourceSetupScreen,
+    SQLiteSource,
     Static,
     TranscriptBlock,
     TranscriptView,
@@ -64,6 +66,48 @@ def test_postgresql_url_and_redaction():
         "password": "[redacted]",
         "ok": 1,
     }
+
+
+def test_welcome_checklist_disappears_once_setup_is_complete():
+    assert "Data" in str(welcome_text(model="any-model"))
+    assert "Model" in str(welcome_text(sources=1))
+    assert "Data" in str(welcome_text(model="any-model", sources=1, catalog_empty=True))
+    complete = str(welcome_text(model="any-model", sources=1))
+    assert "Model" not in complete and "Data" not in complete
+
+
+@pytest.mark.tui_driven
+async def test_closing_sources_updates_the_welcome_checklist(
+    tmp_path: Path, start_host: StartHost
+):
+    database = tmp_path / "records.sqlite"
+    _create_sqlite_source(database, "records")
+    harness = await start_host()
+    opened = await remote_agent(harness, "welcome-after-sources")
+    app = DaitaApp(
+        root=harness.root, start_bootstrap=False, workspace=host_workspace(harness)
+    )
+    app.controller.agent = opened
+
+    async def close_sources(_screen: Any) -> None:
+        return None
+
+    try:
+        async with app.run_test(size=(100, 30)) as pilot:
+            await app._show_chat()
+            await pilot.pause()
+            welcome = app.screen.query_one("#welcome", Static)
+            assert "connect with /sources" in str(welcome.content)
+
+            await opened.attach(SQLiteSource(database, name="Records"))
+            setattr(app, "_await_modal", close_sources)
+            await app._manage_sources()
+            await pilot.pause()
+
+            assert "1 source connected" in str(welcome.content)
+            app.exit(0)
+    finally:
+        await opened.close()
 
 
 @pytest.mark.tui_driven

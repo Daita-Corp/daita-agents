@@ -76,6 +76,8 @@ def welcome_text(
             welcome.append("\n")
         welcome.append(logo, style="bold")
         welcome.append(line, style=style)
+    if model_line[0] == "✓" and data_line[0] == "✓":
+        return welcome
     for mark, label, detail in (model_line, data_line):
         welcome.append("\n" + " " * cell_len(_WELCOME_LOGO[0]))
         welcome.append(mark, style="green" if mark == "✓" else "bold")
