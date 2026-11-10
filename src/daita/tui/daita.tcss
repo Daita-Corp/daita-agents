@@ -266,41 +266,6 @@ ChatScreen.-narrow #main-tabs Tab {
     color: $text-muted;
 }
 
-#suggestions {
-    width: 100%;
-    height: auto;
-    align-horizontal: center;
-}
-
-.suggestion {
-    display: none;
-    width: 1fr;
-    max-width: 36;
-    min-width: 0;
-    height: 5;
-    margin: 0 1;
-    border: round $border;
-    text-wrap: wrap;
-    content-align: center middle;
-}
-
-.suggestion:hover,
-.suggestion:focus {
-    border: round $border;
-}
-
-ChatScreen.-narrow #suggestions {
-    layout: vertical;
-}
-
-ChatScreen.-narrow .suggestion {
-    width: 100%;
-    max-width: 100%;
-    height: 3;
-    text-wrap: nowrap;
-    text-overflow: ellipsis;
-}
-
 #next-steps {
     height: 1;
     margin: 0 0 1 1;

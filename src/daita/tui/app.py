@@ -34,7 +34,6 @@ from .commands import (
     parse_skill_editor_document,
     render_skill_editor_document,
     source_override_completions,
-    suggested_questions,
 )
 from .controller import PresentationController, summarize_sources
 from .models import (
@@ -428,20 +427,12 @@ class DaitaApp(App[int]):
         catalog_empty = (
             bool(sources) and (await self.controller.catalog_summary()).is_empty
         )
-        resources = (
-            await self.controller.list_catalog_resources()
-            if sources and not catalog_empty
-            else ()
-        )
         chat.set_welcome(
             model=(
                 None if agent.model_profile is None else self.controller.model_label()
             ),
             sources=len(sources),
             catalog_empty=catalog_empty,
-            suggestions=suggested_questions(
-                tuple(resource.name for resource in resources[:2])
-            ),
         )
         # The empty chat shows the checklist; a resumed conversation needs a notice.
         if chat.query_one(TranscriptView).is_empty:

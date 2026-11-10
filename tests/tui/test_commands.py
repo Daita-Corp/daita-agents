@@ -371,24 +371,10 @@ async def test_multi_selection_shows_literal_marks_and_continue_button():
     assert app.return_value == ("core",)
 
 
-def test_menu_groups_label_every_row_and_starter_questions_name_real_tables():
-    from daita.tui.commands import (
-        COMMAND_GROUPS,
-        completion_group,
-        suggested_questions,
-    )
+def test_menu_groups_label_every_row():
+    from daita.tui.commands import COMMAND_GROUPS, completion_group
 
     for group, commands in COMMAND_GROUPS:
         assert all(completion_group(display) == group for _i, display, _d in commands)
     assert completion_group("@sales") == "Source"
     assert completion_group("/weekly-report") == "Skill"
-
-    assert suggested_questions(("orders", "customers")) == (
-        "What is in orders?",
-        "Show the 10 most recent rows of orders",
-        "How does orders relate to customers?",
-    )
-    assert suggested_questions(("orders",))[-1] == (
-        "Show the 10 most recent rows of orders"
-    )
-    assert all("folder" in question for question in suggested_questions(()))

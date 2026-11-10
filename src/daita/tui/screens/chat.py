@@ -10,7 +10,6 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import ActiveBinding, Binding
 from textual.containers import Horizontal, Vertical
-from textual.content import Content
 from textual.screen import Screen
 from textual.widgets import Button, Footer, OptionList, Static, Tab, Tabs, TextArea
 
@@ -47,7 +46,6 @@ _WELCOME_LOGO = (
 )
 
 
-_SUGGESTION_SLOTS = 3  # the most suggested_questions returns
 
 
 def welcome_text(
@@ -133,11 +131,6 @@ class ChatScreen(Screen[None]):
                 with Vertical(id="conversation-pane"):
                     with Vertical(id="welcome-region"):
                         yield Static(welcome_text(), id="welcome", markup=False)
-                        with Horizontal(id="suggestions"):
-                            for index in range(_SUGGESTION_SLOTS):
-                                yield Button(
-                                    "", id=f"suggestion-{index}", classes="suggestion"
-                                )
                     yield TranscriptView()
                     yield ApprovalPanel()
                 yield CommandSections()
@@ -275,13 +268,6 @@ class ChatScreen(Screen[None]):
         self.query_one("#next-steps").display = visible
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.has_class("suggestion"):
-            event.stop()
-            composer = self.query_one(Composer)
-            composer.load_text(str(event.button.label))
-            composer.move_cursor((0, len(composer.text)))
-            composer.focus()
-            return
         button_id = event.button.id or ""
         if not button_id.startswith("next-"):
             return
@@ -366,17 +352,10 @@ class ChatScreen(Screen[None]):
         model: str | None,
         sources: int,
         catalog_empty: bool,
-        suggestions: tuple[str, ...],
     ) -> None:
         self.query_one("#welcome", Static).update(
             welcome_text(model=model, sources=sources, catalog_empty=catalog_empty)
         )
-        for index, button in enumerate(self.query(".suggestion").results(Button)):
-            shown = index < len(suggestions)
-            # Content, not str: a table name must never be parsed as markup.
-            button.label = Content(suggestions[index] if shown else "")
-            button.display = shown
-        self.query_one("#suggestions").display = bool(suggestions)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id != "completion-list":
@@ -534,9 +513,6 @@ class ChatScreen(Screen[None]):
     def _show_conversation(self, has_blocks: bool) -> None:
         self.query_one("#welcome-region", Vertical).display = not has_blocks
         self.query_one("#welcome").display = not has_blocks
-        self.query_one("#suggestions").display = not has_blocks and any(
-            button.display for button in self.query(".suggestion")
-        )
         self.query_one(TranscriptView).display = has_blocks
 
     def set_submitting(self, submitting: bool) -> None:

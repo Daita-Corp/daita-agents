@@ -150,25 +150,6 @@ BUILTIN_SLASH_COMMAND_ROOTS = frozenset(
 BUILTIN_SLASH_COMMANDS = BUILTIN_SLASH_COMMAND_ROOTS
 
 
-def suggested_questions(resource_names: tuple[str, ...]) -> tuple[str, ...]:
-    """Starter questions for an empty chat, named after real catalog tables."""
-
-    names = tuple(
-        safe_display(name, fallback="", maximum=60) for name in resource_names
-    )
-    names = tuple(name for name in names if name)
-    if not names:
-        return (
-            "What files are in this folder?",
-            "Summarize the most important file in this folder",
-        )
-    first = names[0]
-    questions = [f"What is in {first}?", f"Show the 10 most recent rows of {first}"]
-    if len(names) > 1:
-        questions.append(f"How does {first} relate to {names[1]}?")
-    return tuple(questions)
-
-
 class LearningInvocation(str):
     """Process-local marker for the explicit /learn control-plane action."""
 
