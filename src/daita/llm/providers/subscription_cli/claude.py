@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -66,6 +67,32 @@ def _usage_from_claude(value: object) -> ModelUsage:
         cache_read_tokens=cache_read,
         cache_write_tokens=cache_write,
         cost_estimate=CostEstimate.unavailable("subscription_billing"),
+    )
+
+
+def _first_request_input(value: object) -> int | None:
+    """Input size of the request Daita sent, not of Claude Code's own retries.
+
+    Top-level usage sums every internal model call, so a structured-output retry
+    would otherwise read as one request twice the size and skew budget forecasts.
+    """
+
+    if not isinstance(value, Mapping):
+        return None
+    iterations = value.get("iterations")
+    if not isinstance(iterations, list) or not iterations:
+        return None
+    first = iterations[0]
+    if not isinstance(first, Mapping):
+        raise ValueError("Claude usage iteration must be an object")
+    return (
+        _optional_usage_integer(first.get("input_tokens"), "input tokens")
+        + _optional_usage_integer(
+            first.get("cache_read_input_tokens"), "cache read input tokens"
+        )
+        + _optional_usage_integer(
+            first.get("cache_creation_input_tokens"), "cache creation input tokens"
+        )
     )
 
 
@@ -187,8 +214,10 @@ class ClaudeCodeSubscriptionProvider:
                 ) from None
         if result.returncode != 0:
             _raise_command_failure("Claude Code", result)
-        payload, response_id, usage = _decode_claude_result(result.stdout)
-        return _decode_model_output(
+        payload, response_id, usage, request_input = _decode_claude_result(
+            result.stdout
+        )
+        response = _decode_model_output(
             payload,
             request=request,
             provider_id=self.provider_id,
@@ -197,9 +226,14 @@ class ClaudeCodeSubscriptionProvider:
             id_factory=self._id_factory,
             transport="claude_code_cli",
         )
+        if request_input is None:
+            return response
+        return replace(response, request_input_tokens=request_input)
 
 
-def _decode_claude_result(stdout: bytes) -> tuple[object, str | None, ModelUsage]:
+def _decode_claude_result(
+    stdout: bytes,
+) -> tuple[object, str | None, ModelUsage, int | None]:
     outer = _strict_json(stdout.decode("utf-8"))
     if not isinstance(outer, Mapping):
         raise ValueError("Claude result must be an object")
@@ -219,4 +253,4 @@ def _decode_claude_result(stdout: bytes) -> tuple[object, str | None, ModelUsage
         payload = _strict_json(result)
     response_id = _bounded_response_id(outer.get("session_id"))
     usage = _usage_from_claude(outer.get("usage"))
-    return payload, response_id, usage
+    return payload, response_id, usage, _first_request_input(outer.get("usage"))

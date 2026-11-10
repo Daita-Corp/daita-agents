@@ -496,6 +496,47 @@ async def test_claude_subscription_remains_an_official_client_transport(monkeypa
     assert commands[0].environment["DISABLE_BUG_COMMAND"] == "1"
 
 
+async def test_claude_subscription_retries_do_not_inflate_request_size():
+    first = {
+        "input_tokens": 10,
+        "cache_read_input_tokens": 1_000,
+        "cache_creation_input_tokens": 90,
+    }
+    retry = {"input_tokens": 1_200, "output_tokens": 30}
+
+    async def run(command):
+        return subscription_process._CompletedCommand(
+            0,
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "structured_output": {
+                        "kind": "message",
+                        "text": "done",
+                        "tool_calls": [],
+                    },
+                    "usage": {
+                        "input_tokens": 1_210,
+                        "cache_read_input_tokens": 1_000,
+                        "cache_creation_input_tokens": 90,
+                        "output_tokens": 30,
+                        "iterations": [first, retry],
+                    },
+                }
+            ).encode(),
+            b"",
+        )
+
+    response = await ClaudeCodeSubscriptionProvider("sonnet", runner=run).generate(
+        _request()
+    )
+
+    assert response.usage.input_tokens == 2_300  # every call still counts as spent
+    assert response.request_input_tokens == 1_100
+
+
 async def test_claude_subscription_total_attempt_timeout_is_normalized():
     async def hang(command):
         del command
