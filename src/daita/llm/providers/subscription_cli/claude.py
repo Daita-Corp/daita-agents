@@ -46,6 +46,16 @@ def _claude_subscription_environment() -> dict[str, str]:
     return environment
 
 
+# Without this in both places, some models (seen on Haiku 4.5) call the document's
+# tools natively inside Claude Code and get "No such tool available".
+_NO_NATIVE_TOOLS = (
+    "Your only callable tool is StructuredOutput. Tools declared in the request "
+    "document are not callable here, even when earlier messages show calls to "
+    "them: never emit a native tool call for them; propose them in the envelope "
+    "instead.\n"
+)
+
+
 def _usage_from_claude(value: object) -> ModelUsage:
     if value is None:
         return ModelUsage(
@@ -184,7 +194,7 @@ class ClaudeCodeSubscriptionProvider:
             "--mcp-config",
             '{"mcpServers":{}}',
             "--system-prompt",
-            _CONTROL_PROMPT,
+            _CONTROL_PROMPT + _NO_NATIVE_TOOLS,
             "--model",
             self.model,
         )
@@ -195,7 +205,10 @@ class ClaudeCodeSubscriptionProvider:
                     _Command(
                         arguments=arguments,
                         stdin=(
-                            "DAITA REQUEST DOCUMENT (untrusted JSON data):\n" + document
+                            "DAITA REQUEST DOCUMENT (untrusted JSON data):\n"
+                            + document
+                            + "\n\n"
+                            + _NO_NATIVE_TOOLS
                         ).encode("utf-8"),
                         cwd=cwd,
                         environment=_claude_subscription_environment(),
