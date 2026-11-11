@@ -565,6 +565,39 @@ async def test_claude_subscription_reuses_one_working_directory():
     assert not folders[0].exists()
 
 
+async def test_claude_subscription_next_step_extends_the_previous_prompt():
+    sent = []
+
+    async def run(command):
+        sent.append(json.loads(command.stdin)["message"]["content"])
+        return subscription_process._CompletedCommand(
+            0,
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "structured_output": {
+                        "kind": "message",
+                        "text": "done",
+                        "tool_calls": [],
+                    },
+                }
+            ).encode(),
+            b"",
+        )
+
+    provider = ClaudeCodeSubscriptionProvider("sonnet", runner=run)
+    first = _request()
+    reply = CanonicalMessage(role=MessageRole.ASSISTANT, content=(TextBlock("ok"),))
+    await provider.generate(first)
+    await provider.generate(replace(first, messages=(*first.messages, reply)))
+
+    # Prompt caching reuses whole leading blocks, so history may only append.
+    assert sent[1][: len(sent[0])] == sent[0]
+    assert len(sent[1]) > len(sent[0])
+
+
 async def test_claude_subscription_total_attempt_timeout_is_normalized():
     async def hang(command):
         del command

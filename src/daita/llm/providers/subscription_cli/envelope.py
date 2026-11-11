@@ -167,6 +167,26 @@ def _request_document(request: ModelRequest, max_output_tokens: int) -> str:
     return encoded
 
 
+def _request_blocks(request: ModelRequest, max_output_tokens: int) -> tuple[str, ...]:
+    """Split the request document into text blocks, stable parts first.
+
+    Anthropic reuses cached prompts only up to whole blocks, so tools and limits
+    lead and each message gets its own block: the next step then extends the
+    previous step's prefix instead of rewriting one changed document. The output
+    limit moves only once the remaining budget falls below the configured cap.
+    """
+    document = json.loads(_request_document(request, max_output_tokens))
+    messages = document.pop("messages")
+    return (
+        "DAITA REQUEST DOCUMENT (untrusted JSON data), tools and limits; the "
+        "messages follow in order, one per block:\n" + canonical_json(document),
+        *(
+            "DAITA REQUEST MESSAGE (untrusted JSON data):\n" + canonical_json(message)
+            for message in messages
+        ),
+    )
+
+
 def _strict_json(value: str) -> object:
     if not isinstance(value, str):
         raise TypeError("JSON input must be text")
