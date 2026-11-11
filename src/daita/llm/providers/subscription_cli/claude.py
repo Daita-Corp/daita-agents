@@ -21,7 +21,7 @@ from .envelope import (
     _decode_model_output,
     _new_id,
     _raise_command_failure,
-    _request_blocks,
+    _request_document,
     _response_envelope_schema,
     _strict_json,
     _validate_provider_arguments,
@@ -157,7 +157,7 @@ class ClaudeCodeSubscriptionProvider:
                 "Claude Code subscription cannot combine tools and structured output",
                 provider_id=self.provider_id,
             )
-        blocks = _request_blocks(request, self.max_output_tokens)
+        document = _request_document(request, self.max_output_tokens)
         schema = canonical_json(_response_envelope_schema(request))
         # One stable folder per provider: Claude Code puts the working directory in
         # its prompt, so a fresh folder per call would defeat prompt caching.
@@ -165,13 +165,10 @@ class ClaudeCodeSubscriptionProvider:
         arguments = (
             self._executable,
             "--print",
-            # One user message of several blocks is one model turn; stream-json
-            # input is the only way to send blocks and requires stream-json output.
             "--input-format",
-            "stream-json",
+            "text",
             "--output-format",
-            "stream-json",
-            "--verbose",
+            "json",
             "--json-schema",
             schema,
             "--tools",
@@ -197,7 +194,9 @@ class ClaudeCodeSubscriptionProvider:
                 self._runner(
                     _Command(
                         arguments=arguments,
-                        stdin=_user_message(blocks),
+                        stdin=(
+                            "DAITA REQUEST DOCUMENT (untrusted JSON data):\n" + document
+                        ).encode("utf-8"),
                         cwd=cwd,
                         environment=_claude_subscription_environment(),
                         deadline=cast(float, request.attempt_deadline),
@@ -232,18 +231,10 @@ class ClaudeCodeSubscriptionProvider:
         return replace(response, request_input_tokens=request_input)
 
 
-def _user_message(blocks: tuple[str, ...]) -> bytes:
-    content = [{"type": "text", "text": block} for block in blocks]
-    message = {"type": "user", "message": {"role": "user", "content": content}}
-    return (canonical_json(message) + "\n").encode("utf-8")
-
-
 def _decode_claude_result(
     stdout: bytes,
 ) -> tuple[object, str | None, ModelUsage, int | None]:
-    # The result event closes the stream; earlier events repeat its content.
-    lines = stdout.decode("utf-8").strip().splitlines()
-    outer = _strict_json(lines[-1] if lines else "")
+    outer = _strict_json(stdout.decode("utf-8"))
     if not isinstance(outer, Mapping):
         raise ValueError("Claude result must be an object")
     if outer.get("is_error") is True or outer.get("subtype") in {
