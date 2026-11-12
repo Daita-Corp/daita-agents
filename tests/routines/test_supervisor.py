@@ -115,7 +115,8 @@ async def _seed_conversation(store: SQLiteStateStore) -> None:
 async def _wait_for_terminal(
     store: SQLiteStateStore, occurrence_id: str
 ) -> RoutineOccurrence:
-    for _ in range(200):
+    # Up to 10 s: a loaded parallel run has missed a 2 s wait; correct runs return early.
+    for _ in range(1000):
         occurrence = await store.load_routine_occurrence("agent-1", occurrence_id)
         if occurrence is not None and occurrence.disposition in {
             RoutineOccurrenceDisposition.COMPLETED,
@@ -127,7 +128,7 @@ async def _wait_for_terminal(
 
 
 async def _wait_for_occurrence_id(store: SQLiteStateStore, routine_id: str) -> str:
-    for _ in range(100):
+    for _ in range(1000):
         current = await store.load_scheduled_routine("agent-1", routine_id)
         if current is not None:
             occurrence_id = current.active_occurrence_id or current.last_occurrence_id
