@@ -202,7 +202,9 @@ class PermissionsScreen(Screen[bool]):
                 multi=True,
                 allow_empty=True,
                 initial_selected=(
-                    () if stored is None else tuple(stored["allowed_operations"])
+                    ()
+                    if stored is None
+                    else tuple(cast(list[str], stored["allowed_operations"]))
                 ),
                 options=(
                     PickerOption(

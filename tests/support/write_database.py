@@ -208,7 +208,7 @@ class Connection:
                     "can_update": guardrails["can_update_columns"],
                     "can_insert": guardrails["can_insert_columns"],
                 }
-                for column in json.loads(guardrails["columns"])
+                for column in json.loads(str(guardrails["columns"]))
             ]
         return ()
 

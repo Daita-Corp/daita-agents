@@ -854,7 +854,7 @@ def readable_arguments(arguments_text: str, indent: str = "") -> str:
         text = scalar(key)
         return text[:1].upper() + text[1:].replace("_", " ") if text == key else text
 
-    def lines(value: object, indent: str) -> list[str]:
+    def lines(value: dict[str, object] | list[object], indent: str) -> list[str]:
         items = (
             [(label(key), child) for key, child in value.items()]
             if isinstance(value, dict)

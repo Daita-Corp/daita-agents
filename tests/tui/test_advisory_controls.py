@@ -52,7 +52,7 @@ def test_editor_failure_still_returns_the_terminal_to_the_tui():
         raise RuntimeError("$EDITOR is not set; set it to an available editor command")
 
     app.suspend = suspended  # type: ignore[method-assign]
-    app.controller.edit_document = edit  # type: ignore[method-assign]
+    app.controller.edit_document = edit  # type: ignore[method-assign,assignment]
     with pytest.raises(RuntimeError, match="EDITOR"):
         app._edit_document("skill")
     assert events == ["suspend", "resume"]

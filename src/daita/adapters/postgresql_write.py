@@ -1540,8 +1540,8 @@ def _preview_failure(
     # A class 42 position would point into Daita's wrapper, not the model's SQL.
     failure = _classified_failure(
         error,
-        PostgreSQLStatement.of(facts),
-        timeout_seconds,  # type: ignore[arg-type]
+        PostgreSQLStatement.of(facts),  # type: ignore[arg-type]
+        timeout_seconds,
     )
     return RelationalWriteError(
         (
