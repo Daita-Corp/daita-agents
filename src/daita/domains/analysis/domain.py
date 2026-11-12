@@ -462,7 +462,7 @@ class AnalysisCapabilityDomain:
         async with state.gate:
             cell_started = asyncio.get_running_loop().time()
             cell_deadline = min(
-                state.session.absolute_deadline,
+                state.session.deadline,
                 cell_started
                 + min(
                     self._limits.cell_seconds,
@@ -1041,7 +1041,7 @@ class AnalysisCapabilityDomain:
                 ),
                 "run_wall_seconds": max(
                     0.0,
-                    state.session.absolute_deadline - asyncio.get_running_loop().time(),
+                    state.session.deadline - asyncio.get_running_loop().time(),
                 ),
                 "run_tool_calls": max(
                     0, state.max_run_calls - state.session.evidence.tool_calls_attempted

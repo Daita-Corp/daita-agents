@@ -42,7 +42,7 @@ async def test_tabs_show_one_view_preserve_draft_and_fit_terminal(
             await app._show_chat()
             chat = app.chat()
             assert chat is not None
-            chat.set_blocks(
+            await chat.set_blocks(
                 (TranscriptBlock("assistant", "answer", "Retained answer"),)
             )
             composer = chat.composer()

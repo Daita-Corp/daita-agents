@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from threading import Lock
@@ -375,6 +376,45 @@ class _SingleUse:
             return self._used
 
 
+class ApprovalPauses:
+    """Time a person spent on approval cards; it does not use the run's time."""
+
+    __slots__ = ("_open", "_since", "_total", "resumed")
+
+    def __init__(self) -> None:
+        self._open = 0
+        self._since = 0.0
+        self._total = 0.0
+        self.resumed = asyncio.Event()
+        self.resumed.set()
+
+    @property
+    def paused(self) -> bool:
+        return self._open > 0
+
+    def seconds(self) -> float:
+        current = (
+            asyncio.get_running_loop().time() - self._since if self._open else 0.0
+        )
+        return self._total + current
+
+    def enter(self) -> None:
+        if not self._open:
+            self._since = asyncio.get_running_loop().time()
+            self.resumed.clear()
+        self._open += 1
+
+    def leave(self) -> float:
+        """Close one wait; return the paused time once the last one closes."""
+        self._open -= 1
+        if self._open:
+            return 0.0
+        elapsed = asyncio.get_running_loop().time() - self._since
+        self._total += elapsed
+        self.resumed.set()
+        return elapsed
+
+
 @dataclass(frozen=True, slots=True)
 class RunSession:
     """One immutable admitted invocation and its isolated mutable capabilities."""
@@ -391,6 +431,9 @@ class RunSession:
     evidence: RunSessionEvidence = field(default_factory=RunSessionEvidence)
     _single_use: _SingleUse = field(
         default_factory=_SingleUse, repr=False, compare=False
+    )
+    approval_pauses: ApprovalPauses = field(
+        default_factory=ApprovalPauses, repr=False, compare=False
     )
 
     def __post_init__(self) -> None:
@@ -427,6 +470,29 @@ class RunSession:
     def used(self) -> bool:
         return self._single_use.used
 
+    @property
+    def deadline(self) -> float:
+        """The absolute deadline, moved back by time spent on approval cards."""
+        return self.absolute_deadline + self.approval_pauses.seconds()
+
+    @contextmanager
+    def approval_wait(self) -> Iterator[None]:
+        """Stop the run's clock while a person decides, for runs they started."""
+        # Background runs keep their clock, or one unanswered card (up to its
+        # 24-hour expiry) would hold a background slot that long.
+        if self.run.origin is not RunOrigin.USER:
+            yield
+            return
+        self.approval_pauses.enter()
+        try:
+            yield
+        finally:
+            elapsed = self.approval_pauses.leave()
+            lease = self.admission_lease
+            if elapsed and lease is not None:
+                # Permits and sub-runs read the lease's deadline.
+                lease.absolute_deadline += elapsed  # type: ignore[attr-defined]
+
     def consume(self) -> None:
         self.cancellation.raise_if_cancelled()
         self._single_use.consume()
@@ -440,6 +506,7 @@ class RunSession:
 
 
 __all__ = [
+    "ApprovalPauses",
     "RunCancellationToken",
     "RunSession",
     "RunSessionEvidence",

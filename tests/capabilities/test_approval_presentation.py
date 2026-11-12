@@ -57,7 +57,7 @@ def test_native_review_sanitizes_preview_text_and_denies_oversized_details():
         reason=request.reason,
     )
     assert reviewable and document is not None and "\x1b" not in document
-    assert "Exact validated details:" in document and "\\u001b" in document
+    assert "data_write\n  Arguments:" in document and "\\u001b" in document
     oversized = replace(
         request,
         arguments=FrozenJsonObject.from_mapping(
@@ -74,3 +74,22 @@ def test_native_review_sanitizes_preview_text_and_denies_oversized_details():
         arguments_text=oversized.render_arguments_for_review(),
         reason=oversized.reason,
     )[1]
+
+
+def test_readable_details_keep_every_value_and_cannot_fake_a_field():
+    from daita.tui.projection import readable_arguments
+
+    text = readable_arguments(
+        json.dumps(
+            {
+                "max_rows": 1000,
+                "note": "line one\nmax_rows: 1",
+                "count": "42",
+                "city": "Montr\u00e9al",
+                "columns": ["priority"],
+            }
+        )
+    )
+    assert "Max rows: 1000" in text and "  - priority" in text
+    assert 'Count: "42"' in text and "Montr\\u00e9al" in text
+    assert "\n    max_rows: 1" in text  # indented under Note, not a field

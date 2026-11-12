@@ -1419,7 +1419,16 @@ class PresentationController:
     async def save_skill(self, name: str, description: str, instructions: str) -> bool:
         validate_skill_name(name)
         Skill(name, description, instructions)
-        return await self.require_agent().save_skill(name, description, instructions)
+        agent = self.require_agent()
+        existing = await agent.read_skill(name)
+        # The owner typed it, like chat text (internal); restricted would fit no
+        # default route. An edit keeps the stored label so it never lowers.
+        sensitivity = (
+            ModelSensitivity.INTERNAL if existing is None else existing.sensitivity
+        )
+        return await agent.save_skill(
+            name, description, instructions, sensitivity=sensitivity
+        )
 
     async def read_skill(self, name: str) -> Skill | None:
         validate_skill_name(name)
@@ -1452,11 +1461,8 @@ class PresentationController:
     def edit_document(self, seed: str) -> str:
         """Run the configured external editor for one bounded local document."""
 
-        editor = os.environ.get("EDITOR")
-        if editor is None or not editor.strip():
-            raise RuntimeError(
-                "$EDITOR is not set; set it to an available editor command"
-            )
+        # nano ships with macOS and most Linux, and is easier to leave than vi.
+        editor = os.environ.get("EDITOR", "").strip() or "nano"
         try:
             command = shlex.split(editor)
         except ValueError as error:

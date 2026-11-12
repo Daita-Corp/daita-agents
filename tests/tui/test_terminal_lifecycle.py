@@ -157,6 +157,7 @@ async def test_learn_command_runs_explicit_learning(start_host: StartHost):
     finally:
         await opened.close()
     assert [kind for kind, _message in calls] == ["learn"]
+    assert type(calls[0][1]) is str  # only plain str crosses the host socket
     assert "fiscal year starts in February" in calls[0][1]
 
 

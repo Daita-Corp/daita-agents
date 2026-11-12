@@ -781,10 +781,12 @@ def _read_input_document(location: str) -> str:
     return Path(location).read_text(encoding="utf-8")
 
 
+DEFAULT_EDITOR = "nano"
+
+
 def _editor_command() -> list[str]:
-    value = os.environ.get("EDITOR")
-    if value is None or not value.strip():
-        raise RuntimeError("$EDITOR is not set; set it to an available editor command")
+    # nano ships with macOS and most Linux, and is easier to leave than vi.
+    value = os.environ.get("EDITOR", "").strip() or DEFAULT_EDITOR
     try:
         command = shlex.split(value)
     except ValueError as error:

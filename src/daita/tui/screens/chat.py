@@ -285,7 +285,9 @@ class ChatScreen(Screen[None]):
             self.action_focus_conversation()
             return
         self.run_worker(
-            self.daita_app.open_command_center_item(event.section, event.item_id),
+            self.daita_app.open_command_center_item(
+                event.section, event.item_id, title=event.title
+            ),
             name="command-center-navigation",
             group="foreground-interaction",
             exclusive=True,
@@ -454,9 +456,9 @@ class ChatScreen(Screen[None]):
     def clear_notice(self) -> None:
         self.query_one(NoticeBar).clear()
 
-    def set_blocks(self, blocks: tuple[TranscriptBlock, ...]) -> None:
+    async def set_blocks(self, blocks: tuple[TranscriptBlock, ...]) -> None:
         transcript = self.query_one(TranscriptView)
-        transcript.set_blocks(blocks)
+        await transcript.set_blocks(blocks)
         self._show_conversation(bool(blocks))
 
     def append_block(self, block: TranscriptBlock) -> None:

@@ -29,7 +29,7 @@ class TranscriptView(VerticalScroll):
     def is_empty(self) -> bool:
         return not self._blocks
 
-    def set_blocks(self, blocks: tuple[TranscriptBlock, ...]) -> None:
+    async def set_blocks(self, blocks: tuple[TranscriptBlock, ...]) -> None:
         incoming = list(blocks)
         if len(incoming) >= len(self._blocks) and all(
             prior == current
@@ -42,7 +42,7 @@ class TranscriptView(VerticalScroll):
             self._maybe_follow()
             return
         self._blocks = incoming
-        self._rebuild()
+        await self._rebuild()
 
     def append_block(self, block: TranscriptBlock) -> None:
         self._blocks.append(block)
@@ -92,10 +92,11 @@ class TranscriptView(VerticalScroll):
         self.following = True
         self.scroll_end(animate=False)
 
-    def _rebuild(self) -> None:
-        for child in list(self.children):
-            child.remove()
-        for block in self._blocks:
+    async def _rebuild(self) -> None:
+        blocks = list(self._blocks)
+        # Removal finishes later; remounting the same block IDs first raises DuplicateIds.
+        await self.remove_children()
+        for block in blocks:
             self._mount_block(block)
         self._maybe_follow()
 

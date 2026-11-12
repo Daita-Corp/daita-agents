@@ -954,11 +954,10 @@ def test_cli_approval_displays_the_exact_canonical_review_document():
     assert decision is ApprovalDecision.APPROVE
     assert stdout.getvalue() == (
         "Approval required\n\n"
-        "Tool: data_write\n"
-        "Capability: data.write\n"
-        "Change: update one row\n"
-        "Exact validated details:\n"
-        f"{rendered}\n"
+        "update one row\n"
+        "data_write\n"
+        '  City: "Montr\\u00e9al"\n'
+        "  Count: 1\n"
     )
     assert "Montr\\u00e9al" in stdout.getvalue()
     assert "Montréal" not in stdout.getvalue()
@@ -1586,11 +1585,16 @@ def test_cli_4_editor_success_updates_memory_user_and_exact_skill_document():
     )
 
 
+@pytest.mark.parametrize("editor", (None, "   "))
+def test_unset_editor_falls_back_to_nano(editor: str | None):
+    environment = {} if editor is None else {"EDITOR": editor}
+    with patch.dict(os.environ, environment, clear=True):
+        assert cli._editor_command() == ["nano"]
+
+
 @pytest.mark.parametrize(
     ("editor", "expected"),
     [
-        (None, "$EDITOR is not set"),
-        ("   ", "$EDITOR is not set"),
         ("'unterminated", "$EDITOR is malformed"),
         ("daita-editor-that-does-not-exist", "$EDITOR command is unavailable"),
         (

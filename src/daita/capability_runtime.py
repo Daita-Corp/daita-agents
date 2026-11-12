@@ -7,7 +7,7 @@ import hmac
 import re
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -25,6 +25,7 @@ from .artifacts.models import (
 )
 from .artifacts.store import AgentHomeArtifactStore
 from .capabilities import (
+    DEFAULT_APPROVAL_REASON,
     RESERVED_TOOL_NAMES,
     TOOLBOX_DEFINITIONS,
     AccessMode,
@@ -237,7 +238,7 @@ class SideEffectPlan:
 
     approval_required: bool = True
     approval_arguments: FrozenJsonObject | None = None
-    approval_reason: str = "Allow this exact side-effecting tool invocation once?"
+    approval_reason: str = DEFAULT_APPROVAL_REASON
     recheck_after_approval: bool = True
     effect_intent: FrozenJsonObject | None = None
 
@@ -3231,7 +3232,7 @@ class CapabilityRuntime:
         # scheduled cell that reads its sole admitted source.
         if capability.id == "analysis.execute":
             return None
-        deadline = None if session is None else session.absolute_deadline
+        deadline = None if session is None else session.deadline
         cancellation = None if session is None else session.cancellation
         presentation = (
             None if catalog_entry is None else catalog_entry.view.connector_presentation
@@ -3382,7 +3383,8 @@ class CapabilityRuntime:
                 catalog_entry=catalog_entry,
             )
             try:
-                decision = await self._approval_handler(request)
+                with nullcontext() if session is None else session.approval_wait():
+                    decision = await self._approval_handler(request)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -3666,7 +3668,7 @@ class CapabilityRuntime:
                 yield
             return
         permit = await self._effect_coordinator.acquire(
-            deadline=None if session is None else session.absolute_deadline,
+            deadline=None if session is None else session.deadline,
             cancellation=None if session is None else session.cancellation,
         )
         async with permit:
@@ -3695,7 +3697,7 @@ class CapabilityRuntime:
         coordinator = self._admission_coordinator
         if coordinator is None or capability.effect_receipt_policy is None:
             return None
-        deadline = None if session is None else session.absolute_deadline
+        deadline = None if session is None else session.deadline
         cancellation = None if session is None else session.cancellation
         presentation = catalog_entry.view.connector_presentation
         if isinstance(presentation, Mapping):

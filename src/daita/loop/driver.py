@@ -560,10 +560,17 @@ class AgentLoop:
             await writer.append(start_message, position=writer.next_position)
             messages = (*messages, start_message)
             started = asyncio.get_running_loop().time()
-            deadline = min(
-                session.absolute_deadline,
-                started + limits.max_wall_time_seconds,
-            )
+
+            def current_deadline() -> float:
+                # Time spent on approval cards moves both bounds back.
+                return min(
+                    session.deadline,
+                    started
+                    + limits.max_wall_time_seconds
+                    + session.approval_pauses.seconds(),
+                )
+
+            deadline = current_deadline()
             if prepared is None:
                 tool_catalog = await _before(
                     deadline,
@@ -583,6 +590,7 @@ class AgentLoop:
                 context_snapshot = prepared.context_snapshot
             for step in range(1, limits.max_steps + 1):
                 session.cancellation.raise_if_cancelled()
+                deadline = current_deadline()
                 sensitivity = max(
                     sensitivity,
                     writer.analysis_sensitivity,
@@ -594,7 +602,7 @@ class AgentLoop:
                         "cost_limit_reached",
                         step - 1,
                     )
-                if self._wall_time_exhausted(started, limits):
+                if self._wall_time_exhausted(started, limits, session):
                     return await finish(
                         LoopExitKind.FAILED,
                         "wall_time_exhausted",
@@ -804,7 +812,8 @@ class AgentLoop:
                 messages = (*messages, assistant)
 
                 outcome, cancellation_requested = await _tool_batch_before(
-                    deadline,
+                    current_deadline,
+                    session,
                     _execute_tools(
                         self._tools,
                         runtime_session,
@@ -1388,9 +1397,12 @@ class AgentLoop:
             event,
         )
 
-    def _wall_time_exhausted(self, started: float, limits: LoopLimits) -> bool:
+    def _wall_time_exhausted(
+        self, started: float, limits: LoopLimits, session: RunSession
+    ) -> bool:
+        elapsed = asyncio.get_running_loop().time() - started
         return (
-            asyncio.get_running_loop().time() - started >= limits.max_wall_time_seconds
+            elapsed - session.approval_pauses.seconds() >= limits.max_wall_time_seconds
         )
 
     def _cost_limit_allows_request(
@@ -1665,16 +1677,32 @@ async def _before(deadline: float, awaitable: Awaitable[_T]) -> _T:
 
 
 async def _tool_batch_before(
-    deadline: float,
+    deadline: Callable[[], float],
+    session: RunSession,
     awaitable: Awaitable[ToolBatchOutcome],
     calls: tuple[ToolCall, ...],
     *,
     recovery_timeout_seconds: float,
 ) -> tuple[ToolBatchOutcome, bool]:
     worker: asyncio.Future[ToolBatchOutcome] = asyncio.ensure_future(awaitable)
-    remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+    pauses = session.approval_pauses
     try:
-        done, _pending = await asyncio.wait((worker,), timeout=remaining)
+        loop = asyncio.get_running_loop()
+        while True:
+            if pauses.paused:
+                # A person is deciding: wait for the batch or the card, untimed.
+                resumed = asyncio.ensure_future(pauses.resumed.wait())
+                try:
+                    await asyncio.wait(
+                        (worker, resumed), return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    resumed.cancel()
+            remaining = max(0.0, deadline() - loop.time())
+            done, _pending = await asyncio.wait((worker,), timeout=remaining)
+            # A card opened or closed meanwhile moves the deadline; wait again.
+            if done or (not pauses.paused and deadline() <= loop.time()):
+                break
     except asyncio.CancelledError:
         worker.cancel(ToolBatchInterruption.CANCELLED.value)
         outcome = await _recover_tool_batch(

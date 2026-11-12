@@ -9,7 +9,7 @@ from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any
 
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.theme import Theme
 
 from daita import (
@@ -634,7 +634,7 @@ class DaitaApp(App[int]):
             return
         conversation_id = self.controller.conversation_id
         if conversation_id is None:
-            screen.set_blocks(())
+            await screen.set_blocks(())
             return
         runs = await self.controller.conversation_runs(conversation_id)
         evidence = {
@@ -643,7 +643,7 @@ class DaitaApp(App[int]):
             )
             for run in runs
         }
-        screen.set_blocks(project_conversation(runs, tool_pairs=evidence))
+        await screen.set_blocks(project_conversation(runs, tool_pairs=evidence))
 
     def _reset_context_usage(self) -> None:
         self._context_input_tokens = None
@@ -745,7 +745,9 @@ class DaitaApp(App[int]):
     def on_resize(self) -> None:
         self.call_later(self._refresh_status)
 
-    async def open_command_center_item(self, section: str, item_id: str | None) -> None:
+    async def open_command_center_item(
+        self, section: str, item_id: str | None, *, title: str = ""
+    ) -> None:
         """Reuse owner screens without dispatching a model command or changing scope."""
 
         chat = self.chat()
@@ -764,7 +766,7 @@ class DaitaApp(App[int]):
             elif section == "routines":
                 await self._await_modal(RoutinesScreen(routine_id=item_id))
             elif section == "result" and item_id is not None:
-                await self._await_modal(ResultScreen(delivery_id=item_id))
+                await self._await_modal(ResultScreen(delivery_id=item_id, title=title))
             elif section == "artifacts":
                 await self._await_modal(ArtifactsScreen(artifact_id=item_id))
             elif section == "memory":
@@ -1287,8 +1289,21 @@ class DaitaApp(App[int]):
     def _edit_document(self, seed: str) -> str:
         """Give the configured external editor temporary control of the terminal."""
 
-        with self.suspend():
-            return self.controller.edit_document(seed)
+        # Textual skips resuming the terminal if the suspended block raises, so the
+        # error is held until the TUI is back (e.g. $EDITOR unset froze the TUI).
+        failure: Exception | None = None
+        edited = seed
+        try:
+            with self.suspend():
+                try:
+                    edited = self.controller.edit_document(seed)
+                except Exception as error:
+                    failure = error
+        except SuspendNotSupported as error:
+            raise RuntimeError("An external editor cannot open here.") from error
+        if failure is not None:
+            raise failure
+        return edited
 
     async def _edit_memory_target(self, target: str) -> None:
         current = (
@@ -1428,7 +1443,7 @@ class DaitaApp(App[int]):
         # /learn needs the explicit-learning run so semantic_save is offered.
         call = (
             agent.learn(
-                message,
+                str(message),  # the marker type has no host wire codec
                 conversation_id=self.controller.conversation_id,
                 source_scope_ids=scope,
             )

@@ -244,3 +244,13 @@ def test_backward_clock_movement_cannot_recreate_completed_slot() -> None:
         after=completed,
     ) == _utc("2026-08-27T05:00:00+00:00")
     assert scheduled_slot_key("routine-1", 1, completed) == original_key
+
+
+def test_out_of_bound_relative_time_names_the_field_and_its_bound() -> None:
+    from daita.routines.owner import RoutineError, parse_schedule
+
+    with pytest.raises(RoutineError, match="anchor_after_seconds must be 1 to"):
+        parse_schedule(
+            {"kind": "interval", "interval_seconds": 300, "anchor_after_seconds": 0},
+            reference_at=datetime(2026, 1, 1, tzinfo=UTC),
+        )

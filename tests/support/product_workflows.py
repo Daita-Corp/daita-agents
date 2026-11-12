@@ -19,6 +19,7 @@ __all__ = (
     "Static",
     "ToolCall",
     "approval_review_document",
+    "readable_arguments",
     "choose",
     "cli",
     "create_fixture",
@@ -53,7 +54,7 @@ from daita.artifacts.models import ArtifactAuthorship
 from daita.distribution import ArtifactRequirement, OutcomeState
 from daita.llm.models import ModelSensitivity, ToolCall
 from daita.tui.app import DaitaApp
-from daita.tui.projection import approval_review_document
+from daita.tui.projection import approval_review_document, readable_arguments
 from daita.tui.screens.permissions import PermissionsScreen
 from daita.tui.screens.routines import render_routine_inspection
 from daita.tui.screens.selection import SelectionScreen

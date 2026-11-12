@@ -200,6 +200,16 @@ class Connection:
 
     async def fetch(self, sql: str, *parameters: object, **_options: object) -> object:
         self.db.log.append(("fetch", sql, parameters))
+        if "daita:postgresql.write_grants" in sql:
+            guardrails = self.db.guardrails
+            return [
+                {
+                    "column_name": column[0],
+                    "can_update": guardrails["can_update_columns"],
+                    "can_insert": guardrails["can_insert_columns"],
+                }
+                for column in json.loads(guardrails["columns"])
+            ]
         return ()
 
     async def prepare(self, sql: str, **_options: object) -> _Statement:
@@ -226,7 +236,9 @@ class Connection:
                 "__daita_action": (
                     "insert"
                     if existing is None
-                    else "update" if "__daita_after_0" in items else "skip"
+                    else "update"
+                    if "__daita_after_0" in items
+                    else "skip"
                 ),
                 "__daita_key": json.dumps([row[KEY_COLUMN]]),
                 "__daita_bound": sha256(

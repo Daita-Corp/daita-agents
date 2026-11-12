@@ -525,7 +525,7 @@ async def test_terminal_defaults_preserve_markdown_and_focus_without_rgb_paint(
             await app.push_screen(ChatScreen())
             chat = app.screen
             assert isinstance(chat, ChatScreen)
-            chat.set_blocks(
+            await chat.set_blocks(
                 (
                     TranscriptBlock(
                         "assistant",

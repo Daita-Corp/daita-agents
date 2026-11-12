@@ -12,6 +12,7 @@ from typing import cast
 
 from .._json import canonical_json
 from ..adapters.models import SourceRegistration
+from ..adapters.postgresql_write import RelationalWriteError
 from ..adapters.registry import SourceOperation, SourceTypeRegistry
 from ..catalog.models import (
     CatalogResource,
@@ -300,6 +301,63 @@ async def _inspect_source_permissions(
     )
 
 
+_EXPLICIT_WRITE_KEYS = frozenset(
+    {
+        "allowed_operations",
+        "allowed_insert_columns",
+        "allowed_update_columns",
+        "max_rows",
+    }
+)
+_GRANTED_WRITE_KEYS = frozenset({"allowed_operations", "max_rows"})
+
+
+async def _granted_constraints(
+    inspect_write_table: Callable[..., Awaitable[Mapping[str, tuple[str, ...]]]],
+    agent_id: str,
+    source_id: str,
+    table: str,
+    constraints: Mapping[str, object],
+    stored: RelationalWriteScope | None,
+) -> dict[str, object]:
+    """Fill a scope's columns with everything the source login may write.
+
+    The database role is the real limit, so Daita offers operations only and takes
+    the columns from the live grants. Narrowing a stored scope still works with
+    the source down, from the columns it already holds.
+    """
+
+    operations = tuple(cast(tuple[str, ...], constraints["allowed_operations"]))
+    try:
+        live = await inspect_write_table(
+            agent_id=agent_id, source_id=source_id, table=table
+        )
+    except RelationalWriteError:
+        if stored is None or not set(operations) <= set(stored.allowed_operations):
+            raise
+        live = {
+            "update_columns": stored.allowed_update_columns,
+            "insert_columns": stored.allowed_insert_columns,
+            "operations": stored.allowed_operations,
+        }
+    refused = [item for item in operations if item not in live["operations"]]
+    if refused:
+        raise ValueError(
+            f"The source login cannot {' or '.join(refused)} rows in {table}; "
+            "grant it in the database first."
+        )
+    return {
+        "allowed_operations": operations,
+        "allowed_update_columns": (
+            live["update_columns"] if "update" in operations else ()
+        ),
+        "allowed_insert_columns": (
+            live["insert_columns"] if "insert" in operations else ()
+        ),
+        "max_rows": constraints["max_rows"],
+    }
+
+
 def _within(scope: RelationalWriteScope, stored: RelationalWriteScope | None) -> bool:
     """True when a scope grants nothing the stored one did not already grant."""
 
@@ -361,15 +419,22 @@ async def _build_source_permissions_preview(
     update_scopes: list[RelationalWriteScope] = []
     requested_update_ids: set[str] = set()
     for table, constraints in relational_write_scopes.items():
-        if not isinstance(constraints, Mapping) or set(constraints) != {
-            "allowed_operations",
-            "allowed_insert_columns",
-            "allowed_update_columns",
-            "max_rows",
-        }:
+        if not isinstance(constraints, Mapping) or set(constraints) not in (
+            _EXPLICIT_WRITE_KEYS,
+            _GRANTED_WRITE_KEYS,
+        ):
             raise ValueError(
-                "write scopes require explicit operations, insert/update columns "
-                "and row limit"
+                "write scopes require operations and a row limit, with insert/update "
+                "columns given explicitly or both left to the login's grants"
+            )
+        if set(constraints) == _GRANTED_WRITE_KEYS:
+            constraints = await _granted_constraints(
+                inspect_write_table,
+                agent_id,
+                inspection.source_id,
+                table,
+                constraints,
+                stored_scopes.get(table),
             )
         resource_id = catalog_resource_id(
             inspection.source_id, ResourceKind.TABLE, table

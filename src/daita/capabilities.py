@@ -1073,6 +1073,9 @@ class ApprovalHandler(Protocol):
     async def __call__(self, request: ApprovalRequest) -> ApprovalDecision: ...
 
 
+DEFAULT_APPROVAL_REASON = "Allow this exact side-effecting tool invocation once?"
+
+
 def render_approval_arguments(arguments: Mapping[str, object]) -> str | None:
     """Render one exact, terminal-safe approval document within its fixed bound."""
 
