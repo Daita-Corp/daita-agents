@@ -504,7 +504,8 @@ async def test_restart_after_artifact_and_terminal_commit_does_not_repeat_work(
             deliveries = await reopened.list_deliveries(conversation_id=conversation_id)
             if deliveries:
                 break
-            await asyncio.sleep(0)
+            # Wall time, not loop ticks: a loaded CI worker needs more ticks.
+            await asyncio.sleep(0.01)
         (delivery,) = deliveries
         assert delivery.artifact_references[0].artifact_id == artifact.artifact_id
         assert (await reopened.read_artifact(artifact.artifact_id)).content == (
@@ -995,7 +996,8 @@ async def test_corrupt_committed_artifact_is_one_failed_delivery(
             if deliveries:
                 delivery = deliveries[0]
                 break
-            await asyncio.sleep(0)
+            # Wall time, not loop ticks: a loaded CI worker needs more ticks.
+            await asyncio.sleep(0.01)
         assert delivery is not None
         assert delivery.conclusion_state is OutcomeState.FAILED
         assert delivery.failure_code == "outcome_artifact_contract_failed"
