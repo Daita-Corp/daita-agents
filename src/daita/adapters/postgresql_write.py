@@ -233,6 +233,22 @@ WHERE namespace.nspname = $1
   AND relation.relname = $2
 LIMIT 1
 """
+_GRANTED_COLUMNS_SQL = """
+/* daita:postgresql.write_grants */
+SELECT
+    attribute.attname::pg_catalog.text AS column_name,
+    pg_catalog.has_column_privilege(
+        current_user, attribute.attrelid, attribute.attnum, 'UPDATE'
+    ) AS can_update,
+    pg_catalog.has_column_privilege(
+        current_user, attribute.attrelid, attribute.attnum, 'INSERT'
+    ) AS can_insert
+FROM pg_catalog.pg_attribute AS attribute
+WHERE attribute.attrelid = $1::pg_catalog.text::pg_catalog.oid
+  AND attribute.attnum > 0
+  AND NOT attribute.attisdropped
+ORDER BY attribute.attnum
+"""
 _GUARDRAIL_NAMES = (
     "relation_kind",
     "is_partition",
@@ -579,7 +595,11 @@ class PostgreSQLWriteBackend:
     async def inspect_write_table(
         self, *, agent_id: str, source_id: str, table: str
     ) -> Mapping[str, tuple[str, ...]]:
-        """Read one table live for enabling writes: what can be written, by name."""
+        """Read one table live for enabling writes: what can be written, by name.
+
+        ``columns`` is every column a write could name; ``update_columns``,
+        ``insert_columns`` and ``operations`` are what this login is granted.
+        """
 
         registration = await self._registration(agent_id, source_id)
         connection = transaction = None
@@ -597,6 +617,11 @@ class PostgreSQLWriteBackend:
                 lock_timeout_seconds=self._lock_timeout_seconds,
             )
             live = await self._live_table(connection, table, (), ())
+            grants = await connection.fetch(
+                _GRANTED_COLUMNS_SQL,
+                live.facts["relation_oid"],
+                timeout=self._statement_timeout_seconds,
+            )
             await transaction.commit()
             finished = True
         except (asyncio.CancelledError, ImportError, RelationalWriteError):
@@ -622,7 +647,24 @@ class PostgreSQLWriteBackend:
             for column in live.columns
             if column[4] != "a" and column[5] != "s"
         )
-        return {"columns": writable}
+        granted = {row["column_name"]: row for row in grants}
+        updatable = tuple(
+            name for name in writable if name in granted and granted[name]["can_update"]
+        )
+        insertable = tuple(
+            name for name in writable if name in granted and granted[name]["can_insert"]
+        )
+        operations = (
+            *(("update",) if updatable else ()),
+            *(("insert",) if insertable else ()),
+            *(("delete",) if live.facts["can_delete_rows"] is True else ()),
+        )
+        return {
+            "columns": writable,
+            "update_columns": updatable,
+            "insert_columns": insertable,
+            "operations": operations,
+        }
 
     async def _finish(self, connection: Any, transaction: Any, finished: bool) -> None:
         try:
@@ -1497,7 +1539,9 @@ def _preview_failure(
         )
     # A class 42 position would point into Daita's wrapper, not the model's SQL.
     failure = _classified_failure(
-        error, PostgreSQLStatement.of(facts), timeout_seconds  # type: ignore[arg-type]
+        error,
+        PostgreSQLStatement.of(facts),  # type: ignore[arg-type]
+        timeout_seconds,
     )
     return RelationalWriteError(
         (

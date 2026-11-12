@@ -563,6 +563,44 @@ async def test_revoking_or_narrowing_needs_no_live_read(tmp_path, monkeypatch):
         await agent.close()
 
 
+async def test_operations_alone_take_their_columns_from_the_login_grants(
+    tmp_path, monkeypatch
+):
+    async def inspect(self, **_arguments: object) -> dict[str, tuple[str, ...]]:
+        return {
+            "columns": ("value_01", "value_02"),
+            "update_columns": ("value_01",),
+            "insert_columns": (),
+            "operations": ("update",),
+        }
+
+    monkeypatch.setattr(PostgreSQLWriteBackend, "inspect_write_table", inspect)
+    agent, source, _resources = await _agent_with_catalog(tmp_path)
+    granted = {"allowed_operations": ("update",), "max_rows": 1_000}
+    try:
+        inspection = await _apply(agent, source, scopes={"public.orders": granted})
+        (scope,) = inspection.state.relational_write_scopes
+        assert scope.allowed_update_columns == ("value_01",)
+        assert scope.allowed_insert_columns == ()
+
+        with pytest.raises(ValueError, match="cannot delete"):
+            await _apply(
+                agent,
+                source,
+                scopes={
+                    "public.orders": {**granted, "allowed_operations": ("delete",)}
+                },
+            )
+
+        _source_unreachable(monkeypatch)
+        inspection = await _apply(
+            agent, source, scopes={"public.orders": {**granted, "max_rows": 10}}
+        )
+        assert inspection.state.relational_write_scopes[0].max_rows == 10
+    finally:
+        await agent.close()
+
+
 @pytest.mark.parametrize(
     "wider",
     (

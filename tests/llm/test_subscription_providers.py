@@ -496,6 +496,75 @@ async def test_claude_subscription_remains_an_official_client_transport(monkeypa
     assert commands[0].environment["DISABLE_BUG_COMMAND"] == "1"
 
 
+async def test_claude_subscription_retries_do_not_inflate_request_size():
+    # Shape recorded from Claude Code 2.1.306: a retry adds a turn, and the
+    # usage sums both model calls while leaving usage.iterations empty.
+    async def run(command):
+        return subscription_process._CompletedCommand(
+            0,
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "num_turns": 3,
+                    "structured_output": {
+                        "kind": "message",
+                        "text": "done",
+                        "tool_calls": [],
+                    },
+                    "usage": {
+                        "input_tokens": 4,
+                        "cache_read_input_tokens": 12_934,
+                        "cache_creation_input_tokens": 12_983,
+                        "output_tokens": 1_539,
+                        "iterations": [],
+                    },
+                }
+            ).encode(),
+            b"",
+        )
+
+    response = await ClaudeCodeSubscriptionProvider("sonnet", runner=run).generate(
+        _request()
+    )
+
+    assert response.usage.input_tokens == 25_921  # every call still counts as spent
+    assert response.request_input_tokens == 12_960
+
+
+async def test_claude_subscription_reuses_one_working_directory():
+    folders = []
+
+    async def run(command):
+        folders.append(command.cwd)
+        return subscription_process._CompletedCommand(
+            0,
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "structured_output": {
+                        "kind": "message",
+                        "text": "done",
+                        "tool_calls": [],
+                    },
+                }
+            ).encode(),
+            b"",
+        )
+
+    provider = ClaudeCodeSubscriptionProvider("sonnet", runner=run)
+    await provider.generate(_request())
+    await provider.generate(_request())
+    await provider.close()
+
+    # Claude Code prompts include the folder, so a new one per call defeats caching.
+    assert folders[0] == folders[1]
+    assert not folders[0].exists()
+
+
 async def test_claude_subscription_total_attempt_timeout_is_normalized():
     async def hang(command):
         del command

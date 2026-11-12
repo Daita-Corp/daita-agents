@@ -832,8 +832,11 @@ def _relative(
 ) -> datetime:
     seconds = _integer(values, name)
     if not 1 <= seconds <= MAX_RELATIVE_SCHEDULE_SECONDS:
+        # Name the field and bound: a bare refusal left the model blaming the interval.
         raise RoutineError(
-            "routine_relative_time_invalid", "Relative timing is outside its bound."
+            "routine_relative_time_invalid",
+            f"{name} must be 1 to {MAX_RELATIVE_SCHEDULE_SECONDS} seconds from now; "
+            "to start right away, use run_immediately.",
         )
     return reference_at.astimezone(UTC) + timedelta(seconds=seconds)
 

@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 
 import pytest
-from textual.widgets import Button, OptionList, Static, Tab
+from textual.widgets import Button, Label, OptionList, Static, Tab
 
 from daita import (
     DeliveryInspection,
@@ -595,18 +595,19 @@ async def test_result_screen_shows_a_sanitized_result_and_dismisses_it(
             await pilot.press("escape")
             await pilot.pause()
 
-            screen = ResultScreen(delivery_id="delivery-1")
+            screen = ResultScreen(delivery_id="delivery-1", title="Weekly tickets")
             await app.push_screen(screen)
+            assert str(screen.query_one("#result-title", Label).content) == (
+                "Weekly tickets"
+            )
             for _ in range(100):
                 await pilot.pause(0.02)
-                if "Result run" in str(
-                    screen.query_one("#result-detail", Static).content
-                ):
+                if "Ready?" in str(screen.query_one("#result-detail", Static).content):
                     break
             detail = str(screen.query_one("#result-detail", Static).content)
             assert "Ready?[31m @everyone" in detail
             assert "\x1b" not in detail
-            assert "Result run: run-routine" in detail
+            assert "run-routine" not in detail  # ids and checksums stay off screen
             assert "never reruns" in str(
                 screen.query_one("#result-help", Static).content
             )
@@ -639,7 +640,7 @@ def test_result_rendering_withholds_blocked_reports_and_marks_bounded_previews()
     )
     rendered = render_result(blocked)
     assert "bounded preview" not in rendered
-    assert "Preview withheld" in rendered
+    assert "withheld here" in rendered
     assert "sensitivity_exceeds_destination" in rendered
 
     routine_escalation = replace(
@@ -653,10 +654,10 @@ def test_result_rendering_withholds_blocked_reports_and_marks_bounded_previews()
         failure_code="routine_precheck_unavailable",
     )
     escalation = render_result(routine_escalation)
-    assert "Routine: occurrence-pre-run-failure" in escalation
-    assert "Result run: No model run started" in escalation
-    assert "Escalation" in escalation
-    assert "failed before a model run could start" in escalation
+    assert "occurrence-pre-run-failure" not in escalation
+    assert escalation.startswith("✗ Failed")
+    assert "failed before it could start" in escalation
+    assert "Reason: routine_precheck_unavailable" in escalation
 
 
 @pytest.mark.tui_driven

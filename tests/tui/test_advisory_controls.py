@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+
+from daita.llm import ModelSensitivity
 from tests.support.host import StartHost, host_workspace, remote_agent
 from tests.tui._support import (
     DaitaApp,
@@ -34,6 +37,27 @@ def test_external_editor_runs_only_inside_textual_suspend():
     assert events == ["suspend", "edit:memory", "resume"]
 
 
+def test_editor_failure_still_returns_the_terminal_to_the_tui():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    events: list[str] = []
+
+    @contextmanager
+    def suspended() -> Iterator[None]:
+        # Like Textual: the terminal is restored only when the block exits cleanly.
+        events.append("suspend")
+        yield
+        events.append("resume")
+
+    def edit(_seed: str) -> str:
+        raise RuntimeError("$EDITOR is not set; set it to an available editor command")
+
+    app.suspend = suspended  # type: ignore[method-assign]
+    app.controller.edit_document = edit  # type: ignore[method-assign,assignment]
+    with pytest.raises(RuntimeError, match="EDITOR"):
+        app._edit_document("skill")
+    assert events == ["suspend", "resume"]
+
+
 async def test_skill_and_memory_editor_flows_use_public_controller(
     start_host: StartHost,
 ):
@@ -52,6 +76,8 @@ async def test_skill_and_memory_editor_flows_use_public_controller(
         skill = await opened.read_skill("audit")
         assert skill is not None
         assert skill.description == "Use for audit work."
+        # Restricted would fit no default model route, so the skill could never run.
+        assert skill.sensitivity is ModelSensitivity.INTERNAL
 
         app._edit_document = lambda seed: seed + "Remember fiscal calendars.\n"  # type: ignore[method-assign]
         await app._edit_memory_target("memory")

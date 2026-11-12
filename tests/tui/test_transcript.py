@@ -517,13 +517,29 @@ async def test_chat_accumulates_and_resumes_the_full_conversation_transcript(
 
 
 @pytest.mark.tui_driven
+async def test_redrawing_a_changed_run_reuses_its_block_ids():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    async with app.run_test(size=(60, 14)) as pilot:
+        await app.push_screen(ChatScreen())
+        chat = app.chat()
+        assert chat is not None
+        asked = TranscriptBlock("user", "run-x:user:0", "/billing-backlog")
+        await chat.set_blocks((asked, TranscriptBlock("notice", "run-x:n", "first")))
+        # A changed tail forces a full redraw with the same block IDs.
+        await chat.set_blocks((asked, TranscriptBlock("notice", "run-x:n", "second")))
+        await pilot.pause()
+        assert "second" in chat.query_one(TranscriptView).copy_text()
+        app.exit(0)
+
+
+@pytest.mark.tui_driven
 async def test_transcript_history_supports_review_and_latest_navigation():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with app.run_test(size=(60, 14)) as pilot:
         await app.push_screen(ChatScreen())
         chat = app.chat()
         assert chat is not None
-        chat.set_blocks(
+        await chat.set_blocks(
             tuple(
                 TranscriptBlock(
                     "assistant" if index % 2 else "user",
@@ -565,7 +581,7 @@ async def test_ctrl_o_toggles_tool_calls_without_exiting_chat():
             await app.push_screen(ChatScreen())
             chat = app.screen
             assert isinstance(chat, ChatScreen)
-            chat.set_blocks(
+            await chat.set_blocks(
                 (
                     TranscriptBlock("user", "user-one", "Inspect the records"),
                     TranscriptBlock(

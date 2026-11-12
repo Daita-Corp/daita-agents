@@ -17,6 +17,7 @@ from tests.support.product_workflows import (
     json,
     pytest,
     pytestmark as _pytestmark,
+    readable_arguments,
 )
 from tests.support.workspace import workspace_for
 
@@ -82,7 +83,7 @@ def test_unrelated_tool_arguments_cannot_impersonate_a_routine_review():
     )
     assert reviewable and document is not None
     assert "Assignment:" not in document
-    assert document.endswith(arguments)
+    assert document.endswith(readable_arguments(arguments, indent="  "))
 
 
 @pytest.mark.parametrize("drift", (False, True))

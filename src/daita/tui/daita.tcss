@@ -266,28 +266,6 @@ ChatScreen.-narrow #main-tabs Tab {
     color: $text-muted;
 }
 
-#suggestions-row {
-    height: auto;
-}
-
-#suggestions {
-    width: 64;
-    max-width: 100%;
-    height: auto;
-    max-height: 4;
-    border: none;
-    padding: 0 1;
-}
-
-#suggestions > .option-list--option-highlighted {
-    text-style: none;
-}
-
-#suggestions:focus > .option-list--option-highlighted,
-#suggestions > .option-list--option-hover {
-    text-style: bold reverse;
-}
-
 #next-steps {
     height: 1;
     margin: 0 0 1 1;

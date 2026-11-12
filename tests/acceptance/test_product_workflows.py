@@ -10,7 +10,6 @@ from tests.support.host import StartHost, host_workspace, short_root
 from tests.support.product_workflows import (
     ActionFixture,
     DaitaApp,
-    Input,
     OnceSchedule,
     OutcomeState,
     PermissionsScreen,
@@ -20,6 +19,7 @@ from tests.support.product_workflows import (
     choose,
     create_fixture,
     pytestmark as _pytestmark,
+    readable_arguments,
     render_routine_inspection,
     replace,
     response,
@@ -72,26 +72,22 @@ async def test_guided_write_authoring_applies_exact_preview(
             await app.push_screen(PermissionsScreen(source_id=resource.source_id))
             manager = app.screen
             assert isinstance(manager, PermissionsScreen)
-            manager.query_one("#perm-max-rows", Input).value = "7"
 
             async def next_picker(previous):
                 await settle_until(
                     pilot,
-                    lambda: isinstance(app.screen, SelectionScreen)
-                    and app.screen is not previous,
+                    lambda: (
+                        isinstance(app.screen, SelectionScreen)
+                        and app.screen is not previous
+                    ),
                 )
 
             assert await pilot.click("#perm-write")
             await settle_until(pilot, lambda: isinstance(app.screen, SelectionScreen))
-            for identities, multi in (
-                ((resource.id,), False),
-                (("insert", "update"), True),
-                (("domain", "name", "evidence_url"), True),
-            ):
-                picker = app.screen
-                choose(app, identities, multi=multi)
-                await next_picker(picker)
-            choose(app, ("name", "evidence_url"), multi=True)
+            picker = app.screen
+            choose(app, (resource.id,), multi=False)
+            await next_picker(picker)
+            choose(app, (), multi=True)  # keep the stored insert and update
             await settle_until(pilot, lambda: manager._preview is not None)
             assert app.screen is manager
             assert isinstance(manager, PermissionsScreen)
@@ -100,13 +96,17 @@ async def test_guided_write_authoring_applies_exact_preview(
             assert (
                 await agent.inspect_source_permissions(resource.source_id)
             ).state == before
-            assert preview.after.relational_write_scopes[0].max_rows == 7
-            assert preview.after.relational_write_scopes[0].allowed_operations == (
+            (scope,) = preview.after.relational_write_scopes
+            assert scope.max_rows == 1_000
+            # Columns come from the login's grants, not from a picker.
+            assert "name" in scope.allowed_update_columns
+            assert "domain" in scope.allowed_insert_columns
+            assert scope.allowed_operations == (
                 "insert",
                 "update",
             )
             body = str(manager.query_one("#perm-body", Static).content)
-            assert '"table": "public.companies"' in body and '"max_rows": 7' in body
+            assert '"table": "public.companies"' in body and '"max_rows": 1000' in body
             assert await pilot.click("#perm-apply")
             await settle_until(pilot, lambda: app.screen is not manager)
             assert (
@@ -144,7 +144,7 @@ async def test_once_mcp_research_creates_sourced_briefing_and_inbox_while_host_o
             reason=request.reason,
         )
         assert reviewable and exact is not None and document is not None
-        assert document.endswith(exact)
+        assert document.endswith(readable_arguments(exact, indent="  "))
         assert "Competitor briefing" in document
         assert fixture.server.calls == []
         await fixture.agent.close()

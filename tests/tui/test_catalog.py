@@ -59,8 +59,10 @@ async def test_source_permissions_picker_remains_interactive_after_command_submi
                 composer.action_submit()
                 await settle_until(
                     pilot,
-                    lambda: isinstance(app.screen, PermissionsScreen)
-                    and bool(app.screen.query("#perm-source")),
+                    lambda: (
+                        isinstance(app.screen, PermissionsScreen)
+                        and bool(app.screen.query("#perm-source"))
+                    ),
                 )
 
                 permissions = app.screen
@@ -92,9 +94,11 @@ async def test_source_permissions_picker_remains_interactive_after_command_submi
                 assert await pilot.click(listing, offset=(2, 0)) is True
                 await settle_until(
                     pilot,
-                    lambda: app.screen is permissions
-                    and "Records"
-                    in str(permissions.query_one("#perm-body", Static).content),
+                    lambda: (
+                        app.screen is permissions
+                        and "Records"
+                        in str(permissions.query_one("#perm-body", Static).content)
+                    ),
                 )
 
                 assert app.screen is permissions
@@ -191,7 +195,7 @@ async def test_choosing_no_operations_revokes_the_table():
         await pilot.pause()
         _pick(app, "resource-tickets")
         await pilot.pause()
-        _pick(app)
+        _pick(app, "update")  # stored operations start ticked; untick the last one
         await pilot.pause()
 
         assert app.screen is permissions
@@ -199,23 +203,23 @@ async def test_choosing_no_operations_revokes_the_table():
         app.exit(0)
 
 
-async def test_editing_a_scope_keeps_its_row_limit_unless_one_is_typed():
-    for typed, expected in (("", 25), ("7", 7)):
-        app, inspection, previews = _permissions_app(stored_max_rows=25)
+async def test_editing_a_scope_never_lowers_its_row_limit_below_the_default():
+    for stored, expected in ((25, 1_000), (5_000, 5_000)):
+        app, inspection, previews = _permissions_app(stored_max_rows=stored)
         async with app.run_test(size=(100, 32)) as pilot:
             await app.push_screen(PermissionsScreen(source_id=inspection.source_id))
-            app.screen.query_one("#perm-max-rows", Input).value = typed
             assert await pilot.click("#perm-write") is True
             await pilot.pause()
             _pick(app, "resource-tickets")
             await pilot.pause()
-            _pick(app, "update")
-            await pilot.pause()
-            _pick(app, "priority")
+            _pick(app, "delete")  # adds delete to the stored update
             await pilot.pause()
 
             updates = previews[-1]["relational_write_scopes"]
-            assert updates["support.tickets"]["max_rows"] == expected
+            assert updates["support.tickets"] == {
+                "allowed_operations": ("update", "delete"),
+                "max_rows": expected,
+            }
             app.exit(0)
 
 
@@ -318,8 +322,6 @@ async def test_source_permissions_configures_exact_relational_write_scope():
         await pilot.pause()
         choose_multi(app, "update")
         await pilot.pause()
-        choose_multi(app, "priority")
-        await pilot.pause()
 
         assert app.screen is permissions
         assert preview_calls == [
@@ -330,9 +332,7 @@ async def test_source_permissions_configures_exact_relational_write_scope():
                 "relational_write_scopes": {
                     tickets.display_name: {
                         "allowed_operations": ("update",),
-                        "allowed_insert_columns": (),
-                        "allowed_update_columns": ("priority",),
-                        "max_rows": 100,
+                        "max_rows": 1_000,
                     },
                 },
             }
@@ -340,7 +340,7 @@ async def test_source_permissions_configures_exact_relational_write_scope():
         body = str(permissions.query_one("#perm-body", Static).content)
         assert "Before → after" in body
         assert '"table": "support.tickets"' in body
-        assert '"max_rows": 100' in body
+        assert '"max_rows": 1000' in body
 
         assert await pilot.click("#perm-apply") is True
         await pilot.pause()
@@ -549,9 +549,11 @@ async def test_catalog_command_opens_grouped_named_resource_tree(
                 composer.action_submit()
                 await settle_until(
                     pilot,
-                    lambda: isinstance(app.screen, CatalogScreen)
-                    and any(
-                        tree.has_focus for tree in app.screen.query("#catalog-tree")
+                    lambda: (
+                        isinstance(app.screen, CatalogScreen)
+                        and any(
+                            tree.has_focus for tree in app.screen.query("#catalog-tree")
+                        )
                     ),
                 )
 

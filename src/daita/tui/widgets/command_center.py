@@ -31,10 +31,13 @@ _WORK_COLUMNS = (
 class CommandCenterNavigate(Message):
     """Open an existing owner screen, optionally selecting an exact item."""
 
-    def __init__(self, section: str, item_id: str | None = None) -> None:
+    def __init__(
+        self, section: str, item_id: str | None = None, title: str = ""
+    ) -> None:
         super().__init__()
         self.section = section
         self.item_id = item_id
+        self.title = title
 
 
 class ProjectionList(OptionList):
@@ -279,7 +282,7 @@ class WorkBoardView(Widget):
         event.stop()
         card = self._cards.get(event.option.id or "")
         if card is not None:
-            self.post_message(CommandCenterNavigate(*_work_target(card)))
+            self.post_message(CommandCenterNavigate(*_work_target(card), card.title))
 
     def _listing(self, column: WorkColumn) -> OptionList:
         return self.query_one(f"#work-{column.value}", OptionList)

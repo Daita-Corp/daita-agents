@@ -7,6 +7,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from daita import ConversationRun, LoopExit, LoopExitKind, Transcript
+from daita.capabilities import DEFAULT_APPROVAL_REASON
 from daita.llm.models import MessageRole, ToolCall, ToolResultBlock
 
 from .models import ToolCardDetails, ToolCardState, ToolTablePreview, TranscriptBlock
@@ -797,39 +798,92 @@ def approval_review_document(
         if requester is not None
         else ""
     )
-    header = asked_by + (
-        f"Tool: {sanitize_terminal_text(tool_name, maximum=128, preserve_lines=False, fallback='tool')}\n"
-        f"Capability: {sanitize_terminal_text(capability_id, maximum=128, preserve_lines=False, fallback='capability')}\n"
-        + (
-            "Change: "
-            + sanitize_terminal_text(
-                reason,
-                maximum=768,
-                preserve_lines=False,
-                fallback="Review this exact change once.",
-            )
-            + "\n"
-            if reason is not None
-            else ""
+    # The default reason is boilerplate; a tool's own reason says what changes.
+    said = (
+        sanitize_terminal_text(
+            reason, maximum=768, preserve_lines=False, fallback="Review this change."
         )
+        + "\n"
+        if reason is not None and reason != DEFAULT_APPROVAL_REASON
+        else ""
     )
+    summary = (
+        approval_summary(arguments_text, capability_id)
+        if capability_id in {"control.resolve_effect", "data.write"}
+        else ""
+    )
+    tool = sanitize_terminal_text(
+        tool_name, maximum=128, preserve_lines=False, fallback="tool"
+    )
+    # Arguments sit indented under the tool, so none can pose as a header line.
     document = (
-        header
-        + (
-            approval_summary(arguments_text, capability_id)
-            if capability_id
-            in {
-                "control.resolve_effect",
-                "data.write",
-            }
-            else ""
-        )
-        + "Exact validated details:\n"
-        + arguments_text
+        asked_by
+        + said
+        + summary
+        + tool
+        + "\n"
+        + readable_arguments(arguments_text, indent="  ")
     )
     if looks_secret_shaped(arguments_text):
         return document, False
     return document, True
+
+
+def readable_arguments(arguments_text: str, indent: str = "") -> str:
+    """Show exact approval JSON as indented lines a person can read.
+
+    Strings appear bare only when ASCII-printable and not readable as another JSON
+    value; anything else stays JSON-quoted, so escapes and lookalikes stay visible.
+    """
+
+    try:
+        document = json.loads(arguments_text)
+    except ValueError:
+        return arguments_text
+
+    def scalar(value: object) -> str:
+        if isinstance(value, str) and value.isascii() and value.isprintable():
+            try:
+                json.loads(value)
+            except ValueError:
+                if value == value.strip() and value:
+                    return value
+        return json.dumps(value, ensure_ascii=True)
+
+    def label(key: str) -> str:
+        text = scalar(key)
+        return text[:1].upper() + text[1:].replace("_", " ") if text == key else text
+
+    def lines(value: dict[str, object] | list[object], indent: str) -> list[str]:
+        items = (
+            [(label(key), child) for key, child in value.items()]
+            if isinstance(value, dict)
+            else [("-", child) for child in value]
+        )
+        rendered: list[str] = []
+        for name, child in items:
+            mark = name if name == "-" else name + ":"
+            if isinstance(child, (dict, list)) and child:
+                rendered += [indent + mark, *lines(child, indent + "  ")]
+            elif (
+                isinstance(child, str)
+                and "\n" in child
+                and all(
+                    part.isascii() and part.isprintable() for part in child.split("\n")
+                )
+            ):
+                # Text blocks sit deeper than their label, so no line can pose as a field.
+                rendered += [indent + mark + " |"]
+                rendered += [indent + "    " + part for part in child.split("\n")]
+            else:
+                rendered.append(
+                    f"{indent}{mark} {'[]' if child == [] else '{}' if child == {} else scalar(child)}"
+                )
+        return rendered
+
+    if not isinstance(document, (dict, list)) or not document:
+        return indent + scalar(document)
+    return "\n".join(lines(document, indent))
 
 
 def looks_secret_shaped(value: str) -> bool:

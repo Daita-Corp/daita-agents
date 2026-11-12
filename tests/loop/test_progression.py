@@ -1210,3 +1210,70 @@ async def test_run_status_is_written_once_and_never_edits_an_earlier_request(tmp
     assert notes[0] == ("one", None)
     assert notes[1][0] == "two" and "last model request" in str(notes[1][1])
     assert third.messages[-1].run_note == notes[1][1]
+
+
+async def test_time_on_an_approval_card_does_not_use_the_run_limit():
+    from daita.loop import ToolBatchOutcome
+    from daita.loop.session import RunCancellationToken, RunSession
+    from daita.loop.transcripts import RunSessionWriter
+
+    store = InMemoryTranscriptStore()
+
+    class ApprovingTools(ScriptedTools):
+        async def execute_session(self, session, calls, **_options):
+            with session.approval_wait():
+                await asyncio.sleep(0.2)  # a person reads the card past the limit
+            return ToolBatchOutcome(tuple(self.outputs[call.id] for call in calls))
+
+    provider = MockModelProvider(
+        (
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(ToolCall(id="write", name="lookup"),),
+            ),
+            ModelResponse(finish_reason=FinishReason.STOP, text="done"),
+        )
+    )
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=ApprovingTools(
+            {"write": ToolResultBlock(call_id="write", output={"saved": True})}
+        ),
+        transcripts=store,
+        limits=LoopLimits(max_wall_time_seconds=0.1),
+        clock=lambda: NOW,
+    )
+    run = RunInput(
+        id="run-approval-pause",
+        agent_id="agent-1",
+        conversation_id="conversation-approval",
+        message="save it",
+        created_at=NOW,
+    )
+    session = RunSession(
+        run=run,
+        writer=RunSessionWriter(store, run, bind_predecessor=False),
+        absolute_deadline=asyncio.get_running_loop().time() + 0.1,
+        cancellation=RunCancellationToken(),
+    )
+
+    result = await loop.run(session)
+
+    assert result.final_text == "done", result.reason
+
+
+async def test_background_runs_keep_their_clock_on_approval_cards():
+    from types import SimpleNamespace
+
+    from daita.loop.session import ApprovalPauses, RunSession
+
+    # An unanswered card could otherwise hold a background slot for 24 hours.
+    session = SimpleNamespace(
+        run=SimpleNamespace(origin=RunOrigin.SCHEDULED_ROUTINE),
+        approval_pauses=ApprovalPauses(),
+        admission_lease=None,
+    )
+    with RunSession.approval_wait(session):  # type: ignore[arg-type]
+        assert not session.approval_pauses.paused
+    assert session.approval_pauses.seconds() == 0.0

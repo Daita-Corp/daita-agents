@@ -1,21 +1,24 @@
-"""Author exact read, update and upsert permissions through preview/apply."""
+"""Choose what the agent may read and change in a source, through preview/apply."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any, cast
 
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Button, Footer, Input, Label, Static
+from textual.widgets import Button, Footer, Label, Static
 
 from daita.capabilities import render_approval_arguments
 
 from ..models import PickerOption
 from ..sanitization import sanitize_terminal_text
 from .selection import SelectionScreen
+
+# shortcut: one fixed ceiling per change instead of a typed limit; every change is
+# still previewed with its exact row count. Make it settable if 1,000 proves tight.
+_DEFAULT_MAX_ROWS = 1_000
 
 
 class PermissionsScreen(Screen[bool]):
@@ -31,7 +34,9 @@ class PermissionsScreen(Screen[bool]):
         with Vertical(id="permissions", classes="control-panel"):
             yield Label("Source permissions", id="onboard-title", markup=False)
             yield Static(
-                "Choose exact read, update or upsert scopes. Permissions do not execute a write.",
+                "Choose what the agent may read and change. The source login still "
+                "limits what is possible, and every change is previewed for your "
+                "approval. Permissions do not execute a write.",
                 id="perm-help",
                 markup=False,
             )
@@ -42,15 +47,6 @@ class PermissionsScreen(Screen[bool]):
                 yield Button("Read: all resources", id="perm-read-all")
                 yield Button("Read: selected resources", id="perm-read-selected")
                 yield Button("Read: none", id="perm-read-none")
-            yield Label(
-                "Maximum rows per call (at most 10,000; a VALUES batch at most 1,000)",
-                markup=False,
-            )
-            yield Input(
-                placeholder="Keep the table's limit, or 100 for a new table",
-                id="perm-max-rows",
-                type="integer",
-            )
             with Horizontal(classes="permission-actions"):
                 yield Button("Edit table write access", id="perm-write")
                 yield Button("Apply", id="perm-apply", variant="primary")
@@ -198,14 +194,25 @@ class PermissionsScreen(Screen[bool]):
         if chosen is None:
             return
         resource = next(item for item in resources if item.resource_id == chosen[0])
+        stored = scopes.get(resource.display_name)
         operations = await self.app._await_modal(  # type: ignore[attr-defined]
             SelectionScreen(
-                title=f"Allowed writes (none removes access): {resource.display_name}",
+                title=f"Changes the agent may propose (none removes access): "
+                f"{resource.display_name}",
                 multi=True,
                 allow_empty=True,
+                initial_selected=(
+                    ()
+                    if stored is None
+                    else tuple(cast(list[str], stored["allowed_operations"]))
+                ),
                 options=(
-                    PickerOption("insert", "Insert rows", "Choose the columns next"),
-                    PickerOption("update", "Update rows", "Choose the columns next"),
+                    PickerOption(
+                        "update", "Update rows", "Any column the login may update"
+                    ),
+                    PickerOption(
+                        "insert", "Insert rows", "Any column the login may insert"
+                    ),
                     PickerOption(
                         "delete", "Delete rows", "Never granted unless chosen here"
                     ),
@@ -217,41 +224,13 @@ class PermissionsScreen(Screen[bool]):
         if not operations:
             scopes.pop(resource.display_name, None)
         else:
-            inserts: tuple[str, ...] = ()
-            updates: tuple[str, ...] = ()
-            if "insert" in operations:
-                selected = await self.app._await_modal(  # type: ignore[attr-defined]
-                    SelectionScreen(
-                        title=f"Insert columns: {resource.display_name}",
-                        multi=True,
-                        options=tuple(
-                            PickerOption(column, column)
-                            for column in resource.eligible_insert_columns
-                        ),
-                    )
-                )
-                if selected is None:
-                    return
-                inserts = selected
-            if "update" in operations:
-                selected = await self.app._await_modal(  # type: ignore[attr-defined]
-                    SelectionScreen(
-                        title=f"Update columns: {resource.display_name}",
-                        multi=True,
-                        options=tuple(
-                            PickerOption(column, column)
-                            for column in resource.eligible_assignment_columns
-                        ),
-                    )
-                )
-                if selected is None:
-                    return
-                updates = selected
+            # Columns come from the login's grants when the host previews this.
             scopes[resource.display_name] = {
                 "allowed_operations": operations,
-                "allowed_insert_columns": inserts,
-                "allowed_update_columns": updates,
-                "max_rows": self._max_rows(scopes.get(resource.display_name)),
+                "max_rows": max(
+                    _DEFAULT_MAX_ROWS,
+                    0 if stored is None else cast(int, stored["max_rows"]),
+                ),
             }
         await self._preview_permissions(
             controller,
@@ -260,12 +239,6 @@ class PermissionsScreen(Screen[bool]):
             read_resource_ids=state.read_scope.resource_ids,
             updates=scopes,
         )
-
-    def _max_rows(self, stored: Mapping[str, object] | None) -> int:
-        typed = self.query_one("#perm-max-rows", Input).value.strip()
-        if typed:
-            return int(typed)
-        return 100 if stored is None else cast(int, stored["max_rows"])
 
     async def _preview_mode(
         self,

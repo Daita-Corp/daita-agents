@@ -9,10 +9,9 @@ from rich.cells import cell_len
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import ActiveBinding, Binding
-from textual.containers import Center, Horizontal, Vertical
+from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Button, Footer, OptionList, Static, Tab, Tabs, TextArea
-from textual.widgets.option_list import Option
 
 from daita import ApprovalDecision, ApprovalRequest
 
@@ -76,6 +75,8 @@ def welcome_text(
             welcome.append("\n")
         welcome.append(logo, style="bold")
         welcome.append(line, style=style)
+    if model_line[0] == "✓" and data_line[0] == "✓":
+        return welcome
     for mark, label, detail in (model_line, data_line):
         welcome.append("\n" + " " * cell_len(_WELCOME_LOGO[0]))
         welcome.append(mark, style="green" if mark == "✓" else "bold")
@@ -128,8 +129,6 @@ class ChatScreen(Screen[None]):
                 with Vertical(id="conversation-pane"):
                     with Vertical(id="welcome-region"):
                         yield Static(welcome_text(), id="welcome", markup=False)
-                        with Center(id="suggestions-row"):
-                            yield OptionList(id="suggestions")
                     yield TranscriptView()
                     yield ApprovalPanel()
                 yield CommandSections()
@@ -284,7 +283,9 @@ class ChatScreen(Screen[None]):
             self.action_focus_conversation()
             return
         self.run_worker(
-            self.daita_app.open_command_center_item(event.section, event.item_id),
+            self.daita_app.open_command_center_item(
+                event.section, event.item_id, title=event.title
+            ),
             name="command-center-navigation",
             group="foreground-interaction",
             exclusive=True,
@@ -351,29 +352,12 @@ class ChatScreen(Screen[None]):
         model: str | None,
         sources: int,
         catalog_empty: bool,
-        suggestions: tuple[str, ...],
     ) -> None:
         self.query_one("#welcome", Static).update(
             welcome_text(model=model, sources=sources, catalog_empty=catalog_empty)
         )
-        listing = self.query_one("#suggestions", OptionList)
-        listing.clear_options()
-        listing.add_options(
-            [
-                Option(Text.assemble(("› ", "bold"), suggestion), id=suggestion)
-                for suggestion in suggestions
-            ]
-        )
-        listing.display = bool(suggestions)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        if event.option_list.id == "suggestions":
-            event.stop()
-            composer = self.query_one(Composer)
-            composer.load_text(event.option.id or "")
-            composer.move_cursor((0, len(composer.text)))
-            composer.focus()
-            return
         if event.option_list.id != "completion-list":
             return
         popup = self.query_one(CompletionPopup)
@@ -470,9 +454,9 @@ class ChatScreen(Screen[None]):
     def clear_notice(self) -> None:
         self.query_one(NoticeBar).clear()
 
-    def set_blocks(self, blocks: tuple[TranscriptBlock, ...]) -> None:
+    async def set_blocks(self, blocks: tuple[TranscriptBlock, ...]) -> None:
         transcript = self.query_one(TranscriptView)
-        transcript.set_blocks(blocks)
+        await transcript.set_blocks(blocks)
         self._show_conversation(bool(blocks))
 
     def append_block(self, block: TranscriptBlock) -> None:
@@ -529,10 +513,6 @@ class ChatScreen(Screen[None]):
     def _show_conversation(self, has_blocks: bool) -> None:
         self.query_one("#welcome-region", Vertical).display = not has_blocks
         self.query_one("#welcome").display = not has_blocks
-        self.query_one("#suggestions").display = (
-            not has_blocks
-            and self.query_one("#suggestions", OptionList).option_count > 0
-        )
         self.query_one(TranscriptView).display = has_blocks
 
     def set_submitting(self, submitting: bool) -> None:
