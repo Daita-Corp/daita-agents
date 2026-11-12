@@ -2,9 +2,13 @@
 
 Daita versions its entire agent home as one unit. The home revision is separate
 from the package version, Git tag, and SQLite schema version. Current revision
-`3` is unreleased; supported homes from revision `1` onward upgrade automatically.
+`4` ships with 1.3.0; supported homes from revision `1` onward upgrade automatically.
 
-Revision `3` adds caller provenance, MCP service contracts, and an independent
+Revision `4` adds bounded analytical evidence, artifact computation provenance,
+declared catalog links and per-resource catalog storage; it converts each stored
+source snapshot into per-resource catalog rows.
+
+Revision `3`, released in 1.2, adds caller provenance, MCP service contracts, and an independent
 artifact registry. Upgrades preserve existing artifact bytes. Homes from the
 original revision-3 MCP development format also convert automatically, preserving
 caller and MCP records. Unrecognized development formats are rejected; contributor

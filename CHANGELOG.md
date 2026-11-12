@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.3.0 (unreleased)
+## 1.3.0 (2026-11-12)
 
 Daita's agent now works with your data where it lives. The model names sources and
 tables, never IDs. Reads go straight to the source, and the catalog only advises.
