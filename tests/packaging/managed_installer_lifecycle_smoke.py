@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -208,7 +209,12 @@ def main() -> int:
 
         environment = fixture_environment(active_fixture, home)
         launcher = home / ".local" / "bin" / "daita"
-        if arguments.real_uv_archive is not None and sys.platform == "darwin":
+        # The analysis runtime supports Apple Silicon only (runtime_status).
+        if (
+            arguments.real_uv_archive is not None
+            and sys.platform == "darwin"
+            and platform.machine() == "arm64"
+        ):
             installed_python = (
                 _current_generation(managed_root) / "tool/daita-agents/bin/python"
             )
