@@ -140,8 +140,9 @@ async def test_actual_sdk_liveness_and_release(family, scenario, monkeypatch):
                         "first_progress",
                     )
                     # timeout_reason above pins which deadline fired; this bound only
-                    # proves a prompt return, with scheduling headroom for loaded runs.
-                    assert elapsed < 1.5
+                    # proves a return before the 3 s guard; a loaded parallel run has
+                    # measured 1.67 s against the 1.2 s request deadline.
+                    assert elapsed < 2.5
                     if scenario == "text_trickle":
                         assert elapsed >= 0.75
                     elif scenario in {"comments", "empty_events"}:

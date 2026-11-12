@@ -284,6 +284,12 @@ class CatalogKeeper:
             self._people -= 1
             self._wake.set()
 
+    async def settle(self) -> None:
+        """Stop a background read and wait for the pass in progress to finish."""
+
+        async with self.person_work(), self._work:
+            pass
+
     # Facts ------------------------------------------------------------------
 
     def facts(self, source_id: str) -> KeeperFacts:

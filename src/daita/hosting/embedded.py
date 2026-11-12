@@ -5123,6 +5123,9 @@ class EmbeddedAgent:
                 await self._store.save_source_state(
                     replace(state, keep_current=keep_current)
                 )
+        if not keep_current:
+            # Off means the keeper touches this source no more once this returns.
+            await self._keeper.settle()
         self._keeper.wake()
         return await self.catalog_status(source_id)
 
