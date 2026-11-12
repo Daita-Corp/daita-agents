@@ -236,9 +236,7 @@ class Connection:
                 "__daita_action": (
                     "insert"
                     if existing is None
-                    else "update"
-                    if "__daita_after_0" in items
-                    else "skip"
+                    else "update" if "__daita_after_0" in items else "skip"
                 ),
                 "__daita_key": json.dumps([row[KEY_COLUMN]]),
                 "__daita_bound": sha256(

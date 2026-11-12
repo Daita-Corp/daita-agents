@@ -393,9 +393,7 @@ class ApprovalPauses:
         return self._open > 0
 
     def seconds(self) -> float:
-        current = (
-            asyncio.get_running_loop().time() - self._since if self._open else 0.0
-        )
+        current = asyncio.get_running_loop().time() - self._since if self._open else 0.0
         return self._total + current
 
     def enter(self) -> None:

@@ -46,8 +46,6 @@ _WELCOME_LOGO = (
 )
 
 
-
-
 def welcome_text(
     *, model: str | None = None, sources: int = 0, catalog_empty: bool = False
 ) -> Text:
