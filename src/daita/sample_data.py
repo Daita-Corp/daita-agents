@@ -463,7 +463,13 @@ class _Generator:
                         else "refunded" if draw < 0.06 else "completed"
                     )
                     orders.append(
-                        (order_id, account_id, ordered.isoformat(), status, _money(total))
+                        (
+                            order_id,
+                            account_id,
+                            ordered.isoformat(),
+                            status,
+                            _money(total),
+                        )
                     )
         return orders, items
 
@@ -497,7 +503,9 @@ class _Generator:
                     (len(payments) + 1, invoice_id, paid.isoformat(), total, method)
                 )
                 if status == "refunded":
-                    refunded = min(paid + timedelta(days=rng.randint(5, 40)), SAMPLE_AS_OF)
+                    refunded = min(
+                        paid + timedelta(days=rng.randint(5, 40)), SAMPLE_AS_OF
+                    )
                     payments.append(
                         (
                             len(payments) + 1,

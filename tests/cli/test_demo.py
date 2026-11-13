@@ -206,9 +206,7 @@ def test_demo_creates_an_isolated_agent_over_the_sample_data(tmp_path: Path) -> 
     assert result["open_command"] == f"daita --root {root} chat demo"
     assert len(result["questions"]) == 4
     assert _digest(_rows(database)) == SAMPLE_DIGEST
-    assert asyncio.run(_sources(root, "demo")) == [
-        ("sample_business", str(database))
-    ]
+    assert asyncio.run(_sources(root, "demo")) == [("sample_business", str(database))]
     assert asyncio.run(_sources(root, "atlas")) == before
     assert asyncio.run(Agent.list(root=root)) == ("atlas", "demo")
 
@@ -232,9 +230,7 @@ def test_demo_is_reused_on_a_second_run_and_reset_is_idempotent(
         resets.append(json.loads(stdout))
     assert len({first["agent_id"], *(item["agent_id"] for item in resets)}) == 3
     assert _rows(database) == rows
-    assert asyncio.run(_sources(root, "demo")) == [
-        ("sample_business", str(database))
-    ]
+    assert asyncio.run(_sources(root, "demo")) == [("sample_business", str(database))]
     assert asyncio.run(Agent.list(root=root)) == ("demo",)
     assert sorted(item.name for item in database.parent.iterdir()) == [
         "agent.json",
