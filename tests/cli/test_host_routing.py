@@ -82,6 +82,30 @@ async def test_agent_commands_reach_the_host_and_keep_their_output(
     assert harness.host.registry.open_names() == ()
 
 
+async def test_demo_sets_up_and_resets_its_agent_through_the_host(
+    start_host: StartHost,
+) -> None:
+    harness = await start_host()
+    await harness.create_agent()
+
+    code, stdout, stderr = await _daita(harness, "demo", "--json")
+    assert (code, stderr) == (0, "")
+    first = json.loads(stdout)
+    assert harness.host.registry.open_names() == ("demo", "sales")
+    code, stdout, stderr = await _daita(harness, "demo", "--reset", "--json")
+    assert (code, stderr) == (0, "")
+    reset = json.loads(stdout)
+
+    assert reset["agent_id"] != first["agent_id"]
+    assert reset["database"] == first["database"]
+    code, stdout, stderr = await _daita(harness, "sources", "demo")
+    assert (code, stderr) == (0, "")
+    assert [item["name"] for item in json.loads(stdout)] == ["sample_business"]
+    code, stdout, stderr = await _daita(harness, "sources", "sales")
+    assert (code, stderr) == (0, "")
+    assert json.loads(stdout) == []
+
+
 async def test_no_host_fails_clearly_while_the_host_holds_the_agent(
     start_host: StartHost,
 ) -> None:
