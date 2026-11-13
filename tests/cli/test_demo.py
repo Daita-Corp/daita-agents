@@ -246,7 +246,9 @@ def test_demo_never_takes_over_an_agent_it_did_not_create(tmp_path: Path) -> Non
     for argv in ((), ("--reset",)):
         code, stdout, stderr = _demo(root, *argv)
         assert (code, stdout) == (1, "")
-        assert "was not created by `daita demo`" in json.loads(stderr)["error"]
+        error = json.loads(stderr)["error"]
+        assert "was not created by `daita demo`" in error
+        assert "`daita delete demo --yes`, then `daita demo`" in error
         assert asyncio.run(_sources(root, "demo")) == []
     assert not (root / "demo" / SAMPLE_DATABASE_FILENAME).exists()
 

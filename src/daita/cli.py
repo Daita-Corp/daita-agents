@@ -1095,7 +1095,8 @@ async def _demo(
             if agent.id != _read_demo_marker(marker):
                 raise ValueError(
                     f"an agent named {args.name!r} already exists and was not "
-                    "created by `daita demo`; it was left unchanged"
+                    "created by `daita demo`; it was left unchanged. To replace "
+                    f"it, run `daita delete {args.name} --yes`, then `daita demo`"
                 )
             if args.reset:
                 await agent.close()
