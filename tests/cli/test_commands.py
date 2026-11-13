@@ -1050,6 +1050,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
     assert set(commands) == {
         "artifacts",
         "create",
+        "demo",
         "attach",
         "sources",
         "relational-write-readiness",
@@ -1077,6 +1078,10 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
     assert _surface(commands["delete"]) == (
         ("name",),
         frozenset({"-h", "--help", "--yes"}),
+    )
+    assert _surface(commands["demo"]) == (
+        (),
+        frozenset({"-h", "--help", "--reset", "--json"}),
     )
     state = _subcommands(commands["state"])
     assert set(state) == {"status"}

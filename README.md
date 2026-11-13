@@ -55,6 +55,13 @@ daita host install
 it running after you close the terminal and after login, so scheduled work and
 approvals continue; `daita host status` shows it.
 
+No database handy? `daita demo` builds a small fictional business database on
+your machine (customers, accounts, orders, invoices, payments and support
+tickets, a few years of history) and sets up a separate `demo` agent that reads
+it. It changes none of your agents or sources, prints questions to try, and
+`daita demo --reset` starts it over. You still choose a model the first time
+you open it.
+
 The first launch guides you through creating an agent, configuring a model, and
 optionally attaching a data source for reading. The launch directory becomes
 the default local working directory of the session folder source, which also
