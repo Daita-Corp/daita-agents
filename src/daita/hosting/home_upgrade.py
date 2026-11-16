@@ -34,12 +34,20 @@ from ..storage.home_migrations.revision_0003 import (
     is_pre_registry_revision_3,
 )
 from ..storage.schema_contract import require_healthy, require_schema
+from ..storage.sqlite import validate_current_state_database
+from .configuration import (
+    _MODEL_CONFIG_NAME,
+    _read_model_configuration,
+    _read_model_configuration_document,
+)
 
 _UPGRADE_DIRECTORY = ".home-upgrade"
 _ROLLBACK_DIRECTORY = ".home-rollbacks"
 _JOURNAL_NAME = "journal.json"
 _MAX_JOURNAL_BYTES = 256 * 1024
 _DISK_HEADROOM_BYTES = 1024 * 1024
+# The only home files a bare state directory can hold.
+_STATE_DIRECTORY_PATHS = frozenset({"state.db", _MODEL_CONFIG_NAME})
 
 HomeValidator = Callable[[Path, Path, frozenset[str]], None]
 PhaseHook = Callable[[str], None]
@@ -151,9 +159,13 @@ def _has_table(connection: sqlite3.Connection, name: str) -> bool:
 def inspect_agent_home(home: Path) -> AgentHomeStatus:
     """Return compatibility facts without changing the home."""
 
-    home = _resolve_home(home)
+    return _inspect(_resolve_home(home), manifest=True)
+
+
+def _inspect(home: Path, *, manifest: bool) -> AgentHomeStatus:
     try:
-        _require_regular(home / "agent.toml")
+        if manifest:
+            _require_regular(home / "agent.toml")
         _require_regular(home / "state.db")
         _require_regular(home / "config.json", optional=True)
         upgrade_path = home / _UPGRADE_DIRECTORY
@@ -900,6 +912,76 @@ def upgrade_agent_home(
 ) -> AgentHomeUpgradeResult:
     """Recover or upgrade one locked home and return its exact transition."""
 
+    return _upgrade(
+        home,
+        inspect=inspect_agent_home,
+        validate_home=validate_home,
+        phase_hook=phase_hook,
+    )
+
+
+def upgrade_state_directory(
+    directory: Path,
+    *,
+    phase_hook: PhaseHook | None = None,
+) -> AgentHomeUpgradeResult:
+    """Upgrade a directory holding ``state.db`` and, if saved, ``config.json``.
+
+    A custom storage adapter exports its rows into a SQLite database at the
+    stored revision, upgrades it here and loads the result. The registered
+    migrations run with the same staging, journal, crash recovery, history and
+    schema checks as a local home, and every current record and the model
+    configuration are validated. A migration that changes any other home file
+    is refused before anything is staged. The caller must hold the directory
+    exclusively for the whole call.
+    """
+
+    def inspect(home: Path) -> AgentHomeStatus:
+        status = _inspect(home, manifest=False)
+        if status.upgrade_required:
+            for migration in _planned_migrations(
+                status.found_revision or 0, status.source_kind
+            ):
+                missing = sorted(set(migration.affected_paths) - _STATE_DIRECTORY_PATHS)
+                if missing:
+                    raise _error(
+                        StateCompatibilityCode.REVISION_UNSUPPORTED,
+                        home,
+                        f"Revision {migration.revision} ({migration.migration_id}) "
+                        f"changes {', '.join(missing)}, which a state directory "
+                        "cannot hold. No local data was changed.",
+                        found=status.found_revision,
+                    )
+        return status
+
+    return _upgrade(
+        directory,
+        inspect=inspect,
+        validate_home=_validate_state_directory,
+        phase_hook=phase_hook,
+    )
+
+
+def _validate_state_directory(
+    source: Path, candidate: Path, affected: frozenset[str]
+) -> None:
+    state_home = candidate if candidate == source or "state.db" in affected else source
+    identity = validate_current_state_database(state_home / "state.db")
+    config_home = (
+        candidate if candidate == source or _MODEL_CONFIG_NAME in affected else source
+    )
+    _read_model_configuration_document(config_home)
+    if identity is not None and candidate != source:
+        _read_model_configuration(config_home, identity.id)
+
+
+def _upgrade(
+    home: Path,
+    *,
+    inspect: Callable[[Path], AgentHomeStatus],
+    validate_home: HomeValidator,
+    phase_hook: PhaseHook | None,
+) -> AgentHomeUpgradeResult:
     home = _resolve_home(home)
     recovered = False
     try:
@@ -908,7 +990,7 @@ def upgrade_agent_home(
             validate_home=validate_home,
             phase_hook=phase_hook,
         )
-        status = inspect_agent_home(home)
+        status = inspect(home)
         if not status.upgrade_required:
             try:
                 validate_home(home, home, frozenset())
@@ -978,4 +1060,5 @@ __all__ = [
     "AgentHomeUpgradeResult",
     "inspect_agent_home",
     "upgrade_agent_home",
+    "upgrade_state_directory",
 ]

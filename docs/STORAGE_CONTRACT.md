@@ -108,15 +108,74 @@ The canonical `CURRENT_DATABASE_SQL`/`CURRENT_SCHEMA` in
 `daita.storage.sqlite_schema`, schema inspection in `daita.storage.schema_contract`,
 and the registry in `daita.storage.home_migrations` are the shared format sources.
 Schema projection must reject unsupported semantics rather than silently discard
-them. Released migration definitions remain immutable. Existing migrations and
-the whole-home upgrade runner currently use local files; a custom upgrade runner
-must reuse the definitions and transformations, and qualify its execution path.
-These interfaces do not make existing local upgrade code portable automatically.
+them. Released migration definitions remain immutable. Migrations run on local
+files, so an adapter upgrades its store through a SQLite round trip (below)
+rather than re-expressing them.
 
 Keep concrete drivers, tenant/security policy, object layout, provisioning,
 lease services and deployment checks in the consuming application. The framework
 owns reusable semantics and local defaults, with no infrastructure-specific
 release fingerprint or second feature-migration sequence.
+
+## Upgrading an adapter's store
+
+When a release advances the home revision (see
+[agent-home upgrades](LOCAL_STATE_UPGRADES.md)), upgrade the adapter's store
+before using it with that release. The framework's migrations run unchanged on
+a SQLite copy:
+
+```python
+import sqlite3
+from pathlib import Path
+
+from daita.hosting.home_upgrade import upgrade_state_directory
+from daita.storage.home_migrations import (
+    HOME_MIGRATIONS,
+    insert_migration_row,
+    revision_database,
+)
+
+def upgrade_store(directory: Path, stored_revision: int) -> None:
+    # 1. Export: an empty database at the store's revision, then its rows.
+    sql, schema = revision_database(stored_revision)
+    with sqlite3.connect(directory / "state.db") as connection:
+        connection.executescript(sql)
+        for migration in HOME_MIGRATIONS[:stored_revision]:
+            insert_migration_row(connection, migration)
+        export_rows(connection)  # adapter-owned: every row, in `schema`'s shape
+    write_saved_model_configuration(directory)  # adapter-owned; config.json, if any
+    # 2. Upgrade with the registered migrations.
+    upgrade_state_directory(directory)
+    # 3. Load: replace the store's rows with the upgraded database's.
+    load_rows(directory / "state.db")  # adapter-owned
+```
+
+`revision_database(revision)` returns the SQL that creates an empty database at
+any revision from 1 to the current one, and the `SQLiteSchema` that revision's
+migration checks. `upgrade_state_directory(directory)` takes an absolute
+directory holding `state.db` and, if the agent has a saved model configuration,
+`config.json`. It runs the registered migrations with the same staging, upgrade
+journal, crash recovery, ledger history and schema checks as a local home, then
+validates every current record and the model configuration. A directory without
+`config.json` upgrades as a local home without one does. A migration that would
+change any other home file (`agent.toml`, memory, skills, artifacts) is refused
+with `StateCompatibilityError` before anything is staged. Revision 3 also reads
+artifact manifests under `artifacts/`; supply them there when a delivery refers
+to an artifact. On success the previous files stay under `.home-rollbacks/`;
+after an interruption, calling it again finishes or discards the unfinished
+upgrade.
+
+The adapter still owns exporting and loading rows, its physical schema and
+indexes, mapping its keys to the canonical ones, credentials and tenant
+security, taking the store out of service and holding the directory exclusively
+for the whole round trip, and keeping its own backup until the load commits.
+
+`tests/fixtures/state-upgrades/revision-3-to-4/` publishes the revision 3 to 4
+change as data: `before/state.sql` and `before/config.json` are a small home at
+revision 3, and `after/` holds the records and configuration the upgrade must
+produce. An adapter's test loads `before` into its store, runs its round trip and
+compares the store's rows with `after/state.sql` loaded into SQLite;
+`tests/storage/test_state_directory_upgrade.py` does the same for the framework.
 
 ## Ownership and lifecycle
 

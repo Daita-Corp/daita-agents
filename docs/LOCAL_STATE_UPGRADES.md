@@ -167,7 +167,9 @@ To add revision `N`:
    path.
 2. Append it to `HOME_MIGRATIONS`; never edit an earlier transition.
 3. Commit its literal released checksum.
-4. Add a complete golden agent-home fixture for revision `N`.
+4. Add a complete golden agent-home fixture for revision `N`, add its database
+   SQL to `revision_database`, and publish the `N-1` to `N` state-directory
+   upgrade fixture for custom storage adapters.
 5. Test every supported prior production revision through the current revision,
    including crash boundaries, rollback, durable-data preservation, and
    downgrade refusal.
