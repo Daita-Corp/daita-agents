@@ -99,6 +99,18 @@ parameter translation, physical isolation, bounded waits and driver-error
 normalization. An unknown commit must stop further writes; never replay it.
 `run_sql_transaction` supplies the existing cancellation owner for adapter writes.
 
+The shared SQL uses no SQLite-only construct outside these hooks:
+
+- `insertion_order` must order rows by when they were inserted, unchanged by
+  later updates. Only `effect_receipts` is read this way (a job's receipts, in
+  reservation order), so an adapter must supply it for that table. No stored
+  column records that order. SQLite uses `rowid`.
+- `conflict(columns)` receives every upsert's canonical conflict columns and
+  returns the adapter's physical conflict target.
+- `distinct_operator` is the null-safe inequality operator.
+- `caller_expression(column)` extracts the caller principal from a stored run
+  input.
+
 The supplied database is borrowed: `SQLStateStore.close()` clears its own caches,
 not the database's pools or credentials. The composing caller must drain active
 operations, close the state handle, then release its owned resources. Opening a
@@ -239,10 +251,11 @@ cases; see [testing](TESTING.md). The cases use logical operations rather than
 concrete store internals. Missing adapter prerequisites must fail qualification.
 
 Coverage includes job records, identity and
-transcript recovery, passive connection setup, scoped effect recovery, transcript
-pages/access, artifact lifecycle/cursors, and routine authority/claims/budgets/
-recovery/delivery, catalog/permission detach, semantic digest CAS, learning review
-stamps and connector revisions. SQLite-specific cases additionally exercise real
+transcript recovery, passive connection setup, scoped effect recovery, job
+receipt order, analysis-evidence upserts, transcript pages/access, artifact
+lifecycle/cursors, and routine authority/claims/budgets/recovery/delivery,
+catalog/permission detach, semantic digest CAS, learning review stamps and
+connector revisions. SQLite-specific cases additionally exercise real
 process contention, transaction rollback, read snapshots and query-count budgets.
 Supervisor integration cases exercise transient and terminal storage failures,
 health reporting, idle polling and prompt wakeup without model calls.
