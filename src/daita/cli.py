@@ -173,6 +173,10 @@ def _mcp_status_mapping(status: MCPBindingStatus) -> dict[str, object]:
     }
 
 
+DEMO_AGENT = "demo"
+_DEMO_MARKER = "agent.json"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="daita")
     parser.add_argument("--version", action="version", version=f"daita {__version__}")
@@ -198,6 +202,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     create = commands.add_parser("create", help="create an agent")
     create.add_argument("name")
+
+    demo = commands.add_parser(
+        "demo",
+        help="set up a separate demo agent with built-in sample data",
+    )
+    demo.add_argument(
+        "--reset",
+        action="store_true",
+        help="rebuild the sample data and the demo agent from scratch",
+    )
+    demo.add_argument("--json", action="store_true", dest="as_json")
+    demo.set_defaults(name=DEMO_AGENT)
 
     attach = commands.add_parser("attach", help="attach a read-only source")
     attach.add_argument("name")
@@ -939,6 +955,15 @@ async def _prompt_for_exact_approval(
         print("Enter y to approve or n to deny.")
 
 
+def _state_root(root: Path | None) -> Path:
+    state_root = (
+        (Path.home() / ".daita")
+        if root is None
+        else Path(os.path.abspath(os.fspath(root))).resolve(strict=False)
+    )
+    return state_root.resolve(strict=False)
+
+
 def _resolve_cli_workspace(args: argparse.Namespace) -> LocalWorkspace:
     sensitivity = ModelSensitivity(args.workspace_sensitivity)
     explicit = args.workspace
@@ -949,14 +974,8 @@ def _resolve_cli_workspace(args: argparse.Namespace) -> LocalWorkspace:
             access=LocalFileAccess.COMPUTER,
         )
 
-    state_root = (
-        (Path.home() / ".daita")
-        if args.root is None
-        else Path(os.path.abspath(os.fspath(args.root))).resolve(strict=False)
-    )
-    state_root = state_root.resolve(strict=False)
     return LocalWorkspace(
-        working_directory(Path.cwd().resolve(strict=True), state_root),
+        working_directory(Path.cwd().resolve(strict=True), _state_root(args.root)),
         sensitivity=sensitivity,
         access=LocalFileAccess.COMPUTER,
     )
@@ -999,6 +1018,156 @@ async def _open_agent(
     )
     # RemoteAgent mirrors every Agent member the CLI calls.
     return typing.cast(Agent, remote)
+
+
+async def _list_agents(args: argparse.Namespace) -> tuple[str, ...]:
+    if args.no_host:
+        return await Agent.list(root=args.root)
+    from .host.client import RemoteAgent
+
+    return await RemoteAgent.list(root=args.root)
+
+
+async def _create_agent(args: argparse.Namespace, workspace: LocalWorkspace) -> Agent:
+    if args.no_host:
+        return await Agent.create(args.name, workspace=workspace, root=args.root)
+    from .host.client import RemoteAgent
+
+    _host_workspace(workspace)
+    created = await RemoteAgent.create(args.name, workspace=workspace, root=args.root)
+    return typing.cast(Agent, created)
+
+
+async def _delete_agent(args: argparse.Namespace) -> None:
+    if args.no_host:
+        await Agent.delete(args.name, root=args.root)
+        return
+    from .host.client import RemoteAgent
+
+    # The host closes the agent first if it holds it.
+    await RemoteAgent.delete(args.name, root=args.root)
+
+
+def _read_demo_marker(marker: Path) -> str | None:
+    try:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    agent_id = value.get("agent_id") if isinstance(value, dict) else None
+    return agent_id if isinstance(agent_id, str) else None
+
+
+def _write_demo_marker(marker: Path, agent_id: str) -> None:
+    temporary = marker.with_name(f".{marker.name}.{os.getpid()}.partial")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as file:
+        json.dump({"agent_id": agent_id}, file)
+    os.replace(temporary, marker)
+
+
+async def _demo(
+    args: argparse.Namespace, workspace: LocalWorkspace
+) -> dict[str, object]:
+    """Set up the demo agent over the built-in sample data.
+
+    The demo agent is the only agent this touches. Its id is recorded beside
+    the sample data, so an unrelated agent that happens to be named ``demo`` is
+    never reused, reset or deleted.
+    """
+
+    from .sample_data import (
+        LEARN_EXAMPLE,
+        SAMPLE_AS_OF,
+        SAMPLE_DATABASE_FILENAME,
+        SUGGESTED_QUESTIONS,
+        build_sample_database,
+    )
+
+    directory = _state_root(args.root) / "demo"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = directory.resolve(strict=True)
+    database = directory / SAMPLE_DATABASE_FILENAME
+    marker = directory / _DEMO_MARKER
+    agent: Agent | None = None
+    try:
+        if args.name in await _list_agents(args):
+            agent = await _open_agent(args, workspace, {})
+            if agent.id != _read_demo_marker(marker):
+                raise ValueError(
+                    f"an agent named {args.name!r} already exists and was not "
+                    "created by `daita demo`; it was left unchanged. To replace "
+                    f"it, run `daita delete {args.name} --yes`, then `daita demo`"
+                )
+            if args.reset:
+                await agent.close()
+                agent = None
+                await _delete_agent(args)
+        if args.reset:
+            marker.unlink(missing_ok=True)
+            database.unlink(missing_ok=True)
+        if not database.exists():
+            await asyncio.to_thread(build_sample_database, database)
+        if agent is None:
+            agent = await _create_agent(args, workspace)
+            _write_demo_marker(marker, agent.id)
+        source = next(
+            (
+                item
+                for item in await agent.list_sources()
+                if item.active
+                and item.adapter_id == "sqlite"
+                and item.configuration.get("path") == str(database)
+            ),
+            None,
+        )
+        if source is None:
+            source = await agent.attach(SQLiteSource(database))
+        open_command = ["daita", "chat", args.name]
+        if args.root is not None:
+            open_command[1:1] = ["--root", str(args.root)]
+        return {
+            "agent": args.name,
+            "agent_id": agent.id,
+            "source": source.display_name,
+            "database": str(database),
+            "data_as_of": SAMPLE_AS_OF.isoformat(),
+            "model_configured": agent.model_profile is not None,
+            "open_command": shlex.join(open_command),
+            "questions": list(SUGGESTED_QUESTIONS),
+            "learn_example": LEARN_EXAMPLE,
+        }
+    finally:
+        if agent is not None:
+            await agent.close()
+
+
+def _demo_guide(result: Mapping[str, object]) -> str:
+    questions = result["questions"]
+    assert isinstance(questions, list)
+    lines = [
+        f"Demo agent {result['agent']!r} is ready with the read-only source "
+        f"{result['source']!r}: a fictional business with data up to "
+        f"{result['data_as_of']}.",
+        f"Sample data: {result['database']}",
+        "Your other agents and sources were not changed.",
+        "",
+        f"Open it:  {result['open_command']}",
+    ]
+    if not result["model_configured"]:
+        lines.append(
+            "It has no model yet: the app's checklist and /model set one up "
+            "(a provider key, a supported subscription or Ollama)."
+        )
+    lines += ["", "Then try:"]
+    lines += [f"  {index}. {text}" for index, text in enumerate(questions, start=1)]
+    lines += [
+        "",
+        "Teach it a business term:",
+        f"  {result['learn_example']}",
+        "",
+        "Start over any time with `daita demo --reset`.",
+    ]
+    return "\n".join(lines)
 
 
 async def _deny_without_prompting(request: ApprovalRequest) -> ApprovalDecision:
@@ -1052,28 +1221,15 @@ async def _execute(args: argparse.Namespace) -> object:
     if args.command == "delete":
         if not args.yes:
             raise ValueError("delete requires --yes")
-        if args.no_host:
-            await Agent.delete(args.name, root=args.root)
-        else:
-            from .host.client import RemoteAgent
-
-            # The host closes the agent first if it holds it.
-            await RemoteAgent.delete(args.name, root=args.root)
+        await _delete_agent(args)
         return {"name": args.name, "deleted": True}
     if args.command == "diagnostics":
         return {"runs": summarize_diagnostics(args.path)}
     workspace = _resolve_cli_workspace(args)
+    if args.command == "demo":
+        return await _demo(args, workspace)
     if args.command == "create":
-        if args.no_host:
-            agent = await Agent.create(args.name, workspace=workspace, root=args.root)
-        else:
-            from .host.client import RemoteAgent
-
-            _host_workspace(workspace)
-            created = await RemoteAgent.create(
-                args.name, workspace=workspace, root=args.root
-            )
-            agent = typing.cast(Agent, created)
+        agent = await _create_agent(args, workspace)
         try:
             return {"agent_id": agent.id, "name": agent.name, "home": str(agent.home)}
         finally:
@@ -1773,6 +1929,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command is None or args.command == "chat":
         assert isinstance(result, int)
         return result
+    if args.command == "demo" and not args.as_json:
+        assert isinstance(result, dict)
+        print(_demo_guide(result))
+        return 0
     print(json.dumps(result, default=str, sort_keys=True))
     return 0
 
