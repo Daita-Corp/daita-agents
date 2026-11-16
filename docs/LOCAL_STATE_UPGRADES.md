@@ -27,6 +27,117 @@ compatible together, including:
 home's detected revision, the minimum supported revision, whether an upgrade is
 required, and whether crash recovery is pending. It is read-only.
 
+## Revisions and what each upgrade changes
+
+An upgrade applies every later revision in order, so a revision-1 home opened by
+1.3.0 goes through revisions 2, 3 and 4. Each entry below is taken from that
+revision's migration in `src/daita/storage/home_migrations/`. "Touches" lists the
+migration's `affected_paths`: the files it may rewrite. Every upgrade stages and
+backs up those files first (see *Open and upgrade behavior*).
+
+| Revision | First release | Touches |
+| --- | --- | --- |
+| 1 | 1.1.0 | `state.db`, `config.json` |
+| 2 | 1.1.0 | `state.db` |
+| 3 | 1.2.0 | `state.db` (reads `artifacts/*/*/manifest.json`, never writes them) |
+| 4 | 1.3.0 | `state.db`, `config.json` |
+
+Releases 1.0.x wrote a home with an earlier development journal
+(`development_baseline`); it has no home revision. Releases 1.1.1, 1.1.2, 1.2.1 and
+1.2.2 did not change the revision.
+
+### Revision 1 (1.1.0)
+
+Admits a home written before the revision ledger existed, and only when its
+database matches one of three exact recognized shapes; any other home is refused
+unchanged. This bridge is not a general legacy framework: Daita `0.19.0` and
+earlier are a different product family and are not upgraded automatically.
+
+- The development journal (`state_migrations`) is replaced by the revision ledger.
+  Every other table is copied as it is, and stored records lose their redundant
+  `version` field.
+- The upgrade is refused, not lossy, when the old home holds rows in a table the
+  new format has no place for: database write receipts, PostgreSQL update scopes,
+  or the old conversation inbox.
+- `config.json`: each model candidate's `profile` becomes `profile_limits`. For a
+  model Daita already knows, the saved context and output limits are dropped and
+  Daita's own limits apply. The retry policy's `attempts` becomes a per-candidate
+  limit with a total of at most 25 attempts, and a missing model call policy gets
+  the default timeouts.
+
+### Revision 2 (1.1.0)
+
+Replaces single jobs and autonomous follow-ups with the durable task graph.
+
+- Succeeded, failed, cancelled and needs-attention jobs keep their state and
+  evidence. A job with a cancellation requested becomes cancelled.
+- An unfinished job stays runnable only if it is a data-profile job run by Daita
+  that has not passed its deadline, has fewer than 3 attempts and no recorded
+  external activity. Every other unfinished job, and every job with a follow-up
+  that was not delivered, becomes needs attention and does not run.
+- Follow-ups are removed. A delivered follow-up's delivery moves to its job.
+- Daita does not fall back to the previous executor. Revision `1` decoders stay
+  inside this migration and are not part of current execution.
+
+### Revision 3 (1.2.0)
+
+Adds caller provenance, MCP service contracts and the artifact registry. No
+record is dropped.
+
+- Each stored run records who called it: the run's scope principal, or the agent
+  for a foreground run.
+- Each MCP binding is marked as owned by the agent with no personal connection,
+  and each MCP tool's raw input schema is recorded as unknown; the admitted
+  schema and its digest are kept.
+- An artifact is registered when a run's tool result, a job task result, a
+  delivery or an unfinished job attempt refers to it. Its bytes stay where they
+  are. An artifact file nothing refers to is not registered.
+- A home from the exact pre-registry development build of revision 3 is also
+  converted; its caller and MCP records are kept as they are.
+
+### Revision 4 (1.3.0)
+
+Replaces the task graph with checklist jobs, stores the catalog per resource and
+simplifies routines. This revision drops or resets data:
+
+- **Jobs.** Each graph job becomes one checklist job with the same job ID. A
+  finished job keeps its state and accepted result; a cancellation in progress
+  becomes cancelled. An unfinished job fails with "Created by an older version of
+  Daita; start it again." (`job_upgraded`) and shows as Needs you. Converted jobs
+  start with an empty checklist, no runs counted, a limit of 20 runs and
+  1,000,000 tokens. Result deliveries and receipts keep their job ID. Graph
+  attention notices are deleted, and so is a second result delivery for the same
+  job and target. The graph tables, including tasks, attempts, results,
+  checkpoints, comments, controls, events and budget ledgers, are dropped.
+- **Catalog.** Each source's stored snapshot becomes one row per table,
+  relationship and search entry, with unchanged resource IDs and revisions, and
+  every table counts as fully described. The snapshot table is dropped. Catalog
+  change history starts empty. Every past sync is marked complete.
+- **SQLite sources.** A table name with uppercase letters gets the lowercase
+  identity SQLite itself uses, so its resource ID changes. Read scopes, semantic
+  notes and the catalog move to the new IDs; runs, messages, artifacts and
+  evidence keep the old ones as history. A SQLite catalog with two tables whose
+  names differ only by case stops the upgrade.
+- **Write scopes.** `update` stays `update`, `upsert` becomes `insert` and
+  `update`, and delete is never granted. Key and identity columns are dropped. A
+  scope whose table left the catalog or changed since it was granted is deleted.
+- **Routines.** A routine keeps its title, prompt, schedule, sources, counters and
+  state. Its frozen access, grants, model routes, sensitivity, budgets, expiry,
+  outcome contract, prechecks, skills and provenance are dropped, and its runs ask
+  before writes. An occurrence drops its precheck, reservations and copy of the
+  run's scope; one waiting on a precheck becomes claimed, and one skipped as
+  unchanged becomes completed.
+- **MCP.** Tool bindings drop unattended eligibility; every MCP action asks at the
+  time.
+- **Learning.** Learning candidates and their review stamps are deleted. Approved
+  memory, skills and semantic notes are kept.
+- **Other records.** Artifacts gain empty computation evidence. A semantic note
+  whose table is still at the revision it was saved against gains the native
+  types of the fields it names.
+- **`config.json`.** Each saved model route candidate gains
+  `reasoning_effort: null`, which keeps the provider's default. A candidate with
+  any other set of fields stops the upgrade.
+
 ## One compatibility authority
 
 `src/daita/storage/home_migrations/registry.py` is the sole compatibility
@@ -177,24 +288,3 @@ To add revision `N`:
 There is deliberately no independently growing codec registry, SQLite-only
 migration sequence, spreadsheet, or Git-tag map that must line up with this
 revision. The append-only home registry is the one persistence version source.
-
-## Revision 1 preproduction bridge
-
-Revision `1` contains a one-time, immutable bridge for the three complete
-preproduction home shapes observed immediately before the freeze. It translates
-their SQLite layout, removes redundant record `version` fields, and converts
-saved model configuration to the stable identifier-and-limits form. The bridge
-accepts only exact known shapes and preserves identities, sources, scopes,
-memory, user profile, skills, conversations, and other supported durable state.
-
-This bridge is not a general legacy framework. Daita `0.19.0` and earlier are a
-different product family and remain outside the automatic support window.
-
-## Revision 2 graph cutover
-
-Revision `2` converts the previous single-job and autonomous-follow-up records
-to the current durable task graph in one atomic home upgrade. It preserves
-terminal evidence and turns only provably safe queued profiles into runnable
-graph work. Work that cannot be mapped safely needs attention; Daita does not
-fall back to the previous executor. Revision `1` decoders remain inside this
-immutable migration and are not part of current execution.

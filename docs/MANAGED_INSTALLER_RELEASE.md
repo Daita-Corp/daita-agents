@@ -145,6 +145,11 @@ clean current-source archive and complete Git history with redacted findings.
    release after their semantic maximum. Refresh the editable environment.
 3. Refresh `release/agent-home-contract.json`; if it differs from the latest
    tagged snapshot, include the candidate home migration and golden fixture.
+   State in the release's `CHANGELOG.md` section whether the home revision
+   changed: "Home revision unchanged (N)" or "Home revision N to M". When it
+   changed, list in plain terms what a user loses or must redo, and which files
+   the migration rewrites (its `affected_paths`), and add the revision to
+   [Agent-home upgrades](LOCAL_STATE_UPGRADES.md#revisions-and-what-each-upgrade-changes).
 4. Merge only after ordinary CI, home-contract, and release-identity checks pass.
 5. Run `python scripts/release_identity.py project-tag` and create that exact
    annotated tag.
