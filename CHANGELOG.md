@@ -14,6 +14,25 @@ are gone.
 
 An existing home migrates automatically to home revision 4 the first time it opens.
 
+- **Home revision 3 to 4.** The upgrade rewrites `state.db` and `config.json`,
+  and keeps a rollback copy of the previous files under `.home-rollbacks/`. It
+  drops or resets:
+  - unfinished background jobs, which fail with "Created by an older version of
+    Daita; start it again."; finished jobs keep their result;
+  - the task-graph tables, including task attempts, checkpoints, comments and
+    budget ledgers, and graph attention notices;
+  - learning candidates and their review stamps; approved knowledge is kept;
+  - catalog change history, which starts empty; each source's catalog snapshot
+    becomes per-table rows with unchanged IDs and revisions;
+  - routines' frozen access, grants, routes, budgets, expiry and prechecks, and
+    occurrences' reservations and prechecks;
+  - MCP tools' unattended eligibility;
+  - write scopes whose table left the catalog or changed since they were granted.
+
+  [Agent-home upgrades](docs/LOCAL_STATE_UPGRADES.md) lists every revision's
+  effects. A custom storage adapter must upgrade its own store to revision 4
+  before using it with 1.3.0.
+
 - **Write scopes.** Stored scopes convert on upgrade: `update` stays `update`, `upsert`
   becomes `insert` and `update`, and delete is never granted. A scope whose table is
   gone from the catalog or changed since it was granted was already refused as stale,
