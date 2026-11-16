@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.3.1 (2026-11-16)
+
+Home revision unchanged (4). No home is migrated by this release.
+
+- **`daita demo`.** Builds a small fictional business database and a separate
+  `demo` agent with that database attached read-only, so a fresh install can ask
+  a first question without connecting any data. `daita demo --reset` rebuilds
+  it. An unrelated agent that happens to be named `demo` is never reused or
+  deleted.
+- **Custom SQL adapters: two statements now use the dialect hooks.** Reading a
+  job's effect receipts ordered by SQLite's `rowid`, and the analysis-evidence
+  upsert named its conflict columns directly. Both now go through
+  `insertion_order` and `conflict()`. An adapter must supply `insertion_order`
+  for `effect_receipts`; see
+  [SQL adapter extension](docs/STORAGE_CONTRACT.md#sql-adapter-extension). The
+  contract suite covers both, and a test fails if the shared SQL gains a
+  SQLite-only construct. SQLite behaviour is unchanged.
+- **Custom SQL adapters: a supported upgrade path.** `revision_database(revision)`
+  in `daita.storage.home_migrations` returns the SQL and schema of any home
+  revision. `upgrade_state_directory(directory)` in `daita.hosting.home_upgrade`
+  runs the registered migrations on a directory that holds only `state.db` and,
+  if present, `config.json`. `tests/fixtures/state-upgrades/revision-3-to-4/`
+  holds a revision 3 store and the expected revision 4 records.
+  [Upgrading an adapter's store](docs/STORAGE_CONTRACT.md#upgrading-an-adapters-store)
+  describes the round trip. `upgrade_agent_home` is unchanged.
+- **Upgrade guide.** [Agent-home upgrades](docs/LOCAL_STATE_UPGRADES.md) now
+  lists every home revision, the release that introduced it and what it drops or
+  resets.
+
 ## 1.3.0 (2026-11-12)
 
 Daita's agent now works with your data where it lives. The model names sources and
