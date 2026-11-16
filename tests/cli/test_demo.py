@@ -23,7 +23,7 @@ from tests.support.workspace import workspace_for
 # Changing the generator changes this digest on purpose: review the new data,
 # then update it. A difference on one platform only means the data is not
 # deterministic there.
-SAMPLE_DIGEST = "0d506486a5d1f6b4f24f3f9614db94e451b91870d79a9dd76ef96708faca2caa"
+SAMPLE_DIGEST = "7482acf3992df34112b44eb9ad8e4cc8c149e36dbbbcf27b5f24fe8e04a7b304"
 
 
 def _digest(tables: object) -> str:
@@ -153,6 +153,9 @@ def test_planted_duplicates_late_payers_and_stale_accounts_are_discoverable(
         "(SELECT value FROM dataset_info WHERE key = 'as_of'), '-90 days'))",
     )
     assert duplicated_domains == 6
+    assert (
+        _scalar(database, "SELECT count(*) - count(DISTINCT email) FROM customers") == 6
+    )
     assert isinstance(late_payers, int) and late_payers >= 5
     assert isinstance(stale_active_accounts, int) and stale_active_accounts >= 10
 

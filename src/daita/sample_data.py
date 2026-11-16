@@ -33,7 +33,8 @@ SUGGESTED_QUESTIONS = (
     "Profile the customers, orders and invoices tables. Does anything look off?",
     "Which region's revenue changed most between Q2 and Q3 2025, and which "
     "products drove the change?",
-    "Every Monday, list invoices more than 30 days past due, grouped by customer.",
+    "Every Monday, list invoices more than 30 days past due as of the as_of date "
+    "in dataset_info, grouped by customer.",
 )
 LEARN_EXAMPLE = (
     "/learn An active customer has an account with status 'active' and a "
@@ -360,14 +361,14 @@ class _Generator:
             f"{name}.",
             name.replace(" ", "  ", 1),
         )
-        domain = str(original[2]).split("@", 1)[1]
         created = date.fromisoformat(str(original[5])) + timedelta(
             days=self._rng.randint(60, 400)
         )
         return (
             len(customers) + 1,
             self._rng.choice(variants),
-            f"accounts@{domain}",
+            # Same email as the original, so a column profile shows the repeat.
+            original[2],
             original[3],
             original[4],
             min(created, date(2025, 9, 30)).isoformat(),
