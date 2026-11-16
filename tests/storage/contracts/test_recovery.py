@@ -220,3 +220,59 @@ async def test_terminal_cleanup_recovery_appends_once_under_exact_cas(
     async with state_store_factory() as store:
         assert await store.result(run.id) == result
         assert await store.load_analysis_evidence("agent-1", run.id) == (disposed,)
+
+
+async def test_analysis_evidence_upsert_replaces_only_its_own_row(
+    state_store_factory: StateStoreFactory,
+):
+    run = RunInput(
+        id="evidence-run",
+        agent_id="agent-1",
+        message="fixture",
+        conversation_id="evidence-conversation",
+        created_at=GRAPH_NOW,
+    )
+
+    def generation(evidence_id: str, status: str) -> AnalysisEvidence:
+        return AnalysisEvidence(
+            run.id,
+            evidence_id,
+            "generation",
+            {
+                "status": status,
+                "scratch": f"/private/tmp/daita-analysis-{evidence_id}",
+                "scratch_device": 1,
+                "scratch_inode": 2,
+                "closure_path": f"/private/tmp/daita-analysis-closure-{evidence_id}",
+                "closure_device": 1,
+                "closure_inode": 3,
+                "closure_nonce": "a" * 64,
+                "usage": {
+                    "cpu_complete": False,
+                    "user_cpu_seconds": None,
+                    "system_cpu_seconds": None,
+                },
+                "cleanup": {"scratch_deleted": False, "failure": "PermissionError"},
+            },
+        )
+
+    first = generation("parser-1", "cleanup_failed")
+    second = generation("parser-2", "admitted")
+    async with state_store_factory() as store:
+        await store.initialize_identity(AgentIdentity("agent-1", "Fixture", GRAPH_NOW))
+        await store.start(run)
+        await store.record_analysis_evidence(
+            "agent-1", generation("parser-1", "admitted")
+        )
+        await store.record_analysis_evidence("agent-1", second)
+        # The same (run_id, evidence_id) updates in place; its sibling is kept.
+        await store.record_analysis_evidence("agent-1", first)
+        assert await store.load_analysis_evidence("agent-1", run.id) == (
+            first,
+            second,
+        )
+    async with state_store_factory() as store:
+        assert await store.load_analysis_evidence("agent-1", run.id) == (
+            first,
+            second,
+        )

@@ -1,5 +1,6 @@
 import ast
 import inspect
+import re
 from collections.abc import Iterable, Mapping
 from functools import cache
 from pathlib import Path
@@ -1235,6 +1236,47 @@ def test_state_backends_share_domain_operations_without_driver_dependencies():
             "psycopg",
             "psycopg_pool",
         }
+
+
+def _string_literals(path: Path) -> Iterable[tuple[int, str]]:
+    """Every string literal; an f-string's substitutions read as ``{}``."""
+    parts: set[int] = set()
+    for node in ast.walk(_tree(path)):
+        if isinstance(node, ast.JoinedStr):
+            parts.update(id(value) for value in node.values)
+            yield node.lineno, "".join(
+                str(value.value) if isinstance(value, ast.Constant) else "{}"
+                for value in node.values
+            )
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in parts
+        ):
+            yield node.lineno, node.value
+
+
+def test_shared_sql_layer_leaves_sqlite_only_sql_to_the_dialect():
+    # Custom adapters run this SQL unchanged; SQLite-only constructs belong to
+    # the dialect hooks on SQLConnection, and conflict targets to conflict().
+    sqlite_only = re.compile(
+        r"\b(rowid|json_extract|pragma|insert\s+or|glob|sqlite_master)\b"
+        r"|\bon\s+conflict\s*\((?!\{\})",
+        re.IGNORECASE,
+    )
+    storage = PACKAGE / "storage"
+    shared = (
+        storage / "sql.py",
+        storage / "catalog_rows.py",
+        *storage.glob("sql_*.py"),
+    )
+    hits = [
+        f"{path.name}:{line}: {match.group(0)}"
+        for path in shared
+        for line, text in _string_literals(path)
+        if (match := sqlite_only.search(text))
+    ]
+    assert hits == []
 
 
 def test_semantic_maintenance_is_read_time_and_evaluation_is_caller_owned():

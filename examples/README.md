@@ -23,6 +23,12 @@ skills loaded through `skill_view`, foreground approval-gated memory/skill
 learning, and best-effort non-persisted events. These walkthroughs stay offline
 and do not perform external data writes or live model calls.
 
+To try Daita on realistic data with a real model instead, run `daita demo`. It
+builds the built-in sample database (`src/daita/sample_data.py`: a fictional
+business with customers, accounts, products, orders, invoices, payments and
+support tickets) from a fixed seed, attaches it read-only to a separate `demo`
+agent and prints questions to ask. `daita demo --reset` rebuilds both.
+
 Run a walkthrough from the repository root:
 
 ```bash

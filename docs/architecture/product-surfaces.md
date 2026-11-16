@@ -40,6 +40,17 @@ Receipt list, inspect and human recovery controls call the existing Agent APIs.
 Recovery never calls the model or an external executor. The original observation
 and separate immutable resolution stay owned by SQLite.
 
+## Demo agent
+
+`daita demo` is an ordinary client of the public API: it lists, creates, opens,
+attaches and deletes through the host (or in-process with `--no-host`) like
+`create`, `attach` and `delete`. `sample_data.py` builds the sample SQLite
+database from a fixed seed and calendar with the standard library only, into
+`<state root>/demo/` with an atomic replace. The demo agent's id is recorded
+beside it in `agent.json`; an agent named `demo` whose id does not match is
+never reused, reset or deleted. `--reset` deletes the recorded agent and the
+data, then builds both again.
+
 ## Host status
 
 The TUI and the CLI are clients of the Daita host. The TUI status bar shows the
