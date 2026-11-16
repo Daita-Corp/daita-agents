@@ -526,7 +526,8 @@ class SQLStateStore:
             with _connect_read_only(self._database) as connection:
                 rows = connection.execute(
                     "SELECT data FROM effect_receipts "
-                    "WHERE agent_id = ? AND job_id = ? ORDER BY rowid LIMIT 257",
+                    "WHERE agent_id = ? AND job_id = ? "
+                    f"ORDER BY {connection.insertion_order} LIMIT 257",
                     (agent_id, job_id),
                 ).fetchall()
             return tuple(decode_receipt(row[0]) for row in rows[:256])
@@ -3471,7 +3472,7 @@ class SQLStateStore:
                 )
             connection.execute(
                 "INSERT INTO analysis_evidence(agent_id, run_id, evidence_id, kind, data, reserved_bytes) VALUES (?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(run_id, evidence_id) DO UPDATE SET data = excluded.data, reserved_bytes = excluded.reserved_bytes",
+                f"ON CONFLICT({connection.conflict('run_id, evidence_id')}) DO UPDATE SET data = excluded.data, reserved_bytes = excluded.reserved_bytes",
                 (
                     agent_id,
                     evidence.run_id,
