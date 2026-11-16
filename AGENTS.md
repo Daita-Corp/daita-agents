@@ -327,7 +327,10 @@ Never add provider branches to `AgentLoop`. Details are in
    `storage/home_migrations/`. Otherwise append a new revision and register it in
    `registry.py`.
 3. Regenerate the golden fixture with the matching
-   `scripts/create_revision_<n>_golden_fixture.py`.
+   `scripts/create_revision_<n>_golden_fixture.py`. For a new revision, also add
+   its database SQL to `revision_database` in `home_migrations/registry.py` and
+   publish its state-directory upgrade fixture under
+   `tests/fixtures/state-upgrades/` (see `docs/STORAGE_CONTRACT.md`).
 4. Refresh and check the release contract:
    ```bash
    python scripts/check_home_release_contract.py write

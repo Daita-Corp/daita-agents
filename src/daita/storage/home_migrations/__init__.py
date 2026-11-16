@@ -16,6 +16,7 @@ if TYPE_CHECKING:
         insert_migration_row,
         inspect_home_revision,
         migration_rows,
+        revision_database,
         stamp_fresh_home,
     )
 
@@ -29,6 +30,7 @@ _REGISTRY_EXPORTS = frozenset(
         "insert_migration_row",
         "inspect_home_revision",
         "migration_rows",
+        "revision_database",
         "stamp_fresh_home",
     }
 )
@@ -61,5 +63,6 @@ __all__ = [
     "insert_migration_row",
     "inspect_home_revision",
     "migration_rows",
+    "revision_database",
     "stamp_fresh_home",
 ]

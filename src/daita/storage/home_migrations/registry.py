@@ -5,9 +5,12 @@ from __future__ import annotations
 import re
 import sqlite3
 
-from ..schema_contract import require_healthy, require_schema
+from ..graph_schema import REVISION_2_DATABASE_SQL
+from ..schema_contract import SQLiteSchema, require_healthy, require_schema
+from ..sqlite_schema import CURRENT_DATABASE_SQL, REVISION_3_DATABASE_SQL
 from .models import HomeMigration
 from .revision_0001 import REVISION_1
+from .revision_0001_schema import REVISION_1_DATABASE_SQL
 from .revision_0002 import REVISION_2
 from .revision_0003 import REVISION_3
 from .revision_0004 import REVISION_4
@@ -60,6 +63,30 @@ def migration_rows() -> tuple[tuple[int, str, str], ...]:
         (migration.revision, migration.migration_id, migration.checksum)
         for migration in HOME_MIGRATIONS
     )
+
+
+# SQL creating an empty database at each revision, where that revision defined it.
+_DATABASE_SQL = {
+    1: REVISION_1_DATABASE_SQL,
+    2: REVISION_2_DATABASE_SQL,
+    3: REVISION_3_DATABASE_SQL,
+    4: CURRENT_DATABASE_SQL,
+}
+
+
+def revision_database(revision: int) -> tuple[str, SQLiteSchema]:
+    """Return the SQL that creates an empty database at ``revision``, and its schema.
+
+    A custom storage adapter exports its rows into this database, records
+    revisions 1 through ``revision`` with ``insert_migration_row`` and upgrades it
+    with ``daita.hosting.home_upgrade.upgrade_state_directory``. The SQL creates
+    every table, including the empty ``agent_home_migrations`` ledger; the schema
+    is the one that revision's migration checks.
+    """
+
+    if type(revision) is not int or revision not in _DATABASE_SQL:
+        raise ValueError(f"unknown agent-home revision: {revision!r}")
+    return _DATABASE_SQL[revision], HOME_MIGRATIONS[revision - 1].target_schema
 
 
 def insert_migration_row(
@@ -138,5 +165,6 @@ __all__ = [
     "insert_migration_row",
     "inspect_home_revision",
     "migration_rows",
+    "revision_database",
     "stamp_fresh_home",
 ]

@@ -38,7 +38,10 @@ The caller must drain operations before closing its borrowed database resources.
 The canonical schema and existing home registry remain the single source of
 record formats and data transformations. Adapters may project the schema and
 execute those transformations using their own physical storage mechanics. Schema
-projection alone does not upgrade stored data. Adapter deployment/security/layout
+projection alone does not upgrade stored data: `upgrade_state_directory` in
+`hosting/home_upgrade.py` runs the registered migrations on an adapter's exported
+SQLite copy, through the same staging, journal and checks as `upgrade_agent_home`
+(see `docs/STORAGE_CONTRACT.md`). Adapter deployment/security/layout
 checks belong to the consuming application; do not add their implementation
 fingerprints or dependencies to the framework's release gate.
 
