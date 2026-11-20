@@ -189,7 +189,6 @@ class _LiveScenario:
     provider: _RecordingProvider
     limits: LoopLimits
     source_id: str
-    resource_id: str
     origin_run_id: str
 
     async def close(self) -> None:
@@ -291,7 +290,7 @@ async def _seed_home(
     name: str,
     *,
     resource_name: str,
-) -> tuple[Path, str, str, str]:
+) -> tuple[Path, str, str]:
     root = tmp_path / f"{name}-root"
     database = tmp_path / f"{name}.sqlite"
     _database(database)
@@ -318,14 +317,14 @@ async def _seed_home(
     try:
         source = await agent.attach(SQLiteSource(database, name="Stage D1 live probe"))
         resources = await agent.list_catalog_resources(source_id=source.id)
-        resource = next(item for item in resources if item.name == resource_name)
+        assert any(item.name == resource_name for item in resources)
         origin = await agent.run(
             "Establish the foreground conversation for one scheduled read report.",
             source_scope_ids=(source.id,),
         )
         assert origin.kind is LoopExitKind.COMPLETED
         assert origin.conversation_id
-        return root, source.id, resource.id, origin.run_id
+        return root, source.id, origin.run_id
     finally:
         await agent.close()
 
@@ -336,7 +335,7 @@ async def _new_live_scenario(
     *,
     resource_name: str,
 ) -> _LiveScenario:
-    root, source_id, resource_id, origin_run_id = await _seed_home(
+    root, source_id, origin_run_id = await _seed_home(
         tmp_path,
         name,
         resource_name=resource_name,
@@ -360,7 +359,6 @@ async def _new_live_scenario(
         provider=provider,
         limits=limits,
         source_id=source_id,
-        resource_id=resource_id,
         origin_run_id=origin_run_id,
     )
 
@@ -461,10 +459,10 @@ async def _run_live_routine(
     assert scope is not None
     assert scope.routine_id == running.routine_id
     assert scope.occurrence_id == item.subject_id
-    # The scope is fixed at run start: the named source, its readable
-    # resources, and every capability except the machine-run exclusions.
+    # The scope is fixed at run start: the named source, read in full, and
+    # every capability except the machine-run exclusions.
     assert scope.allowed_source_ids == (scenario.source_id,)
-    assert scenario.resource_id in scope.allowed_resource_ids
+    assert scenario.source_id in scope.unrestricted_source_ids
     assert {CATALOG_DESCRIBE_CAPABILITY_ID, DATA_QUERY_CAPABILITY_ID} <= set(
         scope.allowed_capability_ids
     )
