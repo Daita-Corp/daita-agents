@@ -1287,7 +1287,7 @@ def test_semantic_maintenance_is_read_time_and_evaluation_is_caller_owned():
         path.read_text(encoding="utf-8")
         for path in sorted((PACKAGE / "storage").glob("sql*.py"))
     )
-    evaluation =(PACKAGE / "evaluation.py").read_text(encoding="utf-8")
+    evaluation = (PACKAGE / "evaluation.py").read_text(encoding="utf-8")
     package_text = _python_text(PACKAGE)
 
     assert _class_owners("AgentLoop") == {"loop/driver.py"}

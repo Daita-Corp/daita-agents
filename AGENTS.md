@@ -630,7 +630,8 @@ protects the user in its place.
 | `src/daita/workspace.py` | local file access intent (`LocalWorkspace`) |
 | `src/daita/security/` | secret references and lazy resolution |
 | `src/daita/observation.py` | observation events and observer protocol |
-| `src/daita/storage/sql.py` | shared state operations |
+| `src/daita/storage/sql.py` | shared state operations and their transactions |
+| `src/daita/storage/sql_*.py` | per-record-family SQL run inside those transactions |
 | `src/daita/storage/sqlite.py` | default local database admission |
 | `src/daita/storage/sqlite_schema.py` | current physical schema |
 | `src/daita/storage/sqlite_codecs/` | strict current-record serializers |
