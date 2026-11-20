@@ -474,6 +474,7 @@ async def test_registry_reads_and_lists_do_not_decode_historical_results(
     artifact_agent, monkeypatch
 ):
     import daita.storage.sql as sqlite_store
+    import daita.storage.sql_conversations as conversation_store
 
     agent, result, _ = artifact_agent
 
@@ -481,6 +482,7 @@ async def test_registry_reads_and_lists_do_not_decode_historical_results(
         raise AssertionError("live artifact queries must not decode history")
 
     monkeypatch.setattr(sqlite_store, "decode_message", reject_history)
+    monkeypatch.setattr(conversation_store, "decode_message", reject_history)
     monkeypatch.setattr(
         sqlite_store, "decode_task_result", reject_history, raising=False
     )
