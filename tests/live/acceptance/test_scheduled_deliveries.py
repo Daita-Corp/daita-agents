@@ -104,7 +104,7 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
     )
     try:
         source = await seed.attach(SQLiteSource(database, name="Stage D2 live probe"))
-        (resource,) = await seed.list_catalog_resources(source_id=source.id)
+        assert len(await seed.list_catalog_resources(source_id=source.id)) == 1
         origin = await seed.run("Establish the foreground authorization context.")
         assert origin.kind is LoopExitKind.COMPLETED
         assert origin.conversation_id is not None
@@ -179,9 +179,10 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
         assert transcript.run.origin is RunOrigin.SCHEDULED_ROUTINE
         scope = transcript.run.execution_scope
         assert scope is not None
-        # Fixed at run start: the named source and every non-excluded capability.
+        # Fixed at run start: the named source, read in full, and every
+        # non-excluded capability.
         assert scope.allowed_source_ids == (source.id,)
-        assert resource.id in scope.allowed_resource_ids
+        assert source.id in scope.unrestricted_source_ids
         assert DATA_EXPORT_TABULAR_CAPABILITY_ID in scope.allowed_capability_ids
         calls = tuple(
             call for call, _ in await agent.tool_evidence(delivery.resulting_run_id)
