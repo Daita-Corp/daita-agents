@@ -22,11 +22,9 @@ from .home_migrations import (
     create_current_database,
     inspect_home_revision,
 )
-from .sql import (
-    SQLStateStore,
-    _validate_current_records as _validate_records,
-)
+from .sql import SQLStateStore
 from .sql_connection import SQLConnection, StateIntegrityError
+from .sql_validation import validate_current_records as _validate_records
 from .sqlite_records import (
     EffectOutcome,
     EffectReceipt,
