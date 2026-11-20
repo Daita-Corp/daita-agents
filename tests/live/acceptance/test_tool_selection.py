@@ -187,6 +187,11 @@ def _successful(
     )
 
 
+def _sql_text(call: ToolCall) -> str:
+    # A data_query call carries sql, or statements for several reads.
+    return str(call.arguments.get("sql", call.arguments.get("statements", "")))
+
+
 def _mapping(value: object, name: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         pytest.fail(f"{name} must be a mapping")
@@ -293,16 +298,17 @@ async def test_live_mixed_file_source_comparison_uses_separate_queries(
     )
     try:
         source = await agent.attach(SQLiteSource(database, name="Connected customers"))
+        session_source_id = cast(str, agent.session_source_id)
         result = await agent.run(
             "This is an authorized Phase 5 mixed-workspace check. Compare local "
             "sales.csv with the connected customers table using separate validated "
             "queries; never federate them in one SQL statement. Use data_query with "
-            "the session folder source_id and path_pattern to aggregate local "
+            "the session folder source and path_pattern to aggregate local "
             "revenue by region with the local verification token. Separately "
             "inspect the connected schema "
             "and query customer counts by segment with its verification token. "
             "Report the exact totals, counts, and both tokens from tool results.",
-            source_scope_ids=(source.id, cast(str, agent.session_source_id)),
+            source_scope_ids=(source.id, session_source_id),
         )
         transcript = await agent.transcript(result.run_id)
         evidence = await agent.tool_evidence(result.run_id)
@@ -320,19 +326,25 @@ async def test_live_mixed_file_source_comparison_uses_separate_queries(
     )
     exchanges = _exchanges(evidence)
     queries = _successful(evidence, "data_query")
+    # The model names each source; evidence records the source it resolved to.
     file_call, file_result = next(
-        item for item in reversed(queries) if "path_pattern" in item[0].arguments
+        item
+        for item in reversed(queries)
+        if item[0].arguments.get("source_id") == session_source_id
+        and "path_pattern" in item[0].arguments
     )
     source_call, source_result = next(
-        item for item in reversed(queries) if "resource_ids" in item[0].arguments
+        item
+        for item in reversed(queries)
+        if item[0].arguments.get("source_id") == source.id
     )
     names = tuple(call.name for call, _block in exchanges)
     assert names.index("catalog_describe") < exchanges.index(
         (source_call, source_result)
     )
     assert file_call.arguments["path_pattern"] == "sales.csv"
-    assert "customers" not in str(file_call.arguments["sql"])
-    assert "sales.csv" not in str(source_call.arguments["sql"])
+    assert "customers" not in _sql_text(file_call)
+    assert "sales.csv" not in _sql_text(source_call)
     assert _MIXED_FILE_TOKEN in canonical_json(file_result.output)
     assert _MIXED_SOURCE_TOKEN in canonical_json(source_result.output)
     assert file_result.sensitivity_provenance["authority"] == (
