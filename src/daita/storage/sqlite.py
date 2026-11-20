@@ -12,6 +12,7 @@ from ..artifacts.models import (
 )
 from ..errors import StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity
+from . import sql_artifacts as _artifact_store
 from .errors import StorageUnavailableError
 from .graph_schema import ClosingSQLiteConnection
 from .home_migrations import (
@@ -23,7 +24,6 @@ from .home_migrations import (
 )
 from .sql import (
     SQLStateStore,
-    _artifact_record_from_row,
     _validate_current_records as _validate_records,
 )
 from .sql_connection import SQLConnection, StateIntegrityError
@@ -111,7 +111,7 @@ def load_current_artifact_inventory(
     """Read authoritative lifecycle rows from an already validated current database."""
     with _connect_read_only(path) as connection:
         return tuple(
-            _artifact_record_from_row(row)
+            _artifact_store.record_from_row(row)
             for row in connection.execute(
                 "SELECT * FROM artifacts WHERE agent_id = ? ORDER BY created_at_us, artifact_id",
                 (agent_id,),

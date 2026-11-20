@@ -19,11 +19,7 @@ from ..adapters.mcp import (
 )
 from ..adapters.models import SourceRegistration
 from ..artifacts.models import (
-    MAX_ARTIFACT_BYTES_PER_AGENT,
-    MAX_ARTIFACT_BYTES_PER_RUN,
     MAX_ARTIFACTS_PER_AGENT,
-    MAX_ARTIFACTS_PER_RUN,
-    ArtifactError,
     ArtifactRecord,
     ArtifactRef,
     ArtifactState,
@@ -100,6 +96,7 @@ from ..semantics import (
 )
 from . import (
     catalog_rows,
+    sql_artifacts as _artifact_store,
     sql_jobs as _job_store,
     sql_mcp as _mcp_store,
     sql_routines as _routine_store,
@@ -150,10 +147,6 @@ from .sqlite_codecs import (
     encode_source_read_scope,
 )
 from .sqlite_codecs.analysis import decode_analysis_evidence, encode_analysis_evidence
-from .sqlite_codecs.artifacts import (
-    decode_artifact_record,
-    encode_artifact_record,
-)
 from .sqlite_codecs.jobs import decode_job
 from .sqlite_codecs.mcp_bindings import decode_mcp_credential_reference_for_deletion
 from .sqlite_records import (
@@ -2840,7 +2833,7 @@ class SQLStateStore:
     async def get_artifact_record(self, artifact_id: str) -> ArtifactRecord | None:
         return await _run_read_transaction(
             self._database,
-            lambda connection: _get_artifact_record(connection, artifact_id),
+            lambda connection: _artifact_store.get_record(connection, artifact_id),
         )
 
     async def list_artifact_records(
@@ -2879,40 +2872,21 @@ class SQLStateStore:
             ):
                 raise ValueError("artifact cursor must contain timestamp and identity")
 
-        def read(connection: SQLConnection) -> tuple[ArtifactRecord, ...]:
-            clauses = ["agent_id = ?"]
-            parameters: list[object] = [agent_id]
-            for column, value in (
-                ("state", state.value if state is not None else None),
-                ("run_id", run_id),
-                ("conversation_id", conversation_id),
-                ("caller_principal_id", caller_principal_id),
-            ):
-                if value is not None:
-                    clauses.append(column + " = ?")
-                    parameters.append(value)
-            if after is not None:
-                clauses.append("(created_at_us, artifact_id) > (?, ?)")
-                parameters.extend((_datetime_us(after[0]), after[1]))
-            return tuple(
-                _artifact_record_from_row(row)
-                for row in connection.execute(
-                    "SELECT artifact_id, agent_id, run_id, conversation_id, caller_principal_id, state, byte_size, created_at_us, data FROM artifacts WHERE "
-                    + " AND ".join(clauses)
-                    + (
-                        " ORDER BY created_at_us DESC, artifact_id DESC LIMIT ? OFFSET ?"
-                        if newest_first
-                        else " ORDER BY created_at_us, artifact_id LIMIT ? OFFSET ?"
-                    ),
-                    (
-                        *parameters,
-                        limit if limit is not None else 9223372036854775807,
-                        offset,
-                    ),
-                )
-            )
-
-        return await _run_read_transaction(self._database, read)
+        return await _run_read_transaction(
+            self._database,
+            lambda connection: _artifact_store.list_records(
+                connection,
+                agent_id,
+                state=state,
+                run_id=run_id,
+                conversation_id=conversation_id,
+                caller_principal_id=caller_principal_id,
+                limit=limit,
+                offset=offset,
+                after=after,
+                newest_first=newest_first,
+            ),
+        )
 
     async def list_artifact_refs(
         self,
@@ -2946,86 +2920,12 @@ class SQLStateStore:
     ) -> None:
         if record.state is not ArtifactState.CREATING:
             raise ValueError("new artifact must be creating")
-
-        def write(connection: SQLConnection) -> None:
-            identity_row = connection.execute(
-                "SELECT data FROM metadata WHERE key = 'identity'"
-            ).fetchone()
-            if (
-                identity_row is None
-                or decode_identity(identity_row[0]).id != record.agent_id
-            ):
-                raise ArtifactError(
-                    "artifact_missing", "Artifact belongs to another agent.", {}
-                )
-            run_row = connection.execute(
-                "SELECT agent_id, input FROM runs WHERE id = ?", (record.ref.run_id,)
-            ).fetchone()
-            if run_row is not None:
-                run = decode_run_input(run_row[1])
-                if (
-                    run_row[0] != record.agent_id
-                    or run.caller_principal_id != record.caller_principal_id
-                    or (run.conversation_id or run.id) != record.ref.conversation_id
-                ):
-                    raise ArtifactError(
-                        "artifact_missing", "Artifact producer ownership differs.", {}
-                    )
-            if _get_artifact_record(connection, record.ref.artifact_id) is not None:
-                raise ArtifactError(
-                    "artifact_storage_failed",
-                    "Artifact identity is already registered.",
-                    {"stage": "identity"},
-                )
-            if reserved:
-                # Only graph task attempts reserved artifact identities.
-                raise ArtifactError(
-                    "artifact_storage_failed",
-                    "Artifact reservation is no longer active.",
-                    {"stage": "reservation"},
-                )
-            rows = tuple(
-                connection.execute(
-                    "SELECT run_id, byte_size FROM artifacts WHERE agent_id = ?",
-                    (record.agent_id,),
-                )
-            )
-            run_rows = tuple(row for row in rows if row[0] == record.ref.run_id)
-            for scope, kind, used, added, ceiling in (
-                ("agent", "count", len(rows), 1, MAX_ARTIFACTS_PER_AGENT),
-                (
-                    "agent",
-                    "bytes",
-                    sum(row[1] for row in rows),
-                    record.ref.byte_size,
-                    MAX_ARTIFACT_BYTES_PER_AGENT,
-                ),
-                ("run", "count", len(run_rows), 1, MAX_ARTIFACTS_PER_RUN),
-                (
-                    "run",
-                    "bytes",
-                    sum(row[1] for row in run_rows),
-                    record.ref.byte_size,
-                    MAX_ARTIFACT_BYTES_PER_RUN,
-                ),
-            ):
-                if used + added > ceiling:
-                    raise ArtifactError(
-                        "artifact_quota_exceeded",
-                        "The artifact exceeds a storage limit.",
-                        {
-                            "scope": scope,
-                            "limit_kind": kind,
-                            "limit": ceiling,
-                            "attempted": used + added,
-                        },
-                    )
-            connection.execute(
-                "INSERT INTO artifacts (artifact_id, agent_id, run_id, conversation_id, caller_principal_id, state, byte_size, created_at_us, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                _artifact_record_row(record),
-            )
-
-        await run_sql_transaction(self._database, write)
+        await run_sql_transaction(
+            self._database,
+            lambda connection: _artifact_store.begin_creation(
+                connection, record, reserved
+            ),
+        )
 
     async def transition_artifact(
         self, record: ArtifactRecord, state: ArtifactState
@@ -3039,42 +2939,18 @@ class SQLStateStore:
         ):
             raise ValueError("artifact lifecycle transition is invalid")
         updated = replace(record, state=state)
-
-        def write(connection: SQLConnection) -> ArtifactRecord:
-            changed = connection.execute(
-                "UPDATE artifacts SET state = ?, data = ? WHERE artifact_id = ? AND data = ?",
-                (
-                    state.value,
-                    encode_artifact_record(updated),
-                    record.ref.artifact_id,
-                    encode_artifact_record(record),
-                ),
-            ).rowcount
-            if changed != 1:
-                raise ArtifactError(
-                    "artifact_missing", "The artifact lifecycle changed.", {}
-                )
-            return updated
-
-        return await run_sql_transaction(self._database, write)
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _artifact_store.transition(connection, record, updated),
+        )
 
     async def finish_artifact_deletion(self, record: ArtifactRecord) -> None:
         if record.state is not ArtifactState.DELETING:
             raise ValueError("artifact deletion must be pending")
-
-        def write(connection: SQLConnection) -> None:
-            if (
-                connection.execute(
-                    "DELETE FROM artifacts WHERE artifact_id = ? AND data = ?",
-                    (record.ref.artifact_id, encode_artifact_record(record)),
-                ).rowcount
-                != 1
-            ):
-                raise ArtifactError(
-                    "artifact_missing", "The artifact lifecycle changed.", {}
-                )
-
-        await run_sql_transaction(self._database, write)
+        await run_sql_transaction(
+            self._database,
+            lambda connection: _artifact_store.finish_deletion(connection, record),
+        )
 
     async def conversation_run_page(
         self,
@@ -3792,38 +3668,6 @@ async def _run_read_transaction(
     return await settled_thread(read)
 
 
-def _artifact_record_row(record: ArtifactRecord) -> tuple[object, ...]:
-    ref = record.ref
-    return (
-        ref.artifact_id,
-        record.agent_id,
-        ref.run_id,
-        ref.conversation_id,
-        record.caller_principal_id,
-        record.state.value,
-        ref.byte_size,
-        int(ref.created_at.timestamp() * 1_000_000),
-        encode_artifact_record(record),
-    )
-
-
-def _artifact_record_from_row(row: tuple) -> ArtifactRecord:
-    record = decode_artifact_record(row[-1])
-    if tuple(row) != _artifact_record_row(record):
-        raise ValueError("stored artifact registry projection differs from its record")
-    return record
-
-
-def _get_artifact_record(
-    connection: SQLConnection, artifact_id: str
-) -> ArtifactRecord | None:
-    row = connection.execute(
-        "SELECT artifact_id, agent_id, run_id, conversation_id, caller_principal_id, state, byte_size, created_at_us, data FROM artifacts WHERE artifact_id = ?",
-        (artifact_id,),
-    ).fetchone()
-    return None if row is None else _artifact_record_from_row(row)
-
-
 def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None:
     _mcp_store.validate_stored_bounds(connection)
     identity: AgentIdentity | None = None
@@ -3836,7 +3680,7 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
             raise ValueError("state metadata key is unsupported")
 
     records = tuple(
-        _artifact_record_from_row(row)
+        _artifact_store.record_from_row(row)
         for row in connection.execute(
             "SELECT artifact_id, agent_id, run_id, conversation_id, caller_principal_id, state, byte_size, created_at_us, data FROM artifacts"
         )
