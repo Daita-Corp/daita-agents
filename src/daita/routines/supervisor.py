@@ -52,6 +52,8 @@ from .owner import RoutineOwner, RoutineSupervisorStore
 _logger = logging.getLogger(__name__)
 
 _DEFAULT_POLL_SECONDS = 1.0
+# Backstop only; every in-process change wakes the driver; must exceed a consumer pool's idle window.
+_IDLE_WAIT_SECONDS = 300.0
 # A provider quota rejection holds new claims on that route, doubling per repeat.
 # Loop exits do not carry the provider's retry-after, so the window is bounded here.
 _QUOTA_HOLD_INITIAL = timedelta(minutes=5)
@@ -121,6 +123,8 @@ class RoutineSupervisor:
         self._consecutive_failures = 0
         self._retry_at = 0.0
         self._quota_holds: dict[str, tuple[datetime, timedelta]] = {}
+        self._claim_refused = False
+        self._lease_ends_at: datetime | None = None
 
     @property
     def status(self) -> SupervisorStatus:
@@ -223,17 +227,36 @@ class RoutineSupervisor:
                         await self._recover()
                         if self._worker is None or self._worker.done():
                             await self._claim_one_due()
-                    timeout = self._poll_seconds
-                    deadline = await self._store.next_routine_deadline(self._agent_id)
-                    until_deadline = (
-                        None
-                        if deadline is None
-                        else (deadline - self._clock()).total_seconds()
-                    )
-                    # A deadline already past was unclaimable this pass (quota hold,
-                    # no model); keep the normal poll instead of hot-looping on it.
-                    if until_deadline is not None and until_deadline > 0:
-                        timeout = min(timeout, max(0.05, until_deadline))
+                    timeout = _IDLE_WAIT_SECONDS
+                    if self._execute_run is not None:
+                        now = self._clock()
+                        # A dead host's claim is recovered only once its lease ends.
+                        if (
+                            self._lease_ends_at is not None
+                            and self._lease_ends_at > now
+                        ):
+                            timeout = max(
+                                0.05, (self._lease_ends_at - now).total_seconds()
+                            )
+                        deadline = await self._store.next_routine_deadline(
+                            self._agent_id
+                        )
+                        until_deadline = (
+                            None
+                            if deadline is None
+                            else (deadline - now).total_seconds()
+                        )
+                        if until_deadline is not None and until_deadline > 0:
+                            timeout = min(timeout, max(0.05, until_deadline))
+                        elif until_deadline is not None:
+                            # Past due and unclaimable this pass: wait for the cause to
+                            # end. Effect and worker blocks wake the driver themselves.
+                            if self._quota_held(now):
+                                timeout = min(
+                                    timeout, max(0.05, self._quota_hold_end(now))
+                                )
+                            elif self._claim_refused:
+                                timeout = min(timeout, self._poll_seconds)
                 except AdmissionClosedError:
                     self._stop_for_host_close()
                     break
@@ -262,12 +285,13 @@ class RoutineSupervisor:
                 await asyncio.gather(self._worker, return_exceptions=True)
 
     async def _claim_one_due(self) -> None:
+        self._claim_refused = False
+        self._lease_ends_at = None
         now = self._clock()
-        routines = await self._store.list_scheduled_routines(
-            self._agent_id,
-            states=frozenset({RoutineState.ACTIVE}),
-        )
-        for routine in sorted(routines, key=lambda item: item.routine_id):
+        # Every state: a paused routine's claim still ends by lease (see _drive).
+        every = await self._store.list_scheduled_routines(self._agent_id)
+        routines = tuple(r for r in every if r.state is RoutineState.ACTIVE)
+        for routine in sorted(every, key=lambda item: item.routine_id):
             if routine.active_occurrence_id is None:
                 continue
             occurrence = await self._store.load_routine_occurrence(
@@ -276,6 +300,16 @@ class RoutineSupervisor:
             )
             if (
                 occurrence is not None
+                and occurrence.lease_expires_at is not None
+                and occurrence.lease_expires_at > now
+            ):
+                self._lease_ends_at = min(
+                    occurrence.lease_expires_at,
+                    self._lease_ends_at or occurrence.lease_expires_at,
+                )
+            if (
+                routine.state is RoutineState.ACTIVE
+                and occurrence is not None
                 and occurrence.reserved_run_id is None
                 and occurrence.lease_expires_at is not None
                 and occurrence.lease_expires_at > now
@@ -310,9 +344,13 @@ class RoutineSupervisor:
                     claimed_at=now,
                     claim_token=self._id_factory("routine-claim"),
                 )
-            except (ValueError, EffectUnresolvedError):
+            except EffectUnresolvedError:
+                continue
+            except ValueError:
+                self._claim_refused = True
                 continue
             if occurrence is None:
+                self._claim_refused = True
                 continue
             self._launch(occurrence)
             return
@@ -409,6 +447,13 @@ class RoutineSupervisor:
             hold[0] > now
             for route in self._model_routes
             if (hold := self._quota_holds.get(route)) is not None
+        )
+
+    def _quota_hold_end(self, now: datetime) -> float:
+        return max(
+            (hold[0] - now).total_seconds()
+            for route in self._model_routes
+            if (hold := self._quota_holds.get(route)) is not None and hold[0] > now
         )
 
     def _observe_quota(self, result: LoopExit) -> None:

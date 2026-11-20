@@ -391,6 +391,83 @@ async def test_unclaimable_past_due_routine_waits_the_poll_interval(
         await store.close()
 
 
+async def test_past_due_routine_under_quota_hold_waits_for_the_hold_to_end(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    await _seed_conversation(store)
+    await store.admit_scheduled_routine(_routine())
+    distribution = DistributionOwner(agent_id="agent-1", store=store)
+    artifacts = await AgentHomeArtifactStore.open(
+        agent_id="agent-1",
+        agent_home=tmp_path,
+        registry=store,
+    )
+    started = asyncio.get_running_loop().time()
+
+    def clock() -> datetime:
+        return NOW + timedelta(seconds=asyncio.get_running_loop().time() - started)
+
+    scans = 0
+    claims = 0
+    original_list = store.list_scheduled_routines
+
+    async def counted_list(*args: object, **kwargs: object):
+        nonlocal scans
+        scans += 1
+        return await original_list(*args, **kwargs)  # type: ignore[arg-type]
+
+    async def refuse(*args: object, **kwargs: object) -> RoutineOccurrence | None:
+        del args, kwargs
+        nonlocal claims
+        claims += 1
+        raise ValueError("routine_claim_refused")
+
+    monkeypatch.setattr(store, "list_scheduled_routines", counted_list)
+    monkeypatch.setattr(store, "claim_due_routine_occurrence", refuse)
+
+    async def execute(
+        occurrence: RoutineOccurrence,
+        run: RunInput,
+    ) -> LoopExit | None:
+        del occurrence, run
+        raise AssertionError("an unclaimable routine cannot run")
+
+    supervisor = RoutineSupervisor(
+        agent_id="agent-1",
+        store=store,
+        owner=cast(RoutineOwner, _Owner()),
+        runtime=cast(CapabilityRuntime, _UnusedRuntime()),
+        distribution=distribution,
+        artifacts=artifacts,
+        execute_run=execute,
+        machine_scope=_SCOPE,
+        model_routes=("mock",),
+        per_run_max_tokens=1_000,
+        per_run_max_cost_usd=Decimal("0.10"),
+        clock=clock,
+        id_factory=_ids(),
+        poll_seconds=0.02,
+    )
+    try:
+        # _observe_quota holds for 5 minutes; this test needs a hold that ends in 0.3 s.
+        hold = timedelta(seconds=0.3)
+        supervisor._quota_holds["mock"] = (clock() + hold, hold)
+        await supervisor.start()
+        await asyncio.sleep(0.15)
+        # A 0.02 s poll would have scanned ~7 times; the hold's end is one wait.
+        assert (scans, claims) == (1, 0)
+        for _ in range(500):
+            if claims:
+                break
+            await asyncio.sleep(0.01)
+        assert claims >= 1
+    finally:
+        await supervisor.close()
+        await store.close()
+
+
 async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
