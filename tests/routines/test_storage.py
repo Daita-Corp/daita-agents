@@ -13,6 +13,7 @@ import pytest
 import daita.storage.sql as sqlite_module
 import daita.storage.sql_deliveries as delivery_store_module
 import daita.storage.sql_routines as routine_store_module
+import daita.storage.sql_validation as validation_module
 from daita.distribution import DeliverySubjectKind, OutcomeState
 from daita.jobs import JobState
 from daita.jobs.owner import JobOwner
@@ -331,7 +332,7 @@ async def test_job_result_deliveries_yield_their_slots_to_routine_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Job results are never acknowledged; the job record stays authoritative.
-    for module in (sqlite_module, delivery_store_module):
+    for module in (validation_module, delivery_store_module):
         monkeypatch.setattr(module, "MAX_DELIVERIES_PER_AGENT", 2)
     path = tmp_path / "state.db"
     store = await SQLiteStateStore.open(path)

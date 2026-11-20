@@ -9,37 +9,20 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from hashlib import sha256
 from typing import TypeVar, cast
 
 from .._json import FrozenJsonObject
 from ..adapters.mcp import (
-    MCP_MAX_ACTIVE_TOOLS_PER_AGENT,
-    MCP_MAX_AGENT_CATALOG_BYTES,
     MCP_MAX_BINDING_CANONICAL_BYTES,
-    MCP_MAX_BINDINGS_PER_AGENT,
-    MCPAdmissionError,
-    MCPBindingState,
     MCPServerBinding,
 )
 from ..adapters.models import SourceRegistration
 from ..artifacts.models import (
-    MAX_ARTIFACT_BYTES_PER_AGENT,
-    MAX_ARTIFACT_BYTES_PER_RUN,
-    MAX_ARTIFACTS_PER_AGENT,
-    MAX_ARTIFACTS_PER_RUN,
-    ArtifactError,
     ArtifactRecord,
     ArtifactRef,
     ArtifactState,
-    artifact_ref_from_mapping,
 )
-from ..capabilities import (
-    EffectEvidenceBasis,
-    EffectObservation,
-    ExecutionScope,
-    ExecutionScopeKind,
-)
+from ..capabilities import ExecutionScope
 from ..catalog.models import (
     CATALOG_MAX_LINKS,
     CatalogChange,
@@ -60,38 +43,29 @@ from ..catalog.models import (
 )
 from ..catalog.protocols import CatalogStoreError
 from ..distribution.models import (
-    MAX_DELIVERIES_PER_AGENT,
     MAX_DELIVERY_LIST_PAGE_SIZE,
     Delivery,
     DeliveryState,
-    DeliverySubjectKind,
     OutcomeArtifactReference,
 )
 from ..identity import AgentIdentity, AgentIdentityConflictError
-from ..jobs.models import LIVE_JOB_STATES, MAX_JOB_LIST_PAGE_SIZE, Job, JobState
+from ..jobs.models import MAX_JOB_LIST_PAGE_SIZE, Job, JobState
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
-    ModelSensitivity,
-    ToolResultBlock,
 )
-from ..loop.analysis import AnalysisEvidence, AnalysisTraceCapacityError
+from ..loop.analysis import AnalysisEvidence
 from ..loop.models import (
     ConversationRun,
     LoopExit,
     LoopExitKind,
     RunInput,
     Transcript,
-    validate_completed_transcript,
 )
-from ..loop.transcripts import ConversationPredecessor
 from ..routines.models import (
-    MAX_ACTIVE_ROUTINES_PER_AGENT,
     MAX_ROUTINE_HISTORY_PAGE_SIZE,
     MAX_ROUTINE_LIST_PAGE_SIZE,
-    MAX_SCHEDULED_ROUTINES_PER_AGENT,
     RoutineOccurrence,
-    RoutineOccurrenceDisposition,
     RoutineState,
     ScheduledRoutine,
 )
@@ -100,26 +74,28 @@ from ..routines.schedule import (
     manual_slot_key,
     validate_schedule,
 )
-from ..semantics import (
-    SEMANTIC_MAX_ANNOTATIONS,
-    SemanticAnnotation,
-    SemanticDigestMismatchError,
-    SemanticNotFoundError,
-    SemanticValidationError,
-    semantic_annotation_sha256,
+from ..semantics import SemanticAnnotation
+from . import (
+    catalog_rows,
+    sql_analysis as _analysis_store,
+    sql_artifacts as _artifact_store,
+    sql_conversations as _conversation_store,
+    sql_effects as _effect_store,
+    sql_jobs as _job_store,
+    sql_mcp as _mcp_store,
+    sql_routines as _routine_store,
+    sql_semantics as _semantic_store,
+    sql_sources as _source_store,
 )
-from . import catalog_rows, sql_jobs as _job_store, sql_routines as _routine_store
 from .sql_connection import (
     SQLConnection,
     SQLDatabase,
-    StateIntegrityError,
     required_row,
 )
 from .sql_routines import (
     _datetime_us,
     _load_routine_occurrence_row,
     _load_routine_row,
-    _replace_routine_row,
     _require_effects_unblocked,
 )
 from .sqlite_codecs import (
@@ -127,65 +103,31 @@ from .sqlite_codecs import (
     decode_catalog_sync,
     decode_delivery,
     decode_identity,
-    decode_loop_exit,
-    decode_mcp_binding,
     decode_message,
-    decode_receipt,
-    decode_relational_write_scope,
-    decode_routine_occurrence,
     decode_run_input,
-    decode_scheduled_routine,
-    decode_semantic_annotation,
-    decode_source,
     decode_source_configuration_for_deletion,
-    decode_source_read_scope,
     encode_catalog_link,
     encode_catalog_sync,
     encode_delivery,
     encode_identity,
-    encode_loop_exit,
     encode_mcp_binding,
-    encode_message,
-    encode_receipt,
-    encode_relational_write_scope,
-    encode_run_input,
     encode_scheduled_routine,
-    encode_semantic_annotation,
-    encode_source,
-    encode_source_read_scope,
 )
-from .sqlite_codecs.analysis import decode_analysis_evidence, encode_analysis_evidence
-from .sqlite_codecs.artifacts import (
-    decode_artifact_record,
-    encode_artifact_record,
-)
-from .sqlite_codecs.jobs import decode_job
+from .sqlite_codecs.analysis import encode_analysis_evidence
 from .sqlite_codecs.mcp_bindings import decode_mcp_credential_reference_for_deletion
 from .sqlite_records import (
     EffectOutcome,
     EffectReceipt,
-    EffectReceiptConflictError,
     EffectResolution,
-    EffectResolutionDecision,
     RelationalWriteScope,
-    SourcePermissionStateError,
     SourceReadMode,
     SourceReadScope,
     effect_receipt_aware as _effect_receipt_aware,
     effect_receipt_text as _effect_receipt_text,
-    relational_write_authorization_fingerprint,
     validate_effect_receipt_id,
 )
 
 _T = TypeVar("_T")
-
-
-def _active_mcp_tool_count(bindings: Iterable[MCPServerBinding]) -> int:
-    return sum(
-        len(binding.tools)
-        for binding in bindings
-        if binding.state is MCPBindingState.ACTIVE
-    )
 
 
 def _load_delivery_row(
@@ -215,192 +157,6 @@ def _model_sensitivity_rank(value) -> int:
         "restricted": 3,
     }
     return order[value.value]
-
-
-def _decode_owned_read_scope(
-    connection: SQLConnection,
-    registration: SourceRegistration,
-    data: object,
-) -> SourceReadScope | None:
-    if not registration.active:
-        if data is not None:
-            raise SourcePermissionStateError(
-                "detached source unexpectedly retains a read scope"
-            )
-        return None
-    if not isinstance(data, str):
-        raise SourcePermissionStateError("active source is missing its read scope")
-    try:
-        scope = decode_source_read_scope(
-            data,
-            agent_id=registration.agent_id,
-            source_id=registration.id,
-        )
-        if scope.mode is SourceReadMode.SELECTED:
-            _require_nonforeign_read_resources(connection, scope)
-        return scope
-    except SourcePermissionStateError:
-        raise
-    except (TypeError, ValueError):
-        raise SourcePermissionStateError(
-            "active source read scope is undecodable"
-        ) from None
-
-
-def _require_nonforeign_read_resources(
-    connection: SQLConnection,
-    scope: SourceReadScope,
-) -> None:
-    requested = sorted(set(scope.resource_ids))
-    foreign = _fetch_foreign(connection, scope, requested)
-    if foreign:
-        raise SourcePermissionStateError(
-            "active source read scope contains a foreign resource"
-        )
-
-
-def _fetch_foreign(
-    connection: SQLConnection, scope: SourceReadScope, requested: list[str]
-) -> bool:
-    # A resource ID hashes its source, so a damaged row cannot make reads foreign.
-    for start in range(0, len(requested), 400):
-        chunk = requested[start : start + 400]
-        marks = ", ".join("?" * len(chunk))
-        if connection.execute(
-            "SELECT 1 FROM catalog_resources WHERE agent_id = ? "
-            f"AND id IN ({marks}) AND source_id <> ?",
-            (scope.agent_id, *chunk, scope.source_id),
-        ).fetchone():
-            return True
-    return False
-
-
-def _decode_source_state(
-    connection: SQLConnection,
-    *,
-    row_agent_id: object,
-    row_source_id: object,
-    source_data: object,
-    read_scope_data: object,
-    update_scope_count: object,
-) -> SourceRegistration:
-    if (
-        not isinstance(row_agent_id, str)
-        or not isinstance(row_source_id, str)
-        or not isinstance(source_data, str)
-        or not isinstance(update_scope_count, int)
-        or isinstance(update_scope_count, bool)
-        or update_scope_count < 0
-    ):
-        raise SourcePermissionStateError("stored source permission state is invalid")
-    try:
-        registration = decode_source(source_data)
-    except (TypeError, ValueError):
-        raise SourcePermissionStateError(
-            "stored source registration is invalid"
-        ) from None
-    if registration.agent_id != row_agent_id or registration.id != row_source_id:
-        raise SourcePermissionStateError("stored source ownership is invalid")
-    _decode_owned_read_scope(connection, registration, read_scope_data)
-    if update_scope_count and not registration.active:
-        raise SourcePermissionStateError("stored PostgreSQL update scope is foreign")
-    return registration
-
-
-def _source_state_row(
-    connection: SQLConnection,
-    agent_id: str,
-    source_id: str,
-) -> tuple[object, ...] | None:
-    return connection.execute(
-        """SELECT s.agent_id, s.id, s.data, r.data,
-                  (SELECT COUNT(*) FROM relational_write_scopes AS u
-                   WHERE u.agent_id = s.agent_id AND u.source_id = s.id)
-           FROM sources AS s
-           LEFT JOIN source_read_scopes AS r
-             ON r.agent_id = s.agent_id AND r.source_id = s.id
-           WHERE s.agent_id = ? AND s.id = ?""",
-        (agent_id, source_id),
-    ).fetchone()
-
-
-def _attach_registration(
-    connection: SQLConnection, registration: SourceRegistration
-) -> None:
-    """First attach inserts the source and an allow-all scope; re-attach follows the rules."""
-
-    stored_registration = registration
-    row = _source_state_row(
-        connection,
-        stored_registration.agent_id,
-        stored_registration.id,
-    )
-    if row is None:
-        connection.execute(
-            "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
-            (
-                stored_registration.agent_id,
-                stored_registration.id,
-                encode_source(stored_registration),
-            ),
-        )
-        if stored_registration.active:
-            attach_scope = SourceReadScope.allow_all(
-                agent_id=stored_registration.agent_id,
-                source_id=stored_registration.id,
-            )
-            connection.execute(
-                """INSERT INTO source_read_scopes(
-                       agent_id, source_id, data
-                   ) VALUES (?, ?, ?)""",
-                (
-                    stored_registration.agent_id,
-                    stored_registration.id,
-                    encode_source_read_scope(attach_scope),
-                ),
-            )
-    else:
-        current = _decode_source_state(
-            connection,
-            row_agent_id=row[0],
-            row_source_id=row[1],
-            source_data=row[2],
-            read_scope_data=row[3],
-            update_scope_count=row[4],
-        )
-        if current != stored_registration:
-            if (
-                current.active
-                or not stored_registration.active
-                or current.adapter_id != stored_registration.adapter_id
-                or current.native_identity != stored_registration.native_identity
-            ):
-                raise ValueError(
-                    "source registration already exists: " f"{stored_registration.id}"
-                )
-            connection.execute(
-                """UPDATE sources SET data = ?
-                   WHERE agent_id = ? AND id = ?""",
-                (
-                    encode_source(stored_registration),
-                    stored_registration.agent_id,
-                    stored_registration.id,
-                ),
-            )
-            attach_scope = SourceReadScope.allow_all(
-                agent_id=stored_registration.agent_id,
-                source_id=stored_registration.id,
-            )
-            connection.execute(
-                """INSERT INTO source_read_scopes(
-                       agent_id, source_id, data
-                   ) VALUES (?, ?, ?)""",
-                (
-                    stored_registration.agent_id,
-                    stored_registration.id,
-                    encode_source_read_scope(attach_scope),
-                ),
-            )
 
 
 class _CatalogCommitGate:
@@ -465,7 +221,7 @@ class SQLStateStore:
         recovered_at = _effect_receipt_aware(recovered_at, "receipt recovery time")
         await run_sql_transaction(
             self._database,
-            lambda connection: _recover_started_effect_receipts(
+            lambda connection: _effect_store.recover_started(
                 connection, agent_id, recovered_at
             ),
         )
@@ -524,13 +280,7 @@ class SQLStateStore:
 
         def read() -> tuple[EffectReceipt, ...]:
             with _connect_read_only(self._database) as connection:
-                rows = connection.execute(
-                    "SELECT data FROM effect_receipts "
-                    "WHERE agent_id = ? AND job_id = ? "
-                    f"ORDER BY {connection.insertion_order} LIMIT 257",
-                    (agent_id, job_id),
-                ).fetchall()
-            return tuple(decode_receipt(row[0]) for row in rows[:256])
+                return _effect_store.job_receipts(connection, agent_id, job_id)
 
         return await settled_thread(read)
 
@@ -631,20 +381,7 @@ class SQLStateStore:
     ) -> MCPServerBinding | None:
         def read() -> MCPServerBinding | None:
             with _connect_read_only(self._database) as connection:
-                row = connection.execute(
-                    """SELECT data FROM mcp_server_bindings
-                       WHERE agent_id = ? AND binding_id = ?""",
-                    (agent_id, binding_id),
-                ).fetchone()
-            return (
-                None
-                if row is None
-                else decode_mcp_binding(
-                    row[0],
-                    agent_id=agent_id,
-                    binding_id=binding_id,
-                )
-            )
+                return _mcp_store.load_binding(connection, agent_id, binding_id)
 
         return await settled_thread(read)
 
@@ -654,33 +391,7 @@ class SQLStateStore:
     ) -> tuple[MCPServerBinding, ...]:
         def read() -> tuple[MCPServerBinding, ...]:
             with _connect_read_only(self._database) as connection:
-                rows = tuple(
-                    connection.execute(
-                        """SELECT binding_id, data FROM mcp_server_bindings
-                           WHERE agent_id = ? ORDER BY binding_id""",
-                        (agent_id,),
-                    )
-                )
-            if len(rows) > MCP_MAX_BINDINGS_PER_AGENT:
-                raise RuntimeError("stored MCP binding count exceeds its fixed bound")
-            encoded_sizes = tuple(len(data.encode("utf-8")) for _, data in rows)
-            if any(size > MCP_MAX_BINDING_CANONICAL_BYTES for size in encoded_sizes):
-                raise RuntimeError("stored MCP binding exceeds its byte bound")
-            if sum(encoded_sizes) > MCP_MAX_AGENT_CATALOG_BYTES:
-                raise RuntimeError("stored MCP agent catalog exceeds its byte bound")
-            bindings = tuple(
-                decode_mcp_binding(
-                    data,
-                    agent_id=agent_id,
-                    binding_id=binding_id,
-                )
-                for binding_id, data in rows
-            )
-            if _active_mcp_tool_count(bindings) > MCP_MAX_ACTIVE_TOOLS_PER_AGENT:
-                raise RuntimeError(
-                    "stored active MCP tool catalog exceeds its fixed bound"
-                )
-            return bindings
+                return _mcp_store.list_bindings(connection, agent_id)
 
         return await settled_thread(read)
 
@@ -701,92 +412,12 @@ class SQLStateStore:
         encoded = encode_mcp_binding(binding)
         if len(encoded.encode("utf-8")) > MCP_MAX_BINDING_CANONICAL_BYTES:
             raise ValueError("MCP binding exceeds its byte bound")
-
-        def write(connection: SQLConnection) -> MCPServerBinding:
-            row = connection.execute(
-                """SELECT data FROM mcp_server_bindings
-                   WHERE agent_id = ? AND binding_id = ?""",
-                (binding.agent_id, binding.binding_id),
-            ).fetchone()
-            if row is None:
-                if expected_revision is not None or binding.revision != 1:
-                    raise ValueError("MCP binding revision precondition failed")
-            else:
-                current = decode_mcp_binding(
-                    row[0],
-                    agent_id=binding.agent_id,
-                    binding_id=binding.binding_id,
-                )
-                if (
-                    expected_revision is None
-                    or current.revision != expected_revision
-                    or binding.revision != expected_revision + 1
-                ):
-                    raise ValueError("MCP binding revision precondition failed")
-            other_rows = tuple(
-                connection.execute(
-                    """SELECT binding_id, data FROM mcp_server_bindings
-                       WHERE agent_id = ? AND binding_id <> ?""",
-                    (binding.agent_id, binding.binding_id),
-                )
-            )
-            total_bytes = len(encoded.encode("utf-8")) + sum(
-                len(data.encode("utf-8")) for _, data in other_rows
-            )
-            if total_bytes > MCP_MAX_AGENT_CATALOG_BYTES:
-                raise ValueError("MCP agent catalog exceeds its byte bound")
-            other_bindings = tuple(
-                decode_mcp_binding(
-                    data,
-                    agent_id=binding.agent_id,
-                    binding_id=other_binding_id,
-                )
-                for other_binding_id, data in other_rows
-            )
-            active_tool_count = _active_mcp_tool_count((*other_bindings, binding))
-            if active_tool_count > MCP_MAX_ACTIVE_TOOLS_PER_AGENT:
-                raise MCPAdmissionError(
-                    "mcp_agent_tool_limit_exceeded",
-                    "The active MCP tool catalog exceeds its fixed per-agent bound.",
-                    {
-                        "observed_tools": active_tool_count,
-                        "maximum_tools": MCP_MAX_ACTIVE_TOOLS_PER_AGENT,
-                    },
-                )
-            if row is None:
-                count = required_row(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM mcp_server_bindings WHERE agent_id = ?",
-                        (binding.agent_id,),
-                    )
-                )[0]
-                if count >= MCP_MAX_BINDINGS_PER_AGENT:
-                    raise ValueError("MCP binding count exceeds its fixed bound")
-                connection.execute(
-                    """INSERT INTO mcp_server_bindings(agent_id, binding_id, data)
-                       VALUES (?, ?, ?)""",
-                    (
-                        binding.agent_id,
-                        binding.binding_id,
-                        encoded,
-                    ),
-                )
-                return binding
-            result = connection.execute(
-                """UPDATE mcp_server_bindings SET data = ?
-                   WHERE agent_id = ? AND binding_id = ? AND data = ?""",
-                (
-                    encoded,
-                    binding.agent_id,
-                    binding.binding_id,
-                    row[0],
-                ),
-            )
-            if result.rowcount != 1:
-                raise RuntimeError("MCP binding changed during its transition")
-            return binding
-
-        return await run_sql_transaction(self._database, write)
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _mcp_store.store_binding(
+                connection, binding, encoded, expected_revision
+            ),
+        )
 
     async def update_mcp_discovery(
         self,
@@ -799,39 +430,17 @@ class SQLStateStore:
     ) -> MCPServerBinding:
         """Replace local hints without changing any execution admission or revision."""
 
-        def write(connection: SQLConnection) -> MCPServerBinding:
-            row = connection.execute(
-                "SELECT data FROM mcp_server_bindings WHERE agent_id = ? AND binding_id = ?",
-                (agent_id, binding_id),
-            ).fetchone()
-            if row is None:
-                raise ValueError("MCP binding does not exist")
-            current = decode_mcp_binding(
-                row[0], agent_id=agent_id, binding_id=binding_id
-            )
-            updated = replace(
-                current, summary=summary, when_to_use=when_to_use, keywords=keywords
-            )
-            encoded = encode_mcp_binding(updated)
-            if len(encoded.encode("utf-8")) > MCP_MAX_BINDING_CANONICAL_BYTES:
-                raise ValueError("MCP binding exceeds its byte bound")
-            others = connection.execute(
-                "SELECT data FROM mcp_server_bindings WHERE agent_id = ? AND binding_id <> ?",
-                (agent_id, binding_id),
-            )
-            if (
-                len(encoded.encode("utf-8"))
-                + sum(len(item[0].encode("utf-8")) for item in others)
-                > MCP_MAX_AGENT_CATALOG_BYTES
-            ):
-                raise ValueError("MCP agent catalog exceeds its byte bound")
-            connection.execute(
-                "UPDATE mcp_server_bindings SET data = ? WHERE agent_id = ? AND binding_id = ?",
-                (encoded, agent_id, binding_id),
-            )
-            return updated
-
-        return await run_sql_transaction(self._database, write)
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _mcp_store.update_discovery(
+                connection,
+                agent_id,
+                binding_id,
+                summary=summary,
+                when_to_use=when_to_use,
+                keywords=keywords,
+            ),
+        )
 
     async def update_source_discovery(
         self,
@@ -844,30 +453,17 @@ class SQLStateStore:
     ) -> SourceRegistration:
         """Replace local discovery hints while retaining source identity and scopes."""
 
-        def write(connection: SQLConnection) -> SourceRegistration:
-            row = _source_state_row(connection, agent_id, source_id)
-            if row is None:
-                raise ValueError("source does not exist")
-            current = _decode_source_state(
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _source_store.update_discovery(
                 connection,
-                row_agent_id=row[0],
-                row_source_id=row[1],
-                source_data=row[2],
-                read_scope_data=row[3],
-                update_scope_count=row[4],
-            )
-            if not current.active:
-                raise ValueError("source is not active")
-            updated = replace(
-                current, summary=summary, when_to_use=when_to_use, keywords=keywords
-            )
-            connection.execute(
-                "UPDATE sources SET data = ? WHERE agent_id = ? AND id = ?",
-                (encode_source(updated), agent_id, source_id),
-            )
-            return updated
-
-        return await run_sql_transaction(self._database, write)
+                agent_id,
+                source_id,
+                summary=summary,
+                when_to_use=when_to_use,
+                keywords=keywords,
+            ),
+        )
 
     async def admit_scheduled_routine(
         self,
@@ -1319,98 +915,24 @@ class SQLStateStore:
     async def register_source(
         self, registration: SourceRegistration
     ) -> SourceRegistration:
-        def write(connection: SQLConnection) -> SourceRegistration:
-            stored = registration
-            row = _source_state_row(
-                connection,
-                registration.agent_id,
-                registration.id,
-            )
-            if row is not None:
-                current = _decode_source_state(
-                    connection,
-                    row_agent_id=row[0],
-                    row_source_id=row[1],
-                    source_data=row[2],
-                    read_scope_data=row[3],
-                    update_scope_count=row[4],
-                )
-                if current != stored:
-                    raise ValueError(
-                        f"source registration already exists: {registration.id}"
-                    )
-                return current
-            connection.execute(
-                "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
-                (stored.agent_id, stored.id, encode_source(stored)),
-            )
-            if stored.active:
-                scope = SourceReadScope.allow_all(
-                    agent_id=stored.agent_id,
-                    source_id=stored.id,
-                )
-                connection.execute(
-                    """INSERT INTO source_read_scopes(agent_id, source_id, data)
-                       VALUES (?, ?, ?)""",
-                    (stored.agent_id, stored.id, encode_source_read_scope(scope)),
-                )
-            return stored
-
-        return await run_sql_transaction(self._database, write)
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _source_store.register(connection, registration),
+        )
 
     async def load_source(
         self, agent_id: str, source_id: str
     ) -> SourceRegistration | None:
         def read() -> SourceRegistration | None:
             with _connect_read_only(self._database) as connection:
-                row = _source_state_row(connection, agent_id, source_id)
-                return (
-                    None
-                    if row is None
-                    else _decode_source_state(
-                        connection,
-                        row_agent_id=row[0],
-                        row_source_id=row[1],
-                        source_data=row[2],
-                        read_scope_data=row[3],
-                        update_scope_count=row[4],
-                    )
-                )
+                return _source_store.load(connection, agent_id, source_id)
 
         return await settled_thread(read)
 
     async def list_sources(self, agent_id: str) -> tuple[SourceRegistration, ...]:
         def read() -> tuple[SourceRegistration, ...]:
             with _connect_read_only(self._database) as connection:
-                rows = connection.execute(
-                    """SELECT s.agent_id, s.id, s.data, r.data,
-                              (SELECT COUNT(*)
-                               FROM relational_write_scopes AS u
-                               WHERE u.agent_id = s.agent_id
-                                 AND u.source_id = s.id)
-                       FROM sources AS s
-                       LEFT JOIN source_read_scopes AS r
-                         ON r.agent_id = s.agent_id AND r.source_id = s.id
-                       WHERE s.agent_id = ? ORDER BY s.id""",
-                    (agent_id,),
-                ).fetchall()
-                return tuple(
-                    _decode_source_state(
-                        connection,
-                        row_agent_id=row_agent_id,
-                        row_source_id=row_source_id,
-                        source_data=data,
-                        read_scope_data=read_scope_data,
-                        update_scope_count=update_scope_count,
-                    )
-                    for (
-                        row_agent_id,
-                        row_source_id,
-                        data,
-                        read_scope_data,
-                        update_scope_count,
-                    ) in rows
-                )
+                return _source_store.list_sources(connection, agent_id)
 
         return await settled_thread(read)
 
@@ -1423,18 +945,7 @@ class SQLStateStore:
 
         def read() -> SourceReadScope | None:
             with _connect_read_only(self._database) as connection:
-                row = _source_state_row(connection, agent_id, source_id)
-                if row is None:
-                    return None
-                registration = _decode_source_state(
-                    connection,
-                    row_agent_id=row[0],
-                    row_source_id=row[1],
-                    source_data=row[2],
-                    read_scope_data=row[3],
-                    update_scope_count=row[4],
-                )
-                return _decode_owned_read_scope(connection, registration, row[3])
+                return _source_store.load_read_scope(connection, agent_id, source_id)
 
         return await settled_thread(read)
 
@@ -1445,41 +956,7 @@ class SQLStateStore:
     ) -> tuple[RelationalWriteScope, ...]:
         def read() -> tuple[RelationalWriteScope, ...]:
             with _connect_read_only(self._database) as connection:
-                source_row = _source_state_row(connection, agent_id, source_id)
-                if source_row is None:
-                    return ()
-                registration = _decode_source_state(
-                    connection,
-                    row_agent_id=source_row[0],
-                    row_source_id=source_row[1],
-                    source_data=source_row[2],
-                    read_scope_data=source_row[3],
-                    update_scope_count=source_row[4],
-                )
-                if not registration.active:
-                    return ()
-                rows = connection.execute(
-                    """SELECT resource_id, authorization_fingerprint, data
-                       FROM relational_write_scopes
-                       WHERE agent_id = ? AND source_id = ?
-                       ORDER BY resource_id""",
-                    (agent_id, source_id),
-                ).fetchall()
-                try:
-                    return tuple(
-                        decode_relational_write_scope(
-                            data,
-                            agent_id=agent_id,
-                            source_id=source_id,
-                            resource_id=resource_id,
-                            authorization_fingerprint=fingerprint,
-                        )
-                        for resource_id, fingerprint, data in rows
-                    )
-                except (TypeError, ValueError):
-                    raise SourcePermissionStateError(
-                        "stored PostgreSQL update scope is undecodable"
-                    ) from None
+                return _source_store.list_write_scopes(connection, agent_id, source_id)
 
         return await settled_thread(read)
 
@@ -1498,82 +975,12 @@ class SQLStateStore:
             raise TypeError("update_scopes must be a tuple of RelationalWriteScope")
         if len({scope.resource_id for scope in update_scopes}) != len(update_scopes):
             raise ValueError("update_scopes cannot contain duplicate resources")
-
-        def write(connection: SQLConnection) -> SourceRegistration:
-            row = _source_state_row(
-                connection,
-                read_scope.agent_id,
-                read_scope.source_id,
-            )
-            if row is None:
-                raise ValueError("permission scopes require an active owned source")
-            registration = _decode_source_state(
-                connection,
-                row_agent_id=row[0],
-                row_source_id=row[1],
-                source_data=row[2],
-                read_scope_data=row[3],
-                update_scope_count=row[4],
-            )
-            if not registration.active:
-                raise ValueError("permission scopes require an active owned source")
-            _require_nonforeign_read_resources(connection, read_scope)
-            if any(
-                scope.agent_id != read_scope.agent_id
-                or scope.source_id != read_scope.source_id
-                for scope in update_scopes
-            ):
-                raise ValueError("update scope belongs to another source")
-            update_resource_ids = {scope.resource_id for scope in update_scopes}
-            if read_scope.mode is SourceReadMode.NONE and update_resource_ids:
-                raise ValueError("PostgreSQL update scope requires read access")
-            if (
-                read_scope.mode is SourceReadMode.SELECTED
-                and not update_resource_ids <= set(read_scope.resource_ids)
-            ):
-                raise ValueError("PostgreSQL update scope must be a read subset")
-            for scope in update_scopes:
-                expected = relational_write_authorization_fingerprint(
-                    source=registration, scope=scope
-                )
-                if scope.authorization_fingerprint != expected:
-                    raise ValueError(
-                        "PostgreSQL write authorization fingerprint is stale"
-                    )
-            connection.execute(
-                f"""INSERT INTO source_read_scopes(agent_id, source_id, data)
-                   VALUES (?, ?, ?)
-                   ON CONFLICT({connection.conflict('agent_id, source_id')})
-                   DO UPDATE SET data = excluded.data""",
-                (
-                    read_scope.agent_id,
-                    read_scope.source_id,
-                    encode_source_read_scope(read_scope),
-                ),
-            )
-            connection.execute(
-                """DELETE FROM relational_write_scopes
-                   WHERE agent_id = ? AND source_id = ?""",
-                (read_scope.agent_id, read_scope.source_id),
-            )
-            for scope in sorted(update_scopes, key=lambda item: item.resource_id):
-                connection.execute(
-                    """INSERT INTO relational_write_scopes(
-                           agent_id, source_id, resource_id,
-                           authorization_fingerprint, data
-                       ) VALUES (?, ?, ?, ?, ?)""",
-                    (
-                        scope.agent_id,
-                        scope.source_id,
-                        scope.resource_id,
-                        scope.authorization_fingerprint,
-                        encode_relational_write_scope(scope),
-                    ),
-                )
-            return registration
-
-        updated = await run_sql_transaction(self._database, write)
-        return updated
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _source_store.replace_permission_scopes(
+                connection, read_scope, update_scopes
+            ),
+        )
 
     async def load_effect_receipt(
         self,
@@ -1585,12 +992,7 @@ class SQLStateStore:
 
         def read() -> EffectReceipt | None:
             with _connect_read_only(self._database) as connection:
-                row = connection.execute(
-                    """SELECT data FROM effect_receipts
-                       WHERE agent_id = ? AND id = ?""",
-                    (agent_id, receipt_id),
-                ).fetchone()
-            return None if row is None else decode_receipt(row[0])
+                return _effect_store.load_receipt(connection, agent_id, receipt_id)
 
         return await settled_thread(read)
 
@@ -1606,12 +1008,9 @@ class SQLStateStore:
 
         def read() -> EffectReceipt | None:
             with _connect_read_only(self._database) as connection:
-                row = connection.execute(
-                    """SELECT data FROM effect_receipts
-                       WHERE agent_id = ? AND run_id = ? AND call_id = ?""",
-                    (agent_id, run_id, call_id),
-                ).fetchone()
-            return None if row is None else decode_receipt(row[0])
+                return _effect_store.load_receipt_for_call(
+                    connection, agent_id, run_id, call_id
+                )
 
         return await settled_thread(read)
 
@@ -1627,11 +1026,9 @@ class SQLStateStore:
 
         def read() -> EffectReceipt | None:
             with _connect_read_only(self._database) as connection:
-                row = connection.execute(
-                    "SELECT data FROM effect_receipts WHERE agent_id = ? AND operation_key = ?",
-                    (agent_id, operation_key),
-                ).fetchone()
-                return None if row is None else decode_receipt(row[0])
+                return _effect_store.load_receipt_for_operation(
+                    connection, agent_id, operation_key
+                )
 
         return await settled_thread(read)
 
@@ -1664,44 +1061,16 @@ class SQLStateStore:
 
         def read() -> tuple[EffectReceipt, ...]:
             with _connect_read_only(self._database) as connection:
-                if caller_principal_id is None:
-                    rows = connection.execute(
-                        "SELECT data FROM effect_receipts WHERE agent_id = ? AND (CAST(? AS TEXT) IS NULL OR run_id = ?) AND (CAST(? AS TEXT) IS NULL OR routine_id = ?) AND (? = 0 OR unresolved = 1) ORDER BY id LIMIT ? OFFSET ?",
-                        (
-                            agent_id,
-                            run_id,
-                            run_id,
-                            routine_id,
-                            routine_id,
-                            int(unresolved_only),
-                            limit,
-                            offset,
-                        ),
-                    )
-                else:
-                    rows = connection.execute(
-                        "SELECT effect_receipts.data FROM effect_receipts "
-                        "JOIN runs ON runs.id = effect_receipts.run_id "
-                        "AND runs.agent_id = effect_receipts.agent_id "
-                        "WHERE effect_receipts.agent_id = ? "
-                        f"AND {connection.caller_expression('runs.input')} = ? "
-                        "AND (CAST(? AS TEXT) IS NULL OR effect_receipts.run_id = ?) "
-                        "AND (CAST(? AS TEXT) IS NULL OR effect_receipts.routine_id = ?) "
-                        "AND (? = 0 OR effect_receipts.unresolved = 1) "
-                        "ORDER BY effect_receipts.id LIMIT ? OFFSET ?",
-                        (
-                            agent_id,
-                            caller_principal_id,
-                            run_id,
-                            run_id,
-                            routine_id,
-                            routine_id,
-                            int(unresolved_only),
-                            limit,
-                            offset,
-                        ),
-                    )
-                return tuple(decode_receipt(row[0]) for row in rows)
+                return _effect_store.list_receipts(
+                    connection,
+                    agent_id,
+                    run_id=run_id,
+                    routine_id=routine_id,
+                    unresolved_only=unresolved_only,
+                    limit=limit,
+                    offset=offset,
+                    caller_principal_id=caller_principal_id,
+                )
 
         return await settled_thread(read)
 
@@ -1732,131 +1101,12 @@ class SQLStateStore:
             or not 1 <= max_receipts_per_run <= 256
         ):
             raise ValueError("receipt reservation requires a positive run call bound")
-
-        def write(connection: SQLConnection) -> EffectReceipt:
-            identity = connection.execute(
-                "SELECT data FROM metadata WHERE key = 'identity'"
-            ).fetchone()
-            run_row = connection.execute(
-                "SELECT input, result FROM runs WHERE agent_id = ? AND id = ?",
-                (receipt.agent_id, receipt.run_id),
-            ).fetchone()
-            if (
-                identity is None
-                or decode_identity(identity[0]).id != receipt.agent_id
-                or run_row is None
-                or run_row[1] is not None
-            ):
-                raise EffectReceiptConflictError(
-                    "receipt requires its current owned nonterminal run"
-                )
-            run = decode_run_input(run_row[0])
-            _require_effects_unblocked(
-                connection,
-                receipt.agent_id,
-                run_id=receipt.run_id,
-                routine_id=receipt.routine_id,
-            )
-            existing = connection.execute(
-                "SELECT id FROM effect_receipts WHERE agent_id = ? AND (id = ? OR (run_id = ? AND call_id = ?) OR operation_key = ?)",
-                (
-                    receipt.agent_id,
-                    receipt.receipt_id,
-                    receipt.run_id,
-                    receipt.call_id,
-                    receipt.operation_key,
-                ),
-            ).fetchone()
-            if existing is not None:
-                raise EffectReceiptConflictError(
-                    "execution or operation identity already has a receipt"
-                )
-            reserved_count = required_row(
-                connection.execute(
-                    "SELECT COUNT(*) FROM effect_receipts WHERE agent_id = ? AND run_id = ?",
-                    (receipt.agent_id, receipt.run_id),
-                )
-            )[0]
-            if reserved_count >= max_receipts_per_run:
-                raise EffectReceiptConflictError(
-                    "the run receipt reservation bound is exhausted"
-                )
-            scope = run.start.execution_scope if run.start is not None else None
-            job_id = (
-                scope.job_id
-                if scope is not None and scope.scope_kind is ExecutionScopeKind.JOB
-                else None
-            )
-            if receipt.capability_grant_digest is not None:
-                raise EffectReceiptConflictError(
-                    "effects are approved at the time; a receipt cannot carry a grant"
-                )
-            if job_id is not None:
-                job = _job_store.load_job(connection, receipt.agent_id, job_id)
-                if (
-                    receipt.routine_id is not None
-                    or job is None
-                    or job.state is not JobState.RUNNING
-                ):
-                    raise EffectReceiptConflictError(
-                        "job receipt requires its running job"
-                    )
-            elif scope is not None:
-                routine_id = receipt.routine_id
-                if routine_id is None:
-                    raise EffectReceiptConflictError(
-                        "machine receipt lacks routine or job authorization"
-                    )
-                if (
-                    scope.routine_id != receipt.routine_id
-                    or scope.routine_revision != receipt.routine_revision
-                    or scope.occurrence_id != receipt.occurrence_id
-                ):
-                    raise EffectReceiptConflictError(
-                        "receipt does not match its scope authorization"
-                    )
-                occurrence = _load_routine_occurrence_row(
-                    connection, receipt.agent_id, receipt.occurrence_id or ""
-                )
-                routine = _load_routine_row(connection, receipt.agent_id, routine_id)
-                if (
-                    occurrence is None
-                    or routine is None
-                    or (
-                        occurrence[0].reserved_run_id != receipt.run_id
-                        or occurrence[0].routine_revision != receipt.routine_revision
-                        or occurrence[0].disposition
-                        is not RoutineOccurrenceDisposition.RUNNING
-                        or occurrence[0].claim_token is None
-                        # The lease fences unbound claims. Once bound, the
-                        # immutable run/scope and nonterminal run row fence
-                        # dispatch; model reasoning may outlast the claim lease.
-                        or routine[0].revision != receipt.routine_revision
-                        or routine[0].active_occurrence_id != receipt.occurrence_id
-                        or routine[0].state is not RoutineState.ACTIVE
-                    )
-                ):
-                    raise EffectReceiptConflictError(
-                        "receipt occurrence claim is no longer current"
-                    )
-            connection.execute(
-                "INSERT INTO effect_receipts(agent_id, id, run_id, call_id, operation_key, routine_id, occurrence_id, grant_digest, unresolved, job_id, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
-                (
-                    receipt.agent_id,
-                    receipt.receipt_id,
-                    receipt.run_id,
-                    receipt.call_id,
-                    receipt.operation_key,
-                    receipt.routine_id,
-                    receipt.occurrence_id,
-                    receipt.capability_grant_digest,
-                    job_id,
-                    encode_receipt(receipt),
-                ),
-            )
-            return receipt
-
-        return await run_sql_transaction(self._database, write)
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _effect_store.start_receipt(
+                connection, receipt, max_receipts_per_run
+            ),
+        )
 
     async def finish_effect_receipt(self, receipt: EffectReceipt) -> EffectReceipt:
         if (
@@ -1867,137 +1117,34 @@ class SQLStateStore:
             raise ValueError(
                 "finish requires one terminal observation without human resolution"
             )
-
-        def write(connection: SQLConnection) -> EffectReceipt:
-            row = connection.execute(
-                "SELECT data, job_id FROM effect_receipts WHERE agent_id = ? AND id = ?",
-                (receipt.agent_id, receipt.receipt_id),
-            ).fetchone()
-            if row is None:
-                raise EffectReceiptConflictError("started receipt does not exist")
-            current = decode_receipt(row[0])
-            if current.outcome is not EffectOutcome.STARTED:
-                if replace(current, resolution=None) == receipt:
-                    return current
-                raise EffectReceiptConflictError("terminal receipt is immutable")
-            if current != receipt.as_started():
-                raise EffectReceiptConflictError(
-                    "terminal receipt does not match its started identity"
-                )
-            connection.execute(
-                "UPDATE effect_receipts SET data = ?, unresolved = ? WHERE agent_id = ? AND id = ?",
-                (
-                    encode_receipt(receipt),
-                    int(receipt.unresolved),
-                    receipt.agent_id,
-                    receipt.receipt_id,
-                ),
-            )
-            if receipt.unresolved:
-                _pause_effect_routine(
-                    connection, receipt, receipt.finished_at or self._clock()
-                )
-                if row[1] is not None:
-                    _job_store.wait_for_uncertain_write(
-                        connection,
-                        receipt.agent_id,
-                        str(row[1]),
-                        receipt.finished_at or self._clock(),
-                    )
-            return receipt
-
-        return await run_sql_transaction(self._database, write)
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _effect_store.finish_receipt(
+                connection, receipt, self._clock
+            ),
+        )
 
     async def resolve_effect_receipt(
         self, agent_id: str, resolution: EffectResolution
     ) -> EffectReceipt:
         if not isinstance(resolution, EffectResolution):
             raise TypeError("effect recovery requires an exact human resolution")
-
-        def write(connection: SQLConnection) -> EffectReceipt:
-            row = connection.execute(
-                "SELECT data, job_id FROM effect_receipts WHERE agent_id = ? AND id = ?",
-                (agent_id, resolution.receipt_id),
-            ).fetchone()
-            if row is None:
-                raise EffectReceiptConflictError(
-                    "the exact owned receipt is unavailable"
-                )
-            receipt = decode_receipt(row[0])
-            if receipt.receipt_digest != resolution.receipt_digest:
-                raise EffectReceiptConflictError(
-                    "the receipt observation changed before recovery"
-                )
-            if receipt.resolution is not None:
-                if receipt.resolution == resolution:
-                    return receipt
-                raise EffectReceiptConflictError(
-                    "an existing human resolution is immutable"
-                )
-            if receipt.outcome is not EffectOutcome.UNCERTAIN:
-                raise EffectReceiptConflictError(
-                    "only terminal uncertainty requires recovery"
-                )
-            resolved = replace(receipt, resolution=resolution)
-            connection.execute(
-                "UPDATE effect_receipts SET data = ?, unresolved = 0 WHERE agent_id = ? AND id = ?",
-                (encode_receipt(resolved), agent_id, receipt.receipt_id),
-            )
-            if receipt.routine_id is not None:
-                loaded = _load_routine_row(connection, agent_id, receipt.routine_id)
-                if loaded is None:
-                    raise EffectReceiptConflictError(
-                        "the producing routine is unavailable"
-                    )
-                routine, data = loaded
-                state = (
-                    RoutineState.DISABLED
-                    if resolution.decision
-                    is EffectResolutionDecision.CLOSE_WITHOUT_RETRY
-                    else RoutineState.PAUSED
-                )
-                _replace_routine_row(
-                    connection,
-                    data,
-                    replace(routine, state=state, updated_at=resolution.resolved_at),
-                )
-            if row[1] is not None:
-                _job_store.release_uncertain_write(
-                    connection, agent_id, str(row[1]), resolution.resolved_at
-                )
-            return resolved
-
-        return await run_sql_transaction(self._database, write)
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _effect_store.resolve_receipt(
+                connection, agent_id, resolution
+            ),
+        )
 
     async def detach_source(
         self, agent_id: str, source_id: str, detached_at: datetime
     ) -> SourceRegistration:
-        def write(connection: SQLConnection) -> SourceRegistration:
-            row = connection.execute(
-                "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
-                (agent_id, source_id),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"unknown source: {source_id}")
-            current = decode_source(row[0])
-            detached = current if not current.active else current.detach(detached_at)
-            connection.execute(
-                "UPDATE sources SET data = ? WHERE agent_id = ? AND id = ?",
-                (encode_source(detached), agent_id, source_id),
-            )
-            connection.execute(
-                """DELETE FROM source_read_scopes
-                   WHERE agent_id = ? AND source_id = ?""",
-                (agent_id, source_id),
-            )
-            connection.execute(
-                """DELETE FROM relational_write_scopes
-                   WHERE agent_id = ? AND source_id = ?""",
-                (agent_id, source_id),
-            )
-            return detached
-
-        return await run_sql_transaction(self._database, write)
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _source_store.detach(
+                connection, agent_id, source_id, detached_at
+            ),
+        )
 
     async def record_sync(self, sync: CatalogSync) -> CatalogSync:
         def write(connection: SQLConnection) -> CatalogSync:
@@ -2037,7 +1184,7 @@ class SQLStateStore:
 
         def write(connection: SQLConnection) -> CatalogCommitSummary:
             if registration is not None:
-                _attach_registration(connection, registration)
+                _source_store.attach_registration(connection, registration)
             return catalog_rows.commit_pass(
                 connection,
                 sync,
@@ -2103,107 +1250,8 @@ class SQLStateStore:
         repair = self._damaged_rows(sync.agent_id)
 
         def write(connection: SQLConnection) -> CatalogCommitSummary:
-            replaced_row = _source_state_row(
-                connection,
-                registration.agent_id,
-                replaced_source_id,
-            )
-            if replaced_row is None:
-                raise ValueError("source edit requires an active owned source")
-            replaced = _decode_source_state(
-                connection,
-                row_agent_id=replaced_row[0],
-                row_source_id=replaced_row[1],
-                source_data=replaced_row[2],
-                read_scope_data=replaced_row[3],
-                update_scope_count=replaced_row[4],
-            )
-            if not replaced.active:
-                raise ValueError("source edit requires an active owned source")
-            if replaced.adapter_id != registration.adapter_id:
-                raise ValueError("source edit cannot change source type")
-            if registration.id != replaced.id:
-                replacement_row = _source_state_row(
-                    connection,
-                    registration.agent_id,
-                    registration.id,
-                )
-                if replacement_row is None:
-                    connection.execute(
-                        "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
-                        (
-                            registration.agent_id,
-                            registration.id,
-                            encode_source(registration),
-                        ),
-                    )
-                else:
-                    existing_replacement = _decode_source_state(
-                        connection,
-                        row_agent_id=replacement_row[0],
-                        row_source_id=replacement_row[1],
-                        source_data=replacement_row[2],
-                        read_scope_data=replacement_row[3],
-                        update_scope_count=replacement_row[4],
-                    )
-                    if existing_replacement.active:
-                        raise ValueError("replacement connection is already attached")
-                    if (
-                        existing_replacement.adapter_id != registration.adapter_id
-                        or existing_replacement.native_identity
-                        != registration.native_identity
-                    ):
-                        raise ValueError(
-                            "replacement source identity conflicts with stored state"
-                        )
-                    connection.execute(
-                        """UPDATE sources SET data = ?
-                           WHERE agent_id = ? AND id = ?""",
-                        (
-                            encode_source(registration),
-                            registration.agent_id,
-                            registration.id,
-                        ),
-                    )
-                detached = replaced.detach(replaced_at)
-                connection.execute(
-                    """UPDATE sources SET data = ?
-                       WHERE agent_id = ? AND id = ?""",
-                    (
-                        encode_source(detached),
-                        replaced.agent_id,
-                        replaced.id,
-                    ),
-                )
-            else:
-                connection.execute(
-                    """UPDATE sources SET data = ?
-                       WHERE agent_id = ? AND id = ?""",
-                    (
-                        encode_source(registration),
-                        registration.agent_id,
-                        registration.id,
-                    ),
-                )
-            for source_id in {replaced.id, registration.id}:
-                connection.execute(
-                    """DELETE FROM source_read_scopes
-                       WHERE agent_id = ? AND source_id = ?""",
-                    (registration.agent_id, source_id),
-                )
-                connection.execute(
-                    """DELETE FROM relational_write_scopes
-                       WHERE agent_id = ? AND source_id = ?""",
-                    (registration.agent_id, source_id),
-                )
-            connection.execute(
-                """INSERT INTO source_read_scopes(agent_id, source_id, data)
-                   VALUES (?, ?, ?)""",
-                (
-                    read_scope.agent_id,
-                    read_scope.source_id,
-                    encode_source_read_scope(read_scope),
-                ),
+            _source_store.replace_for_edit(
+                connection, registration, replaced_source_id, replaced_at, read_scope
             )
             return catalog_rows.commit_pass(
                 connection,
@@ -2589,16 +1637,7 @@ class SQLStateStore:
 
         def read() -> tuple[SemanticAnnotation, ...]:
             with _connect_read_only(self._database) as connection:
-                rows = connection.execute(
-                    """SELECT data FROM semantic_annotations
-                       WHERE agent_id = ? ORDER BY id""",
-                    (agent_id,),
-                ).fetchall()
-            if len(rows) > SEMANTIC_MAX_ANNOTATIONS:
-                raise RuntimeError(
-                    "stored semantic annotation collection exceeds bound"
-                )
-            return tuple(decode_semantic_annotation(data) for (data,) in rows)
+                return _semantic_store.list_annotations(connection, agent_id)
 
         return await settled_thread(read)
 
@@ -2614,12 +1653,9 @@ class SQLStateStore:
 
         def read() -> SemanticAnnotation | None:
             with _connect_read_only(self._database) as connection:
-                row = connection.execute(
-                    """SELECT data FROM semantic_annotations
-                       WHERE agent_id = ? AND id = ?""",
-                    (agent_id, annotation_id),
-                ).fetchone()
-            return None if row is None else decode_semantic_annotation(row[0])
+                return _semantic_store.load_annotation(
+                    connection, agent_id, annotation_id
+                )
 
         return await settled_thread(read)
 
@@ -2631,11 +1667,11 @@ class SQLStateStore:
     ) -> FrozenJsonObject:
         """Validate and fingerprint one exact semantic create or replacement."""
 
-        _validate_semantic_owner(agent_id, annotation)
+        _semantic_store.validate_owner(agent_id, annotation)
 
         def read() -> FrozenJsonObject:
             with _connect_read_only(self._database) as connection:
-                return _semantic_save_fingerprint(
+                return _semantic_store.save_fingerprint(
                     connection,
                     agent_id,
                     annotation,
@@ -2653,31 +1689,13 @@ class SQLStateStore:
     ) -> bool:
         """Atomically create, digest-replace, or digest-supersede one annotation."""
 
-        _validate_semantic_owner(agent_id, annotation)
-
-        def write(connection: SQLConnection) -> bool:
-            _semantic_save_fingerprint(
-                connection,
-                agent_id,
-                annotation,
-                expected_sha256,
-            )
-            row = connection.execute(
-                """SELECT data FROM semantic_annotations
-                   WHERE agent_id = ? AND id = ?""",
-                (agent_id, annotation.id),
-            ).fetchone()
-            changed = row is None or decode_semantic_annotation(row[0]) != annotation
-            connection.execute(
-                f"""INSERT INTO semantic_annotations(agent_id, id, data)
-                   VALUES (?, ?, ?)
-                   ON CONFLICT({connection.conflict('agent_id, id')}) DO UPDATE SET data = excluded.data""",
-                (agent_id, annotation.id, encode_semantic_annotation(annotation)),
-            )
-            return changed
-
-        changed = await run_sql_transaction(self._database, write)
-        return changed
+        _semantic_store.validate_owner(agent_id, annotation)
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _semantic_store.save_annotation(
+                connection, agent_id, annotation, expected_sha256
+            ),
+        )
 
     async def preflight_semantic_delete(
         self,
@@ -2689,7 +1707,7 @@ class SQLStateStore:
 
         def read() -> FrozenJsonObject:
             with _connect_read_only(self._database) as connection:
-                return _semantic_delete_fingerprint(
+                return _semantic_store.delete_fingerprint(
                     connection,
                     agent_id,
                     annotation_id,
@@ -2707,24 +1725,12 @@ class SQLStateStore:
     ) -> bool:
         """Atomically delete one annotation only when its rendered digest matches."""
 
-        def write(connection: SQLConnection) -> bool:
-            _semantic_delete_fingerprint(
-                connection,
-                agent_id,
-                annotation_id,
-                expected_sha256,
-            )
-            cursor = connection.execute(
-                """DELETE FROM semantic_annotations
-                   WHERE agent_id = ? AND id = ?""",
-                (agent_id, annotation_id),
-            )
-            if cursor.rowcount != 1:
-                raise SemanticNotFoundError(annotation_id)
-            return True
-
-        deleted = await run_sql_transaction(self._database, write)
-        return deleted
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _semantic_store.delete_annotation(
+                connection, agent_id, annotation_id, expected_sha256
+            ),
+        )
 
     _UNSPECIFIED_PREDECESSOR = object()
 
@@ -2736,76 +1742,21 @@ class SQLStateStore:
     ) -> Transcript:
         if run.conversation_id is None:
             raise ValueError("run conversation_id must be resolved before persistence")
-
-        def write(connection: SQLConnection) -> Transcript:
-            try:
-                row = connection.execute(
-                    """SELECT id, turn_index, input, result
-                           FROM runs
-                           WHERE agent_id = ? AND conversation_id = ?
-                           ORDER BY turn_index DESC
-                           LIMIT 1""",
-                    (run.agent_id, run.conversation_id),
-                ).fetchone()
-                if predecessor is self._UNSPECIFIED_PREDECESSOR:
-                    turn_index = 0 if row is None else int(row[1]) + 1
-                elif predecessor is None:
-                    if row is not None:
-                        raise ValueError(
-                            "conversation predecessor changed before run start"
-                        )
-                    turn_index = 0
-                else:
-                    if not isinstance(predecessor, ConversationPredecessor):
-                        raise TypeError("conversation predecessor is invalid")
-                    if (
-                        row is None
-                        or row[0] != predecessor.run_id
-                        or int(row[1]) != predecessor.turn_index
-                        or row[3] is None
-                    ):
-                        raise ValueError(
-                            "conversation predecessor changed before run start"
-                        )
-                    current_predecessor = ConversationPredecessor.from_run(
-                        ConversationRun(
-                            turn_index=int(row[1]),
-                            transcript=Transcript(run=decode_run_input(row[2])),
-                            result=decode_loop_exit(row[3]),
-                        )
-                    )
-                    if current_predecessor != predecessor:
-                        raise ValueError(
-                            "conversation predecessor changed before run start"
-                        )
-                    turn_index = predecessor.turn_index + 1
-                connection.execute(
-                    """INSERT INTO runs(
-                               id, agent_id, conversation_id, turn_index, input
-                           ) VALUES (?, ?, ?, ?, ?)""",
-                    (
-                        run.id,
-                        run.agent_id,
-                        run.conversation_id,
-                        turn_index,
-                        encode_run_input(run),
-                    ),
-                )
-            except StateIntegrityError as error:
-                raise ValueError(f"run already exists: {run.id}") from error
-            return Transcript(run=run)
-
-        return await run_sql_transaction(self._database, write)
+        predecessor_given = predecessor is not self._UNSPECIFIED_PREDECESSOR
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _conversation_store.start_run(
+                connection,
+                run,
+                predecessor if predecessor_given else None,
+                predecessor_given=predecessor_given,
+            ),
+        )
 
     async def append(self, run_id: str, message: CanonicalMessage) -> None:
         def position() -> int:
             with _connect_read_only(self._database) as connection:
-                row = connection.execute(
-                    "SELECT COALESCE(MAX(position), -1) + 1 FROM messages WHERE run_id = ?",
-                    (run_id,),
-                ).fetchone()
-                assert row is not None
-                return int(row[0])
+                return _conversation_store.next_position(connection, run_id)
 
         await self.append_at(run_id, await settled_thread(position), message)
 
@@ -2815,46 +1766,20 @@ class SQLStateStore:
         position: int,
         message: CanonicalMessage,
     ) -> None:
-        def write(connection: SQLConnection) -> None:
-            run_row = connection.execute(
-                "SELECT result FROM runs WHERE id = ?", (run_id,)
-            ).fetchone()
-            if run_row is None:
-                raise KeyError(f"unknown run: {run_id}")
-            if run_row[0] is not None:
-                raise ValueError(f"run is already terminal: {run_id}")
-            row = connection.execute(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM messages WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
-            assert row is not None
-            if type(position) is not int or int(row[0]) != position:
-                raise ValueError("transcript append position is out of order")
-            connection.execute(
-                "INSERT INTO messages(run_id, position, data) VALUES (?, ?, ?)",
-                (run_id, position, encode_message(message)),
-            )
-
-        await run_sql_transaction(self._database, write)
+        await run_sql_transaction(
+            self._database,
+            lambda connection: _conversation_store.append_message(
+                connection, run_id, position, message
+            ),
+        )
 
     async def finish(self, result: LoopExit) -> None:
         if result.kind is LoopExitKind.COMPLETED:
             raise ValueError("completed runs require atomic transcript completion")
-
-        def write(connection: SQLConnection) -> None:
-            cursor = connection.execute(
-                """UPDATE runs SET result = ?
-                   WHERE id = ? AND conversation_id = ? AND result IS NULL""",
-                (
-                    encode_loop_exit(result),
-                    result.run_id,
-                    result.conversation_id,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise KeyError(f"unknown run: {result.run_id}")
-
-        await run_sql_transaction(self._database, write)
+        await run_sql_transaction(
+            self._database,
+            lambda connection: _conversation_store.finish_run(connection, result),
+        )
 
     async def complete(
         self,
@@ -2867,48 +1792,12 @@ class SQLStateStore:
             raise ValueError("atomic transcript completion requires a completed exit")
         if final_message.role is not MessageRole.ASSISTANT:
             raise ValueError("atomic completion requires an assistant message")
-
-        def write(connection: SQLConnection) -> None:
-            run_row = connection.execute(
-                """SELECT input, result FROM runs
-                   WHERE id = ? AND conversation_id = ?""",
-                (result.run_id, result.conversation_id),
-            ).fetchone()
-            if run_row is None:
-                raise KeyError(f"unknown run: {result.run_id}")
-            if run_row[1] is not None:
-                raise ValueError(f"run is already terminal: {result.run_id}")
-            rows = connection.execute(
-                """SELECT data FROM messages
-                   WHERE run_id = ? ORDER BY position""",
-                (result.run_id,),
-            ).fetchall()
-            transcript = Transcript(
-                run=decode_run_input(run_row[0]),
-                messages=(
-                    *(decode_message(row[0]) for row in rows),
-                    final_message,
-                ),
-            )
-            validate_completed_transcript(transcript, result)
-            connection.execute(
-                """INSERT INTO messages(run_id, position, data)
-                   VALUES (?, ?, ?)""",
-                (result.run_id, len(rows), encode_message(final_message)),
-            )
-            cursor = connection.execute(
-                """UPDATE runs SET result = ?
-                   WHERE id = ? AND conversation_id = ? AND result IS NULL""",
-                (
-                    encode_loop_exit(result),
-                    result.run_id,
-                    result.conversation_id,
-                ),
-            )
-            if cursor.rowcount != 1:
-                raise RuntimeError("run changed during atomic completion")
-
-        await run_sql_transaction(self._database, write)
+        await run_sql_transaction(
+            self._database,
+            lambda connection: _conversation_store.complete_run(
+                connection, result, final_message
+            ),
+        )
 
     async def recover_unfinished_runs(
         self,
@@ -2920,123 +1809,31 @@ class SQLStateStore:
 
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("agent_id must be non-empty text")
-
-        def write(connection: SQLConnection) -> tuple[LoopExit, ...]:
-            rows = connection.execute(
-                """SELECT id, conversation_id, input
-                   FROM runs
-                   WHERE agent_id = ? AND result IS NULL
-                   ORDER BY conversation_id, turn_index""",
-                (agent_id,),
-            ).fetchall()
-            recovered: list[LoopExit] = []
-            for run_id, conversation_id, run_data in rows:
-                run = decode_run_input(run_data)
-                messages = connection.execute(
-                    "SELECT data FROM messages WHERE run_id = ? ORDER BY position",
-                    (run_id,),
-                ).fetchall()
-                decoded = tuple(decode_message(row[0]) for row in messages)
-                steps = sum(
-                    message.role is MessageRole.ASSISTANT for message in decoded
-                )
-                refs: dict[str, ArtifactRef] = {}
-                sensitivity = max(
-                    run.history_sensitivity,
-                    # Machine content is bounded by its approved ceiling.
-                    # An interrupted foreground request has no persisted
-                    # request classification, so unknown content stays private.
-                    (
-                        run.execution_scope.sensitivity_ceiling
-                        if run.execution_scope is not None
-                        else ModelSensitivity.RESTRICTED
-                    ),
-                    key=lambda item: item.routing_rank,
-                )
-                for message in decoded:
-                    if message.role is not MessageRole.TOOL:
-                        continue
-                    for block in message.content:
-                        if not isinstance(block, ToolResultBlock):
-                            continue
-                        if block.sensitivity is not None:
-                            sensitivity = max(
-                                sensitivity,
-                                block.sensitivity,
-                                key=lambda item: item.routing_rank,
-                            )
-                        value = block.output.get("artifact")
-                        if block.is_error or not isinstance(value, Mapping):
-                            continue
-                        ref = artifact_ref_from_mapping(value)
-                        if (
-                            ref.run_id != run_id
-                            or ref.conversation_id != conversation_id
-                            or ref.call_id != block.call_id
-                            or (
-                                ref.artifact_id in refs and refs[ref.artifact_id] != ref
-                            )
-                        ):
-                            raise RuntimeError(
-                                "recovered artifact identity does not match its run"
-                            )
-                        refs[ref.artifact_id] = ref
-                result = LoopExit(
-                    run_id=run_id,
-                    conversation_id=conversation_id,
-                    kind=LoopExitKind.INTERRUPTED,
-                    reason="previous_process_terminated",
-                    steps=steps,
-                    created_at=created_at,
-                    sensitivity=sensitivity,
-                    artifacts=tuple(refs.values()),
-                )
-                cursor = connection.execute(
-                    "UPDATE runs SET result = ? WHERE id = ? AND result IS NULL",
-                    (encode_loop_exit(result), run_id),
-                )
-                if cursor.rowcount != 1:
-                    raise RuntimeError("unfinished run changed during recovery")
-                recovered.append(result)
-            return tuple(recovered)
-
-        return await run_sql_transaction(self._database, write)
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _conversation_store.recover_unfinished_runs(
+                connection, agent_id, created_at
+            ),
+        )
 
     async def load(self, run_id: str) -> Transcript:
         def read() -> Transcript:
             with _connect_read_only(self._database) as connection:
-                run_row = connection.execute(
-                    "SELECT input FROM runs WHERE id = ?", (run_id,)
-                ).fetchone()
-                if run_row is None:
-                    raise KeyError(f"unknown run: {run_id}")
-                rows = connection.execute(
-                    "SELECT data FROM messages WHERE run_id = ? ORDER BY position",
-                    (run_id,),
-                ).fetchall()
-            return Transcript(
-                run=decode_run_input(run_row[0]),
-                messages=tuple(decode_message(row[0]) for row in rows),
-            )
+                return _conversation_store.load_transcript(connection, run_id)
 
         return await settled_thread(read)
 
     async def result(self, run_id: str) -> LoopExit | None:
         def read() -> LoopExit | None:
             with _connect_read_only(self._database) as connection:
-                row = connection.execute(
-                    "SELECT result FROM runs WHERE id = ?", (run_id,)
-                ).fetchone()
-            if row is None:
-                raise KeyError(f"unknown run: {run_id}")
-            return None if row[0] is None else decode_loop_exit(row[0])
+                return _conversation_store.load_result(connection, run_id)
 
         return await settled_thread(read)
 
     async def get_artifact_record(self, artifact_id: str) -> ArtifactRecord | None:
         return await _run_read_transaction(
             self._database,
-            lambda connection: _get_artifact_record(connection, artifact_id),
+            lambda connection: _artifact_store.get_record(connection, artifact_id),
         )
 
     async def list_artifact_records(
@@ -3075,40 +1872,21 @@ class SQLStateStore:
             ):
                 raise ValueError("artifact cursor must contain timestamp and identity")
 
-        def read(connection: SQLConnection) -> tuple[ArtifactRecord, ...]:
-            clauses = ["agent_id = ?"]
-            parameters: list[object] = [agent_id]
-            for column, value in (
-                ("state", state.value if state is not None else None),
-                ("run_id", run_id),
-                ("conversation_id", conversation_id),
-                ("caller_principal_id", caller_principal_id),
-            ):
-                if value is not None:
-                    clauses.append(column + " = ?")
-                    parameters.append(value)
-            if after is not None:
-                clauses.append("(created_at_us, artifact_id) > (?, ?)")
-                parameters.extend((_datetime_us(after[0]), after[1]))
-            return tuple(
-                _artifact_record_from_row(row)
-                for row in connection.execute(
-                    "SELECT artifact_id, agent_id, run_id, conversation_id, caller_principal_id, state, byte_size, created_at_us, data FROM artifacts WHERE "
-                    + " AND ".join(clauses)
-                    + (
-                        " ORDER BY created_at_us DESC, artifact_id DESC LIMIT ? OFFSET ?"
-                        if newest_first
-                        else " ORDER BY created_at_us, artifact_id LIMIT ? OFFSET ?"
-                    ),
-                    (
-                        *parameters,
-                        limit if limit is not None else 9223372036854775807,
-                        offset,
-                    ),
-                )
-            )
-
-        return await _run_read_transaction(self._database, read)
+        return await _run_read_transaction(
+            self._database,
+            lambda connection: _artifact_store.list_records(
+                connection,
+                agent_id,
+                state=state,
+                run_id=run_id,
+                conversation_id=conversation_id,
+                caller_principal_id=caller_principal_id,
+                limit=limit,
+                offset=offset,
+                after=after,
+                newest_first=newest_first,
+            ),
+        )
 
     async def list_artifact_refs(
         self,
@@ -3142,86 +1920,12 @@ class SQLStateStore:
     ) -> None:
         if record.state is not ArtifactState.CREATING:
             raise ValueError("new artifact must be creating")
-
-        def write(connection: SQLConnection) -> None:
-            identity_row = connection.execute(
-                "SELECT data FROM metadata WHERE key = 'identity'"
-            ).fetchone()
-            if (
-                identity_row is None
-                or decode_identity(identity_row[0]).id != record.agent_id
-            ):
-                raise ArtifactError(
-                    "artifact_missing", "Artifact belongs to another agent.", {}
-                )
-            run_row = connection.execute(
-                "SELECT agent_id, input FROM runs WHERE id = ?", (record.ref.run_id,)
-            ).fetchone()
-            if run_row is not None:
-                run = decode_run_input(run_row[1])
-                if (
-                    run_row[0] != record.agent_id
-                    or run.caller_principal_id != record.caller_principal_id
-                    or (run.conversation_id or run.id) != record.ref.conversation_id
-                ):
-                    raise ArtifactError(
-                        "artifact_missing", "Artifact producer ownership differs.", {}
-                    )
-            if _get_artifact_record(connection, record.ref.artifact_id) is not None:
-                raise ArtifactError(
-                    "artifact_storage_failed",
-                    "Artifact identity is already registered.",
-                    {"stage": "identity"},
-                )
-            if reserved:
-                # Only graph task attempts reserved artifact identities.
-                raise ArtifactError(
-                    "artifact_storage_failed",
-                    "Artifact reservation is no longer active.",
-                    {"stage": "reservation"},
-                )
-            rows = tuple(
-                connection.execute(
-                    "SELECT run_id, byte_size FROM artifacts WHERE agent_id = ?",
-                    (record.agent_id,),
-                )
-            )
-            run_rows = tuple(row for row in rows if row[0] == record.ref.run_id)
-            for scope, kind, used, added, ceiling in (
-                ("agent", "count", len(rows), 1, MAX_ARTIFACTS_PER_AGENT),
-                (
-                    "agent",
-                    "bytes",
-                    sum(row[1] for row in rows),
-                    record.ref.byte_size,
-                    MAX_ARTIFACT_BYTES_PER_AGENT,
-                ),
-                ("run", "count", len(run_rows), 1, MAX_ARTIFACTS_PER_RUN),
-                (
-                    "run",
-                    "bytes",
-                    sum(row[1] for row in run_rows),
-                    record.ref.byte_size,
-                    MAX_ARTIFACT_BYTES_PER_RUN,
-                ),
-            ):
-                if used + added > ceiling:
-                    raise ArtifactError(
-                        "artifact_quota_exceeded",
-                        "The artifact exceeds a storage limit.",
-                        {
-                            "scope": scope,
-                            "limit_kind": kind,
-                            "limit": ceiling,
-                            "attempted": used + added,
-                        },
-                    )
-            connection.execute(
-                "INSERT INTO artifacts (artifact_id, agent_id, run_id, conversation_id, caller_principal_id, state, byte_size, created_at_us, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                _artifact_record_row(record),
-            )
-
-        await run_sql_transaction(self._database, write)
+        await run_sql_transaction(
+            self._database,
+            lambda connection: _artifact_store.begin_creation(
+                connection, record, reserved
+            ),
+        )
 
     async def transition_artifact(
         self, record: ArtifactRecord, state: ArtifactState
@@ -3235,42 +1939,18 @@ class SQLStateStore:
         ):
             raise ValueError("artifact lifecycle transition is invalid")
         updated = replace(record, state=state)
-
-        def write(connection: SQLConnection) -> ArtifactRecord:
-            changed = connection.execute(
-                "UPDATE artifacts SET state = ?, data = ? WHERE artifact_id = ? AND data = ?",
-                (
-                    state.value,
-                    encode_artifact_record(updated),
-                    record.ref.artifact_id,
-                    encode_artifact_record(record),
-                ),
-            ).rowcount
-            if changed != 1:
-                raise ArtifactError(
-                    "artifact_missing", "The artifact lifecycle changed.", {}
-                )
-            return updated
-
-        return await run_sql_transaction(self._database, write)
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _artifact_store.transition(connection, record, updated),
+        )
 
     async def finish_artifact_deletion(self, record: ArtifactRecord) -> None:
         if record.state is not ArtifactState.DELETING:
             raise ValueError("artifact deletion must be pending")
-
-        def write(connection: SQLConnection) -> None:
-            if (
-                connection.execute(
-                    "DELETE FROM artifacts WHERE artifact_id = ? AND data = ?",
-                    (record.ref.artifact_id, encode_artifact_record(record)),
-                ).rowcount
-                != 1
-            ):
-                raise ArtifactError(
-                    "artifact_missing", "The artifact lifecycle changed.", {}
-                )
-
-        await run_sql_transaction(self._database, write)
+        await run_sql_transaction(
+            self._database,
+            lambda connection: _artifact_store.finish_deletion(connection, record),
+        )
 
     async def conversation_run_page(
         self,
@@ -3287,7 +1967,7 @@ class SQLStateStore:
             raise ValueError("conversation cursor must be at least -1")
         return await _run_read_transaction(
             self._database,
-            lambda connection: _conversation_records(
+            lambda connection: _conversation_store.conversation_records(
                 connection,
                 agent_id,
                 conversation_id,
@@ -3304,7 +1984,7 @@ class SQLStateStore:
         """Compatibility full-history read; interactive callers should use pages."""
         return await _run_read_transaction(
             self._database,
-            lambda connection: _conversation_records(
+            lambda connection: _conversation_store.conversation_records(
                 connection, agent_id, conversation_id
             ),
         )
@@ -3318,26 +1998,12 @@ class SQLStateStore:
     ) -> tuple[bool, bool]:
         """Return existence and whole-conversation caller access without messages."""
 
-        def read(connection: SQLConnection) -> tuple[bool, bool]:
-            row = connection.execute(
-                f"""SELECT
-                    EXISTS(SELECT 1 FROM runs WHERE agent_id = ? AND conversation_id = ?),
-                    EXISTS(SELECT 1 FROM runs WHERE agent_id = ? AND conversation_id = ?
-                        AND {connection.caller_expression('input')} {connection.distinct_operator} ?)
-                """,
-                (
-                    agent_id,
-                    conversation_id,
-                    agent_id,
-                    conversation_id,
-                    caller_principal_id,
-                ),
-            ).fetchone()
-            assert row is not None
-            exists = bool(row[0])
-            return exists, exists and (caller_principal_id is None or not row[1])
-
-        return await _run_read_transaction(self._database, read)
+        return await _run_read_transaction(
+            self._database,
+            lambda connection: _conversation_store.conversation_access(
+                connection, agent_id, conversation_id, caller_principal_id
+            ),
+        )
 
     async def conversation_exists(
         self,
@@ -3348,13 +2014,9 @@ class SQLStateStore:
 
         def read() -> bool:
             with _connect_read_only(self._database) as connection:
-                row = connection.execute(
-                    """SELECT 1 FROM runs
-                       WHERE agent_id = ? AND conversation_id = ?
-                       LIMIT 1""",
-                    (agent_id, conversation_id),
-                ).fetchone()
-            return row is not None
+                return _conversation_store.conversation_exists(
+                    connection, agent_id, conversation_id
+                )
 
         return await settled_thread(read)
 
@@ -3362,142 +2024,22 @@ class SQLStateStore:
         self, agent_id: str, evidence: AnalysisEvidence
     ) -> None:
         encoded = encode_analysis_evidence(evidence)
-
-        def write(connection: SQLConnection) -> None:
-            row = connection.execute(
-                "SELECT agent_id, result FROM runs WHERE id = ?", (evidence.run_id,)
-            ).fetchone()
-            if row is None or row[0] != agent_id or row[1] is not None:
-                raise ValueError("Analysis evidence requires an exact live owned run")
-            summary = connection.execute(
-                "SELECT data FROM analysis_evidence WHERE run_id = ? AND evidence_id = 'run-summary'",
-                (evidence.run_id,),
-            ).fetchone()
-            trace_records = (
-                evidence.facts.get("trace_records", 256)
-                if evidence.kind == "run" and evidence.facts["status"] == "admitted"
-                else (
-                    decode_analysis_evidence(summary[0]).facts.get("trace_records", 256)
-                    if summary
-                    else 256
-                )
-            )
-            if type(trace_records) is not int or not 4 <= trace_records <= 256:
-                raise ValueError(
-                    "Analysis trace admission requires a bounded record ceiling"
-                )
-            existing = connection.execute(
-                "SELECT data FROM analysis_evidence WHERE run_id = ? AND evidence_id = ?",
-                (evidence.run_id, evidence.evidence_id),
-            ).fetchone()
-            if existing is not None:
-                prior = decode_analysis_evidence(existing[0])
-                if evidence.kind == "generation" and existing[0] == encoded:
-                    return  # Lost commit acknowledgement: exact settlement only.
-                disposal = (
-                    prior.kind == evidence.kind == "generation"
-                    and prior.facts["status"] == "closed"
-                    and dict(evidence.facts) == {**prior.facts, "proof_disposed": True}
-                )
-                if (
-                    prior.kind != evidence.kind
-                    or not disposal
-                    and prior.facts.get("status")
-                    not in {
-                        "admitted",
-                        "running",
-                    }
-                ):
-                    raise ValueError(
-                        "Analysis evidence cannot be replayed or overwritten"
-                    )
-                for identity in (
-                    "parent_call_id",
-                    "sequence",
-                    "tool_name",
-                    "arguments",
-                    "code",
-                    "scratch",
-                    "closure_nonce",
-                ):
-                    if identity in prior.facts and prior.facts[
-                        identity
-                    ] != evidence.facts.get(identity):
-                        raise ValueError("Analysis evidence identity changed")
-            else:
-                counted = connection.execute(
-                    "SELECT COUNT(*) FROM analysis_evidence WHERE run_id = ?",
-                    (evidence.run_id,),
-                ).fetchone()
-                assert counted is not None
-                count = counted[0]
-                if count >= trace_records:
-                    raise AnalysisTraceCapacityError(
-                        "Analysis evidence capacity exhausted"
-                    )
-            credit = (
-                max(len(encoded.encode()), 270_000)
-                if evidence.facts.get("status")
-                in {"admitted", "running", "cleanup_failed"}
-                or evidence.kind == "generation"
-                and evidence.facts.get("proof_disposed") is not True
-                else len(encoded.encode())
-            )
-            occupied = connection.execute(
-                "SELECT COALESCE(SUM(reserved_bytes), 0) FROM analysis_evidence WHERE run_id = ? AND evidence_id != ?",
-                (evidence.run_id, evidence.evidence_id),
-            ).fetchone()
-            assert occupied is not None
-            trace_limit = (
-                evidence.facts.get("trace_bytes", 4 * 1024 * 1024)
-                if evidence.kind == "run" and evidence.facts["status"] == "admitted"
-                else (
-                    decode_analysis_evidence(summary[0]).facts.get(
-                        "trace_bytes", 4 * 1024 * 1024
-                    )
-                    if summary
-                    else 4 * 1024 * 1024
-                )
-            )
-            if (
-                type(trace_limit) is not int
-                or not 1024 * 1024 <= trace_limit <= 4 * 1024 * 1024
-            ):
-                raise ValueError(
-                    "Analysis trace admission requires a bounded byte ceiling"
-                )
-            if occupied[0] + credit > trace_limit:
-                raise AnalysisTraceCapacityError(
-                    "Analysis trace byte reservation exhausted before dispatch"
-                )
-            connection.execute(
-                "INSERT INTO analysis_evidence(agent_id, run_id, evidence_id, kind, data, reserved_bytes) VALUES (?, ?, ?, ?, ?, ?) "
-                f"ON CONFLICT({connection.conflict('run_id, evidence_id')}) DO UPDATE SET data = excluded.data, reserved_bytes = excluded.reserved_bytes",
-                (
-                    agent_id,
-                    evidence.run_id,
-                    evidence.evidence_id,
-                    evidence.kind,
-                    encoded,
-                    credit,
-                ),
-            )
-
-        await run_sql_transaction(self._database, write)
+        await run_sql_transaction(
+            self._database,
+            lambda connection: _analysis_store.record_evidence(
+                connection, agent_id, evidence, encoded
+            ),
+        )
 
     async def load_analysis_evidence(
         self, agent_id: str, run_id: str
     ) -> tuple[AnalysisEvidence, ...]:
-        def read(connection: SQLConnection) -> tuple[AnalysisEvidence, ...]:
-            return tuple(
-                decode_analysis_evidence(row[0])
-                for row in connection.execute(
-                    "SELECT data FROM analysis_evidence WHERE agent_id = ? AND run_id = ? ORDER BY evidence_id LIMIT 256",
-                    (agent_id, run_id),
-                )
-            )
-
-        return await _run_read_transaction(self._database, read)
+        return await _run_read_transaction(
+            self._database,
+            lambda connection: _analysis_store.load_evidence(
+                connection, agent_id, run_id
+            ),
+        )
 
     async def pending_analysis_evidence(
         self, agent_id: str, *, after: tuple[str, str] = ("", "")
@@ -3507,18 +2049,12 @@ class SQLStateStore:
         The last returned identity is the next cursor even for wholly closed pages.
         """
 
-        def read(connection: SQLConnection) -> tuple[AnalysisEvidence, ...]:
-            return tuple(
-                decode_analysis_evidence(row[0])
-                for row in connection.execute(
-                    "SELECT data FROM analysis_evidence WHERE agent_id = ? "
-                    "AND (run_id > ? OR (run_id = ? AND evidence_id > ?)) "
-                    "ORDER BY run_id, evidence_id LIMIT 256",
-                    (agent_id, after[0], after[0], after[1]),
-                )
-            )
-
-        return await _run_read_transaction(self._database, read)
+        return await _run_read_transaction(
+            self._database,
+            lambda connection: _analysis_store.pending_evidence(
+                connection, agent_id, after
+            ),
+        )
 
     async def recover_analysis_evidence(
         self,
@@ -3573,32 +2109,12 @@ class SQLStateStore:
             expected.run_id, expected.evidence_id, expected.kind, facts
         )
         encoded = encode_analysis_evidence(updated)
-
-        def write(connection: SQLConnection) -> None:
-            row = connection.execute(
-                "SELECT a.data, a.reserved_bytes FROM analysis_evidence a JOIN runs r ON r.id = a.run_id "
-                "WHERE a.agent_id = ? AND r.agent_id = ? AND a.run_id = ? AND a.evidence_id = ?",
-                (agent_id, agent_id, expected.run_id, expected.evidence_id),
-            ).fetchone()
-            if row is None or row[0] not in {before, encoded}:
-                raise ValueError("Recovery evidence CAS identity changed")
-            if len(encoded.encode()) > row[1]:
-                raise AnalysisTraceCapacityError(
-                    "Recovery exceeded its pre-dispatch reservation"
-                )
-            connection.execute(
-                "UPDATE analysis_evidence SET data = ?, reserved_bytes = ? WHERE agent_id = ? AND run_id = ? AND evidence_id = ? AND data = ?",
-                (
-                    encoded,
-                    len(encoded.encode()) if proof_disposed else row[1],
-                    agent_id,
-                    expected.run_id,
-                    expected.evidence_id,
-                    before,
-                ),
-            )
-
-        await run_sql_transaction(self._database, write)
+        await run_sql_transaction(
+            self._database,
+            lambda connection: _analysis_store.replace_recovered_evidence(
+                connection, agent_id, expected, before, encoded, proof_disposed
+            ),
+        )
         return updated
 
     async def clear_conversations(self, agent_id: str) -> int:
@@ -3606,110 +2122,12 @@ class SQLStateStore:
 
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("agent_id must be a non-empty string")
-
-        def write(connection: SQLConnection) -> int:
-            # A live job's runs and running sub-runs are its working state.
-            live_job_conversations = {
-                conversation_id
-                for job in _job_store.list_jobs(
-                    connection,
-                    agent_id,
-                    states=LIVE_JOB_STATES,
-                    limit=MAX_JOB_LIST_PAGE_SIZE,
-                )
-                for conversation_id in (
-                    job.job_id,
-                    *(item.id for item in job.running_delegations),
-                )
-            }
-            protected_run_ids = {
-                str(row[0])
-                for conversation_id in live_job_conversations
-                for row in connection.execute(
-                    "SELECT id FROM runs WHERE agent_id = ? AND conversation_id = ?",
-                    (agent_id, conversation_id),
-                )
-            }
-            protected_run_ids.update(
-                record.run_id
-                for row in connection.execute(
-                    "SELECT data FROM analysis_evidence WHERE agent_id = ? AND kind = 'generation'",
-                    (agent_id,),
-                )
-                if (record := decode_analysis_evidence(row[0])).facts.get(
-                    "proof_disposed"
-                )
-                is not True
-            )
-            occurrence_rows = connection.execute(
-                "SELECT occurrence_id, data FROM routine_occurrences "
-                "WHERE agent_id = ?",
-                (agent_id,),
-            ).fetchall()
-            protected_run_ids.update(
-                occurrence.reserved_run_id
-                for occurrence_id, data in occurrence_rows
-                for occurrence in (
-                    decode_routine_occurrence(
-                        data,
-                        agent_id=agent_id,
-                        occurrence_id=occurrence_id,
-                    ),
-                )
-                if occurrence.reserved_run_id is not None
-                and occurrence.disposition
-                in {
-                    RoutineOccurrenceDisposition.CLAIMED,
-                    RoutineOccurrenceDisposition.RUNNING,
-                    (RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION),
-                    RoutineOccurrenceDisposition.RETRYABLE,
-                }
-            )
-            active_routine_conversations = {
-                routine.conversation_id
-                for routine_id, data in connection.execute(
-                    "SELECT routine_id, data FROM scheduled_routines "
-                    "WHERE agent_id = ?",
-                    (agent_id,),
-                )
-                for routine in (
-                    decode_scheduled_routine(
-                        data,
-                        agent_id=agent_id,
-                        routine_id=routine_id,
-                    ),
-                )
-                if routine.active_occurrence_id is not None
-            }
-            for conversation_id in active_routine_conversations:
-                anchor = connection.execute(
-                    "SELECT id FROM runs "
-                    "WHERE agent_id = ? AND conversation_id = ? "
-                    "ORDER BY turn_index, id LIMIT 1",
-                    (agent_id, conversation_id),
-                ).fetchone()
-                if anchor is not None:
-                    protected_run_ids.add(str(anchor[0]))
-            run_ids = tuple(
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT id FROM runs WHERE agent_id = ?",
-                    (agent_id,),
-                )
-                if row[0] not in protected_run_ids
-            )
-            connection.executemany(
-                "DELETE FROM messages WHERE run_id = ?",
-                ((run_id,) for run_id in run_ids),
-            )
-            connection.executemany(
-                "DELETE FROM runs WHERE id = ? AND agent_id = ?",
-                ((run_id, agent_id) for run_id in run_ids),
-            )
-            return len(run_ids)
-
-        cleared = await run_sql_transaction(self._database, write)
-        return cleared
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _conversation_store.clear_conversations(
+                connection, agent_id
+            ),
+        )
 
     async def completed_conversation_tail(
         self,
@@ -3725,46 +2143,9 @@ class SQLStateStore:
 
         def read() -> tuple[bool, tuple[ConversationRun, ...], bool]:
             with _connect_read_only(self._database) as connection:
-                rows = connection.execute(
-                    """SELECT id, turn_index, input, result
-                       FROM runs
-                       WHERE agent_id = ? AND conversation_id = ?
-                       ORDER BY turn_index DESC""",
-                    (agent_id, conversation_id),
+                return _conversation_store.completed_conversation_tail(
+                    connection, agent_id, conversation_id, limit
                 )
-                exists = False
-                older_completed_exists = False
-                records: list[ConversationRun] = []
-                for run_id, turn_index, input_data, result_data in rows:
-                    exists = True
-                    if result_data is None:
-                        continue
-                    result = decode_loop_exit(result_data)
-                    if result.kind is not LoopExitKind.COMPLETED:
-                        continue
-                    if len(records) >= limit:
-                        older_completed_exists = True
-                        break
-                    message_rows = connection.execute(
-                        """SELECT data FROM messages
-                           WHERE run_id = ? ORDER BY position""",
-                        (run_id,),
-                    ).fetchall()
-                    records.append(
-                        ConversationRun(
-                            turn_index=int(turn_index),
-                            transcript=Transcript(
-                                run=decode_run_input(input_data),
-                                messages=tuple(
-                                    decode_message(message[0])
-                                    for message in message_rows
-                                ),
-                            ),
-                            result=result,
-                        )
-                    )
-            records.reverse()
-            return exists, tuple(records), older_completed_exists
 
         return await settled_thread(read)
 
@@ -3778,32 +2159,8 @@ class SQLStateStore:
         def read() -> ConversationRun | None:
             connection = _connect_read_only(self._database)
             try:
-                row = connection.execute(
-                    """SELECT id, turn_index, input, result
-                       FROM runs
-                       WHERE agent_id = ? AND conversation_id = ?
-                       ORDER BY turn_index DESC LIMIT 1""",
-                    (agent_id, conversation_id),
-                ).fetchone()
-                if row is None:
-                    return None
-                run_id, turn_index, input_data, result_data = row
-                if result_data is None:
-                    raise ValueError("latest conversation run is not terminal")
-                messages = tuple(
-                    decode_message(message_row[0])
-                    for message_row in connection.execute(
-                        "SELECT data FROM messages WHERE run_id = ? ORDER BY position",
-                        (run_id,),
-                    )
-                )
-                return ConversationRun(
-                    turn_index=int(turn_index),
-                    transcript=Transcript(
-                        run=decode_run_input(input_data),
-                        messages=messages,
-                    ),
-                    result=decode_loop_exit(result_data),
+                return _conversation_store.latest_terminal_conversation_run(
+                    connection, agent_id, conversation_id
                 )
             finally:
                 connection.close()
@@ -3828,160 +2185,6 @@ def _catalog_source_ids(source_ids: tuple[str, ...]) -> tuple[str, ...]:
     if len(source_ids) != len(set(source_ids)):
         raise ValueError("catalog source_ids cannot contain duplicates")
     return source_ids
-
-
-def _validate_semantic_owner(
-    agent_id: str,
-    annotation: SemanticAnnotation,
-) -> None:
-    if not isinstance(agent_id, str) or not agent_id:
-        raise ValueError("agent_id must be a non-empty string")
-    if not isinstance(annotation, SemanticAnnotation):
-        raise TypeError("annotation must be SemanticAnnotation")
-    if annotation.agent_id != agent_id:
-        raise ValueError("semantic annotation belongs to another agent")
-
-
-def _semantic_rows(
-    connection: SQLConnection,
-    agent_id: str,
-) -> tuple[tuple[str, SemanticAnnotation, str], ...]:
-    rows = connection.execute(
-        """SELECT id, data FROM semantic_annotations
-           WHERE agent_id = ? ORDER BY id""",
-        (agent_id,),
-    ).fetchall()
-    if len(rows) > SEMANTIC_MAX_ANNOTATIONS:
-        raise RuntimeError("stored semantic annotation collection exceeds bound")
-    return tuple(
-        (annotation_id, decode_semantic_annotation(data), data)
-        for annotation_id, data in rows
-    )
-
-
-def _semantic_state_sha256(
-    rows: tuple[tuple[str, SemanticAnnotation, str], ...],
-) -> str:
-    payload = "\n".join(f"{annotation_id}:{data}" for annotation_id, _, data in rows)
-    return sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _semantic_save_fingerprint(
-    connection: SQLConnection,
-    agent_id: str,
-    annotation: SemanticAnnotation,
-    expected_sha256: str | None,
-) -> FrozenJsonObject:
-    _validate_semantic_owner(agent_id, annotation)
-    if expected_sha256 is not None and (
-        not isinstance(expected_sha256, str)
-        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
-    ):
-        raise SemanticDigestMismatchError(
-            "semantic expected_sha256 must be lowercase SHA-256"
-        )
-    rows = _semantic_rows(connection, agent_id)
-    by_id = {annotation_id: item for annotation_id, item, _ in rows}
-    current = by_id.get(annotation.id)
-    expected_target: SemanticAnnotation | None
-    expected_target_id: str
-    if current is not None:
-        expected_target = current
-        expected_target_id = current.id
-        if annotation.created_at != current.created_at:
-            raise SemanticValidationError(
-                "semantic replacement must preserve created_at"
-            )
-    elif annotation.supersedes_id is not None:
-        expected_target = by_id.get(annotation.supersedes_id)
-        expected_target_id = annotation.supersedes_id
-        if expected_target is None:
-            raise SemanticNotFoundError(annotation.supersedes_id)
-        if (
-            expected_target.subject != annotation.subject
-            or expected_target.kind is not annotation.kind
-        ):
-            raise SemanticValidationError(
-                "a semantic annotation may supersede only the same subject and kind"
-            )
-        if annotation.created_at < expected_target.created_at:
-            raise SemanticValidationError(
-                "semantic supersession cannot predate its target"
-            )
-    else:
-        expected_target = None
-        expected_target_id = annotation.id
-
-    if expected_target is None:
-        if expected_sha256 is not None:
-            raise SemanticDigestMismatchError(
-                "new semantic annotations cannot include expected_sha256"
-            )
-        if len(rows) >= SEMANTIC_MAX_ANNOTATIONS:
-            raise SemanticValidationError(
-                f"semantic annotation collection is limited to "
-                f"{SEMANTIC_MAX_ANNOTATIONS}"
-            )
-        current_sha256 = sha256(b"").hexdigest()
-    else:
-        current_sha256 = semantic_annotation_sha256(expected_target)
-        if expected_sha256 is None:
-            raise SemanticDigestMismatchError(
-                "semantic replacement or supersession requires expected_sha256"
-            )
-        if expected_sha256 != current_sha256:
-            raise SemanticDigestMismatchError(
-                "semantic annotation changed; load it again with semantic_view"
-            )
-
-    return FrozenJsonObject.from_mapping(
-        {
-            "id": annotation.id,
-            "exists": current is not None,
-            "expected_target_id": expected_target_id,
-            "current_sha256": current_sha256,
-            "candidate_sha256": semantic_annotation_sha256(annotation),
-            "state_sha256": _semantic_state_sha256(rows),
-        }
-    )
-
-
-def _semantic_delete_fingerprint(
-    connection: SQLConnection,
-    agent_id: str,
-    annotation_id: str,
-    expected_sha256: str,
-) -> FrozenJsonObject:
-    if not isinstance(agent_id, str) or not agent_id:
-        raise ValueError("agent_id must be a non-empty string")
-    if not isinstance(annotation_id, str) or not annotation_id:
-        raise ValueError("annotation_id must be a non-empty string")
-    if (
-        not isinstance(expected_sha256, str)
-        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
-    ):
-        raise SemanticDigestMismatchError(
-            "semantic deletion requires lowercase expected_sha256"
-        )
-    rows = _semantic_rows(connection, agent_id)
-    current = next(
-        (item for item_id, item, _ in rows if item_id == annotation_id),
-        None,
-    )
-    if current is None:
-        raise SemanticNotFoundError(annotation_id)
-    current_sha256 = semantic_annotation_sha256(current)
-    if current_sha256 != expected_sha256:
-        raise SemanticDigestMismatchError(
-            "semantic annotation changed; load it again with semantic_view"
-        )
-    return FrozenJsonObject.from_mapping(
-        {
-            "id": annotation_id,
-            "current_sha256": current_sha256,
-            "state_sha256": _semantic_state_sha256(rows),
-        }
-    )
 
 
 async def settled_thread(
@@ -4064,47 +2267,6 @@ async def run_sql_transaction(
     return cast(_T, result)
 
 
-def _conversation_records(
-    connection: SQLConnection,
-    agent_id: str,
-    conversation_id: str,
-    *,
-    after_turn_index: int = -1,
-    limit: int | None = None,
-) -> tuple[ConversationRun, ...]:
-    # Both statements use the caller's read snapshot. Joining the selected turns
-    # fetches all messages in one query instead of one query per turn.
-    selection = """SELECT id, turn_index, input, result FROM runs
-        WHERE agent_id = ? AND conversation_id = ? AND turn_index > ?
-        ORDER BY turn_index LIMIT ?"""
-    parameters = (
-        agent_id,
-        conversation_id,
-        after_turn_index,
-        limit if limit is not None else 9223372036854775807,
-    )
-    rows = connection.execute(selection, parameters).fetchall()
-    messages: dict[str, list[CanonicalMessage]] = {row[0]: [] for row in rows}
-    if rows:
-        for run_id, data in connection.execute(
-            "WITH selected AS (" + selection + ") "
-            "SELECT m.run_id, m.data FROM messages AS m JOIN selected AS s ON s.id = m.run_id "
-            "ORDER BY s.turn_index, m.position",
-            parameters,
-        ):
-            messages[run_id].append(decode_message(data))
-    return tuple(
-        ConversationRun(
-            turn_index=int(turn_index),
-            transcript=Transcript(
-                run=decode_run_input(input_data), messages=tuple(messages[run_id])
-            ),
-            result=None if result_data is None else decode_loop_exit(result_data),
-        )
-        for run_id, turn_index, input_data, result_data in rows
-    )
-
-
 def _call_statements(arguments: Mapping[str, object]) -> Iterable[tuple[str, str]]:
     """(source ID, SQL text) of a query call; one entry per source it reads."""
 
@@ -4140,520 +2302,6 @@ async def _run_read_transaction(
             raise path.normalize_error(error) from None
 
     return await settled_thread(read)
-
-
-def _validate_current_mcp_binding_bounds(connection: SQLConnection) -> None:
-    totals: dict[str, int] = {}
-    binding_counts: dict[str, int] = {}
-    active_tool_counts: dict[str, int] = {}
-    for agent_id, binding_id, data in connection.execute(
-        "SELECT agent_id, binding_id, data FROM mcp_server_bindings"
-    ):
-        binding_counts[agent_id] = binding_counts.get(agent_id, 0) + 1
-        if binding_counts[agent_id] > MCP_MAX_BINDINGS_PER_AGENT:
-            raise ValueError("stored MCP binding count exceeds its fixed bound")
-        encoded_bytes = len(data.encode("utf-8"))
-        if encoded_bytes > MCP_MAX_BINDING_CANONICAL_BYTES:
-            raise ValueError("stored MCP binding exceeds its byte bound")
-        totals[agent_id] = totals.get(agent_id, 0) + encoded_bytes
-        if totals[agent_id] > MCP_MAX_AGENT_CATALOG_BYTES:
-            raise ValueError("stored MCP agent catalog exceeds its byte bound")
-        binding = decode_mcp_binding(
-            data,
-            agent_id=agent_id,
-            binding_id=binding_id,
-        )
-        if binding.state is MCPBindingState.ACTIVE:
-            active_tool_counts[agent_id] = active_tool_counts.get(agent_id, 0) + len(
-                binding.tools
-            )
-            if active_tool_counts[agent_id] > MCP_MAX_ACTIVE_TOOLS_PER_AGENT:
-                raise ValueError(
-                    "stored active MCP tool catalog exceeds its fixed bound"
-                )
-
-
-def _artifact_record_row(record: ArtifactRecord) -> tuple[object, ...]:
-    ref = record.ref
-    return (
-        ref.artifact_id,
-        record.agent_id,
-        ref.run_id,
-        ref.conversation_id,
-        record.caller_principal_id,
-        record.state.value,
-        ref.byte_size,
-        int(ref.created_at.timestamp() * 1_000_000),
-        encode_artifact_record(record),
-    )
-
-
-def _artifact_record_from_row(row: tuple) -> ArtifactRecord:
-    record = decode_artifact_record(row[-1])
-    if tuple(row) != _artifact_record_row(record):
-        raise ValueError("stored artifact registry projection differs from its record")
-    return record
-
-
-def _get_artifact_record(
-    connection: SQLConnection, artifact_id: str
-) -> ArtifactRecord | None:
-    row = connection.execute(
-        "SELECT artifact_id, agent_id, run_id, conversation_id, caller_principal_id, state, byte_size, created_at_us, data FROM artifacts WHERE artifact_id = ?",
-        (artifact_id,),
-    ).fetchone()
-    return None if row is None else _artifact_record_from_row(row)
-
-
-def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None:
-    _validate_current_mcp_binding_bounds(connection)
-    identity: AgentIdentity | None = None
-    for key, data in connection.execute("SELECT key, data FROM metadata"):
-        if key == "identity":
-            if identity is not None:
-                raise ValueError("state contains duplicate agent identity")
-            identity = decode_identity(data)
-        else:
-            raise ValueError("state metadata key is unsupported")
-
-    records = tuple(
-        _artifact_record_from_row(row)
-        for row in connection.execute(
-            "SELECT artifact_id, agent_id, run_id, conversation_id, caller_principal_id, state, byte_size, created_at_us, data FROM artifacts"
-        )
-    )
-    if len(records) > MAX_ARTIFACTS_PER_AGENT:
-        raise ValueError("stored artifact registry exceeds its fixed bound")
-    if records and (
-        identity is None or any(record.agent_id != identity.id for record in records)
-    ):
-        raise ValueError("stored artifact belongs to another agent")
-
-    analytical_counts: dict[str, int] = {}
-    analytical_bytes: dict[str, int] = {}
-    for (
-        agent_id,
-        run_id,
-        evidence_id,
-        kind,
-        data,
-        reserved_bytes,
-        run_owner,
-    ) in connection.execute(
-        "SELECT a.agent_id, a.run_id, a.evidence_id, a.kind, a.data, a.reserved_bytes, r.agent_id "
-        "FROM analysis_evidence a LEFT JOIN runs r ON r.id = a.run_id"
-    ):
-        evidence = decode_analysis_evidence(data)
-        if (
-            agent_id != run_owner
-            or identity is None
-            or agent_id != identity.id
-            or (evidence.run_id, evidence.evidence_id, evidence.kind)
-            != (run_id, evidence_id, kind)
-            or type(reserved_bytes) is not int
-            or reserved_bytes < len(data.encode())
-        ):
-            raise ValueError(
-                "Stored analytical evidence identity or byte reservation is invalid"
-            )
-        analytical_counts[run_id] = analytical_counts.get(run_id, 0) + 1
-        analytical_bytes[run_id] = analytical_bytes.get(run_id, 0) + reserved_bytes
-        if (
-            analytical_counts[run_id] > 256
-            or analytical_bytes[run_id] > 4 * 1024 * 1024
-        ):
-            raise ValueError("Stored analytical evidence exceeds its run bounds")
-
-    mcp_binding_counts: dict[str, int] = {}
-    for agent_id, binding_id, data in connection.execute(
-        "SELECT agent_id, binding_id, data FROM mcp_server_bindings"
-    ):
-        mcp_binding_counts[agent_id] = mcp_binding_counts.get(agent_id, 0) + 1
-        if mcp_binding_counts[agent_id] > MCP_MAX_BINDINGS_PER_AGENT:
-            raise ValueError("stored MCP binding count exceeds its fixed bound")
-        binding = decode_mcp_binding(
-            data,
-            agent_id=agent_id,
-            binding_id=binding_id,
-        )
-        if binding.agent_id != agent_id or binding.binding_id != binding_id:
-            raise ValueError("stored MCP binding ownership is invalid")
-        if identity is not None and binding.agent_id != identity.id:
-            raise ValueError("stored MCP binding belongs to another agent")
-
-    sources: dict[tuple[str, str], SourceRegistration] = {}
-    for agent_id, source_id, data in connection.execute(
-        "SELECT agent_id, id, data FROM sources"
-    ):
-        registration = decode_source(data)
-        if registration.agent_id != agent_id or registration.id != source_id:
-            raise ValueError("stored source ownership is invalid")
-        sources[(agent_id, source_id)] = registration
-    if identity is not None and any(agent_id != identity.id for agent_id, _ in sources):
-        raise ValueError("stored source belongs to another agent")
-    read_scopes: dict[tuple[str, str], SourceReadScope] = {}
-    for agent_id, source_id, data in connection.execute(
-        "SELECT agent_id, source_id, data FROM source_read_scopes"
-    ):
-        key = (agent_id, source_id)
-        if key in read_scopes:
-            raise ValueError("stored source read scope identity is duplicated")
-        read_scopes[key] = decode_source_read_scope(
-            data,
-            agent_id=agent_id,
-            source_id=source_id,
-        )
-    for key, registration in sources.items():
-        scope = read_scopes.pop(key, None)
-        if registration.active and scope is None:
-            raise ValueError("active source is missing its read scope")
-        if not registration.active and scope is not None:
-            raise ValueError("detached source retains a read scope")
-    if read_scopes:
-        raise ValueError("stored source read scope is foreign")
-
-    for agent_id, source_id, resource_id, fingerprint, data in connection.execute(
-        """SELECT agent_id, source_id, resource_id,
-                  authorization_fingerprint, data
-           FROM relational_write_scopes"""
-    ):
-        scope_registration = sources.get((agent_id, source_id))
-        if scope_registration is None or not scope_registration.active:
-            raise ValueError("stored PostgreSQL update scope is foreign")
-        decode_relational_write_scope(
-            data,
-            agent_id=agent_id,
-            source_id=source_id,
-            resource_id=resource_id,
-            authorization_fingerprint=fingerprint,
-        )
-
-    # Catalog rows are not read here: a damaged row is refreshed
-    # from its source, so it must not stop the home opening.
-
-    run_ids: set[str] = set()
-    run_inputs: dict[str, RunInput] = {}
-    run_results: dict[str, LoopExit] = {}
-    run_messages: dict[str, list[CanonicalMessage]] = {}
-    message_positions: dict[str, list[int]] = {}
-    for (
-        run_id,
-        agent_id,
-        conversation_id,
-        turn_index,
-        input_data,
-        result,
-    ) in connection.execute(
-        """SELECT id, agent_id, conversation_id, turn_index, input, result
-           FROM runs"""
-    ):
-        run_input = decode_run_input(input_data)
-        if (
-            run_input.id != run_id
-            or run_input.agent_id != agent_id
-            or run_input.conversation_id != conversation_id
-            or not isinstance(turn_index, int)
-            or isinstance(turn_index, bool)
-            or turn_index < 0
-        ):
-            raise ValueError("stored run ownership is invalid")
-        if identity is not None and run_input.agent_id != identity.id:
-            raise ValueError("stored run belongs to another agent")
-        if result is not None:
-            exit_record = decode_loop_exit(result)
-            if (
-                exit_record.run_id != run_id
-                or exit_record.conversation_id != conversation_id
-            ):
-                raise ValueError("stored run result ownership is invalid")
-            run_results[run_id] = exit_record
-        run_ids.add(run_id)
-        run_inputs[run_id] = run_input
-    for run_id, position, data in connection.execute(
-        "SELECT run_id, position, data FROM messages ORDER BY run_id, position"
-    ):
-        if run_id not in run_ids:
-            raise ValueError("stored message belongs to an unknown run")
-        message = decode_message(data)
-        message_positions.setdefault(run_id, []).append(position)
-        run_messages.setdefault(run_id, []).append(message)
-    if any(
-        positions != list(range(len(positions)))
-        for positions in message_positions.values()
-    ):
-        raise ValueError("stored transcript message positions are not contiguous")
-    for run_id, result in run_results.items():
-        if result.kind is LoopExitKind.COMPLETED:
-            validate_completed_transcript(
-                Transcript(
-                    run=run_inputs[run_id],
-                    messages=tuple(run_messages.get(run_id, ())),
-                ),
-                result,
-            )
-
-    for (
-        agent_id,
-        receipt_id,
-        run_id,
-        call_id,
-        operation_key,
-        routine_id,
-        occurrence_id,
-        grant_digest,
-        unresolved,
-        data,
-    ) in connection.execute(
-        """SELECT agent_id, id, run_id, call_id, operation_key, routine_id, occurrence_id, grant_digest, unresolved, data
-           FROM effect_receipts"""
-    ):
-        receipt = decode_receipt(data)
-        if (
-            receipt.agent_id != agent_id
-            or receipt.receipt_id != receipt_id
-            or receipt.run_id != run_id
-            or receipt.call_id != call_id
-            or receipt.operation_key != operation_key
-            or receipt.routine_id != routine_id
-            or receipt.occurrence_id != occurrence_id
-            or receipt.capability_grant_digest != grant_digest
-            or int(receipt.unresolved) != unresolved
-        ):
-            raise ValueError(
-                "stored effect receipt identity or indexed state is invalid"
-            )
-        if identity is not None and receipt.agent_id != identity.id:
-            raise ValueError("stored effect receipt belongs to another agent")
-
-    for agent_id, annotation_id, data in connection.execute(
-        "SELECT agent_id, id, data FROM semantic_annotations"
-    ):
-        annotation = decode_semantic_annotation(data)
-        if annotation.agent_id != agent_id or annotation.id != annotation_id:
-            raise ValueError("stored semantic annotation ownership is invalid")
-        if identity is not None and annotation.agent_id != identity.id:
-            raise ValueError("stored semantic annotation belongs to another agent")
-    for agent_id, link_id, data in connection.execute(
-        "SELECT agent_id, id, data FROM catalog_links"
-    ):
-        link = decode_catalog_link(data)
-        if link.agent_id != agent_id or link.id != link_id:
-            raise ValueError("stored catalog link ownership is invalid")
-        if identity is not None and link.agent_id != identity.id:
-            raise ValueError("stored catalog link belongs to another agent")
-
-    jobs: dict[tuple[str, str], Job] = {}
-    for agent_id, job_id, conversation_id, state, revision, data in connection.execute(
-        "SELECT agent_id, job_id, conversation_id, state, revision, data FROM jobs"
-    ):
-        job = decode_job(data)
-        if (
-            job.agent_id != agent_id
-            or job.job_id != job_id
-            or job.conversation_id != conversation_id
-            or job.state.value != state
-            or job.revision != revision
-        ):
-            raise ValueError("stored job projection is invalid")
-        if identity is not None and job.agent_id != identity.id:
-            raise ValueError("stored job belongs to another agent")
-        jobs[(agent_id, job_id)] = job
-
-    routines: dict[tuple[str, str], ScheduledRoutine] = {}
-    routine_counts: dict[str, int] = {}
-    active_routine_counts: dict[str, int] = {}
-    for (
-        agent_id,
-        routine_id,
-        conversation_id,
-        state,
-        next_due_at_us,
-        data,
-    ) in connection.execute(
-        """SELECT agent_id, routine_id, conversation_id, state,
-                  next_due_at_us, data
-           FROM scheduled_routines"""
-    ):
-        routine = decode_scheduled_routine(
-            data,
-            agent_id=agent_id,
-            routine_id=routine_id,
-        )
-        if (
-            routine.conversation_id != conversation_id
-            or routine.state.value != state
-            or _datetime_us(routine.next_due_at) != next_due_at_us
-        ):
-            raise ValueError("stored scheduled routine projection is invalid")
-        validate_schedule(routine.schedule)
-        if identity is not None and routine.agent_id != identity.id:
-            raise ValueError("stored scheduled routine belongs to another agent")
-        key = (agent_id, routine_id)
-        routines[key] = routine
-        routine_counts[agent_id] = routine_counts.get(agent_id, 0) + 1
-        if routine.state is RoutineState.ACTIVE:
-            active_routine_counts[agent_id] = active_routine_counts.get(agent_id, 0) + 1
-    if any(
-        value > MAX_SCHEDULED_ROUTINES_PER_AGENT for value in routine_counts.values()
-    ):
-        raise ValueError("stored routine count exceeds its fixed bound")
-    if any(
-        value > MAX_ACTIVE_ROUTINES_PER_AGENT
-        for value in active_routine_counts.values()
-    ):
-        raise ValueError("stored active routine count exceeds its fixed bound")
-
-    occurrences: dict[tuple[str, str], RoutineOccurrence] = {}
-    for (
-        agent_id,
-        occurrence_id_value,
-        routine_id,
-        routine_revision,
-        slot_key,
-        state,
-        lease_expires_at_us,
-        reserved_run_id,
-        data,
-    ) in connection.execute(
-        """SELECT agent_id, occurrence_id, routine_id, routine_revision,
-                  slot_key, state, lease_expires_at_us, reserved_run_id, data
-           FROM routine_occurrences"""
-    ):
-        occurrence = decode_routine_occurrence(
-            data,
-            agent_id=agent_id,
-            occurrence_id=occurrence_id_value,
-        )
-        owning_routine = routines.get((agent_id, routine_id))
-        if (
-            owning_routine is None
-            or occurrence.routine_id != routine_id
-            or occurrence.routine_revision != routine_revision
-            or occurrence.routine_revision > owning_routine.revision
-            or occurrence.slot_key != slot_key
-            or occurrence.disposition.value != state
-            or _datetime_us(occurrence.lease_expires_at) != lease_expires_at_us
-            or occurrence.reserved_run_id != reserved_run_id
-        ):
-            raise ValueError("stored routine occurrence projection is invalid")
-        occurrences[(agent_id, occurrence_id_value)] = occurrence
-    for routine in routines.values():
-        if routine.active_occurrence_id is None:
-            continue
-        active = occurrences.get((routine.agent_id, routine.active_occurrence_id))
-        if active is None or active.routine_id != routine.routine_id:
-            raise ValueError("stored routine active occurrence is invalid")
-
-    delivery_counts: dict[str, int] = {}
-    for (
-        agent_id,
-        delivery_id,
-        conversation_id,
-        subject_kind,
-        subject_id,
-        logical_key,
-        target_kind,
-        target_fingerprint_value,
-        state,
-        created_at_us,
-        data,
-    ) in connection.execute(
-        """SELECT agent_id, delivery_id, conversation_id, subject_kind,
-                  subject_id, logical_key, target_kind, target_fingerprint,
-                  state, created_at_us, data
-           FROM deliveries"""
-    ):
-        delivery = decode_delivery(data, agent_id=agent_id, delivery_id=delivery_id)
-        if (
-            delivery.conversation_id != conversation_id
-            or delivery.subject_kind.value != subject_kind
-            or delivery.subject_id != subject_id
-            or delivery.logical_key != logical_key
-            or target_kind != "conversation_inbox"
-            or delivery.target.target_fingerprint != target_fingerprint_value
-            or delivery.visibility_state.value != state
-            or _datetime_us(delivery.created_at) != created_at_us
-        ):
-            raise ValueError("stored delivery projection is invalid")
-        if identity is not None and delivery.agent_id != identity.id:
-            raise ValueError("stored delivery belongs to another agent")
-        if delivery.subject_kind is DeliverySubjectKind.ROUTINE_OCCURRENCE:
-            producer = occurrences.get((agent_id, subject_id))
-            producer_references_delivery = (
-                producer is not None and delivery_id in producer.delivery_ids
-            )
-        elif delivery.subject_kind is DeliverySubjectKind.JOB:
-            producing_job = jobs.get((agent_id, subject_id))
-            producer_references_delivery = (
-                producing_job is not None
-                and producing_job.conversation_id == delivery.conversation_id
-            )
-        else:
-            raise ValueError("stored delivery retained a legacy producer")
-        if not producer_references_delivery:
-            raise ValueError("stored delivery producer reference is invalid")
-        delivery_counts[agent_id] = delivery_counts.get(agent_id, 0) + 1
-        if delivery_counts[agent_id] > MAX_DELIVERIES_PER_AGENT:
-            raise ValueError("stored delivery count exceeds its fixed bound")
-    return identity
-
-
-def _pause_effect_routine(
-    connection: SQLConnection, receipt: EffectReceipt, changed_at: datetime
-) -> None:
-    if receipt.routine_id is None:
-        return
-    loaded = _load_routine_row(connection, receipt.agent_id, receipt.routine_id)
-    if loaded is None:
-        raise EffectReceiptConflictError("the producing routine is unavailable")
-    routine, encoded = loaded
-    _replace_routine_row(
-        connection,
-        encoded,
-        replace(
-            routine,
-            state=RoutineState.PAUSED,
-            updated_at=max(changed_at, routine.updated_at),
-        ),
-    )
-
-
-def _recover_started_effect_receipts(
-    connection: SQLConnection, agent_id: str, completed_at: datetime
-) -> None:
-    rows = tuple(
-        connection.execute(
-            "SELECT agent_id, id, data, job_id FROM effect_receipts WHERE agent_id = ?",
-            (agent_id,),
-        )
-    )
-    started = tuple(
-        (agent_id, receipt_id, receipt, job_id)
-        for (agent_id, receipt_id, data, job_id) in rows
-        if (receipt := decode_receipt(data)).outcome is EffectOutcome.STARTED
-    )
-    for agent_id, receipt_id, receipt, job_id in started:
-        recovered = receipt.finish(
-            EffectObservation(EffectOutcome.UNCERTAIN, EffectEvidenceBasis.UNKNOWN),
-            finished_at=completed_at,
-        )
-        result = connection.execute(
-            """UPDATE effect_receipts SET data = ?
-               WHERE agent_id = ? AND id = ? AND data = ?""",
-            (
-                encode_receipt(recovered),
-                agent_id,
-                receipt_id,
-                encode_receipt(receipt),
-            ),
-        )
-        if result.rowcount != 1:
-            raise RuntimeError("effect receipt changed during startup recovery")
-        _pause_effect_routine(connection, recovered, completed_at)
-        if job_id is not None:
-            _job_store.wait_for_uncertain_write(
-                connection, agent_id, str(job_id), completed_at
-            )
 
 
 def _commit_catalog_transaction(connection: SQLConnection) -> None:

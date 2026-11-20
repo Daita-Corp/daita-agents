@@ -26,9 +26,13 @@ sole current runnable format; legacy decoders remain migration-only.
 
 ## State boundary, migrations and releases
 
-`daita.storage.sql.SQLStateStore` owns shared state operations; `sql_jobs`
-and `sql_routines` hold the job and routine transitions it runs inside its
-transactions. The default SQLite adapter implements the supported
+`daita.storage.sql.SQLStateStore` owns shared state operations and their
+transaction boundaries. The statements it runs inside those transactions live
+in one `storage/sql_<area>.py` module per record family (`sql_jobs`,
+`sql_routines`, `sql_deliveries`, `sql_sources`, `sql_effects`,
+`sql_conversations`, `sql_analysis`, `sql_artifacts`, `sql_mcp`,
+`sql_semantics`), with catalog rows in `catalog_rows` and open-time record
+validation in `sql_validation`. The default SQLite adapter implements the supported
 `SQLDatabase` connection boundary. Custom adapters reuse these operations and
 strict codecs, with no copied state-transition logic. `run_sql_transaction` is
 the shared cancellation-safe transaction owner for adapter administrative writes.
