@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.2 (2026-11-20)
+
+Home revision unchanged (4). No home is migrated by this release.
+
+- **Idle agents stop polling their state store.** The job and routine
+  supervisors used to read the store once a second even with nothing to do.
+  They now poll once a second only while a job is running or a routine claim
+  was briefly refused. Otherwise they wait for a wake, the next routine due
+  time, the end of a quota hold or of a stale claim's lease, with a 300 second
+  backstop. An idle agent makes no store calls, so a custom SQL adapter that
+  pools connections can release them. Routines still run on time (#146).
+- **Resolving an uncertain write resumes its job at once.** `resolve_effect`
+  now wakes the job and routine supervisors, so a job waiting on that write
+  continues immediately instead of on the next poll (#146).
+- **`storage/sql.py` is split into per-area modules.** `SQLStateStore` keeps
+  every public method, and the supported imports in
+  [the storage contract](docs/STORAGE_CONTRACT.md) are unchanged. Custom
+  storage adapters need no change (#148).
+
 ## 1.3.1 (2026-11-16)
 
 Home revision unchanged (4). No home is migrated by this release.
