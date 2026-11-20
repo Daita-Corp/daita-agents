@@ -268,9 +268,12 @@ cross-domain atomic operations intact when narrowing consumer interfaces.
 
 ## Bounded access
 
-- Job polling runs once a second when no wake arrives. Starting, answering and
-  a finished run wake it immediately. Error backoff is separate and capped at
-  five seconds.
+- Job and routine supervisors poll once a second only while a job is running
+  or a routine claim was transiently refused. Otherwise they wait for a wake
+  (starting, answering, a finished run, resolving an effect), the next routine
+  due time, the end of a quota hold or of a stale routine claim's lease, with a
+  300 second backstop, so an idle agent makes no store calls. Error backoff is
+  separate and capped at five seconds.
 - `conversation_run_page` returns 1–100 ascending turns after an exclusive
   `after_turn_index` cursor. Continue after the final returned index; an empty
   page ends traversal. Each page uses one read snapshot and batches its messages.

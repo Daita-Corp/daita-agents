@@ -58,6 +58,8 @@ from .owner import JOB_INBOX_SENSITIVITY, JobOwner
 _logger = logging.getLogger(__name__)
 
 _DEFAULT_POLL_SECONDS = 1.0
+# Backstop only; every in-process change wakes the driver; must exceed a consumer pool's idle window.
+_IDLE_WAIT_SECONDS = 300.0
 _MAX_PAYLOAD_BYTES = 60 * 1024
 _PREVIOUS_MESSAGE_CHARACTERS = 4_000
 _TITLE_CHARACTERS = 120
@@ -244,10 +246,10 @@ class JobSupervisor:
             while not self._closing and not self._failed and not self._host_closed:
                 self._wake.clear()
                 try:
-                    await self._launch_running()
+                    busy = await self._launch_running()
                     self._consecutive_failures = 0
                     self._failure_code = None
-                    timeout = self._poll_seconds
+                    timeout = self._poll_seconds if busy else _IDLE_WAIT_SECONDS
                 except AdmissionClosedError:
                     self._stop_for_host_close()
                     break
@@ -285,7 +287,8 @@ class JobSupervisor:
             _logger.info("jobs supervisor stopped (host_closing)")
         self._wake.set()
 
-    async def _launch_running(self) -> None:
+    async def _launch_running(self) -> bool:
+        """Launch RUNNING jobs; return whether any work remains to poll for."""
         now = self._clock()
         # Background polls share the state database's pressure permits.
         async with await self._admission.sqlite_pressure_permit():
@@ -293,7 +296,7 @@ class JobSupervisor:
                 states=frozenset({JobState.RUNNING}), limit=50
             )
         if self._execute_run is None:
-            return
+            return False
         for job in running:
             held = self._held_until.get(job.job_id)
             if job.job_id in self._workers or (held is not None and held > now):
@@ -313,6 +316,7 @@ class JobSupervisor:
                 self._wake.set()
 
             worker.add_done_callback(done)
+        return bool(running) or bool(self._workers)
 
     async def _run_main(self, job_id: str) -> None:
         assert self._execute_run is not None

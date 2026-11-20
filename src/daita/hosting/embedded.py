@@ -3114,9 +3114,13 @@ class EmbeddedAgent:
                     raise ValueError(
                         "recovery evidence changed while approval was pending"
                     )
-                return await self._store.resolve_effect_receipt(
+                resolved = await self._store.resolve_effect_receipt(
                     self.identity.id, resolution
                 )
+            # Resolution can return a waiting job to RUNNING or unblock a routine claim.
+            self._job_supervisor.wake()
+            self._routine_supervisor.wake()
+            return resolved
 
     async def _effect_recovery_evidence(
         self,

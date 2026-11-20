@@ -19,6 +19,7 @@ from daita.capabilities import (
 )
 from daita.jobs import DelegationState, JobState
 from daita.llm.models import ModelRequest, ModelResponse, ToolCall
+from daita.storage.sqlite_records import EffectResolutionDecision
 from tests.support.jobs import (
     JobModel,
     in_state,
@@ -121,6 +122,48 @@ async def test_a_job_write_asks_commits_once_and_is_listed_as_committed_after_a_
         assert committed["receipt_id"] == receipt.receipt_id
         # Resuming never replays the write, and asks nothing more.
         assert inserts(db) == 1 and len(asked) == 1
+    finally:
+        await agent.close()
+
+
+async def test_resolving_an_uncertain_job_write_relaunches_the_job_promptly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    agent, _provider, db, alpha, *_rest, batch, clock, _approvals = (
+        await create_fixture(tmp_path, monkeypatch)
+    )
+    await agent.close()
+
+    async def approve(request: ApprovalRequest) -> ApprovalDecision:
+        return ApprovalDecision.APPROVE
+
+    model = JobModel()
+    model.script(
+        main=[
+            reply(ToolCall("load", "toolbox_load", {"tool_names": ["data_write"]})),
+            reply(ToolCall("write", "data_write", dict(batch))),
+            reply(text="The write may not have committed."),
+            reply(text="Checked by hand."),
+        ]
+    )
+    db.commit_error = ConnectionError("lost")
+    agent = await reopen(tmp_path, model, alpha, clock, approve)
+    try:
+        job = await agent.start_job(OBJECTIVE)
+        await wait_for_job(
+            agent, job.job_id, in_state(JobState.WAITING_FOR_YOU), model=model
+        )
+        (uncertain,) = await agent.list_effects(unresolved_only=True)
+        await agent.resolve_effect(
+            uncertain.receipt_id,
+            expected_digest=uncertain.receipt_digest,
+            decision=EffectResolutionDecision.CLOSE_WITHOUT_RETRY,
+            note="Checked the table by hand.",
+        )
+        # An idle supervisor waits minutes; only the resolution's wake gets here.
+        await wait_for_job(
+            agent, job.job_id, in_state(JobState.DONE), model=model, timeout=0.5
+        )
     finally:
         await agent.close()
 
