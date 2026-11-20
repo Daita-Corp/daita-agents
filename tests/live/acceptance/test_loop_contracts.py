@@ -298,15 +298,18 @@ async def test_live_tool_round_trip_has_stable_context_and_durable_completion(
                 block.text for block in message.content if isinstance(block, TextBlock)
             )
 
-        # The system prompt stays a stable prefix; per-step budget status
-        # follows the transcript.
+        # The system prompt is fixed and states the run's token budget. Per-step
+        # status rides on a tool result's run note, so each request extends the
+        # one before it and no later system message edits the cached prefix.
         assert len({text(request.messages[0]) for request in provider.requests}) == 1
-        for request in provider.requests:
-            assert request.messages[-1].role is MessageRole.SYSTEM
-            assert text(request.messages[-1]).startswith(
-                "Token budget left for this run (not a routine ceiling): "
-                f"{request.max_total_tokens} tokens."
-            )
+        assert "This run has a token budget." in text(provider.requests[0].messages[0])
+        for earlier, later in zip(provider.requests, provider.requests[1:]):
+            assert later.messages[: len(earlier.messages)] == earlier.messages
+        assert all(
+            message.role is not MessageRole.SYSTEM
+            for request in provider.requests
+            for message in request.messages[1:]
+        )
         assert all(
             tuple(tool.name for tool in request.tools)
             == tuple(tool.name for tool in provider.requests[0].tools)
