@@ -99,6 +99,7 @@ from . import (
     sql_mcp as _mcp_store,
     sql_routines as _routine_store,
     sql_semantics as _semantic_store,
+    sql_sources as _source_store,
 )
 from .sql_connection import (
     SQLConnection,
@@ -135,10 +136,7 @@ from .sqlite_codecs import (
     encode_identity,
     encode_mcp_binding,
     encode_receipt,
-    encode_relational_write_scope,
     encode_scheduled_routine,
-    encode_source,
-    encode_source_read_scope,
 )
 from .sqlite_codecs.analysis import decode_analysis_evidence, encode_analysis_evidence
 from .sqlite_codecs.jobs import decode_job
@@ -150,12 +148,10 @@ from .sqlite_records import (
     EffectResolution,
     EffectResolutionDecision,
     RelationalWriteScope,
-    SourcePermissionStateError,
     SourceReadMode,
     SourceReadScope,
     effect_receipt_aware as _effect_receipt_aware,
     effect_receipt_text as _effect_receipt_text,
-    relational_write_authorization_fingerprint,
     validate_effect_receipt_id,
 )
 
@@ -189,192 +185,6 @@ def _model_sensitivity_rank(value) -> int:
         "restricted": 3,
     }
     return order[value.value]
-
-
-def _decode_owned_read_scope(
-    connection: SQLConnection,
-    registration: SourceRegistration,
-    data: object,
-) -> SourceReadScope | None:
-    if not registration.active:
-        if data is not None:
-            raise SourcePermissionStateError(
-                "detached source unexpectedly retains a read scope"
-            )
-        return None
-    if not isinstance(data, str):
-        raise SourcePermissionStateError("active source is missing its read scope")
-    try:
-        scope = decode_source_read_scope(
-            data,
-            agent_id=registration.agent_id,
-            source_id=registration.id,
-        )
-        if scope.mode is SourceReadMode.SELECTED:
-            _require_nonforeign_read_resources(connection, scope)
-        return scope
-    except SourcePermissionStateError:
-        raise
-    except (TypeError, ValueError):
-        raise SourcePermissionStateError(
-            "active source read scope is undecodable"
-        ) from None
-
-
-def _require_nonforeign_read_resources(
-    connection: SQLConnection,
-    scope: SourceReadScope,
-) -> None:
-    requested = sorted(set(scope.resource_ids))
-    foreign = _fetch_foreign(connection, scope, requested)
-    if foreign:
-        raise SourcePermissionStateError(
-            "active source read scope contains a foreign resource"
-        )
-
-
-def _fetch_foreign(
-    connection: SQLConnection, scope: SourceReadScope, requested: list[str]
-) -> bool:
-    # A resource ID hashes its source, so a damaged row cannot make reads foreign.
-    for start in range(0, len(requested), 400):
-        chunk = requested[start : start + 400]
-        marks = ", ".join("?" * len(chunk))
-        if connection.execute(
-            "SELECT 1 FROM catalog_resources WHERE agent_id = ? "
-            f"AND id IN ({marks}) AND source_id <> ?",
-            (scope.agent_id, *chunk, scope.source_id),
-        ).fetchone():
-            return True
-    return False
-
-
-def _decode_source_state(
-    connection: SQLConnection,
-    *,
-    row_agent_id: object,
-    row_source_id: object,
-    source_data: object,
-    read_scope_data: object,
-    update_scope_count: object,
-) -> SourceRegistration:
-    if (
-        not isinstance(row_agent_id, str)
-        or not isinstance(row_source_id, str)
-        or not isinstance(source_data, str)
-        or not isinstance(update_scope_count, int)
-        or isinstance(update_scope_count, bool)
-        or update_scope_count < 0
-    ):
-        raise SourcePermissionStateError("stored source permission state is invalid")
-    try:
-        registration = decode_source(source_data)
-    except (TypeError, ValueError):
-        raise SourcePermissionStateError(
-            "stored source registration is invalid"
-        ) from None
-    if registration.agent_id != row_agent_id or registration.id != row_source_id:
-        raise SourcePermissionStateError("stored source ownership is invalid")
-    _decode_owned_read_scope(connection, registration, read_scope_data)
-    if update_scope_count and not registration.active:
-        raise SourcePermissionStateError("stored PostgreSQL update scope is foreign")
-    return registration
-
-
-def _source_state_row(
-    connection: SQLConnection,
-    agent_id: str,
-    source_id: str,
-) -> tuple[object, ...] | None:
-    return connection.execute(
-        """SELECT s.agent_id, s.id, s.data, r.data,
-                  (SELECT COUNT(*) FROM relational_write_scopes AS u
-                   WHERE u.agent_id = s.agent_id AND u.source_id = s.id)
-           FROM sources AS s
-           LEFT JOIN source_read_scopes AS r
-             ON r.agent_id = s.agent_id AND r.source_id = s.id
-           WHERE s.agent_id = ? AND s.id = ?""",
-        (agent_id, source_id),
-    ).fetchone()
-
-
-def _attach_registration(
-    connection: SQLConnection, registration: SourceRegistration
-) -> None:
-    """First attach inserts the source and an allow-all scope; re-attach follows the rules."""
-
-    stored_registration = registration
-    row = _source_state_row(
-        connection,
-        stored_registration.agent_id,
-        stored_registration.id,
-    )
-    if row is None:
-        connection.execute(
-            "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
-            (
-                stored_registration.agent_id,
-                stored_registration.id,
-                encode_source(stored_registration),
-            ),
-        )
-        if stored_registration.active:
-            attach_scope = SourceReadScope.allow_all(
-                agent_id=stored_registration.agent_id,
-                source_id=stored_registration.id,
-            )
-            connection.execute(
-                """INSERT INTO source_read_scopes(
-                       agent_id, source_id, data
-                   ) VALUES (?, ?, ?)""",
-                (
-                    stored_registration.agent_id,
-                    stored_registration.id,
-                    encode_source_read_scope(attach_scope),
-                ),
-            )
-    else:
-        current = _decode_source_state(
-            connection,
-            row_agent_id=row[0],
-            row_source_id=row[1],
-            source_data=row[2],
-            read_scope_data=row[3],
-            update_scope_count=row[4],
-        )
-        if current != stored_registration:
-            if (
-                current.active
-                or not stored_registration.active
-                or current.adapter_id != stored_registration.adapter_id
-                or current.native_identity != stored_registration.native_identity
-            ):
-                raise ValueError(
-                    "source registration already exists: " f"{stored_registration.id}"
-                )
-            connection.execute(
-                """UPDATE sources SET data = ?
-                   WHERE agent_id = ? AND id = ?""",
-                (
-                    encode_source(stored_registration),
-                    stored_registration.agent_id,
-                    stored_registration.id,
-                ),
-            )
-            attach_scope = SourceReadScope.allow_all(
-                agent_id=stored_registration.agent_id,
-                source_id=stored_registration.id,
-            )
-            connection.execute(
-                """INSERT INTO source_read_scopes(
-                       agent_id, source_id, data
-                   ) VALUES (?, ?, ?)""",
-                (
-                    stored_registration.agent_id,
-                    stored_registration.id,
-                    encode_source_read_scope(attach_scope),
-                ),
-            )
 
 
 class _CatalogCommitGate:
@@ -677,30 +487,17 @@ class SQLStateStore:
     ) -> SourceRegistration:
         """Replace local discovery hints while retaining source identity and scopes."""
 
-        def write(connection: SQLConnection) -> SourceRegistration:
-            row = _source_state_row(connection, agent_id, source_id)
-            if row is None:
-                raise ValueError("source does not exist")
-            current = _decode_source_state(
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _source_store.update_discovery(
                 connection,
-                row_agent_id=row[0],
-                row_source_id=row[1],
-                source_data=row[2],
-                read_scope_data=row[3],
-                update_scope_count=row[4],
-            )
-            if not current.active:
-                raise ValueError("source is not active")
-            updated = replace(
-                current, summary=summary, when_to_use=when_to_use, keywords=keywords
-            )
-            connection.execute(
-                "UPDATE sources SET data = ? WHERE agent_id = ? AND id = ?",
-                (encode_source(updated), agent_id, source_id),
-            )
-            return updated
-
-        return await run_sql_transaction(self._database, write)
+                agent_id,
+                source_id,
+                summary=summary,
+                when_to_use=when_to_use,
+                keywords=keywords,
+            ),
+        )
 
     async def admit_scheduled_routine(
         self,
@@ -1152,98 +949,24 @@ class SQLStateStore:
     async def register_source(
         self, registration: SourceRegistration
     ) -> SourceRegistration:
-        def write(connection: SQLConnection) -> SourceRegistration:
-            stored = registration
-            row = _source_state_row(
-                connection,
-                registration.agent_id,
-                registration.id,
-            )
-            if row is not None:
-                current = _decode_source_state(
-                    connection,
-                    row_agent_id=row[0],
-                    row_source_id=row[1],
-                    source_data=row[2],
-                    read_scope_data=row[3],
-                    update_scope_count=row[4],
-                )
-                if current != stored:
-                    raise ValueError(
-                        f"source registration already exists: {registration.id}"
-                    )
-                return current
-            connection.execute(
-                "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
-                (stored.agent_id, stored.id, encode_source(stored)),
-            )
-            if stored.active:
-                scope = SourceReadScope.allow_all(
-                    agent_id=stored.agent_id,
-                    source_id=stored.id,
-                )
-                connection.execute(
-                    """INSERT INTO source_read_scopes(agent_id, source_id, data)
-                       VALUES (?, ?, ?)""",
-                    (stored.agent_id, stored.id, encode_source_read_scope(scope)),
-                )
-            return stored
-
-        return await run_sql_transaction(self._database, write)
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _source_store.register(connection, registration),
+        )
 
     async def load_source(
         self, agent_id: str, source_id: str
     ) -> SourceRegistration | None:
         def read() -> SourceRegistration | None:
             with _connect_read_only(self._database) as connection:
-                row = _source_state_row(connection, agent_id, source_id)
-                return (
-                    None
-                    if row is None
-                    else _decode_source_state(
-                        connection,
-                        row_agent_id=row[0],
-                        row_source_id=row[1],
-                        source_data=row[2],
-                        read_scope_data=row[3],
-                        update_scope_count=row[4],
-                    )
-                )
+                return _source_store.load(connection, agent_id, source_id)
 
         return await settled_thread(read)
 
     async def list_sources(self, agent_id: str) -> tuple[SourceRegistration, ...]:
         def read() -> tuple[SourceRegistration, ...]:
             with _connect_read_only(self._database) as connection:
-                rows = connection.execute(
-                    """SELECT s.agent_id, s.id, s.data, r.data,
-                              (SELECT COUNT(*)
-                               FROM relational_write_scopes AS u
-                               WHERE u.agent_id = s.agent_id
-                                 AND u.source_id = s.id)
-                       FROM sources AS s
-                       LEFT JOIN source_read_scopes AS r
-                         ON r.agent_id = s.agent_id AND r.source_id = s.id
-                       WHERE s.agent_id = ? ORDER BY s.id""",
-                    (agent_id,),
-                ).fetchall()
-                return tuple(
-                    _decode_source_state(
-                        connection,
-                        row_agent_id=row_agent_id,
-                        row_source_id=row_source_id,
-                        source_data=data,
-                        read_scope_data=read_scope_data,
-                        update_scope_count=update_scope_count,
-                    )
-                    for (
-                        row_agent_id,
-                        row_source_id,
-                        data,
-                        read_scope_data,
-                        update_scope_count,
-                    ) in rows
-                )
+                return _source_store.list_sources(connection, agent_id)
 
         return await settled_thread(read)
 
@@ -1256,18 +979,7 @@ class SQLStateStore:
 
         def read() -> SourceReadScope | None:
             with _connect_read_only(self._database) as connection:
-                row = _source_state_row(connection, agent_id, source_id)
-                if row is None:
-                    return None
-                registration = _decode_source_state(
-                    connection,
-                    row_agent_id=row[0],
-                    row_source_id=row[1],
-                    source_data=row[2],
-                    read_scope_data=row[3],
-                    update_scope_count=row[4],
-                )
-                return _decode_owned_read_scope(connection, registration, row[3])
+                return _source_store.load_read_scope(connection, agent_id, source_id)
 
         return await settled_thread(read)
 
@@ -1278,41 +990,7 @@ class SQLStateStore:
     ) -> tuple[RelationalWriteScope, ...]:
         def read() -> tuple[RelationalWriteScope, ...]:
             with _connect_read_only(self._database) as connection:
-                source_row = _source_state_row(connection, agent_id, source_id)
-                if source_row is None:
-                    return ()
-                registration = _decode_source_state(
-                    connection,
-                    row_agent_id=source_row[0],
-                    row_source_id=source_row[1],
-                    source_data=source_row[2],
-                    read_scope_data=source_row[3],
-                    update_scope_count=source_row[4],
-                )
-                if not registration.active:
-                    return ()
-                rows = connection.execute(
-                    """SELECT resource_id, authorization_fingerprint, data
-                       FROM relational_write_scopes
-                       WHERE agent_id = ? AND source_id = ?
-                       ORDER BY resource_id""",
-                    (agent_id, source_id),
-                ).fetchall()
-                try:
-                    return tuple(
-                        decode_relational_write_scope(
-                            data,
-                            agent_id=agent_id,
-                            source_id=source_id,
-                            resource_id=resource_id,
-                            authorization_fingerprint=fingerprint,
-                        )
-                        for resource_id, fingerprint, data in rows
-                    )
-                except (TypeError, ValueError):
-                    raise SourcePermissionStateError(
-                        "stored PostgreSQL update scope is undecodable"
-                    ) from None
+                return _source_store.list_write_scopes(connection, agent_id, source_id)
 
         return await settled_thread(read)
 
@@ -1331,82 +1009,12 @@ class SQLStateStore:
             raise TypeError("update_scopes must be a tuple of RelationalWriteScope")
         if len({scope.resource_id for scope in update_scopes}) != len(update_scopes):
             raise ValueError("update_scopes cannot contain duplicate resources")
-
-        def write(connection: SQLConnection) -> SourceRegistration:
-            row = _source_state_row(
-                connection,
-                read_scope.agent_id,
-                read_scope.source_id,
-            )
-            if row is None:
-                raise ValueError("permission scopes require an active owned source")
-            registration = _decode_source_state(
-                connection,
-                row_agent_id=row[0],
-                row_source_id=row[1],
-                source_data=row[2],
-                read_scope_data=row[3],
-                update_scope_count=row[4],
-            )
-            if not registration.active:
-                raise ValueError("permission scopes require an active owned source")
-            _require_nonforeign_read_resources(connection, read_scope)
-            if any(
-                scope.agent_id != read_scope.agent_id
-                or scope.source_id != read_scope.source_id
-                for scope in update_scopes
-            ):
-                raise ValueError("update scope belongs to another source")
-            update_resource_ids = {scope.resource_id for scope in update_scopes}
-            if read_scope.mode is SourceReadMode.NONE and update_resource_ids:
-                raise ValueError("PostgreSQL update scope requires read access")
-            if (
-                read_scope.mode is SourceReadMode.SELECTED
-                and not update_resource_ids <= set(read_scope.resource_ids)
-            ):
-                raise ValueError("PostgreSQL update scope must be a read subset")
-            for scope in update_scopes:
-                expected = relational_write_authorization_fingerprint(
-                    source=registration, scope=scope
-                )
-                if scope.authorization_fingerprint != expected:
-                    raise ValueError(
-                        "PostgreSQL write authorization fingerprint is stale"
-                    )
-            connection.execute(
-                f"""INSERT INTO source_read_scopes(agent_id, source_id, data)
-                   VALUES (?, ?, ?)
-                   ON CONFLICT({connection.conflict('agent_id, source_id')})
-                   DO UPDATE SET data = excluded.data""",
-                (
-                    read_scope.agent_id,
-                    read_scope.source_id,
-                    encode_source_read_scope(read_scope),
-                ),
-            )
-            connection.execute(
-                """DELETE FROM relational_write_scopes
-                   WHERE agent_id = ? AND source_id = ?""",
-                (read_scope.agent_id, read_scope.source_id),
-            )
-            for scope in sorted(update_scopes, key=lambda item: item.resource_id):
-                connection.execute(
-                    """INSERT INTO relational_write_scopes(
-                           agent_id, source_id, resource_id,
-                           authorization_fingerprint, data
-                       ) VALUES (?, ?, ?, ?, ?)""",
-                    (
-                        scope.agent_id,
-                        scope.source_id,
-                        scope.resource_id,
-                        scope.authorization_fingerprint,
-                        encode_relational_write_scope(scope),
-                    ),
-                )
-            return registration
-
-        updated = await run_sql_transaction(self._database, write)
-        return updated
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _source_store.replace_permission_scopes(
+                connection, read_scope, update_scopes
+            ),
+        )
 
     async def load_effect_receipt(
         self,
@@ -1805,32 +1413,12 @@ class SQLStateStore:
     async def detach_source(
         self, agent_id: str, source_id: str, detached_at: datetime
     ) -> SourceRegistration:
-        def write(connection: SQLConnection) -> SourceRegistration:
-            row = connection.execute(
-                "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
-                (agent_id, source_id),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"unknown source: {source_id}")
-            current = decode_source(row[0])
-            detached = current if not current.active else current.detach(detached_at)
-            connection.execute(
-                "UPDATE sources SET data = ? WHERE agent_id = ? AND id = ?",
-                (encode_source(detached), agent_id, source_id),
-            )
-            connection.execute(
-                """DELETE FROM source_read_scopes
-                   WHERE agent_id = ? AND source_id = ?""",
-                (agent_id, source_id),
-            )
-            connection.execute(
-                """DELETE FROM relational_write_scopes
-                   WHERE agent_id = ? AND source_id = ?""",
-                (agent_id, source_id),
-            )
-            return detached
-
-        return await run_sql_transaction(self._database, write)
+        return await run_sql_transaction(
+            self._database,
+            lambda connection: _source_store.detach(
+                connection, agent_id, source_id, detached_at
+            ),
+        )
 
     async def record_sync(self, sync: CatalogSync) -> CatalogSync:
         def write(connection: SQLConnection) -> CatalogSync:
@@ -1870,7 +1458,7 @@ class SQLStateStore:
 
         def write(connection: SQLConnection) -> CatalogCommitSummary:
             if registration is not None:
-                _attach_registration(connection, registration)
+                _source_store.attach_registration(connection, registration)
             return catalog_rows.commit_pass(
                 connection,
                 sync,
@@ -1936,107 +1524,8 @@ class SQLStateStore:
         repair = self._damaged_rows(sync.agent_id)
 
         def write(connection: SQLConnection) -> CatalogCommitSummary:
-            replaced_row = _source_state_row(
-                connection,
-                registration.agent_id,
-                replaced_source_id,
-            )
-            if replaced_row is None:
-                raise ValueError("source edit requires an active owned source")
-            replaced = _decode_source_state(
-                connection,
-                row_agent_id=replaced_row[0],
-                row_source_id=replaced_row[1],
-                source_data=replaced_row[2],
-                read_scope_data=replaced_row[3],
-                update_scope_count=replaced_row[4],
-            )
-            if not replaced.active:
-                raise ValueError("source edit requires an active owned source")
-            if replaced.adapter_id != registration.adapter_id:
-                raise ValueError("source edit cannot change source type")
-            if registration.id != replaced.id:
-                replacement_row = _source_state_row(
-                    connection,
-                    registration.agent_id,
-                    registration.id,
-                )
-                if replacement_row is None:
-                    connection.execute(
-                        "INSERT INTO sources(agent_id, id, data) VALUES (?, ?, ?)",
-                        (
-                            registration.agent_id,
-                            registration.id,
-                            encode_source(registration),
-                        ),
-                    )
-                else:
-                    existing_replacement = _decode_source_state(
-                        connection,
-                        row_agent_id=replacement_row[0],
-                        row_source_id=replacement_row[1],
-                        source_data=replacement_row[2],
-                        read_scope_data=replacement_row[3],
-                        update_scope_count=replacement_row[4],
-                    )
-                    if existing_replacement.active:
-                        raise ValueError("replacement connection is already attached")
-                    if (
-                        existing_replacement.adapter_id != registration.adapter_id
-                        or existing_replacement.native_identity
-                        != registration.native_identity
-                    ):
-                        raise ValueError(
-                            "replacement source identity conflicts with stored state"
-                        )
-                    connection.execute(
-                        """UPDATE sources SET data = ?
-                           WHERE agent_id = ? AND id = ?""",
-                        (
-                            encode_source(registration),
-                            registration.agent_id,
-                            registration.id,
-                        ),
-                    )
-                detached = replaced.detach(replaced_at)
-                connection.execute(
-                    """UPDATE sources SET data = ?
-                       WHERE agent_id = ? AND id = ?""",
-                    (
-                        encode_source(detached),
-                        replaced.agent_id,
-                        replaced.id,
-                    ),
-                )
-            else:
-                connection.execute(
-                    """UPDATE sources SET data = ?
-                       WHERE agent_id = ? AND id = ?""",
-                    (
-                        encode_source(registration),
-                        registration.agent_id,
-                        registration.id,
-                    ),
-                )
-            for source_id in {replaced.id, registration.id}:
-                connection.execute(
-                    """DELETE FROM source_read_scopes
-                       WHERE agent_id = ? AND source_id = ?""",
-                    (registration.agent_id, source_id),
-                )
-                connection.execute(
-                    """DELETE FROM relational_write_scopes
-                       WHERE agent_id = ? AND source_id = ?""",
-                    (registration.agent_id, source_id),
-                )
-            connection.execute(
-                """INSERT INTO source_read_scopes(agent_id, source_id, data)
-                   VALUES (?, ?, ?)""",
-                (
-                    read_scope.agent_id,
-                    read_scope.source_id,
-                    encode_source_read_scope(read_scope),
-                ),
+            _source_store.replace_for_edit(
+                connection, registration, replaced_source_id, replaced_at, read_scope
             )
             return catalog_rows.commit_pass(
                 connection,
