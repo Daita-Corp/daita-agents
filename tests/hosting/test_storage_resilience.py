@@ -19,6 +19,7 @@ from daita.storage.errors import (
     StorageUnavailableError,
 )
 from daita.storage.sqlite import SQLiteStateStore
+from tests.support.jobs import JobModel
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.integration
@@ -32,7 +33,11 @@ async def test_supervisor_recovers_after_known_noncommit_failure(
     tmp_path, monkeypatch, name, operation
 ):
     agent = await Agent.create(
-        "retry-storage", root=tmp_path, workspace=workspace_for(tmp_path)
+        "retry-storage",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=JobModel(),
+        model_profile=JobModel.model_profile,
     )
     calls = 0
     retried = asyncio.Event()
@@ -82,7 +87,11 @@ async def test_supervisor_stops_on_unknown_commit_or_lost_ownership(
     tmp_path, monkeypatch, caplog, error_type, name, operation
 ):
     agent = await Agent.create(
-        "stop-storage", root=tmp_path, workspace=workspace_for(tmp_path)
+        "stop-storage",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=JobModel(),
+        model_profile=JobModel.model_profile,
     )
     calls = 0
 
@@ -111,28 +120,44 @@ async def test_supervisor_stops_on_unknown_commit_or_lost_ownership(
         await agent.close()
 
 
-async def test_idle_job_polling_is_bounded_and_wake_is_prompt(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize(
+    "name,operation",
+    [("jobs", "list_jobs"), ("routines", "next_routine_deadline")],
+)
+async def test_idle_supervisors_wait_for_wake(
+    tmp_path: Path, monkeypatch, name, operation
 ):
-    agent = await Agent.create(
-        "idle-storage", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
     counts: Counter[str] = Counter()
-    woke = asyncio.Event()
-    original = SQLiteStateStore.list_jobs
+    polled = asyncio.Event()
+    original = getattr(SQLiteStateStore, operation)
 
     async def observe(self, *args, **kwargs):
         counts["poll"] += 1
-        woke.set()
+        polled.set()
         return await original(self, *args, **kwargs)
 
+    monkeypatch.setattr(SQLiteStateStore, operation, observe)
+    agent = await Agent.create(
+        "idle-storage",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=JobModel(),
+        model_profile=JobModel.model_profile,
+    )
+    supervisor = (
+        agent._embedded._job_supervisor
+        if name == "jobs"
+        else agent._embedded._routine_supervisor
+    )
     try:
-        monkeypatch.setattr(SQLiteStateStore, "list_jobs", observe)
+        await asyncio.wait_for(polled.wait(), 1)
+        await asyncio.sleep(0.2)  # let startup reads settle
+        settled = counts["poll"]
         await asyncio.sleep(1.1)
-        assert 1 <= counts["poll"] <= 6
-        woke.clear()
-        agent._embedded._job_supervisor.wake()
-        await asyncio.wait_for(woke.wait(), 0.3)
+        assert counts["poll"] == settled
+        polled.clear()
+        supervisor.wake()
+        await asyncio.wait_for(polled.wait(), 0.3)
     finally:
         await agent.close()
 
@@ -143,7 +168,11 @@ async def test_host_admission_close_stops_supervisors_without_failure(
 ):
     caplog.set_level(logging.INFO)
     agent = await Agent.create(
-        "orderly-close", root=tmp_path, workspace=workspace_for(tmp_path)
+        "orderly-close",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=JobModel(),
+        model_profile=JobModel.model_profile,
     )
     embedded = agent._embedded
     supervisor: JobSupervisor | RoutineSupervisor
@@ -178,7 +207,11 @@ async def test_cancelled_supervisor_read_releases_its_connection_before_close(
     """Reproduce the shutdown race: a supervisor is cancelled mid-read."""
 
     agent = await Agent.create(
-        "release-on-close", root=tmp_path, workspace=workspace_for(tmp_path)
+        "release-on-close",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=JobModel(),
+        model_profile=JobModel.model_profile,
     )
     open_connections: set[int] = set()
     entered = threading.Event()
