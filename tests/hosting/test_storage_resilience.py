@@ -19,6 +19,7 @@ from daita.storage.errors import (
     StorageUnavailableError,
 )
 from daita.storage.sqlite import SQLiteStateStore
+from daita.storage.sqlite_records import MAX_UNEXPECTED_FAILURES
 from tests.support.jobs import JobModel
 from tests.support.workspace import workspace_for
 
@@ -115,6 +116,92 @@ async def test_supervisor_stops_on_unknown_commit_or_lost_ownership(
         supervisor.wake()
         await asyncio.sleep(0.05)
         assert calls == 1
+        assert "secret connection string" not in caplog.text
+    finally:
+        await agent.close()
+
+
+async def _unexpected_failures(tmp_path, monkeypatch, name, operation, *, until):
+    """Fail `operation` with an unmapped driver error until `until(calls)` ends it."""
+
+    agent = await Agent.create(
+        "unexpected-error",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=JobModel(),
+        model_profile=JobModel.model_profile,
+    )
+    calls = 0
+    original = getattr(SQLiteStateStore, operation)
+
+    async def flaky(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if not until(calls):
+            raise ConnectionResetError("secret connection string")
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SQLiteStateStore, operation, flaky)
+    supervisor = (
+        agent._embedded._job_supervisor
+        if name == "jobs"
+        else agent._embedded._routine_supervisor
+    )
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep(asyncio.sleep))
+    return agent, supervisor, lambda: calls
+
+
+def _fast_sleep(real):
+    async def sleep(delay, *args):
+        return await real(min(delay, 0.001), *args)
+
+    return sleep
+
+
+@pytest.mark.parametrize(
+    "name,operation",
+    [("jobs", "list_jobs"), ("routines", "next_routine_deadline")],
+)
+async def test_supervisor_survives_transient_unexpected_error(
+    tmp_path, monkeypatch, name, operation
+):
+    agent, supervisor, calls = await _unexpected_failures(
+        tmp_path, monkeypatch, name, operation, until=lambda n: n > 2
+    )
+    try:
+        for _ in range(500):
+            supervisor.wake()
+            if calls() > 2 and supervisor.status.state == "running":
+                break
+            await asyncio.sleep(0.01)
+        assert supervisor.status.state == "running"
+        assert supervisor.status.failure_code is None
+        assert supervisor.status.consecutive_failures == 0
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize(
+    "name,operation",
+    [("jobs", "list_jobs"), ("routines", "next_routine_deadline")],
+)
+async def test_supervisor_stops_after_bounded_unexpected_errors(
+    tmp_path, monkeypatch, caplog, name, operation
+):
+    agent, supervisor, calls = await _unexpected_failures(
+        tmp_path, monkeypatch, name, operation, until=lambda n: False
+    )
+    try:
+        supervisor.wake()
+        assert supervisor._driver is not None
+        await asyncio.wait_for(asyncio.shield(supervisor._driver), 5)
+        status = next(item for item in agent.background_status() if item.name == name)
+        assert status.state == "failed"
+        assert status.failure_code == "supervisor_failed"
+        assert calls() == MAX_UNEXPECTED_FAILURES
+        supervisor.wake()
+        await asyncio.sleep(0.05)
+        assert calls() == MAX_UNEXPECTED_FAILURES
         assert "secret connection string" not in caplog.text
     finally:
         await agent.close()

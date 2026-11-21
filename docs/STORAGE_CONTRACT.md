@@ -240,14 +240,31 @@ starts must settle or expose an unknown outcome before releasing its resources.
 Backends must not translate every transport exception into a retryable error.
 SQLite maps busy/locked failures only after a failed read or a completed rollback.
 
-Supervisors retry known non-commits with capped backoff. Unreconciled unknown
-commits, lost ownership, and unexpected failures stop their driver and cancel
-remaining workers. Storage errors must
-not become ordinary executor failures eligible for automatic replay.
-`Agent.background_status()` exposes payload-free running/retrying/failed/stopped
-status and code-owned failure codes. Logs and status never include driver error
-messages or connection details. Restarting a failed supervisor requires normal
-host close/open and ownership admission; `wake()` cannot bypass it.
+Supervisors retry known non-commits with capped backoff. They also retry an
+unexpected error (one that is not a typed storage error, such as a driver error
+the adapter did not map) up to five consecutive times; a successful pass resets
+the count. Unreconciled unknown commits, lost ownership, unresolved effects and
+the fifth consecutive unexpected error stop their driver and cancel remaining
+workers. Retries re-run only the supervisor's own reads and claims; uncertain
+effects are never replayed, and storage errors must not become ordinary executor
+failures eligible for automatic replay.
+
+`Agent.background_status()` returns one payload-free `SupervisorStatus` each for
+`jobs` and `routines`, with `state`, `consecutive_failures` and a code-owned
+`failure_code`. Logs and status never include driver error messages or
+connection details.
+
+| State | Meaning for a host |
+| --- | --- |
+| `running` | Healthy. |
+| `retrying` | A pass failed and will be retried; `failure_code` says why. No action needed. |
+| `failed` | The supervisor gave up and will not run again in this open agent. Background jobs or routines of that kind do not progress. `failure_code` is the typed storage code, or `supervisor_failed` for an unexpected error. |
+| `stopped` | Not running: not started, closed, or stopped because host admission closed. Not a failure. |
+
+A `failed` supervisor is restarted only by closing the agent and opening it again
+with normal ownership admission; `wake()` cannot bypass it. A long-lived host
+should poll `background_status()` and close and reopen the agent when any status
+is `failed`.
 
 | Operation family | Atomic boundary and replay rules |
 | --- | --- |

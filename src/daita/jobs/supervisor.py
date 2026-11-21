@@ -40,7 +40,12 @@ from ..loop.models import (
 )
 from ..observation import SupervisorStatus
 from ..storage.errors import StorageError, StorageUnavailableError
-from ..storage.sqlite_records import EffectOutcome, EffectReceipt
+from ..storage.sqlite_records import (
+    MAX_UNEXPECTED_FAILURES,
+    EffectOutcome,
+    EffectReceipt,
+    unexpected_is_retryable,
+)
 from .models import (
     INTERRUPTED_BY_RESTART,
     JOB_CONTEXT_THRESHOLD,
@@ -186,6 +191,7 @@ class JobSupervisor:
         self._failed = False
         self._failure_code: str | None = None
         self._consecutive_failures = 0
+        self._unexpected_failures = 0
 
     @property
     def status(self) -> SupervisorStatus:
@@ -248,6 +254,7 @@ class JobSupervisor:
                 try:
                     busy = await self._launch_running()
                     self._consecutive_failures = 0
+                    self._unexpected_failures = 0
                     self._failure_code = None
                     timeout = self._poll_seconds if busy else _IDLE_WAIT_SECONDS
                 except AdmissionClosedError:
@@ -258,18 +265,29 @@ class JobSupervisor:
                     self._failure_code = error.code
                     timeout = min(5.0, 0.1 * 2 ** min(self._consecutive_failures, 6))
                 except Exception as error:
-                    self._failed = True
+                    # A pass only reads, so an unexpected error is safe to retry.
+                    # Uncertain-commit, ownership and effect errors never are.
+                    if not unexpected_is_retryable(error):
+                        self._failed = True
+                    else:
+                        self._unexpected_failures += 1
+                        self._failed = (
+                            self._unexpected_failures >= MAX_UNEXPECTED_FAILURES
+                        )
+                    self._consecutive_failures += 1
                     self._failure_code = (
                         error.code
                         if isinstance(error, StorageError)
                         else "supervisor_failed"
                     )
-                    _logger.error(
-                        "jobs supervisor stopped (%s, %s)",
-                        self._failure_code,
-                        type(error).__name__,
-                    )
-                    break
+                    if self._failed:
+                        _logger.error(
+                            "jobs supervisor stopped (%s, %s)",
+                            self._failure_code,
+                            type(error).__name__,
+                        )
+                        break
+                    timeout = min(5.0, 0.1 * 2 ** min(self._consecutive_failures, 6))
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=timeout)
                 except TimeoutError:
