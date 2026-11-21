@@ -6,6 +6,7 @@ Every public function runs inside a caller-owned transaction or read connection;
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import replace
@@ -74,6 +75,8 @@ from .sqlite_records import (
     EffectUnresolvedError,
     effect_receipt_text as _effect_receipt_text,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 def _insert_delivery(connection: SQLConnection, delivery: Delivery) -> None:
@@ -579,6 +582,13 @@ def claim_due_occurrence(
         )
         _replace_routine_row(connection, encoded, skipped)
         return None
+    if selection.skipped_slots:
+        # Reported, not stored: a durable count needs a home revision.
+        _logger.warning(
+            "routine %s ran its latest missed slot; skipped %d older slots",
+            routine_id,
+            selection.skipped_slots,
+        )
     return _claim_routine_slot(
         connection,
         current,

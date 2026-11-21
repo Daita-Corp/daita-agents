@@ -22,9 +22,13 @@ Everything else is a fixed default, with no option to change it:
 - **Delivery:** the routine's conversation Inbox. A routine created outside a
   conversation (from the CLI or Python without `conversation_id`) gets a new
   conversation of its own, which appears with its first result.
-- **Missed slots are skipped.** One late slot still runs when the host wakes;
-  a backlog of several missed slots does not, and the routine waits for its
-  next future slot.
+- **After downtime, the latest missed slot runs once.** One late slot runs when
+  the host wakes. When several slots were missed, only the most recent runs;
+  older ones are not run and there is no backlog. The host logs a warning with
+  the routine id and how many were skipped. The count is reported, not stored,
+  so it does not appear in routine inspection. The routine then waits for its
+  next future slot. There is no stale-slot cutoff: a missed daily report still
+  runs late.
 - **Run limits:** each run has the agent's normal step, time, token and cost
   limits and uses the agent's current model routes.
 - **Failures:** a recurring routine pauses as **Needs you** after 3
