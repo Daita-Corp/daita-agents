@@ -659,6 +659,20 @@ class SQLStateStore:
 
         return await settled_thread(read)
 
+    async def routine_wake_times(
+        self, agent_id: str
+    ) -> tuple[datetime | None, datetime | None]:
+        """Return (next claimable due slot, earliest live claim lease end) in one read."""
+
+        def read() -> tuple[datetime | None, datetime | None]:
+            with _connect_read_only(self._database) as connection:
+                return (
+                    _routine_store.next_deadline(connection, agent_id),
+                    _routine_store.next_claim_expiry(connection, agent_id),
+                )
+
+        return await settled_thread(read)
+
     async def load_routine_occurrence(
         self,
         agent_id: str,
