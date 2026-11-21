@@ -13,6 +13,7 @@ from .._json import FrozenJsonObject, canonical_json
 from ..adapters.models import SourceRegistration
 from ..capabilities import EffectEvidenceBasis, EffectObservation, EffectOutcome
 from ..llm.models import ModelSensitivity
+from .errors import StorageError
 
 _SOURCE_PERMISSION_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SOURCE_PERMISSION_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
@@ -459,6 +460,23 @@ class EffectUnresolvedError(RuntimeError):
         )
 
 
+# Consecutive unexpected errors a background supervisor retries before it stops.
+# Five attempts under the 5 s backoff cap ride out a dropped connection or a
+# pooler restart (about 1.5 s of waiting), while a defect stops within seconds.
+MAX_UNEXPECTED_FAILURES = 5
+
+
+def unexpected_is_retryable(error: BaseException) -> bool:
+    """Whether a supervisor may retry this unexpected error.
+
+    Typed storage errors (unknown commit, lost ownership) and unresolved
+    effects mean a write may have happened or work must not continue, so they
+    stop the supervisor instead of being repeated.
+    """
+
+    return not isinstance(error, (StorageError, EffectUnresolvedError))
+
+
 def effect_receipt_text(value: str, name: str, *, maximum: int = 512) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError(f"{name} must be non-empty text without surrounding space")
@@ -727,6 +745,7 @@ class EffectReceipt:
 
 
 __all__ = [
+    "MAX_UNEXPECTED_FAILURES",
     "EffectOutcome",
     "EffectReceipt",
     "EffectReceiptConflictError",
@@ -743,5 +762,6 @@ __all__ = [
     "effect_receipt_id",
     "effect_receipt_text",
     "relational_write_authorization_fingerprint",
+    "unexpected_is_retryable",
     "validate_effect_receipt_id",
 ]

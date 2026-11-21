@@ -237,6 +237,30 @@ new due work runs. On reopen, Daita fences stale claims, finalizes a run that
 was already durably terminal without rerunning it, and preserves exactly one
 logical inbox delivery.
 
+### Next wake time
+
+A host that stops idle agents can ask when to start one again:
+
+```python
+wake = await agent.next_wake_at()  # datetime (timezone-aware UTC) | None
+```
+
+It is read-only and costs one state read. `None` means nothing needs the
+process; an instant at or before now means work is due now. It is the earliest of:
+
+- the next due slot of an active routine that has no claim in flight; while a
+  model route is under a quota hold, no later than the hold's end, because
+  the supervisor claims nothing before then;
+- the lease end of a claimed or running occurrence, the instant stale-claim
+  recovery can fence it (a paused routine's claim included).
+
+It never reflects catalog upkeep (probes, refreshes, full checks), so an agent
+whose only stale state is its catalog can sleep. Jobs add nothing: a running
+job has no due time (its `not_before` is not read by the supervisor), and
+deliveries have no retry schedule. Quota holds are process memory, so call this
+on the running agent before stopping it. An agent opened without a model
+returns `None`, since its supervisor claims nothing.
+
 ## Routines from earlier versions
 
 Upgrading a home rewrites each stored routine to this shape. It keeps its

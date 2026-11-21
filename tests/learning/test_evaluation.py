@@ -30,6 +30,7 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
+from daita.loop import driver
 from daita.loop.models import LoopLimits
 from daita.observation import AgentEvent, AgentEventKind
 from tests.support.toolbox_model import (
@@ -286,7 +287,11 @@ def _seed_paid_margin_database(path: Path) -> None:
             """)
 
 
-async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
+async def test_offline_exit_gate_executes_real_learning_lifecycles(
+    tmp_path, monkeypatch
+):
+    # Wall-clock run time would make the verdicts depend on scheduler jitter.
+    monkeypatch.setattr(driver, "_duration_ms", lambda started: 0)
     database = tmp_path / "learning-exit-gate.sqlite"
     _seed_paid_margin_database(database)
     events: list[AgentEvent] = []

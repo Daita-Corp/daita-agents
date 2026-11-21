@@ -519,6 +519,17 @@ class Agent:
             done_window=done_window, caller_principal_id=caller_principal_id
         )
 
+    async def next_wake_at(self) -> datetime | None:
+        """Earliest UTC instant at which background work is due, or ``None``.
+
+        Read-only. Lets a host that stops idle processes start this agent again
+        only when needed. Covers an active routine's next due slot (pushed back
+        to the end of a quota hold), and the lease end of a stale routine claim.
+        An instant at or before now means work is due immediately. Catalog
+        upkeep and jobs never set it; see ``docs/SCHEDULED_ROUTINES.md``.
+        """
+        return await self._embedded.next_wake_at()
+
     def background_status(self) -> tuple[SupervisorStatus, ...]:
         """Return payload-free health of background job and routine execution."""
         return self._embedded.background_status()

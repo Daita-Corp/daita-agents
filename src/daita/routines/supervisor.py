@@ -38,7 +38,11 @@ from ..storage.errors import (
     StorageError,
     StorageUnavailableError,
 )
-from ..storage.sqlite_records import EffectUnresolvedError
+from ..storage.sqlite_records import (
+    MAX_UNEXPECTED_FAILURES,
+    EffectUnresolvedError,
+    unexpected_is_retryable,
+)
 from .models import (
     ROUTINE_INBOX_SENSITIVITY,
     ROUTINE_OUTCOME,
@@ -121,6 +125,7 @@ class RoutineSupervisor:
         self._failed = False
         self._failure_code: str | None = None
         self._consecutive_failures = 0
+        self._unexpected_failures = 0
         self._retry_at = 0.0
         self._quota_holds: dict[str, tuple[datetime, timedelta]] = {}
         self._claim_refused = False
@@ -164,8 +169,14 @@ class RoutineSupervisor:
         self._failure_code = (
             error.code if isinstance(error, StorageError) else "supervisor_failed"
         )
-        if not isinstance(error, StorageUnavailableError):
+        if isinstance(error, StorageUnavailableError):
+            pass
+        elif unexpected_is_retryable(error):
+            self._unexpected_failures += 1
+            self._failed = self._unexpected_failures >= MAX_UNEXPECTED_FAILURES
+        else:
             self._failed = True
+        if self._failed:
             _logger.error(
                 "routines supervisor stopped (%s, %s)",
                 self._failure_code,
@@ -173,7 +184,7 @@ class RoutineSupervisor:
             )
             if self._driver is not None and self._driver is not asyncio.current_task():
                 self._driver.cancel("supervisor_failed")
-        if isinstance(error, StorageUnavailableError):
+        else:
             self._retry_at = asyncio.get_running_loop().time() + min(
                 5.0, 0.1 * 2 ** min(self._consecutive_failures - 1, 6)
             )
@@ -187,6 +198,18 @@ class RoutineSupervisor:
             self._drive(),
             name=f"daita-routine-supervisor:{self._agent_id}",
         )
+
+    async def next_wake_at(self) -> datetime | None:
+        """Read-only: when this supervisor next has work, as ``_drive`` would act."""
+        if self._execute_run is None:
+            return None
+        deadline, lease_end = await self._store.routine_wake_times(self._agent_id)
+        now = self._clock()
+        held = [h[0] for r in self._model_routes if (h := self._quota_holds.get(r))]
+        if deadline is not None and any(end > now for end in held):
+            # A hold delays claiming until it ends, even for a slot due earlier.
+            deadline = max(deadline, *held)
+        return min((t for t in (deadline, lease_end) if t is not None), default=None)
 
     def wake(self) -> None:
         if not self._closing:
@@ -260,18 +283,16 @@ class RoutineSupervisor:
                 except AdmissionClosedError:
                     self._stop_for_host_close()
                     break
-                except StorageUnavailableError as error:
-                    self._record_failure(error)
-                    continue
                 except Exception as error:
                     self._record_failure(error)
-                    break
+                    continue
                 if (
                     not self._failed
                     and self._consecutive_failures == failures_before_poll
                     and (self._worker is None or self._worker.done())
                 ):
                     self._consecutive_failures = 0
+                    self._unexpected_failures = 0
                     self._failure_code = None
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=timeout)
@@ -377,6 +398,7 @@ class RoutineSupervisor:
                     self._record_failure(error)
                 elif not self._failed:
                     self._consecutive_failures = 0
+                    self._unexpected_failures = 0
                     self._failure_code = None
             self._wake.set()
 
