@@ -441,3 +441,79 @@ async def test_a_fill_a_person_cancelled_resumes_on_the_next_tick():
         assert world.store.described > 1
     finally:
         ticking.cancel()
+
+
+class _CountingStore(_Store):
+    calls = 0
+
+    async def load_source_state(self, agent_id, source_id):
+        self.calls += 1
+        return await super().load_source_state(agent_id, source_id)
+
+    async def take_unreadable_catalog_sources(self, agent_id):
+        self.calls += 1
+        return await super().take_unreadable_catalog_sources(agent_id)
+
+
+async def test_an_idle_keeper_makes_no_store_calls_for_minutes():
+    world = _World()
+    world.store = _CountingStore(world.store.state)
+    world.keeper._store = world.store
+    listed = 0
+
+    async def no_sources():
+        nonlocal listed
+        listed += 1
+        return ()
+
+    world.keeper._sources = no_sources
+    await world.keeper.tick()
+    assert (world.store.calls, listed) == (1, 1)
+    for _ in range(10):  # five minutes, far past the old 30 s cadence
+        world.clock.advance(30)
+        assert not await world.keeper.tick()
+    assert (world.store.calls, listed) == (1, 1)
+    assert world.keeper._sleep_seconds() == keeper_module.IDLE_WAIT_SECONDS
+
+
+async def test_a_source_not_yet_due_costs_no_store_call_until_its_probe_is_due():
+    world = _World()
+    world.store = _CountingStore(world.store.state)
+    world.keeper._store = world.store
+    await world.keeper.tick()
+    calls, probes = world.store.calls, world.probe.calls
+    world.clock.advance(1)
+    await world.keeper.tick()
+    assert (world.store.calls, world.probe.calls) == (calls, probes)
+    await world.due()
+    assert world.probe.calls == probes + 1
+
+
+async def test_attach_refresh_and_detach_wake_the_keeper_promptly():
+    world = _World()
+    passes = 0
+    attached: list[KeptSource] = []
+
+    async def sources():
+        nonlocal passes
+        passes += 1
+        return tuple(attached)
+
+    world.keeper._sources = sources
+    world.keeper.start()
+    try:
+        for action in (
+            lambda: attached.append(_SOURCE),
+            lambda: world.keeper.use(["src"]),
+            lambda: attached.clear(),
+        ):
+            before = passes
+            action()
+            world.keeper.wake()
+            for _ in range(100):
+                if passes > before:
+                    break
+                await asyncio.sleep(0.01)
+            assert passes > before
+    finally:
+        await world.keeper.close()
