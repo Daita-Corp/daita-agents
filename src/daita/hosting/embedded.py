@@ -3211,6 +3211,10 @@ class EmbeddedAgent:
             identity=self._id_factory("routine"),
         )
 
+    async def next_wake_at(self) -> datetime | None:
+        self._require_open()
+        return await self._routine_supervisor.next_wake_at()
+
     async def list_routines(
         self,
         *,

@@ -188,6 +188,18 @@ class RoutineSupervisor:
             name=f"daita-routine-supervisor:{self._agent_id}",
         )
 
+    async def next_wake_at(self) -> datetime | None:
+        """Read-only: when this supervisor next has work, as ``_drive`` would act."""
+        if self._execute_run is None:
+            return None
+        deadline, lease_end = await self._store.routine_wake_times(self._agent_id)
+        now = self._clock()
+        held = [h[0] for r in self._model_routes if (h := self._quota_holds.get(r))]
+        if deadline is not None and any(end > now for end in held):
+            # A hold delays claiming until it ends, even for a slot due earlier.
+            deadline = max(deadline, *held)
+        return min((t for t in (deadline, lease_end) if t is not None), default=None)
+
     def wake(self) -> None:
         if not self._closing:
             self._wake.set()

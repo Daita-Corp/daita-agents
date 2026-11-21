@@ -192,6 +192,10 @@ class RoutineSupervisorStore(Protocol):
 
     async def next_routine_deadline(self, agent_id: str) -> datetime | None: ...
 
+    async def routine_wake_times(
+        self, agent_id: str
+    ) -> tuple[datetime | None, datetime | None]: ...
+
     async def recover_stale_routine_occurrences(
         self,
         agent_id: str,
