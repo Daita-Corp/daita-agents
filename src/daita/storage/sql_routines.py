@@ -515,6 +515,23 @@ def next_deadline(connection: SQLConnection, agent_id: str) -> datetime | None:
     return None
 
 
+def next_claim_expiry(connection: SQLConnection, agent_id: str) -> datetime | None:
+    """Earliest lease end among live claims; recovery fences a claim only then."""
+    row = connection.execute(
+        """SELECT MIN(lease_expires_at_us) FROM routine_occurrences
+           WHERE agent_id = ? AND state IN (?, ?)
+             AND lease_expires_at_us IS NOT NULL""",
+        (
+            agent_id,
+            RoutineOccurrenceDisposition.CLAIMED.value,
+            RoutineOccurrenceDisposition.RUNNING.value,
+        ),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(microseconds=row[0])
+
+
 def claim_due_occurrence(
     connection: SQLConnection,
     agent_id: str,
