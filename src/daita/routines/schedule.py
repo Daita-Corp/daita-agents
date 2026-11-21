@@ -69,9 +69,9 @@ def select_due_slot(
 ) -> DueSlotSelection:
     """Select one bounded due slot and materialize the next future instant.
 
-    A single outstanding slot is eligible, so an ordinary late wake still
-    runs. Missed slots are skipped: when several accumulated, none runs and
-    the routine waits for its next future slot.
+    The latest due slot is selected. When several accumulated (the host was
+    down), only that slot runs: the older ones are not run, and
+    ``skipped_slots`` counts them. Each slot still runs at most once.
     """
 
     for value, name in (
@@ -103,9 +103,7 @@ def select_due_slot(
                 raise ValueError("missed schedule exceeds the occurrence bound")
             latest = following
             due_count += 1
-    if due_count == 1:
-        return DueSlotSelection(latest, following, 0)
-    return DueSlotSelection(None, following, due_count)
+    return DueSlotSelection(latest, following, due_count - 1)
 
 
 def scheduled_slot_key(

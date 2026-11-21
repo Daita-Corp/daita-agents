@@ -142,8 +142,8 @@ time slot is due. Fixed code defaults, with no options:
 
 - delivery to the routine's conversation Inbox (a routine created outside a
   conversation gets a new one of its own);
-- missed slots are skipped: a single late slot still runs, an accumulated
-  backlog does not;
+- after downtime the latest missed slot runs once and older ones are skipped,
+  logged with their count (not stored); there is no backlog;
 - each run has the agent's current model and normal run limits, and a routine
   has no sensitivity ceiling of its own; its prompt counts as internal;
 - a recurring routine runs until paused or disabled, and pauses as Needs you

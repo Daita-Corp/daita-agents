@@ -28,6 +28,8 @@ from daita.loop.models import (
     RunStartEnvelope,
 )
 from daita.routines.models import (
+    CalendarDaySelector,
+    CalendarSchedule,
     OnceSchedule,
     RoutineOccurrenceDisposition,
     RoutineState,
@@ -107,6 +109,84 @@ async def test_duplicate_ticks_reserve_one_occurrence(
     assert persisted is not None
     assert persisted.occurrence_count == 1
     assert persisted.attempt_count == 1
+
+
+@pytest.mark.parametrize(
+    ("schedule", "due_at", "late", "latest", "skipped", "following"),
+    [
+        # An ordinary late wake: one outstanding slot runs, nothing is skipped.
+        (None, NOW, timedelta(minutes=30), NOW, 0, NOW + timedelta(hours=1)),
+        # Downtime across several interval slots: only the latest runs.
+        (None, NOW, timedelta(hours=3, minutes=30), NOW + timedelta(hours=3), 3, None),
+        # Downtime across several calendar slots: only the latest runs.
+        (
+            CalendarSchedule(
+                timezone="Etc/UTC",
+                hour=9,
+                minute=0,
+                day_selector=CalendarDaySelector.EVERY_DAY,
+            ),
+            NOW.replace(day=28, hour=9),
+            timedelta(days=3, hours=4),
+            NOW.replace(day=31, hour=9),
+            3,
+            NOW.replace(month=9, day=1, hour=9),
+        ),
+    ],
+)
+async def test_the_latest_missed_slot_runs_once_and_the_skips_are_recorded(
+    state_store: StateStore,
+    caplog: pytest.LogCaptureFixture,
+    schedule,
+    due_at,
+    late,
+    latest,
+    skipped,
+    following,
+) -> None:
+    store = state_store
+    routine = await store.admit_scheduled_routine(
+        routine_record(
+            next_due_at=due_at,
+            **({} if schedule is None else {"schedule": schedule}),
+        )
+    )
+    assert routine.next_due_at == due_at
+    claimed_at = due_at + late
+    first = await store.claim_due_routine_occurrence(
+        routine.agent_id,
+        routine.routine_id,
+        expected_revision=routine.revision,
+        expected_due_at=due_at,
+        claimed_at=claimed_at,
+        claim_token="claim-latest",
+    )
+    assert first is not None
+    assert first.scheduled_for == latest
+    assert ("skipped %d older" % skipped in caplog.text) == bool(skipped)
+    # The same tick again is the same slot: each slot runs at most once.
+    again = await store.claim_due_routine_occurrence(
+        routine.agent_id,
+        routine.routine_id,
+        expected_revision=routine.revision,
+        expected_due_at=due_at,
+        claimed_at=claimed_at,
+        claim_token="claim-again",
+    )
+    assert again is not None and again.occurrence_id == first.occurrence_id
+    assert len(await store.list_routine_occurrences("agent-1", "routine-1")) == 1
+
+    finalized = await store.finalize_routine_occurrence(
+        routine.agent_id,
+        first.occurrence_id,
+        delivery_id="delivery-latest",
+        finalized_at=claimed_at + timedelta(seconds=1),
+        failure_code="routine_authority_revoked",
+    )
+    assert finalized is not None
+    persisted = await store.load_scheduled_routine(routine.agent_id, routine.routine_id)
+    assert persisted is not None
+    assert persisted.next_due_at == (following or latest + timedelta(hours=1))
 
 
 async def test_pre_run_failure_below_threshold_advances_with_one_delivery(

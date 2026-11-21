@@ -160,16 +160,33 @@ def test_ambiguous_or_invalid_timezone_is_rejected(timezone: str) -> None:
         validate_schedule(schedule)
 
 
-def test_missed_slots_are_skipped() -> None:
+def test_the_latest_missed_interval_slot_runs_and_older_ones_are_counted() -> None:
     schedule = IntervalSchedule(3_600, _utc("2026-08-27T00:00:00+00:00"))
-    skipped = select_due_slot(
+    selection = select_due_slot(
         schedule,
         materialized_due_at=_utc("2026-08-27T01:00:00+00:00"),
         now=_utc("2026-08-27T04:30:00+00:00"),
     )
-    assert skipped.selected_at is None
-    assert skipped.skipped_slots == 4
-    assert skipped.next_due_at == _utc("2026-08-27T05:00:00+00:00")
+    assert selection.selected_at == _utc("2026-08-27T04:00:00+00:00")
+    assert selection.skipped_slots == 3
+    assert selection.next_due_at == _utc("2026-08-27T05:00:00+00:00")
+
+
+def test_the_latest_missed_calendar_slot_runs_and_older_ones_are_counted() -> None:
+    schedule = CalendarSchedule(
+        timezone="Etc/UTC",
+        hour=9,
+        minute=0,
+        day_selector=CalendarDaySelector.EVERY_DAY,
+    )
+    selection = select_due_slot(
+        schedule,
+        materialized_due_at=_utc("2026-08-27T09:00:00+00:00"),
+        now=_utc("2026-08-30T12:00:00+00:00"),
+    )
+    assert selection.selected_at == _utc("2026-08-30T09:00:00+00:00")
+    assert selection.skipped_slots == 3
+    assert selection.next_due_at == _utc("2026-08-31T09:00:00+00:00")
 
 
 @pytest.mark.parametrize(
@@ -178,8 +195,8 @@ def test_missed_slots_are_skipped() -> None:
         # (selected, skipped, next due)
         ("01:00", "01:00", ("01:00", 0, "02:00")),
         ("01:00", "01:59", ("01:00", 0, "02:00")),
-        ("01:00", "02:00", (None, 2, "03:00")),
-        ("01:00", "04:30", (None, 4, "05:00")),
+        ("01:00", "02:00", ("02:00", 1, "03:00")),
+        ("01:00", "04:30", ("04:00", 3, "05:00")),
     ],
 )
 def test_interval_backlog_boundaries_match_hand_computed_slots(
@@ -207,8 +224,8 @@ def test_interval_backlog_beyond_the_occurrence_bound_stays_selectable() -> None
         materialized_due_at=anchor,
         now=_utc("2026-09-03T00:00:30+00:00"),
     )
-    assert skipped.selected_at is None
-    assert skipped.skipped_slots == 7 * 24 * 60 + 1
+    assert skipped.selected_at == _utc("2026-09-03T00:00:00+00:00")
+    assert skipped.skipped_slots == 7 * 24 * 60
     assert skipped.next_due_at == _utc("2026-09-03T00:01:00+00:00")
 
 
