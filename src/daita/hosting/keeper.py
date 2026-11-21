@@ -141,6 +141,7 @@ class CatalogKeeper:
         self._mems: dict[str, _Source] = {}
         self._wake = asyncio.Event()
         self._relist = True
+        self._listing = asyncio.Lock()
         self._active: Sequence[KeptSource] = ()
         self._work = asyncio.Lock()
         self._people = 0
@@ -333,15 +334,17 @@ class CatalogKeeper:
 
         if self._people or self._closed:
             return False
-        if self._relist:
-            self._relist = False
-            for source_id in await self._store.take_unreadable_catalog_sources(
-                self._agent_id
-            ):
-                self._mems.setdefault(source_id, _Source()).full_now = True
-            self._active = await self._sources()
-            for gone in set(self._mems) - {s.source_id for s in self._active}:
-                del self._mems[gone]
+        # One lister at a time: a second tick waits for the list, never sees it empty.
+        async with self._listing:
+            if self._relist:
+                self._relist = False
+                for source_id in await self._store.take_unreadable_catalog_sources(
+                    self._agent_id
+                ):
+                    self._mems.setdefault(source_id, _Source()).full_now = True
+                self._active = await self._sources()
+                for gone in set(self._mems) - {s.source_id for s in self._active}:
+                    del self._mems[gone]
         busy = False
         for source in self._active:
             if self._people or self._closed:
