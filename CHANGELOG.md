@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.3.3 (2026-11-21)
+
+Home revision unchanged (4). No home is migrated by this release.
+
+- **An idle agent makes no catalog store calls.** The catalog keeper used to
+  read the source list and every source's state every 30 seconds. It now
+  waits for a wake (attach, refresh, detach, a source being used, or a
+  person's source action) with a 300 second backstop, and reads a source's
+  state only when that source's probe, check or fill is due. Together with
+  1.3.2, an idle agent makes no store calls, so a pooling SQL adapter can
+  release its connections (#158).
+- **`Agent.next_wake_at()`.** Returns when the agent next needs a running
+  process: the next due routine slot, pushed back past a quota hold, or the
+  end of a claimed occurrence's lease. It returns `None` when nothing is
+  scheduled. Jobs, deliveries and catalog upkeep are not included. Hosts that
+  stop idle processes can use it to schedule the next start. The method only
+  reads (#155).
+- **Supervisors retry unexpected errors.** An exception that is not a
+  storage error no longer stops the job or routine supervisor for the rest
+  of the process. It is retried with backoff up to 5 consecutive times, and
+  `background_status()` reports `retrying` meanwhile. After the fifth
+  failure it reports `failed` with `failure_code="supervisor_failed"`. Typed
+  storage errors and unresolved effects still stop it at once. The host
+  contract is in [the storage contract](docs/STORAGE_CONTRACT.md) (#156).
+- **A routine runs its latest missed slot after downtime.** When two or more
+  slots were missed, the routine now runs the most recent one once instead of
+  none. Older slots are skipped, and a warning logs how many. Each slot still
+  runs at most once (#157).
+
 ## 1.3.2 (2026-11-20)
 
 Home revision unchanged (4). No home is migrated by this release.
