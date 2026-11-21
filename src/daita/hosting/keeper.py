@@ -27,7 +27,8 @@ PROBE_TIMEOUT_SECONDS = 5.0
 USE_PROBE_AGE_SECONDS = 30.0
 # A lookup miss is a stronger hint that the catalog is stale.
 MISS_PROBE_AGE_SECONDS = 5.0
-MAX_SLEEP_SECONDS = 30.0
+# Backstop only: attach, refresh, detach, use and miss wake the keeper.
+IDLE_WAIT_SECONDS = 300.0
 MIN_SLEEP_SECONDS = 1.0
 # An unchanged probe rewrites its state row no more often than this.
 STATE_WRITE_SECONDS = 600.0
@@ -139,6 +140,9 @@ class CatalogKeeper:
         self._fill_resources = fill_resources
         self._mems: dict[str, _Source] = {}
         self._wake = asyncio.Event()
+        self._relist = True
+        self._listing = asyncio.Lock()
+        self._active: Sequence[KeptSource] = ()
         self._work = asyncio.Lock()
         self._people = 0
         self._inflight: tuple[str, asyncio.Task[CatalogCommitSummary | None]] | None
@@ -162,6 +166,7 @@ class CatalogKeeper:
             await asyncio.wait(tasks, timeout=_CLOSE_WAIT_SECONDS)
 
     def wake(self) -> None:
+        self._relist = True
         self._wake.set()
 
     async def _run(self) -> None:
@@ -182,7 +187,7 @@ class CatalogKeeper:
 
     def _sleep_seconds(self) -> float:
         now = self._clock()
-        wait = MAX_SLEEP_SECONDS
+        wait = IDLE_WAIT_SECONDS
         for mem in self._mems.values():
             for due in (mem.next_due, mem.full_due):
                 if due is not None:
@@ -204,7 +209,7 @@ class CatalogKeeper:
             mem.reset = True
             if mem.last_probe is None or (now - mem.last_probe).total_seconds() > age:
                 mem.due_now = True
-        self._wake.set()
+        self.wake()
 
     def miss(self, source_id: str) -> None:
         self.use((source_id,), age=MISS_PROBE_AGE_SECONDS)
@@ -282,7 +287,7 @@ class CatalogKeeper:
             yield
         finally:
             self._people -= 1
-            self._wake.set()
+            self.wake()
 
     async def settle(self) -> None:
         """Stop a background read and wait for the pass in progress to finish."""
@@ -329,25 +334,45 @@ class CatalogKeeper:
 
         if self._people or self._closed:
             return False
-        for source_id in await self._store.take_unreadable_catalog_sources(
-            self._agent_id
-        ):
-            self._mems.setdefault(source_id, _Source()).full_now = True
-        active = await self._sources()
-        for gone in set(self._mems) - {s.source_id for s in active}:
-            del self._mems[gone]
+        # One lister at a time: a second tick waits for the list, never sees it empty.
+        async with self._listing:
+            if self._relist:
+                self._relist = False
+                for source_id in await self._store.take_unreadable_catalog_sources(
+                    self._agent_id
+                ):
+                    self._mems.setdefault(source_id, _Source()).full_now = True
+                self._active = await self._sources()
+                for gone in set(self._mems) - {s.source_id for s in self._active}:
+                    del self._mems[gone]
         busy = False
-        for source in active:
+        for source in self._active:
             if self._people or self._closed:
                 break
             try:
+                # Take the lock first so a caller waits for work in progress.
                 async with self._work:
-                    busy = await self._service(source) or busy
+                    if self._due(self._mems.get(source.source_id), self._clock()):
+                        busy = await self._service(source) or busy
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 _LOGGER.warning("catalog keeper failed: %s", type(error).__name__)
         return busy
+
+    @staticmethod
+    def _due(mem: _Source | None, now: datetime) -> bool:
+        """Whether a source needs its state read; idle sources cost no store call."""
+
+        return (
+            mem is None
+            or mem.next_due is None
+            or mem.due_now
+            or mem.full_now
+            or mem.filling
+            or now >= mem.next_due
+            or (mem.full_due is not None and now >= mem.full_due)
+        )
 
     async def _service(self, source: KeptSource, *, force: bool = False) -> bool:
         source_id = source.source_id
@@ -388,6 +413,7 @@ class CatalogKeeper:
             )
             if mem.full_due is None or mem.full_due <= now:
                 await self._full_check(source, backend is not None)
+                mem.full_due = self._clock() + timedelta(seconds=seconds)
         return False
 
     async def _probe(
