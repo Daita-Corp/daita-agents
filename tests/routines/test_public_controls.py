@@ -197,8 +197,9 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
         await agent.set_memory("Unrelated private conversation note.")
         await agent.save_skill(
             "later-procedure",
-            "Private later procedure",
-            "Never part of this assignment.",
+            "Later procedure",
+            "Skills saved after the routine was created are still offered to it.",
+            sensitivity=ModelSensitivity.INTERNAL,
         )
         from daita import (
             ResourceRevisionBinding,
@@ -266,7 +267,8 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
         assert intent.prompt is not None and intent.prompt in scheduled_text
         assert "Authorize the revised scheduled report definition" not in scheduled_text
         assert "Unrelated private conversation note" not in scheduled_text
-        assert "later-procedure" not in scheduled_text
+        # Routines see the current skills, as chat runs do.
+        assert "later-procedure" in scheduled_text
         assert "Private later meaning" not in scheduled_text
         assert delivery.delivery.outcome.conclusion_digest == (
             deliveries[0].conclusion_digest

@@ -622,16 +622,8 @@ class AgentContextBuilder:
         skill_index: str | None = None
         skill_summaries: tuple[SkillSummary, ...] = ()
         if self._skills is not None:
-            if run.origin is RunOrigin.USER:
+            if run.origin in (RunOrigin.USER, RunOrigin.SCHEDULED_ROUTINE):
                 skill_summaries = await self._skills.list_skills()
-            elif run.origin is RunOrigin.SCHEDULED_ROUTINE:
-                retained = []
-                for name, digest in session_options.retained_skill_bindings:
-                    skill = await self._skills.read_retained_skill(name, digest)
-                    if skill is None:
-                        raise RequestSensitivityUnavailable()
-                    retained.append(skill.summary)
-                skill_summaries = tuple(retained)
             skill_index = render_skill_index(skill_summaries)
             sensitivity = max(
                 (sensitivity, *(item.sensitivity for item in skill_summaries)),
