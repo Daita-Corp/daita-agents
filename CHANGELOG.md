@@ -8,6 +8,16 @@
   lists and loads the current skills, as a chat run does. Listing a skill
   counts toward the run's sensitivity, so a routine can now be classified
   higher than before; skills saved without a label are restricted.
+- **Far fewer store reads before a run's first model call.** Preparing a run
+  read the source list and each source's read scope again and again, each on
+  its own connection, and read each source's catalog extent separately. A
+  local user run opened 57 state-database connections with one source and 133
+  with five; it now opens 17 with either, and a routine run 30 instead of 63.
+  The reads come from one snapshot taken while the run is prepared; tool calls
+  still check permissions live. `AgentLoop` takes an optional
+  `preparation_scope` for this, and `SQLStateStore.source_snapshot` provides
+  it. Whether native analysis is available is now checked once per process
+  instead of hashing the Python executable on every run.
 
 ## 1.3.3 (2026-11-21)
 

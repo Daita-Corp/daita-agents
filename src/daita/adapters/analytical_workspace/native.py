@@ -39,7 +39,14 @@ def _cpu_tick_seconds() -> float | None:
     return value.numer / value.denom / 1e9
 
 
+@lru_cache(maxsize=1)
 def available() -> bool:
+    """Whether to offer native analysis; checked once per process.
+
+    Hashing the interpreter costs milliseconds, so runs don't repeat it.
+    Starting a worker checks the full current runtime again.
+    """
+
     return runtime_status()["available"] is True
 
 
@@ -72,12 +79,13 @@ class NativePythonWorker:
         limits: AnalysisLimits = AnalysisLimits(),
         durable_closure: bool = False,
     ) -> None:
-        if not available():
+        runtime = runtime_status()
+        if runtime["available"] is not True:
             raise RuntimeError("Native analysis requires macOS ARM64")
         import fcntl
 
         self.limits = limits
-        self.runtime = runtime_status()
+        self.runtime = runtime
         self.scratch = Path(tempfile.mkdtemp(prefix="daita-analysis-")).resolve()
         self.scratch.chmod(0o700)
         self.process: subprocess.Popen[bytes] | None = None

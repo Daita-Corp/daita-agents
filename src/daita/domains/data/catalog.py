@@ -433,17 +433,30 @@ class CatalogDataView:
             for fact in facts
         )
 
-    async def _catalog_extent(
-        self, agent_id: str, source_id: str
-    ) -> tuple[int | None, bool]:
-        """(object count, whether the catalog holds only part of the source)."""
+    async def _catalog_extents(
+        self, agent_id: str, source_ids: tuple[str, ...]
+    ) -> Mapping[str, tuple[int | None, bool]]:
+        """Each source's (object count, whether the catalog holds only part of it).
+
+        One read for every source; only a truncated sync is counted in SQL.
+        """
 
         try:
-            syncs = await self._store.current_syncs(agent_id, (source_id,))
-            summary = await self._store.summarize_catalog(agent_id, (source_id,))
+            syncs = await self._store.current_syncs(agent_id, source_ids)
         except CatalogStoreError:
-            return None, False
-        return summary.resource_count, any(sync.truncated for sync in syncs)
+            return {}
+        extents: dict[str, tuple[int | None, bool]] = {}
+        for source_id in source_ids:
+            current = [sync for sync in syncs if sync.source_id == source_id]
+            if not any(sync.truncated for sync in current):
+                extents[source_id] = (sum(s.resource_count for s in current), False)
+                continue
+            try:
+                summary = await self._store.summarize_catalog(agent_id, (source_id,))
+            except CatalogStoreError:
+                continue
+            extents[source_id] = (summary.resource_count, True)
+        return extents
 
     async def source_directory(
         self, agent_id: str, source_ids: tuple[str, ...]
@@ -455,10 +468,14 @@ class CatalogDataView:
         """
 
         directory: list[FrozenJsonObject] = []
-        for fact in await self.source_routing_facts(agent_id, source_ids):
+        facts = await self.source_routing_facts(agent_id, source_ids)
+        extents = await self._catalog_extents(
+            agent_id, tuple(cast(str, fact["source_id"]) for fact in facts)
+        )
+        for fact in facts:
             source_id = cast(str, fact["source_id"])
             source_type = self._source_types.get(cast(str, fact["adapter_id"]))
-            count, partial = await self._catalog_extent(agent_id, source_id)
+            count, partial = extents.get(source_id, (None, False))
             directory.append(
                 FrozenJsonObject.from_mapping(
                     {

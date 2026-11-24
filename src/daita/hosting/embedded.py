@@ -10,7 +10,12 @@ import re
 import secrets
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import (
+    AbstractAsyncContextManager,
+    AsyncExitStack,
+    asynccontextmanager,
+    nullcontext,
+)
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1934,6 +1939,7 @@ class EmbeddedAgent:
                     if model_profile is not None
                     else False
                 ),
+                preparation_scope=lambda run: _source_snapshot(store, run.agent_id),
             )
         )
 
@@ -2129,7 +2135,8 @@ class EmbeddedAgent:
             )
             if routine is None or routine.revision != occurrence.routine_revision:
                 return None
-            run_input = await capability_runtime.freeze_source_scope(run_input)
+            async with _source_snapshot(store, identity.id):
+                run_input = await capability_runtime.freeze_source_scope(run_input)
             deadline = asyncio.get_running_loop().time() + limits.max_wall_time_seconds
             lease = await admission_coordinator.admit_execution(
                 WorkloadClass.ROUTINE,
@@ -2581,15 +2588,6 @@ class EmbeddedAgent:
                 await self._require_conversation_caller(
                     resolved_conversation, principal_id
                 )
-            active_ids = {
-                source.id
-                for source in await self._store.list_sources(self.identity.id)
-                if source.active
-            }
-            if session_source_id is not None:
-                active_ids.add(session_source_id)
-            if not set(source_scope_ids) <= active_ids:
-                raise ValueError("A requested source is not active for this agent")
             prior_messages = _project_completed_history(
                 conversation,
                 older_history_exists=older_history_exists,
@@ -2617,19 +2615,29 @@ class EmbeddedAgent:
                     default=ModelSensitivity.PUBLIC,
                 ),
             )
-            # Files-only scopes the run to exactly the live session folder source.
-            run_input = replace(
-                run_input,
-                resolved_source_scope=(
-                    EffectiveSourceScope(
-                        frozenset({cast(str, session_source_id)}), frozenset()
-                    )
-                    if files_only
-                    else await resolve_effective_source_scope(
-                        run_input, self._data_view
-                    )
-                ),
-            )
+            async with _source_snapshot(self._store, self.identity.id):
+                active_ids = {
+                    source.id
+                    for source in await self._store.list_sources(self.identity.id)
+                    if source.active
+                }
+                if session_source_id is not None:
+                    active_ids.add(session_source_id)
+                if not set(source_scope_ids) <= active_ids:
+                    raise ValueError("A requested source is not active for this agent")
+                # Files-only scopes the run to exactly the live session folder source.
+                run_input = replace(
+                    run_input,
+                    resolved_source_scope=(
+                        EffectiveSourceScope(
+                            frozenset({cast(str, session_source_id)}), frozenset()
+                        )
+                        if files_only
+                        else await resolve_effective_source_scope(
+                            run_input, self._data_view
+                        )
+                    ),
+                )
             predecessor_run = await self._store.latest_terminal_conversation_run(
                 self.identity.id,
                 resolved_conversation,
@@ -5402,6 +5410,15 @@ def _require_value(value: _T | None) -> _T:
     if value is None:
         raise AgentNotConfiguredError("agent loop is incomplete")
     return value
+
+
+def _source_snapshot(
+    store: StateStore, agent_id: str
+) -> AbstractAsyncContextManager[object]:
+    """One read of the agent's sources for a run's preparation, when supported."""
+
+    snapshot = getattr(store, "source_snapshot", None)
+    return nullcontext() if snapshot is None else snapshot(agent_id)
 
 
 async def _await_sync_completion(callback: Callable[[], _T]) -> tuple[_T, bool]:
