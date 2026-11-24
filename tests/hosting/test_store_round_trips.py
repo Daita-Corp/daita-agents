@@ -19,6 +19,7 @@ from daita import Agent, IntervalSchedule, RoutineIntent, SQLiteSource
 from daita.llm.models import FinishReason, ModelProfile, ModelResponse, ModelUsage
 from daita.llm.pricing import CostEstimate
 from daita.llm.providers.mock import MockModelProvider
+from daita.storage.sql import SQLStateStore
 from tests.support.workspace import workspace_for
 
 _COUNTING: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -121,9 +122,15 @@ async def _open(tmp_path: Path, counts: _Counts, *, all_tasks: bool) -> Agent:
             supports_tools=True,
         ),
     )
-    store = agent._embedded._store
+    store = _sql_store(agent)
     store._database = _CountingDatabase(store._database, counts, all_tasks=all_tasks)
     return agent
+
+
+def _sql_store(agent: Agent) -> SQLStateStore:
+    store = agent._embedded._store
+    assert isinstance(store, SQLStateStore)
+    return store
 
 
 async def _user_run_count(agent: Agent, counts: _Counts) -> tuple[int, int]:
@@ -165,7 +172,7 @@ async def test_source_snapshot_is_one_read_and_ends_with_its_scope(tmp_path):
         source = await agent.attach(
             SQLiteSource(_database(tmp_path / "s0.sqlite"), name="S0")
         )
-        store = agent._embedded._store
+        store = _sql_store(agent)
         detached = asyncio.Event()
 
         async def read_after_detach():
@@ -179,7 +186,8 @@ async def test_source_snapshot_is_one_read_and_ends_with_its_scope(tmp_path):
                 agent.detach(source.id), context=contextvars.Context()
             )
             assert (await store.list_sources(agent.id))[0].active
-            assert (await store.load_source(agent.id, source.id)).active
+            loaded = await store.load_source(agent.id, source.id)
+            assert loaded is not None and loaded.active
             lingering = asyncio.create_task(read_after_detach())
         # ...and every read after it, even from a task it started, is live.
         detached.set()
