@@ -99,13 +99,6 @@ async def test_model_retained_advice_keeps_full_request_floor_across_reopen(
     else:
         skill = await agent.read_skill("accounting")
         assert skill is not None and skill.sensitivity is ModelSensitivity.CONFIDENTIAL
-        _, digest = await agent._embedded._skill_store.read_skill_with_digest(
-            "accounting"
-        )
-        retained = await agent._embedded._skill_store.retain_current_skill(
-            "accounting", "sha256:" + digest
-        )
-        assert retained.sensitivity is ModelSensitivity.CONFIDENTIAL
     await agent.set_user_profile("", sensitivity=ModelSensitivity.PUBLIC)
     await agent.close()
 

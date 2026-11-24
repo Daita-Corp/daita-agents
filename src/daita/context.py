@@ -120,7 +120,7 @@ from .skills.capabilities import (
     SKILL_SAVE_TOOL_NAME,
     SKILL_VIEW_OUTPUT_KIND,
 )
-from .skills.store import Skill, SkillSummary, render_skill_index
+from .skills.store import SkillSummary, render_skill_index
 
 _MAXIMUM_PRIOR_COMPLETED_RUNS = 8
 _MAXIMUM_PRIOR_MESSAGES = 40
@@ -210,10 +210,6 @@ class MemoryContextReader(Protocol):
 
 class SkillContextReader(Protocol):
     async def list_skills(self) -> tuple[SkillSummary, ...]: ...
-
-    async def read_retained_skill(
-        self, name: str, content_digest: str
-    ) -> Skill | None: ...
 
 
 class SemanticContextReader(Protocol):

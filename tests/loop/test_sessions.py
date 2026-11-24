@@ -48,12 +48,10 @@ async def test_run_session_is_immutable_single_use_and_isolated():
     second_run = _run("run-two", conversation_id="two")
     first_options = RunSessionOptions(
         files_only=True,
-        retained_skill_bindings=(("analysis", "sha256:first"),),
         one_time_artifact_destinations=("destination-one",),
     )
     second_options = RunSessionOptions(
         explicit_learning=True,
-        retained_skill_bindings=(("review", "sha256:second"),),
         one_time_artifact_destinations=("destination-two",),
     )
     first = RunSession(

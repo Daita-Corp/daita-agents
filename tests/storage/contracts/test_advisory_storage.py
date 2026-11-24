@@ -3,13 +3,12 @@
 import asyncio
 import threading
 from contextlib import contextmanager
-from hashlib import sha256
 
 import pytest
 
 from daita.llm.models import ModelSensitivity
 from daita.memory import MemoryStore, MemoryValidationError
-from daita.skills import SkillPathError, SkillStore, SkillValidationError
+from daita.skills import SkillStore, SkillValidationError
 from daita.storage.errors import (
     StorageCommitUnknownError,
     StorageError,
@@ -75,18 +74,13 @@ async def test_memory_corruption_is_not_replaced(advisory_storage, content):
         await memory.close()
 
 
-async def test_skill_preflight_and_retained_content_survive_replacement_and_delete(
-    advisory_storage,
-):
+async def test_skill_preflight_survives_replacement_and_delete(advisory_storage):
     skills = SkillStore(None, asyncio.Lock(), storage=advisory_storage)
     try:
         assert await skills.save_skill("report", "Report", "Use exact facts.")
         assert not await skills.save_skill("report", "Report", "Use exact facts.")
-        original, digest = await skills.read_skill_with_digest("report")
+        original, _digest = await skills.read_skill_with_digest("report")
         assert original is not None
-        assert (
-            await skills.retain_current_skill("report", "sha256:" + digest) == original
-        )
         before = await skills.preflight_delete("report")
         await skills.save_skill("report", "Changed", "Read current facts.")
         await skills.save_skill("report", "Report", "Use exact facts.")
@@ -99,13 +93,6 @@ async def test_skill_preflight_and_retained_content_survive_replacement_and_dele
     reopened = SkillStore(None, asyncio.Lock(), storage=advisory_storage)
     try:
         assert await reopened.list_skills() == ()
-        assert (
-            await reopened.read_retained_skill("report", "sha256:" + digest) == original
-        )
-        with advisory_storage.transaction(write=True) as transaction:
-            transaction.put("retained-skills", digest, b"corrupted")
-        with pytest.raises(SkillPathError, match="digest"):
-            await reopened.read_retained_skill("report", "sha256:" + digest)
     finally:
         await reopened.close()
 
@@ -143,28 +130,6 @@ async def test_skill_index_limit_and_invalid_current_documents_fail_closed(
             transaction.put("skills", "broken", b"not a skill")
         with pytest.raises(SkillValidationError):
             await skills.delete_skill("broken")
-    finally:
-        await skills.close()
-
-
-async def test_retention_count_is_idempotent_and_bounded(advisory_storage):
-    skills = SkillStore(None, asyncio.Lock(), storage=advisory_storage)
-    try:
-        await skills.save_skill("report", "Report", "Use exact facts.")
-        original, digest = await skills.read_skill_with_digest("report")
-        with advisory_storage.transaction(write=True) as transaction:
-            # Valid immutable documents fill the real owner limit.
-            for index in range(256):
-                content = f"<!-- daita-sensitivity: restricted -->\n# old-{index}\n\nOld\n\n## Instructions\n\nOld procedure.\n".encode()
-                transaction.put("retained-skills", sha256(content).hexdigest(), content)
-        with pytest.raises(SkillValidationError, match="count"):
-            await skills.retain_current_skill("report", "sha256:" + digest)
-        with advisory_storage.transaction(write=True) as transaction:
-            current = transaction.get("skills", "report", max_bytes=50000)
-            transaction.put("retained-skills", digest, current.content)
-        assert (
-            await skills.retain_current_skill("report", "sha256:" + digest) == original
-        )
     finally:
         await skills.close()
 

@@ -18,6 +18,12 @@
   `preparation_scope` for this, and `SQLStateStore.source_snapshot` provides
   it. Whether native analysis is available is now checked once per process
   instead of hashing the Python executable on every run.
+- **Removed the unused pinned-skill API.** `RunSessionOptions` no longer has
+  `retained_skill_bindings`, `SkillStore` no longer has
+  `retain_current_skill` or `read_retained_skill`, and `skill_view` no longer
+  takes `content_digest`. Nothing has set or read pinned skills since 1.3.0.
+  Retained skills already in a home are still validated with the rest of the
+  home; the home format is unchanged.
 
 ## 1.3.3 (2026-11-21)
 

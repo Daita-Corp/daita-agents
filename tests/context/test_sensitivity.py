@@ -142,9 +142,6 @@ class _SkillIndex:
             ),
         )
 
-    async def read_retained_skill(self, name, content_digest):
-        return None
-
 
 @pytest.mark.parametrize(
     "classified",

@@ -311,7 +311,6 @@ class RunSessionOptions:
 
     files_only: bool = False
     explicit_learning: bool = False
-    retained_skill_bindings: tuple[tuple[str, str], ...] = ()
     one_time_artifact_destinations: tuple[object, ...] = ()
     execution_preference: ExecutionPreference = ExecutionPreference.AUTO
     # The routine or job title an approval card names; None for foreground runs.
@@ -339,17 +338,6 @@ class RunSessionOptions:
             or self.stop_after_input_tokens < 1
         ):
             raise ValueError("session input-token stop must be a positive integer")
-        bindings = tuple(self.retained_skill_bindings)
-        if any(
-            not isinstance(item, tuple)
-            or len(item) != 2
-            or any(not isinstance(value, str) or not value for value in item)
-            for item in bindings
-        ):
-            raise ValueError("retained skill bindings must contain text pairs")
-        if len({name for name, _digest in bindings}) != len(bindings):
-            raise ValueError("retained skill bindings cannot duplicate a name")
-        object.__setattr__(self, "retained_skill_bindings", tuple(sorted(bindings)))
         object.__setattr__(
             self,
             "one_time_artifact_destinations",
