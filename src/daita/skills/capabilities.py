@@ -86,13 +86,7 @@ class SkillViewExecutor:
     async def execute(self, request: ToolExecution) -> ToolOutput:
         name = request.arguments["name"]
         assert isinstance(name, str)
-        content_digest = request.arguments.get("content_digest")
-        assert content_digest is None or isinstance(content_digest, str)
-        if content_digest is None:
-            skill, current_sha256 = await self._store.read_skill_with_digest(name)
-        else:
-            skill = await self._store.read_retained_skill(name, content_digest)
-            current_sha256 = content_digest.removeprefix("sha256:")
+        skill, current_sha256 = await self._store.read_skill_with_digest(name)
         if skill is None:
             raise SkillNotFoundError(name)
         data = {
@@ -101,8 +95,6 @@ class SkillViewExecutor:
             "instructions": skill.instructions,
             "current_sha256": current_sha256,
         }
-        if content_digest is not None:
-            data["content_digest"] = content_digest
         return ToolOutput(
             kind=SKILL_VIEW_OUTPUT_KIND,
             data=data,
@@ -433,11 +425,6 @@ class SkillCapabilityDomain:
                     "skill_invalid_name",
                     "Skill names must match [a-z][a-z0-9-]{0,63}.",
                 ) from error
-            if arguments.get("content_digest") is not None:
-                raise CapabilityInputError(
-                    "retained_skill_interactive_forbidden",
-                    "Skill reads use the current named skill.",
-                )
         if capability.id == SKILL_SAVE_CAPABILITY_ID:
             # A replacement is checked against the version this run last viewed.
             try:
@@ -554,12 +541,6 @@ def _view_input_schema() -> dict[str, object]:
                 "type": "string",
                 "pattern": _SKILL_NAME_PATTERN,
                 "maxLength": 64,
-            },
-            "content_digest": {
-                "type": "string",
-                "pattern": "^sha256:[0-9a-f]{64}$",
-                "minLength": 71,
-                "maxLength": 71,
             },
         },
         "required": ["name"],

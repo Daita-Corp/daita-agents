@@ -28,7 +28,6 @@ SKILL_RETAINED_MAX_TOTAL_BYTES = 8 * 1_024 * 1_024
 _SKILLS_DIRECTORY = "skills"
 _SKILL_DOCUMENT = "SKILL.md"
 _RETAINED_DIRECTORY = "skill-retained"
-_RETAINED_DIGEST = re.compile(r"sha256:([0-9a-f]{64})\Z")
 _SKILL_NAME = re.compile(r"[a-z][a-z0-9-]{0,63}\Z", re.ASCII)
 _T = TypeVar("_T")
 
@@ -139,24 +138,6 @@ class SkillStore:
     async def skill_index(self) -> str:
         skills = await self._run_locked(self._list_sync)
         return render_skill_index(item.summary for item in skills)
-
-    async def retain_current_skill(self, name: str, content_digest: str) -> Skill:
-        """Retain exact current rendered bytes under their canonical digest."""
-
-        validate_skill_name(name)
-        digest = _retained_digest(content_digest)
-        return await self._run_locked(lambda: self._retain_sync(name, digest))
-
-    async def read_retained_skill(
-        self,
-        name: str,
-        content_digest: str,
-    ) -> Skill | None:
-        """Load one exact retained skill without consulting mutable current content."""
-
-        validate_skill_name(name)
-        digest = _retained_digest(content_digest)
-        return await self._run_locked(lambda: self._read_retained_sync(name, digest))
 
     async def save_skill(
         self,
@@ -293,152 +274,6 @@ class SkillStore:
                 )
                 _require_directory_identity(home, _SKILLS_DIRECTORY, root_state)
                 return skill
-            finally:
-                os.close(root)
-        finally:
-            os.close(home)
-
-    def _retain_sync(self, name: str, digest: str) -> Skill:
-        if self._storage is not None:
-            with self._storage.transaction(write=True) as transaction:
-                skills, _ = _stored_skills(transaction)
-                current = next((skill for skill in skills if skill.name == name), None)
-                if current is None:
-                    raise SkillNotFoundError(name)
-                rendered = _render_skill(current)
-                if _rendered_document_sha256(rendered) != digest:
-                    raise SkillValidationError("current skill content digest changed")
-                retained_document = transaction.get(
-                    "retained-skills", digest, max_bytes=SKILL_RENDERED_MAX_UTF8_BYTES
-                )
-                if retained_document is not None:
-                    if (
-                        _decode_retained(retained_document.content, name, digest)
-                        != current
-                    ):
-                        raise SkillValidationError(
-                            "retained skill identity is inconsistent"
-                        )
-                    return current
-                count, size = transaction.usage("retained-skills")
-                _validate_retained_capacity(count, size, len(rendered))
-                transaction.put("retained-skills", digest, rendered)
-                return current
-        current = self._read_sync(name)
-        if current is None:
-            raise SkillNotFoundError(name)
-        rendered = _render_skill(current)
-        if _rendered_document_sha256(rendered) != digest:
-            raise SkillValidationError("current skill content digest changed")
-        home = self._open_home()
-        root: int | None = None
-        temporary: str | None = None
-        try:
-            root, root_state = _open_directory(
-                home,
-                _RETAINED_DIRECTORY,
-                required=False,
-            )
-            if root is None:
-                try:
-                    os.mkdir(_RETAINED_DIRECTORY, mode=0o700, dir_fd=home)
-                except OSError as error:
-                    raise SkillPathError(
-                        "cannot create the retained skill root"
-                    ) from error
-                root, root_state = _open_directory(
-                    home,
-                    _RETAINED_DIRECTORY,
-                    required=True,
-                )
-                assert root is not None and root_state is not None
-            entries = tuple(sorted(os.listdir(root)))
-            if any(re.fullmatch(r"[0-9a-f]{64}\.md", item) is None for item in entries):
-                raise SkillPathError("retained skill root contains an invalid entry")
-            sizes = []
-            for item in entries:
-                state = _target_state(root, item)
-                if state is None:
-                    raise SkillPathError("retained skill content disappeared")
-                _require_regular_owned_file(state, item)
-                sizes.append(state.st_size)
-            target = f"{digest}.md"
-            if target in entries:
-                retained = self._read_retained_from_root(root, name, digest)
-                if retained != current:
-                    raise SkillPathError("retained skill identity is inconsistent")
-                return retained
-            _validate_retained_capacity(len(entries), sum(sizes), len(rendered))
-            temporary = f".{digest}.{uuid4().hex}.tmp"
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(temporary, flags, 0o600, dir_fd=root)
-            try:
-                with os.fdopen(descriptor, "wb") as file:
-                    file.write(rendered)
-                    file.flush()
-                    os.fsync(file.fileno())
-                descriptor = -1
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
-            _require_directory_identity(home, _RETAINED_DIRECTORY, root_state)
-            try:
-                os.link(
-                    temporary,
-                    target,
-                    src_dir_fd=root,
-                    dst_dir_fd=root,
-                    follow_symlinks=False,
-                )
-            except FileExistsError:
-                pass
-            except OSError as error:
-                raise SkillPathError("cannot commit retained skill content") from error
-            os.unlink(temporary, dir_fd=root)
-            temporary = None
-            os.fsync(root)
-            retained = self._read_retained_from_root(root, name, digest)
-            if retained != current:
-                raise SkillStoreError("retained skill did not round-trip exactly")
-            return retained
-        finally:
-            if temporary is not None and root is not None:
-                try:
-                    os.unlink(temporary, dir_fd=root)
-                except FileNotFoundError:
-                    pass
-            if root is not None:
-                os.close(root)
-            os.close(home)
-
-    def _read_retained_sync(self, name: str, digest: str) -> Skill | None:
-        if self._storage is not None:
-            with self._storage.transaction() as transaction:
-                document = transaction.get(
-                    "retained-skills", digest, max_bytes=SKILL_RENDERED_MAX_UTF8_BYTES
-                )
-                return (
-                    None
-                    if document is None
-                    else _decode_retained(document.content, name, digest)
-                )
-        home = self._open_home()
-        try:
-            root, root_state = _open_directory(
-                home,
-                _RETAINED_DIRECTORY,
-                required=False,
-            )
-            if root is None:
-                return None
-            try:
-                target = f"{digest}.md"
-                if _target_state(root, target) is None:
-                    return None
-                retained = self._read_retained_from_root(root, name, digest)
-                _require_directory_identity(home, _RETAINED_DIRECTORY, root_state)
-                return retained
             finally:
                 os.close(root)
         finally:
@@ -798,15 +633,6 @@ def _validate_skill_change(current: tuple[Skill, ...], candidate: Skill) -> None
     render_skill_index(item.summary for item in proposed.values())
 
 
-def _validate_retained_capacity(count: int, size: int, additional_bytes: int) -> None:
-    if count < 0 or size < 0:
-        raise SkillValidationError("retained skill usage is invalid")
-    if count >= SKILL_RETAINED_MAX_COUNT:
-        raise SkillValidationError("retained skill count exceeds its limit")
-    if size + additional_bytes > SKILL_RETAINED_MAX_TOTAL_BYTES:
-        raise SkillValidationError("retained skill bytes exceed their limit")
-
-
 def _decode_retained(data: bytes, name: str, digest: str) -> Skill:
     if _rendered_document_sha256(data) != digest:
         raise SkillPathError("retained skill digest does not match its bytes")
@@ -977,17 +803,6 @@ def _rendered_document_sha256(data: bytes) -> str:
     """Return the one digest used by skill view and replacement preflight."""
 
     return sha256(data).hexdigest()
-
-
-def _retained_digest(value: str) -> str:
-    if not isinstance(value, str):
-        raise SkillValidationError("retained skill digest must be text")
-    match = _RETAINED_DIGEST.fullmatch(value)
-    if match is None:
-        raise SkillValidationError(
-            "retained skill digest must use canonical sha256:<hex> form"
-        )
-    return match.group(1)
 
 
 def _parse_skill(data: bytes, expected_name: str) -> Skill:
