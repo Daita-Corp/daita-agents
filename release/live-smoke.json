@@ -1,6 +1,6 @@
 {
-  "surface_digest": "sha256:a031eff70035b1e95dac8ad49714956282f3b85bd9d1f256ba58ba74b0dce344",
-  "recorded_on": "2026-11-06",
+  "surface_digest": "sha256:6598cc60381b02988d20fdb4386437e7211c488d2488bc1dff82fb595522984b",
+  "recorded_on": "2026-11-24",
   "cases": {
     "tests/live/analysis/test_public_journeys.py::test_real_model_dependent_cells_and_error_correction": "passed",
     "tests/live/analysis/test_public_journeys.py::test_real_model_tui_python_and_broker": "passed",
