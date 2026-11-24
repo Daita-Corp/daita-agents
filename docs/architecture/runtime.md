@@ -176,8 +176,8 @@ semantics, and current results. Model-written advisory content inherits the full
 request classification. Local advisory imports default to restricted; explicit
 local classification uses typed owner APIs or the owned Markdown sensitivity
 label. These labels affect information handling, never execution authority.
-Scheduled reasoning starts from its approved self-contained instruction and
-exact retained skills, without unrelated conversation history or mutable memory.
+Scheduled reasoning starts from its approved self-contained instruction and the
+current skills, without unrelated conversation history or mutable memory.
 
 The source is authoritative for what it holds. The catalog is a stored snapshot
 that advises discovery and never grants or denies access. A current validated

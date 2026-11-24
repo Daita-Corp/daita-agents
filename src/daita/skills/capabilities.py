@@ -26,7 +26,7 @@ from ..capabilities import (
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
 from ..llm.models import ModelSensitivity, ToolCall, ToolResultBlock
-from ..loop.models import RunInput, RunOrigin, Transcript
+from ..loop.models import RunInput, Transcript
 from ..loop.session import RunSession
 from .store import (
     SKILL_DESCRIPTION_MAX_CHARACTERS,
@@ -421,7 +421,7 @@ class SkillCapabilityDomain:
         request_sensitivity: ModelSensitivity,
         session: RunSession | None = None,
     ) -> FrozenJsonObject:
-        del request_sensitivity
+        del request_sensitivity, session
         if capability.id == SKILL_VIEW_CAPABILITY_ID:
             name = arguments.get("name")
             try:
@@ -433,26 +433,10 @@ class SkillCapabilityDomain:
                     "skill_invalid_name",
                     "Skill names must match [a-z][a-z0-9-]{0,63}.",
                 ) from error
-            content_digest = arguments.get("content_digest")
-            if run.origin is RunOrigin.SCHEDULED_ROUTINE:
-                selected = (
-                    {}
-                    if session is None
-                    else dict(session.options.retained_skill_bindings)
-                )
-                if (
-                    selected is None
-                    or selected.get(name) != content_digest
-                    or not isinstance(content_digest, str)
-                ):
-                    raise CapabilityInputError(
-                        "scheduled_skill_binding_violation",
-                        "A scheduled run may load only its exact pinned skill digest.",
-                    )
-            elif content_digest is not None:
+            if arguments.get("content_digest") is not None:
                 raise CapabilityInputError(
                     "retained_skill_interactive_forbidden",
-                    "Foreground skill reads use the current named skill.",
+                    "Skill reads use the current named skill.",
                 )
         if capability.id == SKILL_SAVE_CAPABILITY_ID:
             # A replacement is checked against the version this run last viewed.

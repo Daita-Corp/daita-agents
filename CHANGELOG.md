@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Scheduled routines can use skills again.** Since 1.3.0 a routine run saw
+  no skills and failed any `skill_view` call, because the check for pinned
+  skill versions outlived the pinned skills themselves. A routine run now
+  lists and loads the current skills, as a chat run does. Listing a skill
+  counts toward the run's sensitivity, so a routine can now be classified
+  higher than before; skills saved without a label are restricted.
+
 ## 1.3.3 (2026-11-21)
 
 Home revision unchanged (4). No home is migrated by this release.
