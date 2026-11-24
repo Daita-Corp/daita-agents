@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -128,6 +130,25 @@ from .sqlite_records import (
 )
 
 _T = TypeVar("_T")
+
+
+class _SourceSnapshot:
+    """One agent's sources and read scopes, read once for one request build."""
+
+    __slots__ = ("agent_id", "open", "read_scopes", "sources", "store")
+
+    def __init__(self, store: SQLStateStore, agent_id: str) -> None:
+        self.store = store
+        self.agent_id = agent_id
+        self.open = True
+        self.sources: tuple[SourceRegistration, ...] | None = None
+        # A scope that failed to decode keeps its error for the caller that asks.
+        self.read_scopes: dict[str, SourceReadScope | None | Exception] = {}
+
+
+_SOURCE_SNAPSHOT: ContextVar[_SourceSnapshot | None] = ContextVar(
+    "daita_source_snapshot", default=None
+)
 
 
 def _load_delivery_row(
@@ -937,13 +958,81 @@ class SQLStateStore:
     async def load_source(
         self, agent_id: str, source_id: str
     ) -> SourceRegistration | None:
+        if (snapshot := await self._source_snapshot(agent_id)) is not None:
+            return next(
+                (item for item in snapshot.sources or () if item.id == source_id),
+                None,
+            )
+
         def read() -> SourceRegistration | None:
             with _connect_read_only(self._database) as connection:
                 return _source_store.load(connection, agent_id, source_id)
 
         return await settled_thread(read)
 
+    @asynccontextmanager
+    async def source_snapshot(self, agent_id: str) -> AsyncIterator[None]:
+        """Serve this agent's source and read-scope reads from one read until exit.
+
+        Only for building a model request: tool execution and every write path
+        run outside it and read permissions live, and a source write made inside
+        it is not seen by it. Nested scopes share the outer one.
+        """
+
+        current = _SOURCE_SNAPSHOT.get()
+        if (
+            current is not None
+            and current.open
+            and current.store is self
+            and current.agent_id == agent_id
+        ):
+            yield
+            return
+        snapshot = _SourceSnapshot(self, agent_id)
+        token = _SOURCE_SNAPSHOT.set(snapshot)
+        try:
+            yield
+        finally:
+            # Tasks started inside the scope keep the variable; closing ends it for them.
+            snapshot.open = False
+            _SOURCE_SNAPSHOT.reset(token)
+
+    async def _source_snapshot(self, agent_id: str) -> _SourceSnapshot | None:
+        snapshot = _SOURCE_SNAPSHOT.get()
+        if (
+            snapshot is None
+            or not snapshot.open
+            or snapshot.store is not self
+            or snapshot.agent_id != agent_id
+        ):
+            return None
+        if snapshot.sources is None:
+
+            def read(
+                connection: SQLConnection,
+            ) -> tuple[
+                tuple[SourceRegistration, ...],
+                dict[str, SourceReadScope | None | Exception],
+            ]:
+                sources = _source_store.list_sources(connection, agent_id)
+                scopes: dict[str, SourceReadScope | None | Exception] = {}
+                for source in sources:
+                    try:
+                        scopes[source.id] = _source_store.load_read_scope(
+                            connection, agent_id, source.id
+                        )
+                    except Exception as error:
+                        scopes[source.id] = error
+                return sources, scopes
+
+            sources, scopes = await _run_read_transaction(self._database, read)
+            snapshot.sources, snapshot.read_scopes = sources, scopes
+        return snapshot
+
     async def list_sources(self, agent_id: str) -> tuple[SourceRegistration, ...]:
+        if (snapshot := await self._source_snapshot(agent_id)) is not None:
+            return cast(tuple[SourceRegistration, ...], snapshot.sources)
+
         def read() -> tuple[SourceRegistration, ...]:
             with _connect_read_only(self._database) as connection:
                 return _source_store.list_sources(connection, agent_id)
@@ -956,6 +1045,12 @@ class SQLStateStore:
         source_id: str,
     ) -> SourceReadScope | None:
         """Load one exact active-source scope; invalid state never becomes all."""
+
+        if (snapshot := await self._source_snapshot(agent_id)) is not None:
+            scope = snapshot.read_scopes.get(source_id)
+            if isinstance(scope, Exception):
+                raise scope
+            return scope
 
         def read() -> SourceReadScope | None:
             with _connect_read_only(self._database) as connection:

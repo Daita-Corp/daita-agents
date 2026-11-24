@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol, TypeVar, cast
@@ -400,7 +401,14 @@ class AgentLoop:
         clock: Callable[[], datetime] = _utc_now,
         observer: AgentObserver | None = None,
         stream_model_calls: bool = False,
+        preparation_scope: (
+            Callable[[RunInput], AbstractAsyncContextManager[object]] | None
+        ) = None,
     ) -> None:
+        """``preparation_scope`` wraps only tool and context preparation for a
+        run, never model calls or tool execution; a host can serve repeated
+        store reads from one snapshot inside it."""
+
         if not isinstance(limits, LoopLimits):
             raise TypeError("limits must be LoopLimits")
         if not callable(clock):
@@ -409,6 +417,9 @@ class AgentLoop:
             raise TypeError("observer must be callable or None")
         if not isinstance(stream_model_calls, bool):
             raise TypeError("stream_model_calls must be a boolean")
+        if preparation_scope is not None and not callable(preparation_scope):
+            raise TypeError("preparation_scope must be callable or None")
+        self._preparation_scope = preparation_scope
         self._model = model
         self._context_builder = context_builder
         self._tools = tools
@@ -420,6 +431,13 @@ class AgentLoop:
         self._clock = clock
         self._observer = observer
         self._stream_model_calls = stream_model_calls
+
+    def _preparing(self, run: RunInput) -> AbstractAsyncContextManager[object]:
+        return (
+            nullcontext()
+            if self._preparation_scope is None
+            else self._preparation_scope(run)
+        )
 
     async def prepare(
         self,
@@ -446,10 +464,14 @@ class AgentLoop:
         messages = (*prior_messages, start_message)
         try:
             limits = _effective_run_limits(self._limits, run)
-            tool_catalog = await _prepare_tools(self._tools, run, session)
-            snapshot = await self._context_builder.prepare(
-                run, messages, tool_catalog, max_total_tokens=limits.max_total_tokens
-            )
+            async with self._preparing(run):
+                tool_catalog = await _prepare_tools(self._tools, run, session)
+                snapshot = await self._context_builder.prepare(
+                    run,
+                    messages,
+                    tool_catalog,
+                    max_total_tokens=limits.max_total_tokens,
+                )
             projection = self._tools.project(tool_catalog, (start_message,))
             request = self._context_builder.project(
                 snapshot,
@@ -572,19 +594,20 @@ class AgentLoop:
 
             deadline = current_deadline()
             if prepared is None:
-                tool_catalog = await _before(
-                    deadline,
-                    _prepare_tools(self._tools, run, runtime_session),
-                )
-                context_snapshot = await _before(
-                    deadline,
-                    self._context_builder.prepare(
-                        run,
-                        messages,
-                        tool_catalog,
-                        max_total_tokens=limits.max_total_tokens,
-                    ),
-                )
+                async with self._preparing(run):
+                    tool_catalog = await _before(
+                        deadline,
+                        _prepare_tools(self._tools, run, runtime_session),
+                    )
+                    context_snapshot = await _before(
+                        deadline,
+                        self._context_builder.prepare(
+                            run,
+                            messages,
+                            tool_catalog,
+                            max_total_tokens=limits.max_total_tokens,
+                        ),
+                    )
             else:
                 tool_catalog = prepared.tool_catalog
                 context_snapshot = prepared.context_snapshot
