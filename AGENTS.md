@@ -612,6 +612,7 @@ protects the user in its place.
 | `src/daita/loop/models.py` | run, transcript, limits, and exit records |
 | `src/daita/capabilities.py` | declarations and registry |
 | `src/daita/capability_runtime.py` | common execution mechanics |
+| `src/daita/capability_toolbox.py`, `capability_results.py`, `capability_domain_calls.py`, `capability_programmatic_reads.py` | runtime helpers: toolbox contracts, result shaping, domain hooks, analysis child reads |
 | `src/daita/context.py` | model-request construction |
 | `src/daita/scope.py` | effective source scope: admitted sources, tables and display names |
 | `src/daita/adapters/registry.py` | source type registry and built-in source types |
