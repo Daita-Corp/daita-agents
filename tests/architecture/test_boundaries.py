@@ -256,23 +256,29 @@ def test_checklist_jobs_are_registered_and_legacy_runtime_is_unreachable():
 
 
 def test_common_runtime_has_one_owner_and_no_domain_dependencies():
-    runtime_path = PACKAGE / "capability_runtime.py"
-    runtime_tree = _tree(runtime_path)
-
     assert _class_owners("CapabilityRuntime") == {"capability_runtime.py"}
-    assert not {
-        "adapters",
-        "catalog",
-        "domains.data",
-        "memory",
-        "semantics",
-        "skills",
-    } & _imports(runtime_path)
-    assert not {
-        node.id
-        for node in ast.walk(runtime_tree)
-        if isinstance(node, ast.Name) and node.id.endswith("_CAPABILITY_ID")
-    }
+    # The runtime's helper modules hold the same domain-neutral boundary.
+    for name in (
+        "capability_runtime.py",
+        "capability_domain_calls.py",
+        "capability_programmatic_reads.py",
+        "capability_results.py",
+        "capability_toolbox.py",
+    ):
+        runtime_path = PACKAGE / name
+        assert not {
+            "adapters",
+            "catalog",
+            "domains.data",
+            "memory",
+            "semantics",
+            "skills",
+        } & _imports(runtime_path), name
+        assert not {
+            node.id
+            for node in ast.walk(_tree(runtime_path))
+            if isinstance(node, ast.Name) and node.id.endswith("_CAPABILITY_ID")
+        }, name
 
 
 def test_toolbox_catalog_and_activation_owners_are_explicit():
